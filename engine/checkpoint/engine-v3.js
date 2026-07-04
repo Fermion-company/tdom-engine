@@ -42,11 +42,14 @@ const HEADING_RE = /^\s*\\(chapter|section|subsection|subsubsection|paragraph)\b
 const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 30_000);
 const BOOT_TIMEOUT = 60_000;
 // Environments that drive TeX's page builder themselves (own \output,
-// column balancing against \vsize). On the dormant \vsize=\maxdimen page
-// they balance against garbage (multicols yields \maxdimen/2-tall columns)
-// or worse — route them through the isolated exact-render rescue, where a
-// real lualatex with the real \textheight typesets them exactly as print.
-const OUTPUT_HIJACK_RE = /\\begin\{(multicols\*?|paracol)\}/;
+// column balancing against \vsize) or that MUST break across real pages
+// (longtable's page-splitting, landscape's rotated geometry). On the
+// dormant \vsize=\maxdimen page they yield garbage or a single giant
+// galley — route them through the isolated exact-render rescue, where a
+// real lualatex with the real \textheight typesets them exactly as print
+// (taller-than-page material ships real pages → per-page chunks with
+// forced breaks).
+const OUTPUT_HIJACK_RE = /\\begin\{(multicols\*?|paracol|longtable|landscape)\}/;
 
 export class CheckpointEngine {
   constructor({ workDir, docDir }) {
