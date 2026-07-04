@@ -35,10 +35,10 @@ const execFileP = promisify(execFile);
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
 const BASE_COUNTERS = [
-  'part', 'section', 'subsection', 'subsubsection', 'paragraph',
+  'part', 'chapter', 'section', 'subsection', 'subsubsection', 'paragraph',
   'equation', 'figure', 'table', 'footnote',
 ];
-const HEADING_RE = /^\s*\\(section|subsection|subsubsection|paragraph)\b/;
+const HEADING_RE = /^\s*\\(chapter|section|subsection|subsubsection|paragraph)\b/;
 const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 30_000);
 const BOOT_TIMEOUT = 60_000;
 // Environments that drive TeX's page builder themselves (own \output,
@@ -400,6 +400,18 @@ export class CheckpointEngine {
     L.push("\\renewcommand\\pageref[1]{\\directlua{tdom_ref('\\luaescapestring{#1}')}\\TDOMpageref{#1}}");
     L.push('\\ifdefined\\eqref\\let\\TDOMeqref\\eqref');
     L.push("\\renewcommand\\eqref[1]{\\directlua{tdom_ref('\\luaescapestring{#1}')}\\TDOMeqref{#1}}\\fi");
+    // toc/lof/lot entries are TeX's own: capture what \addcontentsline
+    // would write, expanded exactly like \protected@write expands it (the
+    // class's real \numberline{\thechapter.\thesection} formatting) — the
+    // orchestrator later substitutes only the page argument it owns
+    L.push('\\let\\TDOMaddcontentsline\\addcontentsline');
+    L.push(
+      '\\renewcommand\\addcontentsline[3]{\\TDOMaddcontentsline{#1}{#2}{#3}' +
+        '{\\let\\label\\@gobble\\let\\index\\@gobble\\let\\glossary\\@gobble' +
+        '\\protected@edef\\TDOM@tocentry{#3}' +
+        "\\directlua{tdom_tocline('\\luaescapestring{#1}','\\luaescapestring{#2}'," +
+        "'\\luaescapestring{\\detokenize\\expandafter{\\TDOM@tocentry}}')}}}"
+    );
     // \cite: record dependencies on bibliography keys
     L.push('\\let\\TDOMcite\\cite');
     L.push("\\renewcommand\\cite[2][]{\\directlua{tdom_cites('\\luaescapestring{#2}')}" +
@@ -960,7 +972,7 @@ export class CheckpointEngine {
     // resident RENDER path (dormant-page reship) must not overwrite them
     block.needsRender =
       !block.rescued && (block.gfx || (galley.floats ?? []).some((f) => f.gfx));
-    block.consumesToc = /\\tableofcontents\b/.test(block.text);
+    block.consumesToc = /\\(tableofcontents|listoffigures|listoftables)\b/.test(block.text);
     block.kind = HEADING_RE.test(block.text)
       ? 'heading'
       : block.gfx
@@ -1162,7 +1174,9 @@ export class CheckpointEngine {
       const toc = this.#computeToc(prov);
       if (toc.hash === this.tocHash) break;
       this.tocHash = toc.hash;
-      writeFileSync(path.join(this.workDir, 'driver.toc'), toc.content);
+      for (const [ext, content] of Object.entries(toc.contents)) {
+        writeFileSync(path.join(this.workDir, `driver.${ext}`), content);
+      }
       let anyConsumer = false;
       for (let c = 0; c < this.blocks.length; c++) {
         const block = this.blocks[c];
@@ -1520,6 +1534,12 @@ export class CheckpointEngine {
 
   // ----------------------------------------------------- toc / includes
 
+  /**
+   * Regenerate the contents files (toc / lof / lot) from the toclines the
+   * daemon captured off \addcontentsline — the entries are TeX's own,
+   * already expanded with the class's real numbering; the orchestrator
+   * substitutes only the page number, which it owns (it builds the pages).
+   */
   #computeToc(pages) {
     const blockPage = new Map();
     for (const page of pages) {
@@ -1527,29 +1547,31 @@ export class CheckpointEngine {
         const bid = d.u?.blockId;
         if (bid && !blockPage.has(bid)) blockPage.set(bid, page.number);
       }
-    }
-    const secIdx = this.counters.indexOf('section');
-    const subIdx = this.counters.indexOf('subsection');
-    const subsubIdx = this.counters.indexOf('subsubsection');
-    const lines = [];
-    for (const block of this.blocks) {
-      const m = block.text.match(/^\s*\\(section|subsection|subsubsection)(\*?)\s*\{/);
-      if (process.env.TDOM_DEBUG_TOC && /\\section/.test(block.text)) {
-        console.error(`toc? ${block.id} m=${!!m} star=${m?.[2]} sv=${!!block.stateVec} text=${JSON.stringify(block.text.slice(0, 40))}`);
+      for (const f of page.floats ?? []) {
+        const bid = f.blockId ?? f.id?.split('#')[0];
+        if (bid && !blockPage.has(bid + '#float')) blockPage.set(bid + '#float', page.number);
       }
-      if (!m || m[2] === '*' || !block.stateVec) continue;
-      const vec = JSON.parse(block.stateVec);
-      const title = extractBraced(block.text, block.text.indexOf('{', m.index));
-      const page = blockPage.get(block.id) ?? 1;
-      let num;
-      if (m[1] === 'section') num = `${vec[secIdx]}`;
-      else if (m[1] === 'subsection') num = `${vec[secIdx]}.${vec[subIdx]}`;
-      else num = `${vec[secIdx]}.${vec[subIdx]}.${vec[subsubIdx]}`;
-      // 4th (destination) argument required by LaTeX 2020-10 and later
-      lines.push(`\\contentsline {${m[1]}}{\\numberline {${num}}${title}}{${page}}{}%`);
     }
-    const content = lines.join('\n') + '\n';
-    return { hash: fnv1a(content), content };
+    const files = { toc: [], lof: [], lot: [] };
+    for (const block of this.blocks) {
+      for (const tl of block.galley?.toclines ?? []) {
+        const ext = tl.e ?? 'toc';
+        if (!files[ext]) files[ext] = [];
+        // float captions (lof/lot) sit on the page the float landed on when
+        // known; everything else on the block's own page
+        const page =
+          (ext !== 'toc' ? blockPage.get(block.id + '#float') : undefined) ??
+          blockPage.get(block.id) ??
+          1;
+        // 4th (destination) argument required by LaTeX 2020-10 and later
+        files[ext].push(`\\contentsline {${tl.l}}{${tl.t}}{${page}}{}%`);
+      }
+    }
+    const contents = {};
+    for (const [ext, lines] of Object.entries(files)) {
+      contents[ext] = lines.join('\n') + '\n';
+    }
+    return { hash: fnv1a(JSON.stringify(contents)), contents };
   }
 
   #expandIncludes(segs, depth) {

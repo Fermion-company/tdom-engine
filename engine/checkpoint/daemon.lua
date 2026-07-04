@@ -33,6 +33,7 @@ local seen_fonts = {}
 local blk_labels = {}
 local blk_refs = {}
 local blk_counters = {}
+local blk_toclines = {}
 local blk_gfx = false
 local blk_floats = {}
 local pending_fmarks = {}
@@ -166,6 +167,14 @@ end
 
 function tdom_ref(key)
   blk_refs[#blk_refs + 1] = key
+end
+
+-- Table-of-contents lines are TeX's own: the driver shims \addcontentsline
+-- and reports the entry exactly as \protected@write would have expanded it
+-- (real \thechapter.\thesection formatting, class-specific levels). The
+-- orchestrator substitutes only the page number — the one value it owns.
+function tdom_tocline(ext, level, text)
+  blk_toclines[#blk_toclines + 1] = { e = ext, l = level, t = text }
 end
 
 function tdom_counter(name, value)
@@ -780,6 +789,7 @@ function tdom_report()
     labels = blk_labels,
     refs = blk_refs,
     state = blk_counters,
+    toclines = blk_toclines,
   })
   if head then node.flush_list(head) end
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
@@ -886,6 +896,7 @@ function tdom_wait()
         blk_labels = {}
         blk_refs = {}
         blk_counters = {}
+        blk_toclines = {}
         blk_gfx = false
         blk_floats = {}
         pending_fmarks = {}
