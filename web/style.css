@@ -2144,3 +2144,12 @@ body.engine-only .code-preview-pane {
 body.engine-only .code-workbench {
   grid-template-columns: minmax(0, 1fr);
 }
+/* #editor-pane is display:none, so the grid loses its first item — drop the
+   menu track entirely or the remaining panes shift into the wrong columns. */
+body.engine-only #layout {
+  grid-template-columns: minmax(0, var(--workspace-width)) var(--splitter-width) minmax(0, var(--preview-width));
+}
+body.engine-only[data-layout-view="workspace"] #layout,
+body.engine-only[data-layout-view="preview"] #layout {
+  grid-template-columns: minmax(0, 1fr);
+}
