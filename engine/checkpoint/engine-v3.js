@@ -49,7 +49,11 @@ const BOOT_TIMEOUT = 60_000;
 // real lualatex with the real \textheight typesets them exactly as print
 // (taller-than-page material ships real pages → per-page chunks with
 // forced breaks).
-const OUTPUT_HIJACK_RE = /\\begin\{(multicols\*?|paracol|longtable|landscape)\}/;
+// environments the dormant galley cannot represent: output-routine swappers
+// (multicols, longtable …) and page-context readers that split against
+// \pagegoal-\pagetotal (mdframed, framed, breakable tcolorbox)
+const OUTPUT_HIJACK_RE =
+  /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded)\}|\\begin\{tcolorbox\}\[[^\]]*breakable/;
 
 export class CheckpointEngine {
   constructor({ workDir, docDir }) {
@@ -719,7 +723,7 @@ export class CheckpointEngine {
   async #typesetBlock(idx) {
     const block = this.blocks[idx];
     const sig = fnv1a(block.text);
-    if (OUTPUT_HIJACK_RE.test(block.text)) {
+    if (this.#needsRescue(block.text)) {
       return this.#rescueBlock(idx, 'output-routine environment needs a real page');
     }
     if (this.poisoned.get(block.id) === sig) {
@@ -734,6 +738,28 @@ export class CheckpointEngine {
       );
       return this.#rescueBlock(idx, err.message);
     }
+  }
+
+  /**
+   * Rescue triggers: the static hijack list plus breakable tcolorbox
+   * environments the PREAMBLE defines (\newtcolorbox/\newtcbtheorem with
+   * a `breakable` option create page-splitting envs under custom names).
+   */
+  #needsRescue(text) {
+    if (OUTPUT_HIJACK_RE.test(text)) return true;
+    if (this._breakableFor !== this.preHash) {
+      const src = this.store.get(this.file) ?? '';
+      const b = documentBounds(src);
+      const pre = src.slice(b.preamble.start, b.preamble.end);
+      const names = [];
+      for (const m of pre.matchAll(/\\newtcolorbox\{([A-Za-z@]+)\}[^\n]*?breakable/g)) names.push(m[1]);
+      for (const m of pre.matchAll(/\\newtcbtheorem(?:\[[^\]]*\])?\{([A-Za-z@]+)\}[^\n]*?breakable/g)) names.push(m[1]);
+      this._breakableRe = names.length
+        ? new RegExp(`\\\\begin\\{(?:${names.join('|')})\\}`)
+        : null;
+      this._breakableFor = this.preHash;
+    }
+    return this._breakableRe ? this._breakableRe.test(text) : false;
   }
 
   /**
@@ -755,8 +781,11 @@ export class CheckpointEngine {
     const refVals = (block.galley?.refs ?? []).map(
       (k) => k + '=' + (this.labelTable.get(k) ?? '')
     );
+    // page-context: the block's on-page start offset changes where a
+    // splitting environment (mdframed, breakable tcolorbox) breaks
+    const pageOff = Math.round((block.pageOffset ?? 0) * 100) / 100;
     const cacheKey = fnv1a(
-      JSON.stringify([block.text, this.blocks[idx - 1]?.stateVec ?? '', this.preHash, refVals])
+      JSON.stringify([block.text, this.blocks[idx - 1]?.stateVec ?? '', this.preHash, refVals, pageOff])
     );
     let iso = this.isoCache.get(cacheKey);
     if (!iso) {
@@ -909,12 +938,18 @@ export class CheckpointEngine {
         'tdom_iso.fires = tdom_iso.fires + 1 ' +
         'if tdom_iso.fires > 50 then tex.box[255] = nil return end ' +
         'tex.deadcycles = 0 ' +
+        'if tdom_iso.ships == 0 then tdom_iso.preabsorbs = (tdom_iso.preabsorbs or 0) + 1 end ' +
         'local b = tex.box[255] ' +
         'local list = nil ' +
         'if b then list = b.list b.list = nil tex.box[255] = nil end ' +
         'if list then ' +
+        // an absorbed fire IS a real page break: leave an eject marker at
+        // the boundary so the harvested stream carries the break position
+        'local mk = node.new("whatsit", node.subtype("special")) ' +
+        'mk.data = "tdom:eject:-10000" ' +
+        'local t0 = node.tail(list) t0.next = mk mk.prev = t0 ' +
         'local oldc = tex.lists.contrib_head ' +
-        'if oldc then local t = node.tail(list) t.next = oldc oldc.prev = t end ' +
+        'if oldc then mk.next = oldc oldc.prev = mk end ' +
         'tex.lists.contrib_head = list ' +
         'end ' +
         'pcall(function() tex.pagetotal = 0 end) ' +
@@ -928,6 +963,17 @@ export class CheckpointEngine {
     // pre-body machinery (and the isostart marker) left with page 1
     L.push('\\AddToHook{shipout/before}{\\directlua{tdom_iso.ships = tdom_iso.ships + 1}}');
     L.push('\\hbox to0pt{}');
+    // page-context strut: reproduce the block's true on-page start position
+    // so splitting environments (mdframed & co.) measure the same
+    // \pagegoal-\pagetotal as in print. The iso page's own \topskip already
+    // contributed, so the strut is the entry \pagetotal minus that.
+    const entryOff = block.pageOffset ?? 0;
+    const topskipW =
+      typeof this.geometry?.topskip === 'object'
+        ? this.geometry.topskip.w ?? 0
+        : this.geometry?.topskip ?? 0;
+    const strut = Math.max(0, entryOff - topskipW);
+    if (strut > 0.01) L.push(`\\vskip ${strut.toFixed(4)}bp`);
     L.push('\\special{tdom:isostart}');
     L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(prevPd)}}`);
     if (prevNobreak) L.push('\\noindent');
@@ -984,7 +1030,9 @@ export class CheckpointEngine {
         'elseif m.id == GL or m.id == KE then local a = (m.id == GL and m.width or m.kern) or 0 ' +
         'if a ~= 0 then table.insert(items, \'{"k":"glue","a":\' .. bp(a) .. \'}\') end ' +
         'elseif m.id == WH and m.subtype == SP and m.data and m.data:sub(1, 8) == "tdom:tl:" then ' +
-        'table.insert(items, \'{"k":"tl","n":\' .. (tonumber(m.data:sub(9)) or 0) .. \'}\') end ' +
+        'table.insert(items, \'{"k":"tl","n":\' .. (tonumber(m.data:sub(9)) or 0) .. \'}\') ' +
+        'elseif m.id == WH and m.subtype == SP and m.data and m.data:sub(1, 11) == "tdom:eject:" then ' +
+        'table.insert(items, \'{"k":"eject","v":\' .. (tonumber(m.data:sub(12)) or -10000) .. \'}\') end ' +
         'm = m.next end ' +
         // empty remainder (env ended exactly at a page break): ship a
         // zero box so the last PDF page always exists for the node side
@@ -1001,6 +1049,7 @@ export class CheckpointEngine {
         'for k, v in pairs(tdom_iso.counters) do table.insert(cnts, jq(k) .. ":" .. v) end ' +
         'f:write(\'{"w":\' .. bp(b.width) .. \',"h":\' .. bp(b.height) .. \',"d":\' .. bp(b.depth) .. ' +
         '\',"ships":\' .. tdom_iso.ships .. ' +
+        '\',"preabsorbs":\' .. (tdom_iso.preabsorbs or 0) .. ' +
         '\',"labels":[\' .. table.concat(labs, ",") .. \'],"toclines":[\' .. table.concat(tls, ",") .. ' +
         '\'],"refs":[\' .. table.concat(rfs, ",") .. ' +
         '\'],"state":{\' .. table.concat(cnts, ",") .. ' +
@@ -1031,6 +1080,13 @@ export class CheckpointEngine {
     const geo = this.geometry ?? {};
     const chunks = [];
     const items = [];
+    // fires absorbed BEFORE the first ship are real page breaks whose
+    // material (pre-body machinery) left with page 1 — e.g. the \clearpage
+    // opening a landscape env. Without them the first chunk page glues
+    // itself to the preceding text and overfills.
+    if (ships > 0) {
+      for (let k = 0; k < (st.preabsorbs ?? 0); k++) items.push({ k: 'eject', v: -10000 });
+    }
     // real shipped pages (material taller than the page inside an
     // output-hijack env): one full-textheight chunk per page + a forced
     // break — the preview page sequence mirrors print exactly
@@ -1411,6 +1467,48 @@ export class CheckpointEngine {
       if (!anyConsumer) break;
     }
     t.lap('toc');
+
+    // ---- page-context-sensitive rescues ---------------------------------
+    // A rescued environment that reads \pagegoal-\pagetotal (mdframed,
+    // breakable tcolorbox …) splits by its position ON the page. Feed each
+    // rescued block its true entry offset from provisional pagination and
+    // iterate to a fixed point — the split changes heights, which move
+    // every later block's offset, exactly like TeX's own reruns would.
+    for (let pass = 0; pass < 4; pass++) {
+      const prov = this.#paginateNow();
+      const entry = prov.blockEntry ?? new Map();
+      let moved = false;
+      for (let c = 0; c < this.blocks.length; c++) {
+        const block = this.blocks[c];
+        if (!block.rescued) continue;
+        const want = Math.round((entry.get(block.id) ?? 0) * 100) / 100;
+        const have = block.pageOffset ?? 0;
+        if (Math.abs(want - have) <= 0.05) continue;
+        // offset-independent cases skip the (expensive) re-rescue:
+        // an env that OPENS with a page break (\clearpage in landscape/
+        // longtable) never sees the entry offset, and an unbroken box that
+        // fits at BOTH offsets renders identically
+        const items = block.galley?.items ?? [];
+        const th = this.geometry?.textheight ?? 0;
+        const boxH = (block.galley?.h ?? 0) + (block.galley?.d ?? 0);
+        if (
+          items[0]?.k === 'eject' ||
+          (!items.some((it) => it.k === 'eject') && boxH <= th - want && boxH <= th - have)
+        ) {
+          block.pageOffset = want;
+          continue;
+        }
+        block.pageOffset = want;
+        moved = true;
+        const from = this.#nearestCheckpoint(c);
+        await this.#retypesetChain(from, c, (j, changed) => {
+          typesetCount++;
+          if (changed && j >= c) dirtyBlocks.push(this.blocks[j].id);
+        });
+      }
+      if (!moved) break;
+    }
+    t.lap('pagectx');
     this._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop };
     } catch (err) {
       if (!retry) {
@@ -2378,6 +2476,12 @@ function buildStream(block, hasChunk, chunks) {
         }
       }
     }
+  }
+  // tag the block's first stream node: the page builder records \pagetotal
+  // at block entry there (page-context-sensitive rescues need it)
+  if (stream[0]) {
+    stream[0].first = true;
+    stream[0].bid = block.id;
   }
   return stream;
 }

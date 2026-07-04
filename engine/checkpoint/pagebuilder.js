@@ -71,7 +71,12 @@ export function parsePlacement(spec) {
 }
 
 export function buildPages(stream, geo) {
-  return new PageBuilder(stream, geo).run();
+  const builder = new PageBuilder(stream, geo);
+  const pages = builder.run();
+  // \pagetotal at each block's entry — page-context-sensitive rescues
+  // (mdframed & co.) need their true on-page start position
+  pages.blockEntry = builder.blockEntry;
+  return pages;
 }
 
 class PageBuilder {
@@ -100,6 +105,7 @@ class PageBuilder {
     this.folio = 1; // TeX's \c@page: assigned per emitted page, reset by \pagenumbering
     this.pendingFolio = null;
     this.footruleUnit = footruleUnitFor(geo);
+    this.blockEntry = new Map(); // blockId -> \pagetotal at its first node
     // break-decision dump for offline referees (tools/compare-breaks.mjs):
     // when the host installs __TDOM_PAGE_DUMP__, every fired page's contents
     // (the pre-output body stream, natural glue values) is recorded
@@ -190,6 +196,14 @@ class PageBuilder {
   run() {
     while (this.qi < this.queue.length) {
       const e = this.queue[this.qi++];
+      // a block's first stream node: record its effective entry offset
+      // (space already unavailable on this page: \pagetotal plus whatever
+      // inserts/floats took off \pagegoal). Items requeued onto the next
+      // page re-record, so the FINAL page's value wins — exactly what the
+      // real run's \pagegoal-\pagetotal arithmetic would see.
+      if (e.first && e.bid) {
+        this.blockEntry.set(e.bid, this.textheight - this.goal + this.total);
+      }
       switch (e.t) {
         case 'box':
           this.#contributeBox(e);
