@@ -52,6 +52,7 @@ async function enginePages() {
     // display lists carry their final chunk overlays
     await engine.bgTask.catch(() => {});
     await (engine.renderTask ?? Promise.resolve()).catch(() => {});
+    await (engine.hfTask ?? Promise.resolve()).catch(() => {});
     const dls = engine.getDisplayLists();
     const geo = engine.getGeometry();
     return { dls, geo };

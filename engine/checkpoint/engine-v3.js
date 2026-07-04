@@ -76,6 +76,10 @@ export class CheckpointEngine {
     this.chunks = new Map(); // chunkKey -> {svg, wBp, hBp, v} exact renders
     this.isoCache = new Map(); // rescue key -> isolated compile result
     this.poisoned = new Map(); // block.id -> fnv1a(text) that failed in-chain
+    this.hf = new Map(); // page number -> {h: items, f: items} TeX-typeset header/footer
+    this.hfSig = null; // page-spec signature the current hf map was built for
+    this.hfPending = null; // spec signature of an in-flight header job
+    this.initialStyle = 'plain'; // \pagestyle in effect at \begin{document}
     this.bgAbort = false;
     this.bgTask = Promise.resolve();
     this.onAsyncPatches = null; // callback(report-ish) for gfx swaps
@@ -339,6 +343,16 @@ export class CheckpointEngine {
     const bounds = documentBounds(text);
     const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
     this.counters = [...BASE_COUNTERS, ...scanCounterDefs(preamble)];
+    // \pagestyle set in the preamble runs before the driver shims exist —
+    // scan for it; otherwise book-family classes default to 'headings'
+    const psMatch = preamble.match(/^[^%\n]*\\pagestyle\s*\{(\w+)\}/m);
+    this.initialStyle = psMatch
+      ? psMatch[1]
+      : /\\documentclass[^{]*\{[^}]*(book|report)[^}]*\}/.test(preamble)
+        ? 'headings'
+        : 'plain';
+    this.hf = new Map();
+    this.hfSig = null;
     writeFileSync(path.join(this.workDir, 'driver.tex'), this.#driverSource(preamble));
 
     rmSync(path.join(this.workDir, 'driver.pdf'), { force: true });
@@ -412,6 +426,42 @@ export class CheckpointEngine {
         "\\directlua{tdom_tocline('\\luaescapestring{#1}','\\luaescapestring{#2}'," +
         "'\\luaescapestring{\\detokenize\\expandafter{\\TDOM@tocentry}}')}}}"
     );
+    // page-style layer events: the orchestrator reconstructs each page's
+    // exact header/footer state from these (the boxes themselves are later
+    // typeset by TeX in a header job — nothing is invented)
+    L.push('\\let\\TDOMpagestyle\\pagestyle');
+    L.push(
+      "\\renewcommand\\pagestyle[1]{\\TDOMpagestyle{#1}\\directlua{tdom_event('style','\\luaescapestring{#1}','')}}"
+    );
+    L.push('\\let\\TDOMthispagestyle\\thispagestyle');
+    L.push(
+      "\\renewcommand\\thispagestyle[1]{\\TDOMthispagestyle{#1}\\directlua{tdom_event('thisstyle','\\luaescapestring{#1}','')}}"
+    );
+    L.push('\\let\\TDOMpagenumbering\\pagenumbering');
+    L.push(
+      "\\renewcommand\\pagenumbering[1]{\\TDOMpagenumbering{#1}\\directlua{tdom_event('pagenum','\\luaescapestring{#1}','')}}"
+    );
+    L.push('\\let\\TDOMmarkboth\\markboth');
+    L.push(
+      '\\renewcommand\\markboth[2]{\\TDOMmarkboth{#1}{#2}' +
+        '{\\protected@edef\\TDOM@mka{#1}\\protected@edef\\TDOM@mkb{#2}' +
+        "\\directlua{tdom_event('mark','\\luaescapestring{\\detokenize\\expandafter{\\TDOM@mka}}'," +
+        "'\\luaescapestring{\\detokenize\\expandafter{\\TDOM@mkb}}')}}}"
+    );
+    L.push('\\let\\TDOMmarkright\\markright');
+    L.push(
+      '\\renewcommand\\markright[1]{\\TDOMmarkright{#1}' +
+        '{\\protected@edef\\TDOM@mka{#1}' +
+        "\\directlua{tdom_event('markr','\\luaescapestring{\\detokenize\\expandafter{\\TDOM@mka}}','')}}}"
+    );
+    // \cleardoublepage decides on a blank verso via \ifodd\c@page — but the
+    // dormant run never ships pages, so \c@page is meaningless here. Emit a
+    // marker instead: the page builder OWNS folios and inserts the blank
+    // (with \thispagestyle{empty}, as the classes do) exactly when the
+    // assigned folio demands it.
+    L.push(
+      "\\renewcommand\\cleardoublepage{\\clearpage\\directlua{tdom_event('cleardouble','','')}}"
+    );
     // \cite: record dependencies on bibliography keys
     L.push('\\let\\TDOMcite\\cite');
     L.push("\\renewcommand\\cite[2][]{\\directlua{tdom_cites('\\luaescapestring{#2}')}" +
@@ -471,6 +521,7 @@ export class CheckpointEngine {
     // keeps it \relax — the page builder needs to know which world it's in
     L.push('\\ifx\\@textbottom\\relax\\directlua{tdom_num(\'raggedbottom\',0)}' +
       '\\else\\directlua{tdom_num(\'raggedbottom\',1)}\\fi');
+    L.push("\\if@twoside\\directlua{tdom_num('twoside',1)}\\else\\directlua{tdom_num('twoside',0)}\\fi");
     // the class's real \footnoterule, measured (kerns+rule items, verbatim)
     L.push('\\setbox0=\\vbox{\\hsize=\\textwidth\\footnoterule}');
     L.push('\\directlua{tdom_footrule(0)}');
@@ -940,7 +991,7 @@ export class CheckpointEngine {
   #adoptGalley(block, galley) {
     block.galley = galley;
     block.galleyHash = fnv1a(
-      JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d])
+      JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events])
     );
     if (galley.tdomIsoChunks) {
       // rescued block: the isolated run's print-identical pixels are the
@@ -1008,7 +1059,19 @@ export class CheckpointEngine {
 
   // ------------------------------------------------------------- update
 
-  async #update({ editLabel, retry = false }) {
+  async #update(args) {
+    // serialize async header-job arrivals against updates: an hf apply
+    // between an update's prevHashes capture and its patch computation
+    // would mark unrelated pages dirty
+    this.updating = true;
+    try {
+      return await this.#updateInner(args);
+    } finally {
+      this.updating = false;
+    }
+  }
+
+  async #updateInner({ editLabel, retry = false }) {
     const t = new Timer();
     const text = this.store.get(this.file);
     const diagnostics = [];
@@ -1215,7 +1278,7 @@ export class CheckpointEngine {
     const patches = [];
     const dirtyPages = [];
     for (const page of pages) {
-      if (!page.dl) page.dl = this.#displayList(page);
+      if (!page.dl || page.dl.hfSig !== this.hfSig) page.dl = this.#displayList(page);
       if (page.dl.hash !== prevHashes.get(page.number)) {
         dirtyPages.push(page.number);
         patches.push({ type: 'replace-page', page: page.number, displayList: page.dl });
@@ -1223,6 +1286,7 @@ export class CheckpointEngine {
     }
     if (pages.length < prevCount) patches.push({ type: 'remove-pages', from: pages.length + 1 });
     this.pages = pages;
+    this.#scheduleHeaders();
     t.lap('paginate');
 
     // ---- async work: rebuild remaining checkpoint chain + gfx renders --
@@ -1490,7 +1554,7 @@ export class CheckpointEngine {
     const prevHashes = new Map(this.pages.map((p) => [p.number, p.dl?.hash]));
     const patches = [];
     for (const page of pages) {
-      if (!page.dl) page.dl = this.#displayList(page);
+      if (!page.dl || page.dl.hfSig !== this.hfSig) page.dl = this.#displayList(page);
       if (page.dl.hash !== prevHashes.get(page.number)) {
         patches.push({ type: 'replace-page', page: page.number, displayList: page.dl });
       }
@@ -1541,6 +1605,11 @@ export class CheckpointEngine {
    * substitutes only the page number, which it owns (it builds the pages).
    */
   #computeToc(pages) {
+    // toc entries print the FOLIO (roman front matter, arabic body...), not
+    // the physical page index — take it from the page specs, formatted with
+    // the kernel's \@arabic/\@roman/... transcriptions
+    const specs = this.#pageSpecs(pages);
+    const folioText = new Map(specs.map((s) => [s.page, formatFolio(s.folio, s.fmt)]));
     const blockPage = new Map();
     for (const page of pages) {
       for (const d of page.draw ?? []) {
@@ -1564,7 +1633,7 @@ export class CheckpointEngine {
           blockPage.get(block.id) ??
           1;
         // 4th (destination) argument required by LaTeX 2020-10 and later
-        files[ext].push(`\\contentsline {${tl.l}}{${tl.t}}{${page}}{}%`);
+        files[ext].push(`\\contentsline {${tl.l}}{${tl.t}}{${folioText.get(page) ?? page}}{}%`);
       }
     }
     const contents = {};
@@ -1572,6 +1641,135 @@ export class CheckpointEngine {
       contents[ext] = lines.join('\n') + '\n';
     }
     return { hash: fnv1a(JSON.stringify(contents)), contents };
+  }
+
+  // ------------------------------------------------- page-style layer
+  //
+  // Headers, footers and folios are TeX-typeset, never invented: the daemon
+  // captures \pagestyle/\thispagestyle/\pagenumbering/\markboth/\markright
+  // as block-anchored events; after pagination the orchestrator reconstructs
+  // each page's exact state (folio value + format, style, marks) and a
+  // header job typesets the real \@oddhead/\@oddfoot boxes for every page.
+
+  #pageSpecs(pages) {
+    // events ride the node stream as markers, so each page's event list
+    // (page.evs) is exact even when one block spans several pages
+    const blockById = new Map(this.blocks.map((b) => [b.id, b]));
+    const specs = [];
+    let style = this.initialStyle;
+    let fmt = 'arabic';
+    let folio = 1;
+    let lmark = '';
+    let rmark = '';
+    for (const page of pages) {
+      let thisstyle = null;
+      // TeX mark semantics: \leftmark = botmark's left (LAST mark on the
+      // page), \rightmark = firstmark's right (FIRST mark on the page, or
+      // the carried value when the page has no marks)
+      const rmarkAtStart = rmark;
+      let firstRight = null;
+      for (const ref of page.evs ?? []) {
+        // synthetic events (blank verso pages) carry their payload inline
+        const ev = ref.bid ? blockById.get(ref.bid)?.galley?.events?.[ref.i] : ref;
+        if (!ev) continue;
+        if (ev.k === 'style') style = ev.a;
+        else if (ev.k === 'thisstyle') thisstyle = ev.a;
+        else if (ev.k === 'pagenum') {
+          fmt = ev.a;
+          folio = 1; // \pagenumbering resets the page counter (kernel behavior)
+        } else if (ev.k === 'mark') {
+          lmark = ev.a;
+          if (firstRight === null) firstRight = ev.b;
+          rmark = ev.b;
+        } else if (ev.k === 'markr') {
+          if (firstRight === null) firstRight = ev.a;
+          rmark = ev.a;
+        }
+      }
+      specs.push({
+        page: page.number,
+        // the page builder owns folio assignment (it inserts blank versos
+        // and applies \pagenumbering resets in stream order)
+        folio: page.folio ?? folio,
+        fmt,
+        style: thisstyle ?? style,
+        lmark,
+        rmark: firstRight ?? rmarkAtStart,
+      });
+      folio = (page.folio ?? folio) + 1;
+    }
+    return specs;
+  }
+
+  #hfJobBody(specs) {
+    const L = ['\\makeatletter'];
+    for (const s of specs) {
+      L.push(`\\global\\c@page=${s.folio}`);
+      L.push(`\\gdef\\thepage{\\csname @${s.fmt}\\endcsname\\c@page}`);
+      L.push(`\\def\\leftmark{${s.lmark}}`);
+      L.push(`\\def\\rightmark{${s.rmark}}`);
+      // reset then apply the page style (an unknown style leaves all empty)
+      L.push('\\def\\@oddhead{}\\def\\@evenhead{}\\def\\@oddfoot{}\\def\\@evenfoot{}');
+      L.push(`\\csname ps@${s.style}\\endcsname`);
+      L.push('\\let\\TDOMhd\\@oddhead\\let\\TDOMft\\@oddfoot');
+      L.push('\\if@twoside\\ifodd\\c@page\\else\\let\\TDOMhd\\@evenhead\\let\\TDOMft\\@evenfoot\\fi\\fi');
+      L.push(
+        `\\setbox\\z@\\vbox{\\hsize\\textwidth\\hb@xt@\\textwidth{\\normalcolor\\TDOMhd}}` +
+          `\\directlua{tdom_hf_box(0, ${s.page}, 'h')}`
+      );
+      L.push(
+        `\\setbox\\z@\\vbox{\\hsize\\textwidth\\hb@xt@\\textwidth{\\normalcolor\\TDOMft}}` +
+          `\\directlua{tdom_hf_box(0, ${s.page}, 'f')}`
+      );
+    }
+    L.push('\\directlua{tdom_hf_flush()}');
+    return L.join('\n');
+  }
+
+  #scheduleHeaders() {
+    const pages = this.pages;
+    if (!pages?.length) return;
+    const specs = this.#pageSpecs(pages);
+    const sig = fnv1a(JSON.stringify(specs));
+    if (sig === this.hfSig || sig === this.hfPending) return;
+    const ck = this.checkpoints.get(0);
+    if (!ck) return;
+    this.hfPending = sig;
+    this.hfTask = (async () => {
+      const body = Buffer.from(this.#hfJobBody(specs), 'utf8');
+      const done = this.#await('galley:__hf', 60_000);
+      done.catch(() => {});
+      ck.send(`RENDER __hf ${this.workDir} ${body.length}\n`);
+      ck.sendRaw(body);
+      const payload = await done;
+      for (const [fid, meta] of Object.entries(payload.fonts ?? {})) {
+        this.#registerFont(Number(fid), meta);
+      }
+      const map = new Map();
+      for (const [pageStr, entry] of Object.entries(payload.hf ?? {})) {
+        map.set(Number(pageStr.replace(/^p/, '')), entry);
+      }
+      // apply only between updates — never mid-#update (see this.updating)
+      await new Promise((resolve) => {
+        const apply = () => {
+          if (this.updating) {
+            setTimeout(apply, 10);
+            return;
+          }
+          this.hf = map;
+          this.hfSig = sig;
+          this.#asyncRepaginate();
+          resolve();
+        };
+        apply();
+      });
+    })()
+      .catch((err) => {
+        this.diagnostics.push('header job failed: ' + err.message);
+      })
+      .finally(() => {
+        if (this.hfPending === sig) this.hfPending = null;
+      });
   }
 
   #expandIncludes(segs, depth) {
@@ -1664,62 +1862,95 @@ export class CheckpointEngine {
         continue;
       }
       flushGfx();
-      for (const r of u.ln.runs ?? []) {
-        if (r.rule) {
-          commands.push({
-            op: 'rule',
-            x: r2(L + r.x),
-            y: r2(baseline + r.dy),
-            w: r2(r.w),
-            h: r2(r.h),
-            color: r.c && r.c !== '#000000' ? r.c : undefined,
-            src: u.blockId,
-          });
-        } else if (r.t) {
-          const fmeta = this.fonts.get(r.f);
-          const text = fmeta?.remap ? remapText(r.t, fmeta.remap) : r.t;
-          // cmex (OMX) glyphs hang below their reference point in TeX's
-          // metrics; the unicode twins sit on a normal baseline. Align the
-          // ink tops exactly: TeX extents travel with the run, twin extents
-          // were measured by the daemon from the actual twin font.
-          let dy = r.dy;
-          if (fmeta?.omx) {
-            const gh = r.gh ?? 0;
-            const gd = r.gd ?? 0;
-            const cp = text.codePointAt(0);
-            const tm = this.twinMetrics?.[cp];
-            if (tm) {
-              dy = r.dy - gh + tm[0] * (r.s / 10);
-            } else {
-              dy = r.dy - gh + 0.78 * (gh + gd);
-            }
-          }
-          commands.push({
-            op: 'glyphs',
-            fam: fmeta?.family ?? 'f-unknown',
-            size: r.s,
-            x: r2(L + r.x),
-            y: r2(baseline + dy),
-            text,
-            color: r.c && r.c !== '#000000' ? r.c : undefined,
-            src: u.blockId,
-          });
-        }
-      }
+      this.#runCommands(commands, u.ln.runs, L, baseline, u.blockId);
     }
     flushGfx();
-    // page style plain: \@thefoot = \hfil\thepage\hfil in an \hbox appended
-    // with \baselineskip=\footskip — the folio baseline lands exactly
-    // \footskip below the text area (see \@outputpage)
-    commands.push({
-      op: 'folio',
-      x: r2(L + geo.textwidth / 2),
-      y: r2(T + geo.textheight + (geo.footskip ?? 30)),
-      text: String(page.number),
-    });
+    // Header / footer: TeX-typeset boxes from the page-style job (the exact
+    // \@oddhead/\@oddfoot with the page's real folio format, style and
+    // marks). \@outputpage geometry: head box bottom at topmargin+headheight,
+    // foot baseline \footskip below the text area.
+    const hfEntry = this.hf?.get(page.number);
+    if (hfEntry) {
+      this.#paintHfItems(commands, hfEntry.h, L, 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0));
+      this.#paintHfItems(commands, hfEntry.f, L, T + geo.textheight + (geo.footskip ?? 30));
+    } else {
+      // header job hasn't landed yet: provisional plain folio (replaced by
+      // the TeX-typeset footer as soon as the async job reports)
+      commands.push({
+        op: 'folio',
+        x: r2(L + geo.textwidth / 2),
+        y: r2(T + geo.textheight + (geo.footskip ?? 30)),
+        text: String(page.number),
+      });
+    }
     const dl = { page: page.number, commands };
     dl.hash = fnv1a(JSON.stringify(commands));
+    dl.hfSig = this.hfSig; // display lists built pre-header-job get rebuilt
     return dl;
+  }
+
+  /** Paint one run list (glyphs + rules) at a baseline — shared by body
+   * units and the TeX-typeset header/footer boxes. */
+  #runCommands(commands, runs, X, baseline, src) {
+    for (const r of runs ?? []) {
+      if (r.rule) {
+        commands.push({
+          op: 'rule',
+          x: r2(X + r.x),
+          y: r2(baseline + r.dy),
+          w: r2(r.w),
+          h: r2(r.h),
+          color: r.c && r.c !== '#000000' ? r.c : undefined,
+          src,
+        });
+      } else if (r.t) {
+        const fmeta = this.fonts.get(r.f);
+        const text = fmeta?.remap ? remapText(r.t, fmeta.remap) : r.t;
+        // cmex (OMX) glyphs hang below their reference point in TeX's
+        // metrics; the unicode twins sit on a normal baseline. Align the
+        // ink tops exactly: TeX extents travel with the run, twin extents
+        // were measured by the daemon from the actual twin font.
+        let dy = r.dy;
+        if (fmeta?.omx) {
+          const gh = r.gh ?? 0;
+          const gd = r.gd ?? 0;
+          const cp = text.codePointAt(0);
+          const tm = this.twinMetrics?.[cp];
+          if (tm) {
+            dy = r.dy - gh + tm[0] * (r.s / 10);
+          } else {
+            dy = r.dy - gh + 0.78 * (gh + gd);
+          }
+        }
+        commands.push({
+          op: 'glyphs',
+          fam: fmeta?.family ?? 'f-unknown',
+          size: r.s,
+          x: r2(X + r.x),
+          y: r2(baseline + dy),
+          text,
+          color: r.c && r.c !== '#000000' ? r.c : undefined,
+          src,
+        });
+      }
+    }
+  }
+
+  /** Paint a harvested header/footer box (vbox-wrapped hbox items) with its
+   * first line's baseline at anchorY. */
+  #paintHfItems(commands, items, X, anchorY) {
+    let y = anchorY;
+    let first = true;
+    for (const it of items ?? []) {
+      if (it.k === 'glue' || it.k === 'kern') {
+        y += it.a ?? 0;
+      } else if (it.k === 'box') {
+        if (!first) y += it.h ?? 0;
+        this.#runCommands(commands, it.runs, X, y, '_hf');
+        y += it.d ?? 0;
+        first = false;
+      }
+    }
   }
 }
 
@@ -1866,6 +2097,13 @@ function buildStream(block, hasChunk, chunks) {
       if (f) stream.push({ t: 'fm', f, vmode: true });
     } else if (it.k === 'eject') {
       stream.push({ t: 'eject', v: it.v ?? -10000 });
+    } else if (it.k === 'ev') {
+      // page-style event marker: invisible, but its page decides when the
+      // event (pagenumbering/style/marks) takes effect. The payload kind
+      // rides along so the page builder can act on folio-coupled events
+      // (\pagenumbering resets, \cleardoublepage blank pages).
+      const ev = block.galley?.events?.[it.n ?? 0];
+      stream.push({ t: 'ev', bid: block.id, i: it.n ?? 0, k: ev?.k, a: ev?.a });
     } else if (it.k === 'box') {
       const unit = {
         blockId: block.id,
@@ -1926,6 +2164,28 @@ function miniUnits(items, blockId, chunkRef) {
 }
 
 /** Extract a balanced {...} group's contents starting at an opening brace. */
+/** Kernel \@arabic/\@roman/\@Roman/\@alph/\@Alph transcriptions. */
+function formatFolio(n, fmt) {
+  if (fmt === 'roman' || fmt === 'Roman') {
+    const table = [
+      [1000, 'm'], [900, 'cm'], [500, 'd'], [400, 'cd'], [100, 'c'], [90, 'xc'],
+      [50, 'l'], [40, 'xl'], [10, 'x'], [9, 'ix'], [5, 'v'], [4, 'iv'], [1, 'i'],
+    ];
+    let v = n;
+    let out = '';
+    for (const [val, sym] of table) {
+      while (v >= val) {
+        out += sym;
+        v -= val;
+      }
+    }
+    return fmt === 'Roman' ? out.toUpperCase() : out;
+  }
+  if (fmt === 'alph') return String.fromCharCode(96 + n);
+  if (fmt === 'Alph') return String.fromCharCode(64 + n);
+  return String(n);
+}
+
 function extractBraced(text, open) {
   if (open < 0 || text[open] !== '{') return '';
   let depth = 1;

@@ -51,6 +51,7 @@ console.log(`applied ${steps.filter(Boolean).length}/${steps.length} edits`);
 
 await engine.bgTask.catch(() => {});
 await (engine.renderTask ?? Promise.resolve()).catch(() => {});
+await (engine.hfTask ?? Promise.resolve()).catch(() => {});
 
 // truth: fresh 2-pass compile of the FINAL source
 const dir = path.join(scratch, 'truth');

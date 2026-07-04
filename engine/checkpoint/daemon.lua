@@ -34,6 +34,7 @@ local blk_labels = {}
 local blk_refs = {}
 local blk_counters = {}
 local blk_toclines = {}
+local blk_events = {}
 local blk_gfx = false
 local blk_floats = {}
 local pending_fmarks = {}
@@ -176,6 +177,27 @@ end
 function tdom_tocline(ext, level, text)
   blk_toclines[#blk_toclines + 1] = { e = ext, l = level, t = text }
 end
+
+-- Page-style layer events (\pagestyle/\thispagestyle/\pagenumbering/marks):
+-- captured per block AND marked in the node stream at the exact point they
+-- occur, so the page builder knows which page each event lands on even when
+-- one block spans several pages. The header/footer boxes themselves are
+-- typeset by TeX (tdom_hf_*) — nothing is invented.
+function tdom_event(kind, a, b)
+  blk_events[#blk_events + 1] = { k = kind, a = a, b = b }
+  local ok, err = pcall(function()
+    local m = node.new('whatsit', node.subtype('special'))
+    m.data = 'tdom:ev:' .. (#blk_events - 1)
+    node.write(m)
+  end)
+  if os.getenv('TDOM_TRACE_EV') then
+    texio.write_nl('term and log', 'TDOMEV ' .. kind .. ' idx=' .. (#blk_events - 1) ..
+      ' mode=' .. tostring(tex.nest[tex.nest.ptr].mode) .. ' nestptr=' .. tostring(tex.nest.ptr) ..
+      ' ok=' .. tostring(ok) .. ' err=' .. tostring(err))
+  end
+end
+
+
 
 function tdom_counter(name, value)
   blk_counters[name] = tonumber(value) or 0
@@ -561,6 +583,12 @@ local function extract_items(head, parentBox)
       elseif SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data and n.data:match('^tdom:eject') then
         local pen = tonumber(n.data:match('^tdom:eject:(-?%d+)')) or -10000
         items[#items + 1] = { k = 'eject', v = pen }
+      elseif SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data and n.data:match('^tdom:ev:') then
+        -- page-style event marker: travels in the stream so the page
+        -- builder knows EXACTLY which page the event lands on (a single
+        -- block can span pages with \pagenumbering changes in between)
+        local ei = tonumber(n.data:match('^tdom:ev:(%d+)')) or 0
+        items[#items + 1] = { k = 'ev', n = ei }
       elseif LIT_SUB and n.subtype == LIT_SUB then
         blk_gfx = true
       end
@@ -749,6 +777,42 @@ local function encode_runs(items)
   end
 end
 
+-- Header/footer harvest for the page-style job: the orchestrator sets the
+-- page's exact state (folio, \thepage format, style, marks), typesets the
+-- head/foot boxes, and we extract their glyph runs like any other galley.
+local hf_pages = {}
+function tdom_hf_box(boxnum, page, which)
+  local box = tex.box[boxnum]
+  if not box then return end
+  colstack = {}
+  local saved_marks = pending_fmarks
+  pending_fmarks = {}
+  local items = extract_items(box.list, box)
+  pending_fmarks = saved_marks
+  -- string key: consecutive integer keys would json-encode as an array
+  local key = 'p' .. page
+  hf_pages[key] = hf_pages[key] or {}
+  hf_pages[key][which] = items
+end
+
+function tdom_hf_flush()
+  for _, page in pairs(hf_pages) do
+    if page.h then encode_runs(page.h) end
+    if page.f then encode_runs(page.f) end
+  end
+  local fonts = {}
+  for fid, f in pairs(seen_fonts) do
+    if not f.sent then
+      fonts[tostring(fid)] = { file = f.file, name = f.name, size = f.size, fmt = f.fmt }
+      f.sent = true
+    end
+  end
+  local payload = jenc({ block = '__hf', hf = hf_pages, fonts = fonts })
+  conn:send('GALLEY __hf ' .. #payload .. '\n')
+  conn:send(payload)
+  fk._exit(0)
+end
+
 function tdom_report()
   -- cross-block layout state: the next block's leading interline glue and
   -- \@afterheading behavior depend on these — they join the state vector so
@@ -790,6 +854,7 @@ function tdom_report()
     refs = blk_refs,
     state = blk_counters,
     toclines = blk_toclines,
+    events = blk_events,
   })
   if head then node.flush_list(head) end
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
@@ -897,6 +962,7 @@ function tdom_wait()
         blk_refs = {}
         blk_counters = {}
         blk_toclines = {}
+        blk_events = {}
         blk_gfx = false
         blk_floats = {}
         pending_fmarks = {}

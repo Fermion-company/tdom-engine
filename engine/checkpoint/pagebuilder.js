@@ -94,6 +94,9 @@ class PageBuilder {
     this.parskip = glueOf({ w: geo.parskip ?? 0, st: 1, sto: 0 }); // stream carries real parskip; only used for \vskip-\parskip after vmode h-floats
     this.interlinepenalty = geo.interlinepenalty ?? 0;
     this.raggedbottom = (geo.raggedbottom ?? 1) === 1;
+    this.twoside = (geo.twoside ?? 0) === 1;
+    this.folio = 1; // TeX's \c@page: assigned per emitted page, reset by \pagenumbering
+    this.pendingFolio = null;
     this.footruleUnit = footruleUnitFor(geo);
 
     this.#startColumnState();
@@ -119,6 +122,25 @@ class PageBuilder {
   }
 
   // ---- TeX page-builder state --------------------------------------------
+
+  /** \cleardoublepage's blank verso: an empty page with \thispagestyle{empty},
+   * emitted when the next folio would be even (twoside). */
+  #emitBlankPage() {
+    const folio = this.pendingFolio ?? this.folio;
+    this.pendingFolio = null;
+    this.folio = folio + 1;
+    this.pages.push({
+      number: this.pages.length + 1,
+      folio,
+      draw: [],
+      identity: ['__blank' + (this.pages.length + 1)],
+      startUnit: null,
+      feet: [],
+      topFloats: [],
+      botFloats: [],
+      evs: [{ k: 'thisstyle', a: 'empty' }],
+    });
+  }
 
   #resetPage() {
     this.contents = []; // placed entries: {e (stream entry), …}
@@ -182,6 +204,23 @@ class PageBuilder {
         case 'eject':
           this.#handleEject(e);
           break;
+        case 'ev':
+          // page-style event marker: rides the stream so its PAGE is exact,
+          // but is transparent to spacing and break legality (the marker
+          // whatsit exists only in the engine's stream, not in a vanilla
+          // run — it must not change any break decision)
+          if (e.k === 'pagenum') this.pendingFolio = 1;
+          if (e.k === 'cleardouble') {
+            // transcription of the classes' \cleardoublepage tail: when the
+            // NEXT page would get an even folio, ship a blank verso with
+            // \thispagestyle{empty} — the page builder owns folios, so the
+            // \ifodd\c@page the class would have evaluated is decided here
+            const nextFolio = this.pendingFolio ?? this.folio ?? 1;
+            if (nextFolio % 2 === 0 && this.twoside) this.#emitBlankPage();
+            break; // the marker itself never lands on a page
+          }
+          this.contents.push({ e });
+          break;
         default:
           break;
       }
@@ -235,7 +274,10 @@ class PageBuilder {
 
   #contributeGlue(e) {
     if (!this.hasBox) return; // discardables above the first box are dropped
-    const prev = this.contents[this.contents.length - 1];
+    // ev markers are transparent: look through them for the legality check
+    let pi = this.contents.length - 1;
+    while (pi >= 0 && this.contents[pi].e.t === 'ev') pi--;
+    const prev = this.contents[pi];
     const prevNondiscardable =
       prev && (prev.e.t === 'box' || prev.e.t === 'ins' || prev.e.t === 'rule');
     if (prevNondiscardable && this.#evalBreak(this.contents.length, 0, e)) {
@@ -251,8 +293,11 @@ class PageBuilder {
 
   #contributeKern(e) {
     if (!this.hasBox) return;
-    // a kern is a breakpoint when immediately followed by glue
-    const next = this.queue[this.qi];
+    // a kern is a breakpoint when immediately followed by glue (ev markers
+    // are transparent — peek through them)
+    let qn = this.qi;
+    while (this.queue[qn] && this.queue[qn].t === 'ev') qn++;
+    const next = this.queue[qn];
     if (next && next.t === 'glue' && this.#evalBreak(this.contents.length, 0, e)) {
       return;
     }
@@ -285,15 +330,20 @@ class PageBuilder {
       if (this.feet.length) {
         this.#firePage(this.contents.length, null);
       } else {
+        // page-style event markers must survive the discard: they belong to
+        // whatever page comes next (the discarded material is invisible)
+        const evs = this.contents.filter((c) => c.e.t === 'ev');
         this.contents = [];
         this.#resetPage();
+        this.contents.push(...evs);
       }
       while (this.deferlist.length) {
         if (!this.#tryFloatColumn(true)) break;
       }
       return;
     }
-    // \newpage (-10000): forced break at this point
+    // \newpage (-10000): forced break at this point. A boxless page is
+    // suppressed, but its event markers carry over to the next real page.
     if (this.hasBox || this.feet.length || this.toplist.length || this.botlist.length) {
       const fired = this.#evalBreak(this.contents.length, EJECT, null);
       if (!fired) this.#firePage(this.contents.length, null);
@@ -579,6 +629,7 @@ class PageBuilder {
     this.pageFeet = feet;
     this.pageTop = toplist.slice();
     this.pageBot = botlist.slice();
+    this.pageEvs = placed.filter((c) => c.e.t === 'ev').map((c) => ({ bid: c.e.bid, i: c.e.i }));
 
     // -- top floats (\@cflt): [box + floatsep]… -floatsep + textfloatsep
     for (let i = 0; i < toplist.length; i++) {
@@ -733,18 +784,24 @@ class PageBuilder {
         y += el.height;
       }
     }
+    const folio = this.pendingFolio ?? this.folio;
+    this.pendingFolio = null;
+    this.folio = folio + 1;
     const page = {
       number: this.pages.length + 1,
+      folio,
       draw,
       identity,
       startUnit: identity[0] ?? null,
       feet: this.pageFeet ?? [],
       topFloats: this.pageTop ?? [],
       botFloats: this.pageBot ?? [],
+      evs: this.pageEvs ?? [],
     };
     this.pageFeet = null;
     this.pageTop = null;
     this.pageBot = null;
+    this.pageEvs = null;
     this.pages.push(page);
   }
 }
