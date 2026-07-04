@@ -2141,8 +2141,21 @@ body.engine-only .code-sidebar,
 body.engine-only .code-preview-pane {
   display: none;
 }
+/* The workspace pane's light background (#eef2f7) was for the editor UI panels;
+   engine-only shows only the dark code editor, so drop the light chrome and let
+   the editor fill the pane edge-to-edge (no white frame). */
+body.engine-only #workspace-pane {
+  background: var(--bg);
+  border-right: 0;
+}
+body.engine-only .workspace-panel[data-panel="code"] {
+  padding: 0;
+}
 body.engine-only .code-workbench {
   grid-template-columns: minmax(0, 1fr);
+  margin: 0;
+  min-height: 0;
+  height: 100%;
 }
 /* #editor-pane is display:none, so the grid loses its first item — drop the
    menu track entirely or the remaining panes shift into the wrong columns. */
