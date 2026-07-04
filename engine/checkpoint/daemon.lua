@@ -121,6 +121,17 @@ function tdom_geo()
     lineskip = bp(tex.lineskip.width or 0),
     parskip = bp(tex.parskip.width or 0),
     parindent = bp(tex.parindent or 0),
+    -- full interline specs: the page builder re-runs \box's append_to_vlist
+    -- when it commits an inline float (tex.web §679)
+    lineskiplimit = bp(tex.lineskiplimit or 0),
+    baselineskipst = bp(tex.baselineskip.stretch or 0),
+    baselineskipsto = tex.baselineskip.stretch_order or 0,
+    baselineskipsh = bp(tex.baselineskip.shrink or 0),
+    baselineskipsho = tex.baselineskip.shrink_order or 0,
+    lineskipst = bp(tex.lineskip.stretch or 0),
+    lineskipsto = tex.lineskip.stretch_order or 0,
+    lineskipsh = bp(tex.lineskip.shrink or 0),
+    lineskipsho = tex.lineskip.shrink_order or 0,
   }
   for k, v in pairs(geo_extra) do geo[k] = v end
   local payload = jenc(geo)
@@ -156,18 +167,57 @@ end
 
 -- ---------------------------------------------------------------- shims
 
+-- amsmath's \label@in@display hands \ltx@label the key WITH its braces
+-- ({eq:x}) — strip one surrounding pair or the live \r@… name is wrong
+local function unbrace(s)
+  if s and s:sub(1, 1) == '{' and s:sub(-1) == '}' then return s:sub(2, -2) end
+  return s
+end
+
 function tdom_label(key, value)
-  blk_labels[#blk_labels + 1] = { k = key, v = value }
+  key = unbrace(key)
+  local entry = { k = key, v = value }
   -- Define the label LIVE in this process lineage: \label only writes to the
   -- aux (which a resident engine never re-reads), so \r@<key> must be set
-  -- here for in-chain \ref resolution to track edits.
+  -- here for in-chain \ref resolution to track edits. Under hyperref the
+  -- \r@… body carries FIVE groups ({label}{page}{name}{anchor}{ext}) and
+  -- hyperref's \@setref/\hyperref parse exactly that — a two-group body
+  -- makes them grab stray tokens and typeset garbage.
   pcall(function()
-    token.set_macro('r@' .. key, '{' .. value .. '}{1}', 'global')
+    local href = token.get_macro('@currentHref')
+    local body
+    if href ~= nil then
+      entry.h = href
+      body = '{' .. value .. '}{1}{}{' .. href .. '}{}'
+    else
+      body = '{' .. value .. '}{1}'
+    end
+    token.set_macro('r@' .. key, body, 'global')
   end)
+  blk_labels[#blk_labels + 1] = entry
 end
 
 function tdom_ref(key)
   blk_refs[#blk_refs + 1] = key
+end
+
+-- cleveref: \cref resolves through r@<key>@cref (the second aux macro the
+-- package writes next to every \newlabel). Capture its value at \label time
+-- and define it LIVE, exactly like the plain form — the [1][1][]1 page field
+-- is the placeholder cleveref's parser expects (pages are the orchestrator's).
+function tdom_label_cref(key, value)
+  key = unbrace(key)
+  blk_labels[#blk_labels + 1] = { k = key .. '@cref', v = value }
+  pcall(function()
+    token.set_macro('r@' .. key .. '@cref', '{' .. value .. '}{[1][1][]1}', 'global')
+  end)
+end
+
+-- \cref{a,b,...}: one dependency per key, under the @cref name it reads
+function tdom_ref_cref(keys)
+  for k in string.gmatch(keys or '', '[^,%s]+') do
+    blk_refs[#blk_refs + 1] = k .. '@cref'
+  end
 end
 
 -- Table-of-contents lines are TeX's own: the driver shims \addcontentsline

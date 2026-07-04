@@ -5,3 +5,4 @@
 .ai-previews/
 node_modules/
 recovered-document.tex
+.cache/

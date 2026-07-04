@@ -73,6 +73,7 @@ export class CheckpointEngine {
     this.counters = [...BASE_COUNTERS];
     this.preHash = null;
     this.labelTable = new Map(); // key -> value (for reboot injection)
+    this.hrefTable = new Map(); // key -> hyperref anchor (\@currentHref at \label)
     this.fonts = new Map(); // fid -> {file,name,size,fmt, family, remap}
     this.fontFiles = new Map(); // familyKey -> absolute path
     this.pages = [];
@@ -102,6 +103,7 @@ export class CheckpointEngine {
     this.store.open(file, text);
     this.blocks = [];
     this.labelTable = new Map();
+    this.hrefTable = new Map();
     this.pages = [];
     return this.#update({ editLabel: 'open' });
   }
@@ -404,19 +406,39 @@ export class CheckpointEngine {
         .map((c) => `'${c}'`)
         .join(',')}})}`
     );
-    // label / ref recording shims (typesetting behavior unchanged)
+    // label / ref recording shims (typesetting behavior unchanged).
+    // cleveref resolves \cref through a SECOND aux macro (r@<key>@cref,
+    // written next to every \newlabel) — capture its value at \label time
+    // exactly like the plain one, or a resident run prints ?? forever.
+    const crefCapture =
+      '\\ifcsname cref@currentlabel\\endcsname' +
+      "\\directlua{tdom_label_cref('\\luaescapestring{#1}'," +
+      "'\\luaescapestring{\\detokenize\\expandafter{\\cref@currentlabel}}')}\\fi";
     L.push('\\let\\TDOMlabel\\label');
-    L.push("\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}}");
+    L.push(
+      "\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}" +
+        crefCapture + '}'
+    );
     // amsmath routes display-math labels through \ltx@label (captured at
     // package load, before our shim) — intercept that path too
     L.push('\\ifdefined\\ltx@label\\let\\TDOMltxlabel\\ltx@label');
-    L.push("\\def\\ltx@label#1{\\TDOMltxlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}}\\fi");
+    L.push(
+      "\\def\\ltx@label#1{\\TDOMltxlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}" +
+        crefCapture + '}\\fi'
+    );
     L.push('\\let\\TDOMref\\ref');
     L.push("\\renewcommand\\ref[1]{\\directlua{tdom_ref('\\luaescapestring{#1}')}\\TDOMref{#1}}");
     L.push('\\let\\TDOMpageref\\pageref');
     L.push("\\renewcommand\\pageref[1]{\\directlua{tdom_ref('\\luaescapestring{#1}')}\\TDOMpageref{#1}}");
     L.push('\\ifdefined\\eqref\\let\\TDOMeqref\\eqref');
     L.push("\\renewcommand\\eqref[1]{\\directlua{tdom_ref('\\luaescapestring{#1}')}\\TDOMeqref{#1}}\\fi");
+    // \cref/\Cref read r@<key>@cref — record the dependency under that key
+    // so label movements retypeset the referencing block (comma lists split
+    // Lua-side); resolution itself stays cleveref's
+    L.push('\\ifdefined\\cref\\let\\TDOMcref\\cref');
+    L.push("\\renewcommand\\cref[1]{\\directlua{tdom_ref_cref('\\luaescapestring{#1}')}\\TDOMcref{#1}}\\fi");
+    L.push('\\ifdefined\\Cref\\let\\TDOMCref\\Cref');
+    L.push("\\renewcommand\\Cref[1]{\\directlua{tdom_ref_cref('\\luaescapestring{#1}')}\\TDOMCref{#1}}\\fi");
     // toc/lof/lot entries are TeX's own: capture what \addcontentsline
     // would write, expanded exactly like \protected@write expands it (the
     // class's real \numberline{\thechapter.\thesection} formatting) — the
@@ -506,11 +528,20 @@ export class CheckpointEngine {
     L.push('\\newbox\\TDOMfloatbox');
     L.push('\\directlua{TDOM_FLOATBOX=\\number\\TDOMfloatbox}');
     L.push('\\newcount\\TDOMfloatn');
+    L.push('\\def\\TDOMHplacement{H}');
     for (const env of ['figure', 'table']) {
+      // float.sty's [H] is NOT a float: \float@endH typesets the box inline
+      // (\vskip\intextsep \box \vskip\intextsep) so it participates in page
+      // breaking like any paragraph. Hand [H] back to the untouched original
+      // environment — \@float@HH re-\lets \end<env> inside the group, so the
+      // capture end-code below never runs for it.
+      L.push(`\\expandafter\\let\\csname TDOMorig${env}\\expandafter\\endcsname\\csname ${env}\\endcsname`);
       L.push(
         `\\renewenvironment{${env}}[1][\\csname fps@${env}\\endcsname]` +
-          `{\\gdef\\TDOMfp{#1}\\def\\@captype{${env}}\\ifhmode\\@bsphack\\fi` +
-          '\\global\\setbox\\TDOMfloatbox\\vbox\\bgroup\\hsize\\columnwidth\\@parboxrestore\\@floatboxreset}' +
+          `{\\gdef\\TDOMfp{#1}\\ifx\\TDOMfp\\TDOMHplacement` +
+          `\\csname TDOMorig${env}\\endcsname[H]` +
+          `\\else\\def\\@captype{${env}}\\ifhmode\\@bsphack\\fi` +
+          '\\global\\setbox\\TDOMfloatbox\\vbox\\bgroup\\hsize\\columnwidth\\@parboxrestore\\@floatboxreset\\fi}' +
           `{\\par\\vskip\\z@skip\\egroup\\global\\advance\\TDOMfloatn\\@ne` +
           `\\special{tdomfloat:\\number\\TDOMfloatn}` +
           `\\directlua{tdom_float(\\number\\TDOMfloatn,'\\TDOMfp','${env}')}` +
@@ -554,6 +585,9 @@ export class CheckpointEngine {
     L.push('\\ifx\\@textbottom\\relax\\directlua{tdom_num(\'raggedbottom\',0)}' +
       '\\else\\directlua{tdom_num(\'raggedbottom\',1)}\\fi');
     L.push("\\if@twoside\\directlua{tdom_num('twoside',1)}\\else\\directlua{tdom_num('twoside',0)}\\fi");
+    // hyperref changes the \r@… label format to five groups — the injection
+    // sites must know which world they write for
+    L.push("\\ifcsname Hy@Warning\\endcsname\\directlua{tdom_num('hyperref',1)}\\else\\directlua{tdom_num('hyperref',0)}\\fi");
     // the class's real \footnoterule, measured (kerns+rule items, verbatim)
     L.push('\\setbox0=\\vbox{\\hsize=\\textwidth\\footnoterule}');
     L.push('\\directlua{tdom_footrule(0)}');
@@ -563,7 +597,7 @@ export class CheckpointEngine {
       if (key.startsWith('cite:')) {
         L.push(`\\global\\@namedef{b@${key.slice(5)}}{${val}}`);
       } else {
-        L.push(`\\global\\@namedef{r@${key}}{{${val}}{1}}`);
+        L.push(`\\global\\@namedef{r@${key}}${labelDefBody(key, val, this.geometry?.hyperref === 1, this.hrefTable?.get(key))}`);
       }
     }
     // font warmup: load the common face set into checkpoint 0
@@ -629,7 +663,7 @@ export class CheckpointEngine {
         } else if (key.startsWith('cite:')) {
           defs.push(`\\global\\@namedef{${cs}}{${val}}`);
         } else {
-          defs.push(`\\global\\@namedef{${cs}}{{${val}}{1}}`);
+          defs.push(`\\global\\@namedef{${cs}}${labelDefBody(key, val, this.geometry?.hyperref === 1, this.hrefTable?.get(key))}`);
         }
       }
       const prelude = defs.length
@@ -714,8 +748,15 @@ export class CheckpointEngine {
    */
   async #rescueBlock(idx, why) {
     const block = this.blocks[idx];
+    // the key carries the CURRENT values of every label the block referenced
+    // in its last compile: when a referenced label moves, the key misses and
+    // the block re-rescues with fresh seeds (first compile has no refs yet —
+    // the backward-reference pass supplies the second look)
+    const refVals = (block.galley?.refs ?? []).map(
+      (k) => k + '=' + (this.labelTable.get(k) ?? '')
+    );
     const cacheKey = fnv1a(
-      JSON.stringify([block.text, this.blocks[idx - 1]?.stateVec ?? '', this.preHash])
+      JSON.stringify([block.text, this.blocks[idx - 1]?.stateVec ?? '', this.preHash, refVals])
     );
     let iso = this.isoCache.get(cacheKey);
     if (!iso) {
@@ -733,7 +774,8 @@ export class CheckpointEngine {
       gfx: true,
       state: iso.state,
       labels: iso.labels,
-      refs: [],
+      toclines: iso.toclines,
+      refs: iso.refs ?? [],
       fonts: {},
       tdomIsoChunks: iso.chunks,
     };
@@ -746,7 +788,7 @@ export class CheckpointEngine {
       if (v !== undefined) L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${v}}\\fi`);
     }
     for (const l of iso.labels ?? []) {
-      L.push(`\\global\\@namedef{r@${l.k}}{{${l.v}}{1}}`);
+      L.push(`\\global\\@namedef{r@${l.k}}${labelDefBody(l.k, l.v, this.geometry?.hyperref === 1, l.h)}`);
     }
     L.push(iso.state['tdom@nobreak'] === 1 ? '\\global\\@nobreaktrue' : '\\global\\@nobreakfalse');
     L.push('\\makeatother');
@@ -770,19 +812,61 @@ export class CheckpointEngine {
     L.push('\\makeatletter\\pagestyle{empty}\\hoffset=-1in\\voffset=-1in');
     for (const [key, val] of this.labelTable) {
       if (key.startsWith('cite:')) L.push(`\\global\\@namedef{b@${key.slice(5)}}{${val}}`);
-      else L.push(`\\global\\@namedef{r@${key}}{{${val}}{1}}`);
+      else L.push(`\\global\\@namedef{r@${key}}${labelDefBody(key, val)}`);
     }
     for (const [name, val] of Object.entries(entry)) {
       L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${val}}\\fi`);
     }
-    // capture labels the block defines (value = \@currentlabel at \label)
+    // capture labels the block defines (value = \@currentlabel at \label);
+    // cleveref's r@<key>@cref companion is captured alongside, like the
+    // resident driver does
+    const isoCrefCapture =
+      '\\ifcsname cref@currentlabel\\endcsname' +
+      "\\directlua{tdom_iso_label_cref('\\luaescapestring{#1}'," +
+      "'\\luaescapestring{\\detokenize\\expandafter{\\cref@currentlabel}}')}\\fi";
+    const isoHref = "'\\luaescapestring{\\ifcsname @currentHref\\endcsname\\@currentHref\\fi}'";
     L.push('\\let\\TDOMlabel\\label');
     L.push(
-      "\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}}"
+      "\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}'," + isoHref + ')}' +
+        isoCrefCapture + '}'
     );
     L.push('\\ifdefined\\ltx@label\\let\\TDOMltxlabel\\ltx@label');
     L.push(
-      "\\def\\ltx@label#1{\\TDOMltxlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}}\\fi"
+      "\\def\\ltx@label#1{\\TDOMltxlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}'," + isoHref + ')}' +
+        isoCrefCapture + '}\\fi'
+    );
+    // ref-use recording: a rescued block that references a label must be
+    // re-rescued when that label's value changes (the cache key carries the
+    // referenced values — see #rescueBlock)
+    L.push('\\let\\TDOMref\\ref');
+    L.push("\\renewcommand\\ref[1]{\\directlua{tdom_iso_ref('\\luaescapestring{#1}')}\\TDOMref{#1}}");
+    L.push('\\let\\TDOMpageref\\pageref');
+    L.push("\\renewcommand\\pageref[1]{\\directlua{tdom_iso_ref('\\luaescapestring{#1}')}\\TDOMpageref{#1}}");
+    L.push('\\ifdefined\\eqref\\let\\TDOMeqref\\eqref');
+    L.push("\\renewcommand\\eqref[1]{\\directlua{tdom_iso_ref('\\luaescapestring{#1}')}\\TDOMeqref{#1}}\\fi");
+    L.push('\\ifdefined\\cref\\let\\TDOMcref\\cref');
+    L.push("\\renewcommand\\cref[1]{\\directlua{tdom_iso_ref_cref('\\luaescapestring{#1}')}\\TDOMcref{#1}}\\fi");
+    L.push('\\ifdefined\\Cref\\let\\TDOMCref\\Cref');
+    L.push("\\renewcommand\\Cref[1]{\\directlua{tdom_iso_ref_cref('\\luaescapestring{#1}')}\\TDOMCref{#1}}\\fi");
+    // toc/lof/lot entries born inside the rescued block (longtable captions,
+    // sectioning inside output-hijack envs …) — captured exactly like the
+    // resident driver captures them, or the contents pages miss the entry
+    L.push('\\let\\TDOMaddcontentsline\\addcontentsline');
+    L.push(
+      '\\renewcommand\\addcontentsline[3]{' +
+        '\\directlua{tdom_iso_in_acl=true}\\TDOMaddcontentsline{#1}{#2}{#3}\\directlua{tdom_iso_in_acl=false}' +
+        '{\\let\\label\\@gobble\\let\\index\\@gobble\\let\\glossary\\@gobble' +
+        '\\protected@edef\\TDOM@tocentry{#3}' +
+        "\\directlua{tdom_iso_tocline('\\luaescapestring{#1}','\\luaescapestring{#2}'," +
+        "'\\luaescapestring{\\detokenize\\expandafter{\\TDOM@tocentry}}')}}}"
+    );
+    L.push('\\let\\TDOMaddtocontents\\addtocontents');
+    L.push(
+      '\\renewcommand\\addtocontents[2]{\\TDOMaddtocontents{#1}{#2}' +
+        '{\\let\\label\\@gobble\\let\\index\\@gobble\\let\\glossary\\@gobble' +
+        '\\protected@edef\\TDOM@tocentry{#2}' +
+        "\\directlua{tdom_iso_tocline('\\luaescapestring{#1}','@raw'," +
+        "'\\luaescapestring{\\detokenize\\expandafter{\\TDOM@tocentry}}')}}}"
     );
     L.push('\\makeatother');
     // dormant page over the REAL \vsize: material stays on one galley (the
@@ -792,9 +876,35 @@ export class CheckpointEngine {
     // (comment) and no '#' (macro parameter) may appear in the Lua source.
     L.push(
       '\\directlua{' +
-        'tdom_iso = { labels = {}, counters = {}, fires = 0, ships = 0 } ' +
-        'function tdom_iso_label(k, v) table.insert(tdom_iso.labels, { k, v }) end ' +
+        'tdom_iso = { labels = {}, counters = {}, toclines = {}, refs = {}, ntl = 0, fires = 0, ships = 0 } ' +
+        'tdom_iso_in_acl = false ' +
+        // amsmath hands \ltx@label the key WITH braces — strip one pair
+        'function tdom_iso_unbrace(s) ' +
+        'if s and s:sub(1, 1) == "{" and s:sub(-1) == "}" then return s:sub(2, -2) end ' +
+        'return s end ' +
+        'function tdom_iso_label(k, v, h) table.insert(tdom_iso.labels, { tdom_iso_unbrace(k), v, h }) end ' +
+        'function tdom_iso_label_cref(k, v) table.insert(tdom_iso.labels, { tdom_iso_unbrace(k) .. "@cref", v }) end ' +
         'function tdom_iso_counter(k, v) tdom_iso.counters[k] = tonumber(v) or 0 end ' +
+        'function tdom_iso_ref(k) table.insert(tdom_iso.refs, k) end ' +
+        // comma-list split for \cref keys (inline Lua forbids a literal '%',
+        // so the character class is assembled via string.char)
+        'function tdom_iso_ref_cref(keys) ' +
+        'local P = string.char(37) ' +
+        'for k in string.gmatch(keys or "", "[^," .. P .. "s]+") do ' +
+        'table.insert(tdom_iso.refs, k .. "@cref") end ' +
+        'end ' +
+        // tocline capture mirrors the resident daemon: record the expanded
+        // entry AND drop a stream marker so multi-page rescues anchor each
+        // entry to its true page (inline Lua: no '#'/'%', hence ntl counter)
+        'function tdom_iso_tocline(e, l, t) ' +
+        'if l == "@raw" and tdom_iso_in_acl then return end ' +
+        'table.insert(tdom_iso.toclines, { e, l, t }) ' +
+        'tdom_iso.ntl = tdom_iso.ntl + 1 ' +
+        'pcall(function() ' +
+        'local m = node.new("whatsit", node.subtype("special")) ' +
+        'm.data = "tdom:tl:" .. (tdom_iso.ntl - 1) ' +
+        'node.write(m) end) ' +
+        'end ' +
         'function tdom_iso_absorb() ' +
         'tdom_iso.fires = tdom_iso.fires + 1 ' +
         'if tdom_iso.fires > 50 then tex.box[255] = nil return end ' +
@@ -872,19 +982,28 @@ export class CheckpointEngine {
         'while m do ' +
         'if m.id == HL or m.id == VL then table.insert(items, \'{"k":"box","h":\' .. bp(m.height) .. \',"d":\' .. bp(m.depth) .. \'}\') ' +
         'elseif m.id == GL or m.id == KE then local a = (m.id == GL and m.width or m.kern) or 0 ' +
-        'if a ~= 0 then table.insert(items, \'{"k":"glue","a":\' .. bp(a) .. \'}\') end end ' +
+        'if a ~= 0 then table.insert(items, \'{"k":"glue","a":\' .. bp(a) .. \'}\') end ' +
+        'elseif m.id == WH and m.subtype == SP and m.data and m.data:sub(1, 8) == "tdom:tl:" then ' +
+        'table.insert(items, \'{"k":"tl","n":\' .. (tonumber(m.data:sub(9)) or 0) .. \'}\') end ' +
         'm = m.next end ' +
         // empty remainder (env ended exactly at a page break): ship a
         // zero box so the last PDF page always exists for the node side
         'local b = out and node.vpack(out) or node.new("hlist") ' +
         'local f = io.open("state.json", "w") ' +
         'local labs = {} ' +
-        'for _, kv in ipairs(tdom_iso.labels) do table.insert(labs, "[" .. jq(kv[1]) .. "," .. jq(kv[2]) .. "]") end ' +
+        'for _, kv in ipairs(tdom_iso.labels) do ' +
+        'table.insert(labs, "[" .. jq(kv[1]) .. "," .. jq(kv[2]) .. ((kv[3] and kv[3] ~= "") and ("," .. jq(kv[3])) or "") .. "]") end ' +
+        'local tls = {} ' +
+        'for _, kv in ipairs(tdom_iso.toclines) do table.insert(tls, "[" .. jq(kv[1]) .. "," .. jq(kv[2]) .. "," .. jq(kv[3]) .. "]") end ' +
+        'local rfs = {} ' +
+        'for _, k in ipairs(tdom_iso.refs) do table.insert(rfs, jq(k)) end ' +
         'local cnts = {} ' +
         'for k, v in pairs(tdom_iso.counters) do table.insert(cnts, jq(k) .. ":" .. v) end ' +
         'f:write(\'{"w":\' .. bp(b.width) .. \',"h":\' .. bp(b.height) .. \',"d":\' .. bp(b.depth) .. ' +
         '\',"ships":\' .. tdom_iso.ships .. ' +
-        '\',"labels":[\' .. table.concat(labs, ",") .. \'],"state":{\' .. table.concat(cnts, ",") .. ' +
+        '\',"labels":[\' .. table.concat(labs, ",") .. \'],"toclines":[\' .. table.concat(tls, ",") .. ' +
+        '\'],"refs":[\' .. table.concat(rfs, ",") .. ' +
+        '\'],"state":{\' .. table.concat(cnts, ",") .. ' +
         '\'},"items":[\' .. table.concat(items, ",") .. \']}\') ' +
         'f:close() ' +
         'tex.box[255] = b ' +
@@ -963,7 +1082,9 @@ export class CheckpointEngine {
       h: st.h,
       d: st.d,
       items,
-      labels: (st.labels ?? []).map(([k, v]) => ({ k, v })),
+      labels: (st.labels ?? []).map(([k, v, h]) => (h != null ? { k, v, h } : { k, v })),
+      toclines: (st.toclines ?? []).map(([e, l, t]) => ({ e, l, t })),
+      refs: st.refs ?? [],
       state: st.state ?? {},
       chunks,
     };
@@ -1196,6 +1317,7 @@ export class CheckpointEngine {
           changedLabels.add(l.k);
           this.labelTable.set(l.k, l.v);
         }
+        if (l.h != null) this.hrefTable.set(l.k, l.h);
       }
       const changed = block.galleyHash !== before.hash || block.stateVec !== before.state;
       if (changed || !wasClean) {
@@ -1511,7 +1633,7 @@ export class CheckpointEngine {
       L.push('\\makeatletter\\pagestyle{empty}\\hoffset=-1in\\voffset=-1in');
       for (const [key, val] of this.labelTable) {
         if (key.startsWith('cite:')) L.push(`\\global\\@namedef{b@${key.slice(5)}}{${val}}`);
-        else L.push(`\\global\\@namedef{r@${key}}{{${val}}{1}}`);
+        else L.push(`\\global\\@namedef{r@${key}}${labelDefBody(key, val, this.geometry?.hyperref === 1, this.hrefTable?.get(key))}`);
       }
       for (const [name, val] of Object.entries(entry)) {
         L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${val}}\\fi`);
@@ -1538,11 +1660,17 @@ export class CheckpointEngine {
         "table.insert(lines, BS .. 'directlua{tdom_iso_load_float(' .. i .. ')}') " +
         "table.insert(lines, BS .. 'shipout' .. BS .. 'box255') end " +
         'if lines[1] then tex.print(lines) end end}');
+      L.push('\\def\\TDOMHplacement{H}');
       for (const env of ['figure', 'table']) {
+        // [H] (float.sty) is inline material, not a float — same dispatch
+        // as the resident driver: hand it back to the original environment
+        L.push(`\\expandafter\\let\\csname TDOMorig${env}\\expandafter\\endcsname\\csname ${env}\\endcsname`);
         L.push(
           `\\renewenvironment{${env}}[1][tbp]` +
-            `{\\def\\@captype{${env}}\\ifhmode\\@bsphack\\fi` +
-            '\\global\\setbox\\TDOMisofbox\\vbox\\bgroup\\hsize\\columnwidth\\@parboxrestore\\@floatboxreset}' +
+            `{\\gdef\\TDOMfp{#1}\\ifx\\TDOMfp\\TDOMHplacement` +
+            `\\csname TDOMorig${env}\\endcsname[H]` +
+            `\\else\\def\\@captype{${env}}\\ifhmode\\@bsphack\\fi` +
+            '\\global\\setbox\\TDOMisofbox\\vbox\\bgroup\\hsize\\columnwidth\\@parboxrestore\\@floatboxreset\\fi}' +
             '{\\par\\vskip\\z@skip\\egroup' +
             '\\directlua{tdom_iso_float()}' +
             '\\ifhmode\\@Esphack\\fi}'
@@ -1810,6 +1938,14 @@ export class CheckpointEngine {
 
   #hfJobBody(specs) {
     const L = ['\\makeatletter'];
+    // \pageref{LastPage} in headers/footers: the label lastpage would write
+    // at \enddocument is the LAST page's folio — a value the page builder
+    // owns outright (\pageref prints the second group of \r@LastPage)
+    const last = specs[specs.length - 1];
+    if (last) {
+      const lp = formatFolio(last.folio, last.fmt);
+      L.push(`\\global\\@namedef{r@LastPage}{{}{${lp}}}`);
+    }
     for (const s of specs) {
       L.push(`\\global\\c@page=${s.folio}`);
       L.push(`\\gdef\\thepage{\\csname @${s.fmt}\\endcsname\\c@page}`);
@@ -2273,6 +2409,20 @@ function miniUnits(items, blockId, chunkRef) {
   return units;
 }
 
+/**
+ * The \r@<key> macro body for a live label definition. Plain labels carry a
+ * bare page number; cleveref's @cref labels carry the bracketed page field
+ * its parser expects ([1][1][]1 — pages are substituted by the orchestrator,
+ * never read from here). Under hyperref the plain body must be the FIVE
+ * group form {label}{page}{name}{anchor}{ext} — hyperref's \@setref and
+ * \hyperref parse exactly five and typeset garbage otherwise.
+ */
+function labelDefBody(key, val, hy, href) {
+  if (key.endsWith('@cref')) return `{{${val}}{[1][1][]1}}`;
+  if (hy) return `{{${val}}{1}{}{${href ?? ''}}{}}`;
+  return `{{${val}}{1}}`;
+}
+
 /** Extract a balanced {...} group's contents starting at an opening brace. */
 /** Kernel \@arabic/\@roman/\@Roman/\@alph/\@Alph transcriptions. */
 function formatFolio(n, fmt) {
@@ -2332,7 +2482,14 @@ function resolvedInGalley(block, key, labelTable) {
     block.__galleyTextHash = block.galleyHash;
   }
   if (block.__galleyText.includes('??') || block.__galleyText.includes('[?]')) return false;
-  return block.__galleyText.includes(String(val));
+  let needle = String(val);
+  if (key.endsWith('@cref')) {
+    // @cref values are "[type][i][j]<printed label>" — only the printed
+    // label part ever appears in the galley text
+    const m = needle.lastIndexOf(']');
+    if (m >= 0) needle = needle.slice(m + 1);
+  }
+  return block.__galleyText.includes(needle);
 }
 
 /** Pull the first TeX error lines out of a lualatex log/stdout capture. */

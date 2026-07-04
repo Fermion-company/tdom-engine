@@ -27,6 +27,8 @@ const AWFUL = 0x3fffffff; // tex.web awful_bad
 const INF_BAD = 10000;
 const DEPLORABLE = 100000;
 const EJECT = -10000;
+const FIL = 65536 / 65781.76; // 1fil in bp units (the stream's bp scale)
+const ORDERS = 5; // LuaTeX glue orders: normal, fi, fil, fill, filll
 
 // TeX's badness function (tex.web §108), computed in scaled points.
 function badness(tBp, sBp) {
@@ -98,6 +100,10 @@ class PageBuilder {
     this.folio = 1; // TeX's \c@page: assigned per emitted page, reset by \pagenumbering
     this.pendingFolio = null;
     this.footruleUnit = footruleUnitFor(geo);
+    // break-decision dump for offline referees (tools/compare-breaks.mjs):
+    // when the host installs __TDOM_PAGE_DUMP__, every fired page's contents
+    // (the pre-output body stream, natural glue values) is recorded
+    this.dumpRec = typeof globalThis.__TDOM_PAGE_DUMP__ === 'function' ? [] : null;
 
     this.#startColumnState();
     this.#resetPage();
@@ -126,6 +132,7 @@ class PageBuilder {
   /** \cleardoublepage's blank verso: an empty page with \thispagestyle{empty},
    * emitted when the next folio would be even (twoside). */
   #emitBlankPage() {
+    if (this.dumpRec) this.dumpRec.push({ blank: true });
     const folio = this.pendingFolio ?? this.folio;
     this.pendingFolio = null;
     this.folio = folio + 1;
@@ -146,7 +153,8 @@ class PageBuilder {
     this.contents = []; // placed entries: {e (stream entry), …}
     this.total = 0; // \pagetotal
     this.depth = 0; // \pagedepth
-    this.stretch = [0, 0, 0, 0]; // by order
+    this.prevdepth = null; // real \prevdepth (uncapped) for interline synthesis
+    this.stretch = new Array(ORDERS).fill(0); // by LuaTeX order (fi..filll)
     this.shrink = 0;
     this.shrinkInf = false;
     this.hasBox = false; // topskip not yet inserted
@@ -231,12 +239,19 @@ class PageBuilder {
       }
     }
     // end of document: \enddocument runs \clearpage, whose \newpage puts
-    // \vfil before the eject — that fil is what pins bottom floats to the
-    // page bottom on the final page. Reproduce it literally.
+    //   \ifdim\prevdepth>\z@ \vskip-min(\prevdepth,\maxdepth) \fi \vfil
+    // before the eject. NB LuaTeX glue orders run fi=1,fil=2,fill=3,filll=4
+    // (the stream uses that encoding), so \vfil is order TWO here.
     this.finishing = true;
     if (this.contents.some((c) => c.e.t === 'box' || c.e.t === 'ins') ||
         this.toplist.length || this.botlist.length) {
-      if (this.hasBox) this.#contributeGlue({ t: 'glue', a: 0, st: 1, sto: 1, sh: 0, sho: 0 });
+      if (this.hasBox) {
+        const pd = this.prevdepth ?? 0;
+        if (pd > 0) {
+          this.#contributeGlue({ t: 'glue', a: -Math.min(pd, this.maxdepth), st: 0, sto: 0, sh: 0, sho: 0 });
+        }
+        this.#contributeGlue({ t: 'glue', a: 0, st: FIL, sto: 2, sh: 0, sho: 0 });
+      }
       this.#firePage(this.contents.length, null);
     }
     while (this.deferlist.length) {
@@ -244,6 +259,7 @@ class PageBuilder {
       if (!made) break;
     }
     if (!this.pages.length) this.#emitEmptyPage();
+    if (this.dumpRec) globalThis.__TDOM_PAGE_DUMP__(this.dumpRec);
     return this.pages;
   }
 
@@ -269,6 +285,7 @@ class PageBuilder {
     }
     this.total += this.depth + e.u.h;
     this.depth = e.u.d;
+    this.prevdepth = e.u.d; // uncapped, unlike \pagedepth
     if (this.depth > this.maxdepth) {
       this.total += this.depth - this.maxdepth;
       this.depth = this.maxdepth;
@@ -367,7 +384,7 @@ class PageBuilder {
     if (pi >= INF_BAD) return false;
     let b;
     if (this.total < this.goal) {
-      b = this.stretch[1] || this.stretch[2] || this.stretch[3]
+      b = this.stretch[1] || this.stretch[2] || this.stretch[3] || this.stretch[4]
         ? 0
         : badness(this.goal - this.total, this.stretch[0]);
     } else if (this.total - this.goal > this.shrink && !this.shrinkInf) {
@@ -408,6 +425,29 @@ class PageBuilder {
     // #evalBreak handles — nothing to do eagerly.
   }
 
+  /**
+   * append_to_vlist's interline glue (tex.web §679) for a box the page
+   * builder itself commits (inline float): baselineskip minus prevdepth
+   * minus the box height, or lineskip when that falls under lineskiplimit.
+   * Returns null when \prevdepth is in ignore state (fresh page).
+   */
+  #interlineGlue(boxHeight) {
+    const pd = this.prevdepth;
+    if (pd === null || pd <= -996) return null; // \ignoredepth (-1000pt)
+    const g = this.geo;
+    const b = (g.baselineskip ?? 0) - pd - boxHeight;
+    if (b < (g.lineskiplimit ?? 0)) {
+      return {
+        t: 'glue', a: g.lineskip ?? 0, st: g.lineskipst ?? 0, sto: g.lineskipsto ?? 0,
+        sh: g.lineskipsh ?? 0, sho: g.lineskipsho ?? 0, sub: 1,
+      };
+    }
+    return {
+      t: 'glue', a: b, st: g.baselineskipst ?? 0, sto: g.baselineskipsto ?? 0,
+      sh: g.baselineskipsh ?? 0, sho: g.baselineskipsho ?? 0, sub: 2,
+    };
+  }
+
   // ------------------------------------------------------- float dispatch
 
   #floatHt(f) {
@@ -442,9 +482,13 @@ class PageBuilder {
                   this.colnum--;
                   this.textfloatsheight += this.#floatHt(f) + 2 * this.intextsep.w;
                   this.midlist.push(f);
+                  // \box\@currbox in \@addtocurcol appends to a vlist, so
+                  // TeX inserts interline glue against \prevdepth first
+                  const il = this.#interlineGlue(f.h);
                   const inject = [
                     { t: 'pen', v: this.lastPen >= INF_BAD ? INF_BAD : this.interlinepenalty },
                     { t: 'glue', a: this.intextsep.w, st: this.intextsep.st, sto: this.intextsep.sto, sh: this.intextsep.sh, sho: this.intextsep.sho },
+                    ...(il ? [il] : []),
                     { t: 'box', u: floatAsUnit(f) },
                     { t: 'pen', v: this.interlinepenalty },
                     { t: 'glue', a: this.intextsep.w, st: this.intextsep.st, sto: this.intextsep.sto, sh: this.intextsep.sh, sho: this.intextsep.sho },
@@ -538,6 +582,9 @@ class PageBuilder {
   #firePage(breakIndex, breakPen, pending = null) {
     const placed = this.contents.slice(0, breakIndex);
     const rest = this.contents.slice(breakIndex);
+    if (this.dumpRec) {
+      this.dumpRec.push(dumpPageRecord(placed, breakPen, this.goal, this.total));
+    }
     // stored entries after the break re-enter the stream, followed by the
     // item that was in flight when the page fired (document order!); the
     // discard rules of the fresh page then drop what TeX would drop.
@@ -632,6 +679,9 @@ class PageBuilder {
       }
     }
     if (!acc) return false;
+    if (this.dumpRec) {
+      this.dumpRec.push({ floatpage: true, ids: acc.map((f) => f.id) });
+    }
     this.#emitFloatPage(acc);
     this.#startColumnState();
     return true;
@@ -707,9 +757,10 @@ class PageBuilder {
       }
     }
     if (dpLast) g.push({ kind: 'glue', spec: { w: -dpLast, st: 0, sh: 0, sto: 0, sho: 0 } });
-    // -- \@textbottom (raggedbottom: \vskip 0pt plus .0001fil)
+    // -- \@textbottom (raggedbottom: \vskip 0pt plus .0001fil — LuaTeX
+    //    order 2, sharing an order with any \newpage/\vfil on the page)
     if (this.raggedbottom) {
-      g.push({ kind: 'glue', spec: { w: 0, st: 0.0001, sto: 1, sh: 0, sho: 0 } });
+      g.push({ kind: 'glue', spec: { w: 0, st: 0.0001 * FIL, sto: 2, sh: 0, sho: 0 } });
     }
     this.#layoutAndPush(g, this.colht);
   }
@@ -744,8 +795,8 @@ class PageBuilder {
     }
     // natural size + stretch/shrink pools
     let natural = 0;
-    const st = [0, 0, 0, 0];
-    const sh = [0, 0, 0, 0];
+    const st = new Array(ORDERS).fill(0);
+    const sh = new Array(ORDERS).fill(0);
     for (const el of elems) {
       if (el.kind === 'glue') {
         natural += el.spec.w;
@@ -767,11 +818,11 @@ class PageBuilder {
     let ratio = 0;
     let shrinking = false;
     if (excess > 0) {
-      order = st[3] ? 3 : st[2] ? 2 : st[1] ? 1 : 0;
+      order = st[4] ? 4 : st[3] ? 3 : st[2] ? 2 : st[1] ? 1 : 0;
       ratio = st[order] > 0 ? excess / st[order] : 0;
     } else if (excess < 0) {
       shrinking = true;
-      order = sh[3] ? 3 : sh[2] ? 2 : sh[1] ? 1 : 0;
+      order = sh[4] ? 4 : sh[3] ? 3 : sh[2] ? 2 : sh[1] ? 1 : 0;
       ratio = sh[order] > 0 ? Math.min(-excess / sh[order], order === 0 ? 1 : Infinity) : 0;
     }
     const setGlue = (spec) => {
@@ -828,6 +879,52 @@ class PageBuilder {
     this.pageTls = null;
     this.pages.push(page);
   }
+}
+
+/** Text of a box unit's glyph runs (comparison key for compare-breaks). */
+function unitText(u, limit = 48) {
+  let s = '';
+  for (const r of u.ln?.runs ?? []) {
+    if (r.rule) continue;
+    if (typeof r.t === 'string') {
+      s += r.t;
+    } else {
+      for (const g of r.g ?? []) {
+        const cp = Array.isArray(g) ? g[0] : g?.c;
+        if (typeof cp === 'number') s += String.fromCodePoint(cp >= 0xe000 && cp < 0xe020 ? cp - 0xe000 + 32 : cp);
+      }
+    }
+    if (s.length >= limit) return s.slice(0, limit);
+  }
+  return s;
+}
+
+/** One fired page's body stream, natural values — compare-breaks format. */
+function dumpPageRecord(placed, pen, goal, total) {
+  const nodes = [];
+  for (const c of placed) {
+    const e = c.e;
+    if (e.t === 'box') {
+      nodes.push({
+        k: 'box',
+        h: e.u.h ?? 0,
+        d: e.u.d ?? 0,
+        t: e.u.isFloat ? '<float>' : unitText(e.u),
+      });
+    } else if (e.t === 'glue') {
+      nodes.push({
+        k: 'glue', w: e.a ?? 0, st: e.st ?? 0, sto: e.sto ?? 0,
+        sh: e.sh ?? 0, sho: e.sho ?? 0, sub: e.sub ?? 0, ...(c.topskip ? { ts: 1 } : {}),
+      });
+    } else if (e.t === 'kern') {
+      nodes.push({ k: 'kern', w: e.a ?? 0 });
+    } else if (e.t === 'pen') {
+      nodes.push({ k: 'pen', v: e.v ?? 0 });
+    } else if (e.t === 'ins') {
+      nodes.push({ k: 'ins', h: e.h ?? 0 });
+    }
+  }
+  return { pen, goal, total, nodes };
 }
 
 /** A committed inline float participates in the text stream as one big box. */

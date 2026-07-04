@@ -13,6 +13,7 @@
 // Exit code 0 when every page matches within tolerance; 1 otherwise.
 
 import { execFileSync, execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
@@ -70,10 +71,25 @@ async function truthPages() {
   const run = () =>
     execFileP('lualatex', ['-interaction=nonstopmode', 'main.tex'], {
       cwd: dir,
-      timeout: 180_000,
+      timeout: 600_000,
     }).catch(() => {});
-  await run();
-  await run();
+  // compile to FIXPOINT: a non-converged run prints stale toc/ref pages —
+  // "the real PDF" the engine must match is the converged document
+  const auxState = () => {
+    let s = '';
+    for (const f of ['main.aux', 'main.toc', 'main.lof', 'main.lot', 'main.out', 'main.idx']) {
+      const p = path.join(dir, f);
+      if (existsSync(p)) s += f + ':' + createHash('sha256').update(readFileSync(p)).digest('hex') + '\n';
+    }
+    return s;
+  };
+  let prev = null;
+  for (let pass = 1; pass <= 6; pass++) {
+    await run();
+    const cur = auxState();
+    if (pass >= 2 && cur === prev) break;
+    prev = cur;
+  }
   const pdf = path.join(dir, 'main.pdf');
   if (!existsSync(pdf)) throw new Error('real lualatex compile failed');
   // exact glyph-run coordinates from the content streams (bp, top-origin)
