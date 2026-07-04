@@ -314,8 +314,12 @@ class PageBuilder {
     this.lastPen = e.v;
     if (!this.hasBox) return;
     if (e.v < INF_BAD) this.#evalBreak(this.contents.length, e.v, null);
-    // penalties occupy no space and need not be stored; if the page fired
-    // at this penalty it has been consumed by the break
+    // Penalties occupy no space but MUST be stored: a glue whose previous
+    // node is a (discardable) penalty is NOT a legal breakpoint — \nobreak
+    // after headings relies on exactly this. Dropping the node here made
+    // the following glue look box-preceded and legal, so pages broke right
+    // after headings and every subsequent page under-filled.
+    this.contents.push({ e });
   }
 
   #contributeIns(e) {
@@ -380,7 +384,18 @@ class PageBuilder {
     if (this.best === null || c <= this.best.cost) {
       this.best = { index, cost: c, pen: pi };
     }
+    if (process.env.TDOM_DEBUG_BREAK) {
+      console.error(
+        `evalBreak idx=${index} pi=${pi} total=${this.total.toFixed(1)} goal=${this.goal.toFixed(1)} b=${b} c=${c} best=${this.best.index}/${this.best.cost}`
+      );
+    }
     if (c === AWFUL || pi <= EJECT) {
+      if (process.env.TDOM_DEBUG_BREAK) {
+        const around = this.contents
+          .slice(Math.max(0, this.best.index - 3), this.best.index + 2)
+          .map((x) => x.e.t + (x.e.t === 'pen' ? `(${x.e.v})` : x.e.t === 'box' ? `(h${(x.e.u?.h ?? 0).toFixed(0)})` : ''));
+        console.error(`FIRE at ${this.best.index} pen=${this.best.pen} around=[${around.join(' ')}]`);
+      }
       this.#firePage(this.best.index, this.best.pen, pending);
       return true;
     }
