@@ -39,8 +39,14 @@ const BASE_COUNTERS = [
   'equation', 'figure', 'table', 'footnote',
 ];
 const HEADING_RE = /^\s*\\(section|subsection|subsubsection|paragraph)\b/;
-const JOB_TIMEOUT = 30_000;
+const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 30_000);
 const BOOT_TIMEOUT = 60_000;
+// Environments that drive TeX's page builder themselves (own \output,
+// column balancing against \vsize). On the dormant \vsize=\maxdimen page
+// they balance against garbage (multicols yields \maxdimen/2-tall columns)
+// or worse — route them through the isolated exact-render rescue, where a
+// real lualatex with the real \textheight typesets them exactly as print.
+const OUTPUT_HIJACK_RE = /\\begin\{(multicols\*?|paracol)\}/;
 
 export class CheckpointEngine {
   constructor({ workDir, docDir }) {
@@ -68,6 +74,8 @@ export class CheckpointEngine {
     this.fontFiles = new Map(); // familyKey -> absolute path
     this.pages = [];
     this.chunks = new Map(); // chunkKey -> {svg, wBp, hBp, v} exact renders
+    this.isoCache = new Map(); // rescue key -> isolated compile result
+    this.poisoned = new Map(); // block.id -> fnv1a(text) that failed in-chain
     this.bgAbort = false;
     this.bgTask = Promise.resolve();
     this.onAsyncPatches = null; // callback(report-ish) for gfx swaps
@@ -105,7 +113,12 @@ export class CheckpointEngine {
       try { w.close(); } catch { /* already closed */ }
     }
     this.watchers.clear();
-    for (const peer of this.peers) peer.send('DIE\n');
+    for (const peer of this.peers) {
+      peer.send('DIE\n');
+      if (peer.pid) {
+        try { process.kill(peer.pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
     if (this.root) {
       try { this.root.kill('SIGKILL'); } catch { /* gone */ }
     }
@@ -307,8 +320,14 @@ export class CheckpointEngine {
   async #bootRoot() {
     await this.#ensureShim();
     await this.#ensureServer();
-    // tear down any previous tree
-    for (const peer of this.peers) peer.send('DIE\n');
+    // tear down any previous tree — DIE for the well-behaved residents plus
+    // SIGKILL by pid, because a child stuck in a TeX loop never reads DIE
+    for (const peer of this.peers) {
+      peer.send('DIE\n');
+      if (peer.pid) {
+        try { process.kill(peer.pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
     this.checkpoints.clear();
     if (this.root) {
       try { this.root.kill('SIGKILL'); } catch { /* gone */ }
@@ -491,50 +510,368 @@ export class CheckpointEngine {
 
   // ------------------------------------------------------------- typeset
 
-  async #jobBlock(idx) {
+  async #jobBlock(idx, override = null) {
     const block = this.blocks[idx];
     const ck = this.checkpoints.get(idx);
     if (!ck) throw new Error(`no checkpoint at ${idx} for block ${block.id}`);
-    // Labels are defined in descendant lineages only; when resuming from an
-    // ancestor snapshot, forward-referenced values must be injected so this
-    // block sees the document-wide truth.
-    const defs = [];
-    for (const key of block.galley?.refs ?? []) {
-      const val = this.labelTable.get(key);
-      const cs = key.startsWith('cite:') ? `b@${key.slice(5)}` : `r@${key}`;
-      if (val === undefined) {
-        // vanished label: neutralize stale definitions in this lineage
-        defs.push(`\\global\\expandafter\\let\\csname ${cs}\\endcsname\\relax`);
-      } else if (key.startsWith('cite:')) {
-        defs.push(`\\global\\@namedef{${cs}}{${val}}`);
-      } else {
-        defs.push(`\\global\\@namedef{${cs}}{{${val}}{1}}`);
+    let body;
+    let jobId;
+    if (override) {
+      // raw job (rescue continuation): caller supplies the exact body
+      body = Buffer.from(override.body, 'utf8');
+      jobId = override.id;
+    } else {
+      // Labels are defined in descendant lineages only; when resuming from an
+      // ancestor snapshot, forward-referenced values must be injected so this
+      // block sees the document-wide truth.
+      const defs = [];
+      for (const key of block.galley?.refs ?? []) {
+        const val = this.labelTable.get(key);
+        const cs = key.startsWith('cite:') ? `b@${key.slice(5)}` : `r@${key}`;
+        if (val === undefined) {
+          // vanished label: neutralize stale definitions in this lineage
+          defs.push(`\\global\\expandafter\\let\\csname ${cs}\\endcsname\\relax`);
+        } else if (key.startsWith('cite:')) {
+          defs.push(`\\global\\@namedef{${cs}}{${val}}`);
+        } else {
+          defs.push(`\\global\\@namedef{${cs}}{{${val}}{1}}`);
+        }
       }
+      const prelude = defs.length
+        ? `\\makeatletter ${defs.join(' ')}\\makeatother\n`
+        : '';
+      // Mid-typing safety: an unclosed brace makes a \long macro argument
+      // scan past the injected \par/report tokens to EOF and kills the child
+      // (the old \vbox wrapper stopped it structurally). Auto-close the
+      // imbalance — the source is transiently invalid anyway, and the exact
+      // path resumes on the next balanced keystroke.
+      const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
+      body = Buffer.from(prelude + block.text + guard, 'utf8');
+      jobId = block.id;
     }
-    const prelude = defs.length
-      ? `\\makeatletter ${defs.join(' ')}\\makeatother\n`
-      : '';
-    // Mid-typing safety: an unclosed brace makes a \long macro argument
-    // scan past the injected \par/report tokens to EOF and kills the child
-    // (the old \vbox wrapper stopped it structurally). Auto-close the
-    // imbalance — the source is transiently invalid anyway, and the exact
-    // path resumes on the next balanced keystroke.
-    const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
-    const body = Buffer.from(prelude + block.text + guard, 'utf8');
-    const galleyKey = 'galley:' + block.id;
+    const galleyKey = 'galley:' + jobId;
     const ckptKey = 'ckpt:' + (idx + 1);
     const galleyP = this.#await(galleyKey);
     const ckptP = this.#await(ckptKey);
+    // mark both consumed so a late sibling rejection never surfaces as an
+    // unhandled rejection after Promise.all already bailed on the first one
+    galleyP.catch(() => {});
+    ckptP.catch(() => {});
     this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1 };
     try {
-      ck.send(`JOB ${block.id} ${idx + 1} ${body.length}\n`);
+      ck.send(`JOB ${jobId} ${idx + 1} ${body.length}\n`);
       ck.sendRaw(body);
       const [galley] = await Promise.all([galleyP, ckptP]);
       this.#retireOffGrid(idx);
       return galley;
+    } catch (err) {
+      // A stuck fork child (e.g. a TeX infinite loop in this block) never
+      // reads DIE from its socket — kill it hard or it spins at full CPU
+      // forever. The pid arrived with the FORKED announcement.
+      const pid = this.currentJob?.pid;
+      if (pid) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      this._reject(galleyKey, err);
+      this._reject(ckptKey, err);
+      throw err;
     } finally {
       this.currentJob = null;
     }
+  }
+
+  /**
+   * Rescue-aware typeset: the in-chain fork path for normal blocks, the
+   * isolated exact-render path for blocks the dormant page cannot represent
+   * (output-routine environments) or that failed/hung in-chain. The premise:
+   * anything real lualatex compiles must render — worst case through a real
+   * lualatex run whose pixels ARE the print output.
+   */
+  async #typesetBlock(idx) {
+    const block = this.blocks[idx];
+    const sig = fnv1a(block.text);
+    if (OUTPUT_HIJACK_RE.test(block.text)) {
+      return this.#rescueBlock(idx, 'output-routine environment needs a real page');
+    }
+    if (this.poisoned.get(block.id) === sig) {
+      return this.#rescueBlock(idx, 'previous in-chain failure');
+    }
+    try {
+      return await this.#jobBlock(idx);
+    } catch (err) {
+      this.poisoned.set(block.id, sig);
+      this.diagnostics.push(
+        `${block.id}: in-chain typeset failed (${err.message}) — isolated exact-render rescue`
+      );
+      return this.#rescueBlock(idx, err.message);
+    }
+  }
+
+  /**
+   * Isolated rescue: compile ONLY this block in a standalone lualatex with
+   * the document's real preamble, the entry counter/label/layout state, and
+   * the REAL \textheight (a dormant absorb keeps material on one galley, so
+   * column balancing sees true page geometry). The run reports exit
+   * counters, labels, per-line galley dims and ships the galley as a PDF —
+   * the preview chunk is therefore print-identical. A no-op state job then
+   * creates the next checkpoint so the resident chain continues with the
+   * exact exit state.
+   */
+  async #rescueBlock(idx, why) {
+    const block = this.blocks[idx];
+    const cacheKey = fnv1a(
+      JSON.stringify([block.text, this.blocks[idx - 1]?.stateVec ?? '', this.preHash])
+    );
+    let iso = this.isoCache.get(cacheKey);
+    if (!iso) {
+      iso = await this.#isoCompile(block, idx, why);
+      this.isoCache.set(cacheKey, iso);
+    }
+    // continuation checkpoint carrying the isolated run's exact exit state
+    await this.#jobBlock(idx, { id: block.id + '@state', body: this.#stateJobBody(iso) });
+    return {
+      items: iso.items,
+      floats: [],
+      w: iso.w,
+      h: iso.h,
+      d: iso.d,
+      gfx: true,
+      state: iso.state,
+      labels: iso.labels,
+      refs: [],
+      fonts: {},
+      tdomIsoChunks: iso.chunks,
+    };
+  }
+
+  #stateJobBody(iso) {
+    const L = ['\\makeatletter'];
+    for (const name of this.counters) {
+      const v = iso.state[name];
+      if (v !== undefined) L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${v}}\\fi`);
+    }
+    for (const l of iso.labels ?? []) {
+      L.push(`\\global\\@namedef{r@${l.k}}{{${l.v}}{1}}`);
+    }
+    L.push(iso.state['tdom@nobreak'] === 1 ? '\\global\\@nobreaktrue' : '\\global\\@nobreakfalse');
+    L.push('\\makeatother');
+    L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(iso.state['tdom@pd'] ?? -65536000)}}`);
+    return L.join('\n');
+  }
+
+  async #isoCompile(block, idx, why) {
+    const entry = {};
+    const prevVec = idx > 0 ? JSON.parse(this.blocks[idx - 1].stateVec ?? '[]') : [];
+    this.counters.forEach((c, i) => {
+      entry[c] = prevVec[i] ?? 0;
+    });
+    const prevPd = idx > 0 && prevVec.length >= 2 ? prevVec[prevVec.length - 2] : -65536000;
+    const prevNobreak = idx > 0 && prevVec.length >= 1 ? prevVec[prevVec.length - 1] === 1 : false;
+    const text = this.store.get(this.file);
+    const bounds = documentBounds(text);
+    const L = [];
+    L.push(text.slice(bounds.preamble.start, bounds.preamble.end).trimEnd());
+    L.push('\\begin{document}');
+    L.push('\\makeatletter\\pagestyle{empty}\\hoffset=-1in\\voffset=-1in');
+    for (const [key, val] of this.labelTable) {
+      if (key.startsWith('cite:')) L.push(`\\global\\@namedef{b@${key.slice(5)}}{${val}}`);
+      else L.push(`\\global\\@namedef{r@${key}}{{${val}}{1}}`);
+    }
+    for (const [name, val] of Object.entries(entry)) {
+      L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${val}}\\fi`);
+    }
+    // capture labels the block defines (value = \@currentlabel at \label)
+    L.push('\\let\\TDOMlabel\\label');
+    L.push(
+      "\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}}"
+    );
+    L.push('\\ifdefined\\ltx@label\\let\\TDOMltxlabel\\ltx@label');
+    L.push(
+      "\\def\\ltx@label#1{\\TDOMltxlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}}\\fi"
+    );
+    L.push('\\makeatother');
+    // dormant page over the REAL \vsize: material stays on one galley (the
+    // absorb hands it back), while \pagegoal/\vsize read true page geometry
+    // so multicols & co. balance exactly as in print
+    // NB: inline \directlua bodies are read with LaTeX catcodes — no '%'
+    // (comment) and no '#' (macro parameter) may appear in the Lua source.
+    L.push(
+      '\\directlua{' +
+        'tdom_iso = { labels = {}, counters = {}, fires = 0, ships = 0 } ' +
+        'function tdom_iso_label(k, v) table.insert(tdom_iso.labels, { k, v }) end ' +
+        'function tdom_iso_counter(k, v) tdom_iso.counters[k] = tonumber(v) or 0 end ' +
+        'function tdom_iso_absorb() ' +
+        'tdom_iso.fires = tdom_iso.fires + 1 ' +
+        'if tdom_iso.fires > 50 then tex.box[255] = nil return end ' +
+        'tex.deadcycles = 0 ' +
+        'local b = tex.box[255] ' +
+        'local list = nil ' +
+        'if b then list = b.list b.list = nil tex.box[255] = nil end ' +
+        'if list then ' +
+        'local oldc = tex.lists.contrib_head ' +
+        'if oldc then local t = node.tail(list) t.next = oldc oldc.prev = t end ' +
+        'tex.lists.contrib_head = list ' +
+        'end ' +
+        'pcall(function() tex.pagetotal = 0 end) ' +
+        'end}'
+    );
+    L.push('\\holdinginserts=1');
+    L.push('\\maxdeadcycles=200');
+    L.push('\\output={\\directlua{tdom_iso_absorb()}}');
+    // material taller than the page inside an output-hijack env (multicols'
+    // own routine) ships REAL pages — count them so the harvest knows the
+    // pre-body machinery (and the isostart marker) left with page 1
+    L.push('\\AddToHook{shipout/before}{\\directlua{tdom_iso.ships = tdom_iso.ships + 1}}');
+    L.push('\\hbox to0pt{}');
+    L.push('\\special{tdom:isostart}');
+    L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(prevPd)}}`);
+    if (prevNobreak) L.push('\\noindent');
+    L.push(block.text.trimEnd() + '}'.repeat(Math.max(0, braceImbalance(block.text))));
+    L.push('\\par');
+    for (const name of this.counters) {
+      L.push(
+        `\\ifcsname c@${name}\\endcsname\\directlua{tdom_iso_counter('${name}',\\number\\value{${name}})}\\fi`
+      );
+    }
+    L.push(
+      '\\makeatletter\\csname if@nobreak\\endcsname' +
+        "\\directlua{tdom_iso_counter('tdom@nobreak',1)}\\else" +
+        "\\directlua{tdom_iso_counter('tdom@nobreak',0)}\\fi\\makeatother"
+    );
+    // harvest: strip pre-body machinery + inserts, record per-item dims
+    // (real break opportunities for the page builder), vpack and ship.
+    // Same inline-Lua constraint: no '%'/'#' characters (LaTeX catcodes).
+    L.push(
+      '\\directlua{' +
+        "tdom_iso_counter('tdom@pd', math.floor(tex.nest[0].prevdepth or 0)) " +
+        'tex.triggerbuildpage() ' +
+        'local head = tex.lists.page_head ' +
+        'tex.lists.page_head = nil tex.lists.contrib_head = nil ' +
+        'local INS = node.id("ins") local WH = node.id("whatsit") ' +
+        'local HL = node.id("hlist") local VL = node.id("vlist") ' +
+        'local GL = node.id("glue") local KE = node.id("kern") ' +
+        'local SP = node.subtype("special") ' +
+        // pre-body machinery precedes the marker ONLY when no page shipped;
+        // otherwise it (and the marker) left with page 1 already
+        'if tdom_iso.ships == 0 then ' +
+        'while head do ' +
+        'local ismark = head.id == WH and head.subtype == SP and head.data == "tdom:isostart" ' +
+        'local nxt = head.next head.next = nil if nxt then nxt.prev = nil end node.free(head) head = nxt ' +
+        'if ismark then break end end ' +
+        'end ' +
+        'local out, tail = nil, nil local n = head ' +
+        'while n do local nxt = n.next n.next = nil n.prev = nil ' +
+        'if n.id == INS then node.free(n) else if tail then tail.next = n n.prev = tail else out = n end tail = n end n = nxt end ' +
+        'local SP2BP = 65781.76 ' +
+        'local function bp(sp) return math.floor(((sp or 0) / SP2BP) * 1000000 + 0.5) / 1000000 end ' +
+        // no literal backslash may appear in inline Lua (TeX would tokenize
+        // and expand it as a control sequence) — build it via string.char
+        'local BS = string.char(92) local DQ = string.char(34) ' +
+        'local function jq(s) ' +
+        's = tostring(s) ' +
+        's = s:gsub(BS, BS .. BS) ' +
+        's = s:gsub(DQ, BS .. DQ) ' +
+        'return DQ .. s .. DQ end ' +
+        'local items = {} ' +
+        'local m = out ' +
+        'while m do ' +
+        'if m.id == HL or m.id == VL then table.insert(items, \'{"k":"box","h":\' .. bp(m.height) .. \',"d":\' .. bp(m.depth) .. \'}\') ' +
+        'elseif m.id == GL or m.id == KE then local a = (m.id == GL and m.width or m.kern) or 0 ' +
+        'if a ~= 0 then table.insert(items, \'{"k":"glue","a":\' .. bp(a) .. \'}\') end end ' +
+        'm = m.next end ' +
+        // empty remainder (env ended exactly at a page break): ship a
+        // zero box so the last PDF page always exists for the node side
+        'local b = out and node.vpack(out) or node.new("hlist") ' +
+        'local f = io.open("state.json", "w") ' +
+        'local labs = {} ' +
+        'for _, kv in ipairs(tdom_iso.labels) do table.insert(labs, "[" .. jq(kv[1]) .. "," .. jq(kv[2]) .. "]") end ' +
+        'local cnts = {} ' +
+        'for k, v in pairs(tdom_iso.counters) do table.insert(cnts, jq(k) .. ":" .. v) end ' +
+        'f:write(\'{"w":\' .. bp(b.width) .. \',"h":\' .. bp(b.height) .. \',"d":\' .. bp(b.depth) .. ' +
+        '\',"ships":\' .. tdom_iso.ships .. ' +
+        '\',"labels":[\' .. table.concat(labs, ",") .. \'],"state":{\' .. table.concat(cnts, ",") .. ' +
+        '\'},"items":[\' .. table.concat(items, ",") .. \']}\') ' +
+        'f:close() ' +
+        'tex.box[255] = b ' +
+        'tex.pagewidth = math.max(b.width or 0, 65536) ' +
+        'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536)}'
+    );
+    L.push('\\shipout\\box255');
+    L.push('\\csname @@end\\endcsname');
+    const jobdir = path.join(this.workDir, `rescue-${block.id}-${fnv1a(block.text)}`);
+    mkdirSync(jobdir, { recursive: true });
+    rmSync(path.join(jobdir, 'iso.pdf'), { force: true });
+    rmSync(path.join(jobdir, 'state.json'), { force: true });
+    writeFileSync(path.join(jobdir, 'iso.tex'), L.join('\n') + '\n');
+    await execFileP('lualatex', ['-interaction=nonstopmode', 'iso.tex'], {
+      cwd: jobdir,
+      timeout: 120_000,
+    }).catch(() => {});
+    const pdf = path.join(jobdir, 'iso.pdf');
+    const statePath = path.join(jobdir, 'state.json');
+    if (!existsSync(pdf) || !existsSync(statePath)) {
+      throw new Error(`isolated rescue failed for ${block.id} (${why})`);
+    }
+    const st = JSON.parse(readFileSync(statePath, 'utf8'));
+    const ships = st.ships ?? 0;
+    const geo = this.geometry ?? {};
+    const chunks = [];
+    const items = [];
+    // real shipped pages (material taller than the page inside an
+    // output-hijack env): one full-textheight chunk per page + a forced
+    // break — the preview page sequence mirrors print exactly
+    for (let k = 1; k <= ships; k++) {
+      const svgPath = path.join(jobdir, `page-${k}.svg`);
+      await execFileP('pdftocairo', ['-svg', '-f', String(k), '-l', String(k), pdf, svgPath], {
+        timeout: 30_000,
+      });
+      const x0 = geo.oddsidemargin ?? 0;
+      const y0 = (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
+      const w = geo.textwidth ?? st.w;
+      const h = geo.textheight ?? st.h;
+      const key = `${block.id}@p${k}`;
+      chunks.push({ key, svg: cropSvgAt(readFileSync(svgPath, 'utf8'), x0, y0, w, h), wBp: w, hBp: h });
+      items.push({ k: 'box', h, d: 0, chunk: key, coff: 0 });
+      items.push({ k: 'eject', v: -10000 });
+    }
+    // remainder galley = the LAST pdf page (our manual shipout); its items
+    // carry chunk-local offsets so page breaks inside it clip correctly
+    const lastPage = ships + 1;
+    const svgPath = path.join(jobdir, 'iso.svg');
+    await execFileP(
+      'pdftocairo',
+      ['-svg', '-f', String(lastPage), '-l', String(lastPage), pdf, svgPath],
+      { timeout: 30_000 }
+    );
+    const remainderKey = block.id;
+    if ((st.h ?? 0) + (st.d ?? 0) > 0.01) {
+      chunks.push({
+        key: remainderKey,
+        svg: cropSvg(readFileSync(svgPath, 'utf8'), st.w, st.h + st.d),
+        wBp: st.w,
+        hBp: st.h + st.d,
+      });
+      let coff = 0;
+      for (const it of st.items ?? []) {
+        if (it.k === 'box') {
+          items.push({ ...it, chunk: remainderKey, coff });
+          coff += (it.h ?? 0) + (it.d ?? 0);
+        } else {
+          items.push(it);
+          if (it.k === 'glue' || it.k === 'kern') coff += it.a ?? 0;
+        }
+      }
+    }
+    rmSync(jobdir, { recursive: true, force: true });
+    return {
+      w: Math.max(st.w ?? 0, ships ? (geo.textwidth ?? 0) : 0),
+      h: st.h,
+      d: st.d,
+      items,
+      labels: (st.labels ?? []).map(([k, v]) => ({ k, v })),
+      state: st.state ?? {},
+      chunks,
+    };
   }
 
   // Sparse checkpoints: for large documents only every grid-th boundary
@@ -577,7 +914,7 @@ export class CheckpointEngine {
     for (let j = from; j < this.blocks.length; j++) {
       const block = this.blocks[j];
       const before = { hash: block.galleyHash, state: block.stateVec };
-      const g = await this.#jobBlock(j).catch(() => null);
+      const g = await this.#typesetBlock(j).catch(() => null);
       if (!g) break;
       this.#adoptGalley(block, g);
       n++;
@@ -593,6 +930,24 @@ export class CheckpointEngine {
     block.galleyHash = fnv1a(
       JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d])
     );
+    if (galley.tdomIsoChunks) {
+      // rescued block: the isolated run's print-identical pixels are the
+      // chunks — registered here so forGalley matches the adopted hash
+      for (const c of galley.tdomIsoChunks) {
+        const prev = this.chunks.get(c.key);
+        this.chunks.set(c.key, {
+          svg: c.svg,
+          wBp: c.wBp,
+          hBp: c.hBp,
+          v: (prev?.v ?? 0) + 1,
+          forGalley: block.galleyHash,
+        });
+      }
+      delete galley.tdomIsoChunks;
+      block.rescued = true;
+    } else {
+      block.rescued = false;
+    }
     // exit state = tracked counters + cross-block layout state (prevdepth,
     // \if@nobreak) — any change forces the convergence chain onward
     block.stateVec = JSON.stringify([
@@ -601,7 +956,10 @@ export class CheckpointEngine {
       galley.state?.['tdom@nobreak'] ?? 0,
     ]);
     block.gfx = !!galley.gfx;
-    block.needsRender = block.gfx || (galley.floats ?? []).some((f) => f.gfx);
+    // rescued blocks already carry their print-identical chunks — the
+    // resident RENDER path (dormant-page reship) must not overwrite them
+    block.needsRender =
+      !block.rescued && (block.gfx || (galley.floats ?? []).some((f) => f.gfx));
     block.consumesToc = /\\tableofcontents\b/.test(block.text);
     block.kind = HEADING_RE.test(block.text)
       ? 'heading'
@@ -720,7 +1078,7 @@ export class CheckpointEngine {
       const block = this.blocks[i];
       const before = { hash: block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
       const t0 = performance.now();
-      const galley = await this.#jobBlock(i);
+      const galley = await this.#typesetBlock(i);
       forkMs += performance.now() - t0;
       typesetCount++;
       const wasClean = before.hadGalley && !dirtySource.has(block.id);
@@ -899,7 +1257,7 @@ export class CheckpointEngine {
         if (this.checkpoints.has(j + 1)) continue;
         const block = this.blocks[j];
         const before = block.galleyHash;
-        const galley = await this.#jobBlock(j).catch(() => null);
+        const galley = await this.#typesetBlock(j).catch(() => null);
         if (!galley) return;
         this.#adoptGalley(block, galley);
         if (block.galleyHash !== before) {
@@ -1496,8 +1854,11 @@ function buildStream(block, hasChunk, chunks) {
           descent: it.d ?? 0,
           boxH: it.h ?? 0,
           runs: it.runs ?? [],
-          gfxChunk:
-            block.gfx && hasChunk
+          // rescued blocks carry per-item chunk refs (multi-page isolated
+          // renders); ordinary gfx blocks map every unit into one chunk
+          gfxChunk: it.chunk
+            ? { blockId: it.chunk, yOff: it.coff ?? 0, w: chunks.get(it.chunk)?.wBp ?? block.galley.w }
+            : block.gfx && hasChunk
               ? { blockId: block.id, yOff, w: block.galley.w }
               : null,
         },
@@ -1615,6 +1976,15 @@ function cropSvg(svg, wBp, hBp) {
   return svg.replace(
     /<svg([^>]*?)width="[^"]*" height="[^"]*" viewBox="[^"]*"/,
     `<svg$1width="${wBp}pt" height="${hBp}pt" viewBox="0 0 ${wBp} ${hBp}"`
+  );
+}
+
+/** cropSvg with an origin offset — for real \@outputpage ships, whose content
+ * sits at (oddsidemargin, topmargin+headheight+headsep) under \hoffset=-1in. */
+function cropSvgAt(svg, xBp, yBp, wBp, hBp) {
+  return svg.replace(
+    /<svg([^>]*?)width="[^"]*" height="[^"]*" viewBox="[^"]*"/,
+    `<svg$1width="${wBp}pt" height="${hBp}pt" viewBox="${xBp} ${yBp} ${wBp} ${hBp}"`
   );
 }
 

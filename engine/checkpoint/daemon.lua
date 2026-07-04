@@ -614,9 +614,41 @@ end
 -- \clearpage internals, a package's raw \penalty-10000), the output routine
 -- fires. We absorb \box255 back into the dormant page, plant an eject marker
 -- so the orchestrator breaks the page at exactly this point, and continue.
+-- Resetting deadcycles below disables TeX's own output-loop protection, so
+-- the absorb routine carries its own: a sane block fires the output routine
+-- at most a handful of times (\clearpage = 2). A block that keeps firing is
+-- caught in a page-builder cycle the dormant-page model cannot represent —
+-- exit the fork child cleanly; the orchestrator rescues the block through
+-- the isolated exact-render path instead of spinning forever.
+local absorb_fires = 0
+function tdom_absorb_reset()
+  absorb_fires = 0
+end
+
 function tdom_absorb_output()
+  absorb_fires = absorb_fires + 1
+  if absorb_fires > 50 then
+    texio.write_nl('term and log', 'tdom: output routine fired ' .. absorb_fires ..
+      ' times in one block — page-builder cycle, bailing out of this fork')
+    fk._exit(3)
+  end
   tex.deadcycles = 0
   local pen = tex.outputpenalty or -10000
+  if os.getenv('TDOM_TRACE_OUTPUT') then
+    local jid = JOB and JOB.id or '?'
+    local desc = {}
+    local dlen = 0
+    local n = tex.box[255] and tex.box[255].list or nil
+    while n and dlen < 10 do
+      dlen = dlen + 1
+      local t = node.type(n.id)
+      if t == 'penalty' then t = t .. '(' .. (n.penalty or 0) .. ')' end
+      desc[dlen] = t
+      n = n.next
+    end
+    texio.write_nl('term and log', 'TDOMTRACE absorb job=' .. jid .. ' pen=' .. pen ..
+      ' box255=[' .. table.concat(desc, ' ') .. (n and ' ...' or '') .. ']')
+  end
   local b = tex.box[255]
   local list = nil
   if b then
@@ -857,6 +889,7 @@ function tdom_wait()
         blk_gfx = false
         blk_floats = {}
         pending_fmarks = {}
+        tdom_absorb_reset()
         RENDER_MODE = false
         reconnect('job', newckpt)
         inject_job(body, false)
