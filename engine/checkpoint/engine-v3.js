@@ -1472,12 +1472,6 @@ export class CheckpointEngine {
    * (full preamble per render) but pixel-exact all the same.
    */
   async #renderIsolated(block, idx) {
-    if ((block.galley?.floats ?? []).length) {
-      this.diagnostics.push(
-        `render ${block.id}: float chunks unavailable under hyperref-style preambles (instant glyphs kept)`
-      );
-      return;
-    }
     const forGalley = block.galleyHash;
     const inflightKey = 'iso:' + block.id + ':' + forGalley;
     this.rendering ??= new Set();
@@ -1509,6 +1503,38 @@ export class CheckpointEngine {
       for (const [name, val] of Object.entries(entry)) {
         L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${val}}\\fi`);
       }
+      // float capture, exactly like the resident driver: the environment
+      // body is typeset into a box with \@xfloat's setup, and a Lua-side
+      // copy is kept so each float ships as its own page (2..N) after the
+      // galley — same protocol as the resident RENDER path
+      // NB: inline Lua under LaTeX catcodes — no '%', '#' or backslash
+      // characters (see #isoCompile); TeX tokens are built via string.char
+      L.push('\\newbox\\TDOMisofbox');
+      L.push('\\directlua{tdom_iso_fbox=\\number\\TDOMisofbox tdom_iso_floats={} tdom_iso_nf=0 ' +
+        'function tdom_iso_float() local b = tex.box[tdom_iso_fbox] ' +
+        'if b then tdom_iso_nf = tdom_iso_nf + 1 tdom_iso_floats[tdom_iso_nf] = node.copy_list(b) end end ' +
+        'function tdom_iso_load_float(i) local b = tdom_iso_floats[i] ' +
+        'if not b then return end tdom_iso_floats[i] = false ' +
+        'tex.box[255] = b ' +
+        'tex.pagewidth = math.max(b.width or 0, 65536) ' +
+        'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536) end ' +
+        'function tdom_iso_ship_floats() ' +
+        'local BS = string.char(92) ' +
+        'local lines = {} ' +
+        'for i = 1, tdom_iso_nf do ' +
+        "table.insert(lines, BS .. 'directlua{tdom_iso_load_float(' .. i .. ')}') " +
+        "table.insert(lines, BS .. 'shipout' .. BS .. 'box255') end " +
+        'if lines[1] then tex.print(lines) end end}');
+      for (const env of ['figure', 'table']) {
+        L.push(
+          `\\renewenvironment{${env}}[1][tbp]` +
+            `{\\def\\@captype{${env}}\\ifhmode\\@bsphack\\fi` +
+            '\\global\\setbox\\TDOMisofbox\\vbox\\bgroup\\hsize\\columnwidth\\@parboxrestore\\@floatboxreset}' +
+            '{\\par\\vskip\\z@skip\\egroup' +
+            '\\directlua{tdom_iso_float()}' +
+            '\\ifhmode\\@Esphack\\fi}'
+        );
+      }
       L.push('\\makeatother');
       // same dormant-page technique as the resident daemon: typeset on the
       // real MVL (state-faithful spacing), then harvest, vpack and ship
@@ -1537,11 +1563,15 @@ export class CheckpointEngine {
           'local out, tail = nil, nil local n = head ' +
           'while n do local nxt = n.next n.next = nil n.prev = nil ' +
           'if n.id == INS then node.free(n) else if tail then tail.next = n n.prev = tail else out = n end tail = n end n = nxt end ' +
-          'if out then local b = node.vpack(out) ' +
+          // page 1 must ALWAYS exist (floats follow at 2..N): an empty
+          // galley (float-only block) would make \shipout void = no page
+          // and shift every float's page index
+          'local b = out and node.vpack(out) or node.new("hlist") ' +
           'tex.box[255] = b tex.pagewidth = math.max(b.width or 0, 65536) ' +
-          'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536) end}'
+          'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536)}'
       );
       L.push('\\shipout\\box255');
+      L.push('\\directlua{tdom_iso_ship_floats()}');
       L.push('\\csname @@end\\endcsname');
       const jobdir = path.join(this.workDir, `render-${block.id}-${forGalley}`);
       mkdirSync(jobdir, { recursive: true });
@@ -1553,24 +1583,42 @@ export class CheckpointEngine {
       }).catch(() => {});
       const pdf = path.join(jobdir, 'iso.pdf');
       if (!existsSync(pdf)) throw new Error('isolated render produced no PDF');
-      const svgPath = path.join(jobdir, 'iso.svg');
-      await execFileP('pdftocairo', ['-svg', '-f', '1', '-l', '1', pdf, svgPath], { timeout: 30_000 });
-      // the shipped page can come out paper-sized when a class hooks the
-      // shipout (luatexja); the box sits at the origin (\hoffset=-1in), so
-      // cropping the viewBox to the known galley extent is always exact
-      const svg = cropSvg(
-        readFileSync(svgPath, 'utf8'),
-        block.galley.w,
-        block.galley.h + block.galley.d
-      );
-      const prev = this.chunks.get(block.id);
-      this.chunks.set(block.id, {
-        svg,
-        wBp: block.galley.w,
-        hBp: block.galley.h + block.galley.d,
-        v: (prev?.v ?? 0) + 1,
-        forGalley,
+      // page 1 = the block galley; pages 2..N = its float boxes in order —
+      // the same convention as the resident RENDER path
+      const targets = [];
+      if (block.gfx) {
+        targets.push({
+          key: block.id,
+          page: 1,
+          w: block.galley.w,
+          h: block.galley.h + block.galley.d,
+        });
+      }
+      (block.galley.floats ?? []).forEach((f, i) => {
+        if (f.gfx) {
+          targets.push({ key: block.id + '#' + f.n, page: 2 + i, w: f.w, h: (f.h ?? 0) + (f.d ?? 0) });
+        }
       });
+      for (const tgt of targets) {
+        const svgPath = path.join(jobdir, `iso-${tgt.page}.svg`);
+        await execFileP(
+          'pdftocairo',
+          ['-svg', '-f', String(tgt.page), '-l', String(tgt.page), pdf, svgPath],
+          { timeout: 30_000 }
+        );
+        // the shipped page can come out paper-sized when a class hooks the
+        // shipout (luatexja); the box sits at the origin (\hoffset=-1in), so
+        // cropping the viewBox to the known extent is always exact
+        const svg = cropSvg(readFileSync(svgPath, 'utf8'), tgt.w, tgt.h);
+        const prev = this.chunks.get(tgt.key);
+        this.chunks.set(tgt.key, {
+          svg,
+          wBp: tgt.w,
+          hBp: tgt.h,
+          v: (prev?.v ?? 0) + 1,
+          forGalley,
+        });
+      }
       if (block.galleyHash === forGalley) this.#asyncRepaginate();
       rmSync(jobdir, { recursive: true, force: true });
     } finally {
