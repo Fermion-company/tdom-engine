@@ -174,8 +174,20 @@ end
 -- and reports the entry exactly as \protected@write would have expanded it
 -- (real \thechapter.\thesection formatting, class-specific levels). The
 -- orchestrator substitutes only the page number — the one value it owns.
+-- \addcontentsline routes through \addtocontents in modern kernels — the
+-- flag lets the @raw capture skip what the entry capture already recorded.
+tdom_in_acl = false
+
 function tdom_tocline(ext, level, text)
+  if level == '@raw' and tdom_in_acl then return end
   blk_toclines[#blk_toclines + 1] = { e = ext, l = level, t = text }
+  -- stream marker: a tocline's PAGE must come from where it sits in the
+  -- node stream, not from its block (one block can span many pages)
+  pcall(function()
+    local m = node.new('whatsit', node.subtype('special'))
+    m.data = 'tdom:tl:' .. (#blk_toclines - 1)
+    node.write(m)
+  end)
 end
 
 -- Page-style layer events (\pagestyle/\thispagestyle/\pagenumbering/marks):
@@ -589,6 +601,10 @@ local function extract_items(head, parentBox)
         -- block can span pages with \pagenumbering changes in between)
         local ei = tonumber(n.data:match('^tdom:ev:(%d+)')) or 0
         items[#items + 1] = { k = 'ev', n = ei }
+      elseif SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data and n.data:match('^tdom:tl:') then
+        -- tocline marker: same stream-anchoring for contents entries
+        local ti = tonumber(n.data:match('^tdom:tl:(%d+)')) or 0
+        items[#items + 1] = { k = 'tl', n = ti }
       elseif LIT_SUB and n.subtype == LIT_SUB then
         blk_gfx = true
       end

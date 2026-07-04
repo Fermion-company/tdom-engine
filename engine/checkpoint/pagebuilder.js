@@ -211,14 +211,19 @@ class PageBuilder {
           // run — it must not change any break decision)
           if (e.k === 'pagenum') this.pendingFolio = 1;
           if (e.k === 'cleardouble') {
-            // transcription of the classes' \cleardoublepage tail: when the
-            // NEXT page would get an even folio, ship a blank verso with
+            // transcription of the classes' clear-to-parity tail: when the
+            // NEXT page's folio parity is wrong, ship a blank page with
             // \thispagestyle{empty} — the page builder owns folios, so the
             // \ifodd\c@page the class would have evaluated is decided here
             const nextFolio = this.pendingFolio ?? this.folio ?? 1;
-            if (nextFolio % 2 === 0 && this.twoside) this.#emitBlankPage();
+            const wantOdd = (e.a || 'odd') !== 'even';
+            if (this.twoside && (nextFolio % 2 === 1) !== wantOdd) this.#emitBlankPage();
             break; // the marker itself never lands on a page
           }
+          this.contents.push({ e });
+          break;
+        case 'tl':
+          // tocline marker: transparent, page-anchors a contents entry
           this.contents.push({ e });
           break;
         default:
@@ -274,9 +279,9 @@ class PageBuilder {
 
   #contributeGlue(e) {
     if (!this.hasBox) return; // discardables above the first box are dropped
-    // ev markers are transparent: look through them for the legality check
+    // ev/tl markers are transparent: look through them for the legality check
     let pi = this.contents.length - 1;
-    while (pi >= 0 && this.contents[pi].e.t === 'ev') pi--;
+    while (pi >= 0 && (this.contents[pi].e.t === 'ev' || this.contents[pi].e.t === 'tl')) pi--;
     const prev = this.contents[pi];
     const prevNondiscardable =
       prev && (prev.e.t === 'box' || prev.e.t === 'ins' || prev.e.t === 'rule');
@@ -293,10 +298,10 @@ class PageBuilder {
 
   #contributeKern(e) {
     if (!this.hasBox) return;
-    // a kern is a breakpoint when immediately followed by glue (ev markers
-    // are transparent — peek through them)
+    // a kern is a breakpoint when immediately followed by glue (ev/tl
+    // markers are transparent — peek through them)
     let qn = this.qi;
-    while (this.queue[qn] && this.queue[qn].t === 'ev') qn++;
+    while (this.queue[qn] && (this.queue[qn].t === 'ev' || this.queue[qn].t === 'tl')) qn++;
     const next = this.queue[qn];
     if (next && next.t === 'glue' && this.#evalBreak(this.contents.length, 0, e)) {
       return;
@@ -330,9 +335,10 @@ class PageBuilder {
       if (this.feet.length) {
         this.#firePage(this.contents.length, null);
       } else {
-        // page-style event markers must survive the discard: they belong to
-        // whatever page comes next (the discarded material is invisible)
-        const evs = this.contents.filter((c) => c.e.t === 'ev');
+        // page-style event / tocline markers must survive the discard: they
+        // belong to whatever page comes next (the discarded material is
+        // invisible)
+        const evs = this.contents.filter((c) => c.e.t === 'ev' || c.e.t === 'tl');
         this.contents = [];
         this.#resetPage();
         this.contents.push(...evs);
@@ -630,6 +636,7 @@ class PageBuilder {
     this.pageTop = toplist.slice();
     this.pageBot = botlist.slice();
     this.pageEvs = placed.filter((c) => c.e.t === 'ev').map((c) => ({ bid: c.e.bid, i: c.e.i }));
+    this.pageTls = placed.filter((c) => c.e.t === 'tl').map((c) => ({ bid: c.e.bid, i: c.e.i }));
 
     // -- top floats (\@cflt): [box + floatsep]… -floatsep + textfloatsep
     for (let i = 0; i < toplist.length; i++) {
@@ -797,11 +804,13 @@ class PageBuilder {
       topFloats: this.pageTop ?? [],
       botFloats: this.pageBot ?? [],
       evs: this.pageEvs ?? [],
+      tls: this.pageTls ?? [],
     };
     this.pageFeet = null;
     this.pageTop = null;
     this.pageBot = null;
     this.pageEvs = null;
+    this.pageTls = null;
     this.pages.push(page);
   }
 }

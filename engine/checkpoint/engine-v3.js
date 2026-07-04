@@ -423,10 +423,25 @@ export class CheckpointEngine {
     // orchestrator later substitutes only the page argument it owns
     L.push('\\let\\TDOMaddcontentsline\\addcontentsline');
     L.push(
-      '\\renewcommand\\addcontentsline[3]{\\TDOMaddcontentsline{#1}{#2}{#3}' +
+      '\\renewcommand\\addcontentsline[3]{' +
+        // modern kernels route \addcontentsline through \addtocontents —
+        // flag the window so the @raw capture skips the duplicate
+        '\\directlua{tdom_in_acl=true}\\TDOMaddcontentsline{#1}{#2}{#3}\\directlua{tdom_in_acl=false}' +
         '{\\let\\label\\@gobble\\let\\index\\@gobble\\let\\glossary\\@gobble' +
         '\\protected@edef\\TDOM@tocentry{#3}' +
         "\\directlua{tdom_tocline('\\luaescapestring{#1}','\\luaescapestring{#2}'," +
+        "'\\luaescapestring{\\detokenize\\expandafter{\\TDOM@tocentry}}')}}}"
+    );
+    // \addtocontents carries the NON-entry contents material (\chapter's
+    // \addvspace{10pt} between groups in lof/lot/toc, tocloft adjustments…)
+    // — captured verbatim and replayed in document order between the
+    // \contentsline entries, or the contents pages come out compressed
+    L.push('\\let\\TDOMaddtocontents\\addtocontents');
+    L.push(
+      '\\renewcommand\\addtocontents[2]{\\TDOMaddtocontents{#1}{#2}' +
+        '{\\let\\label\\@gobble\\let\\index\\@gobble\\let\\glossary\\@gobble' +
+        '\\protected@edef\\TDOM@tocentry{#2}' +
+        "\\directlua{tdom_tocline('\\luaescapestring{#1}','@raw'," +
         "'\\luaescapestring{\\detokenize\\expandafter{\\TDOM@tocentry}}')}}}"
     );
     // page-style layer events: the orchestrator reconstructs each page's
@@ -463,8 +478,22 @@ export class CheckpointEngine {
     // (with \thispagestyle{empty}, as the classes do) exactly when the
     // assigned folio demands it.
     L.push(
-      "\\renewcommand\\cleardoublepage{\\clearpage\\directlua{tdom_event('cleardouble','','')}}"
+      "\\renewcommand\\cleardoublepage{\\clearpage\\directlua{tdom_event('cleardouble','odd','')}}"
     );
+    // jsclasses (ltjsbook & co) have a whole clear-to-parity family that
+    // \frontmatter/\mainmatter/\chapter use directly — shim each with its
+    // parity target (right/left mapping assumes yoko direction; tate docs
+    // flip these — TODO when vertical typesetting lands)
+    for (const [name, parity] of [
+      ['pltx@cleartooddpage', 'odd'],
+      ['pltx@cleartoevenpage', 'even'],
+      ['pltx@cleartorightpage', 'odd'],
+      ['pltx@cleartoleftpage', 'even'],
+    ]) {
+      L.push(
+        `\\ifdefined\\${name}\\def\\${name}{\\clearpage\\directlua{tdom_event('cleardouble','${parity}','')}}\\fi`
+      );
+    }
     // \cite: record dependencies on bibliography keys
     L.push('\\let\\TDOMcite\\cite');
     L.push("\\renewcommand\\cite[2][]{\\directlua{tdom_cites('\\luaescapestring{#2}')}" +
@@ -1624,20 +1653,33 @@ export class CheckpointEngine {
         if (bid && !blockPage.has(bid + '#float')) blockPage.set(bid + '#float', page.number);
       }
     }
+    // toclines are stream-anchored (tdom:tl markers): the entry's page is
+    // the page its marker landed on, exact even inside multi-page blocks
+    const tlPage = new Map();
+    for (const page of pages) {
+      for (const r of page.tls ?? []) tlPage.set(`${r.bid}:${r.i}`, page.number);
+    }
     const files = { toc: [], lof: [], lot: [] };
     for (const block of this.blocks) {
-      for (const tl of block.galley?.toclines ?? []) {
+      (block.galley?.toclines ?? []).forEach((tl, idx) => {
         const ext = tl.e ?? 'toc';
         if (!files[ext]) files[ext] = [];
+        if (tl.l === '@raw') {
+          // \addtocontents material (inter-group \addvspace etc.): replayed
+          // verbatim in document order between the entries
+          files[ext].push(tl.t);
+          return;
+        }
         // float captions (lof/lot) sit on the page the float landed on when
-        // known; everything else on the block's own page
+        // known; everything else on the page its stream marker reached
         const page =
           (ext !== 'toc' ? blockPage.get(block.id + '#float') : undefined) ??
+          tlPage.get(`${block.id}:${idx}`) ??
           blockPage.get(block.id) ??
           1;
         // 4th (destination) argument required by LaTeX 2020-10 and later
         files[ext].push(`\\contentsline {${tl.l}}{${tl.t}}{${folioText.get(page) ?? page}}{}%`);
-      }
+      });
     }
     const contents = {};
     for (const [ext, lines] of Object.entries(files)) {
@@ -2107,6 +2149,9 @@ function buildStream(block, hasChunk, chunks) {
       // (\pagenumbering resets, \cleardoublepage blank pages).
       const ev = block.galley?.events?.[it.n ?? 0];
       stream.push({ t: 'ev', bid: block.id, i: it.n ?? 0, k: ev?.k, a: ev?.a });
+    } else if (it.k === 'tl') {
+      // tocline marker: page-anchors the contents entry it points at
+      stream.push({ t: 'tl', bid: block.id, i: it.n ?? 0 });
     } else if (it.k === 'box') {
       const unit = {
         blockId: block.id,
