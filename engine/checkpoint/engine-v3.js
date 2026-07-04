@@ -976,7 +976,12 @@ export class CheckpointEngine {
     if (strut > 0.01) L.push(`\\vskip ${strut.toFixed(4)}bp`);
     L.push('\\special{tdom:isostart}');
     L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(prevPd)}}`);
-    if (prevNobreak) L.push('\\noindent');
+    // \noindent only for blocks that CONTINUE a paragraph (start with text).
+    // A block opening a vertical environment (\begin{tcolorbox|mdframed|…})
+    // must NOT be forced into horizontal mode — that suppresses the env's own
+    // \vskip before-skip (tcolorbox breakable) and drops leading glue. Carry
+    // the real \if@nobreak flag instead so the env clears it exactly as print.
+    if (prevNobreak) L.push(startsVertical(block.text) ? '\\makeatletter\\@nobreaktrue\\makeatother' : '\\noindent');
     L.push(block.text.trimEnd() + '}'.repeat(Math.max(0, braceImbalance(block.text))));
     L.push('\\par');
     for (const name of this.counters) {
@@ -1132,7 +1137,8 @@ export class CheckpointEngine {
         }
       }
     }
-    rmSync(jobdir, { recursive: true, force: true });
+    if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
+    else console.error('ISO_KEEP', block.id, jobdir);
     return {
       w: Math.max(st.w ?? 0, ships ? (geo.textwidth ?? 0) : 0),
       h: st.h,
@@ -1783,7 +1789,9 @@ export class CheckpointEngine {
       L.push('\\hbox to0pt{}');
       L.push('\\special{tdom:isostart}');
       L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(prevPd)}}`);
-      if (prevNobreak) L.push('\\noindent');
+      // see #isoCompile: vertical-env blocks keep the @nobreak flag instead
+      // of \noindent, so their own before-skip glue survives
+      if (prevNobreak) L.push(startsVertical(block.text) ? '\\makeatletter\\@nobreaktrue\\makeatother' : '\\noindent');
       L.push(block.text.trimEnd() + '}'.repeat(Math.max(0, braceImbalance(block.text))));
       L.push('\\par');
       L.push(
@@ -2521,6 +2529,15 @@ function miniUnits(items, blockId, chunkRef) {
  * group form {label}{page}{name}{anchor}{ext} — hyperref's \@setref and
  * \hyperref parse exactly five and typeset garbage otherwise.
  */
+/**
+ * True when a block opens with a vertical-mode environment (its content
+ * begins in vertical mode, not by continuing a paragraph). Such blocks must
+ * not be forced into horizontal mode with \noindent in the isolated rescue.
+ */
+function startsVertical(text) {
+  return /^\s*(\\begin\s*\{|\\(chapter|section|subsection|subsubsection|vspace|vskip|clearpage|newpage|noindent)\b)/.test(text);
+}
+
 function labelDefBody(key, val, hy, href) {
   if (key.endsWith('@cref')) return `{{${val}}{[1][1][]1}}`;
   if (hy) return `{{${val}}{1}{}{${href ?? ''}}{}}`;
