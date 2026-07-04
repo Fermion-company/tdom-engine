@@ -126,11 +126,33 @@ function highlightTexSource(source) {
   editorHighlightEl.innerHTML = html + (source.endsWith('\n') ? '\n' : '');
 }
 
+// Re-highlighting rebuilds a document-sized innerHTML — on a large file
+// that's tens of milliseconds. Skip when the text is unchanged (scroll
+// events!) and coalesce keystroke bursts into one paint per frame.
+let lastHighlighted = null;
+let highlightRaf = 0;
+
+function syncHighlightScroll() {
+  // compositor-only: translating the content-sized pre avoids the layout
+  // pass a scrollTop write would force on every scroll event
+  editorHighlightEl.style.transform = `translate(${-editor.scrollLeft}px, ${-editor.scrollTop}px)`;
+}
+
 function syncEditorHighlight() {
   if (!editor || !editorHighlightEl) return;
-  highlightTexSource(editor.value);
-  editorHighlightEl.scrollTop = editor.scrollTop;
-  editorHighlightEl.scrollLeft = editor.scrollLeft;
+  if (editor.value !== lastHighlighted) {
+    lastHighlighted = editor.value;
+    highlightTexSource(lastHighlighted);
+  }
+  syncHighlightScroll();
+}
+
+function scheduleHighlight() {
+  if (highlightRaf) return;
+  highlightRaf = requestAnimationFrame(() => {
+    highlightRaf = 0;
+    syncEditorHighlight();
+  });
 }
 
 // -------------------------------------------------------- topbar selects
@@ -418,7 +440,7 @@ function diffText(oldStr, newStr) {
 }
 
 function scheduleSync() {
-  syncEditorHighlight();
+  scheduleHighlight();
   if (backend === 'lualatex') {
     // per-block compiles cost ~0.5s: coalesce keystrokes
     clearTimeout(debounceTimer);
@@ -472,14 +494,15 @@ function flushSync() {
 editor.addEventListener('compositionstart', () => (composing = true));
 editor.addEventListener('compositionend', () => {
   composing = false;
-  syncEditorHighlight();
+  scheduleHighlight();
   scheduleSync();
 });
 editor.addEventListener('input', () => {
-  syncEditorHighlight();
+  scheduleHighlight();
   if (!composing) scheduleSync();
 });
-editor.addEventListener('scroll', syncEditorHighlight);
+// scroll only moves the overlay — it must never re-render the highlight
+editor.addEventListener('scroll', syncHighlightScroll);
 
 // Preview interaction: Alt+click a glyph/rule jumps to the corresponding
 // source in the editor — the data-src mapping is an engine feature (every

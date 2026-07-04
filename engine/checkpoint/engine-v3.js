@@ -1472,6 +1472,19 @@ export class CheckpointEngine {
    * (full preamble per render) but pixel-exact all the same.
    */
   async #renderIsolated(block, idx) {
+    // isolated renders are FULL lualatex runs of the document preamble —
+    // dozens in parallel overload the machine, hit the 90s timeout and
+    // leave truncated PDFs ('Invalid XRef'). Serialize them; each result
+    // is cached by galley hash so the queue drains once per content.
+    this.isoRenderQueue = (this.isoRenderQueue ?? Promise.resolve()).then(() =>
+      this.#renderIsolatedInner(block, idx).catch((err) => {
+        this.diagnostics.push(`render ${block.id}: ${err.message}`);
+      })
+    );
+    return this.isoRenderQueue;
+  }
+
+  async #renderIsolatedInner(block, idx) {
     const forGalley = block.galleyHash;
     const inflightKey = 'iso:' + block.id + ':' + forGalley;
     this.rendering ??= new Set();
@@ -1583,6 +1596,7 @@ export class CheckpointEngine {
       }).catch(() => {});
       const pdf = path.join(jobdir, 'iso.pdf');
       if (!existsSync(pdf)) throw new Error('isolated render produced no PDF');
+      await waitForPdf(pdf); // %%EOF flushed before pdftocairo reads it
       // page 1 = the block galley; pages 2..N = its float boxes in order —
       // the same convention as the resident RENDER path
       const targets = [];

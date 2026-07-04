@@ -309,14 +309,24 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
   background: #0f172a;
 }
 #editor-highlight {
+  /* scroll-synced via transform (compositor-only): a scrollTop write on a
+     content-sized pre forces layout of the whole 50k-px layer (~40ms per
+     scroll event on large docs) */
   position: absolute;
-  inset: 0;
-  overflow: hidden;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
   margin: 0;
   padding: 14px 16px;
   color: #d5dcec;
+  /* CRITICAL: the highlight pre and the transparent textarea must wrap at
+     EXACTLY the same points or the visible text drifts away from the caret
+     (edits appear to land on the wrong line). Textareas soft-wrap with
+     break-word semantics — pin both elements to identical rules. */
   white-space: pre-wrap;
-  overflow-wrap: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
   tab-size: 2;
   font: 12.5px/1.55 "SF Mono", ui-monospace, Menlo, Consolas, monospace;
   pointer-events: none;
@@ -342,8 +352,17 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
   line-height: 1.55;
   padding: 14px 16px;
   tab-size: 2;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
   position: relative;
   z-index: 1;
+  /* a visible scrollbar would narrow the textarea's wrap width relative to
+     the overflow-hidden highlight layer — same drift as above */
+  scrollbar-width: none;
+}
+#editor::-webkit-scrollbar {
+  display: none;
 }
 #editor::selection {
   background: rgba(92, 200, 255, 0.28);
