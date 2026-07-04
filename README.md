@@ -1,13 +1,14 @@
 # TDOM Engine — TeX DOM Runtime
 
-> **Engine-focused build.** This repository is the realtime-preview core
-> extracted from `fermion-tex-engine`: the UI shows only the TeX source and
-> the live pseudo-PDF, so the preview demonstrates the engine itself
-> (display-list patches, incremental relayout). The menu / workspace editor
-> UI (word editor, insert builder, structure, refs, drawing, tables, AI,
-> code-file workbench) is still in the codebase but disabled behind the
-> `ENGINE_ONLY` flag in `web/app.js`; the click-to-edit preview overlay
-> (block editors, MathLive input) has been removed.
+> **Engine-core build.** This repository is the realtime-preview core
+> extracted from `fermion-tex-engine`. The UI is exactly the TeX source
+> editor, the live pseudo-PDF preview, and the Engine Inspector, so the
+> screen demonstrates the engine itself (display-list patches, incremental
+> relayout, print-identical layout). All the document-editing UI (menu,
+> word editor, insert builder, structure, refs, drawing, tables, AI,
+> code-file workbench, click-to-edit overlay, MathLive) has been removed —
+> `web/app.js` is a ~800-line client that only draws. The full editor lives
+> on in `fermion-tex-engine`.
 
 A **resident, incremental TeX/LaTeX typesetting runtime**: the engine keeps
 the whole document state alive between keystrokes and turns source diffs into
