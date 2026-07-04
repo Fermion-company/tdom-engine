@@ -357,6 +357,7 @@ if (backend === 'checkpoint') {
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
@@ -427,15 +428,17 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
     if (req.method === 'GET' && url.pathname === '/') return serveStatic(res, 'index.html');
+    if (req.method === 'GET' && url.pathname === '/compare') return serveStatic(res, 'compare.html');
     if (
       req.method === 'GET' &&
       (url.pathname === '/app.js' ||
         url.pathname === '/style.css' ||
-        url.pathname === '/math-keyboard-data.js')
+        url.pathname === '/compare.js')
     ) {
       return serveStatic(res, url.pathname.slice(1));
     }
-    if (req.method === 'GET' && url.pathname.startsWith('/mathlive/')) {
+    // vendored pdf.js (used by the side-by-side compare page)
+    if (req.method === 'GET' && url.pathname.startsWith('/pdfjs/')) {
       return serveStatic(res, url.pathname.slice(1));
     }
     if (req.method === 'GET' && url.pathname === '/doc') return json(res, docPayload());

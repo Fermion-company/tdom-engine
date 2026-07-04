@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TDOM Engine — 比較 (pdf.js ↔ 擬似PDF)</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  /* Full-bleed dark compare view: no white container, the two documents
+     fill the whole viewport. Only the page sheets themselves are white. */
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+  body.compare { display: flex; flex-direction: column; overflow: hidden; }
+
+  #cmp-bar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 8px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  #cmp-bar .brand { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  #cmp-bar .brand .logo { color: var(--accent); font-size: 18px; }
+  #cmp-bar .spacer { flex: 1; }
+  #cmp-bar button {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 4px 12px; font-size: 13px; cursor: pointer;
+  }
+  #cmp-bar button:hover { border-color: var(--accent); }
+  #cmp-bar .zoom { display: inline-flex; align-items: center; gap: 6px; }
+  #cmp-bar label.sync { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+  #cmp-status { color: var(--muted, #8a93a6); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  #cmp-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 1fr; }
+  .cmp-col { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+  .cmp-col:last-child { border-right: 0; }
+  .cmp-col-head {
+    flex: none; padding: 6px 14px; font-size: 12px; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--muted, #8a93a6);
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .cmp-col-head .tag { color: var(--accent-2); }
+  .cmp-scroll {
+    flex: 1; min-height: 0; overflow: auto;
+    padding: 20px 0 60px; display: flex; flex-direction: column; align-items: center; gap: 20px;
+  }
+  /* page sheets sized by a shared width var so both columns match exactly */
+  .cmp-page {
+    position: relative; width: var(--page-w, 560px); flex: none;
+    background: #fff; box-shadow: var(--page-shadow, 0 2px 12px rgba(0,0,0,.5)); border-radius: 2px;
+  }
+  .cmp-page canvas { display: block; width: 100%; height: auto; border-radius: 2px; }
+  .cmp-page svg { display: block; width: 100%; height: auto; }
+  .cmp-page .chunkwin { position: absolute; overflow: hidden; }
+  .cmp-page .chunkwin img.chunk { display: block; width: 100%; height: auto; user-select: none; }
+  .cmp-pageno {
+    position: absolute; top: -18px; left: 0; font-size: 11px;
+    color: var(--muted, #8a93a6); text-transform: none; letter-spacing: 0;
+  }
+  .cmp-empty { color: var(--muted, #8a93a6); padding: 40px; text-align: center; font-size: 13px; }
+  .cmp-page.flash { outline: 2px solid var(--accent-2); }
+</style>
+</head>
+<body class="compare">
+  <header id="cmp-bar">
+    <span class="brand"><span class="logo">Ψ</span> TDOM 比較</span>
+    <div class="zoom">
+      <button id="cmp-zoom-out" title="縮小">−</button>
+      <span id="cmp-zoom-level">100%</span>
+      <button id="cmp-zoom-in" title="拡大">＋</button>
+      <button id="cmp-zoom-fit" title="幅に合わせる">合わせる</button>
+    </div>
+    <label class="sync"><input type="checkbox" id="cmp-sync" checked> スクロール同期</label>
+    <button id="cmp-recompile" title="本物のPDFをlualatexで再コンパイル">本物のPDFを再生成</button>
+    <span class="spacer"></span>
+    <span id="cmp-status"></span>
+  </header>
+  <div id="cmp-body">
+    <section class="cmp-col" id="cmp-col-real">
+      <div class="cmp-col-head">左: 本物のPDF <span class="tag">lualatex → pdf.js</span></div>
+      <div class="cmp-scroll" id="cmp-real"><div class="cmp-empty">読み込み中…</div></div>
+    </section>
+    <section class="cmp-col" id="cmp-col-engine">
+      <div class="cmp-col-head">右: 擬似PDF <span class="tag" id="cmp-engine-backend">TDOMエンジン</span></div>
+      <div class="cmp-scroll" id="cmp-engine"><div class="cmp-empty">読み込み中…</div></div>
+    </section>
+  </div>
+  <script type="module" src="/compare.js"></script>
+</body>
+</html>

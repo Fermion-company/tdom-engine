@@ -4952,6 +4952,10 @@ document.getElementById('btn-pdf').addEventListener('click', () => {
   window.open('/pdf', '_blank');
 });
 
+document.getElementById('btn-compare')?.addEventListener('click', () => {
+  window.open('/compare', '_blank');
+});
+
 document.getElementById('btn-reset').addEventListener('click', async () => {
   const doc = await fetch('/open', { method: 'POST', body: '{}' }).then((r) => r.json());
   adoptDoc(doc);

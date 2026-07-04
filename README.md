@@ -50,6 +50,17 @@ Requirements:
 Run the test suite with `npm test` (the LuaLaTeX integration tests skip
 automatically when no TeX installation is found).
 
+## Compare view (pdf.js ↔ pseudo-PDF)
+
+The **比較** button in the header opens `/compare`, a full-bleed side-by-side
+page: on the **left**, the *real* PDF — a full 2-pass `lualatex` compile of the
+current source (`/pdf`), rendered by a vendored [pdf.js](web/pdfjs/); on the
+**right**, the engine's live pseudo-PDF (the display lists drawn exactly as the
+main preview). Both columns render at one shared width so page *N* sits
+pixel-for-pixel over page *N*; scroll is synced and the engine side stays live
+over SSE (hit **本物のPDFを再生成** to recompile the left after edits). This is
+the visual counterpart to the `tools/verify-layout.mjs` referee.
+
 **Full implementation guide (Japanese):** [docs/](docs/README.md) —
 a 7-chapter walkthrough of the entire codebase, written for readers
 without prior TeX internals knowledge: how TeX engines are built, what we
