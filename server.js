@@ -315,7 +315,7 @@ async function createEngine() {
       docDir: path.join(ROOT, 'samples'),
     }),
     backend: 'checkpoint',
-    sample: readFileSync(path.join(ROOT, 'samples', 'demo-lua.tex'), 'utf8'),
+    sample: readFileSync(path.join(ROOT, 'samples', 'stress-test-ja.tex'), 'utf8'),
   };
 }
 
