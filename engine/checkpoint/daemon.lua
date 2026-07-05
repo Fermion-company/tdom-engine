@@ -48,6 +48,24 @@ local SP2BP = 65781.76
 local function bp(sp) return math.floor(((sp or 0) / SP2BP) * 1000000 + 0.5) / 1000000 end
 
 local DUMMY_ATTR = 8123
+local LASTSKIP_ATTR = 8124 -- marks the \lastskip primer glue (see tdom_prime_lastskip)
+
+-- A block is harvested on a freshly-seeded page, so \lastskip is 0 when it
+-- starts — but in a continuous run the previous block's trailing \addvspace
+-- would still be on the list, and this block's leading \addvspace MAXes
+-- against it (LaTeX \addvspace merges, never sums). Contribute a marked
+-- primer glue of the previous block's trailing skip so \lastskip is correct;
+-- extract_items drops the primer (it's already counted in the previous
+-- block's galley). Without it, tcolorbox/list after-skip + a following
+-- \section before-skip come out summed instead of maxed.
+function tdom_prime_lastskip(sp)
+  sp = tonumber(sp) or 0
+  if sp == 0 then return end
+  local g = node.new('glue')
+  g.width = sp
+  node.set_attribute(g, LASTSKIP_ATTR, 1)
+  node.write(g)
+end
 
 -- ---------------------------------------------------------------- json
 
@@ -561,6 +579,9 @@ local function extract_items(head, parentBox)
     local id = n.id
     if is_dummy(n) then
       -- the page-keeper box: not document content
+    elseif not parentBox and node.has_attribute(n, LASTSKIP_ATTR) then
+      -- the \lastskip primer: only present to make this block's leading
+      -- \addvspace merge; its height belongs to the PREVIOUS block's galley
     elseif id == HLIST or id == VLIST or id == RULE then
       local h = n.height or 0
       local d = n.depth or 0
@@ -885,6 +906,22 @@ function tdom_report()
   -- the orchestrator's convergence check re-typesets downstream blocks
   -- whenever they move (same mechanism as counters).
   blk_counters['tdom@pd'] = math.floor(tex.nest[0].prevdepth or 0)
+  -- trailing vertical skip (for the NEXT block's \addvspace merge): the last
+  -- glue on the list before harvest, in sp. Non-glue tail = no mergeable skip.
+  do
+    pcall(function() tex.triggerbuildpage() end)
+    local list = tex.lists.contrib_head or tex.lists.page_head
+    local t = list and node.tail(list)
+    local ls = 0
+    while t do
+      if is_dummy(t) then
+        -- keeper box: keep scanning past it
+      elseif t.id == GLUE then ls = t.width break
+      else break end
+      t = t.prev
+    end
+    blk_counters['tdom@ls'] = math.floor(ls)
+  end
   local head = harvest_nodes()
   colstack = {}
   pending_fmarks = {}

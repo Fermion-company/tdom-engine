@@ -670,9 +670,24 @@ export class CheckpointEngine {
           defs.push(`\\global\\@namedef{${cs}}${labelDefBody(key, val, this.geometry?.hyperref === 1, this.hrefTable?.get(key))}`);
         }
       }
-      const prelude = defs.length
-        ? `\\makeatletter ${defs.join(' ')}\\makeatother\n`
-        : '';
+      // \lastskip primer: this block is typeset on a freshly-seeded page, so
+      // \lastskip is 0 — but in a continuous run the previous block's trailing
+      // \addvspace would still be present, and this block's leading \addvspace
+      // MAXes against it. Re-establish \lastskip from the previous block's
+      // exit tdom@ls (sp) so the merge is exact; the daemon marks the primer
+      // and drops it from the harvest (it is already in the previous galley).
+      // Prime ONLY when this block opens with an \addvspace-emitting construct
+      // (sectioning, list/box environment, \vspace…) that MERGES against
+      // \lastskip. A plain paragraph keeps \lastskip untouched and adds its own
+      // material, so a primer there would just sit as extra height.
+      let primer = '';
+      if (idx > 0 && startsAddvspace(block.text)) {
+        const pv = JSON.parse(this.blocks[idx - 1].stateVec ?? '[]');
+        const ls = pv.length ? pv[pv.length - 1] : 0;
+        if (ls) primer = `\\directlua{tdom_prime_lastskip(${Math.round(ls)})}`;
+      }
+      const prelude =
+        (defs.length ? `\\makeatletter ${defs.join(' ')}\\makeatother\n` : '') + primer;
       // Mid-typing safety: an unclosed brace makes a \long macro argument
       // scan past the injected \par/report tokens to EOF and kills the child
       // (the old \vbox wrapper stopped it structurally). Auto-close the
@@ -831,8 +846,9 @@ export class CheckpointEngine {
     this.counters.forEach((c, i) => {
       entry[c] = prevVec[i] ?? 0;
     });
-    const prevPd = idx > 0 && prevVec.length >= 2 ? prevVec[prevVec.length - 2] : -65536000;
-    const prevNobreak = idx > 0 && prevVec.length >= 1 ? prevVec[prevVec.length - 1] === 1 : false;
+    // tail layout: [...counters, tdom@pd, tdom@nobreak, tdom@ls]
+    const prevPd = idx > 0 && prevVec.length >= 3 ? prevVec[prevVec.length - 3] : -65536000;
+    const prevNobreak = idx > 0 && prevVec.length >= 2 ? prevVec[prevVec.length - 2] === 1 : false;
     const text = this.store.get(this.file);
     const bounds = documentBounds(text);
     const L = [];
@@ -976,6 +992,18 @@ export class CheckpointEngine {
     if (strut > 0.01) L.push(`\\vskip ${strut.toFixed(4)}bp`);
     L.push('\\special{tdom:isostart}');
     L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(prevPd)}}`);
+    // \lastskip primer: a rescued block opening an \addvspace-emitting env
+    // (tcolorbox/mdframed before-skip) must MERGE against the previous block's
+    // trailing skip, but the isostart whatsit above resets \lastskip to 0.
+    // Re-establish it here (after isostart, marked with LASTSKIP_ATTR so the
+    // harvest drops the primer — it is already in the previous block's galley).
+    const prevLsSp = idx > 0 ? prevVec[prevVec.length - 1] ?? 0 : 0;
+    if (prevLsSp > 0 && startsAddvspace(block.text)) {
+      L.push(
+        `\\directlua{local g=node.new('glue') g.width=${Math.round(prevLsSp)} ` +
+          `node.set_attribute(g, 8124, 1) node.write(g)}`
+      );
+    }
     // \noindent only for blocks that CONTINUE a paragraph (start with text).
     // A block opening a vertical environment (\begin{tcolorbox|mdframed|…})
     // must NOT be forced into horizontal mode — that suppresses the env's own
@@ -1017,7 +1045,9 @@ export class CheckpointEngine {
         'end ' +
         'local out, tail = nil, nil local n = head ' +
         'while n do local nxt = n.next n.next = nil n.prev = nil ' +
-        'if n.id == INS then node.free(n) else if tail then tail.next = n n.prev = tail else out = n end tail = n end n = nxt end ' +
+        // drop footnote inserts AND the \lastskip primer (attr 8124): the
+        // primer only set \lastskip for the leading \addvspace merge
+        'if n.id == INS or node.has_attribute(n, 8124) then node.free(n) else if tail then tail.next = n n.prev = tail else out = n end tail = n end n = nxt end ' +
         'local SP2BP = 65781.76 ' +
         'local function bp(sp) return math.floor(((sp or 0) / SP2BP) * 1000000 + 0.5) / 1000000 end ' +
         // no literal backslash may appear in inline Lua (TeX would tokenize
@@ -1139,6 +1169,14 @@ export class CheckpointEngine {
     }
     if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
     else console.error('ISO_KEEP', block.id, jobdir);
+    // trailing skip for the NEXT block's \addvspace merge: last glue item, sp
+    const state = { ...(st.state ?? {}) };
+    let trailLs = 0;
+    for (const it of items) {
+      if (it.k === 'glue' || it.k === 'kern') trailLs = it.a ?? 0;
+      else if (it.k === 'box') trailLs = 0;
+    }
+    state['tdom@ls'] = Math.round(trailLs * 65781.76);
     return {
       w: Math.max(st.w ?? 0, ships ? (geo.textwidth ?? 0) : 0),
       h: st.h,
@@ -1147,7 +1185,7 @@ export class CheckpointEngine {
       labels: (st.labels ?? []).map(([k, v, h]) => (h != null ? { k, v, h } : { k, v })),
       toclines: (st.toclines ?? []).map(([e, l, t]) => ({ e, l, t })),
       refs: st.refs ?? [],
-      state: st.state ?? {},
+      state,
       chunks,
     };
   }
@@ -1232,6 +1270,7 @@ export class CheckpointEngine {
       ...this.counters.map((c) => galley.state?.[c] ?? 0),
       galley.state?.['tdom@pd'] ?? 0,
       galley.state?.['tdom@nobreak'] ?? 0,
+      galley.state?.['tdom@ls'] ?? 0,
     ]);
     block.gfx = !!galley.gfx;
     // rescued blocks already carry their print-identical chunks — the
@@ -1725,10 +1764,10 @@ export class CheckpointEngine {
         entry[c] = prevVec[i] ?? 0;
       });
       // cross-block layout state from the previous block's REAL exit vector:
-      // [..counters.., tdom@pd, tdom@nobreak] — prevdepth reproduces the
-      // exact leading interline glue, @nobreak the post-heading \everypar
-      const prevPd = idx > 0 && prevVec.length >= 2 ? prevVec[prevVec.length - 2] : -65536000;
-      const prevNobreak = idx > 0 && prevVec.length >= 1 ? prevVec[prevVec.length - 1] === 1 : false;
+      // [..counters.., tdom@pd, tdom@nobreak, tdom@ls] — prevdepth reproduces
+      // the exact leading interline glue, @nobreak the post-heading \everypar
+      const prevPd = idx > 0 && prevVec.length >= 3 ? prevVec[prevVec.length - 3] : -65536000;
+      const prevNobreak = idx > 0 && prevVec.length >= 2 ? prevVec[prevVec.length - 2] === 1 : false;
       const text = this.store.get(this.file);
       const bounds = documentBounds(text);
       const L = [];
@@ -2536,6 +2575,17 @@ function miniUnits(items, blockId, chunkRef) {
  */
 function startsVertical(text) {
   return /^\s*(\\begin\s*\{|\\(chapter|section|subsection|subsubsection|vspace|vskip|clearpage|newpage|noindent)\b)/.test(text);
+}
+
+/**
+ * True when a block opens with a construct that emits leading vertical space
+ * via LaTeX's \addvspace (sectioning commands, list/box environments, the
+ * \…skip family) — i.e. it MERGES (maxes) against \lastskip rather than
+ * summing. Only such blocks want the \lastskip primer; a plain paragraph
+ * keeps \lastskip and would just accrue the primer as extra height.
+ */
+function startsAddvspace(text) {
+  return /^\s*(\\begin\s*\{|\\(chapter|section|subsection|subsubsection|paragraph|subparagraph)\b|\\(addvspace|vspace|smallskip|medskip|bigskip)\b)/.test(text);
 }
 
 function labelDefBody(key, val, hy, href) {
