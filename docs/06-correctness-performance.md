@@ -1,141 +1,75 @@
-# 第6章 性能・正しさ・限界 — 定量評価と罠のアーカイブ
+# 06. 正確性確認・性能観測・現在の制限
 
-## 6.1 性能実測
+この章は、現行実装がどこで正確性を確認し、どこに制限を持つかを整理する。将来の性能目標ではなく、現在のコードとテストから読める地図である。
 
-環境：Apple Silicon Mac / TeX Live 2024 / Node 22。文書は
-`samples/demo-lua.tex`（23ブロック・3ページ・amsmath/amsthm/TikZ/
-booktabs/脚注/フロート/目次/文献）。
+## 6.1 正確性を支える経路
 
-| 操作 | v1 | **v3 checkpoint** |
-|---|---|---|
-| 初回オープン（プロセス起動＋全ブロック） | 2.4s | 0.9–1.6s |
-| 1単語編集：エンジン内組版 | 420–455ms | **3.7–14ms** |
-| 1単語編集：キー押下→ページ差替え完了（ブラウザ実測） | 〜740ms | **29ms** |
-| 式1本挿入→下流の式番号・参照が全更新 | 1.4s（15ブロック） | **52ms**（15ブロック） |
-| ラベル改名（前方＋後方参照の追随込み） | 〜500ms | 27–57ms |
-| 日本語段落の編集（luatexja） | — | **5.2ms** |
-| TikZ座標の編集 | 〜600ms | 即時近似→**1–2sで精密SVG自動置換** |
-| undo | 1ms（キャッシュ） | 数ms（再組版） |
-| プリアンブル変更（構造変更） | 1.3–1.8s | 〜1s（全再構築） |
+現行 engine は、すべてを自前組版で完全再現しようとしていない。低レイテンシの構造化表示と、canonical TeX 出力を組み合わせる。
 
-### なぜ29msが実質的な下限か
+| 経路 | 役割 |
+| --- | --- |
+| resident TeX daemon | 編集 block を速く再処理し、real MVL・refs・labels・font 情報を返す |
+| page builder | TeX の page builder と LaTeX output routine 相当を JavaScript 側で再構成する |
+| canonical layer | 通常の `lualatex` で PDF/SVG/text/paper 情報を作る正本 |
+| visual fidelity gate | structured/exact chunk が canonical と食い違う block を demotion する |
+| safety gate | page-global に危険な構文を structured path から外す |
+| block-level rescue | 局所的に output routine を変える block を exact chunk として扱う |
 
-1編集の不可避コストを分解します：
+PDF export は canonical layer から出る。checkpoint 表示 state は編集体験のための高速表示であり、最終 PDF の正本ではない。
 
-```text
-fork(COWスナップショット分岐)             0.21ms   ← OSの下限
-編集段落のKnuth-Plass（本物のTeX）        1〜5ms   ← 品質を落とさない限り不可避
-収束検証にもう1ブロック                    1〜5ms   ← 正しさの検算コスト
-ノード走査＋JSON＋ローカルTCP             1〜3ms
-ブラウザのSVG差替え＋描画                  3〜8ms   ← 描画パイプラインの都合
-```
+## 6.2 テスト
 
-合計が実測の4〜14ms（組版側）／29ms（画面まで）と整合します。残りを
-削る余地（バイナリプロトコル化等）はありますが、人間の知覚閾（50〜
-100ms）を既に大きく下回っており、**体感上の改善は不可能**です。
-また全項目が「編集された段落の量」にのみ依存し**文書サイズに非依存**
-（O(編集範囲)）である点が、全コンパイル方式との本質的な差です。
+`npm test` は次の 5 ファイルを実行する。
 
-## 6.2 正しさをどう担保しているか
+| ファイル | 件数 | 主な対象 |
+| --- | ---: | --- |
+| `tests/canonical.test.js` | 9 | canonical PDF/SVG/text/paper、aux fixed point |
+| `tests/engine-v3.test.js` | 14 | checkpoint engine、編集、rescue/opaque、PDF export |
+| `tests/fidelity.test.js` | 12 | verify token、page-window、demotion 判定 |
+| `tests/hot-path.test.js` | 7 | 編集ホットパス、bounded verification、background chain |
+| `tests/server-api.test.js` | 2 | server API と DOM/PDF API |
 
-増分システムの危険は「差分の取りこぼしによる、静かに間違った表示」
-です。本エンジンは4つの独立した機構で防いでいます。
+合計は 44 件である。一部テストは `lualatex` など外部 TeX toolchain が無い環境では skip される。
 
-1. **収束の自己検証**（第3章§3.8）：停止条件そのものが
-   「クリーンなブロックを実際に組み直して出力一致を確認」という検算。
-   依存の列挙漏れがあっても、状態が実際に変わっていれば一致せず
-   継続する。
-2. **状態値は常にTeX産**：カウンタは `\value` の実測、ラベルは
-   `\label` 実行時の `\@currentlabel`、目次のページ番号は実ページ
-   分割から。オーケストレータは番号を**一切自前計算しない**。
-3. **精密レンダー層**：グリフ近似で表現しきれないもの（TikZ・大型
-   数式記号）は、本物のPDF出荷→SVG化が最終表示を上書きする。
-4. **フルコンパイルという神託**：`GET /pdf` は素のlualatex 2パス。
-   ライブ表示とエクスポートの一致（式番号・参照値まで確認済み）が、
-   増分計算全体のend-to-end検算になっている。
+## 6.3 safety gate の現在地
 
-## 6.3 テスト30本の一覧
+`engine/checkpoint/safety.js` は、document-level に structured path を壊す package/body token を検出する。現在の unsafe には、custom output routine、shipout hook、`twocolumn`、`marginpar`/`marginnote`、`newgeometry`、`enlargethispage`、`balance` などが含まれる。
 
-`npm test`（TeX無し環境ではlualatex系が自動skip）。
+`pdfpages` の読み込み自体は unsafe package ではない。`\includepdf` は block-level rescue の対象である。
 
-**tests/engine.test.js — v0内部エンジン（10本）**
-開いてDOM構築／1単語編集のdirty最小性（他ページのDLハッシュ不変まで
-確認）／空白のみ編集で再レイアウトゼロ・パッチゼロ／マクロ再定義は
-利用ブロックのみ／ラベル改名は参照ブロックのみ＋`??`往復／ページ
-再利用と収束／節挿入のカウンタ連鎖／入力途中の不正ソース耐性／
-PDF構造妥当性／ウォーム時性能。
+## 6.4 block-level rescue
 
-**tests/engine-lua.test.js — v1（8本）**
-実ラベル値（thm 2.1等）／1ブロックコンパイル＋1ページパッチ＋他ページ
-ハッシュ不変／undo=0コンパイル／式挿入の再番号カスケードと復元／
-マクロ再定義の利用ブロック限定（個数一致まで）／ラベル依存／破損
-ブロック生存／フルPDF。
+`engine-v3.js` の `OUTPUT_HIJACK_RE` に一致する block は、通常の構造化 chunk ではなく exact chunk として扱われる。現行対象は、`multicols`、`paracol`、`longtable`、`landscape`、`mdframed`、`framed`、`shaded`、breakable `tcolorbox`、`\includepdf` である。
 
-**tests/engine-v3.test.js — v3 checkpoint（12本）**
-常駐チェーンと実ラベル（fig:plot=1, thm:main=2.1, cite番号）／1桁ms
-編集とページ採用／グリフrunの実在（座標・fam・rule）／式挿入カスケード
-と復元／TikZのgfx判定と精密チャンク到着／プリアンブル変更の正直
-リブート／不正入力生存／**脚注がページ下部・脚注罫の描画**／
-**フロートのtop/bottom配置と実キャプション番号**／**目次エントリの
-ライブ組版**／**文献引用の解決とbibitem改名の追跡**／**ラベル改名の
-後方伝播（`??`化→復元）**。
+これは文書全体を opaque にする処理ではない。局所 block を exact に寄せ、周辺 block は可能なら checkpoint path に残す。
 
-## 6.4 既知の限界（正直な一覧）
+## 6.5 visual fidelity gate
 
-| 項目 | 現状 | 備考 |
-|---|---|---|
-| 二段組（twocolumn） | 未対応 | pagebuilderは単一コラム前提 |
-| `\marginpar` | 未対応 | |
-| `longtable`（ページまたぎ表） | 未対応 | 環境は1ブロック＝1ボックス前提 |
-| 脚注のページまたぎ分割 | 分割しない（丸ごと次ページ送り） | TeXの`\vsplit`相当が必要 |
-| `\clearpage`のフロート強制放流 | 未対応 | 通常の繰越配置のみ |
-| `\footnoterule`等の見た目 | 固定近似（0.4×版面幅・間隙6bp） | クラスのカスタム罫は反映されない |
-| flushbottom（版面下端揃え） | raggedbottom相当 | ページ内グルーの伸長を未実装 |
-| `\setcounter`絶対代入 | 収束はするが余分な再組版が出得る | デルタ/検証機構の設計上の周辺 |
-| ヘッダ・フッタ（pagestyle） | ページ番号のみ自前描画 | `\markboth`系のマーク未捕捉 |
-| ライブ層の色付きテキスト | colorstackの rg/g/k のみ | spot color等は精密層任せ |
-| 大型数式記号の即時層 | 近似（精密層が1–2秒で確定） | OpenType math variantはブラウザから選べない |
-| `--shell-escape` 必須 | セキュリティ上の注意 | 信頼できる文書のみ。サンドボックス化は今後の課題 |
-| Windows | 未検証（fork前提） | WSL2では動く見込み。ネイティブはv1へのフォールバック想定 |
+`fidelity.js` は canonical page text と chunk text から verify token を作り、近傍 page window で containment を見る。token は文字 bigram ベースで、ラテン語だけを単語、CJK だけを bigram と分ける実装ではない。
 
-いずれも「プリアンブル変更＝全再構築でよい」と同じ設計判断の内側に
-あり、アーキテクチャの作り直しなしに追加実装できる位置にあります。
+page count mismatch は report されるが、それだけで即座に文書全体を opaque にするわけではない。demotion は block/chunk 単位で起きる。
 
-## 6.5 罠のアーカイブ — 開発中に実際に踏んだ18の地雷
+## 6.6 現在の制限
 
-同種の実装を試みる人への最大の贈り物はこの表だと考えています。
-すべて本セッションで実際に遭遇し、解決したものです。
+| 領域 | 現在の扱い |
+| --- | --- |
+| custom output routine | document-level unsafe として structured path から外れる |
+| two-column / margin notes / geometry change | safety gate の対象 |
+| block-local output hijack | block-level rescue で exact chunk 化 |
+| footnote splitting | page builder は footnote を扱うが、TeX と同じ分割を完全再現する実装ではない |
+| float placement | 代表的な placement は扱うが、package が output routine を置き換える場合は rescue/opaque 側 |
+| shell escape | resident root は `tdomfork.c` の読み込みに `--shell-escape` を使う。canonical/isolated compile は shell-escape flag を渡さない |
+| POSIX fork | resident daemon は `tdomfork.c` に依存するため、ネイティブ Windows 実行は現在の対象外 |
+| external tools | `lualatex`、`pdftocairo`、`pdftotext`、`pdfinfo` の有無で canonical 取得範囲が変わる |
 
-| # | 症状 | 真因 | 解決 |
-|---|---|---|---|
-| 1 | lualatexで `require('ffi')` が「ARM未対応」 | 非JIT版LuaTeX同梱のluaffiはx86のみ | Lua C APIで書いた71行の`.so`を`package.loadlib`（`--shell-escape`必須） |
-| 2 | `tex.takebox` がnil | LuaHBTeX 1.18のtexテーブルに存在しない | `node.copy_list`で複製 |
-| 3 | `\shipout`で「Incompatible list can't be unboxed」 | box255と元レジスタが**同一ノードリストを共有**、片方のnil代入が実体を解放 | 所有権を意識し必ずcopy_list |
-| 4 | 注入した`\newlabel`が「Can be used only in preamble」 | LaTeXが`\newlabel`を`\@onlypreamble`化 | 内部形式 `\global\@namedef{r@key}{{v}{p}}` を直接実行 |
-| 5 | ディスプレイ数式の`\label`が捕捉されない | amsmathはパッケージ読込時に`\let`した`\ltx@label`経由で呼ぶ（後付けシムを迂回） | `\ltx@label`もシム |
-| 6 | 後で定義したラベルの参照が永遠に`??`／消したラベルが亡霊化 | `token.set_macro`の定義は**その子孫プロセスにしか存在しない**（fork系統の分岐） | ジョブ毎に参照キーの現在値プレリュード注入＋消滅キーは`\let…\relax`で中和 |
-| 7 | ラベル改名後、旧参照が`??`に戻らない | 消滅ラベルの検出処理が後方参照パスの**後**に走っていた | 掃き出しを前へ移動（処理順序バグ） |
-| 8 | 目次の2行目以降が重なって文字化け | **LaTeX 2020-10以降`\contentsline`は4引数**（hyperref用宛先）。3引数だと次行を引数として食う | `{ページ}{}%` と空の第4引数を出力 |
-| 9 | 目次が2回目以降空になる | `\@starttoc`は読込後に`\openout`で同名ファイルを**即トランケート** | 読み出し専用版に`\renewcommand` |
-| 10 | TikZが右下にずれて数片しか描かれない | TeXの出荷原点は(1in,1in)。タイトページでは中身がほぼ全部ページ外 | driver.texで`\hoffset=-1in \voffset=-1in` |
-| 11 | TikZブロックでLuaが「number has no integer representation」 | Lua 5.3の`%02x`は浮動小数を拒否（色値 r*255） | `math.floor`＋クランプ |
-| 12 | 数式のπやギリシャ文字が消える | cmmiのスロット0x19等**32未満**が、JSON安全化の制御文字除去で消えていた | 0xE000+slotのPUAへシフトして輸送、受信側で復元 |
-| 13 | Σ・√が浮いて表示される | cmexは**インクが基準点より下**という特殊設計。Unicode双子は通常ベースライン | TeX側実寸(gh/gd)＋双子実寸(TWIN計測)でインク上端を厳密整列。大型スロットは精密層へ |
-| 14 | レンダー子のDONEが来ず60秒待つ | LaTeX下では生の`callback.register`が禁止（luatexbaseが所有） | `luatexbase.add_to_callback('finish_pdffile',…)` |
-| 15 | tikz入りプリアンブルのformatでPDF出力不能 | mylatexformatダンプにpgfのPDFオブジェクト参照が焼き込まれる既知問題（v1） | ダンプ後に1ページ出荷するスモークテスト→失敗時はformat放棄 |
-| 16 | 見出しの後に「?」が印字される（v0） | ファイル書込みツール経由でem space(U+2003)が普通の空白に化けた | ソース中の特殊文字は`\u`エスケープで書く |
-| 17 | UI経由の編集だけ2秒遅い | **非表示タブのsetTimeoutをブラウザが1秒粒度にスロットル**（計測環境の問題） | checkpointではデバウンス廃止（直列チェーンが自然合流）。実利用（可視タブ）では元々発生しない |
-| 18 | ジョブ子が親のソケットで喋り混線 | forkはFDを複製する | 子は継承FDを閉じて自分の接続を張り直す（`reconnect`） |
+## 6.7 性能値の読み方
 
-## 6.6 今後の拡張余地
+docs では固定の性能保証値を置かない。実際のレイテンシは TeX toolchain、文書サイズ、dirty block 数、exact render の有無、canonical cooldown、外部 PDF tool の有無に依存する。
 
-優先度順の私見：
+現行コード上の大きな挙動は次である。
 
-1. **二段組と`\clearpage`**：pagebuilderの拡張のみで到達可能
-2. **脚注分割**：insミニガレーを行単位で持っているので、ページ残量に
-   合わせた分割は実装可能な位置にある
-3. **エラーUX**：ジョブ子のTeXエラーを行位置つきでエディタに波線表示
-   （ログは既に取れている）
-4. **チェックポイントのディスク退避**：メモリ上限をさらに超える文書
-   規模への備え（CRIU的アプローチ）
-5. **Windowsネイティブ**：fork不在環境向けに、v1方式との自動ハイブリッド
+- foreground verification には bounded budget がある。
+- background chain は idle 後に走る。
+- high-fidelity render は dirty block 数や render budget によって抑制される。
+- canonical layer は cooldown と cache を持つ。
+- export PDF は表示 state ではなく canonical 経路で作る。

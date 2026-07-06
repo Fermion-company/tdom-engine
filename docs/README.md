@@ -1,45 +1,33 @@
-# Fermion TeX Engine 完全実装解説書
+# TDOM Engine 実装地図
 
-このディレクトリは、Fermion TeX Engine（TeX DOM Runtime）の実装を
-**TeXの深い知識がない読者でも**理解できるように書かれた解説書です。
-リポジトリの全ソースコード（約7,700行）をコードレベルで説明します。
+この `docs/` は、現在のリポジトリに存在する実装を読むための地図である。未実装案、性能目標、ロードマップはここには置かない。
 
-## 読む順序
+実装と食い違う記述があれば、実装を正とする。特にこの版の実装は `checkpoint` バックエンド単独で動作しており、旧 v0/v1 バックエンドの選択機構は存在しない。
 
-| 章 | ファイル | 内容 | 対象読者 |
-|---|---|---|---|
-| 1 | [01-tex-background.md](01-tex-background.md) | TeXとは何か。エンジンはどんな言語でどう開発されてきたか。バッチモデル・ボックスとグルー・出力ルーチンなど、本書を読むのに必要な周辺知識のすべて | TeXを知らない人はここから |
-| 2 | [02-overview.md](02-overview.md) | 私たちが何を作ったか（3つのバックエンドと進化）、**何を変更し、何を一切変更していないか**、リポジトリの地図 | 全員 |
-| 3 | [03-checkpoint-engine.md](03-checkpoint-engine.md) | 本体：fork()チェックポイント式常駐エンジンの完全詳解。Cシム・TeX内デーモン・オーケストレータ・通信プロトコル・編集パイプライン・ライブ出力ルーチン | 実装を読む人 |
-| 4 | [04-renderer-and-fonts.md](04-renderer-and-fonts.md) | グリフ直接描画、数式フォント置換（Type1→OTF双子）、ブラウザ側の描画契約 | 実装を読む人 |
-| 5 | [05-v1-v0-backends.md](05-v1-v0-backends.md) | v1（ブロック独立コンパイル）とv0（依存ゼロ内部エンジン）の解説 | 歴史と代替設計に興味がある人 |
-| 6 | [06-correctness-performance.md](06-correctness-performance.md) | 性能実測と「なぜこれが下限か」、正しさの担保、テスト30本の一覧、既知の限界、**開発中に踏んだ罠のアーカイブ** | 全員（特に罠の表） |
-| 7 | [07-glossary.md](07-glossary.md) | 用語集 | 随時参照 |
-| 8 | [08-canonical-exact-layer.md](08-canonical-exact-layer.md) | **2026-07大改修**: canonical exact layer（LuaLaTeX実出力＝最終表示の権威）、safety gate、opaqueモード、一致検証、srcRev二重系列 | 全員（最新の権威構造） |
-| 9 | [09-visual-fidelity-gate.md](09-visual-fidelity-gate.md) | **2026-07第2次改修**: Visual Fidelity Gate（safe-glyph / exact-preview-required / canonical-only）、行粒度の high-fidelity chunk、stale-exact 表示、フォント配信ティア、検証降格 | 全員（表示品質の契約） |
-| 10 | [10-edit-hot-path.md](10-edit-hot-path.md) | **2026-07第3次改修**: 編集ホットパスの不変量（有界foreground・checkpoint fungibility・アイドル最小性）、チェーン温存と再キー、settle/rebuildの非同期化、galley同一性の安定化（フォントid正規化・jenc決定論化） | 全員（編集性能の契約） |
-| — | [ROADMAP.md](ROADMAP.md) | **第一目標「canonicalが体感から消えたリアルタイムプレビュー」**（2026-07-07確定）: 達成条件A–D、Phase 0 監査装置 → 1 incremental canonical → 2 見える依存の掃討 → 3 ストリーミングboot、恒久ドクトリン6箇条 | 全員（開発の現在地） |
+## 読む順番
 
-## この解説書の対象コミット
+| 章 | 内容 |
+| --- | --- |
+| [01-tex-background.md](./01-tex-background.md) | TeX の page builder / output routine / LuaTeX node list の前提 |
+| [02-overview.md](./02-overview.md) | 現行エンジンの全体像、ファイル配置、API 経路 |
+| [03-checkpoint-engine.md](./03-checkpoint-engine.md) | checkpoint エンジン本体、Lua daemon、resident TeX、page builder |
+| [04-renderer-and-fonts.md](./04-renderer-and-fonts.md) | DOM 表示、font fidelity、PDF/SVG 表示経路 |
+| [05-shared-substrate.md](./05-shared-substrate.md) | 現行 checkpoint engine が使う共有基盤 |
+| [06-correctness-performance.md](./06-correctness-performance.md) | テスト、正確性の確認経路、現在の制限 |
+| [07-glossary.md](./07-glossary.md) | 用語集 |
+| [08-canonical-exact-layer.md](./08-canonical-exact-layer.md) | canonical exact layer、安全ゲート、opaque 化、block rescue |
+| [09-visual-fidelity-gate.md](./09-visual-fidelity-gate.md) | visual fidelity gate と exact chunk demotion |
+| [10-edit-hot-path.md](./10-edit-hot-path.md) | 編集ホットパス、checkpoint 再利用、非同期追従 |
 
-第1〜7章は `341afa3`（2026-07-03）時点のソースに対応します。
-コード引用の行番号は目安であり、以後の変更でずれる可能性があります。
-**2026-07-06の改修**（第8章）で v0/v1 バックエンドは削除され、表示の
-権威は canonical layer（素のLuaLaTeX実出力）に移りました。第5章の
-v0/v1解説と、第2〜4章の「JS pagebuilder / display list が最終表示」
-という記述は歴史的文書として読んでください — 現在のそれらは
-provisional 層（高速プレビュー専用）です。
+## 現行実装の短い要約
 
-## 30秒の要約
+- サーバーは `server.js` から `engine/checkpoint/engine-v3.js` を直接使う。
+- TeX は常駐 `lualatex` daemon として起動し、編集ごとに差分 block を再投入する。
+- 低レイテンシ表示は、TeX から取り出した real MVL と page builder の再構成で作る。
+- 完全一致が必要な部分は canonical PDF/SVG を使い、部分 crop、resident render、isolated render を組み合わせる。
+- 出力ルーチンを大きく変える構文は安全ゲートまたは block-level rescue に回る。
+- PDF export は常に canonical `lualatex` 経路で作る。
 
-TeXは1978年設計の**バッチ処理系**です：毎回プロセスを起動し、文書全体を
-読み・展開し・組版し、PDFを吐いて死にます。私たちはこれを、
-**一度起動したら死なないランタイム**に作り替えました。ただしTeXの
-組版アルゴリズム（世界最高の行分割・数式組版）には一切手を入れず、
-**プロセスの外側から** fork(2) によるメモリスナップショットと
-LuaTeXの公式Lua APIだけで実現しています。
+## 数字の扱い
 
-結果：キーを1つ打ってから画面のページが差し替わるまで**実測29ms**
-（うち本物の組版は4〜14ms）。脚注・フロート（図表の自動配置）・目次・
-文献参照・日本語（luatexja）まで、紙に印刷されるものと同じ組版が
-打鍵に同期して動きます。
+この docs では、ファイル行数や速度値を固定仕様として扱わない。テスト数、公開 API、主要ファイル、実行時の分岐は現在のリポジトリから読める事実だけを書く。

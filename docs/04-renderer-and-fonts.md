@@ -1,7 +1,7 @@
 # 第4章 描画層 — TeXのグリフ座標をブラウザで寸分違わず再現する
 
-対象ファイル：`engine/checkpoint/mathmap.js`（186行）、
-`web/app.js`（522行）、`web/style.css`、`server.js` のフォント配信部、
+対象ファイル：`engine/checkpoint/mathmap.js`、
+`web/app.js`、`web/style.css`、`server.js` のフォント配信部、
 および `engine-v3.js` の `#displayList()` / `#registerFont()`。
 
 ## 4.1 問題設定
@@ -149,9 +149,8 @@ display list生成時、cmex由来のrunは
   `data-src` のブロックid→ `/dom` で行番号を引いてエディタをジャンプ
 - **Engine Inspector**：毎編集のレポート（dirtyチェーン・依存・
   キャッシュ/再利用統計・フェーズ別時間・履歴）を右ペインに描画。
-  「この1文字で何がdirtyになったか」という当初の成功条件を、
-  常時目視できるようにするためのUI
+  「この1文字で何がdirtyになったか」を常時目視できるようにするためのUI
 
 ---
 
-次章は、参照実装として残している旧2バックエンドです。
+次章は、現行 checkpoint engine が使う共有基盤です。

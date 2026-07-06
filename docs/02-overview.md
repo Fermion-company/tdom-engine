@@ -1,171 +1,98 @@
-# 第2章 全体像 — 何を作り、何を変えていないか
+# 02. 現行エンジンの全体像
 
-## 2.1 プロジェクトの目標
+この章は、現在の `tdom-core` に存在する実装の地図である。旧構想ではなく、どのファイルがどの役割を持ち、編集から表示・PDF 出力まで何が起きるかを追う。
 
-出発点の仕様書（リポジトリ外・日本語28節）の要求は一言でいえば：
+## 2.1 実行されるエンジン
 
-> TeXを「毎回ファイルからPDFを作るバッチ処理系」ではなく、Webブラウザの
-> ように文書状態を常駐保持し、ソース変更差分から表示差分を生成できる
-> 組版ランタイムへ作り替える。
+現行サーバーは `server.js` から `engine/checkpoint/engine-v3.js` を直接使う。`TDOM_BACKEND` による v0/v1/checkpoint 切り替えは存在しない。
 
-成功条件は「**この1文字変更で、何がdirtyになるか？**」にエンジンが
-正確に答え、変わったページだけをパッチすることでした。その後の対話で
-要求は「lualatexと同一品質」「これ以上速くならない理論限界」
-「脚注・フロート等も含めた完全性」へと引き上げられ、最終形が
-本書の主役である**checkpointバックエンド**です。
+現在の実装単位は次の通り。
 
-## 2.2 3世代のバックエンド
+| 層 | 主なファイル | 役割 |
+| --- | --- | --- |
+| HTTP/API | `server.js` | 単一 engine instance、編集 API、DOM/PDF API、サンプル UI |
+| source 管理 | `engine/source-store.js` | block id と source 本文の対応 |
+| segmentation | `engine/segmenter.js` | LaTeX ソースを編集単位 block に分割 |
+| checkpoint engine | `engine/checkpoint/engine-v3.js` | resident TeX、差分投入、checkpoint 再利用、表示 state |
+| Lua daemon | `engine/checkpoint/daemon.lua` | TeX 内で JOB/RENDER を処理し、MVL・refs・labels・events を返す |
+| fork shim | `engine/checkpoint/tdomfork.c` | LuaTeX から POSIX `fork()` を呼ぶ小さな C shim |
+| page builder | `engine/checkpoint/pagebuilder.js` | TeX page builder / LaTeX output routine 相当の再構成 |
+| canonical | `engine/checkpoint/canonical.js` | full `lualatex` による PDF/SVG/text/paper 情報の正本 |
+| fidelity | `engine/checkpoint/fidelity.js` | exact chunk と構造化 chunk の視覚差分判定 |
+| safety | `engine/checkpoint/safety.js` | unsafe package/body token 検出、verify token 生成 |
+| math/font | `engine/checkpoint/mathmap.js` | legacy math font から Latin Modern twin への写像 |
 
-リポジトリには設計の進化がそのまま3つのバックエンドとして残っており、
-サーバー起動時に選択されます（`server.js` の `createEngine()`、
-環境変数 `TDOM_BACKEND` で強制可能）。
+## 2.2 編集から表示まで
 
-| | v0: internal | v1: lualatex | **v3: checkpoint（既定）** |
-|---|---|---|---|
-| 組版の実体 | 自前JS（近似） | 本物のlualatex | 本物のlualatex |
-| 実行形態 | 常駐JSオブジェクト | **編集ごとに新プロセス**でdirtyブロックのみコンパイル | **常駐プロセスツリー**（forkスナップショット） |
-| 1編集の速さ | 〜1ms | 〜430ms | **組版4〜14ms / 画面まで29ms** |
-| 品質 | デモ水準（貪欲行分割・自前数式） | 印刷同等 | 印刷同等 |
-| 脚注/フロート/目次/引用 | なし | なし（インライン近似） | **ライブで実配置** |
-| プレビューの描き方 | 自前グリフ座標→SVG | ブロック画像（PDF→SVG） | **TeXの実グリフ座標→実フォントで描画**＋精密画像層 |
-| 存在意義 | TeX不要環境のフォールバック・アーキテクチャの参照実装 | 中間段階の参照実装（fork不可環境の代替にもなる） | 本命 |
+編集 API は `POST /edit` で LaTeX ソースの範囲差分を受け取る。エンジン側では、おおまかに次の順に進む。
 
-3世代は多くの基盤（ブロック分割・差分・ページ再利用・パッチ配信・UI）を
-共有しています。共有部は第5章で、v3固有部は第3章で解説します。
+1. safety gate が document-level に危険な package/body token を調べる。
+2. `segmenter.js` が source を block 列に分ける。
+3. 前回 block 列との差分を取り、prefix/suffix で再利用できる checkpoint を付け替える。
+4. resident TeX daemon に必要な block を JOB として投入する。
+5. daemon は real MVL、labels/refs、toc lines、shipout events、font 情報などを返す。
+6. `pagebuilder.js` が galley・float・footnote をページに組む。
+7. 表示用 display list と chunk 情報が `GET /doc` と `GET /dom` から観測できる。
+8. exact が必要な block は resident render、canonical crop、isolated render のいずれかで置き換わる。
 
-## 2.3 中心となる考え方 — 5行で
+「編集された箇所だけを再 TeX する」ために、engine は block hash と checkpoint を保持する。現在の実装は、単純に編集位置以降を全破棄するのではなく、共通 prefix/suffix に合わせて checkpoint を再キー化し、残せる状態を残す。
 
-1. 文書を空行等で**ブロック**（≒段落・見出し・環境）に割り、内容ハッシュで
-   差分を取る。ブロックが増分処理の単位。
-2. **本物のlualatexに常駐してもらい**、fork(2)のコピーオンライトで
-   「各ブロック境界時点の完全なTeX状態」をプロセスとして凍結保存する。
-3. 編集されたら、直近のスナップショットから**変わったブロックだけ**
-   組版し直す。カウンタ・ラベルの連鎖は「もう1ブロック余分に組版して
-   出力が前回と一致するか確かめる」ことで収束を自己検証する。
-4. 組版結果はPDFにせず、**ノードリストからグリフ座標を直接抜いて**
-   JSONでブラウザへ送り、TeXが使ったのと同じフォントファイルで描く。
-5. 脚注・フロートはノードリストから実体を捕捉し、**自前のページビルダー**
-   （LaTeX出力ルーチンの忠実な再実装）が配置する。
+## 2.3 canonical 経路
 
-## 2.4 何を変更していないか（このプロジェクトの誠実さの核）
+canonical layer は通常の `lualatex` を一時ディレクトリで実行し、PDF を正本として扱う。そこから必要に応じて次を生成する。
 
-「TeXを改造した」と聞くと組版アルゴリズムに手を入れた印象を持たれ
-がちですが、実際は逆です。**変更していないもの**を先に列挙します：
+| 取得物 | 経路 |
+| --- | --- |
+| PDF | `lualatex` fixed-point run |
+| SVG page | `pdftocairo -svg` |
+| page text | `pdftotext` |
+| paper size | `pdfinfo` |
+| block exact crop | canonical SVG から block bbox を crop |
 
-| 変更していないもの | 意味 |
-|---|---|
-| **lualatex（LuaHBTeX）のバイナリ・C/CWEBソース** | 1バイトも触っていない。TeX Liveのものをそのまま起動する |
-| **Knuth-Plass行分割・数式組版・ハイフネーション** | 段落や数式の見た目を決める計算はすべてKnuthのコードが実行 |
-| **フォント処理**（luaotfload・HarfBuzz） | リガチャ・カーニング・字形選択は従来どおりエンジン内で確定 |
-| **LaTeXカーネル（latex.ltx）・フォーマットファイル** | 無改変。`lualatex.fmt` をそのままロード |
-| **パッケージ群**（amsmath, tikz, booktabs, luatexja, ...） | 無改変。TikZはpgfの生成したPDF命令をそのまま精密レンダーに使う |
-| **PDF書き出し** | エクスポートは素の `lualatex` 2パス実行。ライブ表示との一致が増分計算の検算になる |
+canonical は aux fixed point を最大 3 pass で追う。`GET /pdf` は checkpoint 表示 state ではなく、この canonical 経路を使う。
 
-では何を**加えた**のか。エンジンの外から注入するものは3種類だけです：
+## 2.4 safety と opaque/rescue
 
-1. **Cシム 71行**（`engine/checkpoint/tdomfork.c`）
-   `fork`/`waitpid`/`_exit`/`getpid`/`signal(SIGCHLD,SIG_IGN)` をLuaに
-   公開するだけの共有ライブラリ。`package.loadlib` でロード。
-2. **Luaデーモン 666行**（`engine/checkpoint/daemon.lua`）
-   ソケット通信・チェックポイントループ・ノードリスト走査。すべて
-   LuaTeXの公式APIの範囲内。
-3. **TeXマクロのシム約40行**（`engine-v3.js` がdriver.texに生成）
-   `\label` 等を「**元の動作をそのまま実行した上で**、Luaに記録する」
-   形でラップする。組版結果を変えるシムは、フロート環境（次項）と
-   ページスタイル程度。
+現行実装には二種類の退避経路がある。
 
-シムの全リスト（生成元は `engine-v3.js` の `#driverSource()`）：
+| 種類 | 例 | 何が起きるか |
+| --- | --- | --- |
+| document-level unsafe | output routine を根本的に変える package、shipout hook、page builder を大域的に壊す body token | structured checkpoint 表示を避け、canonical/opaque 表示へ寄せる |
+| block-level rescue | `multicols`、`paracol`、`longtable`、`landscape`、`mdframed`、`framed`、`shaded`、breakable `tcolorbox`、`\includepdf` | 該当 block を構造化せず exact chunk として扱う |
 
-| シム対象 | 方式 | 目的 | 組版への影響 |
-|---|---|---|---|
-| `\label` | 元を退避して呼んだ後 `tdom_label` | ラベル値の記録＋`\r@key`の即時定義 | なし |
-| `\ltx@label` | 同上 | amsmathがディスプレイ数式内で使う迂回路の捕捉 | なし |
-| `\ref` `\pageref` `\eqref` | 元を呼ぶ前に `tdom_ref` | 依存グラフ（どのブロックがどのラベルを参照するか）の記録 | なし |
-| `\cite` | 同上（`tdom_cites`、カンマ区切り対応） | 引用依存の記録 | なし |
-| `figure`/`table` 環境 | **置換**：中身を `\TDOMfloatbox` に組み、`\special{tdomfloat:N}` でアンカーを残し、`tdom_float` で捕捉 | フロートの実体と`[htbp]`指定の取得 | ライブ層では自前ページビルダーが配置（印刷はフルコンパイルなので無影響） |
-| `\@starttoc` | 読み出し専用に置換 | `\tableofcontents` が私たちの生成する `driver.toc` を読む。**書き出しストリームを開かない**（従来実装はopenoutで即トランケートするため） | なし |
-| `\@bibitem` `\@lbibitem` | 元を呼んだ後 `tdom_bib` | 文献番号の記録＋`\b@key`の即時定義 | なし |
-| `\pagestyle{empty}` `\hoffset=-1in` `\voffset=-1in` | 設定 | レンダー子が出荷するタイトページの原点合わせ | ライブ層のみ |
-| フォントウォームアップboxと`\TDOMtwinmath`計測 | 追加実行 | チェックポイント0に主要フォントを常駐させ、数式代替フォントの実寸を測る | なし（boxは捨てる） |
-| `\TDOMloop` | 追加定義 | デーモンの待機ループ（第3章） | なし |
+`pdfpages` の読み込み自体は document-level unsafe ではない。実際に `\includepdf` が現れる block は block-level rescue の対象になる。
 
-つまり**「lualatexが計算する内容」は一切変えず、「いつ・どの単位で
-計算するか」と「結果をどこへ出すか」だけを差し替えた**、というのが
-本プロジェクトの正確な要約です。
+## 2.5 公開 API の地図
 
-## 2.5 使用言語と分量
+`server.js` は単一 engine instance を持つ。主要 API は次である。
 
-| 層 | 言語 | 行数 | ファイル |
-|---|---|---|---|
-| プロセス制御シム | C | 71 | `engine/checkpoint/tdomfork.c` |
-| TeX内デーモン | Lua (5.3 / LuaTeX内蔵) | 666 | `engine/checkpoint/daemon.lua` |
-| v1用ガレー抽出 | Lua | 160 | `engine/luatex/linesplit.lua` |
-| オーケストレータ（v3） | JavaScript (Node.js, ESM, 依存ゼロ) | 1,373 | `engine/checkpoint/engine-v3.js` |
-| ライブ出力ルーチン | JavaScript | 258 | `engine/checkpoint/pagebuilder.js` |
-| 数式フォント対応表 | JavaScript | 186 | `engine/checkpoint/mathmap.js` |
-| v1エンジン | JavaScript | 656 + 302 | `engine/engine-lua.js`, `engine/luatex/backend.js` |
-| v0内部エンジン一式 | JavaScript | 約1,800 | `engine/*.js`（第5章） |
-| HTTP/SSEサーバー | JavaScript | 234 | `server.js` |
-| ブラウザUI | JavaScript + CSS + HTML | 522 + 209 + 55 | `web/` |
-| テスト | JavaScript | 448（30テスト） | `tests/` |
-| サンプル文書 | LaTeX | 285 | `samples/` |
-| **合計** | | **約7,700** | |
+| API | 内容 |
+| --- | --- |
+| `GET /doc` | source、display list、geometry、font manifest、report |
+| `POST /edit` | `{start,end,text}` の範囲編集 |
+| `POST /open` | source/template で文書を開き直す |
+| `GET /dom` | engine 観測用 JSON |
+| `GET /canonical/:n.svg?c=<id>` | canonical page SVG |
+| `GET /chunk/:id.svg` | exact chunk SVG |
+| `GET /font/:key` | TeX が使った font file |
+| `POST /font-fail` | browser font load failure の報告 |
+| `GET /canonical.pdf` | 最後に成功した canonical PDF |
+| `GET /pdf` | 現 source を canonical layer で ensure して PDF を返す |
+| `GET /events` | SSE |
+| `GET /status` | queue/canonical/mode の lightweight status |
 
-npm依存は**ゼロ**です（Node標準ライブラリのみ）。外部コマンド依存は
-`lualatex`・`pdftocairo`（poppler、精密レンダー層のPDF→SVG変換）・
-`cc`（シムの初回コンパイル）・`kpsewhich`（フォント探索）。
+フロントエンドは `web/` 配下にあり、DOM chunk を絶対配置に近い形で描画する。UI の仕様はこの engine docs の対象外である。
 
-## 2.6 リポジトリの地図
+## 2.6 テストの地図
 
-```text
-fermion-tex-engine/
-├── server.js                  常駐HTTPサーバー。バックエンド選択・/edit・SSE・/font・/chunk
-├── engine/
-│   ├── checkpoint/            ★ 本命 v3
-│   │   ├── tdomfork.c         fork(2)のLuaブリッジ（第3章§3.4）
-│   │   ├── daemon.lua         TeX内デーモン（§3.5〜3.7）
-│   │   ├── engine-v3.js       オーケストレータ（§3.8）
-│   │   ├── pagebuilder.js     ライブ出力ルーチン（§3.9）
-│   │   └── mathmap.js         Type1数式→OTF双子の字形対応（第4章）
-│   ├── luatex/                v1バックエンドのコンパイルサービス
-│   │   ├── backend.js
-│   │   └── linesplit.lua
-│   ├── engine-lua.js          v1エンジン本体
-│   ├── engine.js              v0エンジン本体
-│   ├── segmenter.js           ブロック分割＋ハッシュ差分（全世代共有・第5章§5.2）
-│   ├── source-store.js        テキストバッファ＋範囲編集（共有）
-│   ├── hash.js                FNV-1a（共有）
-│   ├── page.js                v0/v1のページ分割
-│   ├── macro-vm.js, tokenizer.js, semantic.js, layout.js,
-│   │   math-layout.js, metrics.js, display-list.js, pdf.js   （v0一式）
-├── web/                       ブラウザ側（第4章§4.5）
-├── samples/demo.tex           v0用サンプル
-├── samples/demo-lua.tex       v1/v3用サンプル（脚注・フロート・目次・文献入り）
-├── tests/                     30本の統合テスト（第6章）
-└── docs/                      本書
-```
+`npm test` は `node --test` で次を実行する。
 
-## 2.7 何ができるようになったか — 機能と実測値の対応表
+| ファイル | 見ている対象 |
+| --- | --- |
+| `tests/engine-v3.test.js` | checkpoint engine、編集、opaque/rescue、export |
+| `tests/canonical.test.js` | canonical fixed-point、SVG/text/paper 情報 |
+| `tests/fidelity.test.js` | visual fidelity gate、token/window 判定 |
+| `tests/hot-path.test.js` | 編集ホットパス、差分範囲、background chain |
+| `tests/server-api.test.js` | HTTP API の基本動作 |
 
-すべて本リポジトリのテストまたはブラウザ実機で計測した値です
-（Apple Silicon Mac、TeX Live 2024。詳細は第6章）。
-
-| できるようになったこと | 従来（バッチ） | 本エンジン |
-|---|---|---|
-| 1単語直して画面に反映 | 数秒（全コンパイル×2＋PDFリロード） | **29ms**（組版4〜14ms） |
-| 式を1本挿入→以降の式番号・参照が全部更新 | 同上 | **52ms**（影響15ブロックのみ再組版） |
-| 取り消し（undo） | 同上 | 数ms（ガレー再組版のみ、v1ではキャッシュで0コンパイル） |
-| 脚注がページ下部に罫線付きで出る | ○（印刷と同じ） | **ライブで同じ**（insノード捕捉） |
-| 図表フロートが`[htbp]`に従って配置 | ○ | **ライブで同じ**（自前出力ルーチン） |
-| 目次がページ番号付きで出る | 2〜3回コンパイル後 | **ライブ**（固定点まで自動反復） |
-| `\cite` の番号 | 2回コンパイル後 | **ライブ**（`\b@`即時定義） |
-| 後方で定義されるラベルへの前方参照 | 2回コンパイル後 | **ライブ**（値注入＋後方パス） |
-| TikZ図の編集 | 数秒 | 即時近似（グリフ）＋**約1〜2秒で精密SVGに自動置換** |
-| 日本語（`\usepackage{luatexja}`） | ○ | **ライブ**（禁則込み。編集5.2ms実測、原ノ味フォント自動配信） |
-| `\input` 分割ファイル | ○ | ○（ブロック展開＋ファイル監視で自動再組版） |
-| プリアンブル変更（パッケージ追加等） | 全コンパイル | 全再構築（約1秒）— 仕様上「ここは再コンパイルでよい」と定めた領域 |
-| PDF書き出し | ○ | ○（素のlualatex 2パス。ライブ表示と一致することを検証済み） |
-
----
-
-次章はいよいよ本体、checkpointバックエンドの完全詳解です。
+現在のテスト総数は 44 件である。

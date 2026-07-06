@@ -1,223 +1,94 @@
-# 第8章 Canonical Exact Layer — 2層の真実と安全ゲート
+# 08. canonical exact layer
 
-この章は、2026-07 の大改修で導入された**表示の権威構造**を説明します。
-第3章までのcheckpointエンジンは「速い側の層」として全面的に生き残って
-いますが、その位置づけが変わりました。
+この章は、`engine/checkpoint/canonical.js` と、それを使う safety/verification/opaque 経路の地図である。
 
-## 8.1 何が問題だったか
+## 8.1 canonical renderer
 
-改修前のエンジンは、JSページビルダー（`pagebuilder.js`）が組み立てた
-display list を**最終表示そのもの**として扱っていました。ページビルダーは
-TeXの出力ルーチンの忠実な転写であり検証もされていましたが、原理的には
-「JS側の再実装が最終真実」という構造です。これは次の2点で危険でした。
+`CanonicalRenderer` は、実 source をそのまま `lualatex` に渡して PDF を作る正本 layer である。checkpoint engine の display list は編集直後の preview であり、PDF export と最終的な page pixels は canonical layer から来る。
 
-1. ページビルダーが再現できない機構（shipout hook・twocolumn・
-   marginpar…）を含む文書では、**表示が静かに間違う**。
-2. 間違ったときに、それを検出して正す**上位の権威が存在しない**。
+主な public method は次である。
 
-改修後の絶対条件は「最終表示は常に素のLuaLaTeX実出力と一致する」です。
+| method | 内容 |
+| --- | --- |
+| `schedule(source, rev)` | debounce/cooldown 付きで compile を予約する |
+| `ensure(source, rev)` | 現 source の compile を強制し、成功 result を返す |
+| `settle()` | pending/running compile を drain する |
+| `info()` | rev/id/pageCount/paper/passes/ms/error などの snapshot |
+| `pageSVG(page, id)` | 指定 compile id の page SVG を lazy 生成する |
+| `pageTexts(id)` | `pdftotext` で page text を返す |
+| `pdfBytes()` | 最後に成功した PDF bytes を返す |
 
-## 8.2 2層の真実
+compile は aux family の hash が安定するまで回る。上限は `MAX_PASSES = 3` である。page SVG は `pdftocairo` により要求された page だけ変換し、LRU cache に載る。paper size は `pdfinfo` から取得する。
 
-```text
-┌─────────────────────────────────────────────────────────┐
-│ canonical層 (engine/checkpoint/canonical.js)            │  ← 権威
-│   素のlualatexをaux固定点まで実行（最大3パス）           │
-│   → canon-<id>.pdf → ページ単位SVG（要求時に遅延変換）   │
-└─────────────────────────────────────────────────────────┘
-                    ▲ 常に勝つ（ページ単位で上書き）
-┌─────────────────────────────────────────────────────────┐
-│ provisional層 (engine-v3.js + pagebuilder.js)           │  ← 速度
-│   fork checkpoint常駐TeX、キーストローク同期パッチ       │
-└─────────────────────────────────────────────────────────┘
-```
+## 8.2 scheduling
 
-`CanonicalRenderer` は編集のたびに `schedule(source, srcRev)` を受け取り、
-デバウンス（既定350ms）・直列化・**latest-wins**（コンパイル中に届いた
-編集は、完了後に最新ソースをもう1回だけコンパイル）で動きます。編集の
-同期パスに入るのは「最新ソースを控えてタイマーを張る」ことだけです。
+canonical scheduling は latest-wins である。compile 中に新しい source が来た場合、完了後に最新 source が pending として残る。
 
-- **ページ数**はログの `Output written on … (N pages` から取得。
-- **紙面サイズ**は `pdfinfo`（MediaBoxは圧縮オブジェクト内にあるため
-  バイト走査では見えない）。
-- **ページSVG**は `pdftocairo -f n -l n` を**要求されたページだけ**変換
-  （クライアントの `<img loading="lazy">` と合わせて viewport-aware）。
-  PDFはコンパイルidごとに保持され、次のコンパイルとレースしない。
-- **失敗時**は直前の成功コンパイルを保持し、TeXの実エラー行を報告。
-  打鍵途中の壊れたソースで表示が消えることはない。
+structured mode では `pressure = 'authority'` で、基本 debounce に加えて前回 compile time に比例した cooldown を持つ。opaque mode では `pressure = 'display'` になり、canonical compile 自体が表示更新なので debounce 中心で動く。
 
-### rev の二重系列
+`GET /pdf` は `engine.exportPDF()` 経由で `canonical.ensure()` を呼ぶ。表示用 checkpoint state から PDF を作る経路はない。
 
-非同期パッチ（TikZチャンク差し替え等）は表示リストの `rev` を進めますが
-ソースは変わりません。canonical層の追いつき判定を `rev` で行うと永遠に
-「古い」ことになるため、**ソース改訂だけを数える `srcRev`** を別に持ち、
-canonicalのスケジュール・検証・クライアントの鮮度判定はすべて `srcRev`
-軸で行います。
+## 8.3 client convergence
 
-## 8.3 クライアントの収束機構 (web/app.js)
+`server.js` は canonical compile が着地すると SSE `canonical` event を送る。client は compile id を付けて `/canonical/:n.svg?c=<id>` を取りに行く。stale id なら 404 になり、現在の id で取り直す。
 
-各ページは2層のDOMです。
+表示側は provisional layer、exact chunk layer、canonical page layer を重ねる。source rev が一致した canonical page は最終表示として勝つ。編集で dirty になった page/band だけが provisional に戻り、次の canonical 着地で消える。
 
-```html
-<div class="page is-final">
-  <svg>…provisional glyphs…</svg>       <!-- 下: 打鍵同期 -->
-  <div class="chunkwin">…</div>          <!-- 下: 精密チャンク -->
-  <img class="canon" loading="lazy">     <!-- 上: LuaLaTeX実出力 -->
-</div>
-```
+## 8.4 safety gate
 
-- ページ`n`がcanonicalを表示する条件:
-  `pageDirtyRev.get(n) ≤ canonical.rev`（dirtyマークは replace-page
-  パッチ適用時に `srcRev` で記録）。
-- canonical着地（SSE `canonical` イベント）で、カバーされたdirtyマークを
-  消し、provisionalに存在しないページのシェルを作り、鮮度が完全なら
-  provisionalだけの余剰ページを `phantom` として隠す（**ページ数の権威も
-  canonical**）。
-- **バンド粒度の収束**: 編集がページを invalid にする範囲は「実際に
-  変わった帯」だけ。パッチ適用時に新旧display listを多重集合diffし
-  （0.5bp量子化でサブピクセルドリフトを無視、チャンク版数は変更として
-  扱う）、変わった行域のy帯を計算。canonicalオーバーレイに clip-path で
-  その帯だけ窓を開け、帯の外は実LuaLaTeXピクセルを保持したまま、帯の
-  中だけprovisionalが見える（`is-partial` 状態）。数式を1文字直しても
-  ページ全体が揺れることはなく、編集した数行だけが更新される。高さが
-  変わる編集は下流の全コマンドが動くためdiffが自然にページ下端までの
-  帯を返す。次のcanonicalが着地した時点で帯は消え、全面exactに戻る。
-- リロード時、収束済みなら `canonical.rev === srcRev` なので初回描画から
-  全ページexact（成功条件7）。
-- opaqueモードではprovisional層を持たず、canonicalページのみを表示。
+`safety.js` は document-level に structured path を壊す構造を検出する。危険なのは未知 macro ではなく、page assembly を document-wide に変える構造である。
 
-## 8.4 Safety gate (engine/checkpoint/safety.js)
+現在 document-level unsafe に入るもの:
 
-structured層はJSで**ページ組み立てだけ**を再実装しているため、危険なのは
-未知マクロではなく「ページ機構に触る構造」です。ゲートは3段構えです。
+- `flowfram`、`eso-pic`、`everypage`、`background`、`xwatermark`、`draftwatermark`、`atbegshi` などの shipout/page paint 系 package。
+- custom `\output`、raw `\shipout`、shipout hook、`\AtBeginDvi`。
+- class option または本文中の `twocolumn`。
+- `\marginpar`、`\marginnote`。
+- `\newgeometry`、`\enlargethispage`。
+- `\balance`。
 
-1. **静的**: eso-pic/atbegshi/pdfpages等のパッケージ、`\output`再定義、
-   shipout hook、twocolumn、本文中の `\marginpar`/`\newgeometry`/
-   `\enlargethispage`/`\includepdf` → 文書全体をopaqueへ。
-2. **動的**: プリアンブルboot失敗・組版フェーズ全面失敗 → opaqueへ。
-   demoteはそのプリアンブルhashに**粘着**し、打鍵ごとに失敗bootを
-   繰り返さない（プリアンブルを直せば自動でstructuredに復帰）。
-3. **検証** (`#verifyAgainstCanonical`): canonicalが現行`srcRev`に追い
-   ついた時点で、`pdftotext`のページテキストとprovisionalのグリフ流を
-   照合。トークンは**ラテン語系は単語・CJKは文字bigram**（行分割・
-   ハイフネーション・リガチャ正規化に頑健）で、provisionalトークンの
-   canonicalページへの**多重集合包含率**が0.8を下回ったページのブロック
-   を `poisoned` へ登録 → 以後そのブロックは隔離rescue（実PDFピクセル）
-   で表示される。**structured→opaqueの一方向demote**であり、無理に
-   structuredへ戻すことはしない。
+`pdfpages` package の読み込み自体は unsafe ではない。実際の `\includepdf` は block-level rescue 対象である。
 
-multicols・longtable・breakable tcolorbox・TikZは従来どおり**ブロック
-単位のexact経路**（第3章の隔離rescue／レンダー子）で処理されるため、
-文書全体をopaqueにはしません。fallbackの粒度は
-「ブロック → ページ → 文書」の順で常に最小を選びます。
+## 8.5 block-level rescue
 
-**壊れたブロックの凍結** (`#brokenBlockGalley`): 打鍵途中の壊れたTeX
-（未完の `\frac`、行末の裸のバックスラッシュ…）が in-chain と隔離
-rescue の**両方**を失敗させても、文書は demote されない。そのブロック
-だけが最後の正常ガレー（無ければ空）で凍結され、チェーンは前ブロック
-の出口状態から継続する。テキストが変わればポイズンのハッシュが外れて
-自動回復し、canonical層は常にLuaLaTeX自身のエラー回復出力を表示し
-続ける。文書全体のopaque demoteは、boot失敗とチェーン全体の破綻という
-本当に文書級の障害だけに残る。
+`engine-v3.js` の `OUTPUT_HIJACK_RE` に一致する block は、文書全体を opaque にせず exact block として扱われる。現在の対象は、`multicols`、`paracol`、`longtable`、`landscape`、`mdframed`、`framed`、`shaded`、breakable `tcolorbox`、`\includepdf` である。
 
-## 8.5 Opaqueモード
+rescue block は stale-first で表示される。前回の galley/chunk があればそれを保持し、isolated exact compile は async queue で進む。
 
-```text
-編集 → SourceStoreに適用（O(編集量)） → canonical再スケジュール → 即return
-```
+## 8.6 verification
 
-opaqueモードのエンジンは常駐プロセスツリーを解放し、レポートは
-`mode: 'opaque'` と理由を運びます。表示は最後に成功したcanonicalページ
-のまま、新しいコンパイルが着地するたびに差し替わります。編集の反映は
-コンパイル1回分遅れますが、**表示が間違うことは構造的にあり得ません**。
-LuaLaTeXが受理する文書はすべて表示でき、拒否する文書は実エラーが
-そのまま出ます。
+fresh canonical が現 source rev に追いついたとき、`#verifyAgainstCanonical()` が structured page text と canonical page text を照合する。
 
-## 8.6 ホットパス保証 — stale-first rescue
+現在の実装:
 
-隔離rescueコンパイル（フルプリアンブルで数秒）は、いかなる経路でも
-編集の同期パスに入らない。
+- `pdftotext` が使えない場合は verification を skip する。canonical overlay は残る。
+- token は `verifyTokens()` の文字 bigram である。Latin word と CJK bigram を別規則にする実装ではない。
+- 同一 page に加えて ±1 page の window を見る。
+- page count mismatch は report されるが、それだけで block demotion しない。
+- window containment が 0.5 未満の confident divergence だけを demotion 候補にする。
+- demotion は block/chunk 単位で、document 全体を opaque にする処理ではない。
 
-- **stale-first**: rescue対象ブロックに前回のガレーがあれば、それを
-  即座に再利用して表示し（provisional層は一時的に古くてよい —
-  canonicalが最終ピクセルを保証する）、前回の出口状態からstate jobで
-  継続チェックポイントを作ってチェーンの整合を保ち、正確な隔離
-  コンパイルは**非同期キュー**（`rescueQueue` + `#pumpRescues`）で実行
-  する。着地したらチェーンロック下で採用・収束・SSE再パッチ。
-- **チェーンロック** (`#locked`): update・バックグラウンドチェーン
-  再構築・rescue採用は同一ロックで直列化される。採用の収束チェーンは
-  ブロック単位で `bgAbort` をチェックし、**編集が来たら即座に譲って
-  自分を再キュー**する（編集のロック待ちは最悪でも1ブロック分）。
-- **page-context固定点も非同期**: オフセットが動いた分割環境の
-  再rescueは採用後の `#queueMovedOffsets` が非同期に反復する。
-  フォアグラウンドのpagectxパスはstale-firstにより実質無料になった。
-- canonicalコンパイル・SVG変換・検証はすべて非同期で、`/edit` の応答を
-  待たせない（`/pdf` もエンジンのミューテーションキューを通らない）。
-- **隔離レンダーはアイドルゲート付きの最低優先度**: hyperrefがrootで
-  PDFを開く文書では、gfxブロックの精密チャンクがブロックごとの
-  フルコンパイル（このプリアンブルで各~110秒）になる。rescueキューが
-  空・canonicalが非コンパイル中・最終編集から3秒以上、の全条件が
-  揃うまで実行を待つ。CPU飽和はfork型常駐組版を数十倍遅くするため、
-  ここを絞らないとキーストロークが分単位に劣化する（実測で確認済み）。
-  exactの保証はcanonical層が持つので、チャンクの遅延は表示品質にしか
-  影響しない。
-- 変換済みページSVGはコンパイルid付きURL（`/canonical/n.svg?c=<id>`）で
-  immutableキャッシュされ、スクロールで再変換しない（LRU 400ページ）。
+glyph layer がズレた block は exact-only へ降格する。すでに exact/rescue 表示だった block がズレた場合は canonical-only へ降格する。降格は block source hash に粘着し、source が変わるまで戻らない。
 
-実測（70ページ/285ブロックのストレス文書）: 文挿入 11.3s→2.3s、
-rescue環境内への入力 4.1s→2.3s、定常キーストローク 45〜300ms
-（バックグラウンド収束中は数百ms、アイドル時は2桁ms）。
+## 8.7 opaque mode
 
-## 8.7 長大文書スケーリング — 増分ページ分割
+opaque mode では resident process tree を捨て、表示は canonical page だけになる。編集は source に適用され、canonical compile が schedule される。
 
-編集の同期パスから O(文書長) を排除するための機構（2026-07-06追記）。
+opaque に入る主な経路:
 
-- **増分ページ分割** (`pagebuilder.js`): ビルダーのストリーム消費を
-  「素ストリーム位置 `si` + 注入キュー `pending`」の2系統に分離し、
-  **各ページ境界で再開点スナップショット**（si・持ち越し項目・保留
-  フロート・folio・カラム状態 — すべて O(小)）を記録する。編集時は
-  ブロック単位のunit配列の同一性から最初の差分位置を求め、その直前の
-  境界から再開。クリーンな接尾辞に入って旧走査と境界状態が一致した
-  瞬間に**残りの旧ページをそのまま接合**する（ページ数がズレた場合は
-  folio/番号シフト付き複製 — 内容の改ページ計算は再利用）。編集コスト
-  は「編集周辺の数ページ」に比例し、文書全体には比例しない。
-  正しさは「増分結果 = 同一ソースの新規フルビルド」の等価テストで担保。
-- **ページ分割のメモ化**: unit配列列が不変なら直前の結果を返す —
-  1回の編集内で走る複数回の分割（toc・オフセット・非同期再パッチ）は
-  実質無料。
-- **ラベル/参照インデックス**: 消失ラベル検出と後方参照パスを
-  O(ラベル×ブロック) の全走査から、ガレー採用時に維持する
-  カウント/逆引きインデックス参照へ。
-- **クライアントの行単位ハイライト**: 全文 innerHTML 再構築
-  （長文書で打鍵ごとに数十ms＋レイアウト）を、変更行のみの
-  span 差し替えに。
+- safety gate が document-level unsafe を検出した。
+- structured boot が失敗した。
+- full rebuild retry 後も structured typeset が失敗した。
 
-実測（1,200ブロック／論理90ページ級の日本語ベンチ文書）:
-文書先頭への打鍵 ~400-600ms（大半はtoc再組版）、ウォームな領域への
-打鍵 **12-16ms**、成長編集後の隣接打鍵 ~300ms。ラテン文字文書は
-400ブロック/53ページのブートが2.2秒で完全に線形。
+boot 失敗は preamble hash に sticky になる。ただし `#scheduleStructuredReprobe()` により、一度だけ quiet delay 後の structured boot 再試行がある。preamble が変われば通常の structured 判定に戻る。
 
-### 既知の壁: luatexja 長文書の fork lineage 劣化
+## 8.8 canonical crop
 
-日本語（luatexja）文書では、**1つのfork系譜内で累積~25ページ相当の
-CJK組版を超えると、以降のin-chainジョブがluahbtex内部（C側の
-連結リスト走査）で無限にスピンする**。Lua GC・ノードメモリ・
-page_so_far全リセット・fork失敗・fdリークは全て実測で否定済み。
-ラテン文字文書では発生しない（luatexja固有の内部状態）。
+`#cropCanonicalChunks()` は、fresh canonical compile が現 source rev と一致し、かつ provisional page count と canonical page count が一致するときに動く。
 
-エンジンは次で吸収する: 連続3回のin-chainタイムアウト（既定12秒、
-`TDOM_JOB_TIMEOUT`）で壁と判定し、以降のブロックは**試行せず空凍結**
-（25ブロックごとの回復プローブのみ）。凍結ブロックは非同期rescue
-ポンプが新規プロセスで通常速度に組版し、provisional層は背景で
-自己修復する。表示の正しさは常にcanonical層が持つ。効果:
-40節ベンチのブートが38分超→**127秒**。凍結領域への初回編集は
-チェーン復元の一括コスト（実測~最大3分）を払うが、以降は12ms級。
-根治は「セグメント分割チェーン」（~150ブロックごとに隔離rescueの
-状態再構築を根とする複数系譜）の導入が設計方針。
+条件を満たす single-page block について、canonical page SVG から block band を切り出し、chunk cache に登録する。上限は `TDOM_CANON_CROP_MAX`、既定 40 block である。page count が drift しているときや block が page をまたぐときは crop しない。
 
-## 8.8 削除されたもの
+## 8.9 旧バックエンド
 
-v0（内部エンジン）と v1（ブロック独立コンパイル）のバックエンドは削除
-されました。「LuaLaTeXなしでの互換表示」は非目標であり、絶対条件1と
-両立しないためです。第5章はアーキテクチャ史として残っています
-（コードはコミット `341afa3` 以前に存在）。
+v0/v1 バックエンドは現行リポジトリに存在しない。server から選択する経路もない。現行の fallback は、safety gate、block-level rescue、visual fidelity demotion、opaque mode、canonical layer の組み合わせである。
+
