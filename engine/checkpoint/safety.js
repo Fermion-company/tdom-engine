@@ -61,9 +61,8 @@ const UNSAFE_PREAMBLE = [
 // they read or change the CURRENT PAGE while it is being built.
 const UNSAFE_BODY = [
   // Margin placement writes OUTSIDE the galley box: a per-block chunk crops
-  // it away (silently wrong pixels), so no per-block fallback can represent
-  // it yet — document-level demotion until a canonical-only block tier
-  // carries these (docs/10 follow-up).
+  // it away (silently wrong pixels), so no current per-block fallback can
+  // represent it — document-level demotion is the implemented behavior.
   [/\\marginpar\b/, '\\marginpar (page-margin placement)'],
   [/\\marginnote\b/, '\\marginnote (page-margin placement)'],
   [/\\newgeometry\b/, '\\newgeometry (mid-document page geometry)'],

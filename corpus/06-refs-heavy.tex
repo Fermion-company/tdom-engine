@@ -1,0 +1,29 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath}
+\begin{document}
+\tableofcontents
+
+\section{Alpha}\label{s:a}
+Points at \ref{s:b}, \ref{s:c}, equation \eqref{e:z} and
+page~\pageref{s:c} — every target is defined later, so all of these
+resolve only through the label table.
+
+\section{Beta}\label{s:b}
+Backward look at \ref{s:a}. A numbered display:
+\begin{equation}\label{e:y}
+  y = mx + b
+\end{equation}
+
+\section{Gamma}\label{s:c}
+Forward equation target:
+\begin{equation}\label{e:z}
+  z^2 = x^2 + y^2
+\end{equation}
+Uses \eqref{e:y} backwards and \ref{s:d} forwards, plus
+page~\pageref{s:a} backwards.
+
+\section{Delta}\label{s:d}
+Terminal section referring to \ref{s:a}, \ref{s:b} and \ref{s:c} so every
+section participates in the reference graph in both directions.
+
+\end{document}

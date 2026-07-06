@@ -1,13 +1,21 @@
 // Source segmenter — builds the top level of the Source DOM.
 //
 // The body of the document is split into blocks: the incremental unit of the
-// whole pipeline. A block is a paragraph, a heading, a display-math span, or
-// an entire environment. Boundaries are:
-//   - blank lines at group/environment depth 0
-//   - lines starting with \section / \subsection / \begin{...} / \[  (depth 0)
-//   - the line where an environment or display math closes
+// whole pipeline. Boundaries are:
+//   - blank lines at group/environment depth 0 (a real \par)
+//   - lines starting a sectioning command (which performs its own \par)
 //
 // Blank lines *inside* an environment or display math do not split.
+//
+// A block boundary MUST be a \par boundary. Splitting at a bare \begin{...}
+// or \[ used to detach environments from the paragraph they are attached to
+// (no blank line), and the fresh job then entered them in VERTICAL mode
+// while the continuous run was still in horizontal mode — \@trivlist adds
+// \partopsep only in vmode, displays pick \abovedisplay(short)skip from the
+// open paragraph, so every attached list/display drifted by a few points
+// (found by the Phase-0 farm). Paragraph-attached environments now stay in
+// the block of their paragraph; the h/v-mode at every boundary is vertical
+// by construction, in the job AND in the continuous run.
 //
 // segmentBody() is a linear scan over the body text — trivial arithmetic per
 // keystroke. Everything expensive downstream (expansion, semantics, layout)
@@ -15,7 +23,7 @@
 
 import { fnv1a } from './hash.js';
 
-const FORCED_START = /^\s*(\\section\b|\\subsection\b|\\begin\{|\\\[)/;
+const FORCED_START = /^\s*\\(chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
 
 export function segmentBody(text, baseOffset) {
   const segs = [];
@@ -57,13 +65,9 @@ export function segmentBody(text, baseOffset) {
     if (/\\\]/.test(stripped)) inDisplay = false;
     braceDepth += braceDelta(stripped);
     if (braceDepth < 0) braceDepth = 0;
-
-    // Environment / display math closed on this line at depth 0: block ends here.
-    if (cur !== null && envDepth === 0 && !inDisplay && braceDepth <= 0) {
-      if (/\\end\{[^}]*\}\s*$/.test(stripped) || /\\\]\s*$/.test(stripped)) {
-        flush(ln.end);
-      }
-    }
+    // NOTE: an environment/display CLOSING no longer ends the block — text
+    // attached right after \end{...} (no blank line) continues in @endpe
+    // state in the continuous run, so it belongs to the same \par unit.
   }
   flush(text.length);
 

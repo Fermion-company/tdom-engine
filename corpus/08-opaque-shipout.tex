@@ -1,0 +1,15 @@
+% EXPECTED-OPAQUE: shipout hooks are document-scale page decoration the
+% structured layer must refuse (gate doctrine: never fake what the JS page
+% assembly cannot represent). The farm asserts this demotes — a structured
+% pass here would be a gate regression, not a win.
+\documentclass[11pt,a4paper]{article}
+\usepackage{atbegshi}
+\AtBeginShipout{\AtBeginShipoutUpperLeft{\put(10,-30){\small draft}}}
+\begin{document}
+
+\section{Decorated pages}
+
+Body text under a per-page decoration hook. The canonical layer renders
+this exactly; the structured layer must stand aside.
+
+\end{document}

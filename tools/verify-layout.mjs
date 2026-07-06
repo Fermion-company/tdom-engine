@@ -72,6 +72,13 @@ async function truthPages() {
     execFileP('lualatex', ['-interaction=nonstopmode', 'main.tex'], {
       cwd: dir,
       timeout: 600_000,
+      // doc-relative assets (\includegraphics, \includepdf …) resolve against
+      // the ORIGINAL document directory, same as the engine's three tiers
+      env: {
+        ...process.env,
+        TEXINPUTS: `${path.dirname(texPath)}:${process.env.TEXINPUTS || ''}`,
+        LUAINPUTS: `${path.dirname(texPath)}:${process.env.LUAINPUTS || ''}`,
+      },
     }).catch(() => {});
   // compile to FIXPOINT: a non-converged run prints stale toc/ref pages —
   // "the real PDF" the engine must match is the converged document

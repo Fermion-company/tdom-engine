@@ -2,10 +2,10 @@
 --
 -- The engine process never restarts. Every block boundary is frozen as a
 -- fork()ed process (copy-on-write snapshot of the COMPLETE TeX state:
--- catcodes, macros, fonts, counters, label table, everything). An edit kills
--- the stale suffix of the checkpoint chain and resumes typesetting from the
--- last valid snapshot — so the visible cost of a keystroke is one paragraph
--- of Knuth-Plass plus IPC.
+-- catcodes, macros, fonts, counters, label table, everything). An edit
+-- preserves exact prefix checkpoints, lets the orchestrator rekey reusable
+-- suffix checkpoints, and typesets the bounded foreground window from the
+-- nearest valid snapshot.
 --
 -- THE EXACTNESS CONTRACT (v3.2): blocks are typeset on the REAL main
 -- vertical list — no \vbox wrapper, no group. TeX's page builder is kept
@@ -654,9 +654,13 @@ local function extract_items(head, parentBox)
       line_x = false
       line_xb = false
       if id == HLIST then
-        walk_h(n.list, n, 0, 0, runs)
+        -- shift_amount is how TeX indents \parshape/\hangindent lines —
+        -- LaTeX lists live on it. The nested walks (519/587) honored it;
+        -- the top-level line boxes must too, or every \item renders at the
+        -- body margin (found by the Phase-0 farm's dx metric).
+        walk_h(n.list, n, bp(n.shift or 0), 0, runs)
       elseif id == VLIST then
-        walk_v(n, 0, bp(h), runs)
+        walk_v(n, bp(n.shift or 0), bp(h), runs)
       else
         runs[1] = { rule = true, x = 0, dy = -bp(h), w = bp(w), h = bp(h) + bp(d), c = '#000000' }
       end

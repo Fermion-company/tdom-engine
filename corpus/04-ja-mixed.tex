@@ -1,0 +1,36 @@
+\documentclass[11pt,a4paper]{ltjsarticle}
+\usepackage{amsmath}
+\begin{document}
+
+\section{和文の段落}
+
+日本語の本文がそのまま組まれる段落である。行分割は禁則処理を含み、
+約物の詰めと欧文との混植が同時に起きるので、シェーピングと
+JFMグルーの両方がこの一段落だけで検査できる。English words mixed in
+run alongside 和文 with inter-script glue.
+
+\section{数式との混植}
+
+和文の途中に $\alpha + \beta = \gamma$ のような数式が入り、別行立ての
+式も続く:
+\begin{equation}
+  f(x) = \frac{1}{\sqrt{2\pi}} e^{-x^2/2}
+\end{equation}
+
+式のあとの段落。ここは前の式との間隔（\verb|\abovedisplayskip| 系）が
+連続ランと一致するかを見るための本文である。長めに書いて二行以上に
+折り返させる。
+
+\section{箇条書き}
+
+\begin{enumerate}
+  \item 一つ目の項目。短い。
+  \item 二つ目の項目。こちらは折り返しが起きる程度に長く書いてあり、
+        字下げの継続も確認できる。
+  \item 三つ目。
+\end{enumerate}
+
+締めの段落。全体で二ページ弱に収まる分量とし、農場の実行時間を
+短く保つ。
+
+\end{document}

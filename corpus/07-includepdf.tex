@@ -1,0 +1,16 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{pdfpages}
+\begin{document}
+
+\section{Around foreign pages}
+
+Text before the included foreign page. The include is a single block that
+takes the exact-render rescue while this paragraph stays on the glyph
+layer.
+
+\includepdf[pages=1]{inc-asset.pdf}
+
+Text after the foreign page, confirming pagination resumes on the
+structured path.
+
+\end{document}

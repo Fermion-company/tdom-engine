@@ -22,10 +22,12 @@
 // The provisional machinery: a single resident lualatex process tree holds
 // the document. Every block
 // boundary is a fork()ed checkpoint: a copy-on-write snapshot of the COMPLETE
-// TeX state. An edit kills the stale suffix of the chain and resumes from the
-// last valid snapshot, so the foreground cost of a keystroke is:
+// TeX state. An edit preserves exact prefix checkpoints, rekeys reusable
+// suffix checkpoints as volatile-stale, and runs only a bounded foreground
+// verification walk before deferring wider propagation, so the foreground
+// cost of a keystroke is:
 //
-//   fork (~0.2ms) + typeset the changed block (+1 verification block)
+//   fork + typeset the changed block (+bounded verification blocks)
 //   + node-walk galley extraction + JSON over a local socket
 //
 // — typically single-digit milliseconds. There is no process start, no
@@ -547,8 +549,8 @@ export class CheckpointEngine {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: {
           ...process.env,
-          TEXINPUTS: `${this.docDir}//:${process.env.TEXINPUTS || ''}`,
-          LUAINPUTS: `${this.docDir}//:${process.env.LUAINPUTS || ''}`,
+          TEXINPUTS: `${this.docDir}:${process.env.TEXINPUTS || ''}`,
+          LUAINPUTS: `${this.docDir}:${process.env.LUAINPUTS || ''}`,
         },
       }
     );
@@ -836,9 +838,22 @@ export class CheckpointEngine {
     } else {
       // Labels are defined in descendant lineages only; when resuming from an
       // ancestor snapshot, forward-referenced values must be injected so this
-      // block sees the document-wide truth.
+      // block sees the document-wide truth. A freshly EDITED block has no
+      // galley yet (diffBlocks re-minted it), so its refs must come from the
+      // new text itself — otherwise editing any \ref-bearing paragraph froze
+      // its references at '??' until some label happened to move (found by
+      // the Phase-0 fuzzer, corpus/06 seed 7).
+      const refKeys = new Set(block.galley?.refs ?? []);
+      const REF_USE_RE = /\\(?:ref|eqref|pageref|vref|vpageref|autoref|nameref|cref|Cref)\*?\s*\{([^}]+)\}/g;
+      for (const m of block.text.matchAll(REF_USE_RE)) {
+        for (const k of m[1].split(',')) refKeys.add(k.trim());
+      }
+      const CITE_USE_RE = /\\[cC]ite[a-zA-Z]*\*?\s*(?:\[[^\]]*\]\s*)*\{([^}]+)\}/g;
+      for (const m of block.text.matchAll(CITE_USE_RE)) {
+        for (const k of m[1].split(',')) refKeys.add('cite:' + k.trim());
+      }
       const defs = [];
-      for (const key of block.galley?.refs ?? []) {
+      for (const key of refKeys) {
         const val = this.labelTable.get(key);
         const cs = key.startsWith('cite:') ? `b@${key.slice(5)}` : `r@${key}`;
         if (val === undefined) {
@@ -1281,7 +1296,13 @@ export class CheckpointEngine {
     );
     L.push('\\holdinginserts=1');
     L.push('\\maxdeadcycles=200');
-    L.push('\\output={\\directlua{tdom_iso_absorb()}}');
+    // Page-EMITTING blocks (\includepdf: whole foreign pages) keep the REAL
+    // output routine so every page ships and becomes a per-page chunk. The
+    // dormant absorb would hand their zero-dimension page paintings back to
+    // the galley as invisible material (pdfpages draws via a 0pt picture
+    // box). Galley-material blocks keep the absorb as before.
+    const realOutput = /\\includepdf\b/.test(block.text);
+    if (!realOutput) L.push('\\output={\\directlua{tdom_iso_absorb()}}');
     // material taller than the page inside an output-hijack env (multicols'
     // own routine) ships REAL pages — count them so the harvest knows the
     // pre-body machinery (and the isostart marker) left with page 1
@@ -1421,8 +1442,8 @@ export class CheckpointEngine {
       // same way the canonical compile resolves them
       env: {
         ...process.env,
-        TEXINPUTS: `${this.docDir}//:${process.env.TEXINPUTS || ''}`,
-        LUAINPUTS: `${this.docDir}//:${process.env.LUAINPUTS || ''}`,
+        TEXINPUTS: `${this.docDir}:${process.env.TEXINPUTS || ''}`,
+        LUAINPUTS: `${this.docDir}:${process.env.LUAINPUTS || ''}`,
       },
     });
     this.isoChildren.add(run.child);
@@ -1453,13 +1474,26 @@ export class CheckpointEngine {
       await execFileP('pdftocairo', ['-svg', '-f', String(k), '-l', String(k), pdf, svgPath], {
         timeout: 30_000,
       });
+      const svg = readFileSync(svgPath, 'utf8');
+      // A BLANK shipped page is a break, not content: with the real output
+      // routine in place (\includepdf), the leading \clearpage ships the
+      // near-empty current page — in the full document that position is
+      // occupied by the PRECEDING blocks' material, so representing it as a
+      // chunk would mint a phantom page. Keep the break, drop the box.
+      const blank = !/<(path|image|text)\b/.test(svg);
+      if (blank) {
+        items.push({ k: 'eject', v: -10000 });
+        continue;
+      }
       const x0 = geo.oddsidemargin ?? 0;
       const y0 = (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
       const w = geo.textwidth ?? st.w;
       const h = geo.textheight ?? st.h;
       const key = `${block.id}@p${k}`;
-      chunks.push({ key, svg: cropSvgAt(readFileSync(svgPath, 'utf8'), x0, y0, w, h), wBp: w, hBp: h });
-      items.push({ k: 'box', h, d: 0, chunk: key, coff: 0 });
+      chunks.push({ key, svg: cropSvgAt(svg, x0, y0, w, h), wBp: w, hBp: h });
+      // full: a REAL shipped page — it owns its page style (pdfpages sets
+      // \thispagestyle{empty}), so the preview must not stamp a folio on it
+      items.push({ k: 'box', h, d: 0, chunk: key, coff: 0, full: 1 });
       items.push({ k: 'eject', v: -10000 });
     }
     // remainder galley = the LAST pdf page (our manual shipout); its items
@@ -2770,8 +2804,8 @@ export class CheckpointEngine {
       this.diagnostics.push('chain pass failed: ' + err.message);
     });
     // High-fidelity chunk renders go to the pump ONLY for the blocks this
-    // edit touched: their checkpoint is warm (render hold) and the RENDER
-    // round is ~100–200ms. COLD blocks (boot backlog, far-away staleness)
+    // edit touched: their checkpoint is warm (render hold). COLD blocks
+    // (boot backlog, far-away staleness)
     // are deliberately NOT queued — on deep-lineage luatexja documents a
     // resident RENDER there spins to its timeout, and a whole-document
     // sweep would storm the CPU that the fork jobs need. Their exact
@@ -3731,11 +3765,14 @@ export class CheckpointEngine {
       gfxOpen = null;
     };
 
+    let ownsPage = false; // a real shipped page (iso `full` chunk) carries
+    // its own page style — no provisional folio/header on top of it
     for (const entry of page.draw ?? []) {
       const u = entry.u;
       const baseline = T + entry.y;
       if (u.ln.gfxChunk) {
         const c = u.ln.gfxChunk;
+        if (c.full) ownsPage = true;
         const unitTop = baseline - u.ln.boxH;
         const chunkTop = unitTop - c.yOff;
         const clip0 = c.yOff;
@@ -3757,11 +3794,11 @@ export class CheckpointEngine {
     // \@oddhead/\@oddfoot with the page's real folio format, style and
     // marks). \@outputpage geometry: head box bottom at topmargin+headheight,
     // foot baseline \footskip below the text area.
-    const hfEntry = this.hf?.get(page.number);
+    const hfEntry = ownsPage ? null : this.hf?.get(page.number);
     if (hfEntry) {
       this.#paintHfItems(commands, hfEntry.h, L, 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0));
       this.#paintHfItems(commands, hfEntry.f, L, T + geo.textheight + (geo.footskip ?? 30));
-    } else {
+    } else if (!ownsPage) {
       // header job hasn't landed yet: provisional plain folio (replaced by
       // the TeX-typeset footer as soon as the async job reports)
       commands.push({
@@ -4036,6 +4073,7 @@ function buildStream(block, chunks) {
       let gfxChunk = null;
       if (it.chunk) {
         gfxChunk = { blockId: it.chunk, yOff: it.coff ?? 0, w: chunks.get(it.chunk)?.wBp ?? galley.w };
+        if (it.full) gfxChunk.full = 1; // real shipped page: owns folio/hf
       } else if (wantExact && bc) {
         gfxChunk = { blockId: block.id, yOff, w: galley.w, stale: bcFresh ? undefined : 1 };
       }

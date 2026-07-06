@@ -1,0 +1,37 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\newtheorem{theorem}{Theorem}[section]
+\begin{document}
+
+\section{Statements}
+
+Inline math like $e^{i\pi}+1=0$ and $\sum_{k=1}^{n} k = \tfrac{n(n+1)}{2}$
+inside running text, followed by displayed equations:
+\begin{equation}\label{eq:gauss}
+  \int_{-\infty}^{\infty} e^{-x^2}\,dx = \sqrt{\pi}
+\end{equation}
+
+\begin{theorem}\label{thm:main}
+  For every $\varepsilon>0$ there exists $\delta>0$ such that
+  $|f(x)-f(a)|<\varepsilon$ whenever $|x-a|<\delta$.
+\end{theorem}
+
+\begin{align}
+  a_1 &= b_1 + c_1, \\
+  a_2 &= b_2 + c_2 + d_2, \label{eq:second}\\
+  a_3 &= b_3.
+\end{align}
+
+\section{Uses}
+
+Equation~\eqref{eq:gauss} and~\eqref{eq:second} together with
+Theorem~\ref{thm:main} give the usual argument, spelled out here in prose
+long enough to form a real paragraph around the mathematics.
+
+Matrices too:
+\[
+  M = \begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix},\qquad
+  \det M = -2 .
+\]
+
+\end{document}

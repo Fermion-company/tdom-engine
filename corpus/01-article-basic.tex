@@ -1,0 +1,33 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{fontspec}
+\begin{document}
+\tableofcontents
+
+\section{Opening}\label{sec:open}
+
+Plain prose paragraph with enough words to wrap across several lines and
+exercise ordinary hyphenation, kerning and paragraph building without any
+special machinery at all.
+
+Second paragraph referencing Section~\ref{sec:close} ahead of its
+definition, so the backward-reference pass has real work to do.
+
+\section{Middle}
+
+A list environment:
+\begin{itemize}
+  \item first item with a short clause after it
+  \item second item that is somewhat longer and wraps to the following line
+        when the column is narrow enough
+  \item third item
+\end{itemize}
+
+Another paragraph after the list to carry inter-block spacing state across
+an environment boundary.
+
+\section{Closing}\label{sec:close}
+
+Final paragraph mentioning Section~\ref{sec:open} so both reference
+directions appear in one document.
+
+\end{document}

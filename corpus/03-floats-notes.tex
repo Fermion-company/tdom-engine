@@ -1,0 +1,44 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{tikz}
+\usepackage{booktabs}
+\begin{document}
+
+\section{Floats and notes}
+
+Opening paragraph before the first float, with a footnote\footnote{The
+footnote body itself is long enough to wrap onto a second line so the
+insert machinery carries real content.} in the middle of it.
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}
+    \draw[thick] (0,0) rectangle (3,1.5);
+    \draw (0,0) -- (3,1.5);
+    \node at (1.5,0.75) {tikz};
+  \end{tikzpicture}
+  \caption{A drawn figure so the float carries a pdf-literal chunk.}
+  \label{fig:one}
+\end{figure}
+
+Paragraph between the floats referring to Figure~\ref{fig:one} and to
+Table~\ref{tab:one}, long enough to flow around their placement.
+
+\begin{table}[htbp]
+  \centering
+  \begin{tabular}{lrr}
+    \toprule
+    name & count & share \\
+    \midrule
+    alpha & 12 & 0.30 \\
+    beta  & 23 & 0.55 \\
+    gamma &  7 & 0.15 \\
+    \bottomrule
+  \end{tabular}
+  \caption{A ruled table.}
+  \label{tab:one}
+\end{table}
+
+Closing paragraph with a second footnote\footnote{Short one.} to move the
+footnote counter and the insert stream once more.
+
+\end{document}

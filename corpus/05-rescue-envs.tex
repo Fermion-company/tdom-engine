@@ -1,0 +1,36 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage{multicol}
+\usepackage{longtable}
+\usepackage{framed}
+\begin{document}
+
+\section{Output-routine environments}
+
+Paragraph before the rescued blocks, typeset by the ordinary structured
+path so both tiers appear on one page.
+
+\begin{multicols}{2}
+Two-column text lives inside an environment that drives the page builder
+itself, so the engine routes this whole block through the isolated
+exact-render rescue and shows real LuaLaTeX pixels for it. This filler is
+long enough to balance across the two columns and produce a visible
+column break in the middle of the material.
+\end{multicols}
+
+Between-blocks paragraph back on the structured path.
+
+\begin{framed}
+A framed block, another page-context environment: its box is drawn by the
+rescue tier while the surrounding prose stays on the glyph layer.
+\end{framed}
+
+\begin{longtable}{ll}
+row one   & value \\
+row two   & value \\
+row three & value \\
+row four  & value \\
+\end{longtable}
+
+Closing paragraph after the longtable.
+
+\end{document}

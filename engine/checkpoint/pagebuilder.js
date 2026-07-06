@@ -663,13 +663,14 @@ class PageBuilder {
                   this.colnum--;
                   this.textfloatsheight += this.#floatHt(f) + 2 * this.intextsep.w;
                   this.midlist.push(f);
-                  // \box\@currbox in \@addtocurcol appends to a vlist, so
-                  // TeX inserts interline glue against \prevdepth first
-                  const il = this.#interlineGlue(f.h);
+                  // \@addtocurcol commits here-floats under \nointerlineskip
+                  // (\@tempdima\prevdepth … \prevdepth\@tempdima): NO
+                  // interline glue before the float box — the real node
+                  // stream carries the \intextsep pair only (farm: corpus/03
+                  // showed a phantom \lineskip per committed float)
                   const inject = [
                     { t: 'pen', v: this.lastPen >= INF_BAD ? INF_BAD : this.interlinepenalty },
                     { t: 'glue', a: this.intextsep.w, st: this.intextsep.st, sto: this.intextsep.sto, sh: this.intextsep.sh, sho: this.intextsep.sho },
-                    ...(il ? [il] : []),
                     { t: 'box', u: floatAsUnit(f) },
                     { t: 'pen', v: this.interlinepenalty },
                     { t: 'glue', a: this.intextsep.w, st: this.intextsep.st, sto: this.intextsep.sto, sh: this.intextsep.sh, sho: this.intextsep.sho },
