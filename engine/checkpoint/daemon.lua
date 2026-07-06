@@ -76,6 +76,15 @@ local LASTSKIP_ATTR = 8124 -- marks the \lastskip primer glue (see tdom_prime_la
 -- extract_items drops the primer (it's already counted in the previous
 -- block's galley). Without it, tcolorbox/list after-skip + a following
 -- \section before-skip come out summed instead of maxed.
+-- \enlargethispage{X}: the REAL page builder honors it via \pagegoal; the
+-- dormant run only records a marker so the orchestrator's page builder can
+-- grow the CURRENT page's goal at exactly this stream position.
+function tdom_enlarge(sp, star)
+  local m = node.new('whatsit', node.subtype('special'))
+  m.data = 'tdom:enlarge:' .. math.floor(tonumber(sp) or 0) .. ':' .. (star or 0)
+  node.write(m)
+end
+
 function tdom_prime_lastskip(sp)
   sp = tonumber(sp) or 0
   if sp == 0 then return end
@@ -734,6 +743,9 @@ local function extract_items(head, parentBox)
       elseif SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data and n.data:match('^tdom:eject') then
         local pen = tonumber(n.data:match('^tdom:eject:(-?%d+)')) or -10000
         items[#items + 1] = { k = 'eject', v = pen }
+      elseif SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data and n.data:match('^tdom:enlarge') then
+        local sp, star = n.data:match('^tdom:enlarge:(-?%d+):(%d)')
+        items[#items + 1] = { k = 'enlarge', a = bp(tonumber(sp) or 0), star = tonumber(star) }
       elseif SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data and n.data:match('^tdom:ev:') then
         -- page-style event marker: travels in the stream so the page
         -- builder knows EXACTLY which page the event lands on (a single

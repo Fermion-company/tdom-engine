@@ -66,7 +66,6 @@ const UNSAFE_BODY = [
   [/\\marginpar\b/, '\\marginpar (page-margin placement)'],
   [/\\marginnote\b/, '\\marginnote (page-margin placement)'],
   [/\\newgeometry\b/, '\\newgeometry (mid-document page geometry)'],
-  [/\\enlargethispage\b/, '\\enlargethispage'],
   // NOT \includepdf: block-level rescue ships its foreign pages exactly
   // (see OUTPUT_HIJACK_RE in engine-v3.js).
   [/\\twocolumn\b/, 'mid-document \\twocolumn'],

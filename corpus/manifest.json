@@ -1,17 +1,52 @@
 {
   "comment": "Farm corpus (docs/ROADMAP.md Phase 0). expect: structured docs run the verify-layout referee (pseudo == real PDF); opaque docs assert the gate demotes. knownDiverged marks pre-existing baselines the farm reports but does not fail on. --full adds the slow entries.",
   "docs": [
-    { "file": "01-article-basic.tex", "expect": "structured" },
-    { "file": "02-math-ams.tex", "expect": "structured" },
-    { "file": "03-floats-notes.tex", "expect": "structured" },
-    { "file": "04-ja-mixed.tex", "expect": "structured" },
-    { "file": "05-rescue-envs.tex", "expect": "structured" },
-    { "file": "06-refs-heavy.tex", "expect": "structured" },
-    { "file": "07-includepdf.tex", "expect": "structured" },
-    { "file": "08-opaque-shipout.tex", "expect": "opaque" },
-    { "file": "../samples/demo-lua.tex", "expect": "structured" }
+    {
+      "file": "01-article-basic.tex",
+      "expect": "structured"
+    },
+    {
+      "file": "02-math-ams.tex",
+      "expect": "structured"
+    },
+    {
+      "file": "03-floats-notes.tex",
+      "expect": "structured"
+    },
+    {
+      "file": "04-ja-mixed.tex",
+      "expect": "structured"
+    },
+    {
+      "file": "05-rescue-envs.tex",
+      "expect": "structured"
+    },
+    {
+      "file": "06-refs-heavy.tex",
+      "expect": "structured"
+    },
+    {
+      "file": "07-includepdf.tex",
+      "expect": "structured"
+    },
+    {
+      "file": "08-opaque-shipout.tex",
+      "expect": "opaque"
+    },
+    {
+      "file": "09-enlarge.tex",
+      "expect": "structured"
+    },
+    {
+      "file": "../samples/demo-lua.tex",
+      "expect": "structured"
+    }
   ],
   "full": [
-    { "file": "../samples/stress-test-ja.tex", "expect": "structured", "knownDiverged": true }
+    {
+      "file": "../samples/stress-test-ja.tex",
+      "expect": "structured",
+      "knownDiverged": true
+    }
   ]
 }

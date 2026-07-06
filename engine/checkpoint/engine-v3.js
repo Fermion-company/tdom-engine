@@ -610,6 +610,18 @@ export class CheckpointEngine {
       '\\ifcsname cref@currentlabel\\endcsname' +
       "\\directlua{tdom_label_cref('\\luaescapestring{#1}'," +
       "'\\luaescapestring{\\detokenize\\expandafter{\\cref@currentlabel}}')}\\fi";
+    // \enlargethispage: record a stream marker for the JS page builder
+    // (the dormant page ignores the real effect); the original still runs.
+    L.push('\\let\\TDOMenlarge\\enlargethispage');
+    L.push('\\renewcommand\\enlargethispage{\\@ifstar\\TDOMenlargeS\\TDOMenlargeN}');
+    L.push(
+      '\\newcommand\\TDOMenlargeS[1]{\\TDOMenlarge*{#1}' +
+        '\\begingroup\\dimen@=\\dimexpr#1\\relax\\directlua{tdom_enlarge(\\number\\dimen@,1)}\\endgroup}'
+    );
+    L.push(
+      '\\newcommand\\TDOMenlargeN[1]{\\TDOMenlarge{#1}' +
+        '\\begingroup\\dimen@=\\dimexpr#1\\relax\\directlua{tdom_enlarge(\\number\\dimen@,0)}\\endgroup}'
+    );
     L.push('\\let\\TDOMlabel\\label');
     L.push(
       "\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}" +
@@ -4226,6 +4238,10 @@ function buildStream(block, chunks) {
       if (f) stream.push({ t: 'fm', f, vmode: true });
     } else if (it.k === 'eject') {
       stream.push({ t: 'eject', v: it.v ?? -10000 });
+    } else if (it.k === 'enlarge') {
+      // \enlargethispage marker: grows the CURRENT page's goal in the page
+      // builder at exactly this stream position
+      stream.push({ t: 'enlarge', a: it.a ?? 0, star: it.star ?? 0 });
     } else if (it.k === 'ev') {
       // page-style event marker: invisible, but its page decides when the
       // event (pagenumbering/style/marks) takes effect. The payload kind

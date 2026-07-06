@@ -392,6 +392,11 @@ class PageBuilder {
         case 'eject':
           this.#handleEject(e);
           break;
+        case 'enlarge':
+          // \enlargethispage at this stream position: the CURRENT page's
+          // goal grows; #startColumnState resets it for the next page
+          this.colroom += e.a;
+          break;
         case 'ev':
           // page-style event marker: rides the stream so its PAGE is exact,
           // but is transparent to spacing and break legality (the marker
