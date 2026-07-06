@@ -17,6 +17,8 @@
 | 7 | [07-glossary.md](07-glossary.md) | 用語集 | 随時参照 |
 | 8 | [08-canonical-exact-layer.md](08-canonical-exact-layer.md) | **2026-07大改修**: canonical exact layer（LuaLaTeX実出力＝最終表示の権威）、safety gate、opaqueモード、一致検証、srcRev二重系列 | 全員（最新の権威構造） |
 | 9 | [09-visual-fidelity-gate.md](09-visual-fidelity-gate.md) | **2026-07第2次改修**: Visual Fidelity Gate（safe-glyph / exact-preview-required / canonical-only）、行粒度の high-fidelity chunk、stale-exact 表示、フォント配信ティア、検証降格 | 全員（表示品質の契約） |
+| 10 | [10-edit-hot-path.md](10-edit-hot-path.md) | **2026-07第3次改修**: 編集ホットパスの不変量（有界foreground・checkpoint fungibility・アイドル最小性）、チェーン温存と再キー、settle/rebuildの非同期化、galley同一性の安定化（フォントid正規化・jenc決定論化） | 全員（編集性能の契約） |
+| — | [ROADMAP.md](ROADMAP.md) | **第一目標「canonicalが体感から消えたリアルタイムプレビュー」**（2026-07-07確定）: 達成条件A–D、Phase 0 監査装置 → 1 incremental canonical → 2 見える依存の掃討 → 3 ストリーミングboot、恒久ドクトリン6箇条 | 全員（開発の現在地） |
 
 ## この解説書の対象コミット
 

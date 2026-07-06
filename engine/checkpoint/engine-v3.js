@@ -76,7 +76,56 @@ const BOOT_TIMEOUT = 60_000;
 // (multicols, longtable …) and page-context readers that split against
 // \pagegoal-\pagetotal (mdframed, framed, breakable tcolorbox)
 const OUTPUT_HIJACK_RE =
-  /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded)\}|\\begin\{tcolorbox\}\[[^\]]*breakable/;
+  /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded)\}|\\begin\{tcolorbox\}\[[^\]]*breakable|\\includepdf\b/;
+
+// Definition-bearing body edits: a macro/environment/length defined (or
+// undefined) in a BODY block can change the meaning of every later block in
+// ways the exit-state vector cannot see. Such edits forfeit checkpoint-suffix
+// preservation and take the conservative path: serial re-typeset of the
+// suffix, off the hot path.
+const DEF_RE =
+  /\\(def|edef|gdef|xdef|newcommand|renewcommand|providecommand|DeclareRobustCommand|DeclareMathOperator|let|futurelet|newenvironment|renewenvironment|newcounter|newtheorem|newlength|newsavebox|setlength|addtolength|makeatletter|catcode|pagestyle)\b/;
+
+/** Stable, lineage-independent identity of one TeX font instance. */
+function stableFontKey(meta) {
+  return 'F' + fnv1a(`${meta.file || ''}|${meta.name || ''}|${meta.size || 0}`);
+}
+
+/** Visit every glyph run in a harvested item tree (boxes, floats, inserts). */
+function walkItemRuns(items, fn) {
+  if (!items) return;
+  for (const it of items) {
+    if (it.runs) {
+      for (const r of it.runs) fn(r);
+    }
+    if (it.items) walkItemRuns(it.items, fn);
+  }
+}
+
+function parseVec(json) {
+  try {
+    return JSON.parse(json ?? '[]');
+  } catch {
+    return [];
+  }
+}
+
+// stateVec layout: [...counters, tdom@pd, tdom@nobreak, tdom@ls]
+function vecCountersEqual(aJson, bJson) {
+  const a = parseVec(aJson);
+  const b = parseVec(bJson);
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length - 3; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function vecLocalsEqual(aJson, bJson) {
+  const a = parseVec(aJson);
+  const b = parseVec(bJson);
+  if (a.length !== b.length) return false;
+  for (let i = Math.max(0, a.length - 3); i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
 // cheap "will want an exact preview chunk" scan for blocks with no fidelity
 // verdict yet (checkpoint render-hold heuristic — a miss only costs the
 // slower isolated render path)
@@ -172,6 +221,14 @@ export class CheckpointEngine {
     this.renderPumping = 0;
     this.renderTask = Promise.resolve();
     this.renderHold = new Map(); // ckpt idx kept alive for a pending render -> block.id
+    // Edit-locus pinning: the checkpoints at (and right after) the block the
+    // user is typing in are exempt from grid retirement, so a keystroke burst
+    // is always "fork once + typeset one block", never a grid replay.
+    this.editHold = []; // boundary indices (most recent loci, capped)
+    // Deferred chain work (the ONLY background chain activity): 'rebuild'
+    // re-typesets the suffix serially (definition edits, untracked-state
+    // leaks). Idle-gated, preemptible, resumable — see #runChainPass.
+    this.pendingChain = null; // {kind:'rebuild', from, phase:'blocks'|'after', labels:Set}
   }
 
   /** Serialize access to the resident chain (jobBlock/currentJob users). */
@@ -204,6 +261,8 @@ export class CheckpointEngine {
     this.modeReasons = [];
     this.opaqueStickyPre = null;
     this.verifyState = null;
+    this.pendingChain = null;
+    this.editHold = [];
     return this.#update({ editLabel: 'open' });
   }
 
@@ -216,6 +275,7 @@ export class CheckpointEngine {
   }
 
   async close() {
+    this.closed = true;
     this.bgAbort = true;
     this.canonical.dispose();
     this.rescueQueue.clear();
@@ -466,13 +526,31 @@ export class CheckpointEngine {
     this.hfSig = null;
     writeFileSync(path.join(this.workDir, 'driver.tex'), this.#driverSource(preamble));
 
+    // The aux family is a BYPRODUCT of the previous process tree, not state:
+    // everything persistent lives in the orchestrator (labelTable, hrefTable,
+    // #computeToc regenerates driver.toc after the first pagination). A tree
+    // that died mid-write (SIGKILL, crash, power) leaves truncated/NUL-ridden
+    // files behind, and \begin{document} reading them kills the boot ("Text
+    // line contains an invalid character") — demoting a perfectly good
+    // document to opaque. Boot from a clean slate, always.
+    for (const ext of ['aux', 'toc', 'lof', 'lot', 'loa', 'lol', 'idx', 'out', 'nav', 'snm', 'vrb']) {
+      rmSync(path.join(this.workDir, `driver.${ext}`), { force: true });
+    }
     rmSync(path.join(this.workDir, 'driver.pdf'), { force: true });
     const ckptReady = this.#await('ckpt:0', BOOT_TIMEOUT);
     const geoReady = this.#await('geo', BOOT_TIMEOUT);
     this.root = spawn(
       'lualatex',
       ['--shell-escape', '-interaction=nonstopmode', 'driver.tex'],
-      { cwd: this.workDir, stdio: ['ignore', 'pipe', 'pipe'] }
+      {
+        cwd: this.workDir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          TEXINPUTS: `${this.docDir}//:${process.env.TEXINPUTS || ''}`,
+          LUAINPUTS: `${this.docDir}//:${process.env.LUAINPUTS || ''}`,
+        },
+      }
     );
     let rootLog = '';
     this.root.stdout.on('data', (d) => { rootLog += d; if (rootLog.length > 65536) rootLog = rootLog.slice(-32768); });
@@ -788,8 +866,9 @@ export class CheckpointEngine {
         const ls = pv.length ? pv[pv.length - 1] : 0;
         if (ls) primer = `\\directlua{tdom_prime_lastskip(${Math.round(ls)})}`;
       }
+      const volatilePre = ck.vstale && idx > 0 ? this.#volatilePrelude(idx) : '';
       const prelude =
-        (defs.length ? `\\makeatletter ${defs.join(' ')}\\makeatother\n` : '') + primer;
+        volatilePre + (defs.length ? `\\makeatletter ${defs.join(' ')}\\makeatother\n` : '') + primer;
       // Mid-typing safety: an unclosed brace makes a \long macro argument
       // scan past the injected \par/report tokens to EOF and kills the child
       // (the old \vbox wrapper stopped it structurally). Auto-close the
@@ -1025,6 +1104,27 @@ export class CheckpointEngine {
       fonts: {},
       tdomIsoChunks: iso.chunks,
     };
+  }
+
+  /**
+   * Volatile-state normalization for jobs forked from a vstale checkpoint
+   * (a lineage that predates an upstream edit): re-seed counters,
+   * \prevdepth and \if@nobreak from the orchestrator's authoritative exit
+   * vector of the previous block. Identical machinery to the rescue
+   * continuations (#stateJobBody); \lastskip is covered by the primer,
+   * labels by the per-job defs. Natural fresh lineages never pass through
+   * here — the hot path stays byte-identical to a continuous run.
+   */
+  #volatilePrelude(idx) {
+    const prevVec = parseVec(this.blocks[idx - 1]?.stateVec);
+    if (!prevVec.length) return '';
+    const state = {};
+    this.counters.forEach((c, i) => {
+      state[c] = prevVec[i] ?? 0;
+    });
+    state['tdom@pd'] = prevVec[prevVec.length - 3] ?? -65536000;
+    state['tdom@nobreak'] = prevVec[prevVec.length - 2] ?? 0;
+    return this.#stateJobBody({ state, labels: [] }) + '\n';
   }
 
   #stateJobBody(iso) {
@@ -1317,6 +1417,13 @@ export class CheckpointEngine {
     const run = execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
       cwd: jobdir,
       timeout: 120_000,
+      // doc-relative assets (\includegraphics, \includepdf …) resolve the
+      // same way the canonical compile resolves them
+      env: {
+        ...process.env,
+        TEXINPUTS: `${this.docDir}//:${process.env.TEXINPUTS || ''}`,
+        LUAINPUTS: `${this.docDir}//:${process.env.LUAINPUTS || ''}`,
+      },
     });
     this.isoChildren.add(run.child);
     await run.catch(() => {});
@@ -1417,6 +1524,9 @@ export class CheckpointEngine {
     const grid = this.#ckptGrid();
     if (grid <= 1 || idx === 0 || idx % grid === 0) return;
     if (!this.checkpoints.has(idx + 1)) return; // successor must exist first
+    // edit-locus pin: keep the boundaries around the block being typed in,
+    // so a keystroke burst never pays a grid replay
+    if (this.editHold.includes(idx)) return;
     // Render hold: the resident RENDER path needs the state AT the block,
     // so a block that will want a high-fidelity chunk (math/gfx — typically
     // the one being edited) keeps its checkpoint alive until the chunk
@@ -1528,7 +1638,42 @@ export class CheckpointEngine {
     this.#indexBlock(blockId, EMPTY_UNITS, EMPTY_UNITS);
   }
 
+  /**
+   * Rewrite the galley's numeric daemon font ids to stable keys BEFORE
+   * anything hashes or stores it. Daemon ids are allocation-order artifacts
+   * of one fork lineage: replaying the same block in a different lineage
+   * (chain preservation, background rebuild, engine restart) yields
+   * different ids for identical output — which used to make galleyHash /
+   * page identity churn, mark untouched pages dirty and peel their
+   * canonical overlays. After this pass, galley identity is a pure function
+   * of TeX's output.
+   */
+  #normalizeGalleyFonts(galley) {
+    const map = new Map();
+    for (const [fid, meta] of Object.entries(galley.fonts ?? {})) {
+      const key = stableFontKey(meta);
+      map.set(Number(fid), key);
+      this.#registerFont(key, meta);
+    }
+    if (galley.fontsNormalized) return; // stale-first reuse re-adopts objects
+    const rewrite = (r) => {
+      if (r.rule || r.f == null) return;
+      const key = map.get(r.f);
+      if (key) r.f = key;
+      else if (typeof r.f === 'number' && map.size) {
+        // a PARTIALLY mapped galley is a real bug (the daemon reports every
+        // id its runs use); rescued iso galleys legitimately carry no font
+        // table at all — their pixels come from chunks, runs only size them
+        this.diagnostics.push(`font id ${r.f} missing from galley font table`);
+      }
+    };
+    walkItemRuns(galley.items, rewrite);
+    for (const f of galley.floats ?? []) walkItemRuns(f.items, rewrite);
+    galley.fontsNormalized = true;
+  }
+
   #adoptGalley(block, galley) {
+    this.#normalizeGalleyFonts(galley);
     this.#indexBlock(
       block.id,
       (galley.labels ?? []).map((l) => l.k),
@@ -1570,10 +1715,8 @@ export class CheckpointEngine {
       galley.state?.['tdom@ls'] ?? 0,
     ]);
     block.gfx = !!galley.gfx;
-    // fonts must be registered BEFORE the fidelity gate reads their tiers
-    for (const [fid, meta] of Object.entries(galley.fonts ?? {})) {
-      this.#registerFont(Number(fid), meta);
-    }
+    // fonts were registered by #normalizeGalleyFonts BEFORE the fidelity
+    // gate reads their tiers
     this.#applyFidelity(block, galley);
     block.consumesToc = /\\(tableofcontents|listoffigures|listoftables)\b/.test(block.text);
     block.kind = HEADING_RE.test(block.text)
@@ -1602,8 +1745,8 @@ export class CheckpointEngine {
     block.units = null;
   }
 
-  #registerFont(fid, meta) {
-    if (this.fonts.has(fid)) return;
+  #registerFont(key, meta) {
+    if (this.fonts.has(key)) return;
     const base = path.basename(meta.file || meta.name || '');
     const browserLoadable = /\.(otf|ttf)$/i.test(base);
     const legacy = !browserLoadable ? mapLegacyFont(meta.name) : null;
@@ -1626,11 +1769,11 @@ export class CheckpointEngine {
       if (!this.fontFiles.has(familyKey)) this.fontFiles.set(familyKey, meta.file);
       tier = 'native';
     } else {
-      familyKey = 'f-' + fnv1a(meta.file || meta.name || String(fid));
+      familyKey = 'f-' + fnv1a(meta.file || meta.name || String(key));
       tier = 'none';
     }
     if (this.demotedFamilies.has(familyKey)) tier = 'none';
-    this.fonts.set(fid, {
+    this.fonts.set(key, {
       ...meta,
       family: familyKey,
       remap: legacy?.map ?? null,
@@ -1729,6 +1872,7 @@ export class CheckpointEngine {
       this.mode = 'structured';
       this.modeReasons = [];
       this.preHash = null; // the resident tree was torn down — force a boot
+      this.canonical.pressure = 'authority'; // provisional carries the display again
       this.diagnostics.push('safety gate: structured layer re-enabled');
     }
 
@@ -1749,6 +1893,7 @@ export class CheckpointEngine {
         await this.#bootRoot();
       } catch (err) {
         this.opaqueStickyPre = preHash;
+        this.#scheduleStructuredReprobe(preHash);
         return this.#opaqueUpdate(editLabel, t, [`structured boot failed: ${err.message}`]);
       }
       this.preHash = preHash;
@@ -1791,11 +1936,41 @@ export class CheckpointEngine {
     if (oldBlocks.length !== this.blocks.length || diff.removed.length) {
       firstDirty = Math.min(firstDirty, commonPrefix);
     }
-    // kill checkpoints beyond the last valid boundary
-    for (const [idx, peer] of [...this.checkpoints]) {
-      if (idx > firstDirty) {
-        peer.send('DIE\n');
-        this.checkpoints.delete(idx);
+    // Checkpoint-suffix preservation (docs/10 §I2): boundaries outside the
+    // edited window survive the edit. Prefix boundaries are exact; suffix
+    // boundaries move by the window's index delta and are marked
+    // volatile-stale — a job forked from one re-seeds counters/\prevdepth/
+    // \if@nobreak from the orchestrator's stateVec (#volatilePrelude). Only
+    // boundaries INSIDE the window die. Whether the suffix may be TRUSTED
+    // is decided after the foreground walk (verdict): definition edits and
+    // untracked-state leaks still kill and rebuild it, off the hot path.
+    {
+      const { prefixLen, oldSuffixStart, newSuffixStart } = diff.bounds;
+      const delta = newSuffixStart - oldSuffixStart;
+      const rekeyed = new Map();
+      for (const [idx, peer] of this.checkpoints) {
+        if (idx <= prefixLen) {
+          rekeyed.set(idx, peer);
+        } else if (idx >= oldSuffixStart) {
+          peer.vstale = true;
+          rekeyed.set(idx + delta, peer);
+        } else {
+          peer.send('DIE\n');
+        }
+      }
+      this.checkpoints = rekeyed;
+      const holds = new Map();
+      for (const [idx, id] of this.renderHold) {
+        if (idx <= prefixLen) holds.set(idx, id);
+        else if (idx >= oldSuffixStart) holds.set(idx + delta, id);
+      }
+      this.renderHold = holds;
+      this.editHold = this.editHold
+        .map((idx) => (idx <= prefixLen ? idx : idx >= oldSuffixStart ? idx + delta : -1))
+        .filter((idx) => idx >= 0);
+      if (this.pendingChain) {
+        const f = this.pendingChain.from;
+        this.pendingChain.from = f <= prefixLen ? f : f >= oldSuffixStart ? f + delta : prefixLen;
       }
     }
 
@@ -1811,10 +1986,32 @@ export class CheckpointEngine {
     let typesetCount = 0;
     let forkMs = 0;
 
+    // Definition-bearing edits (docs/10 §I2b) forfeit suffix trust: scan the
+    // changed window's old AND new text before deciding anything.
+    let defEdit = false;
+    {
+      const { prefixLen, oldSuffixStart, newSuffixStart } = diff.bounds;
+      for (let k = prefixLen; k < oldSuffixStart && !defEdit; k++) {
+        defEdit = DEF_RE.test(oldBlocks[k]?.text ?? '');
+      }
+      for (let k = prefixLen; k < newSuffixStart && !defEdit; k++) {
+        defEdit = DEF_RE.test(this.blocks[k]?.text ?? '');
+      }
+    }
+
+    // Bounded foreground walk (docs/10 §I1): typeset the edited region plus
+    // its verification blocks, then STOP with a verdict — never walk the
+    // document on the hot path. 'clean' keeps the preserved suffix as-is;
+    // 'counters' hands the moving exit state to the async settle pass;
+    // 'leak' (galley divergence past the budget, or a definition edit)
+    // distrusts the suffix and hands it to the async rebuild pass.
+    let verdict = null;
+    let verifyGalleyBudget = 8; // layout-coupled clean blocks absorbed inline
+    let verifyLocalBudget = 4; // \prevdepth/\lastskip ripple blocks absorbed inline
     let i = this.#nearestCheckpoint(Math.min(firstDirty, this.blocks.length));
     while (i < this.blocks.length) {
       // /status liveness marker: which block the foreground pass is on —
-      // a 2-minute rebuild shows movement instead of silence
+      // a long boot walk shows movement instead of silence
       this.progress = { phase: 'typeset', at: i + 1, total: this.blocks.length };
       const block = this.blocks[i];
       const before = { hash: block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
@@ -1840,15 +2037,56 @@ export class CheckpointEngine {
         }
       }
       i++;
-      if (wasClean && !changed && i > firstDirty) {
-        // convergence: verify no known-affected blocks remain downstream
-        const affectedAhead = this.blocks.slice(i).some(
-          (b) => !b.galley || (b.galley.refs ?? []).some((k) => changedLabels.has(k))
-        );
-        if (!affectedAhead) break;
+      if (i <= firstDirty) continue; // replay ramp up to the edited region
+      if (!wasClean) continue; // still consuming the edited/new region
+      if (!changed) {
+        // convergence: exit state and galley reproduced exactly. Galley-less
+        // blocks ahead (boot/reboot fill) still need a walk; moved-label
+        // dependents are handled by the backward-reference pass below.
+        const holes = this.blocks.slice(i).some((b) => !b.galley);
+        if (!holes) {
+          verdict = 'clean';
+          break;
+        }
+        continue;
       }
+      if (block.galleyHash !== before.hash) {
+        // real layout coupling (\addvspace max-merge, @nobreak …) extends
+        // the edited region — within a budget. A long cascade means an
+        // untracked state (font switch, macro) is flowing downstream.
+        if (verifyGalleyBudget-- > 0) continue;
+        verdict = 'leak';
+        break;
+      }
+      // galley identical, exit state moved: counters and/or the local tail
+      if (vecLocalsEqual(before.state, block.stateVec)) {
+        verdict = 'counters';
+        break;
+      }
+      if (verifyLocalBudget-- > 0) continue; // let \prevdepth ripples settle
+      verdict = 'counters';
+      break;
     }
+    if (defEdit && verdict) verdict = 'leak';
     const fgStop = i;
+
+    // verdict dispatch: anything beyond the foreground bound is DEFERRED
+    if (verdict === 'counters' || verdict === 'leak') {
+      if (verdict === 'leak') {
+        // the suffix lineage can no longer be trusted — kill it; the async
+        // rebuild re-typesets serially from the stop point
+        for (const [idx, peer] of [...this.checkpoints]) {
+          if (idx > fgStop) {
+            peer.send('DIE\n');
+            this.checkpoints.delete(idx);
+          }
+        }
+        for (const idx of [...this.renderHold.keys()]) {
+          if (idx > fgStop) this.renderHold.delete(idx);
+        }
+      }
+      this.#queueChainWork(verdict === 'leak' ? 'rebuild' : 'settle', fgStop, changedLabels);
+    }
 
     // labels whose defining blocks all disappeared — index-driven, no
     // labels × blocks scan on the hot path
@@ -1864,8 +2102,10 @@ export class CheckpointEngine {
     // Backward references: a label defined LATER in the chain (new figure,
     // renamed equation...) can be referenced by EARLIER blocks, which the
     // forward pass never revisits. Retypeset those ref-users explicitly —
-    // candidates come from the ref index, not a full block scan.
-    if (changedLabels.size) {
+    // candidates come from the ref index, not a full block scan. With chain
+    // work pending, labels are still moving: the async pass runs this after
+    // the suffix settles (#chainAfterPass) instead.
+    if (changedLabels.size && !this.pendingChain) {
       const candidates = new Set();
       for (const k of changedLabels) {
         for (const bid of this.refIndex.get(k) ?? []) candidates.add(bid);
@@ -1903,7 +2143,9 @@ export class CheckpointEngine {
     // retypeset the \tableofcontents blocks with the fresh toc file.
     // Fixed point: the toc block's own height shifts page numbers, which
     // shift the toc — iterate like latex reruns would, but per block.
-    for (let pass = 0; pass < 3; pass++) {
+    // Deferred to #chainAfterPass while chain work is pending (page numbers
+    // are still moving until the suffix settles).
+    for (let pass = 0; pass < 3 && !this.pendingChain; pass++) {
       const prov = this.#paginateNow();
       const toc = this.#computeToc(prov);
       if (toc.hash === this.tocHash) break;
@@ -1940,13 +2182,15 @@ export class CheckpointEngine {
     // screen meanwhile, and canonical guarantees the final pixels.
     this.#queueMovedOffsets();
     t.lap('pagectx');
-    this._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop };
+    this._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict };
     } catch (err) {
       if (!retry) {
         this.diagnostics.push('typeset phase failed (' + err.message + ') — full rebuild');
         this.preHash = null; // force a root reboot on the retry pass
         for (const peer of this.peers) peer.send('DIE\n');
         this.checkpoints.clear();
+        this.pendingChain = null; // the reboot walk re-typesets everything
+        this.editHold = [];
         // direct inner call: we already hold the chain lock (re-entering
         // #update would deadlock on it)
         return this.#updateInner({ editLabel, retry: true });
@@ -1956,7 +2200,15 @@ export class CheckpointEngine {
       this.opaqueStickyPre = this.preHash;
       return this.#opaqueUpdate(editLabel, t, [`structured typeset failed: ${err.message}`]);
     }
-    const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop } = this._typesetResult;
+    const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict } =
+      this._typesetResult;
+    // pin the edit locus so the next keystroke is fork-once, typeset-once
+    const locusPins = [fgStop];
+    for (const id of dirtyBlocks) {
+      const idx = this.blocks.findIndex((b) => b.id === id);
+      if (idx >= 0) locusPins.push(idx, idx + 1);
+    }
+    this.editHold = [...new Set([...locusPins, ...this.editHold])].slice(0, 8);
 
     // ---- pages, display lists, patches ---------------------------------
     const pagesRaw = this.#paginateNow();
@@ -2012,6 +2264,10 @@ export class CheckpointEngine {
         typesetMs: Math.round(forkMs * 100) / 100,
         rebooted,
         checkpoints: this.checkpoints.size,
+        chainVerdict: verdict ?? 'walked',
+        chainPending: this.pendingChain
+          ? { kind: this.pendingChain.kind, from: this.pendingChain.from }
+          : null,
         pagesReused: reused,
         pagesRebuilt: rebuilt,
         pageCount: pages.length,
@@ -2061,6 +2317,8 @@ export class CheckpointEngine {
     const text = this.store.get(this.file);
     if (this.mode !== 'opaque') {
       this.mode = 'opaque';
+      // the compile IS the display now: recompile promptly on every pause
+      this.canonical.pressure = 'display';
       this.diagnostics.push(`structured layer demoted to opaque: ${reasons.join('; ')}`);
       this.#teardownTree();
     }
@@ -2105,6 +2363,28 @@ export class CheckpointEngine {
     };
   }
 
+  /**
+   * Transient boot failures (system pressure, teardown races, a workdir in a
+   * bad moment) must not pin the document in opaque until the user happens
+   * to edit the preamble. One automatic re-probe per failed preamble: after
+   * a quiet delay, drop the sticky pin and re-run the update. Boot succeeds
+   * → the structured layer comes back on its own; fails again → the pin
+   * returns and stays (a genuinely unbootable preamble keeps its honest
+   * opaque fallback without a retry storm).
+   */
+  #scheduleStructuredReprobe(preHash) {
+    if (this.reprobedPre === preHash) return; // one shot per preamble
+    this.reprobedPre = preHash;
+    const t = setTimeout(() => {
+      if (this.closed || this.mode !== 'opaque') return;
+      if (this.opaqueStickyPre !== preHash) return; // preamble moved on
+      this.diagnostics.push('opaque self-heal: re-probing the structured boot');
+      this.opaqueStickyPre = null;
+      this.#update({ editLabel: 'structured-reprobe' }).catch(() => {});
+    }, Number(process.env.TDOM_REPROBE_MS || 20_000));
+    t.unref?.(); // never keep the process alive for a reprobe
+  }
+
   /** Free the resident process tree (opaque mode needs none of it). */
   #teardownTree() {
     for (const peer of this.peers) {
@@ -2121,6 +2401,8 @@ export class CheckpointEngine {
     this.rescueQueue.clear();
     this.renderWant.clear();
     this.renderHold.clear();
+    this.pendingChain = null;
+    this.editHold = [];
     for (const child of this.isoChildren) {
       try { child.kill('SIGKILL'); } catch { /* gone */ }
     }
@@ -2450,31 +2732,42 @@ export class CheckpointEngine {
     if (queued) this.#pumpRescues();
   }
 
+  /**
+   * Merge deferred chain work (docs/10). 'settle' re-typesets forward until
+   * the moving exit state converges (trusting the same verification the
+   * foreground uses); 'rebuild' distrusts the suffix entirely (definition
+   * edits, untracked-state leaks) and never converges early. rebuild
+   * subsumes settle; overlapping requests keep the earliest start.
+   */
+  #queueChainWork(kind, from, labels) {
+    const cur = this.pendingChain;
+    if (!cur) {
+      this.pendingChain = { kind, from, phase: 'blocks', labels: new Set(labels) };
+      return;
+    }
+    cur.kind = cur.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle';
+    cur.from = Math.min(cur.from, from);
+    cur.phase = 'blocks';
+    for (const k of labels ?? []) cur.labels.add(k);
+  }
+
   #scheduleBackground(fromIdx, dirtyBlocks) {
-    // Chain restoration must finish before the next edit is applied (edits
-    // await bgTask); graphics renders are fire-and-forget — an edit never
-    // waits on pdftocairo. The task runs under the chain lock (it drives
-    // jobBlock) and is queued behind the update that created it.
-    this.bgTask = this.#locked(async () => {
-      this.bgActive = true;
-      try {
-      for (let j = fromIdx; j < this.blocks.length; j++) {
-        if (this.bgAbort) return;
-        if (this.checkpoints.has(j + 1)) continue;
-        const block = this.blocks[j];
-        const before = block.galleyHash;
-        const galley = await this.#typesetBlock(j).catch(() => null);
-        if (!galley) return;
-        this.#adoptGalley(block, galley);
-        if (block.galleyHash !== before) {
-          // late-discovered change (rare): patch through the async channel
-          this.#asyncRepaginate();
-          if (block.needsRender) this.#queueRender(block.id);
-        }
+    // Deferred chain work is the ONLY background chain activity (docs/10
+    // §I3): nothing runs while the user is typing. The pass starts after a
+    // short idle gate, aborts between blocks on the next edit (#update sets
+    // bgAbort and SIGKILLs the in-flight job) and resumes where it left
+    // off. With no pending work the engine is completely idle between
+    // keystrokes. Graphics renders stay fire-and-forget — an edit never
+    // waits on pdftocairo.
+    this.bgTask = (async () => {
+      if (!this.pendingChain) return;
+      while (!this.bgAbort && Date.now() - (this.lastEditAt ?? 0) < 300) {
+        await new Promise((r) => setTimeout(r, 25));
       }
-      } finally {
-        this.bgActive = false;
-      }
+      if (this.bgAbort || !this.pendingChain) return;
+      await this.#locked(() => this.#runChainPass());
+    })().catch((err) => {
+      this.diagnostics.push('chain pass failed: ' + err.message);
     });
     // High-fidelity chunk renders go to the pump ONLY for the blocks this
     // edit touched: their checkpoint is warm (render hold) and the RENDER
@@ -2507,6 +2800,140 @@ export class CheckpointEngine {
         this.#retireOffGrid(idx);
       }
     }
+  }
+
+  /**
+   * The deferred chain pass. 'settle': re-typeset forward from the stop
+   * point until a clean block reproduces its galley AND exit state exactly
+   * (the moving counters have been chased to convergence). 'rebuild': same
+   * walk but to the end of the document — after a definition edit or an
+   * untracked-state leak no early convergence can be trusted. Both are
+   * resumable: bgAbort (set by the next edit) exits between blocks with
+   * work.from advanced, and the pass re-runs after that edit's own
+   * foreground. Changed galleys stream to the client through the async
+   * patch channel; stale galleys stay on screen meanwhile (old-but-clean
+   * beats fast-but-wrong, and canonical owns the final pixels regardless).
+   */
+  async #runChainPass() {
+    const work = this.pendingChain;
+    if (!work) return;
+    this.bgActive = true;
+    try {
+      if (work.phase === 'blocks') {
+        let sinceRepaint = 0;
+        let j = this.#nearestCheckpoint(Math.min(work.from, this.blocks.length));
+        while (j < this.blocks.length) {
+          if (this.bgAbort) {
+            work.from = Math.min(work.from, j);
+            return;
+          }
+          this.progress = { phase: 'chain', at: j + 1, total: this.blocks.length };
+          const block = this.blocks[j];
+          const before = { hash: block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
+          let galley;
+          try {
+            galley = await this.#typesetBlock(j);
+          } catch {
+            work.from = Math.min(work.from, j);
+            return; // killed by an incoming edit — resume afterwards
+          }
+          this.#adoptGalley(block, galley);
+          for (const l of galley.labels ?? []) {
+            if (this.labelTable.get(l.k) !== l.v) {
+              work.labels.add(l.k);
+              this.labelTable.set(l.k, l.v);
+            }
+            if (l.h != null) this.hrefTable.set(l.k, l.h);
+          }
+          const changed = block.galleyHash !== before.hash || block.stateVec !== before.state;
+          if (changed) {
+            if (block.needsRender) this.#queueRender(block.id);
+            if (++sinceRepaint >= 8) {
+              this.#asyncRepaginate();
+              sinceRepaint = 0;
+            }
+          }
+          j++;
+          work.from = Math.max(work.from, j);
+          if (
+            work.kind === 'settle' &&
+            before.hadGalley &&
+            !changed &&
+            !this.blocks.slice(j).some((b) => !b.galley)
+          ) {
+            break; // exit state converged — the untouched suffix is exact
+          }
+        }
+        if (sinceRepaint) this.#asyncRepaginate();
+        work.phase = 'after';
+      }
+      if (this.bgAbort) return;
+      await this.#chainAfterPass(work);
+      if (this.bgAbort) return;
+      if (this.pendingChain === work) this.pendingChain = null;
+    } finally {
+      this.bgActive = false;
+      this.progress = null;
+    }
+  }
+
+  /**
+   * Post-settle dependency passes — the async twins of the foreground's
+   * inline backward-reference and toc sections, run once the suffix state
+   * has stopped moving. Abortable and re-entrant (work.phase = 'after').
+   */
+  async #chainAfterPass(work) {
+    const changedLabels = work.labels;
+    if (changedLabels.size) {
+      const candidates = new Set();
+      for (const k of changedLabels) {
+        for (const bid of this.refIndex.get(k) ?? []) candidates.add(bid);
+      }
+      for (let c = 0; c < this.blocks.length && candidates.size; c++) {
+        if (this.bgAbort) return;
+        const block = this.blocks[c];
+        if (!candidates.has(block.id)) continue;
+        candidates.delete(block.id);
+        const hit = (block.galley?.refs ?? []).some(
+          (k) => changedLabels.has(k) && !resolvedInGalley(block, k, this.labelTable)
+        );
+        if (!hit) continue;
+        const n = await this.#retypesetChain(
+          this.#nearestCheckpoint(c),
+          c,
+          () => {},
+          () => this.bgAbort
+        );
+        if (n < 0) return;
+      }
+    }
+    for (let pass = 0; pass < 3; pass++) {
+      if (this.bgAbort) return;
+      const prov = this.#paginateNow();
+      const toc = this.#computeToc(prov);
+      if (toc.hash === this.tocHash) break;
+      this.tocHash = toc.hash;
+      for (const [ext, content] of Object.entries(toc.contents)) {
+        writeFileSync(path.join(this.workDir, `driver.${ext}`), content);
+      }
+      let anyConsumer = false;
+      for (let c = 0; c < this.blocks.length; c++) {
+        if (this.bgAbort) return;
+        const block = this.blocks[c];
+        if (!block.consumesToc) continue;
+        anyConsumer = true;
+        const n = await this.#retypesetChain(
+          this.#nearestCheckpoint(c),
+          c,
+          () => {},
+          () => this.bgAbort
+        );
+        if (n < 0) return;
+      }
+      if (!anyConsumer) break;
+    }
+    this.#queueMovedOffsets();
+    this.#asyncRepaginate();
   }
 
   /**
@@ -3190,11 +3617,22 @@ export class CheckpointEngine {
       ck.send(`RENDER __hf ${this.workDir} ${body.length}\n`);
       ck.sendRaw(body);
       const payload = await done;
+      // same stable-key rewrite as galleys (lineage-independent identity)
+      const fkeys = new Map();
       for (const [fid, meta] of Object.entries(payload.fonts ?? {})) {
-        this.#registerFont(Number(fid), meta);
+        const key = stableFontKey(meta);
+        fkeys.set(Number(fid), key);
+        this.#registerFont(key, meta);
       }
+      const rewrite = (r) => {
+        if (r.rule || r.f == null) return;
+        const key = fkeys.get(r.f);
+        if (key) r.f = key;
+      };
       const map = new Map();
       for (const [pageStr, entry] of Object.entries(payload.hf ?? {})) {
+        walkItemRuns(entry.h, rewrite);
+        walkItemRuns(entry.f, rewrite);
         map.set(Number(pageStr.replace(/^p/, '')), entry);
       }
       // apply only between updates — never mid-#update (see this.updating)

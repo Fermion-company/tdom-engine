@@ -166,7 +166,18 @@ export function diffBlocks(oldBlocks, segs, nextId) {
     blocks.push(refresh(oldBlocks[so + i], segs[sn + i]));
   }
 
-  return { blocks, dirty, added, removed };
+  // Window bounds for checkpoint re-keying: a checkpoint at boundary k holds
+  // the state after blocks[0..k-1], so prefix boundaries (k <= prefixLen)
+  // survive as-is and suffix boundaries (old k >= oldSuffixStart) survive at
+  // k + (newSuffixStart - oldSuffixStart). Only boundaries inside the edited
+  // window are gone for real.
+  return {
+    blocks,
+    dirty,
+    added,
+    removed,
+    bounds: { prefixLen: p, oldSuffixStart: so, newSuffixStart: sn },
+  };
 }
 
 function refresh(block, seg) {

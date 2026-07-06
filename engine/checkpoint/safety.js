@@ -31,7 +31,11 @@ const UNSAFE_PACKAGES = [
   'draftwatermark',
   'atbegshi',
   'everyshi',
-  'pdfpages',
+  // NOT pdfpages: loading it is harmless (macro definitions only). The
+  // ACTION — \includepdf — is a single block, and the isolated exact-render
+  // rescue ships its foreign pages as real per-page chunks with forced
+  // breaks (same machinery as landscape/longtable). Gate granularity is
+  // block, not document.
   'pagegrid',
   'fancytabs',
   'thumbs',
@@ -56,11 +60,16 @@ const UNSAFE_PREAMBLE = [
 // Body constructs the JS page assembly cannot represent even per block:
 // they read or change the CURRENT PAGE while it is being built.
 const UNSAFE_BODY = [
+  // Margin placement writes OUTSIDE the galley box: a per-block chunk crops
+  // it away (silently wrong pixels), so no per-block fallback can represent
+  // it yet — document-level demotion until a canonical-only block tier
+  // carries these (docs/10 follow-up).
   [/\\marginpar\b/, '\\marginpar (page-margin placement)'],
   [/\\marginnote\b/, '\\marginnote (page-margin placement)'],
   [/\\newgeometry\b/, '\\newgeometry (mid-document page geometry)'],
   [/\\enlargethispage\b/, '\\enlargethispage'],
-  [/\\includepdf\b/, '\\includepdf (foreign pages)'],
+  // NOT \includepdf: block-level rescue ships its foreign pages exactly
+  // (see OUTPUT_HIJACK_RE in engine-v3.js).
   [/\\twocolumn\b/, 'mid-document \\twocolumn'],
   [/\\balance\b/, 'column balancing'],
 ];

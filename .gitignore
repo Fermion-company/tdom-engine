@@ -10,3 +10,4 @@ recovered-document.tex
 samples/bench-long.tex
 .tdom-bench*/
 samples/uploads/
+.tdom-hotpath-test*/

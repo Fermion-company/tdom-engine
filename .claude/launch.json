@@ -12,6 +12,12 @@
       "runtimeExecutable": "bash",
       "runtimeArgs": ["-lc", "PORT=4644 TDOM_WORKDIR=.tdom-v3-alt exec node server.js"],
       "port": 4644
+    },
+    {
+      "name": "tdom-engine-hotpath",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-lc", "PORT=4655 TDOM_WORKDIR=.tdom-v3-hotpath exec node server.js"],
+      "port": 4655
     }
   ]
 }

@@ -37,6 +37,13 @@ local blk_toclines = {}
 local blk_events = {}
 local blk_gfx = false
 local blk_floats = {}
+-- fonts referenced by the CURRENT job's harvested runs. Reported in full
+-- with every galley: font ids are allocation-order artifacts of one fork
+-- lineage (two lineages can give the same font different ids — or worse,
+-- different fonts the same id), so the orchestrator must be able to
+-- resolve every id from the galley payload alone, never from lineage
+-- history. seen_fonts stays as the per-process meta cache.
+local blk_fonts = {}
 local pending_fmarks = {}
 local geo_extra = {}
 local RENDER_MODE = false
@@ -101,8 +108,16 @@ local function jenc(v)
       for i = 1, #v do parts[#parts + 1] = jenc(v[i]) end
       return '[' .. table.concat(parts, ',') .. ']'
     else
+      -- SORTED keys: pairs() order depends on the Lua hash seed, which
+      -- differs per process — two lineages typesetting identical content
+      -- would otherwise emit differently-ordered JSON, making every galley
+      -- hash (and thus page identity) a per-lineage artifact. Deterministic
+      -- bytes here are what make "same output ⇒ same hash" true end to end.
+      local keys = {}
+      for k in pairs(v) do keys[#keys + 1] = k end
+      table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
       local parts = {}
-      for k, val in pairs(v) do parts[#parts + 1] = jstr(k) .. ':' .. jenc(val) end
+      for _, k in ipairs(keys) do parts[#parts + 1] = jstr(k) .. ':' .. jenc(v[k]) end
       return '{' .. table.concat(parts, ',') .. '}'
     end
   end
@@ -368,7 +383,9 @@ local function check_special(n)
 end
 
 local function note_font(fid)
-  if fid and fid > 0 and not seen_fonts[fid] then
+  if not fid or fid <= 0 then return end
+  blk_fonts[fid] = true
+  if not seen_fonts[fid] then
     local f = font.getfont(fid) or {}
     seen_fonts[fid] = {
       file = f.filename or '',
@@ -974,10 +991,10 @@ function tdom_hf_flush()
     if page.f then encode_runs(page.f) end
   end
   local fonts = {}
-  for fid, f in pairs(seen_fonts) do
-    if not f.sent then
+  for fid in pairs(blk_fonts) do
+    local f = seen_fonts[fid]
+    if f then
       fonts[tostring(fid)] = { file = f.file, name = f.name, size = f.size, fmt = f.fmt, mth = f.mth }
-      f.sent = true
     end
   end
   local payload = jenc({ block = '__hf', hf = hf_pages, fonts = fonts })
@@ -1044,11 +1061,12 @@ function tdom_report()
   end
   encode_runs(items)
   for _, f in ipairs(blk_floats) do encode_runs(f.items) end
+  -- complete font table for THIS galley: every id its runs reference
   local fonts = {}
-  for fid, f in pairs(seen_fonts) do
-    if not f.sent then
+  for fid in pairs(blk_fonts) do
+    local f = seen_fonts[fid]
+    if f then
       fonts[tostring(fid)] = { file = f.file, name = f.name, size = f.size, fmt = f.fmt, mth = f.mth }
-      f.sent = true
     end
   end
   local payload = jenc({
@@ -1217,6 +1235,7 @@ function tdom_wait()
         blk_events = {}
         blk_gfx = false
         blk_floats = {}
+        blk_fonts = {}
         pending_fmarks = {}
         tdom_absorb_reset()
         RENDER_MODE = false

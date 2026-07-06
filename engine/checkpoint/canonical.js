@@ -42,6 +42,17 @@ export class CanonicalRenderer {
     this.idSeq = 0;
     this.last = null; // last GOOD compile: {id, rev, srcHash, pdf, pageCount, paper, passes, ms}
     this.lastError = null; // {rev, message}
+    // Demand-paced authority (docs/10 §I3): in structured mode the canonical
+    // output is consumed when the user PAUSES to look or exports — not per
+    // edit. Recompiles are therefore paced by their own cost (a cooldown of
+    // cooldownFactor × last compile time, capped), which bounds canonical's
+    // CPU duty cycle at ~1/(1+factor) no matter how large the document is.
+    // In opaque mode the compile IS the display: pressure 'display' restores
+    // the immediate debounce-only behavior.
+    this.pressure = 'authority'; // 'authority' | 'display'
+    this.lastEndAt = 0;
+    this.cooldownFactor = Number(process.env.TDOM_CANON_COOLDOWN ?? 2);
+    this.cooldownCapMs = Number(process.env.TDOM_CANON_COOLDOWN_CAP ?? 30_000);
     this.svgCache = new Map(); // `${id}:${page}` -> svg string (LRU)
     this.textCache = null; // {id, pages: [string]} pdftotext page texts
     this.onResult = null; // callback({...info}) after every compile attempt
@@ -76,7 +87,21 @@ export class CanonicalRenderer {
     this.timer = setTimeout(() => {
       this.timer = null;
       this.#drain();
-    }, this.debounceMs);
+    }, this.delayFor());
+  }
+
+  /**
+   * Delay before the next compile may start. Base debounce always applies;
+   * under 'authority' pressure a cost-proportional cooldown (measured from
+   * the END of the previous compile) is added on top, so a document whose
+   * compile takes 7s recompiles at most every ~(1+factor)×7s while the user
+   * keeps editing — instead of back-to-back. Public for tests.
+   */
+  delayFor() {
+    if (this.pressure !== 'authority' || !this.last?.ms) return this.debounceMs;
+    const cooldown = Math.min(this.last.ms * this.cooldownFactor, this.cooldownCapMs);
+    const since = Date.now() - this.lastEndAt;
+    return Math.max(this.debounceMs, cooldown - since);
   }
 
   /**
@@ -119,13 +144,24 @@ export class CanonicalRenderer {
         this.running = null;
       });
     await this.running;
+    this.lastEndAt = Date.now();
     try {
       this.onResult?.(this.info());
     } catch {
       /* observer errors must not break the drain loop */
     }
-    // an edit landed while we compiled: converge on the newest source
-    if (this.pendingJob && !this.disposed) await this.#drain();
+    // An edit landed while we compiled: converge on the newest source — at
+    // the authority cadence, NOT immediately. The old unconditional re-drain
+    // ran full compiles back-to-back for as long as the user kept typing,
+    // which was the single biggest CPU sink on long documents. settle()
+    // still converges promptly for exports/tests (it clears the timer and
+    // drains directly).
+    if (this.pendingJob && !this.disposed && !this.timer) {
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        this.#drain();
+      }, this.delayFor());
+    }
   }
 
   async #compile({ source, rev }) {

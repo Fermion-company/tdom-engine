@@ -4,7 +4,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -19,6 +20,36 @@ const available = await promisify(execFile)('lualatex', ['--version'], { timeout
 );
 const opts = available ? {} : { skip: 'lualatex not installed' };
 
+// -------------------------------------------- demand-paced authority cadence
+
+test('authority pressure paces recompiles by compile cost; display does not', () => {
+  const c = new CanonicalRenderer({ workDir: WORK + '-pace' });
+  try {
+    // no compile yet: base debounce only (fast first exactness)
+    assert.equal(c.delayFor(), c.debounceMs);
+    // a 8s compile just finished: the next one must wait ~factor× its cost
+    c.last = { ms: 8000 };
+    c.lastEndAt = Date.now();
+    assert.ok(
+      c.delayFor() >= 8000 * c.cooldownFactor - 100,
+      `cooldown scales with compile cost (got ${c.delayFor()})`
+    );
+    // the cooldown is capped (a pathological 5-minute doc must still refresh)
+    c.last = { ms: 600_000 };
+    assert.ok(c.delayFor() <= c.cooldownCapMs, 'cooldown capped');
+    // once the cooldown has elapsed, only the base debounce remains
+    c.last = { ms: 8000 };
+    c.lastEndAt = Date.now() - 8000 * c.cooldownFactor - 1000;
+    assert.equal(c.delayFor(), c.debounceMs);
+    // opaque mode: the compile IS the display — never pace it
+    c.pressure = 'display';
+    c.lastEndAt = Date.now();
+    assert.equal(c.delayFor(), c.debounceMs);
+  } finally {
+    c.dispose();
+  }
+});
+
 // ------------------------------------------------------------ safety gate
 
 test('safety gate: clean documents pass, page-mechanism hazards demote', () => {
@@ -31,7 +62,9 @@ test('safety gate: clean documents pass, page-mechanism hazards demote', () => {
   assert.equal(classifyDocument('\\documentclass[a4paper,twocolumn]{article}', '').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}\\AtBeginShipout{x}', '').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}', 'a \\marginpar{note} b').safe, false);
-  assert.equal(classifyDocument('\\documentclass{article}', 'a \\includepdf{x.pdf}').safe, false);
+  // \includepdf demotes the BLOCK (isolated exact-render rescue ships its
+  // foreign pages), never the document — gate granularity is block-first
+  assert.equal(classifyDocument('\\documentclass{article}\\usepackage{pdfpages}', 'a \\includepdf{x.pdf}').safe, true);
   // commented-out hazards do not demote
   assert.equal(classifyDocument('\\documentclass{article}\n% \\twocolumn', 'body').safe, true);
   // block-level rescue targets stay structured at the document level
@@ -150,6 +183,47 @@ test('a broken preamble is not fatal: open resolves in opaque mode', opts, async
 });
 
 // ------------------------------------------------- structured convergence
+
+test('\\includepdf stays structured: the block rescues, the document does not demote', opts, async () => {
+  const work = WORK + '-incpdf';
+  rmSync(work, { recursive: true, force: true });
+  mkdirSync(work, { recursive: true });
+  // build a one-page pdf to include
+  writeFileSync(
+    path.join(work, 'inc.tex'),
+    '\\documentclass{article}\\begin{document}FOREIGN PAGE\\end{document}\n'
+  );
+  await promisify(execFile)('lualatex', ['-interaction=nonstopmode', 'inc.tex'], {
+    cwd: work,
+    timeout: 120_000,
+  });
+  assert.ok(existsSync(path.join(work, 'inc.pdf')), 'fixture pdf built');
+  const eng = new CheckpointEngine({ workDir: work, docDir: work });
+  try {
+    const r = await eng.open(
+      [
+        '\\documentclass{article}',
+        '\\usepackage{pdfpages}',
+        '\\begin{document}',
+        '',
+        'Text before the foreign pages.',
+        '',
+        '\\includepdf[pages=1]{inc.pdf}',
+        '',
+        'Text after the foreign pages.',
+        '',
+        '\\end{document}',
+        '',
+      ].join('\n')
+    );
+    assert.equal(r.mode, 'structured', `stays structured (${r.modeReasons?.join('; ')})`);
+    const blk = eng.blocks.find((b) => /includepdf/.test(b.text));
+    assert.ok(blk?.rescued, 'the \\includepdf block took the exact-render rescue');
+    assert.ok(eng.pages.length >= 2, `foreign page paginates (got ${eng.pages.length})`);
+  } finally {
+    await eng.close();
+  }
+});
 
 test('structured docs converge: canonical matches the current source after edits', opts, async () => {
   const eng = new CheckpointEngine({ workDir: WORK + '-conv' });

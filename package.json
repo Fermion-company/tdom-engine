@@ -6,7 +6,7 @@
   "main": "engine/checkpoint/engine-v3.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test tests/fidelity.test.js tests/canonical.test.js tests/engine-v3.test.js tests/server-api.test.js"
+    "test": "node --test tests/fidelity.test.js tests/canonical.test.js tests/engine-v3.test.js tests/server-api.test.js tests/hot-path.test.js"
   },
   "engines": {
     "node": ">=18"
