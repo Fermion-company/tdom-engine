@@ -132,6 +132,13 @@ export function diffBlocks(oldBlocks, segs, nextId) {
       // Modified in place: keep the id. Expansion/semantics must rebuild
       // (they depend on the text), but the layout cache is carried over —
       // the layout key decides whether the rebuilt semantics differ.
+      // The PREVIOUS galley rides along as the stale-first display: an
+      // edited rescue-environment block without it had to pay a SYNCHRONOUS
+      // isolated compile (~2s) on every keystroke — old-but-clean pixels
+      // plus an async exact render is the doctrine, and it needs the old
+      // galley to exist. The block stays in `dirty`, so everything that
+      // must re-typeset still does; the carried fields are only the
+      // "last good" state the rescue tiers show meanwhile.
       const nb = {
         id: ob.id,
         start: sg.start,
@@ -142,6 +149,17 @@ export function diffBlocks(oldBlocks, segs, nextId) {
         exp: null,
         layout: ob.layout,
         layoutKey: ob.layoutKey,
+        galley: ob.galley,
+        galleyHash: ob.galleyHash,
+        stateVec: ob.stateVec,
+        units: ob.units,
+        rescued: ob.rescued,
+        pageOffset: ob.pageOffset,
+        fidelity: ob.fidelity,
+        needsRender: ob.needsRender,
+        gfx: ob.gfx,
+        kind: ob.kind,
+        consumesToc: ob.consumesToc,
       };
       blocks.push(nb);
       dirty.add(nb.id);

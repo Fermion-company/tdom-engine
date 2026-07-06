@@ -47,6 +47,7 @@ local blk_fonts = {}
 local pending_fmarks = {}
 local geo_extra = {}
 local RENDER_MODE = false
+T_JOB = 0 -- wall clock at JOB child start (phase timing)
 local FLOAT_COPIES = {}
 local FOOT_COPIES = {}
 -- Visual-fidelity flags for the CURRENT top-level line box being walked
@@ -1050,6 +1051,7 @@ function tdom_report()
     end
     blk_counters['tdom@ls'] = math.floor(ls)
   end
+  local TR0 = os.gettimeofday and os.gettimeofday() or os.clock()
   local head = harvest_nodes()
   colstack = {}
   pending_fmarks = {}
@@ -1073,7 +1075,16 @@ function tdom_report()
       fonts[tostring(fid)] = { file = f.file, name = f.name, size = f.size, fmt = f.fmt, mth = f.mth }
     end
   end
+  local TR1 = os.gettimeofday and os.gettimeofday() or os.clock()
+  local tm = nil
+  if os.getenv('TDOM_TRACE_JOB') then
+    tm = {
+      typeset = math.floor((TR0 - (T_JOB or TR0)) * 100000 + 0.5) / 100,
+      harvest = math.floor((TR1 - TR0) * 100000 + 0.5) / 100,
+    }
+  end
   local payload = jenc({
+    tm = tm,
     block = JOB.id,
     gfx = blk_gfx,
     w = w,
@@ -1232,6 +1243,7 @@ function tdom_wait()
       end
       if pid == 0 then
         JOB = { id = id, ckpt = newckpt, body = body }
+        T_JOB = os.gettimeofday and os.gettimeofday() or os.clock()
         blk_labels = {}
         blk_refs = {}
         blk_counters = {}

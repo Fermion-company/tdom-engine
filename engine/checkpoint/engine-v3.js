@@ -944,6 +944,10 @@ export class CheckpointEngine {
   async #typesetBlock(idx) {
     const block = this.blocks[idx];
     const sig = fnv1a(block.text);
+    const TRACE = process.env.TDOM_TRACE_JOB
+      ? (label, t0) => console.error(`[job] ${block.id} ${label} ${(performance.now() - t0).toFixed(0)}ms`)
+      : null;
+    const T0 = performance.now();
     // Block-granular last resort: a block that fails BOTH the chain and the
     // isolated rescue (mid-typing broken TeX — an unfinished \frac, a bare
     // trailing backslash …) must never take the whole document down. It
@@ -962,7 +966,9 @@ export class CheckpointEngine {
     };
     if (this.bgAbort) throw new Error('background pass aborted (edit waiting)');
     if (this.#needsRescue(block.text)) {
-      return rescueSafely('output-routine environment needs a real page');
+      const g = await rescueSafely('output-routine environment needs a real page');
+      TRACE?.('rescue(env)', T0);
+      return g;
     }
     if (this.poisoned.get(block.id) === sig) {
       return rescueSafely('previous in-chain failure');
@@ -979,6 +985,7 @@ export class CheckpointEngine {
     try {
       const galley = await this.#jobBlock(idx);
       this.chainTimeouts = 0;
+      TRACE?.('in-chain', T0);
       return galley;
     } catch (err) {
       // an edit is waiting on this background pass: fail the block WITHOUT
@@ -2082,7 +2089,16 @@ export class CheckpointEngine {
       }
       i++;
       if (i <= firstDirty) continue; // replay ramp up to the edited region
-      if (!wasClean) continue; // still consuming the edited/new region
+      if (!wasClean) {
+        // an EDITED block that reproduced its galley AND exit state exactly
+        // (stale-first rescue reuse, comment-only change) moved nothing:
+        // converge without paying a verification job
+        if (!changed && before.hadGalley && !this.blocks.slice(i).some((b) => !b.galley)) {
+          verdict = 'clean';
+          break;
+        }
+        continue; // still consuming the edited/new region
+      }
       if (!changed) {
         // convergence: exit state and galley reproduced exactly. Galley-less
         // blocks ahead (boot/reboot fill) still need a walk; moved-label
