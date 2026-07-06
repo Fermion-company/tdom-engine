@@ -26,7 +26,8 @@ async function startServer(t) {
   const port = await freePort();
   const child = spawn(process.execPath, ['server.js'], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(port), TDOM_BACKEND: 'internal' },
+    // the small demo boots in seconds; the default stress doc takes minutes
+    env: { ...process.env, PORT: String(port), TDOM_SAMPLE: 'demo-lua.tex' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -37,7 +38,8 @@ async function startServer(t) {
     output += chunk.toString();
   });
   await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(`server did not start:\n${output}`)), 10_000);
+    // the server boots a resident lualatex tree before listening
+    const timeout = setTimeout(() => reject(new Error(`server did not start:\n${output}`)), 120_000);
     child.on('exit', (code) => {
       clearTimeout(timeout);
       reject(new Error(`server exited with ${code}:\n${output}`));
@@ -65,7 +67,10 @@ async function hasLuaLatex() {
   }
 }
 
-test('server stores, lists, and reads uploaded TeX files', async (t) => {
+// the server itself requires lualatex now (final display = LuaLaTeX output)
+const texReady = await hasLuaLatex();
+
+test('server stores, lists, and reads uploaded TeX files', { skip: !texReady && 'lualatex not installed' }, async (t) => {
   const base = await startServer(t);
   const name = `server-api-${Date.now()}.tex`;
   const file = path.join(ROOT, 'samples', 'uploads', name);
@@ -91,7 +96,7 @@ test('server stores, lists, and reads uploaded TeX files', async (t) => {
   assert.equal(payload.size, Buffer.byteLength(body, 'utf8'));
 });
 
-test('server compiles AI style previews to a real PDF when LuaLaTeX is available', { skip: !(await hasLuaLatex()) && 'lualatex not installed' }, async (t) => {
+test('server compiles AI style previews to a real PDF when LuaLaTeX is available', { skip: !texReady && 'lualatex not installed' }, async (t) => {
   const base = await startServer(t);
   const source = String.raw`\documentclass{article}
 \begin{document}

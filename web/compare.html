@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TDOM Engine — 比較 (pdf.js ↔ 擬似PDF)</title>
+<title>TDOM Engine — 比較 (canonical ↔ provisional)</title>
 <link rel="stylesheet" href="/style.css">
 <style>
   /* Full-bleed dark compare view: no white container, the two documents
@@ -75,17 +75,17 @@
       <button id="cmp-zoom-fit" title="幅に合わせる">合わせる</button>
     </div>
     <label class="sync"><input type="checkbox" id="cmp-sync" checked> スクロール同期</label>
-    <button id="cmp-recompile" title="本物のPDFをlualatexで再コンパイル">本物のPDFを再生成</button>
+    <button id="cmp-recompile" title="最新ソースをlualatexで今すぐコンパイル（通常はcanonical着地時に自動更新）">本物のPDFを再生成</button>
     <span class="spacer"></span>
     <span id="cmp-status"></span>
   </header>
   <div id="cmp-body">
     <section class="cmp-col" id="cmp-col-real">
-      <div class="cmp-col-head">左: 本物のPDF <span class="tag">lualatex → pdf.js</span></div>
+      <div class="cmp-col-head">左: canonical — 最終表示の権威 <span class="tag">lualatex実出力 → pdf.js</span></div>
       <div class="cmp-scroll" id="cmp-real"><div class="cmp-empty">読み込み中…</div></div>
     </section>
     <section class="cmp-col" id="cmp-col-engine">
-      <div class="cmp-col-head">右: 擬似PDF <span class="tag" id="cmp-engine-backend">TDOMエンジン</span></div>
+      <div class="cmp-col-head">右: provisional — 増分プレビュー層 <span class="tag" id="cmp-engine-backend">TDOMエンジン</span></div>
       <div class="cmp-scroll" id="cmp-engine"><div class="cmp-empty">読み込み中…</div></div>
     </section>
   </div>

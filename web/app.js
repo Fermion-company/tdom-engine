@@ -4,15 +4,16 @@
 // inspector renders the engine's dirty report. All typesetting intelligence
 // lives in the resident engine process — this file only draws.
 //
-// This is the engine-core build: the UI is just the TeX source editor, the
-// live preview (pseudo-PDF), and the Engine Inspector, so the screen
-// demonstrates the engine itself. There is no document-editing UI.
-//
-// Two display-list dialects:
-//   - internal / checkpoint backend: glyphs/rule commands -> SVG text pages
-//     (checkpoint also overlays exact-render chunk images for TikZ / cmex)
-//   - lualatex backend: chunk commands (per-block SVG images produced by a
-//     real LuaTeX) composed with clip windows + a folio number
+// Every page is TWO stacked layers with a strict ranking:
+//   - provisional: display-list commands (glyph runs + exact-render chunk
+//     images) painted keystroke-synchronously by the resident engine;
+//   - canonical: the same page as real LuaLaTeX output (/canonical/n.svg),
+//     which ALWAYS wins once a compile of the current source has landed.
+// An edit flips the touched pages back to provisional; the next canonical
+// compile flips them to exact again. Pages the edit never touched keep
+// their canonical pixels throughout. In opaque mode (safety-gate demotion)
+// there is no provisional layer at all — the canonical pages are the
+// display.
 
 const editor = document.getElementById('editor');
 const editorHighlightEl = document.getElementById('editor-highlight');
@@ -48,6 +49,17 @@ let debounceTimer = null;
 let inFlight = false;
 const history = [];
 const pageDivs = new Map();
+
+// canonical (exact LuaLaTeX) layer state — all comparisons use SOURCE
+// revisions (srcRev): async repaints (TikZ chunk swaps …) advance the patch
+// rev without changing the source, and must not un-freshen the canonical
+let mode = 'structured'; // 'structured' | 'opaque'
+let modeReasons = [];
+let canonical = null; // {id, rev(srcRev), pageCount, paper, inFlight, error}
+let appliedSrcRev = 0;
+const pageDirtyRev = new Map(); // page -> srcRev of the last provisional patch
+let lastRemoveRev = 0; // srcRev of the last provisional remove-pages patch
+const docStateEl = document.getElementById('doc-state');
 
 // ---------------------------------------------------------------- layout
 
@@ -275,15 +287,28 @@ async function boot() {
 
 function adoptDoc(doc) {
   geometry = doc.geometry;
-  backend = doc.backend ?? 'internal';
+  backend = doc.backend ?? 'checkpoint';
   injectFonts(doc.fonts);
   serverText = doc.source;
   editor.value = doc.source;
   syncEditorHighlight();
   pagesEl.textContent = '';
   pageDivs.clear();
+  pageDirtyRev.clear();
+  lastRemoveRev = 0;
+  mode = doc.mode ?? 'structured';
+  modeReasons = doc.modeReasons ?? [];
+  canonical = doc.canonical ?? null;
   for (const dl of doc.pages) renderPage(dl, false);
   appliedRev = doc.report.rev;
+  appliedSrcRev = doc.report.srcRev ?? doc.report.rev;
+  // a canonical compile older than the document state cannot vouch for any
+  // page — show provisional until the fresh one lands (reload after
+  // convergence has canonical.rev === srcRev: exact from frame one)
+  if (mode === 'structured' && canonical && canonical.rev < appliedSrcRev) {
+    for (const n of pageDivs.keys()) pageDirtyRev.set(n, appliedSrcRev);
+  }
+  syncCanonical();
 }
 
 // ---------------------------------------------------------------- pages
@@ -308,29 +333,25 @@ function renderPage(dl, flash) {
     pagesEl.insertBefore(div, after ? after[1] : null);
     pageDivs.set(dl.page, div);
   }
+  // rebuild only the PROVISIONAL layers; the canonical overlay (img.canon)
+  // survives provisional repaints untouched
   div.querySelector('svg')?.remove();
-  div.querySelector('.sheet')?.remove();
   div.querySelectorAll('.chunkwin').forEach((e) => e.remove());
+  div.dataset.prov = '1';
 
-  // checkpoint / internal display lists carry glyph runs -> unified SVG
-  // plus absolutely-positioned <img> overlays for exact-render chunks;
-  // lualatex (v1) pages are chunk-image compositions -> HTML sheet
-  const hasGlyphs = dl.commands.some((c) => c.op === 'glyphs');
-  if (hasGlyphs || backend !== 'lualatex') {
-    div.insertAdjacentHTML('beforeend', svgFor(dl));
-    for (const cmd of dl.commands) {
-      if (cmd.op !== 'chunk') continue;
-      const W = geometry.paperwidth;
-      const H = geometry.paperheight;
-      const shiftPct = (cmd.sy / cmd.w) * 100; // margin-top % is width-relative
-      div.insertAdjacentHTML(
-        'beforeend',
-        `<div class="chunkwin" data-src="${cmd.src}" style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
-          `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
-      );
-    }
-  } else {
-    div.insertAdjacentHTML('beforeend', chunkSheet(dl));
+  // display lists carry glyph runs -> unified SVG plus absolutely-
+  // positioned <img> overlays for exact-render block chunks
+  div.insertAdjacentHTML('beforeend', svgFor(dl));
+  for (const cmd of dl.commands) {
+    if (cmd.op !== 'chunk') continue;
+    const W = geometry.paperwidth;
+    const H = geometry.paperheight;
+    const shiftPct = (cmd.sy / cmd.w) * 100; // margin-top % is width-relative
+    div.insertAdjacentHTML(
+      'beforeend',
+      `<div class="chunkwin" data-src="${cmd.src}" style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
+        `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
+    );
   }
 
   if (flash) {
@@ -339,34 +360,6 @@ function renderPage(dl, flash) {
     requestAnimationFrame(() => div.classList.add('fading'));
     setTimeout(() => div.classList.remove('patched', 'fading'), 1200);
   }
-}
-
-/** lualatex mode: compose per-block chunk SVGs with clip windows. */
-function chunkSheet(dl) {
-  const W = geometry.paperwidth;
-  const H = geometry.paperheight;
-  const parts = [`<div class="sheet" style="aspect-ratio:${W}/${H}">`];
-  for (const cmd of dl.commands) {
-    if (cmd.op === 'chunk') {
-      const left = (cmd.x / W) * 100;
-      const top = (cmd.y / H) * 100;
-      const width = (cmd.w / W) * 100;
-      const height = (cmd.h / H) * 100;
-      // margin-top % is relative to the WRAPPER WIDTH, so divide by chunk width
-      const shift = (cmd.sy / cmd.w) * 100;
-      parts.push(
-        `<div class="chunkwin" data-src="${cmd.src}" style="left:${left}%;top:${top}%;width:${width}%;height:${height}%">` +
-          `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg" style="margin-top:-${shift}%" draggable="false">` +
-          `</div>`
-      );
-    } else if (cmd.op === 'folio') {
-      parts.push(
-        `<div class="folio" style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%">${escapeHtml(cmd.text)}</div>`
-      );
-    }
-  }
-  parts.push('</div>');
-  return parts.join('');
 }
 
 /** Unified SVG page: TeX-positioned glyph runs, rules, chunk images, folio. */
@@ -417,10 +410,162 @@ function removePagesFrom(from) {
 function applyReport(report) {
   if (report.rev <= appliedRev) return;
   appliedRev = report.rev;
+  appliedSrcRev = report.srcRev ?? appliedSrcRev;
+  setMode(report.mode ?? 'structured', report.modeReasons ?? []);
+  if (report.canonical) canonical = report.canonical;
   for (const patch of report.patches) {
-    if (patch.type === 'replace-page') renderPage(patch.displayList, true);
-    else if (patch.type === 'remove-pages') removePagesFrom(patch.from);
+    if (patch.type === 'replace-page') {
+      renderPage(patch.displayList, true);
+      // this page now differs from the last canonical compile — provisional
+      // wins here until a compile of srcRev >= this one lands
+      pageDirtyRev.set(patch.displayList.page, appliedSrcRev);
+      updateCanonState(patch.displayList.page);
+    } else if (patch.type === 'remove-pages') {
+      lastRemoveRev = appliedSrcRev;
+      removePagesFrom(patch.from);
+    }
   }
+  updateBadge();
+}
+
+// ------------------------------------------------- canonical (exact) layer
+
+function setMode(newMode, reasons) {
+  modeReasons = reasons ?? modeReasons;
+  if (newMode === mode) return;
+  mode = newMode;
+  if (mode === 'opaque') {
+    // the provisional layers are dead weight now — every page is canonical
+    for (const div of pageDivs.values()) {
+      div.querySelector('svg')?.remove();
+      div.querySelectorAll('.chunkwin').forEach((e) => e.remove());
+      delete div.dataset.prov;
+    }
+    pageDirtyRev.clear();
+  }
+}
+
+/** A page shell with no provisional content (canonical-only pages). */
+function ensureShell(n) {
+  let div = pageDivs.get(n);
+  if (div) return div;
+  div = document.createElement('div');
+  div.className = 'page';
+  div.dataset.page = n;
+  if (geometry?.paperwidth && geometry?.paperheight) {
+    div.style.aspectRatio = `${geometry.paperwidth} / ${geometry.paperheight}`;
+  }
+  const no = document.createElement('span');
+  no.className = 'pageno';
+  no.textContent = `page ${n}`;
+  div.appendChild(no);
+  const after = [...pageDivs.entries()].filter(([k]) => k > n).sort((a, b) => a[0] - b[0])[0];
+  pagesEl.insertBefore(div, after ? after[1] : null);
+  pageDivs.set(n, div);
+  return div;
+}
+
+/** Reconcile shells + per-page overlays after a canonical compile lands. */
+function syncCanonical() {
+  if (canonical && canonical.id) {
+    // dirty marks covered by this compile are settled: those pages are
+    // exactly what LuaLaTeX printed for the current source
+    for (const [n, rev] of [...pageDirtyRev]) {
+      if (rev <= canonical.rev) pageDirtyRev.delete(n);
+    }
+    // canonical-only pages (beyond the provisional count) get shells —
+    // unless a newer provisional update legitimately removed pages
+    if (canonical.rev >= lastRemoveRev) {
+      for (let n = 1; n <= canonical.pageCount; n++) {
+        if (!pageDivs.has(n)) ensureShell(n);
+      }
+    }
+    // canonical-only shells beyond the new page count disappear
+    for (const [n, div] of [...pageDivs]) {
+      if (n > canonical.pageCount && div.dataset.prov !== '1') {
+        div.remove();
+        pageDivs.delete(n);
+      }
+    }
+  }
+  for (const n of pageDivs.keys()) updateCanonState(n);
+  updateBadge();
+}
+
+/** Decide, for one page, whether the canonical overlay wins right now. */
+function updateCanonState(n) {
+  const div = pageDivs.get(n);
+  if (!div) return;
+  const eligible =
+    canonical &&
+    canonical.id &&
+    n <= canonical.pageCount &&
+    (pageDirtyRev.get(n) ?? 0) <= canonical.rev;
+  if (eligible) {
+    let img = div.querySelector('img.canon');
+    if (!img) {
+      img = document.createElement('img');
+      img.className = 'canon';
+      img.loading = 'lazy'; // viewport-aware: offscreen pages convert lazily
+      img.decoding = 'async';
+      img.draggable = false;
+      img.addEventListener('error', () => {
+        // superseded compile id (or conversion hiccup): fall back to the
+        // provisional layer; the next canonical event re-points the src
+        delete img.dataset.src;
+        img.removeAttribute('src');
+        div.classList.remove('is-final');
+      });
+      div.appendChild(img);
+    }
+    const src = `/canonical/${n}.svg?c=${canonical.id}`;
+    if (img.dataset.src !== src) {
+      img.dataset.src = src;
+      img.src = src; // in-DOM swap keeps old pixels until the new SVG decodes
+    }
+    div.classList.add('is-final');
+  } else {
+    div.classList.remove('is-final');
+  }
+  // a fully-fresh canonical is the page-count authority: provisional-only
+  // pages beyond it are phantoms of the JS pagination and are hidden
+  const phantom =
+    canonical &&
+    canonical.id &&
+    canonical.rev >= appliedSrcRev &&
+    pageDirtyRev.size === 0 &&
+    n > canonical.pageCount;
+  div.classList.toggle('phantom', !!phantom);
+}
+
+function updateBadge() {
+  if (!docStateEl) return;
+  const err = canonical?.error;
+  const parts = [];
+  let cls = 'state-preview';
+  let text;
+  if (mode === 'opaque') {
+    if (canonical?.id && !canonical.inFlight && !err && canonical.rev >= appliedSrcRev) {
+      cls = 'state-exact';
+      text = '✓ exact — LuaLaTeX直描画';
+    } else {
+      text = err ? 'TeXエラー（前回の正確な表示を保持）' : 'exact fallback — コンパイル中…';
+      if (err) cls = 'state-error';
+    }
+    parts.push(text);
+  } else if (err && canonical.errorRev >= appliedSrcRev) {
+    cls = 'state-error';
+    parts.push('TeXエラー — 検証コンパイル失敗（プレビュー続行）');
+  } else if (canonical?.id && canonical.rev >= appliedSrcRev && pageDirtyRev.size === 0 && !canonical.inFlight) {
+    cls = 'state-exact';
+    parts.push('✓ exact — LuaLaTeX出力と一致');
+  } else {
+    parts.push('preview — exactへ収束中…');
+  }
+  docStateEl.className = cls;
+  docStateEl.textContent = parts.join(' ');
+  docStateEl.title =
+    (modeReasons?.length ? `opaque理由: ${modeReasons.join('; ')}\n` : '') + (err ? `TeX: ${err}` : '');
 }
 
 // ---------------------------------------------------------------- editing
@@ -441,14 +586,10 @@ function diffText(oldStr, newStr) {
 
 function scheduleSync() {
   scheduleHighlight();
-  if (backend === 'lualatex') {
-    // per-block compiles cost ~0.5s: coalesce keystrokes
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(flushSync, 300);
-    return;
-  }
-  // checkpoint/internal engines absorb every keystroke: send immediately —
-  // the serialized `sending` chain coalesces bursts into single diffs
+  // the resident engine absorbs every keystroke: send immediately — the
+  // serialized `sending` chain coalesces bursts into single diffs (in
+  // opaque mode the edit is a source-apply + canonical reschedule, cheaper
+  // still)
   flushSync();
 }
 
@@ -459,7 +600,6 @@ function flushSync() {
     if (!d) return;
     const t0 = performance.now();
     inFlight = true;
-    if (backend === 'lualatex') statusEl.textContent = '組版中… (lualatex)';
     try {
       const res = await fetch('/edit', {
         method: 'POST',
@@ -473,16 +613,16 @@ function flushSync() {
       applyReport(report);
       renderInspector(report, rtt);
       const engineMs =
-        backend === 'checkpoint'
-          ? `組版 ${report.stats.typesetMs ?? 0} ms / 全体 ${fmtUs(report.stats.totalUs)}`
-          : backend === 'lualatex'
-            ? `lualatex ${report.stats.lualatexMs ?? 0} ms / 全体 ${fmtUs(report.stats.totalUs)}`
-            : `engine ${fmtUs(report.stats.totalUs)}`;
+        report.mode === 'opaque'
+          ? `opaque（canonical再コンパイル待ち）/ ${fmtUs(report.stats.totalUs)}`
+          : `組版 ${report.stats.typesetMs ?? 0} ms / 全体 ${fmtUs(report.stats.totalUs)}`;
       statusEl.textContent =
-        `update #${report.rev} [${backend}] — ${engineMs} / 往復 ${rtt.toFixed(0)} ms` +
+        `update #${report.rev} — ${engineMs} / 往復 ${rtt.toFixed(0)} ms` +
         (report.dirtyPages.length
           ? ` / patched pages: ${report.dirtyPages.join(', ')}`
-          : ' / 表示差分なし');
+          : report.mode === 'opaque'
+            ? ''
+            : ' / 表示差分なし');
     } catch (err) {
       statusEl.textContent = `エラー: ${err.message}`;
     } finally {
@@ -644,7 +784,7 @@ templateSelectEl?.addEventListener('change', async (ev) => {
 });
 
 document.getElementById('btn-pdf').addEventListener('click', () => {
-  statusEl.textContent = backend === 'lualatex' ? 'PDF生成中（フルコンパイル）…' : 'PDF生成中…';
+  statusEl.textContent = 'PDF生成中（canonical層から配信）…';
   window.open('/pdf', '_blank');
 });
 
@@ -687,10 +827,8 @@ function renderInspector(report, rtt) {
     if (history.length > 8) history.pop();
   }
 
-  const isLua = backend === 'lualatex';
-  const isCkpt = backend === 'checkpoint';
-  const cacheRows = isCkpt
-    ? `
+  const isOpaque = (report.mode ?? mode) === 'opaque';
+  const cacheRows = `
         <span class="k">ブロック総数</span><span class="v">${s.blocksTotal}</span>
         <span class="k">fork再開組版</span><span class="v">${s.blocksTypeset}</span>
         <span class="k">ブロック再利用</span><span class="v good">${s.blocksTotal - s.blocksTypeset}</span>
@@ -698,32 +836,54 @@ function renderInspector(report, rtt) {
         <span class="k">常駐チェックポイント</span><span class="v">${s.checkpoints}</span>
         <span class="k">フル再構築</span><span class="v">${s.rebooted ? 'あり（プリアンブル変更）' : 'なし'}</span>
         <span class="k">ページ再利用</span><span class="v good">${s.pagesReused} / ${s.pageCount}</span>
-        <span class="k">ページ再構築</span><span class="v">${s.pagesRebuilt}</span>`
-    : isLua
-    ? `
-        <span class="k">ブロック総数</span><span class="v">${s.blocksTotal}</span>
-        <span class="k">lualatex再コンパイル</span><span class="v">${s.blocksCompiled}</span>
-        <span class="k">ブロック再利用</span><span class="v good">${s.blocksTotal - s.blocksCompiled}</span>
-        <span class="k">チャンクキャッシュヒット</span><span class="v good">${s.chunkCacheHits}</span>
-        <span class="k">lualatex時間</span><span class="v">${s.lualatexMs} ms</span>
-        <span class="k">SVG変換時間</span><span class="v">${s.svgMs} ms</span>
-        <span class="k">format再構築</span><span class="v">${s.fmtRebuilt ? 'あり' : 'なし'}</span>
-        <span class="k">ページ再利用</span><span class="v good">${s.pagesReused} / ${s.pageCount}</span>
-        <span class="k">ページ再構築</span><span class="v">${s.pagesRebuilt}</span>`
-    : `
-        <span class="k">ブロック総数</span><span class="v">${s.blocksTotal}</span>
-        <span class="k">再パース（展開+意味）</span><span class="v">${s.blocksReparsed}</span>
-        <span class="k">展開キャッシュ再利用</span><span class="v good">${s.semanticCacheHits}</span>
-        <span class="k">レイアウト再計算</span><span class="v">${s.layoutCacheMisses}</span>
-        <span class="k">レイアウトキャッシュヒット</span><span class="v good">${s.layoutCacheHits}</span>
-        <span class="k">ページ再利用</span><span class="v good">${s.pagesReused} / ${s.pageCount}</span>
         <span class="k">ページ再構築</span><span class="v">${s.pagesRebuilt}</span>`;
+
+  const c = report.canonical ?? canonical ?? {};
+  const verify = s.verify;
+  const canonState = c.error
+    ? `<span class="v" style="color:var(--warn)">TeXエラー</span>`
+    : c.inFlight
+      ? `<span class="v" style="color:var(--accent-2)">コンパイル中…</span>`
+      : c.rev >= (report.srcRev ?? 0)
+        ? `<span class="v good">✓ 現行ソースと一致</span>`
+        : `<span class="v">srcRev ${c.rev} 待ち</span>`;
+  const canonicalCard = `
+    <div class="card">
+      <h3>Canonical — LuaLaTeX exact render（最終表示の権威）</h3>
+      <div class="kv">
+        <span class="k">状態</span>${canonState}
+        <span class="k">コンパイル済み / 現在</span><span class="v">srcRev ${c.rev ?? 0} / ${report.srcRev ?? 0}</span>
+        <span class="k">実ページ数</span><span class="v">${c.pageCount ?? 0}</span>
+        <span class="k">パス数 / 時間</span><span class="v">${c.passes ?? 0} / ${c.ms ?? 0} ms</span>
+        ${
+          verify
+            ? `<span class="k">一致検証</span><span class="v ${verify.mismatches?.length ? '' : 'good'}">${
+                verify.mismatches?.length
+                  ? escapeHtml(verify.mismatches[0])
+                  : `✓ ${verify.pagesChecked}ページ一致`
+              }</span>`
+            : ''
+        }
+      </div>
+      ${c.error ? `<div class="diag">${escapeHtml(c.error)}</div>` : ''}
+    </div>`;
+
+  const opaqueCard = isOpaque
+    ? `<div class="card">
+        <h3>Opaque mode — exact fallback</h3>
+        <div class="diag">structured層は停止中。表示はLuaLaTeX実出力のみ（編集は継続可能）。</div>
+        ${(report.modeReasons ?? modeReasons ?? []).map((r) => `<div class="diag">${escapeHtml(r)}</div>`).join('')}
+      </div>`
+    : '';
 
   inspectorEl.innerHTML = `
     <div class="card">
-      <div class="bigtime">${fmtUs(s.totalUs)} <span class="unit">${isCkpt ? 'checkpoint engine (常駐TeX)' : isLua ? 'lualatex backend' : 'internal engine'}${rtt != null ? ` / 往復 ${rtt.toFixed(0)} ms` : ''}</span></div>
-      <div class="editlabel">edit: ${escapeHtml(report.edit)} (rev ${report.rev})</div>
+      <div class="bigtime">${fmtUs(s.totalUs)} <span class="unit">${isOpaque ? 'opaque (canonicalのみ)' : 'checkpoint engine (常駐TeX)'}${rtt != null ? ` / 往復 ${rtt.toFixed(0)} ms` : ''}</span></div>
+      <div class="editlabel">edit: ${escapeHtml(report.edit)} (rev ${report.rev} / src ${report.srcRev ?? '-'})</div>
     </div>
+
+    ${opaqueCard}
+    ${canonicalCard}
 
     <div class="card">
       <h3>Dirty 伝播チェーン</h3>
@@ -802,13 +962,26 @@ const sse = new EventSource('/events');
 sse.onmessage = (ev) => {
   try {
     const msg = JSON.parse(ev.data);
+    if (msg.kind === 'canonical') {
+      // a real-lualatex compile landed: converge every covered page to it
+      canonical = msg.canonical;
+      if (msg.mode) setMode(msg.mode, modeReasons);
+      syncCanonical();
+      return;
+    }
     if (msg.kind === 'patches') {
-      // async arrivals (TikZ exact renders, background chain discoveries)
+      // async arrivals (TikZ exact renders, background chain discoveries):
+      // the SOURCE is unchanged, so canonical stays authoritative — no
+      // dirty marks, but re-evaluate each repainted page's overlay state
       if (msg.rev > appliedRev) {
         appliedRev = msg.rev;
         for (const patch of msg.patches) {
-          if (patch.type === 'replace-page') renderPage(patch.displayList, true);
-          else if (patch.type === 'remove-pages') removePagesFrom(patch.from);
+          if (patch.type === 'replace-page') {
+            renderPage(patch.displayList, true);
+            updateCanonState(patch.displayList.page);
+          } else if (patch.type === 'remove-pages') {
+            removePagesFrom(patch.from);
+          }
         }
       }
       return;

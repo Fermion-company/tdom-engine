@@ -1,15 +1,19 @@
-// Side-by-side compare page for the TDOM Engine.
+// Side-by-side compare page for the TDOM Engine — the provisional layer's
+// referee.
 //
-//   left  — the REAL PDF: a full 2-pass lualatex compile of the current
-//           source (server /pdf endpoint), rendered by pdf.js.
-//   right — the ENGINE pseudo-PDF: the live display lists (server /doc),
-//           drawn exactly as the main preview does (SVG glyph runs + chunk
-//           image overlays), and kept live over SSE.
+//   left  — CANONICAL: the real LuaLaTeX output, byte-identical to what the
+//           main preview converges to (/canonical.pdf, auto-refreshed on
+//           every canonical SSE event; falls back to /pdf when no compile
+//           has landed yet), rendered by pdf.js.
+//   right — PROVISIONAL: the live display lists (server /doc), drawn from
+//           glyph runs + chunk overlays and kept live over SSE. This is the
+//           only place the provisional layer is still visible — the main
+//           preview hides it under the canonical render once fresh.
 //
-// The whole point of the project is that these two are the same picture; this
-// page lets you see it. Both columns render their pages at one shared width
-// (--page-w) so a page on the left sits pixel-for-pixel over the same page on
-// the right.
+// In the two-truth architecture the left column is the authority and the
+// right column is the fast approximation; this page shows how close the
+// approximation runs. Both columns render at one shared width (--page-w) so
+// page N sits pixel-for-pixel over page N.
 
 import * as pdfjsLib from '/pdfjs/pdf.min.mjs';
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdfjs/pdf.worker.min.mjs';
@@ -126,8 +130,15 @@ function enginePage(dl) {
   return wrap;
 }
 
-function renderEngine(pages) {
+function renderEngine(pages, mode) {
   engineScroll.innerHTML = '';
+  if (mode === 'opaque') {
+    engineScroll.innerHTML =
+      '<div class="cmp-empty">opaqueモード: この文書はstructured層の対象外です<br>' +
+      '(safety gateによるexact fallback)。provisional層は存在せず、<br>' +
+      'メインプレビューは左と同じLuaLaTeX実出力を表示しています。</div>';
+    return;
+  }
   if (!pages?.length) {
     engineScroll.innerHTML = '<div class="cmp-empty">ページがありません</div>';
     return;
@@ -138,11 +149,11 @@ function renderEngine(pages) {
 async function loadEngine() {
   const doc = await fetch('/doc').then((r) => r.json());
   geometry = doc.geometry;
-  backend = doc.backend ?? 'internal';
-  backendTag.textContent = `TDOMエンジン (${backend})`;
+  backend = doc.backend ?? 'checkpoint';
+  backendTag.textContent = doc.mode === 'opaque' ? 'opaqueモード (exact fallback)' : `provisional層 (${backend})`;
   injectFonts(doc.fonts);
   applyPageWidth();
-  renderEngine(doc.pages);
+  renderEngine(doc.pages, doc.mode);
 }
 
 // -------------------------------------------------------------- real (left)
@@ -159,13 +170,40 @@ async function paintRealPage(entry) {
   await page.render({ canvasContext: ctx, viewport }).promise;
 }
 
-async function renderReal() {
-  realScroll.innerHTML = '<div class="cmp-empty">本物のPDFをlualatexでコンパイル中…</div>';
-  status('lualatex フルコンパイル中…');
+let realBusy = false;
+
+/**
+ * Paint the left column.
+ * force=false: serve the last LANDED canonical compile (/canonical.pdf,
+ * instant, never triggers a compile) — used at boot and on canonical SSE
+ * events, so the left column always mirrors the main preview's authority.
+ * force=true: compile the newest source now (/pdf) — the manual button.
+ */
+async function renderReal(force = false) {
+  if (realBusy) return;
+  realBusy = true;
+  try {
+    await renderRealInner(force);
+  } finally {
+    realBusy = false;
+  }
+}
+
+async function renderRealInner(force) {
+  if (force) {
+    realScroll.innerHTML = '<div class="cmp-empty">本物のPDFをlualatexでコンパイル中…</div>';
+    status('lualatex コンパイル中…');
+  }
   let buf;
   try {
-    const resp = await fetch('/pdf');
-    if (!resp.ok) throw new Error(`/pdf → ${resp.status}`);
+    let resp = force ? await fetch('/pdf') : await fetch('/canonical.pdf');
+    if (!force && resp.status === 404) {
+      // no canonical compile has landed yet (fresh boot): compile one
+      realScroll.innerHTML = '<div class="cmp-empty">本物のPDFをlualatexでコンパイル中…</div>';
+      status('canonical未着 — lualatex コンパイル中…');
+      resp = await fetch('/pdf');
+    }
+    if (!resp.ok) throw new Error(`${resp.url.split('/').pop()} → ${resp.status}`);
     buf = await resp.arrayBuffer();
   } catch (err) {
     realScroll.innerHTML = `<div class="cmp-empty">本物のPDFを取得できませんでした<br>${escapeXml(err.message)}<br><br>lualatex が必要です。</div>`;
@@ -190,7 +228,7 @@ async function renderReal() {
       realPages.push(entry);
       await paintRealPage(entry);
     }
-    status(`本物のPDF: ${pdf.numPages} ページを描画しました`);
+    status(`canonical (本物のLuaLaTeX出力): ${pdf.numPages} ページを描画しました`);
   } catch (err) {
     realScroll.innerHTML = `<div class="cmp-empty">pdf.js の描画に失敗しました<br>${escapeXml(err.message)}</div>`;
     status('pdf.js 描画エラー');
@@ -212,7 +250,7 @@ function setZoom(z) {
 document.getElementById('cmp-zoom-in').addEventListener('click', () => setZoom(zoom * 1.1));
 document.getElementById('cmp-zoom-out').addEventListener('click', () => setZoom(zoom / 1.1));
 document.getElementById('cmp-zoom-fit').addEventListener('click', () => setZoom(1));
-document.getElementById('cmp-recompile').addEventListener('click', renderReal);
+document.getElementById('cmp-recompile').addEventListener('click', () => renderReal(true));
 
 // ---------------------------------------------------------------- sync scroll
 
@@ -237,9 +275,19 @@ const sse = new EventSource('/events');
 sse.onmessage = (ev) => {
   try {
     const msg = JSON.parse(ev.data);
+    if (msg.kind === 'canonical') {
+      // a fresh canonical compile landed: the left column can mirror it
+      // instantly (no compile — /canonical.pdf serves the landed bytes)
+      if (msg.canonical?.error) {
+        status(`TeXエラー — 左は前回のcanonicalを保持: ${msg.canonical.error}`);
+      } else {
+        renderReal(false);
+      }
+      return;
+    }
     if (msg.kind === 'update' || msg.kind === 'patches' || msg.kind === 'reset') {
       loadEngine().then(() => {
-        status('右（擬似PDF）を更新しました — 本物のPDFは「再生成」で更新');
+        status('右（provisional層）を更新しました — 左はcanonical着地時に自動更新');
       });
     }
   } catch { /* ignore */ }

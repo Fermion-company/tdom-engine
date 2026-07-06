@@ -15,11 +15,17 @@
 | 5 | [05-v1-v0-backends.md](05-v1-v0-backends.md) | v1（ブロック独立コンパイル）とv0（依存ゼロ内部エンジン）の解説 | 歴史と代替設計に興味がある人 |
 | 6 | [06-correctness-performance.md](06-correctness-performance.md) | 性能実測と「なぜこれが下限か」、正しさの担保、テスト30本の一覧、既知の限界、**開発中に踏んだ罠のアーカイブ** | 全員（特に罠の表） |
 | 7 | [07-glossary.md](07-glossary.md) | 用語集 | 随時参照 |
+| 8 | [08-canonical-exact-layer.md](08-canonical-exact-layer.md) | **2026-07大改修**: canonical exact layer（LuaLaTeX実出力＝最終表示の権威）、safety gate、opaqueモード、一致検証、srcRev二重系列 | 全員（最新の権威構造） |
 
 ## この解説書の対象コミット
 
-`341afa3`（2026-07-03）時点のソースに対応します。
+第1〜7章は `341afa3`（2026-07-03）時点のソースに対応します。
 コード引用の行番号は目安であり、以後の変更でずれる可能性があります。
+**2026-07-06の改修**（第8章）で v0/v1 バックエンドは削除され、表示の
+権威は canonical layer（素のLuaLaTeX実出力）に移りました。第5章の
+v0/v1解説と、第2〜4章の「JS pagebuilder / display list が最終表示」
+という記述は歴史的文書として読んでください — 現在のそれらは
+provisional 層（高速プレビュー専用）です。
 
 ## 30秒の要約
 

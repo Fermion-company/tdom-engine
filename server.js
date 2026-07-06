@@ -1,15 +1,18 @@
 // Resident engine server.
 //
 // The TDOM engine lives in this process, holding the full document state
-// between requests. Three interchangeable engines (TDOM_BACKEND=...):
-//   - checkpoint (default with TeX installed): fork-checkpointed resident
-//     lualatex — keystroke-synchronous live preview (~5ms edits) drawing
-//     TeX's own glyphs with TeX's own fonts
-//   - lualatex: per-block isolated compiles (v1 architecture)
-//   - internal: the zero-dependency toy engine
+// between requests. Two display layers, strictly ranked:
+//   - canonical: real lualatex output (async, always wins — /canonical/:n.svg)
+//   - provisional: the fork-checkpointed resident lualatex chain painting
+//     keystroke-synchronous display-list patches
 //
 // Clients are thin: the editor POSTs text deltas, the viewer applies
-// display-list patches (from the POST response and/or the SSE stream).
+// display-list patches and converges each page to the canonical render
+// (from the POST response and/or the SSE stream).
+//
+// lualatex + poppler are REQUIRED: the engine's first absolute condition is
+// that the final display equals LuaLaTeX's real output, which no fallback
+// engine can promise.
 
 import http from 'node:http';
 import { execFile } from 'node:child_process';
@@ -18,11 +21,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { TDOMEngine } from './engine/engine.js';
-import { LuaTDOMEngine } from './engine/engine-lua.js';
-import { LuaTexBackend } from './engine/luatex/backend.js';
 import { CheckpointEngine } from './engine/checkpoint/engine-v3.js';
-import { PAGE } from './engine/layout.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 4633);
@@ -292,34 +291,40 @@ async function compilePreviewPdf(source) {
   }
 }
 
-async function createEngine() {
-  const pref = process.env.TDOM_BACKEND;
-  const texAvailable = await LuaTexBackend.detect();
-  if (pref === 'internal' || !texAvailable) {
-    return {
-      engine: new TDOMEngine(),
-      backend: 'internal',
-      sample: readFileSync(path.join(ROOT, 'samples', 'demo.tex'), 'utf8'),
-    };
+async function requireToolchain() {
+  const missing = [];
+  for (const [cmd, hint] of [
+    ['lualatex', 'TeX Live (brew install --cask mactex-no-gui / apt install texlive-luatex)'],
+    ['pdftocairo', 'poppler (brew install poppler / apt install poppler-utils)'],
+  ]) {
+    try {
+      await execFileP(cmd, ['-v'], { timeout: 15_000 });
+    } catch (err) {
+      if (err?.code === 'ENOENT') missing.push(`${cmd} — ${hint}`);
+      // any other exit means the binary exists and answered
+    }
   }
-  if (pref === 'lualatex') {
-    return {
-      engine: new LuaTDOMEngine({ workDir: path.join(ROOT, '.tdom-cache') }),
-      backend: 'lualatex',
-      sample: readFileSync(path.join(ROOT, 'samples', 'demo-lua.tex'), 'utf8'),
-    };
+  if (missing.length) {
+    console.error(
+      '[tdom] required toolchain missing (the final display must equal real LuaLaTeX output):\n' +
+        missing.map((m) => `  - ${m}`).join('\n')
+    );
+    process.exit(1);
   }
-  return {
-    engine: new CheckpointEngine({
-      workDir: path.join(ROOT, '.tdom-v3'),
-      docDir: path.join(ROOT, 'samples'),
-    }),
-    backend: 'checkpoint',
-    sample: readFileSync(path.join(ROOT, 'samples', 'stress-test-ja.tex'), 'utf8'),
-  };
 }
 
-const { engine, backend, sample } = await createEngine();
+await requireToolchain();
+const backend = 'checkpoint';
+const engine = new CheckpointEngine({
+  workDir: path.join(ROOT, '.tdom-v3'),
+  docDir: path.join(ROOT, 'samples'),
+});
+// TDOM_SAMPLE picks the boot document (tests use the small demo — booting
+// the 70-page stress doc takes ~2 minutes)
+const sampleFile = /^[a-z0-9-]+\.tex$/i.test(process.env.TDOM_SAMPLE || '')
+  ? process.env.TDOM_SAMPLE
+  : 'stress-test-ja.tex';
+const sample = readFileSync(path.join(ROOT, 'samples', sampleFile), 'utf8');
 let lastReport = await engine.open(sample);
 console.log(
   `[tdom] engine resident (${backend}): ${lastReport.stats.pageCount} pages, ` +
@@ -341,18 +346,21 @@ function broadcast(payload) {
 }
 
 // async patches (TikZ renders, late chain discoveries) from the checkpoint engine
-if (backend === 'checkpoint') {
-  engine.onAsyncPatches = (partial) => {
-    broadcast({ kind: 'patches', rev: partial.rev, patches: partial.patches });
-  };
-  engine.onExternalChange = () => {
-    withEngine(async () => {
-      lastReport = await engine.refresh();
-      broadcast({ kind: 'update', report: lastReport });
-      return lastReport;
-    }).catch(() => {});
-  };
-}
+engine.onAsyncPatches = (partial) => {
+  broadcast({ kind: 'patches', rev: partial.rev, patches: partial.patches });
+};
+engine.onExternalChange = () => {
+  withEngine(async () => {
+    lastReport = await engine.refresh();
+    broadcast({ kind: 'update', report: lastReport });
+    return lastReport;
+  }).catch(() => {});
+};
+// canonical compiles land asynchronously: tell every client so it can
+// converge its pages to the exact LuaLaTeX render
+engine.onCanonical = (info) => {
+  broadcast({ kind: 'canonical', canonical: info, mode: engine.mode });
+};
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -408,18 +416,26 @@ function readBody(req) {
 }
 
 function geometry() {
-  if (backend === 'internal') return { paperwidth: PAGE.width, paperheight: PAGE.height };
+  // opaque documents may never have booted the structured layer — take the
+  // paper size from the canonical PDF instead
   const g = engine.getGeometry();
-  return g;
+  if (g) return g;
+  const paper = engine.canonical.info().paper;
+  return paper
+    ? { paperwidth: paper.w, paperheight: paper.h }
+    : { paperwidth: 612, paperheight: 792 };
 }
 
 function docPayload() {
   return {
     backend,
+    mode: engine.mode,
+    modeReasons: engine.modeReasons,
+    canonical: engine.canonical.info(),
     source: engine.getSource(),
     pages: engine.getDisplayLists(),
     geometry: geometry(),
-    fonts: backend === 'checkpoint' ? engine.getFontManifest() : [],
+    fonts: engine.getFontManifest(),
     report: lastReport,
   };
 }
@@ -474,6 +490,24 @@ const server = http.createServer(async (req, res) => {
       return serveAsset(res, decodeURIComponent(url.pathname.slice('/assets/'.length)));
     }
     if (req.method === 'GET' && url.pathname === '/dom') return json(res, engine.getDOM());
+    // canonical exact pages: lazy per-page SVG of the real lualatex PDF.
+    // The client pins the compile id via ?c=<id>; a stale id 404s so the
+    // client refetches against the current compile.
+    if (req.method === 'GET' && url.pathname.startsWith('/canonical/')) {
+      const n = Number(url.pathname.slice('/canonical/'.length).replace(/\.svg$/, ''));
+      const id = url.searchParams.get('c');
+      const svg = await engine.canonical.pageSVG(n, id).catch(() => null);
+      if (!svg) {
+        res.writeHead(404, { 'Cache-Control': 'no-store' });
+        return res.end('no canonical page');
+      }
+      res.writeHead(200, {
+        'Content-Type': 'image/svg+xml',
+        // the URL carries the compile id — content under it never changes
+        'Cache-Control': id ? 'public, max-age=31536000, immutable' : 'no-cache',
+      });
+      return res.end(svg);
+    }
     if (req.method === 'GET' && url.pathname.startsWith('/chunk/')) {
       const id = decodeURIComponent(url.pathname.slice('/chunk/'.length)).replace(/\.svg$/, '');
       const svg = engine.getChunkSVG ? engine.getChunkSVG(id) : null;
@@ -501,8 +535,26 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end(body);
     }
+    // the last LANDED canonical compile, byte-identical to what the main
+    // preview converged to — never triggers a compile (the compare view's
+    // left column auto-refreshes from here on every canonical SSE event)
+    if (req.method === 'GET' && url.pathname === '/canonical.pdf') {
+      const body = engine.canonical.pdfBytes();
+      if (!body) {
+        res.writeHead(404, { 'Cache-Control': 'no-store' });
+        return res.end('no canonical compile yet');
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/pdf',
+        'Cache-Control': 'no-cache',
+      });
+      return res.end(body);
+    }
     if (req.method === 'GET' && url.pathname === '/pdf') {
-      const pdf = await withEngine(() => engine.exportPDF());
+      // served by the canonical layer (cached when the source is unchanged);
+      // deliberately NOT serialized behind engine edits — a full compile
+      // must never block the editing hot path
+      const pdf = await engine.exportPDF();
       res.writeHead(200, {
         'Content-Type': 'application/pdf',
         'Content-Disposition': 'inline; filename="tdom-export.pdf"',

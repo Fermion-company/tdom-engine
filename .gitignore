@@ -6,3 +6,4 @@
 node_modules/
 recovered-document.tex
 .cache/
+.tdom-canon-test*/

@@ -5,13 +5,17 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { LuaTexBackend } from '../engine/luatex/backend.js';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 
 const DEMO = readFileSync(fileURLToPath(new URL('../samples/demo-lua.tex', import.meta.url)), 'utf8');
 const WORK = fileURLToPath(new URL('../.tdom-v3-test', import.meta.url));
 
-const available = await LuaTexBackend.detect();
+const available = await promisify(execFile)('lualatex', ['--version'], { timeout: 15_000 }).then(
+  () => true,
+  () => false
+);
 const opts = available ? {} : { skip: 'lualatex not installed' };
 
 let eng;

@@ -1,12 +1,12 @@
 {
   "name": "tdom-engine",
-  "version": "0.1.0",
-  "description": "TDOM Engine — a resident, incremental TeX/LaTeX typesetting runtime (TeX DOM Runtime). Engine-focused build: TeX source + live preview only.",
+  "version": "0.2.0",
+  "description": "TDOM Engine — a resident, incremental TeX/LaTeX typesetting runtime (TeX DOM Runtime). Canonical LuaLaTeX output as the display authority, DOM-style incremental preview on top.",
   "type": "module",
-  "main": "engine/engine.js",
+  "main": "engine/checkpoint/engine-v3.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test tests/engine.test.js tests/engine-lua.test.js tests/engine-v3.test.js tests/server-api.test.js"
+    "test": "node --test tests/canonical.test.js tests/engine-v3.test.js tests/server-api.test.js"
   },
   "engines": {
     "node": ">=18"

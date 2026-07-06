@@ -1,6 +1,26 @@
-// CheckpointEngine — the endgame architecture.
+// CheckpointEngine — the structured/provisional layer plus its exact anchor.
 //
-// A single resident lualatex process tree holds the document. Every block
+// Two truths, strictly ranked:
+//
+//   1. CANONICAL (canonical.js): a real, plain lualatex compile of the
+//      actual source — the ONLY authority on what the final display looks
+//      like. It runs asynchronously off the edit path and the client
+//      converges every page to it.
+//   2. PROVISIONAL (this file + pagebuilder.js): the resident fork-
+//      checkpointed lualatex chain that turns a keystroke into display-list
+//      patches in milliseconds. It exists for latency, dependency tracking,
+//      the inspector and source mapping — never for final correctness.
+//
+// A safety gate (safety.js) decides whether a document may use the
+// structured layer at all; anything page-mechanism-hostile (shipout hooks,
+// twocolumn, marginpar …), any boot/typeset failure, and any verification
+// mismatch demotes to the opaque path: the display becomes the canonical
+// LuaLaTeX pages themselves, still editable, still incremental at the
+// source level. Unknown constructs are not failures — they are opaque
+// nodes rendered from LuaLaTeX's own output.
+//
+// The provisional machinery: a single resident lualatex process tree holds
+// the document. Every block
 // boundary is a fork()ed checkpoint: a copy-on-write snapshot of the COMPLETE
 // TeX state. An edit kills the stale suffix of the chain and resumes from the
 // last valid snapshot, so the foreground cost of a keystroke is:
@@ -29,6 +49,8 @@ import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { buildPages, reconcile, parsePlacement } from './pagebuilder.js';
 import { mapLegacyFont, remapText } from './mathmap.js';
+import { CanonicalRenderer } from './canonical.js';
+import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
 import { statSync, watch } from 'node:fs';
 
 const execFileP = promisify(execFile);
@@ -64,7 +86,8 @@ export class CheckpointEngine {
     this.file = 'main.tex';
     this.blocks = [];
     this.idSeq = 1;
-    this.rev = 0;
+    this.rev = 0; // patch-stream ordering (advances on async repaints too)
+    this.srcRev = 0; // SOURCE revisions only — what canonical compiles chase
 
     this.server = null;
     this.port = 0;
@@ -98,6 +121,37 @@ export class CheckpointEngine {
     this.includes = new Map(); // path -> {mtime, text}
     this.watchers = new Map(); // path -> FSWatcher
     this.maxCheckpoints = 64;
+
+    // canonical layer: the exact-output authority (see file header)
+    this.canonical = new CanonicalRenderer({
+      workDir: path.join(this.workDir, 'canonical'),
+      docDir: this.docDir,
+    });
+    this.canonical.onResult = (info) => this.#onCanonicalResult(info);
+    this.onCanonical = null; // callback(info) for the server's SSE fanout
+    this.mode = 'structured'; // 'structured' | 'opaque'
+    this.modeReasons = [];
+    this.opaqueStickyPre = null; // preamble hash a dynamic demotion sticks to
+    this.verifyState = null; // last exactness-verification outcome
+
+    // stale-first rescue machinery: exact isolated compiles are queued and
+    // run OFF the editing hot path; the chain lock serializes everything
+    // that touches the resident checkpoint chain (updates, background chain
+    // rebuild, async rescue adoption)
+    this.chainLock = Promise.resolve();
+    this.rescueQueue = new Map(); // block.id -> cacheKey at queue time
+    this.rescuePumping = false;
+    this.isoChildren = new Set(); // in-flight isolated lualatex processes
+  }
+
+  /** Serialize access to the resident chain (jobBlock/currentJob users). */
+  #locked(fn) {
+    const run = this.chainLock.then(fn);
+    this.chainLock = run.then(
+      () => {},
+      () => {}
+    );
+    return run;
   }
 
   // ------------------------------------------------------------ lifecycle
@@ -109,6 +163,11 @@ export class CheckpointEngine {
     this.labelTable = new Map();
     this.hrefTable = new Map();
     this.pages = [];
+    // a fresh document gets a fresh chance at the structured layer
+    this.mode = 'structured';
+    this.modeReasons = [];
+    this.opaqueStickyPre = null;
+    this.verifyState = null;
     return this.#update({ editLabel: 'open' });
   }
 
@@ -122,6 +181,11 @@ export class CheckpointEngine {
 
   async close() {
     this.bgAbort = true;
+    this.canonical.dispose();
+    this.rescueQueue.clear();
+    for (const child of this.isoChildren) {
+      try { child.kill('SIGKILL'); } catch { /* gone */ }
+    }
     for (const w of this.watchers.values()) {
       try { w.close(); } catch { /* already closed */ }
     }
@@ -180,6 +244,9 @@ export class CheckpointEngine {
     return {
       rev: this.rev,
       backend: this.backendName,
+      mode: this.mode,
+      modeReasons: this.modeReasons,
+      canonical: this.canonical.info(),
       pageCount: this.pages.length,
       checkpoints: [...this.checkpoints.keys()].sort((a, b) => a - b),
       blocks: this.blocks.map((b, i) => {
@@ -210,19 +277,13 @@ export class CheckpointEngine {
   }
 
   async exportPDF() {
-    // The honest full path: a real 2-pass lualatex over the actual source.
-    const p = path.join(this.workDir, 'export.tex');
-    writeFileSync(p, this.getSource());
-    const run = () =>
-      execFileP('lualatex', ['-interaction=nonstopmode', 'export.tex'], {
-        cwd: this.workDir,
-        timeout: 120_000,
-      }).catch(() => {});
-    await run();
-    await run();
-    const pdf = path.join(this.workDir, 'export.pdf');
-    if (!existsSync(pdf)) throw new Error('full compile failed');
-    return readFileSync(pdf);
+    // The canonical layer IS the honest full path (plain lualatex to its
+    // aux fixpoint); when its last compile already matches the current
+    // source this returns the exact bytes the preview converged to.
+    // NB: srcRev, not rev — canonical revisions live on the source axis
+    // (async repaints advance this.rev without changing the source)
+    const res = await this.canonical.ensure(this.getSource(), this.srcRev);
+    return readFileSync(res.pdf);
   }
 
   // ---------------------------------------------------------- root/daemon
@@ -787,23 +848,46 @@ export class CheckpointEngine {
    * creates the next checkpoint so the resident chain continues with the
    * exact exit state.
    */
-  async #rescueBlock(idx, why) {
-    const block = this.blocks[idx];
-    // the key carries the CURRENT values of every label the block referenced
-    // in its last compile: when a referenced label moves, the key misses and
-    // the block re-rescues with fresh seeds (first compile has no refs yet —
-    // the backward-reference pass supplies the second look)
+  /**
+   * The rescue cache key carries every input the isolated compile depends
+   * on: the block text, the previous block's exit state, the preamble, the
+   * CURRENT values of every label the block referenced in its last compile
+   * (when a referenced label moves, the key misses and the block re-rescues
+   * with fresh seeds), and the block's on-page start offset (splitting
+   * environments — mdframed, breakable tcolorbox — break by page position).
+   */
+  #rescueCacheKey(block, idx) {
     const refVals = (block.galley?.refs ?? []).map(
       (k) => k + '=' + (this.labelTable.get(k) ?? '')
     );
-    // page-context: the block's on-page start offset changes where a
-    // splitting environment (mdframed, breakable tcolorbox) breaks
     const pageOff = Math.round((block.pageOffset ?? 0) * 100) / 100;
-    const cacheKey = fnv1a(
+    return fnv1a(
       JSON.stringify([block.text, this.blocks[idx - 1]?.stateVec ?? '', this.preHash, refVals, pageOff])
     );
+  }
+
+  async #rescueBlock(idx, why) {
+    const block = this.blocks[idx];
+    const cacheKey = this.#rescueCacheKey(block, idx);
     let iso = this.isoCache.get(cacheKey);
     if (!iso) {
+      if (block.galley?.state) {
+        // STALE-FIRST: an isolated compile takes seconds and must never sit
+        // on the editing hot path. Keep the previous galley on screen (the
+        // provisional layer is allowed to be temporarily stale — canonical
+        // guarantees the final pixels), seed the continuation checkpoint
+        // from the stale exit state so the chain stays consistent, and let
+        // the exact compile land asynchronously.
+        await this.#jobBlock(idx, {
+          id: block.id + '@state',
+          body: this.#stateJobBody({ state: block.galley.state, labels: block.galley.labels ?? [] }),
+        });
+        this.rescueQueue.set(block.id, cacheKey);
+        this.#pumpRescues();
+        return { ...block.galley, tdomStale: true };
+      }
+      // first-ever rescue of this block (no previous galley to show):
+      // compile synchronously — there is nothing older to display
       iso = await this.#isoCompile(block, idx, why);
       this.isoCache.set(cacheKey, iso);
     }
@@ -832,7 +916,13 @@ export class CheckpointEngine {
       if (v !== undefined) L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${v}}\\fi`);
     }
     for (const l of iso.labels ?? []) {
-      L.push(`\\global\\@namedef{r@${l.k}}${labelDefBody(l.k, l.v, this.geometry?.hyperref === 1, l.h)}`);
+      // stale-first passes real galley labels through here, which can
+      // include \bibitem captures (cite: keys) — those live under b@
+      if (l.k.startsWith('cite:')) {
+        L.push(`\\global\\@namedef{b@${l.k.slice(5)}}{${l.v}}`);
+      } else {
+        L.push(`\\global\\@namedef{r@${l.k}}${labelDefBody(l.k, l.v, this.geometry?.hyperref === 1, l.h)}`);
+      }
     }
     L.push(iso.state['tdom@nobreak'] === 1 ? '\\global\\@nobreaktrue' : '\\global\\@nobreakfalse');
     L.push('\\makeatother');
@@ -1101,10 +1191,18 @@ export class CheckpointEngine {
     rmSync(path.join(jobdir, 'iso.pdf'), { force: true });
     rmSync(path.join(jobdir, 'state.json'), { force: true });
     writeFileSync(path.join(jobdir, 'iso.tex'), L.join('\n') + '\n');
-    await execFileP('lualatex', ['-interaction=nonstopmode', 'iso.tex'], {
+    // tracked so teardown/close can reap in-flight isolated compiles; edits
+    // do NOT kill these — with stale-first rescues they already run off the
+    // hot path, and a finished compile is a cache entry worth keeping.
+    // nice(1): isolated compiles must lose CPU contests against the
+    // resident fork jobs that answer keystrokes
+    const run = execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
       cwd: jobdir,
       timeout: 120_000,
-    }).catch(() => {});
+    });
+    this.isoChildren.add(run.child);
+    await run.catch(() => {});
+    this.isoChildren.delete(run.child);
     const pdf = path.join(jobdir, 'iso.pdf');
     const statePath = path.join(jobdir, 'state.json');
     if (!existsSync(pdf) || !existsSync(statePath)) {
@@ -1224,10 +1322,12 @@ export class CheckpointEngine {
    * self-verifying convergence as the main edit path, factored out so the
    * toc and backward-reference passes cannot cut the chain short.
    * Returns the number of blocks typeset; reports (idx, changed) per block.
+   * `shouldAbort` lets background callers yield to an incoming edit.
    */
-  async #retypesetChain(from, target, onBlock) {
+  async #retypesetChain(from, target, onBlock, shouldAbort = null) {
     let n = 0;
     for (let j = from; j < this.blocks.length; j++) {
+      if (shouldAbort?.()) return -(n + 1); // strictly negative: aborted
       const block = this.blocks[j];
       const before = { hash: block.galleyHash, state: block.stateVec };
       const g = await this.#typesetBlock(j).catch(() => null);
@@ -1260,6 +1360,11 @@ export class CheckpointEngine {
         });
       }
       delete galley.tdomIsoChunks;
+      block.rescued = true;
+    } else if (galley.tdomStale) {
+      // stale-first rescue: the previous (rescued) galley is being reused
+      // verbatim — its chunks are already registered under the same hash
+      delete galley.tdomStale;
       block.rescued = true;
     } else {
       block.rescued = false;
@@ -1314,15 +1419,25 @@ export class CheckpointEngine {
   // ------------------------------------------------------------- update
 
   async #update(args) {
-    // serialize async header-job arrivals against updates: an hf apply
-    // between an update's prevHashes capture and its patch computation
-    // would mark unrelated pages dirty
-    this.updating = true;
-    try {
-      return await this.#updateInner(args);
-    } finally {
-      this.updating = false;
-    }
+    this.lastEditAt = Date.now(); // pauses the idle-gated isolated renders
+    // Stop the in-flight background chain rebuild BEFORE taking the chain
+    // lock (it holds the lock while running; aborting it first avoids a
+    // lock-order deadlock). With stale-first rescues the background task
+    // never blocks on an isolated compile, so this wait is milliseconds.
+    this.bgAbort = true;
+    await this.bgTask.catch(() => {});
+    return this.#locked(async () => {
+      // serialize async header-job arrivals against updates: an hf apply
+      // between an update's prevHashes capture and its patch computation
+      // would mark unrelated pages dirty
+      this.updating = true;
+      this.bgAbort = false;
+      try {
+        return await this.#updateInner(args);
+      } finally {
+        this.updating = false;
+      }
+    });
   }
 
   async #updateInner({ editLabel, retry = false }) {
@@ -1330,18 +1445,48 @@ export class CheckpointEngine {
     const text = this.store.get(this.file);
     const diagnostics = [];
 
-    // stop any in-flight background rebuild before touching the chain
-    this.bgAbort = true;
-    await this.bgTask.catch(() => {});
-    this.bgAbort = false;
-
     const bounds = documentBounds(text);
     const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
     const preHash = fnv1a(preamble);
+
+    // ---- safety gate -----------------------------------------------------
+    // Structured is a privilege, not a default: page-mechanism-hostile
+    // constructs and previously-failed preambles take the opaque path,
+    // where the display is the canonical LuaLaTeX output itself.
+    const gate = classifyDocument(preamble, text.slice(bounds.body.start, bounds.body.end));
+    if (!gate.safe) {
+      return this.#opaqueUpdate(editLabel, t, gate.reasons.map((r) => `safety gate: ${r}`));
+    }
+    if (this.opaqueStickyPre === preHash) {
+      // dynamically demoted on this exact preamble — don't pay a doomed
+      // boot per keystroke; a preamble edit (or reopen) retries structured
+      return this.#opaqueUpdate(editLabel, t, this.modeReasons);
+    }
+    if (this.mode === 'opaque') {
+      this.mode = 'structured';
+      this.modeReasons = [];
+      this.preHash = null; // the resident tree was torn down — force a boot
+      this.diagnostics.push('safety gate: structured layer re-enabled');
+    }
+
     let rebooted = false;
     if (preHash !== this.preHash) {
-      // Structure-changing edit: the honest full-rebuild path.
-      await this.#bootRoot();
+      if (process.env.TDOM_DEBUG_BOOT) {
+        console.error(
+          `[tdom-debug] preHash mismatch: have=${this.preHash} want=${preHash} ` +
+            `preambleLen=${preamble.length} bodyStart=${bounds.body.start} edit=${editLabel}`
+        );
+      }
+      // Structure-changing edit: the honest full-rebuild path. A preamble
+      // the daemon cannot boot (unknown packages breaking the driver shims,
+      // TeX errors before \begin{document} …) is not an error state: the
+      // document demotes to opaque and the canonical layer keeps rendering.
+      try {
+        await this.#bootRoot();
+      } catch (err) {
+        this.opaqueStickyPre = preHash;
+        return this.#opaqueUpdate(editLabel, t, [`structured boot failed: ${err.message}`]);
+      }
       this.preHash = preHash;
       rebooted = true;
       for (const b of this.blocks) {
@@ -1515,44 +1660,14 @@ export class CheckpointEngine {
 
     // ---- page-context-sensitive rescues ---------------------------------
     // A rescued environment that reads \pagegoal-\pagetotal (mdframed,
-    // breakable tcolorbox …) splits by its position ON the page. Feed each
-    // rescued block its true entry offset from provisional pagination and
-    // iterate to a fixed point — the split changes heights, which move
-    // every later block's offset, exactly like TeX's own reruns would.
-    for (let pass = 0; pass < 4; pass++) {
-      const prov = this.#paginateNow();
-      const entry = prov.blockEntry ?? new Map();
-      let moved = false;
-      for (let c = 0; c < this.blocks.length; c++) {
-        const block = this.blocks[c];
-        if (!block.rescued) continue;
-        const want = Math.round((entry.get(block.id) ?? 0) * 100) / 100;
-        const have = block.pageOffset ?? 0;
-        if (Math.abs(want - have) <= 0.05) continue;
-        // offset-independent cases skip the (expensive) re-rescue:
-        // an env that OPENS with a page break (\clearpage in landscape/
-        // longtable) never sees the entry offset, and an unbroken box that
-        // fits at BOTH offsets renders identically
-        const items = block.galley?.items ?? [];
-        const th = this.geometry?.textheight ?? 0;
-        const boxH = (block.galley?.h ?? 0) + (block.galley?.d ?? 0);
-        if (
-          items[0]?.k === 'eject' ||
-          (!items.some((it) => it.k === 'eject') && boxH <= th - want && boxH <= th - have)
-        ) {
-          block.pageOffset = want;
-          continue;
-        }
-        block.pageOffset = want;
-        moved = true;
-        const from = this.#nearestCheckpoint(c);
-        await this.#retypesetChain(from, c, (j, changed) => {
-          typesetCount++;
-          if (changed && j >= c) dirtyBlocks.push(this.blocks[j].id);
-        });
-      }
-      if (!moved) break;
-    }
+    // breakable tcolorbox …) splits by its position ON the page. An edit
+    // near the top of the document moves EVERY later block's offset, so
+    // walking re-rescue chains here would be O(document) on the hot path
+    // (measured: 2 minutes for a one-character edit). Instead: update the
+    // offsets, queue the affected rescues, and let the async exact
+    // pipeline iterate to the fixed point — the stale galleys stay on
+    // screen meanwhile, and canonical guarantees the final pixels.
+    this.#queueMovedOffsets();
     t.lap('pagectx');
     this._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop };
     } catch (err) {
@@ -1561,9 +1676,14 @@ export class CheckpointEngine {
         this.preHash = null; // force a root reboot on the retry pass
         for (const peer of this.peers) peer.send('DIE\n');
         this.checkpoints.clear();
-        return this.#update({ editLabel, retry: true });
+        // direct inner call: we already hold the chain lock (re-entering
+        // #update would deadlock on it)
+        return this.#updateInner({ editLabel, retry: true });
       }
-      throw err;
+      // even the full rebuild failed: demote to opaque instead of erroring —
+      // the canonical layer keeps the document visible and editable
+      this.opaqueStickyPre = this.preHash;
+      return this.#opaqueUpdate(editLabel, t, [`structured typeset failed: ${err.message}`]);
     }
     const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop } = this._typesetResult;
 
@@ -1591,10 +1711,19 @@ export class CheckpointEngine {
     t.lap('schedule');
 
     this.rev++;
+    this.srcRev++;
+    // converge to exact: the canonical compile of THIS source is scheduled
+    // off the hot path; when it lands the client swaps every clean page to
+    // LuaLaTeX's own pixels
+    this.canonical.schedule(text, this.srcRev);
     return {
       rev: this.rev,
+      srcRev: this.srcRev,
       edit: editLabel,
       backend: this.backendName,
+      mode: this.mode,
+      modeReasons: this.modeReasons,
+      canonical: this.canonical.info(),
       dirtySourceNodes: [...dirtySource].map((id) => 'src-' + id),
       dirtySemanticNodes: dirtyBlocks.map((id) => 'blk-' + id),
       dirtyDependencies: depDirty,
@@ -1617,16 +1746,309 @@ export class CheckpointEngine {
         pageCount: pages.length,
         macrosChanged: [],
         labelsChanged: [...changedLabels],
+        verify: this.verifyState,
         diagnostics: [...diagnostics, ...this.diagnostics.splice(0)],
       },
     };
   }
 
+  // ------------------------------------------------- opaque document mode
+  //
+  // The document-granularity exact fallback: no structured typesetting, no
+  // JS page assembly — the display is the canonical LuaLaTeX pages, edits
+  // keep applying to the source and each one schedules a fresh canonical
+  // compile. Coarse-grained but unbreakable: anything lualatex compiles
+  // renders, and anything it rejects reports its real TeX error while the
+  // last good pages stay up.
+
+  #opaqueUpdate(editLabel, t, reasons) {
+    const text = this.store.get(this.file);
+    if (this.mode !== 'opaque') {
+      this.mode = 'opaque';
+      this.diagnostics.push(`structured layer demoted to opaque: ${reasons.join('; ')}`);
+      this.#teardownTree();
+    }
+    this.modeReasons = reasons;
+    t.lap('gate');
+    this.rev++;
+    this.srcRev++;
+    this.canonical.schedule(text, this.srcRev);
+    return {
+      rev: this.rev,
+      srcRev: this.srcRev,
+      edit: editLabel,
+      backend: this.backendName,
+      mode: this.mode,
+      modeReasons: this.modeReasons,
+      canonical: this.canonical.info(),
+      dirtySourceNodes: [],
+      dirtySemanticNodes: [],
+      dirtyDependencies: [],
+      dirtyLayoutNodes: [],
+      dirtyPages: [],
+      patches: [],
+      stats: {
+        ...t.done(),
+        blocksTotal: 0,
+        blocksTypeset: 0,
+        blocksReparsed: 0,
+        semanticCacheHits: 0,
+        layoutCacheHits: 0,
+        layoutCacheMisses: 0,
+        typesetMs: 0,
+        rebooted: false,
+        checkpoints: 0,
+        pagesReused: 0,
+        pagesRebuilt: 0,
+        pageCount: this.canonical.info().pageCount,
+        macrosChanged: [],
+        labelsChanged: [],
+        verify: null,
+        diagnostics: this.diagnostics.splice(0),
+      },
+    };
+  }
+
+  /** Free the resident process tree (opaque mode needs none of it). */
+  #teardownTree() {
+    for (const peer of this.peers) {
+      peer.send('DIE\n');
+      if (peer.pid) {
+        try { process.kill(peer.pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+    this.checkpoints.clear();
+    if (this.root) {
+      try { this.root.kill('SIGKILL'); } catch { /* gone */ }
+      this.root = null;
+    }
+    this.rescueQueue.clear();
+    for (const child of this.isoChildren) {
+      try { child.kill('SIGKILL'); } catch { /* gone */ }
+    }
+    this.preHash = null; // a later promotion must reboot from scratch
+    this.pages = [];
+  }
+
+  // ------------------------------------- canonical arrival + verification
+
+  #onCanonicalResult(info) {
+    try {
+      this.onCanonical?.(info);
+    } catch { /* observer errors are not ours */ }
+    if (info.error || process.env.TDOM_NO_VERIFY) return;
+    // verify only at convergence: the compile must be of the CURRENT source
+    if (this.mode !== 'structured' || info.rev !== this.srcRev) return;
+    this.#verifyAgainstCanonical(info).catch((err) => {
+      this.diagnostics.push('verification failed to run: ' + err.message);
+    });
+  }
+
+  /**
+   * Exactness verification (structured → opaque demotion): compare each
+   * provisional page's glyph text against the canonical PDF's text via
+   * token containment (latin words + CJK bigrams). A page whose provisional
+   * tokens are largely missing from the canonical page means the JS page
+   * assembly diverged from the real output routine there — its blocks are
+   * demoted to the isolated exact-render path (print-identical pixels) and
+   * stay demoted until their source changes. Conservative thresholds: this
+   * must never demote healthy pages en masse.
+   */
+  async #verifyAgainstCanonical(info) {
+    const texts = await this.canonical.pageTexts(info.id);
+    if (!texts) return; // pdftotext unavailable — canonical overlay still wins visually
+    if (this.srcRev !== info.rev || this.mode !== 'structured') return; // superseded meanwhile
+    const mismatches = [];
+    // Pagination drift (different page count, or content landing a page
+    // early/late) is NOT block-level wrongness: the canonical overlay
+    // already owns those pages visually, and demoting their blocks to the
+    // rescue path cannot fix an offset — it would only poison the editing
+    // hot path with full compiles. Demote only for genuine content
+    // divergence: same page count AND the page's text matches neither its
+    // own canonical page nor a ±1 neighbor.
+    const countsMatch = this.pages.length === info.pageCount;
+    if (!countsMatch) {
+      mismatches.push(`page count: provisional ${this.pages.length} vs LuaLaTeX ${info.pageCount}`);
+    }
+    const demote = new Set();
+    for (const page of this.pages) {
+      const provTokens = [];
+      for (const d of page.draw ?? []) {
+        for (const r of d.u?.ln?.runs ?? []) {
+          if (r.t) provTokens.push(...verifyTokens(r.t));
+        }
+      }
+      if (provTokens.length < 20) continue; // chunk/gfx pages carry exact pixels already
+      const n = page.number;
+      const c = tokenContainment(provTokens, verifyTokens(texts[n - 1] ?? ''));
+      if (c >= 0.8) continue;
+      const window = Math.max(
+        c,
+        tokenContainment(provTokens, verifyTokens(texts[n - 2] ?? '')),
+        tokenContainment(provTokens, verifyTokens(texts[n] ?? ''))
+      );
+      if (window >= 0.8) {
+        mismatches.push(`page ${n}: drifted (content found on a neighboring page)`);
+        continue;
+      }
+      mismatches.push(`page ${n}: ${Math.round(window * 100)}% of preview text found`);
+      // demote only on CONFIDENT divergence — the canonical overlay already
+      // guarantees the final pixels page-granularly, so a demotion buys
+      // exact provisional rendering at real hot-path cost; borderline
+      // scores (kerning artifacts, extraction quirks) are report-only
+      if (!countsMatch || window >= 0.5) continue;
+      for (const d of page.draw ?? []) {
+        const bid = d.u?.blockId;
+        if (bid) demote.add(bid);
+      }
+    }
+    this.verifyState = {
+      rev: info.rev,
+      canonicalId: info.id,
+      pagesChecked: Math.min(this.pages.length, info.pageCount),
+      mismatches,
+    };
+    if (demote.size) {
+      let demoted = 0;
+      for (const bid of demote) {
+        const block = this.blocks.find((b) => b.id === bid);
+        if (block && !block.rescued && this.poisoned.get(bid) !== fnv1a(block.text)) {
+          this.poisoned.set(bid, fnv1a(block.text));
+          demoted++;
+        }
+      }
+      if (demoted) {
+        this.diagnostics.push(
+          `verification demoted ${demoted} block(s) to exact rendering: ${mismatches.join('; ')}`
+        );
+      }
+    }
+  }
+
+  // ------------------------------------------ async exact-rescue pipeline
+  //
+  // Stale-first rescues land here: the isolated lualatex compile runs OFF
+  // the chain lock (concurrently with edits), and only the cheap adoption
+  // step — retypeset from the nearest checkpoint with the now-cached iso
+  // result, repaginate, patch over SSE — takes the lock. Superseded work
+  // (the block's inputs changed while compiling) is dropped; the newer
+  // queue entry carries the fresh inputs.
+
+  #pumpRescues() {
+    if (this.rescuePumping) return;
+    this.rescuePumping = true;
+    (async () => {
+      try {
+        while (this.rescueQueue.size) {
+          const [bid, key] = this.rescueQueue.entries().next().value;
+          this.rescueQueue.delete(bid);
+          try {
+            await this.#asyncRescueOne(bid, key);
+          } catch (err) {
+            this.diagnostics.push(`async rescue ${bid}: ${err.message}`);
+          }
+        }
+      } finally {
+        this.rescuePumping = false;
+      }
+    })();
+  }
+
+  async #asyncRescueOne(bid, key) {
+    if (this.mode !== 'structured') return;
+    // typing-burst quiescence: a keystroke inside/near a rescue block
+    // supersedes the previous compile anyway — wait for a short pause so
+    // bursts cost ONE compile instead of one per keystroke, and the
+    // resident fork jobs keep the CPU while the user is typing
+    while (Date.now() - (this.lastEditAt ?? 0) < 800) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    let idx = this.blocks.findIndex((b) => b.id === bid);
+    if (idx < 0) return;
+    let block = this.blocks[idx];
+    if (this.#rescueCacheKey(block, idx) !== key) return; // superseded
+    if (!this.isoCache.has(key)) {
+      const iso = await this.#isoCompile(block, idx, 'async exact rescue');
+      this.isoCache.set(key, iso);
+    }
+    const outcome = await this.#locked(async () => {
+      if (this.mode !== 'structured') return 'done';
+      idx = this.blocks.findIndex((b) => b.id === bid);
+      if (idx < 0) return 'done';
+      block = this.blocks[idx];
+      if (this.#rescueCacheKey(block, idx) !== key) return 'done'; // superseded
+      const before = block.galleyHash + '|' + block.stateVec;
+      // cache hit inside → the exact galley adopts in milliseconds; the
+      // chain continues to convergence exactly like a foreground edit,
+      // but YIELDS to an incoming edit and re-queues so the propagation
+      // resumes afterwards
+      const n = await this.#retypesetChain(
+        this.#nearestCheckpoint(idx),
+        idx,
+        () => {},
+        () => this.bgAbort
+      );
+      if (n < 0) return 'aborted';
+      for (const l of block.galley?.labels ?? []) {
+        if (l.v !== undefined) {
+          this.labelTable.set(l.k, l.v);
+          if (l.h != null) this.hrefTable.set(l.k, l.h);
+        }
+      }
+      if (before !== block.galleyHash + '|' + block.stateVec) this.#asyncRepaginate();
+      this.#queueMovedOffsets();
+      return 'done';
+    });
+    if (outcome === 'aborted') {
+      // resume after the edit that pre-empted us (waiting OUTSIDE the lock
+      // — the edit needs it); the queue entry revalidates on retry
+      this.rescueQueue.set(bid, key);
+      while (this.bgAbort) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    }
+  }
+
+  /**
+   * Async page-context fixpoint: after an exact rescue lands (or a
+   * foreground update repaginated with stale galleys), page offsets of
+   * splitting environments may have moved — queue their re-rescues. The
+   * same offset-independence shortcuts as the foreground pass apply.
+   */
+  #queueMovedOffsets() {
+    if (this.mode !== 'structured') return;
+    const prov = this.#paginateNow();
+    const entry = prov.blockEntry ?? new Map();
+    let queued = false;
+    for (let c = 0; c < this.blocks.length; c++) {
+      const block = this.blocks[c];
+      if (!block.rescued) continue;
+      const want = Math.round((entry.get(block.id) ?? 0) * 100) / 100;
+      const have = block.pageOffset ?? 0;
+      if (Math.abs(want - have) <= 0.05) continue;
+      const items = block.galley?.items ?? [];
+      const th = this.geometry?.textheight ?? 0;
+      const boxH = (block.galley?.h ?? 0) + (block.galley?.d ?? 0);
+      if (
+        items[0]?.k === 'eject' ||
+        (!items.some((it) => it.k === 'eject') && boxH <= th - want && boxH <= th - have)
+      ) {
+        block.pageOffset = want;
+        continue;
+      }
+      block.pageOffset = want;
+      this.rescueQueue.set(block.id, this.#rescueCacheKey(block, c));
+      queued = true;
+    }
+    if (queued) this.#pumpRescues();
+  }
+
   #scheduleBackground(fromIdx, dirtyBlocks) {
     // Chain restoration must finish before the next edit is applied (edits
     // await bgTask); graphics renders are fire-and-forget — an edit never
-    // waits on pdftocairo.
-    this.bgTask = (async () => {
+    // waits on pdftocairo. The task runs under the chain lock (it drives
+    // jobBlock) and is queued behind the update that created it.
+    this.bgTask = this.#locked(async () => {
       for (let j = fromIdx; j < this.blocks.length; j++) {
         if (this.bgAbort) return;
         if (this.checkpoints.has(j + 1)) continue;
@@ -1647,7 +2069,7 @@ export class CheckpointEngine {
           }
         }
       }
-    })();
+    });
     const renders = [];
     const fresh = (key, block) => {
       const c = this.chunks.get(key);
@@ -1673,7 +2095,7 @@ export class CheckpointEngine {
 
   async #renderBlock(block) {
     const idx = this.blocks.indexOf(block);
-    if (idx < 0) return;
+    if (idx < 0 || !block.galley) return; // superseded (reboot nulls galleys)
     if (this.pdfOpenedAtRoot) return this.#renderIsolated(block, idx);
     const ck = this.checkpoints.get(idx);
     if (!ck) return;
@@ -1749,7 +2171,29 @@ export class CheckpointEngine {
     return this.isoRenderQueue;
   }
 
+  /**
+   * Isolated renders are the LOWEST-priority work in the system: a full
+   * preamble compile (~minutes on package-heavy documents) per gfx block,
+   * purely to upgrade the provisional preview's block chunks. The canonical
+   * layer already guarantees exact final pixels, so these must never
+   * compete with typing (rescue queue), the canonical compile, or an edit
+   * burst — CPU saturation here slows the resident fork jobs by orders of
+   * magnitude.
+   */
+  async #renderIdleGate() {
+    for (;;) {
+      const busy =
+        this.rescueQueue.size > 0 ||
+        this.canonical.info().inFlight ||
+        Date.now() - (this.lastEditAt ?? 0) < 3000;
+      if (!busy) return;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
   async #renderIsolatedInner(block, idx) {
+    await this.#renderIdleGate();
+    if (!block.galley || !this.blocks.includes(block)) return; // superseded (reboot nulls galleys)
     const forGalley = block.galleyHash;
     const inflightKey = 'iso:' + block.id + ':' + forGalley;
     this.rendering ??= new Set();
@@ -1863,7 +2307,8 @@ export class CheckpointEngine {
       mkdirSync(jobdir, { recursive: true });
       rmSync(path.join(jobdir, 'iso.pdf'), { force: true });
       writeFileSync(path.join(jobdir, 'iso.tex'), L.join('\n') + '\n');
-      await execFileP('lualatex', ['-interaction=nonstopmode', 'iso.tex'], {
+      // lowest-priority CPU: see #isoCompile
+      await execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
         cwd: jobdir,
         timeout: 90_000,
       }).catch(() => {});

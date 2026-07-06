@@ -420,6 +420,42 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 }
 .page svg { display: block; width: 100%; height: auto; }
 .page .sheet { position: relative; width: 100%; overflow: hidden; }
+
+/* canonical layer: the exact LuaLaTeX render of this page. When fresh it
+   sits on top of (and hides) the provisional layers; pointer events pass
+   through so Alt+click source mapping keeps working. */
+.page img.canon { display: none; }
+.page.is-final img.canon {
+  display: block;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: #fff;
+  z-index: 5;
+  pointer-events: none;
+  user-select: none;
+}
+.page.is-final svg,
+.page.is-final .chunkwin,
+.page.is-final .folio { visibility: hidden; }
+.page.is-final .pageno::after {
+  content: " · exact";
+  color: var(--ok);
+}
+/* pages the fresh canonical says don't exist */
+.page.phantom { display: none; }
+
+/* document state badge (preview pane title) */
+#doc-state {
+  margin-left: 10px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 600;
+}
+#doc-state.state-exact { color: var(--ok); }
+#doc-state.state-preview { color: var(--accent-2); }
+#doc-state.state-error { color: var(--warn); }
 .chunkwin { position: absolute; overflow: hidden; cursor: pointer; }
 .chunkwin img.chunk { display: block; width: 100%; height: auto; user-select: none; }
 .folio {
