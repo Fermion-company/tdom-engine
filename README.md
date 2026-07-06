@@ -46,6 +46,17 @@ becomes the canonical LuaLaTeX pages themselves — still editable, still
 converging, never wrong. Unknown structure is not a failure mode; it is
 content rendered from LuaLaTeX's own output.
 
+A second, orthogonal **visual fidelity gate** (`fidelity.js`) protects the
+provisional layer's LOOKS: browser SVG text may only draw lines proven to
+match LuaLaTeX output (the actual TeX font file served, no math, no
+unencoded glyphs). Math lines, legacy CM / OpenType-math glyphs, and
+anything uncertain render as **high-fidelity chunks** instead — the edited
+block re-typeset by the resident checkpoint child, shipped as a tight PDF
+and swapped in as SVG within ~100–200ms, while the previous exact pixels
+hold the band ("a moment stale but clean" always beats "fast but wrong").
+Verified divergence and browser font-load failures demote regions
+per-block, sticky until their source changes.
+
 ## Quick start
 
 ```bash

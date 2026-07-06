@@ -51,6 +51,7 @@ import { buildPages, reconcile, parsePlacement } from './pagebuilder.js';
 import { mapLegacyFont, remapText } from './mathmap.js';
 import { CanonicalRenderer } from './canonical.js';
 import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
+import { classifyGalley, demoteFidelity, SAFE_GLYPH } from './fidelity.js';
 import { statSync, watch } from 'node:fs';
 
 const execFileP = promisify(execFile);
@@ -76,6 +77,13 @@ const BOOT_TIMEOUT = 60_000;
 // \pagegoal-\pagetotal (mdframed, framed, breakable tcolorbox)
 const OUTPUT_HIJACK_RE =
   /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded)\}|\\begin\{tcolorbox\}\[[^\]]*breakable/;
+// cheap "will want an exact preview chunk" scan for blocks with no fidelity
+// verdict yet (checkpoint render-hold heuristic — a miss only costs the
+// slower isolated render path)
+const MATHY_RE =
+  /\$|\\\[|\\\(|\\begin\{(equation|align|gather|multline|eqnarray|math|displaymath|tikzpicture)/;
+// how many off-grid checkpoints may stay alive awaiting their block's chunk
+const RENDER_HOLD_MAX = Number(process.env.TDOM_RENDER_HOLD_MAX || 8);
 
 export class CheckpointEngine {
   constructor({ workDir, docDir }) {
@@ -119,6 +127,7 @@ export class CheckpointEngine {
     this.hfPending = null; // spec signature of an in-flight header job
     this.initialStyle = 'plain'; // \pagestyle in effect at \begin{document}
     this.bgAbort = false;
+    this.bgActive = false; // a background pass holds the chain lock right now
     this.bgTask = Promise.resolve();
     this.onAsyncPatches = null; // callback(report-ish) for gfx swaps
     this.onExternalChange = null; // callback when an \input file changes
@@ -149,6 +158,20 @@ export class CheckpointEngine {
     this.rescueQueue = new Map(); // block.id -> cacheKey at queue time
     this.rescuePumping = false;
     this.isoChildren = new Set(); // in-flight isolated lualatex processes
+
+    // visual fidelity gate state (fidelity.js): verification demotions are
+    // sticky per (block, text) — a region caught diverging never uses the
+    // glyph layer again until its source changes
+    this.fidelityDemoted = new Map(); // block.id -> {hash, level:'exact'|'canonical'}
+    this.demotedFamilies = new Set(); // font family keys the browser failed to load
+    this.fidelityEpoch = 0; // bumped when font tiers change (busts unit sigs)
+    // high-fidelity chunk queue: latest-wins per block, LIFO across blocks
+    // (the block just edited gets its exact pixels first), small
+    // concurrency so an edit burst never forks a render storm
+    this.renderWant = new Map(); // block.id -> queue marker
+    this.renderPumping = 0;
+    this.renderTask = Promise.resolve();
+    this.renderHold = new Map(); // ckpt idx kept alive for a pending render -> block.id
   }
 
   /** Serialize access to the resident chain (jobBlock/currentJob users). */
@@ -263,14 +286,15 @@ export class CheckpointEngine {
       pageCount: this.pages.length,
       checkpoints: [...this.checkpoints.keys()].sort((a, b) => a - b),
       blocks: this.blocks.map((b, i) => {
-        const floatGfxChunks = (b.galley?.floats ?? []).filter((f) => f.gfx).map((f) => `${b.id}#${f.n}`);
-        const gfxChunks = [...(b.gfx ? [b.id] : []), ...floatGfxChunks];
+        const chunkKeys = this.#chunkTargets(b).map((t) => t.key);
         return {
           id: b.id,
           index: i,
           type: b.kind ?? 'block',
-          gfx: gfxChunks.length > 0,
-          gfxChunks,
+          gfx: chunkKeys.length > 0,
+          gfxChunks: chunkKeys,
+          fidelity: b.fidelity?.level ?? null,
+          exactLines: b.fidelity?.exactLines ?? 0,
           source: {
             file: this.file,
             start: this.store.position(this.file, b.start),
@@ -400,6 +424,10 @@ export class CheckpointEngine {
         if (this.currentJob && this.currentJob.galleyKey === 'galley:' + msg.id) {
           this.currentJob.pid = msg.pid;
         }
+        // render children announce the same way — remember the pid so a
+        // timed-out render (deep-lineage luahbtex spin) can be SIGKILLed
+        // instead of burning a core forever
+        if (this.renderPids?.has(msg.id)) this.renderPids.set(msg.id, msg.pid);
         break;
     }
   }
@@ -823,10 +851,12 @@ export class CheckpointEngine {
       try {
         return await this.#rescueBlock(idx, why);
       } catch (err) {
+        if (this.bgAbort) throw err; // an edit is waiting — no freeze jobs now
         this.diagnostics.push(`${block.id}: rescue failed (${err.message}) — freezing the block`);
         return this.#brokenBlockGalley(idx);
       }
     };
+    if (this.bgAbort) throw new Error('background pass aborted (edit waiting)');
     if (this.#needsRescue(block.text)) {
       return rescueSafely('output-routine environment needs a real page');
     }
@@ -847,6 +877,11 @@ export class CheckpointEngine {
       this.chainTimeouts = 0;
       return galley;
     } catch (err) {
+      // an edit is waiting on this background pass: fail the block WITHOUT
+      // poisoning it (its job may have been killed mid-flight, not broken)
+      // and without paying for rescue/state follow-up jobs — the next
+      // rebuild retries from scratch
+      if (this.bgAbort) throw err;
       this.poisoned.set(block.id, sig);
       const isTimeout = /timeout/.test(err.message);
       this.chainTimeouts = isTimeout ? (this.chainTimeouts ?? 0) + 1 : 0;
@@ -1382,11 +1417,40 @@ export class CheckpointEngine {
     const grid = this.#ckptGrid();
     if (grid <= 1 || idx === 0 || idx % grid === 0) return;
     if (!this.checkpoints.has(idx + 1)) return; // successor must exist first
+    // Render hold: the resident RENDER path needs the state AT the block,
+    // so a block that will want a high-fidelity chunk (math/gfx — typically
+    // the one being edited) keeps its checkpoint alive until the chunk
+    // lands. Small budget: a boot-time flood must not hold half the
+    // document's process tree — beyond it the isolated render path covers.
+    const block = this.blocks[idx];
+    if (
+      block &&
+      !this.renderHold.has(idx) &&
+      this.renderHold.size < RENDER_HOLD_MAX &&
+      this.#mayNeedRender(block)
+    ) {
+      this.renderHold.set(idx, block.id);
+      return;
+    }
     const peer = this.checkpoints.get(idx);
     if (peer) {
       peer.send('DIE\n');
       this.checkpoints.delete(idx);
     }
+  }
+
+  /** Will this block plausibly want an exact preview chunk? Known from its
+   * last fidelity verdict; brand-new blocks get a cheap math/gfx scan. */
+  #mayNeedRender(block) {
+    if (block.fidelity) return !!block.needsRender;
+    return MATHY_RE.test(block.text);
+  }
+
+  /** A held checkpoint has served its render (or the hold went stale):
+   * resume normal grid retirement. */
+  #releaseRenderHold(idx) {
+    if (!this.renderHold.delete(idx)) return;
+    this.#retireOffGrid(idx);
   }
 
   #nearestCheckpoint(idx) {
@@ -1506,10 +1570,11 @@ export class CheckpointEngine {
       galley.state?.['tdom@ls'] ?? 0,
     ]);
     block.gfx = !!galley.gfx;
-    // rescued blocks already carry their print-identical chunks — the
-    // resident RENDER path (dormant-page reship) must not overwrite them
-    block.needsRender =
-      !block.rescued && (block.gfx || (galley.floats ?? []).some((f) => f.gfx));
+    // fonts must be registered BEFORE the fidelity gate reads their tiers
+    for (const [fid, meta] of Object.entries(galley.fonts ?? {})) {
+      this.#registerFont(Number(fid), meta);
+    }
+    this.#applyFidelity(block, galley);
     block.consumesToc = /\\(tableofcontents|listoffigures|listoftables)\b/.test(block.text);
     block.kind = HEADING_RE.test(block.text)
       ? 'heading'
@@ -1517,31 +1582,88 @@ export class CheckpointEngine {
         ? 'graphics'
         : 'paragraph';
     block.units = null;
-    for (const [fid, meta] of Object.entries(galley.fonts ?? {})) {
-      this.#registerFont(Number(fid), meta);
+  }
+
+  /**
+   * Visual fidelity gate, applied per adopted galley: classify every line
+   * (safe-glyph vs exact-preview-required), merge any sticky verification
+   * demotion, and derive whether the block needs a high-fidelity chunk.
+   * Rescued blocks already carry print-identical chunks — the resident
+   * RENDER path (dormant-page reship) must not overwrite them.
+   */
+  #applyFidelity(block, galley) {
+    let fid = classifyGalley(galley, this.fonts);
+    const dem = this.fidelityDemoted.get(block.id);
+    if (dem && dem.hash === fnv1a(block.text)) {
+      fid = demoteFidelity(fid, dem.level);
     }
+    block.fidelity = fid;
+    block.needsRender = !block.rescued && !fid.canonicalOnly && fid.exact;
+    block.units = null;
   }
 
   #registerFont(fid, meta) {
     if (this.fonts.has(fid)) return;
     const base = path.basename(meta.file || meta.name || '');
-    const legacy = !/\.(otf|ttf)$/i.test(base) ? mapLegacyFont(meta.name) : null;
+    const browserLoadable = /\.(otf|ttf)$/i.test(base);
+    const legacy = !browserLoadable ? mapLegacyFont(meta.name) : null;
+    // delivery tier (fidelity gate input): only the ACTUAL TeX font file,
+    // present on disk and browser-loadable, is 'native'. Legacy fonts with
+    // a Latin Modern twin are 'twin' (a substitution — never exact); every
+    // other case (pfb without a twin, missing file) is 'none': the glyph
+    // layer must not fake those at all.
     let familyKey;
+    let tier;
     if (legacy) {
       familyKey = 'twin-' + legacy.twin;
       if (!this.fontFiles.has(familyKey)) {
         this.fontFiles.set(familyKey, resolveFont(legacy.twin));
       }
-    } else {
+      const twinPath = this.fontFiles.get(familyKey);
+      tier = twinPath && existsSync(twinPath) ? 'twin' : 'none';
+    } else if (browserLoadable && meta.file && existsSync(meta.file)) {
       familyKey = 'f-' + fnv1a(meta.file);
       if (!this.fontFiles.has(familyKey)) this.fontFiles.set(familyKey, meta.file);
+      tier = 'native';
+    } else {
+      familyKey = 'f-' + fnv1a(meta.file || meta.name || String(fid));
+      tier = 'none';
     }
+    if (this.demotedFamilies.has(familyKey)) tier = 'none';
     this.fonts.set(fid, {
       ...meta,
       family: familyKey,
       remap: legacy?.map ?? null,
       omx: !!legacy?.omx,
+      tier,
     });
+  }
+
+  /**
+   * The browser reported it cannot load a served font family (@font-face
+   * failure). Everything drawn with it would silently fall back to a
+   * default browser font — exactly the display this engine exists to
+   * prevent. Demote the family to tier 'none': lines using it become
+   * exact-preview-required with no glyph bridge.
+   */
+  demoteFontFamily(familyKey) {
+    if (!familyKey || this.demotedFamilies.has(familyKey)) return false;
+    this.demotedFamilies.add(familyKey);
+    let touched = false;
+    for (const meta of this.fonts.values()) {
+      if (meta.family === familyKey && meta.tier !== 'none') {
+        meta.tier = 'none';
+        touched = true;
+      }
+    }
+    if (!touched) return false;
+    this.diagnostics.push(`fidelity gate: font ${familyKey} failed in the browser — demoted to exact preview`);
+    this.fidelityEpoch++;
+    for (const block of this.blocks) {
+      if (block.galley) this.#applyFidelity(block, block.galley);
+    }
+    this.#asyncRepaginate();
+    return true;
   }
 
   // ------------------------------------------------------------- update
@@ -1551,8 +1673,20 @@ export class CheckpointEngine {
     // Stop the in-flight background chain rebuild BEFORE taking the chain
     // lock (it holds the lock while running; aborting it first avoids a
     // lock-order deadlock). With stale-first rescues the background task
-    // never blocks on an isolated compile, so this wait is milliseconds.
+    // never blocks on an isolated compile, so this wait is milliseconds —
+    // EXCEPT in a deep-lineage luatexja wall, where the current in-chain
+    // job can spin to its 12s timeout (and its rescue's state jobs after
+    // it: up to ~36s before the loop re-checks the flag). The flag alone
+    // is not an abort there: kill the in-flight background job outright
+    // (#typesetBlock sees bgAbort and neither poisons the block nor runs
+    // its follow-up jobs — the next rebuild simply retries it).
     this.bgAbort = true;
+    if (this.bgActive) {
+      const pid = this.currentJob?.pid;
+      if (pid) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
     await this.bgTask.catch(() => {});
     return this.#locked(async () => {
       // serialize async header-job arrivals against updates: an hf apply
@@ -1564,6 +1698,7 @@ export class CheckpointEngine {
         return await this.#updateInner(args);
       } finally {
         this.updating = false;
+        this.progress = null; // /status liveness marker
       }
     });
   }
@@ -1609,6 +1744,7 @@ export class CheckpointEngine {
       // the daemon cannot boot (unknown packages breaking the driver shims,
       // TeX errors before \begin{document} …) is not an error state: the
       // document demotes to opaque and the canonical layer keeps rendering.
+      this.progress = { phase: 'boot' }; // /status: preamble reload running
       try {
         await this.#bootRoot();
       } catch (err) {
@@ -1677,6 +1813,9 @@ export class CheckpointEngine {
 
     let i = this.#nearestCheckpoint(Math.min(firstDirty, this.blocks.length));
     while (i < this.blocks.length) {
+      // /status liveness marker: which block the foreground pass is on —
+      // a 2-minute rebuild shows movement instead of silence
+      this.progress = { phase: 'typeset', at: i + 1, total: this.blocks.length };
       const block = this.blocks[i];
       const before = { hash: block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
       const t0 = performance.now();
@@ -1879,8 +2018,33 @@ export class CheckpointEngine {
         macrosChanged: [],
         labelsChanged: [...changedLabels],
         verify: this.verifyState,
+        fidelity: this.#fidelitySummary(),
         diagnostics: [...diagnostics, ...this.diagnostics.splice(0)],
       },
+    };
+  }
+
+  /** Inspector counters for the visual fidelity gate. */
+  #fidelitySummary() {
+    let safe = 0;
+    let exact = 0;
+    let canonicalOnly = 0;
+    let exactLines = 0;
+    for (const b of this.blocks) {
+      const f = b.fidelity;
+      if (!f || f.level === SAFE_GLYPH) safe++;
+      else if (f.canonicalOnly) canonicalOnly++;
+      else exact++;
+      exactLines += f?.exactLines ?? 0;
+    }
+    return {
+      safeBlocks: safe,
+      exactBlocks: exact,
+      canonicalOnlyBlocks: canonicalOnly,
+      exactLines,
+      demoted: this.fidelityDemoted.size,
+      demotedFonts: [...this.demotedFamilies],
+      pendingRenders: this.renderWant.size,
     };
   }
 
@@ -1955,6 +2119,8 @@ export class CheckpointEngine {
       this.root = null;
     }
     this.rescueQueue.clear();
+    this.renderWant.clear();
+    this.renderHold.clear();
     for (const child of this.isoChildren) {
       try { child.kill('SIGKILL'); } catch { /* gone */ }
     }
@@ -1972,9 +2138,86 @@ export class CheckpointEngine {
     if (info.error || process.env.TDOM_NO_VERIFY) return;
     // verify only at convergence: the compile must be of the CURRENT source
     if (this.mode !== 'structured' || info.rev !== this.srcRev) return;
-    this.#verifyAgainstCanonical(info).catch((err) => {
-      this.diagnostics.push('verification failed to run: ' + err.message);
-    });
+    this.#verifyAgainstCanonical(info)
+      .catch((err) => {
+        this.diagnostics.push('verification failed to run: ' + err.message);
+      })
+      .then(() => this.#cropCanonicalChunks(info))
+      .catch((err) => {
+        this.diagnostics.push('canonical crop failed: ' + err.message);
+      });
+  }
+
+  /**
+   * Canonical-crop chunk source (the cheapest exact pixels in the system):
+   * when a fresh canonical compile matches the current source, every block
+   * whose exact preview chunk is missing/stale gets it cropped straight out
+   * of the canonical page SVG. No compile at all: the pixels are the ones
+   * the overlay already shows, but registering them as chunks means the
+   * NEXT edit to that block holds a clean stale-exact band instead of
+   * bridge glyphs. This is the ONLY bulk chunk source — the resident
+   * RENDER pump serves just-edited blocks only (a whole-document RENDER
+   * sweep spins on deep-lineage luatexja and starves the fork jobs), and
+   * the isolated queue serves what drift keeps this pass from reaching.
+   */
+  async #cropCanonicalChunks(info) {
+    if (this.mode !== 'structured' || this.srcRev !== info.rev) return;
+    // pagination drift means provisional coordinates cannot address the
+    // canonical pages — never crop pixels from the wrong page
+    if (this.pages.length !== info.pageCount) return;
+    const geo = this.geometry;
+    if (!geo) return;
+    const T = 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
+    const L = 72 + (geo.oddsidemargin ?? 0);
+    // block -> its vertical band, only when the block sits on ONE page
+    // (page-spanning galleys cannot be one chunk box)
+    const bands = new Map();
+    for (const page of this.pages) {
+      for (const d of page.draw ?? []) {
+        const bid = d.u?.blockId;
+        if (!bid) continue;
+        const top = T + d.y - (d.u.ln?.boxH ?? d.u.h ?? 0);
+        const cur = bands.get(bid);
+        if (!cur) bands.set(bid, { page: page.number, top });
+        else if (cur.page !== page.number) cur.split = true;
+        else cur.top = Math.min(cur.top, top);
+      }
+    }
+    let budget = Number(process.env.TDOM_CANON_CROP_MAX || 40);
+    let changed = false;
+    for (const block of this.blocks) {
+      if (budget <= 0) break;
+      if (!block.needsRender || !block.galley) continue;
+      const bc = this.chunks.get(block.id);
+      if (bc && bc.forGalley === block.galleyHash) continue; // fresh already
+      if (this.renderWant.has(block.id)) continue; // a hot render is coming
+      const band = bands.get(block.id);
+      if (!band || band.split) continue;
+      // chunk coordinates start at the galley TOP (leading glue included in
+      // the shipped vpack) — rewind the first drawn box by the leading skips
+      let lead = 0;
+      for (const it of block.galley.items ?? []) {
+        if (it.k === 'box') break;
+        if (it.k === 'glue' || it.k === 'kern') lead += it.a ?? 0;
+      }
+      const h = block.galley.h + block.galley.d;
+      const w = block.galley.w;
+      if (!(h > 0) || !(w > 0)) continue;
+      const pageSvg = await this.canonical.pageSVG(band.page, info.id).catch(() => null);
+      if (!pageSvg) continue;
+      if (this.srcRev !== info.rev) return; // superseded mid-pass
+      const prev = this.chunks.get(block.id);
+      this.chunks.set(block.id, {
+        svg: cropSvgAt(pageSvg, L, band.top - lead, w, h),
+        wBp: w,
+        hBp: h,
+        v: (prev?.v ?? 0) + 1,
+        forGalley: block.galleyHash,
+      });
+      budget--;
+      changed = true;
+    }
+    if (changed) this.#asyncRepaginate();
   }
 
   /**
@@ -2043,12 +2286,31 @@ export class CheckpointEngine {
     };
     if (demote.size) {
       let demoted = 0;
+      let refidelity = false;
       for (const bid of demote) {
         const block = this.blocks.find((b) => b.id === bid);
-        if (block && !block.rescued && this.poisoned.get(bid) !== fnv1a(block.text)) {
-          this.poisoned.set(bid, fnv1a(block.text));
+        if (!block) continue;
+        const hash = fnv1a(block.text);
+        // fidelity-gate demotion, sticky until the block's source changes:
+        // glyph divergence costs the block its glyph privileges (exact
+        // preview chunks only, no bridge); divergence while it ALREADY
+        // showed exact pixels means the placement itself is wrong — stop
+        // trusting the provisional layer there entirely (canonical-only)
+        const level = block.rescued || block.fidelity?.blockExact ? 'canonical' : 'exact';
+        const prev = this.fidelityDemoted.get(bid);
+        if (!prev || prev.hash !== hash || (prev.level !== level && level === 'canonical')) {
+          this.fidelityDemoted.set(bid, { hash, level });
+          if (block.galley) this.#applyFidelity(block, block.galley);
+          refidelity = true;
+        }
+        if (!block.rescued && this.poisoned.get(bid) !== hash) {
+          this.poisoned.set(bid, hash);
           demoted++;
         }
+      }
+      if (refidelity) {
+        this.fidelityEpoch++;
+        this.#asyncRepaginate();
       }
       if (demoted) {
         this.diagnostics.push(
@@ -2114,14 +2376,26 @@ export class CheckpointEngine {
       // cache hit inside → the exact galley adopts in milliseconds; the
       // chain continues to convergence exactly like a foreground edit,
       // but YIELDS to an incoming edit and re-queues so the propagation
-      // resumes afterwards
-      const n = await this.#retypesetChain(
-        this.#nearestCheckpoint(idx),
-        idx,
-        () => {},
-        () => this.bgAbort
-      );
-      if (n < 0) return 'aborted';
+      // resumes afterwards. bgActive lets the edit KILL the in-flight
+      // job instead of waiting out a deep-lineage spin (#update).
+      this.bgActive = true;
+      let n;
+      try {
+        n = await this.#retypesetChain(
+          this.#nearestCheckpoint(idx),
+          idx,
+          () => {},
+          () => this.bgAbort
+        );
+      } catch (err) {
+        if (this.bgAbort) return 'aborted';
+        throw err;
+      } finally {
+        this.bgActive = false;
+      }
+      // retypesetChain swallows a killed job into an early break — treat
+      // any abort-flagged pass as pre-empted so the queue entry retries
+      if (n < 0 || this.bgAbort) return 'aborted';
       for (const l of block.galley?.labels ?? []) {
         if (l.v !== undefined) {
           this.labelTable.set(l.k, l.v);
@@ -2182,6 +2456,8 @@ export class CheckpointEngine {
     // waits on pdftocairo. The task runs under the chain lock (it drives
     // jobBlock) and is queued behind the update that created it.
     this.bgTask = this.#locked(async () => {
+      this.bgActive = true;
+      try {
       for (let j = fromIdx; j < this.blocks.length; j++) {
         if (this.bgAbort) return;
         if (this.checkpoints.has(j + 1)) continue;
@@ -2193,48 +2469,177 @@ export class CheckpointEngine {
         if (block.galleyHash !== before) {
           // late-discovered change (rare): patch through the async channel
           this.#asyncRepaginate();
-          if (block.needsRender) {
-            this.renderTask = (this.renderTask ?? Promise.resolve()).then(() =>
-              this.#renderBlock(block).catch((err) => {
-                this.diagnostics.push(`render ${block.id}: ${err.message}`);
-              })
-            );
-          }
+          if (block.needsRender) this.#queueRender(block.id);
         }
       }
+      } finally {
+        this.bgActive = false;
+      }
     });
-    const renders = [];
-    const fresh = (key, block) => {
-      const c = this.chunks.get(key);
-      return !!c && c.forGalley === block.galleyHash;
-    };
-    for (const block of this.blocks) {
-      const missingChunk =
-        (block.gfx && !fresh(block.id, block)) ||
-        (block.galley?.floats ?? []).some((f) => f.gfx && !fresh(block.id + '#' + f.n, block));
-      if (block.needsRender && (dirtyBlocks.includes(block.id) || missingChunk)) {
-        renders.push(
-          this.bgTask
-            .then(() => this.#renderBlock(block))
-            .catch((err) => {
-              this.diagnostics.push(`render ${block.id}: ${err.message}`);
-            })
-        );
+    // High-fidelity chunk renders go to the pump ONLY for the blocks this
+    // edit touched: their checkpoint is warm (render hold) and the RENDER
+    // round is ~100–200ms. COLD blocks (boot backlog, far-away staleness)
+    // are deliberately NOT queued — on deep-lineage luatexja documents a
+    // resident RENDER there spins to its timeout, and a whole-document
+    // sweep would storm the CPU that the fork jobs need. Their exact
+    // pixels arrive for free from the canonical-crop pass instead (and,
+    // for drifting documents, from the idle-gated isolated queue). A boot
+    // or huge paste of a LONG document dirties everything — that is the
+    // cold case: cap it. Small documents render their whole set at boot
+    // (a few seconds, and the referee tools rely on it).
+    const hot = dirtyBlocks.length <= Number(process.env.TDOM_RENDER_HOT_MAX || 64) ? dirtyBlocks : [];
+    for (const id of hot) {
+      const block = this.blocks.find((b) => b.id === id);
+      if (!block?.needsRender) continue;
+      const stale = this.#chunkTargets(block).some(
+        (t) => this.chunks.get(t.key)?.forGalley !== block.galleyHash
+      );
+      if (stale) this.#queueRender(id);
+    }
+    // stale render holds: the held block moved/changed under its index, or
+    // its chunks are already fresh — resume normal grid retirement
+    for (const [idx, id] of [...this.renderHold]) {
+      const b = this.blocks[idx];
+      const freshAll =
+        b && !this.#chunkTargets(b).some((t) => this.chunks.get(t.key)?.forGalley !== b.galleyHash);
+      if (!b || b.id !== id || freshAll) {
+        this.renderHold.delete(idx);
+        this.#retireOffGrid(idx);
       }
     }
-    // exposed so tools/tests can wait for the exact-render tier to settle
-    this.renderTask = Promise.all(renders).then(() => {});
   }
 
-  async #renderBlock(block) {
+  /**
+   * Chunk pages the RENDER protocol ships for one block: page 1 = the
+   * galley (needed when ANY line requires exact pixels), 2..1+F = float
+   * boxes in order, 2+F..1+F+N = footnote insert bodies in order — the
+   * same page map the daemon's tdom_ship/tdom_ship_floats produce.
+   * Rescued blocks carry their own print-identical chunks and never
+   * appear here (needsRender is false).
+   */
+  #chunkTargets(block) {
+    const galley = block.galley;
+    if (!galley) return [];
+    const fid = block.fidelity;
+    const targets = [];
+    if (block.gfx || fid?.blockExact || (fid?.exactLines ?? 0) > 0) {
+      targets.push({ key: block.id, page: 1, w: galley.w, h: galley.h + galley.d });
+    }
+    const floats = galley.floats ?? [];
+    floats.forEach((f, i) => {
+      if (f.gfx || fid?.floats?.get(f.n)?.exact) {
+        targets.push({ key: block.id + '#' + f.n, page: 2 + i, w: f.w, h: (f.h ?? 0) + (f.d ?? 0) });
+      }
+    });
+    let k = 0;
+    for (const it of galley.items ?? []) {
+      if (it.k !== 'ins') continue;
+      if (fid?.ins?.get(k)?.exact) {
+        let w = 0;
+        for (const sub of it.items ?? []) {
+          if (sub.k === 'box' && (sub.w ?? 0) > w) w = sub.w;
+        }
+        targets.push({
+          key: `${block.id}@fn${k}`,
+          page: 2 + floats.length + k,
+          w: w || galley.w || 1,
+          h: it.hc ?? (it.h ?? 0) + (it.d ?? 0),
+        });
+      }
+      k++;
+    }
+    return targets;
+  }
+
+  /**
+   * High-fidelity chunk scheduler. Latest-wins per block (a superseded
+   * galley is never rendered — #renderBlock reads the block's CURRENT
+   * hash), newest-queued block first (the one being edited), bounded
+   * concurrency (an edit burst or a math-heavy boot must not fork a
+   * lualatex/pdftocairo storm — CPU saturation slows the resident fork
+   * jobs by orders of magnitude), paused while a foreground update runs.
+   */
+  #queueRender(blockId) {
+    this.renderWant.delete(blockId); // re-insertion moves it to the back = newest
+    this.renderWant.set(blockId, true);
+    this.#pumpRenders();
+  }
+
+  #pumpRenders() {
+    const MAX = Number(process.env.TDOM_RENDER_CONCURRENCY || 2);
+    if (this.renderPumping >= MAX) return;
+    this.renderPumping++;
+    const drain = (async () => {
+      try {
+        while (this.renderWant.size) {
+          if (this.updating) {
+            await new Promise((r) => setTimeout(r, 25));
+            continue;
+          }
+          const id = [...this.renderWant.keys()].pop(); // newest first
+          this.renderWant.delete(id);
+          const block = this.blocks.find((b) => b.id === id);
+          if (!block || !block.galley || !block.needsRender) continue;
+          await this.#renderBlock(block).catch((err) => {
+            this.diagnostics.push(`render ${id}: ${err.message}`);
+          });
+        }
+      } finally {
+        this.renderPumping--;
+      }
+    })();
+    // exposed so tools/tests can wait for the exact-render tier to settle
+    this.renderTask = Promise.all([this.renderTask.catch(() => {}), drain]).then(() => {});
+  }
+
+  #renderBlock(block) {
+    // per-block serialization: the RENDER protocol's reply key is the block
+    // id, so two in-flight renders of the same block (different galleys, two
+    // pump lanes) would collide in the waiter table
+    this.renderLocks ??= new Map();
+    const prev = this.renderLocks.get(block.id) ?? Promise.resolve();
+    const run = prev.then(() => this.#renderBlockInner(block));
+    this.renderLocks.set(
+      block.id,
+      run.catch(() => {})
+    );
+    return run;
+  }
+
+  async #renderBlockInner(block) {
     const idx = this.blocks.indexOf(block);
     if (idx < 0 || !block.galley) return; // superseded (reboot nulls galleys)
-    if (this.pdfOpenedAtRoot) return this.#renderIsolated(block, idx);
-    const ck = this.checkpoints.get(idx);
-    if (!ck) return;
     // one render per (block, content); stale results are discarded so a
     // fast typist never sees an outdated exact image over live glyphs
     const forGalley = block.galleyHash;
+    // only the pages whose chunks are missing/stale — a fresh set is free
+    const targets = this.#chunkTargets(block).filter(
+      (t) => this.chunks.get(t.key)?.forGalley !== forGalley
+    );
+    if (!targets.length) {
+      this.#releaseRenderHold(idx);
+      return;
+    }
+    if (this.pdfOpenedAtRoot) {
+      // resident children share hyperref's open PDF fd and cannot ship.
+      // Fire-and-forget into the idle-gated isolated queue — it must NOT
+      // occupy a pump lane (its gate can stay closed for minutes while
+      // rescues/canonical churn, and each compile is minutes on
+      // package-heavy documents). Meanwhile the canonical-crop pass
+      // (#cropCanonicalChunks) supplies exact pixels for these blocks.
+      this.#renderIsolated(block, idx);
+      return;
+    }
+    const ck = this.checkpoints.get(idx);
+    if (!ck) {
+      // checkpoint retired off the grid (long documents keep ~64): the
+      // resident RENDER path needs the state AT this block, so fall back to
+      // the isolated render. Fire-and-forget — its queue is idle-gated and
+      // self-serialized, and it must never occupy a pump lane (the lane has
+      // to stay free for the fast resident renders of just-edited blocks).
+      this.#renderIsolated(block, idx);
+      return;
+    }
     const inflightKey = block.id + ':' + forGalley;
     this.rendering ??= new Set();
     if (this.rendering.has(inflightKey)) return;
@@ -2245,24 +2650,39 @@ export class CheckpointEngine {
     rmSync(path.join(jobdir, 'driver.pdf'), { force: true });
     const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
     const body = Buffer.from(block.text + guard, 'utf8');
-    const done = this.#await('render:' + block.id, 60_000);
+    // renders are latency work, not correctness work (canonical always
+    // wins): give up quickly on a spinning child rather than parking a
+    // pump lane on it
+    this.renderPids ??= new Map();
+    this.renderPids.set(block.id, 0); // armed: FORKED will fill the pid
+    const done = this.#await('render:' + block.id, Number(process.env.TDOM_RENDER_TIMEOUT || 20_000));
     ck.send(`RENDER ${block.id} ${jobdir} ${body.length}\n`);
     ck.sendRaw(body);
-    await done;
+    try {
+      await done;
+    } catch (err) {
+      if (/timeout/.test(String(err?.message))) {
+        // deep-lineage luatexja wall: the forked render child spins in
+        // luahbtex exactly like in-chain jobs do. Kill it (it never reads
+        // its socket again) and let the canonical-crop pass supply the
+        // exact pixels instead.
+        const pid = this.renderPids.get(block.id);
+        if (pid) {
+          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        }
+        // exact pixels still arrive two ways: the canonical-crop pass, or
+        // (for drifting documents it cannot serve) the idle-gated isolated
+        // queue — a fresh process typesets wall blocks at normal speed
+        this.#renderIsolated(block, idx);
+      }
+      throw err;
+    } finally {
+      this.renderPids.delete(block.id);
+    }
     const pdf = path.join(jobdir, 'driver.pdf');
     // DONE fires from finish_pdffile, but the child's stdio buffers reach
     // the disk only on _exit — wait until the file is complete (%%EOF)
     await waitForPdf(pdf);
-    // page 1 = the block galley; pages 2..N = its float boxes in order
-    const targets = [];
-    if (block.gfx) {
-      targets.push({ key: block.id, page: 1, w: block.galley.w, h: block.galley.h + block.galley.d });
-    }
-    (block.galley.floats ?? []).forEach((f, i) => {
-      if (f.gfx) {
-        targets.push({ key: block.id + '#' + f.n, page: 2 + i, w: f.w, h: (f.h ?? 0) + (f.d ?? 0) });
-      }
-    });
     for (const tgt of targets) {
       const svgPath = path.join(jobdir, `chunk-${tgt.page}.svg`);
       await execFileP(
@@ -2283,6 +2703,13 @@ export class CheckpointEngine {
     if (block.galleyHash === forGalley) this.#asyncRepaginate();
     } finally {
       this.rendering.delete(inflightKey);
+      // fresh chunks (or a superseding edit) end the checkpoint's reprieve
+      if (
+        this.blocks[idx] !== block ||
+        !this.#chunkTargets(block).some((t) => this.chunks.get(t.key)?.forGalley !== block.galleyHash)
+      ) {
+        this.#releaseRenderHold(idx);
+      }
     }
   }
 
@@ -2328,6 +2755,11 @@ export class CheckpointEngine {
     await this.#renderIdleGate();
     if (!block.galley || !this.blocks.includes(block)) return; // superseded (reboot nulls galleys)
     const forGalley = block.galleyHash;
+    // a full-preamble compile is minutes on package-heavy documents: never
+    // pay it when every chunk is already fresh (idle-gate wait races)
+    if (!this.#chunkTargets(block).some((t) => this.chunks.get(t.key)?.forGalley !== forGalley)) {
+      return;
+    }
     const inflightKey = 'iso:' + block.id + ':' + forGalley;
     this.rendering ??= new Set();
     if (this.rendering.has(inflightKey)) return;
@@ -2366,18 +2798,27 @@ export class CheckpointEngine {
       // characters (see #isoCompile); TeX tokens are built via string.char
       L.push('\\newbox\\TDOMisofbox');
       L.push('\\directlua{tdom_iso_fbox=\\number\\TDOMisofbox tdom_iso_floats={} tdom_iso_nf=0 ' +
+        'tdom_iso_feet={} tdom_iso_nfeet=0 ' +
         'function tdom_iso_float() local b = tex.box[tdom_iso_fbox] ' +
         'if b then tdom_iso_nf = tdom_iso_nf + 1 tdom_iso_floats[tdom_iso_nf] = node.copy_list(b) end end ' +
-        'function tdom_iso_load_float(i) local b = tdom_iso_floats[i] ' +
-        'if not b then return end tdom_iso_floats[i] = false ' +
+        'function tdom_iso_load_box(b) ' +
         'tex.box[255] = b ' +
         'tex.pagewidth = math.max(b.width or 0, 65536) ' +
         'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536) end ' +
+        'function tdom_iso_load_float(i) local b = tdom_iso_floats[i] ' +
+        'if not b then return end tdom_iso_floats[i] = false tdom_iso_load_box(b) end ' +
+        'function tdom_iso_load_foot(i) local b = tdom_iso_feet[i] ' +
+        'if not b then return end tdom_iso_feet[i] = false tdom_iso_load_box(b) end ' +
+        // page map matches the resident RENDER path: galley, floats,
+        // then footnote insert bodies
         'function tdom_iso_ship_floats() ' +
         'local BS = string.char(92) ' +
         'local lines = {} ' +
         'for i = 1, tdom_iso_nf do ' +
         "table.insert(lines, BS .. 'directlua{tdom_iso_load_float(' .. i .. ')}') " +
+        "table.insert(lines, BS .. 'shipout' .. BS .. 'box255') end " +
+        'for i = 1, tdom_iso_nfeet do ' +
+        "table.insert(lines, BS .. 'directlua{tdom_iso_load_foot(' .. i .. ')}') " +
         "table.insert(lines, BS .. 'shipout' .. BS .. 'box255') end " +
         'if lines[1] then tex.print(lines) end end}');
       L.push('\\def\\TDOMHplacement{H}');
@@ -2425,7 +2866,13 @@ export class CheckpointEngine {
           'if ismark then break end end ' +
           'local out, tail = nil, nil local n = head ' +
           'while n do local nxt = n.next n.next = nil n.prev = nil ' +
-          'if n.id == INS then node.free(n) else if tail then tail.next = n n.prev = tail else out = n end tail = n end n = nxt end ' +
+          // footnote bodies ship as their own pages after the floats (kept
+          // even when empty so page indices stay aligned with the galley's
+          // ins items)
+          'if n.id == INS then local c = n.head or n.list ' +
+          'local b if c then b = node.vpack(node.copy_list(c)) else b = node.new("hlist") end ' +
+          'tdom_iso_nfeet = tdom_iso_nfeet + 1 tdom_iso_feet[tdom_iso_nfeet] = b ' +
+          'node.free(n) else if tail then tail.next = n n.prev = tail else out = n end tail = n end n = nxt end ' +
           // page 1 must ALWAYS exist (floats follow at 2..N): an empty
           // galley (float-only block) would make \shipout void = no page
           // and shift every float's page index
@@ -2448,22 +2895,10 @@ export class CheckpointEngine {
       const pdf = path.join(jobdir, 'iso.pdf');
       if (!existsSync(pdf)) throw new Error('isolated render produced no PDF');
       await waitForPdf(pdf); // %%EOF flushed before pdftocairo reads it
-      // page 1 = the block galley; pages 2..N = its float boxes in order —
-      // the same convention as the resident RENDER path
-      const targets = [];
-      if (block.gfx) {
-        targets.push({
-          key: block.id,
-          page: 1,
-          w: block.galley.w,
-          h: block.galley.h + block.galley.d,
-        });
-      }
-      (block.galley.floats ?? []).forEach((f, i) => {
-        if (f.gfx) {
-          targets.push({ key: block.id + '#' + f.n, page: 2 + i, w: f.w, h: (f.h ?? 0) + (f.d ?? 0) });
-        }
-      });
+      // same page map as the resident RENDER path: galley, floats, feet
+      const targets = this.#chunkTargets(block).filter(
+        (t) => this.chunks.get(t.key)?.forGalley !== forGalley
+      );
       for (const tgt of targets) {
         const svgPath = path.join(jobdir, `iso-${tgt.page}.svg`);
         await execFileP(
@@ -2566,17 +3001,23 @@ export class CheckpointEngine {
 
   #rebuildUnits() {
     for (const block of this.blocks) {
-      const bc = this.chunks.get(block.id);
-      const hasChunk = !!bc && bc.forGalley === block.galleyHash;
+      // the sig carries chunk VERSION and FRESHNESS (stale chunks are
+      // displayed too — see buildStream — so a stale→fresh flip must
+      // rebuild) plus the fidelity epoch (font-tier demotions)
+      const chunkSig = (key) => {
+        const c = this.chunks.get(key);
+        return c ? `${c.v}${c.forGalley === block.galleyHash ? 'F' : 'S'}` : '0';
+      };
       const floatVs = (block.galley?.floats ?? [])
-        .map((f) => {
-          const fc = this.chunks.get(block.id + '#' + f.n);
-          return fc && fc.forGalley === block.galleyHash ? fc.v : 0;
-        })
+        .map((f) => chunkSig(block.id + '#' + f.n))
         .join(',');
-      const sig = `${block.galleyHash}|${hasChunk ? bc.v : 0}|${floatVs}`;
+      const insVs = (block.galley?.items ?? [])
+        .filter((it) => it.k === 'ins')
+        .map((_, k) => chunkSig(`${block.id}@fn${k}`))
+        .join(',');
+      const sig = `${block.galleyHash}|${chunkSig(block.id)}|${floatVs}|${insVs}|${this.fidelityEpoch}`;
       if (!block.units || block.unitsSig !== sig) {
-        block.units = buildStream(block, hasChunk, this.chunks);
+        block.units = buildStream(block, this.chunks);
         block.unitsSig = sig;
       }
     }
@@ -2846,6 +3287,7 @@ export class CheckpointEngine {
         sy: r2(gfxOpen.clip0),
         ch: r2(meta?.hBp ?? gfxOpen.clip1),
         cv: meta?.v ?? 0,
+        st: gfxOpen.stale ? 1 : undefined, // stale-exact: previous pixels held
         src: gfxOpen.blockId,
       });
       gfxOpen = null;
@@ -2862,9 +3304,10 @@ export class CheckpointEngine {
         const clip1 = c.yOff + u.h + (u.d ?? 0);
         if (gfxOpen && gfxOpen.blockId === c.blockId && Math.abs(gfxOpen.top - chunkTop) < 0.05) {
           gfxOpen.clip1 = Math.max(gfxOpen.clip1, clip1);
+          gfxOpen.stale ||= !!c.stale;
         } else {
           flushGfx();
-          gfxOpen = { blockId: c.blockId, top: chunkTop, clip0, clip1, w: c.w };
+          gfxOpen = { blockId: c.blockId, top: chunkTop, clip0, clip1, w: c.w, stale: !!c.stale };
         }
         continue;
       }
@@ -3054,20 +3497,38 @@ class Peer {
  * stream entries and attaches drawing/chunk metadata. Entry objects are
  * cached per block (unitsSig), so page identity survives unrelated edits.
  */
-function buildStream(block, hasChunk, chunks) {
-  const items = block.galley?.items ?? [];
-  const floats = block.galley?.floats ?? [];
+function buildStream(block, chunks) {
+  const galley = block.galley;
+  const items = galley?.items ?? [];
+  const floats = galley?.floats ?? [];
+  const fid = block.fidelity;
+  // Fidelity display policy (best available first):
+  //   fresh chunk > STALE chunk (the previous edit's TeX pixels — old but
+  //   clean) > glyph bridge (only where every glyph is at least mappable)
+  //   > blank (no-bridge lines, canonical-only blocks).
+  // A fast-but-wrong display is never an option; a ~100ms-old exact one is.
+  const bc = chunks.get(block.id);
+  const bcFresh = !!bc && bc.forGalley === block.galleyHash;
+  const blockExact = !!(block.gfx || fid?.blockExact);
+  const canonicalOnly = !!fid?.canonicalOnly;
+
   const stream = [];
   let li = 0;
   let yOff = 0;
+  let insOrdinal = 0;
 
   const makeFloat = (n) => {
     const f = floats.find((x) => x.n === n);
     if (!f) return null;
     const chunkKey = block.id + '#' + f.n;
     const fc = chunks.get(chunkKey);
+    const ffid = fid?.floats?.get(f.n);
+    const wantExact = !canonicalOnly && !!(f.gfx || ffid?.exact);
     const chunkRef =
-      f.gfx && fc && fc.forGalley === block.galleyHash ? { key: chunkKey, w: f.w } : null;
+      wantExact && fc
+        ? { key: chunkKey, w: f.w, stale: fc.forGalley === block.galleyHash ? undefined : 1 }
+        : null;
+    const suppress = canonicalOnly || (wantExact && !fc && !!ffid?.noBridge);
     return {
       id: chunkKey,
       n: f.n,
@@ -3078,11 +3539,12 @@ function buildStream(block, hasChunk, chunks) {
       d: f.d ?? 0,
       gfx: f.gfx,
       blockId: block.id,
-      units: miniUnits(f.items, block.id, chunkRef),
+      units: miniUnits(f.items, block.id, chunkRef, suppress),
     };
   };
 
-  for (const it of items) {
+  for (let ii = 0; ii < items.length; ii++) {
+    const it = items[ii];
     if (it.k === 'glue') {
       stream.push({ t: 'glue', a: it.a ?? 0, st: it.st ?? 0, sto: it.sto ?? 0, sh: it.sh ?? 0, sho: it.sho ?? 0, sub: it.sub ?? 0 });
       yOff += it.a ?? 0;
@@ -3092,12 +3554,24 @@ function buildStream(block, hasChunk, chunks) {
     } else if (it.k === 'pen') {
       stream.push({ t: 'pen', v: it.v ?? 0 });
     } else if (it.k === 'ins') {
+      // footnote bodies get their own chunk pages (RENDER pages after the
+      // floats) when the fidelity gate flags them
+      const k = insOrdinal++;
+      const ifid = fid?.ins?.get(k);
+      const chunkKey = `${block.id}@fn${k}`;
+      const ic = chunks.get(chunkKey);
+      const wantExact = !canonicalOnly && !!ifid?.exact;
+      const chunkRef =
+        wantExact && ic
+          ? { key: chunkKey, w: ic.wBp, stale: ic.forGalley === block.galleyHash ? undefined : 1 }
+          : null;
+      const suppress = canonicalOnly || (wantExact && !ic && !!ifid?.noBridge);
       stream.push({
         t: 'ins',
         h: it.h ?? it.hc ?? 0,
         d: it.d ?? 0,
         hc: it.hc ?? it.h ?? 0,
-        units: miniUnits(it.items, block.id, null),
+        units: miniUnits(it.items, block.id, chunkRef, suppress),
       });
     } else if (it.k === 'fm') {
       const f = makeFloat(it.n);
@@ -3115,6 +3589,24 @@ function buildStream(block, hasChunk, chunks) {
       // tocline marker: page-anchors the contents entry it points at
       stream.push({ t: 'tl', bid: block.id, i: it.n ?? 0 });
     } else if (it.k === 'box') {
+      // fidelity verdict for THIS line: exact-required lines map into the
+      // block chunk (fresh, or stale until the new one lands ~100ms later);
+      // safe lines stay pure glyphs. Rescued blocks carry per-item chunk
+      // refs (multi-page isolated renders) which take precedence.
+      const flags = fid?.itemFlags?.[ii] ?? 0;
+      const wantExact = !canonicalOnly && (blockExact || (flags & 1) !== 0);
+      let gfxChunk = null;
+      if (it.chunk) {
+        gfxChunk = { blockId: it.chunk, yOff: it.coff ?? 0, w: chunks.get(it.chunk)?.wBp ?? galley.w };
+      } else if (wantExact && bc) {
+        gfxChunk = { blockId: block.id, yOff, w: galley.w, stale: bcFresh ? undefined : 1 };
+      }
+      // no exact pixels yet: mappable glyphs may bridge the render latency;
+      // unmappable ones (and verification-demoted blocks) show nothing
+      // rather than something wrong
+      const lineNoBridge =
+        canonicalOnly || (flags & 2) !== 0 || (blockExact && !!fid?.noBridge);
+      const suppress = !gfxChunk && (canonicalOnly || (wantExact && lineNoBridge));
       const unit = {
         blockId: block.id,
         li: li++,
@@ -3123,14 +3615,8 @@ function buildStream(block, hasChunk, chunks) {
         ln: {
           descent: it.d ?? 0,
           boxH: it.h ?? 0,
-          runs: it.runs ?? [],
-          // rescued blocks carry per-item chunk refs (multi-page isolated
-          // renders); ordinary gfx blocks map every unit into one chunk
-          gfxChunk: it.chunk
-            ? { blockId: it.chunk, yOff: it.coff ?? 0, w: chunks.get(it.chunk)?.wBp ?? block.galley.w }
-            : block.gfx && hasChunk
-              ? { blockId: block.id, yOff, w: block.galley.w }
-              : null,
+          runs: suppress ? [] : (it.runs ?? []),
+          gfxChunk,
         },
       };
       stream.push({ t: 'box', u: unit });
@@ -3152,8 +3638,10 @@ function buildStream(block, hasChunk, chunks) {
   return stream;
 }
 
-/** Convert a captured mini-galley (float body, footnote text) to draw units. */
-function miniUnits(items, blockId, chunkRef) {
+/** Convert a captured mini-galley (float body, footnote text) to draw
+ * units. `suppress` blanks the glyph runs when the fidelity gate forbids a
+ * glyph bridge and no exact chunk has landed yet. */
+function miniUnits(items, blockId, chunkRef, suppress = false) {
   const units = [];
   let y = 0;
   for (const it of items ?? []) {
@@ -3170,8 +3658,10 @@ function miniUnits(items, blockId, chunkRef) {
       ln: {
         descent: it.d ?? 0,
         boxH: it.h ?? 0,
-        runs: it.runs ?? [],
-        gfxChunk: chunkRef ? { blockId: chunkRef.key, yOff: y, w: chunkRef.w } : null,
+        runs: suppress && !chunkRef ? [] : (it.runs ?? []),
+        gfxChunk: chunkRef
+          ? { blockId: chunkRef.key, yOff: y, w: chunkRef.w, stale: chunkRef.stale }
+          : null,
       },
     });
     y += (it.h ?? 0) + (it.d ?? 0);

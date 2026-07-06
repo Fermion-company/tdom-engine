@@ -84,7 +84,9 @@ test('equation insertion renumbers downstream through the live chain', opts, asy
 
 test('TikZ blocks are flagged for the exact-render tier and get chunks', opts, async () => {
   const dom = eng.getDOM();
-  const gfx = dom.blocks.filter((b) => b.gfx);
+  const gfx = dom.blocks.filter(
+    (b) => b.gfxChunks.length > 0 && eng.blocks[b.index]?.text.includes('tikzpicture')
+  );
   assert.ok(gfx.length >= 1, 'tikz block detected via pdf literals');
   // wait for the async exact render to land
   const id = gfx[0].gfxChunks?.[0] ?? gfx[0].id;
@@ -93,6 +95,44 @@ test('TikZ blocks are flagged for the exact-render tier and get chunks', opts, a
   }
   const svg = eng.getChunkSVG(id);
   assert.ok(svg && svg.includes('<svg'), 'exact chunk rendered');
+});
+
+test('math passes the visual fidelity gate into exact preview chunks', opts, async () => {
+  const dom = eng.getDOM();
+  const mathBlocks = dom.blocks.filter(
+    (b) => b.fidelity === 'exact-preview-required' && b.exactLines > 0
+  );
+  assert.ok(mathBlocks.length >= 2, `equation/align blocks demand exact preview (got ${mathBlocks.length})`);
+  const eqBlock = eng.blocks.find((b) => b.text.includes('\\begin{equation}'));
+  assert.ok(eqBlock?.fidelity?.exact, 'equation block gated');
+  assert.ok(
+    eqBlock.fidelity.exactLines < eqBlock.fidelity.lines || eqBlock.fidelity.lines <= 2,
+    'gate is line-granular: prose lines around the math stay safe-glyph'
+  );
+  // the high-fidelity chunk pump renders the block's exact pixels async
+  for (let i = 0; i < 100 && !eng.getChunkSVG(eqBlock.id); i++) {
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  const svg = eng.getChunkSVG(eqBlock.id);
+  assert.ok(svg && svg.includes('<svg'), 'exact math chunk rendered from the checkpoint child');
+  // and the display list shows the math band as a chunk window, not glyphs
+  await eng.renderTask.catch(() => {});
+  const dls = eng.getDisplayLists();
+  const chunkCmds = dls.flatMap((dl) => dl.commands.filter((c) => c.op === 'chunk'));
+  assert.ok(
+    chunkCmds.some((c) => c.chunk === eqBlock.id),
+    'math band drawn from the exact chunk'
+  );
+});
+
+test('inline math lines are chunk-banded while plain paragraphs stay glyphs', opts, () => {
+  const inline = eng.blocks.find((b) => /\$[^$]+\$/.test(b.text) && !b.gfx);
+  if (!inline) return; // demo may not carry inline math outside gfx blocks
+  assert.ok(inline.fidelity?.exact, 'inline math demands exact preview');
+  const plain = eng.blocks.find(
+    (b) => b.fidelity && b.fidelity.level === 'safe-glyph' && b.fidelity.lines > 0
+  );
+  assert.ok(plain, 'plain prose blocks remain safe-glyph');
 });
 
 test('preamble edits take the honest full-rebuild path', opts, async () => {

@@ -6,6 +6,12 @@
       "runtimeExecutable": "node",
       "runtimeArgs": ["server.js"],
       "port": 4633
+    },
+    {
+      "name": "tdom-engine-alt",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-lc", "PORT=4644 TDOM_WORKDIR=.tdom-v3-alt exec node server.js"],
+      "port": 4644
     }
   ]
 }

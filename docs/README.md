@@ -16,6 +16,7 @@
 | 6 | [06-correctness-performance.md](06-correctness-performance.md) | 性能実測と「なぜこれが下限か」、正しさの担保、テスト30本の一覧、既知の限界、**開発中に踏んだ罠のアーカイブ** | 全員（特に罠の表） |
 | 7 | [07-glossary.md](07-glossary.md) | 用語集 | 随時参照 |
 | 8 | [08-canonical-exact-layer.md](08-canonical-exact-layer.md) | **2026-07大改修**: canonical exact layer（LuaLaTeX実出力＝最終表示の権威）、safety gate、opaqueモード、一致検証、srcRev二重系列 | 全員（最新の権威構造） |
+| 9 | [09-visual-fidelity-gate.md](09-visual-fidelity-gate.md) | **2026-07第2次改修**: Visual Fidelity Gate（safe-glyph / exact-preview-required / canonical-only）、行粒度の high-fidelity chunk、stale-exact 表示、フォント配信ティア、検証降格 | 全員（表示品質の契約） |
 
 ## この解説書の対象コミット
 

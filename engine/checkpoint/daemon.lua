@@ -41,6 +41,16 @@ local pending_fmarks = {}
 local geo_extra = {}
 local RENDER_MODE = false
 local FLOAT_COPIES = {}
+local FOOT_COPIES = {}
+-- Visual-fidelity flags for the CURRENT top-level line box being walked
+-- (reset per box item in extract_items, accumulated through nested boxes):
+--   line_x   the line needs an exact preview chunk (math nodes, math-font
+--            or legacy CM glyphs — browser glyph output would differ)
+--   line_xb  the line contains glyphs the browser cannot draw at all
+--            (unencoded/PUA slots: OpenType math size variants, extensible
+--            pieces) — not even a glyph bridge is presentable
+local line_x = false
+local line_xb = false
 
 local SP2BP = 65781.76
 -- 6 decimals: page assembly sums hundreds of these; 3 decimals accumulated
@@ -340,6 +350,7 @@ local DISC = node.id('disc')
 local WHATSIT = node.id('whatsit')
 local INS = node.id('ins')
 local MARK = node.id('mark')
+local MATH = node.id('math')
 
 local LIT_SUB = node.subtype and node.subtype('pdf_literal')
 local COL_SUB = node.subtype and node.subtype('pdf_colorstack')
@@ -365,6 +376,9 @@ local function note_font(fid)
       size = bp(f.size or 655360),
       encb = f.encodingbytes or 0,
       fmt = f.format or '',
+      -- OpenType MATH fonts (unicode-math &c.): their glyphs ARE math even
+      -- when individually cmap-clean — the fidelity gate keys off this
+      mth = (f.mathparameters or f.MathConstants) and 1 or nil,
     }
   end
 end
@@ -443,13 +457,27 @@ walk_h = function(head, parent, x0, dy0, out)
       end
       -- slots below 32 (legacy greek etc.) travel as PUA so JSON stays clean
       local c = n.char or 63
+      local legacy = fi and fi.name and fi.name:find('^cm%l*%d')
       -- Legacy Computer Modern (Type1) glyphs — i.e. classic math setups —
       -- cannot be reproduced exactly in the browser (no Type1 @font-face,
-      -- twins differ subtly). Route such blocks through the exact-render
-      -- tier: the instant glyph approximation shows while typing and the
-      -- print-identical SVG swaps in right after.
-      if fi and fi.name and fi.name:find('^cm%l*%d') then
-        blk_gfx = true
+      -- twins differ subtly), and OpenType MATH font glyphs go through
+      -- TeX's math machinery (variants, extensibles, italic correction).
+      -- Either way the LINE needs an exact preview chunk; the twin/glyph
+      -- approximation is at best a brief bridge until it lands.
+      if legacy or (fi and fi.mth) then
+        line_x = true
+      end
+      -- Glyphs outside cmap reach: luaotfload parks unencoded glyphs
+      -- (math size variants, extensible pieces) in the PUA planes, and
+      -- anything ≥ 0x110000 is not even valid UTF-8 for the payload.
+      -- The browser has no way to address these — no glyph bridge.
+      if c >= 0x110000 then
+        c = 63
+        line_x = true
+        line_xb = true
+      elseif (c >= 0xE000 and c <= 0xF8FF and not legacy) or c >= 0xF0000 then
+        line_x = true
+        line_xb = true
       end
       if c < 32 then c = 0xE000 + c end
       run.g[#run.g + 1] = { c, gx }
@@ -487,6 +515,18 @@ walk_h = function(head, parent, x0, dy0, out)
       if d and d < -1073741823 then d = parent and parent.depth or 0 end
       out[#out + 1] = { rule = true, x = x, dy = dy0 - bp(h), w = bp(w), h = bp(h) + bp(d), c = curcolor() }
       x = x + bp(w or 0)
+    elseif id == MATH then
+      -- inline math on/off marker: the surrounding line must be shown as
+      -- an exact preview chunk (fidelity gate) — math never rides the
+      -- browser glyph path by default
+      flush()
+      line_x = true
+      -- \mathsurround travels on the math node (kern-like, or glue in
+      -- LuaTeX's mathsurroundskip form); zero in almost every document
+      local mw = 0
+      pcall(function() mw = node.effective_glue(n, parent) or 0 end)
+      if mw == 0 then mw = n.surround or 0 end
+      x = x + bp(mw)
     elseif id == DISC then
       -- post-linebreak: the replace text is what shows mid-line
       flush()
@@ -592,6 +632,10 @@ local function extract_items(head, parentBox)
         if d < -1073741823 then d = 0 end
       end
       local runs = {}
+      -- visual-fidelity flags accumulate across the whole (possibly nested)
+      -- walk of this one top-level line box
+      line_x = false
+      line_xb = false
       if id == HLIST then
         walk_h(n.list, n, 0, 0, runs)
       elseif id == VLIST then
@@ -600,6 +644,8 @@ local function extract_items(head, parentBox)
         runs[1] = { rule = true, x = 0, dy = -bp(h), w = bp(w), h = bp(h) + bp(d), c = '#000000' }
       end
       local item = { k = 'box', h = bp(h), d = bp(d), w = bp(w), runs = runs }
+      if line_x then item.x = 1 end
+      if line_xb then item.xb = 1 end
       if #pending_fmarks > 0 then
         item.fm = pending_fmarks
         pending_fmarks = {}
@@ -930,7 +976,7 @@ function tdom_hf_flush()
   local fonts = {}
   for fid, f in pairs(seen_fonts) do
     if not f.sent then
-      fonts[tostring(fid)] = { file = f.file, name = f.name, size = f.size, fmt = f.fmt }
+      fonts[tostring(fid)] = { file = f.file, name = f.name, size = f.size, fmt = f.fmt, mth = f.mth }
       f.sent = true
     end
   end
@@ -1001,7 +1047,7 @@ function tdom_report()
   local fonts = {}
   for fid, f in pairs(seen_fonts) do
     if not f.sent then
-      fonts[tostring(fid)] = { file = f.file, name = f.name, size = f.size, fmt = f.fmt }
+      fonts[tostring(fid)] = { file = f.file, name = f.name, size = f.size, fmt = f.fmt, mth = f.mth }
       f.sent = true
     end
   end
@@ -1052,7 +1098,9 @@ function tdom_ship()
   if not head then return end
   -- drop the leading dummy and any held ins nodes: footnote bodies are
   -- placed by the orchestrator's page builder, not inside the block chunk
-  -- (they contribute no vertical space in the item stream either)
+  -- (they contribute no vertical space in the item stream either). The ins
+  -- CONTENT is kept: each footnote body ships as its own tight page after
+  -- the floats, so math-bearing footnotes get exact preview chunks too.
   local out = nil
   local tail = nil
   local n = head
@@ -1060,7 +1108,13 @@ function tdom_ship()
     local nxt = n.next
     n.next = nil
     n.prev = nil
-    if is_dummy(n) or n.id == INS then
+    if n.id == INS then
+      local content = n.head or n.list
+      if content then
+        FOOT_COPIES[#FOOT_COPIES + 1] = node.vpack(node.copy_list(content))
+      end
+      node.free(n)
+    elseif is_dummy(n) then
       node.free(n)
     else
       if tail then
@@ -1093,25 +1147,42 @@ function tdom_render_end()
 end
 
 -- Render children: after the main galley page, ship one tight page per
--- captured float box (queued tokens run before the final \end).
+-- captured float box, then one per captured footnote body (queued tokens
+-- run before the final \end). Page map: 1 = galley, 2..1+F = floats in
+-- order, 2+F..1+F+N = footnote inserts in order.
 function tdom_ship_floats()
   local lines = {}
   for i = 1, #FLOAT_COPIES do
     lines[#lines + 1] = '\\directlua{tdom_load_float(' .. i .. ')}'
     lines[#lines + 1] = '\\shipout\\box255'
   end
+  for i = 1, #FOOT_COPIES do
+    lines[#lines + 1] = '\\directlua{tdom_load_foot(' .. i .. ')}'
+    lines[#lines + 1] = '\\shipout\\box255'
+  end
   if #lines > 0 then tex.print(lines) end
+end
+
+local function load_ship_box(b)
+  local w = math.max(b.width or 0, 65536)
+  local total = math.max((b.height or 0) + (b.depth or 0), 65536)
+  tex.box[255] = b
+  tex.pagewidth = w
+  tex.pageheight = total
 end
 
 function tdom_load_float(i)
   local b = FLOAT_COPIES[i]
   if not b then return end
   FLOAT_COPIES[i] = false
-  local w = math.max(b.width or 0, 65536)
-  local total = math.max((b.height or 0) + (b.depth or 0), 65536)
-  tex.box[255] = b
-  tex.pagewidth = w
-  tex.pageheight = total
+  load_ship_box(b)
+end
+
+function tdom_load_foot(i)
+  local b = FOOT_COPIES[i]
+  if not b then return end
+  FOOT_COPIES[i] = false
+  load_ship_box(b)
 end
 
 -- --------------------------------------------------------- the loop
@@ -1182,6 +1253,7 @@ function tdom_wait()
         pending_fmarks = {}
         RENDER_MODE = true
         FLOAT_COPIES = {}
+        FOOT_COPIES = {}
         reconnect('render', 0)
         lfs.chdir(jobdir)
         -- under LaTeX, raw callback.register is owned by luatexbase

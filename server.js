@@ -320,8 +320,33 @@ const backend = 'checkpoint';
 const workDirName = /^[.a-z0-9_-]+$/i.test(process.env.TDOM_WORKDIR || '')
   ? process.env.TDOM_WORKDIR
   : '.tdom-v3';
+// The work directory is a live process's private state (driver.tex, format,
+// render jobs, canonical PDFs). TWO servers sharing one silently corrupt
+// each other — a concurrently rewritten driver.tex reads back as NUL
+// garbage and the boot demotes to opaque. A pid lockfile detects a living
+// owner and moves this instance to a suffixed directory instead.
+function claimWorkDir(base) {
+  const dir = path.join(ROOT, base);
+  const lock = path.join(dir, '.tdom-owner');
+  try {
+    const pid = Number(readFileSync(lock, 'utf8'));
+    if (pid && pid !== process.pid) {
+      process.kill(pid, 0); // throws when the owner is gone
+      const fallback = `${base}-${process.pid}`;
+      console.warn(
+        `[tdom] work dir ${base} is owned by live pid ${pid} — using ${fallback} instead`
+      );
+      return claimWorkDir(fallback);
+    }
+  } catch {
+    /* no lock, stale lock, or unreadable — claim it */
+  }
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(lock, String(process.pid));
+  return dir;
+}
 const engine = new CheckpointEngine({
-  workDir: path.join(ROOT, workDirName),
+  workDir: claimWorkDir(workDirName),
   docDir: path.join(ROOT, 'samples'),
 });
 // TDOM_SAMPLE picks the boot document (tests use the small demo — booting
@@ -338,9 +363,23 @@ console.log(
 
 // Serialize all engine mutations (compiles can take a while).
 let queue = Promise.resolve();
+// Engine-queue liveness for the /status pill: how many mutations are
+// queued/running right now, and since when. This must be readable WITHOUT
+// entering the queue — its whole point is telling a "long compile" apart
+// from a dead server while the queue is occupied.
+let engineBusy = 0;
+let engineBusySince = 0;
 function withEngine(fn) {
+  engineBusy++;
+  if (engineBusy === 1) engineBusySince = Date.now();
   const run = queue.then(fn);
   queue = run.catch(() => {});
+  run
+    .catch(() => {})
+    .finally(() => {
+      engineBusy--;
+      if (engineBusy === 0) engineBusySince = 0;
+    });
   return run;
 }
 
@@ -462,6 +501,24 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname.startsWith('/pdfjs/')) {
       return serveStatic(res, url.pathname.slice(1));
     }
+    // liveness probe for the status pill: cheap, engine-queue-free, safe to
+    // poll every second. A hung/killed server simply stops answering this.
+    if (req.method === 'GET' && url.pathname === '/status') {
+      res.setHeader('Cache-Control', 'no-store');
+      return json(res, {
+        up: true,
+        pid: process.pid,
+        port: PORT,
+        busy: engineBusy > 0,
+        queued: engineBusy,
+        busyMs: engineBusy > 0 ? Date.now() - engineBusySince : 0,
+        mode: engine.mode,
+        rev: engine.rev,
+        srcRev: engine.srcRev,
+        progress: engine.progress ?? null,
+        canonical: engine.canonical.info(),
+      });
+    }
     if (req.method === 'GET' && url.pathname === '/doc') return json(res, docPayload());
     if (req.method === 'GET' && url.pathname === '/templates') return json(res, listTemplates());
     if (req.method === 'POST' && url.pathname === '/templates') {
@@ -539,6 +596,14 @@ const server = http.createServer(async (req, res) => {
         'Cache-Control': 'public, max-age=31536000, immutable',
       });
       return res.end(body);
+    }
+    // fidelity gate feedback: the browser could not LOAD a served font
+    // (@font-face failure = silent fallback to a default browser font).
+    // Demote the family so affected lines switch to exact preview chunks.
+    if (req.method === 'POST' && url.pathname === '/font-fail') {
+      const body = JSON.parse(await readBody(req));
+      const demoted = engine.demoteFontFamily ? engine.demoteFontFamily(String(body.family ?? '')) : false;
+      return json(res, { demoted });
     }
     // the last LANDED canonical compile, byte-identical to what the main
     // preview converged to — never triggers a compile (the compare view's

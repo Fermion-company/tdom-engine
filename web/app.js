@@ -40,6 +40,7 @@ const FONT_FAMILY = {
 let geometry = { paperwidth: 612, paperheight: 792 };
 let backend = 'internal';
 const loadedFonts = new Set();
+const failedFonts = new Set(); // families reported to /font-fail (once each)
 
 let serverText = '';
 let appliedRev = 0;
@@ -328,6 +329,28 @@ function injectFonts(keys) {
   style.textContent = css;
   document.head.appendChild(style);
   for (const k of missing) loadedFonts.add(k);
+  // fidelity gate: verify each face actually loads. A face the browser
+  // rejects (unsupported table, truncated file) silently falls back to a
+  // default font — report it so the engine demotes those lines to exact
+  // preview chunks instead of showing wrong glyphs.
+  for (const k of missing) {
+    document.fonts.load(`12px "${k}"`).then(
+      (faces) => {
+        if (!faces || faces.length === 0) reportFontFailure(k);
+      },
+      () => reportFontFailure(k)
+    );
+  }
+}
+
+function reportFontFailure(family) {
+  if (failedFonts.has(family)) return;
+  failedFonts.add(family);
+  fetch('/font-fail', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ family }),
+  }).catch(() => {});
 }
 
 // ---------------------------------------------------------------- boot
@@ -406,9 +429,12 @@ function renderPage(dl, flash) {
     const W = geometry.paperwidth;
     const H = geometry.paperheight;
     const shiftPct = (cmd.sy / cmd.w) * 100; // margin-top % is width-relative
+    // st=1: a stale-exact chunk — the previous edit's TeX pixels, held
+    // until the fresh render lands (~100–200ms). Old but clean beats fast
+    // but wrong; the class is a hook for the inspector, not a visual.
     div.insertAdjacentHTML(
       'beforeend',
-      `<div class="chunkwin" data-src="${cmd.src}" style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
+      `<div class="chunkwin${cmd.st ? ' stale' : ''}" data-src="${cmd.src}" style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
         `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
     );
   }
@@ -771,6 +797,7 @@ function flushSync() {
     if (!d) return;
     const t0 = performance.now();
     inFlight = true;
+    noteEditStart(); // status pill: computing, instantly
     try {
       const res = await fetch('/edit', {
         method: 'POST',
@@ -798,9 +825,73 @@ function flushSync() {
       statusEl.textContent = `エラー: ${err.message}`;
     } finally {
       inFlight = false;
+      noteEditEnd();
     }
   });
 }
+
+// ------------------------------------------------------- liveness pill
+//
+// One glanceable answer to "is it computing, or is the server dead?".
+// Sources: the client's own in-flight /edit POST (instant), plus a 1s poll
+// of /status (cheap, engine-queue-free — a hung or killed server simply
+// stops answering it). While the engine grinds, the pill shows the phase
+// and elapsed seconds; a full rebuild shows block progress.
+
+const pillEl = document.getElementById('livestatus');
+let pillEdits = 0;
+let pillBusySince = 0;
+
+function pill(state, text) {
+  if (!pillEl) return;
+  pillEl.className = 'pill ' + state;
+  pillEl.textContent = text;
+}
+
+function noteEditStart() {
+  pillEdits++;
+  if (!pillBusySince) pillBusySince = Date.now();
+  pill('busy', '⏳ 組版中…');
+}
+
+function noteEditEnd() {
+  pillEdits = Math.max(0, pillEdits - 1);
+  pollStatus();
+}
+
+async function pollStatus() {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2500);
+    const r = await fetch('/status', { signal: ctrl.signal, cache: 'no-store' });
+    clearTimeout(timer);
+    if (!r.ok) throw new Error(String(r.status));
+    const s = await r.json();
+    if (pillEdits > 0 || s.busy) {
+      if (!pillBusySince) pillBusySince = Date.now() - (s.busyMs || 0);
+      const secs = Math.floor((Date.now() - pillBusySince) / 1000);
+      const prog =
+        s.progress?.phase === 'typeset' && s.progress.total
+          ? ` ${s.progress.at}/${s.progress.total}ブロック`
+          : s.progress?.phase === 'boot'
+            ? '（プリアンブル再構築）'
+            : '';
+      pill('busy', `⏳ 組版中${prog}${secs >= 2 ? ` — ${secs}秒` : '…'}`);
+    } else if (s.canonical?.inFlight) {
+      pillBusySince = 0;
+      pill('busy', '⏳ canonical コンパイル中');
+    } else {
+      pillBusySince = 0;
+      pill('ok', '✓ 稼働中');
+    }
+  } catch {
+    pillBusySince = 0;
+    pill('down', '✕ サーバー停止・応答なし');
+  }
+}
+
+setInterval(pollStatus, 1000);
+pollStatus();
 
 editor.addEventListener('compositionstart', () => (composing = true));
 editor.addEventListener('compositionend', () => {
@@ -1035,8 +1126,18 @@ function renderInspector(report, rtt) {
               }</span>`
             : ''
         }
+        ${
+          s.fidelity
+            ? `<span class="k">Fidelity gate</span><span class="v">safe ${s.fidelity.safeBlocks} / exact ${s.fidelity.exactBlocks}${
+                s.fidelity.canonicalOnlyBlocks ? ` / canon-only ${s.fidelity.canonicalOnlyBlocks}` : ''
+              }${s.fidelity.demoted ? `（降格 ${s.fidelity.demoted}）` : ''}${
+                s.fidelity.pendingRenders ? ` / chunk待ち ${s.fidelity.pendingRenders}` : ''
+              }</span>`
+            : ''
+        }
       </div>
       ${c.error ? `<div class="diag">${escapeHtml(c.error)}</div>` : ''}
+      ${(s.fidelity?.demotedFonts ?? []).map((f) => `<div class="diag">font demoted: ${escapeHtml(f)}</div>`).join('')}
     </div>`;
 
   const opaqueCard = isOpaque
