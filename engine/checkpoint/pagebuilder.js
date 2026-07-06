@@ -70,22 +70,51 @@ export function parsePlacement(spec) {
   return { bits, bang };
 }
 
-export function buildPages(stream, geo) {
+/**
+ * Build pages from the stream. `incr` (optional) enables incremental
+ * repagination: `{ prevRun, dirtyFromSi, suffixStartNew, suffixShift }`
+ * — resume from the last page boundary before the first divergent stream
+ * index, and once a boundary in the clean suffix matches the previous
+ * run's state, splice the remaining old pages instead of re-breaking
+ * them. Editing cost becomes O(pages around the edit), not O(document).
+ */
+export function buildPages(stream, geo, incr = null) {
   const builder = new PageBuilder(stream, geo);
-  const pages = builder.run();
+  const prevRun = incr && incr.prevRun && incr.prevRun.geo === geo ? incr.prevRun : null;
+  const pages = builder.run(prevRun, incr ?? {});
   // \pagetotal at each block's entry — page-context-sensitive rescues
-  // (mdframed & co.) need their true on-page start position
+  // (mdframed & co.) need their true on-page start position. Blocks the
+  // incremental run never re-processed keep their previous entry offsets.
+  if (prevRun) {
+    for (const [k, v] of prevRun.blockEntry) {
+      if (!builder.blockEntry.has(k)) builder.blockEntry.set(k, v);
+    }
+  }
   pages.blockEntry = builder.blockEntry;
+  pages.__run = {
+    geo,
+    pages,
+    blockEntry: builder.blockEntry,
+    snapshots: builder.snapshots,
+    sawParityEvent: builder.sawParityEvent,
+  };
   return pages;
 }
 
 class PageBuilder {
   constructor(stream, geo) {
     this.geo = geo;
-    this.queue = stream.slice(); // working queue (we splice float material in)
-    this.qi = 0;
+    // Two-source consumption: `si` walks the pristine stream, `pending`
+    // holds injected material (float bodies, penalties) and the leftovers
+    // a fired page re-queues. Keeping the pristine stream untouched makes
+    // a page-boundary snapshot O(carried items) instead of O(document).
+    this.stream = stream;
+    this.si = 0;
+    this.pending = [];
     this.pages = [];
     this.deferlist = [];
+    this.snapshots = []; // page-boundary resume points
+    this.sawParityEvent = false; // \cleardoublepage / \pagenumbering seen
 
     this.textheight = geo.textheight;
     this.maxdepth = geo.atmaxdepth ?? geo.maxdepth ?? 4;
@@ -193,9 +222,146 @@ class PageBuilder {
 
   // ------------------------------------------------------------------ run
 
-  run() {
-    while (this.qi < this.queue.length) {
-      const e = this.queue[this.qi++];
+  #nextItem() {
+    if (this.pending.length) return this.pending.shift();
+    if (this.si < this.stream.length) return this.stream[this.si++];
+    return null;
+  }
+
+  /** Peek the k-th upcoming item without consuming (pending first). */
+  #peekItem(k) {
+    if (k < this.pending.length) return this.pending[k];
+    return this.stream[this.si + (k - this.pending.length)];
+  }
+
+  /** Boundary resume point — everything the builder carries across a page. */
+  #snapshot() {
+    return {
+      si: this.si,
+      pending: this.pending.slice(),
+      deferlist: this.deferlist.slice(),
+      folio: this.folio,
+      pendingFolio: this.pendingFolio,
+      sawParityEvent: this.sawParityEvent,
+      pageCount: this.pages.length,
+      col: {
+        colroom: this.colroom,
+        topnum: this.topnum,
+        botnum: this.botnum,
+        colnum: this.colnum,
+        toproom: this.toproom,
+        botroom: this.botroom,
+        textfloatsheight: this.textfloatsheight,
+        toplist: this.toplist.slice(),
+        botlist: this.botlist.slice(),
+        midlist: this.midlist.slice(),
+      },
+    };
+  }
+
+  #restore(s, pages) {
+    this.si = s.si;
+    this.pending = s.pending.slice();
+    this.deferlist = s.deferlist.slice();
+    this.folio = s.folio;
+    this.pendingFolio = s.pendingFolio;
+    this.sawParityEvent = s.sawParityEvent;
+    this.pages = pages.slice(0, s.pageCount);
+    this.colht = this.textheight;
+    this.colroom = s.col.colroom;
+    this.topnum = s.col.topnum;
+    this.botnum = s.col.botnum;
+    this.colnum = s.col.colnum;
+    this.toproom = s.col.toproom;
+    this.botroom = s.col.botroom;
+    this.textfloatsheight = s.col.textfloatsheight;
+    this.toplist = s.col.toplist.slice();
+    this.botlist = s.col.botlist.slice();
+    this.midlist = s.col.midlist.slice();
+    this.#resetPage();
+  }
+
+  /**
+   * Do two boundary states describe the same continuation? Stream items
+   * compare by identity (clean blocks keep their unit objects across runs);
+   * synthetic items (float glue/penalties) compare structurally; float and
+   * unit references compare by identity.
+   */
+  #sameBoundary(a, b) {
+    if (a.pending.length !== b.pending.length) return false;
+    for (let i = 0; i < a.pending.length; i++) {
+      if (!sameCarryItem(a.pending[i], b.pending[i])) return false;
+    }
+    if (a.deferlist.length !== b.deferlist.length) return false;
+    for (let i = 0; i < a.deferlist.length; i++) {
+      if (a.deferlist[i] !== b.deferlist[i]) return false;
+    }
+    const ca = a.col;
+    const cb = b.col;
+    if (
+      ca.colroom !== cb.colroom || ca.topnum !== cb.topnum || ca.botnum !== cb.botnum ||
+      ca.colnum !== cb.colnum || ca.toproom !== cb.toproom || ca.botroom !== cb.botroom ||
+      ca.textfloatsheight !== cb.textfloatsheight ||
+      ca.toplist.length !== cb.toplist.length || ca.botlist.length !== cb.botlist.length ||
+      ca.midlist.length !== cb.midlist.length
+    ) {
+      return false;
+    }
+    for (let i = 0; i < ca.toplist.length; i++) if (ca.toplist[i] !== cb.toplist[i]) return false;
+    for (let i = 0; i < ca.botlist.length; i++) if (ca.botlist[i] !== cb.botlist[i]) return false;
+    for (let i = 0; i < ca.midlist.length; i++) if (ca.midlist[i] !== cb.midlist[i]) return false;
+    if (a.pendingFolio !== b.pendingFolio) return false;
+    return true;
+  }
+
+  run(prevRun = null, incr = {}) {
+    // record the pristine start as a resume point (snapshot 0)
+    this.snapshots.push(this.#snapshot());
+
+    // ---- incremental resume: skip the clean prefix -----------------------
+    let resyncFrom = null; // old-si -> old snapshot index list, armed below
+    if (prevRun && Number.isFinite(incr.dirtyFromSi)) {
+      let best = null;
+      for (const s of prevRun.snapshots) {
+        // everything a boundary carries was consumed from indices < si, so
+        // any boundary at si <= first divergence is valid verbatim
+        if (s.si <= incr.dirtyFromSi && (!best || s.si > best.si)) best = s;
+      }
+      if (best && best.pageCount <= prevRun.pages.length) {
+        this.#restore(best, prevRun.pages);
+        // resume points up to here stay valid for FUTURE edits too
+        this.snapshots = prevRun.snapshots.slice(0, prevRun.snapshots.indexOf(best) + 1);
+        resyncFrom = new Map();
+        for (let i = 0; i < prevRun.snapshots.length; i++) {
+          const s = prevRun.snapshots[i];
+          if (!resyncFrom.has(s.si)) resyncFrom.set(s.si, []);
+          resyncFrom.get(s.si).push(s);
+        }
+      }
+    }
+    const suffixStartNew = incr.suffixStartNew ?? Infinity;
+    const suffixShift = incr.suffixShift ?? 0;
+
+    for (;;) {
+      // ---- resync: a boundary in the clean suffix that matches the old
+      // run replays identically — splice the remaining old pages
+      if (resyncFrom && this.justFired && this.pages.length && this.si >= suffixStartNew) {
+        const candidates = resyncFrom.get(this.si - suffixShift) ?? [];
+        const here = this.#snapshot();
+        for (const old of candidates) {
+          if (!this.#sameBoundary(here, { ...old, si: old.si + suffixShift })) continue;
+          const folioDelta = here.folio - old.folio;
+          if (folioDelta !== 0 && (this.sawParityEvent || old.sawParityEvent)) break;
+          if (this.#spliceOldPages(prevRun, old, folioDelta, suffixShift)) {
+            if (this.dumpRec) globalThis.__TDOM_PAGE_DUMP__(this.dumpRec);
+            return this.pages;
+          }
+        }
+      }
+      this.justFired = false;
+
+      const e = this.#nextItem();
+      if (!e) break;
       // a block's first stream node: record its effective entry offset
       // (space already unavailable on this page: \pagetotal plus whatever
       // inserts/floats took off \pagegoal). Items requeued onto the next
@@ -231,6 +397,7 @@ class PageBuilder {
           // but is transparent to spacing and break legality (the marker
           // whatsit exists only in the engine's stream, not in a vanilla
           // run — it must not change any break decision)
+          if (e.k === 'pagenum' || e.k === 'cleardouble') this.sawParityEvent = true;
           if (e.k === 'pagenum') this.pendingFolio = 1;
           if (e.k === 'cleardouble') {
             // transcription of the classes' clear-to-parity tail: when the
@@ -331,9 +498,9 @@ class PageBuilder {
     if (!this.hasBox) return;
     // a kern is a breakpoint when immediately followed by glue (ev/tl
     // markers are transparent — peek through them)
-    let qn = this.qi;
-    while (this.queue[qn] && (this.queue[qn].t === 'ev' || this.queue[qn].t === 'tl')) qn++;
-    const next = this.queue[qn];
+    let k = 0;
+    let next = this.#peekItem(k);
+    while (next && (next.t === 'ev' || next.t === 'tl')) next = this.#peekItem(++k);
     if (next && next.t === 'glue' && this.#evalBreak(this.contents.length, 0, e)) {
       return;
     }
@@ -512,7 +679,7 @@ class PageBuilder {
                     const ng = negGlue(this.parskip);
                     inject.push({ t: 'glue', a: ng.w, st: ng.st, sto: ng.sto, sh: ng.sh, sho: ng.sho });
                   }
-                  this.queue.splice(this.qi, 0, ...inject);
+                  this.pending.unshift(...inject);
                   inserted = true;
                   inline = true;
                 }
@@ -530,7 +697,7 @@ class PageBuilder {
     if (!inline) {
       // \@specialoutput tail: \addpenalty\interlinepenalty at the anchor
       // (\nobreak instead while @nobreak is in force, i.e. after a heading)
-      this.queue.splice(this.qi, 0, {
+      this.pending.unshift({
         t: 'pen',
         v: this.lastPen >= INF_BAD ? INF_BAD : this.interlinepenalty,
       });
@@ -626,7 +793,53 @@ class PageBuilder {
       for (const f of defer) this.#addToNextCol(f);
     }
     // re-feed the leftover items through the normal contribution path
-    if (requeue.length) this.queue.splice(this.qi, 0, ...requeue);
+    if (requeue.length) this.pending.unshift(...requeue);
+    // page boundary complete: record the resume point and arm the resync
+    // probe for the next loop iteration
+    if (!this.finishing) {
+      this.snapshots.push(this.#snapshot());
+      this.justFired = true;
+    }
+  }
+
+  /**
+   * Resync succeeded at a boundary: the previous run's remaining pages
+   * replay verbatim. Reuse the page objects when nothing shifted (their
+   * cached display lists survive); clone with adjusted number/folio when
+   * the edit changed the page count (their content is identical, but the
+   * printed folio genuinely differs).
+   */
+  #spliceOldPages(prevRun, oldSnap, folioDelta, suffixShift) {
+    const numberDelta = this.pages.length - oldSnap.pageCount;
+    const tail = prevRun.pages.slice(oldSnap.pageCount);
+    for (const p of tail) {
+      if (numberDelta === 0 && folioDelta === 0) {
+        this.pages.push(p);
+      } else {
+        this.pages.push({
+          ...p,
+          number: p.number + numberDelta,
+          folio: p.folio + folioDelta,
+          dl: undefined,
+        });
+      }
+    }
+    // carry the old suffix's resume points (shifted) for the NEXT edit
+    let seen = false;
+    for (const s of prevRun.snapshots) {
+      if (s === oldSnap) {
+        seen = true;
+        continue;
+      }
+      if (!seen || s.si < oldSnap.si) continue;
+      this.snapshots.push({
+        ...s,
+        si: s.si + suffixShift,
+        folio: s.folio + folioDelta,
+        pageCount: s.pageCount + numberDelta,
+      });
+    }
+    return true;
   }
 
   /** \@addtonextcol */
@@ -892,6 +1105,30 @@ class PageBuilder {
     this.pageEvs = null;
     this.pageTls = null;
     this.pages.push(page);
+  }
+}
+
+/** Carried-item equality across runs: stream/unit/float objects by
+ * identity (clean blocks keep them), synthetic glue/penalties by value. */
+function sameCarryItem(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.t !== b.t) return false;
+  switch (a.t) {
+    case 'glue':
+      return (
+        a.a === b.a && (a.st ?? 0) === (b.st ?? 0) && (a.sto ?? 0) === (b.sto ?? 0) &&
+        (a.sh ?? 0) === (b.sh ?? 0) && (a.sho ?? 0) === (b.sho ?? 0) && (a.sub ?? 0) === (b.sub ?? 0)
+      );
+    case 'pen':
+      return a.v === b.v;
+    case 'kern':
+      return a.a === b.a;
+    case 'box':
+      return a.u === b.u;
+    case 'fm':
+      return a.f === b.f;
+    default:
+      return false; // ins/ev/tl/eject: identity only
   }
 }
 

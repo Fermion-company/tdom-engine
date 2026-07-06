@@ -190,3 +190,46 @@ test('structured docs converge: canonical matches the current source after edits
     await eng.close();
   }
 });
+
+// ---------------------------------------------- incremental pagination
+
+test('incremental pagination matches a from-scratch build after edits', opts, async () => {
+  const DEMO = (await import('node:fs')).readFileSync(
+    new URL('../samples/demo-lua.tex', import.meta.url), 'utf8');
+  const eng = new CheckpointEngine({ workDir: WORK + '-incr' });
+  const pageSig = (e) =>
+    e.pages.map((p) =>
+      (p.draw ?? [])
+        .map((d) => `${d.y.toFixed(1)}:${(d.u.h ?? 0).toFixed(1)}:${(d.u.d ?? 0).toFixed(1)}`)
+        .join('|')
+    );
+  try {
+    await eng.open(DEMO);
+    // a sequence of shape-changing edits: grow a paragraph, add an
+    // equation (renumbers downstream), then delete the insertion
+    const i1 = eng.getSource().indexOf('Edit any word');
+    await eng.edit(i1, i1, 'Extra sentence to change line breaking and page fill. ');
+    const i2 = eng.getSource().indexOf('\\begin{equation}');
+    await eng.edit(i2, i2, '\\begin{equation}q^2=2\\end{equation}\n\n');
+    const src2 = eng.getSource();
+    const ins = '\\begin{equation}q^2=2\\end{equation}\n\n';
+    const i3 = src2.indexOf(ins);
+    await eng.edit(i3, i3 + ins.length, '');
+    const incremental = pageSig(eng);
+
+    // a fresh engine on the SAME final source paginates from scratch
+    const eng2 = new CheckpointEngine({ workDir: WORK + '-incr2' });
+    try {
+      await eng2.open(eng.getSource());
+      const fresh = pageSig(eng2);
+      assert.equal(incremental.length, fresh.length, 'page counts match');
+      for (let n = 0; n < fresh.length; n++) {
+        assert.equal(incremental[n], fresh[n], `page ${n + 1} layout matches`);
+      }
+    } finally {
+      await eng2.close();
+    }
+  } finally {
+    await eng.close();
+  }
+});

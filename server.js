@@ -315,8 +315,13 @@ async function requireToolchain() {
 
 await requireToolchain();
 const backend = 'checkpoint';
+// TDOM_WORKDIR isolates parallel instances (benchmarks, tests) — two
+// engines sharing one workdir would clobber each other's driver/canonical
+const workDirName = /^[.a-z0-9_-]+$/i.test(process.env.TDOM_WORKDIR || '')
+  ? process.env.TDOM_WORKDIR
+  : '.tdom-v3';
 const engine = new CheckpointEngine({
-  workDir: path.join(ROOT, '.tdom-v3'),
+  workDir: path.join(ROOT, workDirName),
   docDir: path.join(ROOT, 'samples'),
 });
 // TDOM_SAMPLE picks the boot document (tests use the small demo — booting

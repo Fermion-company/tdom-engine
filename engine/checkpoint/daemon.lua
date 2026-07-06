@@ -701,16 +701,57 @@ end
 -- from Lua; the driver first contributes a real \hbox to0pt{} (which sets
 -- the flag to box_there) and only then calls tdom_seed to swap the list.
 -- The flag survives all later list surgery.
+-- Reseed THROUGH the real page builder: empty the page, hand a fresh dummy
+-- to the CONTRIBUTION list and let build_page move it — TeX then resets its
+-- internal page_so_far state (\pagegoal, \pagetotal, \pagedepth) itself.
+-- Assigning tex.pagetotal directly does NOT stick: the dormant \pagetotal
+-- kept accumulating across blocks and, at \maxdimen (~16384pt ≈ 25 pages of
+-- content), the output routine started firing on every contribution — every
+-- block past that point died in-chain and fell back to the isolated rescue,
+-- which is exactly the "long documents crawl" wall.
+local function reseed_page()
+  local d = new_dummy()
+  local oldc = tex.lists.contrib_head
+  d.next = oldc
+  if oldc then oldc.prev = d end
+  tex.lists.page_head = nil
+  tex.lists.contrib_head = d
+  pcall(function() tex.triggerbuildpage() end)
+  -- the builder inserts \topskip glue above the first box of a fresh page;
+  -- the dummy is machinery, not content — unlink the glue or every block's
+  -- harvest would begin with a phantom 10pt
+  local h = tex.lists.page_head
+  if h and h.id == GLUE and h.next and is_dummy(h.next) then
+    tex.lists.page_head = h.next
+    h.next.prev = nil
+    h.next = nil
+    node.free(h)
+  end
+  -- Zero the WHOLE page_so_far family. The dormant page never goes through
+  -- fire_up, so the stretch/shrink accumulators grow monotonically across
+  -- every block in the lineage; past ~25 pages of cumulative content the
+  -- typesetting child starts spinning forever (every in-chain job times
+  -- out and the whole document degrades to the rescue path).
+  pcall(function()
+    tex.pagetotal = 0
+    tex.pagestretch = 0
+    tex.pagefilstretch = 0
+    tex.pagefillstretch = 0
+    tex.pagefilllstretch = 0
+    tex.pageshrink = 0
+    tex.pagedepth = 0
+  end)
+end
+
 function tdom_seed()
   pcall(function() tex.triggerbuildpage() end)
   local old = tex.lists.page_head
   local oldc = tex.lists.contrib_head
   tex.lists.contrib_head = nil
-  tex.lists.page_head = new_dummy()
-  pcall(function() tex.pagetotal = 0 end)
-  pcall(function() tex.pagedepth = 0 end)
+  tex.lists.page_head = nil
   if old then node.flush_list(old) end
   if oldc then node.flush_list(oldc) end
+  reseed_page()
   -- fresh document start: no interline glue above the first line
   tex.nest[0].prevdepth = -65536000
 end
@@ -721,11 +762,10 @@ local function harvest_nodes()
   pcall(function() tex.triggerbuildpage() end)
   local head = tex.lists.page_head
   local contrib = tex.lists.contrib_head
-  -- detach both lists from TeX first, then splice
-  tex.lists.page_head = new_dummy()
+  -- detach both lists from TeX first, then reseed through the builder
+  tex.lists.page_head = nil
   tex.lists.contrib_head = nil
-  pcall(function() tex.pagetotal = 0 end)
-  pcall(function() tex.pagedepth = 0 end)
+  reseed_page()
   if head and contrib then
     local tail = node.tail(head)
     tail.next = contrib
@@ -901,6 +941,27 @@ function tdom_hf_flush()
 end
 
 function tdom_report()
+  if os.getenv('TDOM_TRACE_MEM') then
+    local ok, st = pcall(status.list)
+    st = ok and st or {}
+    local t0 = os.clock()
+    for _ = 1, 5000 do
+      local g = node.new('glue')
+      node.free(g)
+    end
+    local tg = (os.clock() - t0) * 1000
+    t0 = os.clock()
+    for _ = 1, 2000 do
+      local h = node.new('hlist')
+      node.free(h)
+    end
+    local th = (os.clock() - t0) * 1000
+    texio.write_nl('term and log', string.format(
+      'TDOMMEM job=%s tot=%s str=%s fil=%s fill=%s shr=%s dep=%s',
+      tostring(JOB and JOB.id or '?'),
+      tostring(tex.pagetotal), tostring(tex.pagestretch), tostring(tex.pagefilstretch),
+      tostring(tex.pagefillstretch), tostring(tex.pageshrink), tostring(tex.pagedepth)))
+  end
   -- cross-block layout state: the next block's leading interline glue and
   -- \@afterheading behavior depend on these — they join the state vector so
   -- the orchestrator's convergence check re-typesets downstream blocks
@@ -962,6 +1023,20 @@ function tdom_report()
   if head then node.flush_list(head) end
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
   conn:send(payload)
+  -- Collect BEFORE this process becomes a long-lived checkpoint: the fork
+  -- chain inherits the whole Lua heap, so uncollected per-job garbage
+  -- (luatexja's per-paragraph tables, payload strings) compounds across
+  -- generations — on Japanese documents the per-block cost was measured
+  -- growing from ~1ms to ~11s along a 450-block chain without this.
+  -- Thresholded so clean-heap blocks don't pay a full GC sweep each.
+  if not os.getenv('TDOM_NO_CKPT_GC') then
+    local kb = collectgarbage('count')
+    if kb > (TDOM_GC_FLOOR or 0) + 8192 then
+      collectgarbage('collect')
+      collectgarbage('collect')
+      TDOM_GC_FLOOR = collectgarbage('count')
+    end
+  end
   -- this child now becomes the next checkpoint in the chain
   CKPT = JOB.ckpt
   conn:send('CKPT ' .. CKPT .. ' ' .. fk.getpid() .. '\n')
@@ -1059,6 +1134,9 @@ function tdom_wait()
       local len = tonumber(c) or 0
       local body = len > 0 and conn:receive(len) or ''
       local pid = fk.fork()
+      if pid and pid < 0 then
+        texio.write_nl('term and log', 'TDOMFORKFAIL job=' .. tostring(id) .. ' ckpt=' .. tostring(CKPT))
+      end
       if pid == 0 then
         JOB = { id = id, ckpt = newckpt, body = body }
         blk_labels = {}
@@ -1072,6 +1150,21 @@ function tdom_wait()
         tdom_absorb_reset()
         RENDER_MODE = false
         reconnect('job', newckpt)
+        if os.getenv('TDOM_TRACE_HANG') then
+          -- hang forensics: if this job burns absurd Lua instruction counts,
+          -- dump WHERE and bail — a silent C-side spin never trips this hook
+          local ticks = 0
+          debug.sethook(function()
+            ticks = ticks + 1
+            if ticks > 40 then
+              texio.write_nl('term and log', 'TDOMHANG job=' .. tostring(id) .. ' ' ..
+                debug.traceback('', 2):gsub('\n', ' | '):sub(1, 600))
+              io.stdout:write('\n')
+              pcall(io.stdout.flush, io.stdout)
+              fk._exit(7)
+            end
+          end, '', 10000000)
+        end
         inject_job(body, false)
         return -- resume TeX: typeset, report, then \TDOMloop brings us back
       else

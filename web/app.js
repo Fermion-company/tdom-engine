@@ -61,6 +61,17 @@ const pageDirtyRev = new Map(); // page -> srcRev of the last provisional patch
 let lastRemoveRev = 0; // srcRev of the last provisional remove-pages patch
 const docStateEl = document.getElementById('doc-state');
 
+// Band-granular convergence: an edit invalidates the canonical render only
+// where the page actually CHANGED. We diff the old and new display lists,
+// keep the canonical pixels everywhere outside the changed y-band (via a
+// clip-path window), and let only the edited lines render provisionally —
+// so a one-character math edit no longer degrades the whole page for the
+// seconds until the next canonical compile lands. A height-changing edit
+// reflows everything below it, which the diff naturally reports as a band
+// reaching the page bottom.
+const pageDls = new Map(); // page -> last rendered display list (diff base)
+const pageBands = new Map(); // page -> {top,bottom} bp | 'full', since last full canonical
+
 // ---------------------------------------------------------------- layout
 
 function applyLayoutView(value = layoutViewEl?.value || 'both') {
@@ -128,19 +139,62 @@ function nudgeLayoutSplit(delta) {
 
 // --------------------------------------------------------- editor highlight
 
-function highlightTexSource(source) {
-  if (!editorHighlightEl) return;
-  const html = escapeHtml(source || '')
+function highlightLineHtml(line) {
+  return escapeHtml(line)
     .replace(/(%[^\n]*)/g, '<span class="tok-comment">$1</span>')
     .replace(/(\\(?:[A-Za-z@]+|.))/g, '<span class="tok-command">$1</span>')
     .replace(/(\{[^{}\n]*\})/g, '<span class="tok-brace">$1</span>')
     .replace(/(\$[^$\n]*\$)/g, '<span class="tok-math">$1</span>');
-  editorHighlightEl.innerHTML = html + (source.endsWith('\n') ? '\n' : '');
 }
 
-// Re-highlighting rebuilds a document-sized innerHTML — on a large file
-// that's tens of milliseconds. Skip when the text is unchanged (scroll
-// events!) and coalesce keystroke bursts into one paint per frame.
+// Incremental highlight: one <span> per source line (the tokenizer is
+// line-local, so lines are independent). A keystroke re-renders only the
+// lines that changed instead of rebuilding a document-sized innerHTML —
+// on long documents the full rebuild was tens of milliseconds of parse
+// plus layout PER KEYSTROKE.
+let hlLines = []; // current line strings
+let hlSpans = []; // corresponding <span> elements
+
+function highlightTexSource(source) {
+  const lines = (source || '').split('\n');
+  // common prefix / suffix of the line arrays — only the middle changed
+  let p = 0;
+  const maxP = Math.min(hlLines.length, lines.length);
+  while (p < maxP && hlLines[p] === lines[p]) p++;
+  let s = 0;
+  const maxS = Math.min(hlLines.length, lines.length) - p;
+  while (s < maxS && hlLines[hlLines.length - 1 - s] === lines[lines.length - 1 - s]) s++;
+
+  const removeCount = hlLines.length - p - s;
+  const insertLines = lines.slice(p, lines.length - s);
+  const newSpans = insertLines.map((ln, i) => {
+    const span = document.createElement('span');
+    span.innerHTML = highlightLineHtml(ln) + (p + i < lines.length - 1 ? '\n' : '');
+    return span;
+  });
+  // the span BEFORE the suffix carries a trailing \n that may appear or
+  // vanish when the last line moves — refresh the boundary span's newline
+  const anchor = hlSpans[p + removeCount] ?? null;
+  for (let i = 0; i < removeCount; i++) hlSpans[p + i].remove();
+  for (const span of newSpans) editorHighlightEl.insertBefore(span, anchor);
+  hlSpans.splice(p, removeCount, ...newSpans);
+  hlLines = lines;
+  // A span's trailing newline depends on whether it is the LAST line.
+  // Exactly two positions can change "lastness" in a splice: the new last
+  // (truncation) and the span before the insertion point (append after
+  // the old last). Repair both.
+  const last = hlSpans.length - 1;
+  const fixNl = (i) => {
+    if (i < 0 || i > last) return;
+    const wantNl = i < last;
+    if (hlSpans[i].textContent.endsWith('\n') !== wantNl) {
+      hlSpans[i].innerHTML = highlightLineHtml(hlLines[i]) + (wantNl ? '\n' : '');
+    }
+  };
+  fixNl(last);
+  fixNl(p - 1);
+}
+
 let lastHighlighted = null;
 let highlightRaf = 0;
 
@@ -295,11 +349,16 @@ function adoptDoc(doc) {
   pagesEl.textContent = '';
   pageDivs.clear();
   pageDirtyRev.clear();
+  pageDls.clear();
+  pageBands.clear();
   lastRemoveRev = 0;
   mode = doc.mode ?? 'structured';
   modeReasons = doc.modeReasons ?? [];
   canonical = doc.canonical ?? null;
-  for (const dl of doc.pages) renderPage(dl, false);
+  for (const dl of doc.pages) {
+    renderPage(dl, false);
+    pageDls.set(dl.page, dl);
+  }
   appliedRev = doc.report.rev;
   appliedSrcRev = doc.report.srcRev ?? doc.report.rev;
   // a canonical compile older than the document state cannot vouch for any
@@ -403,6 +462,8 @@ function removePagesFrom(from) {
     if (n >= from) {
       div.remove();
       pageDivs.delete(n);
+      pageDls.delete(n);
+      pageBands.delete(n);
     }
   }
 }
@@ -415,11 +476,15 @@ function applyReport(report) {
   if (report.canonical) canonical = report.canonical;
   for (const patch of report.patches) {
     if (patch.type === 'replace-page') {
-      renderPage(patch.displayList, true);
+      const dl = patch.displayList;
+      // where did the page actually change? canonical keeps everything else
+      noteBand(dl.page, changedBand(dl, pageDls.get(dl.page)));
+      renderPage(dl, true);
+      pageDls.set(dl.page, dl);
       // this page now differs from the last canonical compile — provisional
-      // wins here until a compile of srcRev >= this one lands
-      pageDirtyRev.set(patch.displayList.page, appliedSrcRev);
-      updateCanonState(patch.displayList.page);
+      // wins INSIDE the changed band until a compile of srcRev >= this lands
+      pageDirtyRev.set(dl.page, appliedSrcRev);
+      updateCanonState(dl.page);
     } else if (patch.type === 'remove-pages') {
       lastRemoveRev = appliedSrcRev;
       removePagesFrom(patch.from);
@@ -429,6 +494,86 @@ function applyReport(report) {
 }
 
 // ------------------------------------------------- canonical (exact) layer
+
+/**
+ * The y-extent (bp) of everything that visually changed between two display
+ * lists of the same page. Multiset diff over serialized commands: commands
+ * present in only one side are "changed"; unchanged content shifted by a
+ * reflow differs in its coordinates, so a height-changing edit naturally
+ * yields a band reaching the bottom. Returns:
+ *   null           — no visual difference
+ *   {top, bottom}  — the changed band
+ *   'full'         — no diff base (first paint of this page)
+ */
+// Sub-visible differences must not count as "changed": glue re-resolution
+// after an async exact-rescue lands can drift every coordinate by a few
+// hundredths of a bp, which would otherwise flip whole pages to
+// provisional for an invisible reason. Quantize to 0.5bp. Chunk version
+// counters DO count — a cv bump is how an edit inside a chunk-rendered
+// block (mhchem, TikZ, rescued envs) becomes visible.
+function bandKey(c) {
+  const q = (v) => (typeof v === 'number' ? Math.round(v * 2) / 2 : v);
+  const rest = { ...c };
+  for (const f of ['x', 'y', 'w', 'h', 'sy', 'ch', 'size']) {
+    if (rest[f] !== undefined) rest[f] = q(rest[f]);
+  }
+  return JSON.stringify(rest);
+}
+
+function changedBand(newDl, prevDl) {
+  if (!prevDl || !newDl) return 'full';
+  const counts = new Map();
+  for (const c of prevDl.commands) {
+    const k = bandKey(c);
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  const changed = [];
+  for (const c of newDl.commands) {
+    const k = bandKey(c);
+    const n = counts.get(k) ?? 0;
+    if (n > 0) counts.set(k, n - 1);
+    else changed.push(c);
+  }
+  for (const [k, n] of counts) {
+    if (n > 0) changed.push(JSON.parse(k));
+  }
+  if (!changed.length) return null;
+  let top = Infinity;
+  let bottom = -Infinity;
+  for (const c of changed) {
+    if (c.op === 'glyphs') {
+      // y is the baseline: cover ascenders and descenders of the line
+      top = Math.min(top, c.y - (c.size ?? 10) * 1.2);
+      bottom = Math.max(bottom, c.y + (c.size ?? 10) * 0.5);
+    } else if (c.op === 'rule' || c.op === 'chunk') {
+      top = Math.min(top, c.y);
+      bottom = Math.max(bottom, c.y + (c.h ?? 0));
+    } else {
+      top = Math.min(top, (c.y ?? 0) - 12);
+      bottom = Math.max(bottom, (c.y ?? 0) + 4);
+    }
+  }
+  return {
+    top: Math.max(0, top),
+    bottom: Math.min(geometry.paperheight ?? bottom, bottom),
+  };
+}
+
+/** Accumulate a page's changed band until the next full canonical. */
+function noteBand(page, band) {
+  const prev = pageBands.get(page);
+  if (prev === 'full') return;
+  if (band === 'full') {
+    pageBands.set(page, 'full');
+    return;
+  }
+  // null = the patch changed nothing visible (hash-only churn): an empty
+  // band keeps the full canonical on screen instead of dropping the page
+  // to provisional for an invisible change
+  const b = band ?? { top: 0, bottom: 0 };
+  if (!prev) pageBands.set(page, { ...b });
+  else pageBands.set(page, { top: Math.min(prev.top, b.top), bottom: Math.max(prev.bottom, b.bottom) });
+}
 
 function setMode(newMode, reasons) {
   modeReasons = reasons ?? modeReasons;
@@ -442,6 +587,8 @@ function setMode(newMode, reasons) {
       delete div.dataset.prov;
     }
     pageDirtyRev.clear();
+    pageDls.clear();
+    pageBands.clear();
   }
 }
 
@@ -492,17 +639,22 @@ function syncCanonical() {
   updateBadge();
 }
 
-/** Decide, for one page, whether the canonical overlay wins right now. */
+/**
+ * Decide, for one page, how much of the canonical overlay wins right now:
+ *   final       — canonical covers the page's current source: full overlay
+ *   partial     — the page was edited since the last compile, but only a
+ *                 known band changed: canonical keeps everything OUTSIDE
+ *                 the band (clip-path window), provisional shows through
+ *                 inside it
+ *   provisional — no usable canonical (or the whole page changed)
+ */
 function updateCanonState(n) {
   const div = pageDivs.get(n);
   if (!div) return;
-  const eligible =
-    canonical &&
-    canonical.id &&
-    n <= canonical.pageCount &&
-    (pageDirtyRev.get(n) ?? 0) <= canonical.rev;
-  if (eligible) {
-    let img = div.querySelector('img.canon');
+  const canonAvail = canonical && canonical.id && n <= canonical.pageCount;
+  const fresh = canonAvail && (pageDirtyRev.get(n) ?? 0) <= canonical.rev;
+  let img = div.querySelector('img.canon');
+  if (canonAvail) {
     if (!img) {
       img = document.createElement('img');
       img.className = 'canon';
@@ -514,7 +666,7 @@ function updateCanonState(n) {
         // provisional layer; the next canonical event re-points the src
         delete img.dataset.src;
         img.removeAttribute('src');
-        div.classList.remove('is-final');
+        div.classList.remove('is-final', 'is-partial');
       });
       div.appendChild(img);
     }
@@ -523,10 +675,29 @@ function updateCanonState(n) {
       img.dataset.src = src;
       img.src = src; // in-DOM swap keeps old pixels until the new SVG decodes
     }
-    div.classList.add('is-final');
-  } else {
-    div.classList.remove('is-final');
   }
+
+  let state = 'provisional';
+  let clip = '';
+  const band = pageBands.get(n);
+  if (fresh) {
+    state = 'final';
+    pageBands.delete(n); // the compile covers everything accumulated so far
+  } else if (canonAvail && band && band !== 'full') {
+    const H = geometry.paperheight || 1;
+    const t = Math.max(0, (band.top / H) * 100);
+    const b = Math.min(100, (band.bottom / H) * 100);
+    if (b - t <= 75) {
+      // canonical everywhere except the changed band: one polygon tracing
+      // the top rectangle, bridging down the left edge, then the bottom
+      // rectangle — the band itself is left open for the provisional layer
+      state = 'partial';
+      clip = `polygon(0% 0%, 100% 0%, 100% ${t.toFixed(3)}%, 0% ${t.toFixed(3)}%, 0% ${b.toFixed(3)}%, 100% ${b.toFixed(3)}%, 100% 100%, 0% 100%)`;
+    }
+  }
+  if (img) img.style.clipPath = state === 'partial' ? clip : '';
+  div.classList.toggle('is-final', state === 'final');
+  div.classList.toggle('is-partial', state === 'partial');
   // a fully-fresh canonical is the page-count authority: provisional-only
   // pages beyond it are phantoms of the JS pagination and are hidden
   const phantom =
@@ -977,8 +1148,11 @@ sse.onmessage = (ev) => {
         appliedRev = msg.rev;
         for (const patch of msg.patches) {
           if (patch.type === 'replace-page') {
-            renderPage(patch.displayList, true);
-            updateCanonState(patch.displayList.page);
+            const dl = patch.displayList;
+            noteBand(dl.page, changedBand(dl, pageDls.get(dl.page)));
+            renderPage(dl, true);
+            pageDls.set(dl.page, dl);
+            updateCanonState(dl.page);
           } else if (patch.type === 'remove-pages') {
             removePagesFrom(patch.from);
           }

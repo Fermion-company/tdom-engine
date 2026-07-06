@@ -7,3 +7,6 @@ node_modules/
 recovered-document.tex
 .cache/
 .tdom-canon-test*/
+samples/bench-long.tex
+.tdom-bench*/
+samples/uploads/

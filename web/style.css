@@ -425,7 +425,8 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
    sits on top of (and hides) the provisional layers; pointer events pass
    through so Alt+click source mapping keeps working. */
 .page img.canon { display: none; }
-.page.is-final img.canon {
+.page.is-final img.canon,
+.page.is-partial img.canon {
   display: block;
   position: absolute;
   inset: 0;
@@ -439,9 +440,16 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 .page.is-final svg,
 .page.is-final .chunkwin,
 .page.is-final .folio { visibility: hidden; }
+/* partial: the canonical overlay is clipped to everything OUTSIDE the
+   edited band, so the provisional layers stay visible and show through
+   the window — only the edited lines change appearance while typing */
 .page.is-final .pageno::after {
   content: " · exact";
   color: var(--ok);
+}
+.page.is-partial .pageno::after {
+  content: " · exact + 編集帯";
+  color: var(--accent-2);
 }
 /* pages the fresh canonical says don't exist */
 .page.phantom { display: none; }

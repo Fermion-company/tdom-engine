@@ -61,7 +61,7 @@ const BASE_COUNTERS = [
   'equation', 'figure', 'table', 'footnote',
 ];
 const HEADING_RE = /^\s*\\(chapter|section|subsection|subsubsection|paragraph)\b/;
-const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 30_000);
+const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 12_000);
 const BOOT_TIMEOUT = 60_000;
 // Environments that drive TeX's page builder themselves (own \output,
 // column balancing against \vsize) or that MUST break across real pages
@@ -101,6 +101,13 @@ export class CheckpointEngine {
     this.preHash = null;
     this.labelTable = new Map(); // key -> value (for reboot injection)
     this.hrefTable = new Map(); // key -> hyperref anchor (\@currentHref at \label)
+    // incremental label/ref bookkeeping — the hot path must never scan
+    // every block × every label (O(L×B) melts on long documents)
+    this.blockLabelIdx = new Map(); // blockId -> [label keys its galley defines]
+    this.blockRefIdx = new Map(); // blockId -> [label keys its galley references]
+    this.labelCount = new Map(); // label key -> number of defining blocks
+    this.refIndex = new Map(); // label key -> Set<blockId> of referencing blocks
+    this.vanishedLabels = new Set(); // keys whose defining count dropped to 0
     this.fonts = new Map(); // fid -> {file,name,size,fmt, family, remap}
     this.fontFiles = new Map(); // familyKey -> absolute path
     this.pages = [];
@@ -162,6 +169,12 @@ export class CheckpointEngine {
     this.blocks = [];
     this.labelTable = new Map();
     this.hrefTable = new Map();
+    this.blockLabelIdx = new Map();
+    this.blockRefIdx = new Map();
+    this.labelCount = new Map();
+    this.refIndex = new Map();
+    this.vanishedLabels = new Set();
+    this._pageRun = null;
     this.pages = [];
     // a fresh document gets a fresh chance at the structured layer
     this.mode = 'structured';
@@ -799,21 +812,91 @@ export class CheckpointEngine {
   async #typesetBlock(idx) {
     const block = this.blocks[idx];
     const sig = fnv1a(block.text);
+    // Block-granular last resort: a block that fails BOTH the chain and the
+    // isolated rescue (mid-typing broken TeX — an unfinished \frac, a bare
+    // trailing backslash …) must never take the whole document down. It
+    // freezes at its last good galley (or renders empty when it never had
+    // one), the chain continues with a consistent state, and the block
+    // heals automatically on the next edit that changes its text. The
+    // canonical layer keeps showing LuaLaTeX's own error-recovery output.
+    const rescueSafely = async (why) => {
+      try {
+        return await this.#rescueBlock(idx, why);
+      } catch (err) {
+        this.diagnostics.push(`${block.id}: rescue failed (${err.message}) — freezing the block`);
+        return this.#brokenBlockGalley(idx);
+      }
+    };
     if (this.#needsRescue(block.text)) {
-      return this.#rescueBlock(idx, 'output-routine environment needs a real page');
+      return rescueSafely('output-routine environment needs a real page');
     }
     if (this.poisoned.get(block.id) === sig) {
-      return this.#rescueBlock(idx, 'previous in-chain failure');
+      return rescueSafely('previous in-chain failure');
+    }
+    // Established deep-lineage wall: don't even attempt the doomed in-chain
+    // job (each attempt hangs to the timeout). A probe block every 25
+    // still tries, so the chain recovers automatically if the wall lifts.
+    if ((this.chainTimeouts ?? 0) >= 3 && !block.galley && idx % 25 !== 0) {
+      this.poisoned.set(block.id, sig);
+      this.rescueQueue.set(block.id, this.#rescueCacheKey(block, idx));
+      this.#pumpRescues();
+      return this.#brokenBlockGalley(idx);
     }
     try {
-      return await this.#jobBlock(idx);
+      const galley = await this.#jobBlock(idx);
+      this.chainTimeouts = 0;
+      return galley;
     } catch (err) {
       this.poisoned.set(block.id, sig);
+      const isTimeout = /timeout/.test(err.message);
+      this.chainTimeouts = isTimeout ? (this.chainTimeouts ?? 0) + 1 : 0;
       this.diagnostics.push(
         `${block.id}: in-chain typeset failed (${err.message}) — isolated exact-render rescue`
       );
-      return this.#rescueBlock(idx, err.message);
+      // Deep-lineage wall (long luatexja documents): past ~25 pages of
+      // cumulative CJK content in one fork lineage, every in-chain job
+      // spins in luahbtex until the timeout. Once that pattern is
+      // established, stop paying a timeout plus a synchronous isolated
+      // compile PER BLOCK: freeze the block empty, queue its exact rescue
+      // on the async pump (fresh processes typeset it at normal speed off
+      // the hot path) and let the canonical layer own the pixels until the
+      // provisional tail self-repairs in the background.
+      if (isTimeout && this.chainTimeouts >= 3 && !block.galley) {
+        this.diagnostics.push(
+          `${block.id}: consecutive in-chain timeouts — deferring the tail to the async rescue pump`
+        );
+        this.rescueQueue.set(block.id, this.#rescueCacheKey(block, idx));
+        this.#pumpRescues();
+        return this.#brokenBlockGalley(idx);
+      }
+      return rescueSafely(err.message);
     }
+  }
+
+  /** Freeze a doubly-failed block: last good galley when one exists, an
+   * empty galley carrying the previous block's exit state otherwise. */
+  async #brokenBlockGalley(idx) {
+    const block = this.blocks[idx];
+    if (block.galley?.state) {
+      await this.#jobBlock(idx, {
+        id: block.id + '@state',
+        body: this.#stateJobBody({ state: block.galley.state, labels: block.galley.labels ?? [] }),
+      });
+      return { ...block.galley, tdomStale: true };
+    }
+    const prevVec = idx > 0 ? JSON.parse(this.blocks[idx - 1].stateVec ?? '[]') : [];
+    const state = {};
+    this.counters.forEach((c, i) => {
+      state[c] = prevVec[i] ?? 0;
+    });
+    state['tdom@pd'] = prevVec.length >= 3 ? prevVec[prevVec.length - 3] : -65536000;
+    state['tdom@nobreak'] = prevVec.length >= 2 ? prevVec[prevVec.length - 2] : 0;
+    state['tdom@ls'] = prevVec.length >= 1 ? prevVec[prevVec.length - 1] : 0;
+    await this.#jobBlock(idx, {
+      id: block.id + '@state',
+      body: this.#stateJobBody({ state, labels: [] }),
+    });
+    return { items: [], floats: [], w: 0, h: 0, d: 0, state, labels: [], toclines: [], refs: block.galley?.refs ?? [], fonts: {} };
   }
 
   /**
@@ -1341,7 +1424,52 @@ export class CheckpointEngine {
     return n;
   }
 
+  /** Keep the label/ref indexes in sync with one block's galley change. */
+  #indexBlock(blockId, labels, refs) {
+    const oldLabels = this.blockLabelIdx.get(blockId) ?? EMPTY_UNITS;
+    for (const k of oldLabels) {
+      const n = (this.labelCount.get(k) ?? 1) - 1;
+      if (n <= 0) {
+        this.labelCount.delete(k);
+        this.vanishedLabels.add(k);
+      } else {
+        this.labelCount.set(k, n);
+      }
+    }
+    for (const k of labels) {
+      this.labelCount.set(k, (this.labelCount.get(k) ?? 0) + 1);
+      this.vanishedLabels.delete(k);
+    }
+    if (labels.length) this.blockLabelIdx.set(blockId, labels);
+    else this.blockLabelIdx.delete(blockId);
+
+    const oldRefs = this.blockRefIdx.get(blockId) ?? EMPTY_UNITS;
+    for (const k of oldRefs) {
+      const set = this.refIndex.get(k);
+      if (set) {
+        set.delete(blockId);
+        if (!set.size) this.refIndex.delete(k);
+      }
+    }
+    for (const k of refs) {
+      let set = this.refIndex.get(k);
+      if (!set) this.refIndex.set(k, (set = new Set()));
+      set.add(blockId);
+    }
+    if (refs.length) this.blockRefIdx.set(blockId, refs);
+    else this.blockRefIdx.delete(blockId);
+  }
+
+  #unindexBlock(blockId) {
+    this.#indexBlock(blockId, EMPTY_UNITS, EMPTY_UNITS);
+  }
+
   #adoptGalley(block, galley) {
+    this.#indexBlock(
+      block.id,
+      (galley.labels ?? []).map((l) => l.k),
+      galley.refs ?? []
+    );
     block.galley = galley;
     block.galleyHash = fnv1a(
       JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events])
@@ -1501,6 +1629,7 @@ export class CheckpointEngine {
     segs = this.#expandIncludes(segs, 0);
     const diff = diffBlocks(this.blocks, segs, () => this.idSeq++);
     this.blocks = diff.blocks;
+    for (const id of diff.removed) this.#unindexBlock(id);
     const dirtySource = new Set(diff.dirty);
     t.lap('segment');
 
@@ -1545,7 +1674,6 @@ export class CheckpointEngine {
     const changedLabels = new Set();
     let typesetCount = 0;
     let forkMs = 0;
-    const oldLabels = new Map(this.labelTable);
 
     let i = this.#nearestCheckpoint(Math.min(firstDirty, this.blocks.length));
     while (i < this.blocks.length) {
@@ -1583,13 +1711,12 @@ export class CheckpointEngine {
     }
     const fgStop = i;
 
-    // labels that vanished entirely
-    for (const key of oldLabels.keys()) {
-      let stillDefined = false;
-      for (const b of this.blocks) {
-        if ((b.galley?.labels ?? []).some((l) => l.k === key)) { stillDefined = true; break; }
-      }
-      if (!stillDefined) {
+    // labels whose defining blocks all disappeared — index-driven, no
+    // labels × blocks scan on the hot path
+    for (const key of [...this.vanishedLabels]) {
+      this.vanishedLabels.delete(key);
+      if (this.labelCount.has(key)) continue; // redefined meanwhile
+      if (this.labelTable.has(key)) {
         this.labelTable.delete(key);
         changedLabels.add(key);
       }
@@ -1597,10 +1724,17 @@ export class CheckpointEngine {
 
     // Backward references: a label defined LATER in the chain (new figure,
     // renamed equation...) can be referenced by EARLIER blocks, which the
-    // forward pass never revisits. Retypeset those ref-users explicitly.
+    // forward pass never revisits. Retypeset those ref-users explicitly —
+    // candidates come from the ref index, not a full block scan.
     if (changedLabels.size) {
-      for (let c = 0; c < this.blocks.length; c++) {
+      const candidates = new Set();
+      for (const k of changedLabels) {
+        for (const bid of this.refIndex.get(k) ?? []) candidates.add(bid);
+      }
+      for (let c = 0; c < this.blocks.length && candidates.size; c++) {
         const block = this.blocks[c];
+        if (!candidates.has(block.id)) continue;
+        candidates.delete(block.id);
         const hit = (block.galley?.refs ?? []).some(
           (k) => changedLabels.has(k) && !resolvedInGalley(block, k, this.labelTable)
         );
@@ -1622,9 +1756,7 @@ export class CheckpointEngine {
     t.lap('typeset');
 
     for (const key of changedLabels) {
-      for (const b of this.blocks) {
-        if ((b.galley?.refs ?? []).includes(key)) push2(depDirty, 'label', key, b.id);
-      }
+      for (const bid of this.refIndex.get(key) ?? []) push2(depDirty, 'label', key, bid);
     }
 
     // ---- live table of contents -----------------------------------------
@@ -1828,6 +1960,7 @@ export class CheckpointEngine {
     }
     this.preHash = null; // a later promotion must reboot from scratch
     this.pages = [];
+    this._pageRun = null;
   }
 
   // ------------------------------------- canonical arrival + verification
@@ -2385,9 +2518,50 @@ export class CheckpointEngine {
 
   #paginateNow() {
     this.#rebuildUnits();
+    const prev = this._pageRun;
+    const seq = this.blocks.map((b) => b.units ?? EMPTY_UNITS);
+    // memo: repeated paginations inside one update (toc pass, offset
+    // check, async repaints) are free when no block's units changed
+    if (prev && prev.geoRef === this.geometry && sameUnitSeq(prev.seq, seq)) {
+      return prev.pages;
+    }
     const stream = [];
-    for (const block of this.blocks) stream.push(...(block.units ?? []));
-    return buildPages(stream, this.geometry);
+    const offsets = new Array(seq.length);
+    for (let i = 0; i < seq.length; i++) {
+      offsets[i] = stream.length;
+      const u = seq[i];
+      for (let j = 0; j < u.length; j++) stream.push(u[j]);
+    }
+    let incr = null;
+    if (prev && prev.geoRef === this.geometry) {
+      // common prefix/suffix of the per-block unit arrays: the builder
+      // resumes before the first divergence and resyncs in the suffix
+      const old = prev.seq;
+      let p = 0;
+      while (p < old.length && p < seq.length && old[p] === seq[p]) p++;
+      let s = 0;
+      while (s < old.length - p && s < seq.length - p && old[old.length - 1 - s] === seq[seq.length - 1 - s]) s++;
+      const dirtyFromSi = p < offsets.length ? offsets[p] : stream.length;
+      const suffixStartNew = seq.length - s < offsets.length ? offsets[seq.length - s] : stream.length;
+      const suffixStartOld =
+        old.length - s < prev.offsets.length ? prev.offsets[old.length - s] : prev.streamLen;
+      incr = {
+        prevRun: prev.run,
+        dirtyFromSi,
+        suffixStartNew,
+        suffixShift: suffixStartNew - suffixStartOld,
+      };
+    }
+    const pages = buildPages(stream, this.geometry, incr);
+    this._pageRun = {
+      geoRef: this.geometry,
+      seq,
+      offsets,
+      streamLen: stream.length,
+      run: pages.__run,
+      pages,
+    };
+    return pages;
   }
 
   #rebuildUnits() {
@@ -3186,6 +3360,14 @@ function braceImbalance(text) {
     }
   }
   return d;
+}
+
+const EMPTY_UNITS = [];
+
+function sameUnitSeq(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 function push2(list, kind, key, blockId) {
