@@ -11,3 +11,4 @@ samples/bench-long.tex
 .tdom-bench*/
 samples/uploads/
 .tdom-hotpath-test*/
+.tdom-ship-test*/

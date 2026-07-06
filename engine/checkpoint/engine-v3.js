@@ -52,6 +52,7 @@ import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { buildPages, reconcile, parsePlacement } from './pagebuilder.js';
 import { mapLegacyFont, remapText } from './mathmap.js';
 import { CanonicalRenderer } from './canonical.js';
+import { ensureShim } from './forkshim.js';
 import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
 import { classifyGalley, demoteFidelity, SAFE_GLYPH } from './fidelity.js';
 import { statSync, watch } from 'node:fs';
@@ -388,14 +389,7 @@ export class CheckpointEngine {
   // ---------------------------------------------------------- root/daemon
 
   async #ensureShim() {
-    const so = path.join(this.workDir, 'tdomfork.so');
-    const src = path.join(DIR, 'tdomfork.c');
-    if (existsSync(so)) return;
-    const args =
-      process.platform === 'darwin'
-        ? ['-O2', '-shared', '-undefined', 'dynamic_lookup', '-o', so, src]
-        : ['-O2', '-shared', '-fPIC', '-o', so, src];
-    await execFileP('cc', args, { timeout: 60_000 });
+    await ensureShim(this.workDir);
   }
 
   async #ensureServer() {
