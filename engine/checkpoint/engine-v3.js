@@ -3593,6 +3593,19 @@ export class CheckpointEngine {
       this.rev++;
       this.onAsyncPatches({ rev: this.rev, patches });
     }
+    // toc drift: an async landing (header job, rescue offsets, chunk
+    // adoption) moved provisional page numbers AFTER the last toc pass —
+    // the \tableofcontents blocks would keep printing the older numbers
+    // (the one identity gap the farm's incremental-vs-scratch check kept
+    // finding). Queue the settle pass; #chainAfterPass runs the toc
+    // fixpoint once the stream is quiet.
+    if (this.mode === 'structured' && !this.pendingChain) {
+      const consumer = this.blocks.findIndex((b) => b.consumesToc);
+      if (consumer >= 0 && this.#computeToc(pages).hash !== this.tocHash) {
+        this.#queueChainWork('settle', consumer, []);
+        this.#scheduleBackground(consumer, []);
+      }
+    }
   }
 
   // --------------------------------------------------------------- units
