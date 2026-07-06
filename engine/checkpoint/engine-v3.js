@@ -53,6 +53,7 @@ import { buildPages, reconcile, parsePlacement } from './pagebuilder.js';
 import { mapLegacyFont, remapText } from './mathmap.js';
 import { CanonicalRenderer } from './canonical.js';
 import { ensureShim } from './forkshim.js';
+import { ShippingChain } from './shipping.js';
 import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
 import { classifyGalley, demoteFidelity, SAFE_GLYPH } from './fidelity.js';
 import { statSync, watch } from 'node:fs';
@@ -197,6 +198,19 @@ export class CheckpointEngine {
     });
     this.canonical.onResult = (info) => this.#onCanonicalResult(info);
     this.onCanonical = null; // callback(info) for the server's SSE fanout
+
+    // shipping chain: the INCREMENTAL authority (goal "invisible canonical",
+    // phase 1). Feature-flagged while the ja long-document numbers are
+    // gathered; the cold canonical stays as the demand-paced final audit.
+    this.onShipPage = null; // callback({page, gen, srcRev}) for SSE fanout
+    this.shipGenRev = new Map(); // wave generation -> srcRev it converges to
+    this.shipBootedFor = null; // preamble hash the chain booted with
+    this.shipStale = false; // a label diverged from its seed: cold owns truth
+    this.shipBooting = false;
+    this.shipBootTimer = null;
+    this.shipLabelOverrides = new Map(); // ship-observed truth for reseeding
+    this.shipBootTries = 0; // bounded per preamble: a reboot loop burns CPU
+    this.shipping = process.env.TDOM_SHIP === '1' ? this.#makeShipping() : null;
     this.mode = 'structured'; // 'structured' | 'opaque'
     this.modeReasons = [];
     this.opaqueStickyPre = null; // preamble hash a dynamic demotion sticks to
@@ -281,6 +295,8 @@ export class CheckpointEngine {
     this.closed = true;
     this.bgAbort = true;
     this.canonical.dispose();
+    clearTimeout(this.shipBootTimer);
+    if (this.shipping) await this.shipping.close().catch(() => {});
     this.rescueQueue.clear();
     for (const child of this.isoChildren) {
       try { child.kill('SIGKILL'); } catch { /* gone */ }
@@ -2267,6 +2283,7 @@ export class CheckpointEngine {
     // off the hot path; when it lands the client swaps every clean page to
     // LuaLaTeX's own pixels
     this.canonical.schedule(text, this.srcRev);
+    this.#shipUpdate(text);
     return {
       rev: this.rev,
       srcRev: this.srcRev,
@@ -2341,6 +2358,147 @@ export class CheckpointEngine {
   // renders, and anything it rejects reports its real TeX error while the
   // last good pages stay up.
 
+  // ------------------------------------------- shipping chain (phase 1)
+
+  #makeShipping() {
+    const chain = new ShippingChain({
+      workDir: path.join(this.workDir, 'ship'),
+      docDir: this.docDir,
+    });
+    chain.onPaged = ({ page, gen }) => {
+      if (this.shipStale || chain !== this.shipping) return;
+      this.onShipPage?.({ page, gen, srcRev: this.shipGenRev.get(gen) ?? 0 });
+    };
+    chain.onLabel = ({ key, val }) => {
+      const known = this.labelTable.get(key);
+      const seeded = this.shipLabelOverrides.get(key) ?? known;
+      if (seeded !== undefined && String(seeded) !== String(val) && !this.shipStale) {
+        // backward effect: a label value the seeds promised has moved —
+        // EARLIER pages may print stale numbers. Record the SHIP-observed
+        // truth and reboot with corrected seeds (bounded: a divergence the
+        // reseed cannot absorb must not loop). Until then the cold
+        // canonical owns the display truth.
+        this.shipStale = true;
+        this.shipLabelOverrides.set(key, val);
+        this.diagnostics.push(`shipping: label ${key} diverged (${seeded} -> ${val}) — reseeding`);
+        this.#queueShipBoot();
+      } else if (seeded === undefined) {
+        this.shipLabelOverrides.set(key, val);
+      }
+    };
+    return chain;
+  }
+
+  /**
+   * Boot (or reboot) the incremental authority with the engine's own seeds:
+   * label values + their provisional page numbers, and the computed
+   * toc/lof/lot. Off the hot path; edits during the boot are caught by the
+   * source comparison at the end.
+   */
+  async #bootShipping() {
+    if (!this.shipping || this.mode !== 'structured' || this.shipBooting) return;
+    this.shipBooting = true;
+    try {
+      const text = this.store.get(this.file);
+      const preHash = this.preHash;
+      if (this.shipBootedFor !== preHash) this.shipBootTries = 0;
+      if (this.shipBootedFor !== null || this.shipping.rootPeer || this.shipping.disposed) {
+        // a previous run exists: replace the whole instance (its net server
+        // and process tree die with it)
+        await this.shipping.close().catch(() => {});
+        this.shipping = this.#makeShipping();
+      }
+      const prov = this.#paginateNow();
+      const blockPage = new Map();
+      for (const page of this.pages) {
+        for (const d of page.draw ?? []) {
+          const bid = d.u?.blockId;
+          if (bid && !blockPage.has(bid)) blockPage.set(bid, page.number);
+        }
+      }
+      const labelPage = new Map();
+      for (const [bid, keys] of this.blockLabelIdx) {
+        for (const k of keys) {
+          if (!labelPage.has(k)) labelPage.set(k, blockPage.get(bid) ?? 1);
+        }
+      }
+      const labelSeed = [...this.labelTable].map(([k, v]) => [
+        k,
+        [this.shipLabelOverrides.get(k) ?? v, labelPage.get(k) ?? 1],
+      ]);
+      for (const [k, v] of this.shipLabelOverrides) {
+        if (!this.labelTable.has(k)) labelSeed.push([k, [v, labelPage.get(k) ?? 1]]);
+      }
+      const toc = this.#computeToc(prov);
+      this.shipStale = false;
+      this.shipGenRev.clear();
+      this.shipGenRev.set(0, this.srcRev);
+      this.shipBootTries = this.shipBootedFor === preHash ? this.shipBootTries + 1 : 1;
+      await this.shipping.open(text, { labelSeed, contents: toc.contents });
+      this.shipBootedFor = preHash;
+      // an edit landed while booting: converge the wave to it now
+      const now = this.store.get(this.file);
+      if (now !== text) this.#shipUpdate(now);
+    } catch (err) {
+      this.diagnostics.push('shipping boot failed: ' + err.message);
+      this.shipBootedFor = null;
+    } finally {
+      this.shipBooting = false;
+    }
+  }
+
+  #queueShipBoot() {
+    if (!this.shipping || this.shipBootTimer) return;
+    if (this.shipBootTries >= 3) return; // stays cold-covered; a preamble
+    // edit resets the budget (a genuinely divergent doc must not loop)
+    const arm = () => {
+      this.shipBootTimer = setTimeout(() => {
+        this.shipBootTimer = null;
+        // a stale-but-running run is a TRUTH HARVESTER: every divergent
+        // label it reports lands in shipLabelOverrides, so ONE reboot with
+        // the complete truth converges. Killing it at the first divergence
+        // would relearn one label per boot and exhaust the budget.
+        if (this.shipping && !this.shipping.done && this.shipping.rootPeer?.alive && !this.shipping.err) {
+          arm();
+          return;
+        }
+        this.#bootShipping().catch(() => {});
+      }, 800);
+      this.shipBootTimer.unref?.();
+    };
+    arm();
+  }
+
+  /** Hot-path hook: cheap (a unit diff + one socket line). */
+  #shipUpdate(text) {
+    if (!this.shipping || this.mode !== 'structured') return;
+    if (this.shipBooting) return; // boot-end convergence will catch up
+    if (
+      this.shipping.err?.message?.startsWith('pdf-opened-at-root') &&
+      this.shipBootedFor === this.preHash &&
+      this.shipDisabledFor !== this.preHash
+    ) {
+      // hyperref-class document: the per-page lazy-open scheme cannot work;
+      // the cold canonical owns the display. Disabled PER PREAMBLE — a
+      // preamble edit (or another document) gets a fresh chance.
+      this.shipDisabledFor = this.preHash;
+      this.diagnostics.push('shipping disabled for this preamble: ' + this.shipping.err.message);
+    }
+    if (this.shipDisabledFor === this.preHash) return;
+    if (this.shipBootedFor !== this.preHash || this.shipStale || this.shipping.err) {
+      this.#queueShipBoot();
+      return;
+    }
+    const r = this.shipping.resume(text);
+    if (r.mode === 'resumed') {
+      this.shipGenRev.set(this.shipping.gen, this.srcRev);
+    } else if (r.mode === 'unchanged') {
+      this.shipGenRev.set(this.shipping.gen, this.srcRev);
+    } else if (r.mode === 'reboot-needed') {
+      this.#queueShipBoot();
+    }
+  }
+
   #opaqueUpdate(editLabel, t, reasons) {
     const text = this.store.get(this.file);
     if (this.mode !== 'opaque') {
@@ -2355,6 +2513,7 @@ export class CheckpointEngine {
     this.rev++;
     this.srcRev++;
     this.canonical.schedule(text, this.srcRev);
+    this.#shipUpdate(text);
     return {
       rev: this.rev,
       srcRev: this.srcRev,
@@ -2431,6 +2590,10 @@ export class CheckpointEngine {
     this.renderHold.clear();
     this.pendingChain = null;
     this.editHold = [];
+    clearTimeout(this.shipBootTimer);
+    this.shipBootTimer = null;
+    this.shipBootedFor = null;
+    if (this.shipping) this.shipping.close().catch(() => {});
     for (const child of this.isoChildren) {
       try { child.kill('SIGKILL'); } catch { /* gone */ }
     }

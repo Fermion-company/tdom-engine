@@ -60,6 +60,7 @@ export class ShippingChain {
     this.svgCache = new Map(); // `${gen}:${page}` -> svg
     this.done = false; // current run reached EOF
     this.onShip = null; // callback({page, nline, gen})
+    this.onPaged = null; // callback({page, gen, pdf}) — pixels ready
     this.onLabel = null; // callback({key, val, page})
     this.onDone = null; // callback({pages, gen})
     this.disposed = false;
@@ -86,7 +87,19 @@ export class ShippingChain {
     // the live feeder ending its run through \enddocument closes its socket:
     // that IS completion (superseded feeders are replaced before their DIE)
     sock.on('close', () => {
-      if (!this.disposed && peer === this.rootPeer && !this.done) {
+      if (this.disposed) return;
+      // a pager's EXIT is the completion signal for its page: the PDF is
+      // fully flushed exactly when the process is gone (an in-run message
+      // races the final xref write)
+      if (peer.role === 'pager' && peer.gen === this.gen) {
+        const dir = path.join(this.workDir, `ship-g${peer.gen}-p${peer.idx}`);
+        const pdf = path.join(dir, 'driver-ship.pdf');
+        if (existsSync(pdf)) {
+          this.pagePdf.set(peer.idx, pdf);
+          this.onPaged?.({ page: peer.idx, gen: peer.gen, pdf });
+        }
+      }
+      if (peer === this.rootPeer && !this.done) {
         this.done = true;
         this.onDone?.({ pages: this.ships.length, gen: this.gen });
       }
@@ -124,6 +137,7 @@ export class ShippingChain {
       peer.role = parts[1];
       peer.idx = Number(parts[2]);
       peer.pid = Number(parts[3]);
+      peer.gen = parts[4] !== undefined ? Number(parts[4]) : this.gen;
       if (peer.role === 'root') this.rootPeer = peer;
       if (peer.role === 'ckpt') this.checkpoints.set(peer.idx, peer);
       return;
@@ -142,14 +156,26 @@ export class ShippingChain {
     if (kind === 'SSHIP') {
       const page = Number(parts[1]);
       const nline = Number(parts[2]);
-      this.ships.push({ page, nline, gen: this.gen });
-      this.onShip?.({ page, nline, gen: this.gen });
+      const gen = Number(parts[3] ?? this.gen);
+      if (gen !== this.gen) return; // a superseded lineage's late report
+      this.ships.push({ page, nline, gen });
+      // resource cap: resume checkpoints are resident processes. Keep the
+      // RECENT pages densely (typing locality: a wave restarts at the
+      // edited page) and every GRIDth boundary sparsely — a cold jump
+      // replays at most GRID-1 extra pages, tens of ms each.
+      const recent = Number(process.env.TDOM_SHIP_RECENT ?? 16);
+      const grid = Number(process.env.TDOM_SHIP_GRID ?? 8);
+      for (const [pg, ck] of [...this.checkpoints]) {
+        if (pg > page - recent || pg % grid === 0) continue;
+        ck.send('DIE\n');
+        this.checkpoints.delete(pg);
+      }
+      this.onShip?.({ page, nline, gen });
       return;
     }
-    if (kind === 'SPAGED') {
-      const page = Number(parts[1]);
-      const dir = path.join(this.workDir, `ship-g${this.gen}-p${page}`);
-      this.pagePdf.set(page, path.join(dir, 'driver-ship.pdf'));
+    if (kind === 'SPDFROOT') {
+      this.err = new Error('pdf-opened-at-root (hyperref-class document)');
+      this.done = true;
       return;
     }
     if (kind === 'SRESUMED') {
@@ -191,7 +217,8 @@ export class ShippingChain {
       if (key.startsWith('cite:')) {
         L.push(`\\global\\@namedef{b@${key.slice(5)}}{${val}}`);
       } else {
-        L.push(`\\global\\@namedef{r@${key}}{{${val}}{1}}`);
+        const v = Array.isArray(val) ? val : [val, 1];
+        L.push(`\\global\\@namedef{r@${key}}{{${v[0]}}{${v[1] ?? 1}}}`);
       }
     }
     // capture labels at definition time (the aux is never read back)
@@ -303,7 +330,14 @@ export class ShippingChain {
     }
     const old = this.rootPeer;
     this.rootPeer = null; // a superseded feeder's close is not completion
-    if (old?.alive) old.send('DIE\n');
+    if (old?.alive) {
+      old.send('DIE\n');
+      // a feeder deep inside typesetting reads the socket only at its next
+      // SNEED — kill it outright so the wave preempts instantly
+      if (old.pid) {
+        try { process.kill(old.pid, 'SIGKILL'); } catch { /* gone */ }
+      }
+    }
     this.ships = this.ships.filter((s) => s.page <= best.page);
     for (const [page] of [...this.pagePdf]) {
       if (page > best.page) this.pagePdf.delete(page);

@@ -92,26 +92,25 @@ function tdom_ship_before()
   -- before finalizing the page PDF
   local aux = io.open(dir .. '/driver-ship.aux', 'w')
   if aux then aux:write('\\relax\n') aux:close() end
+  local mygen = GEN
   local pid = fk.fork()
   if pid == 0 then
     ROLE = 'pager'
     lfs.chdir(dir)
     pcall(function() conn:close() end) -- drop the INHERITED parent fd:
     -- otherwise the parent's socket never closes while children live
-    connect('pager', page)
-    local notify = function()
-      pcall(function() conn:send('SPAGED ' .. page .. '\n') end)
-    end
-    if luatexbase and luatexbase.add_to_callback then
-      pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdomship')
-    else
-      pcall(callback.register, 'finish_pdffile', notify)
-    end
+    -- HELLO carries the generation; page completion is detected by the
+    -- ORCHESTRATOR when this process exits (socket close) — finish_pdffile
+    -- fires before the file is fully flushed, so a message from inside the
+    -- run can race the conversion reading a truncated PDF
+    conn = assert(sock.connect('127.0.0.1', PORT))
+    conn:setoption('tcp-nodelay', true)
+    send('SHELLO pager ' .. page .. ' ' .. fk.getpid() .. ' ' .. mygen .. '\n')
     tex.setcount('global', 'TDOMdiscard', 0) -- this child ships for real
     return
   end
   PAGE = page
-  send('SSHIP ' .. PAGE .. ' ' .. NLINE .. '\n')
+  send('SSHIP ' .. PAGE .. ' ' .. NLINE .. ' ' .. GEN .. '\n')
   -- resume checkpoint: full state at page PAGE's boundary (its box copy is
   -- discarded on resume exactly like the parent discards it now)
   local cpid = fk.fork()
@@ -171,7 +170,20 @@ end
 -- (\TDOMshiploop) so each printed unit is a single input level that opens
 -- and CLOSES before the next step — a Lua-side recursion would stack input
 -- levels and hit "text input levels=15".
+local PDFCHECKED = false
 function tdom_ship_feed()
+  if not PDFCHECKED then
+    PDFCHECKED = true
+    -- hyperref-class documents write PDF objects during \begin{document}:
+    -- the ROOT's pdf is then already open, every pager inherits the shared
+    -- fd and the per-page lazy-open scheme cannot work. Report and stop —
+    -- the cold canonical owns these documents (same as before phase 1).
+    if lfs.attributes(WORKDIR .. '/driver-ship.pdf') then
+      send('SPDFROOT\n')
+      tex.print('\\csname @@end\\endcsname')
+      return
+    end
+  end
   if ROLE == 'pagerdone' then
     -- main loop, outside any output routine: end the run so luatex
     -- finalizes this pager's single-page PDF (finish_pdffile → SPAGED)

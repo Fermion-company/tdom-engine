@@ -405,6 +405,11 @@ engine.onExternalChange = () => {
 engine.onCanonical = (info) => {
   broadcast({ kind: 'canonical', canonical: info, mode: engine.mode });
 };
+// incremental authority (TDOM_SHIP=1): a page's real pixels landed — the
+// client swaps just that page, without waiting for the cold compile
+engine.onShipPage = (info) => {
+  broadcast({ kind: 'ship', ...info });
+};
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -567,6 +572,20 @@ const server = http.createServer(async (req, res) => {
         'Content-Type': 'image/svg+xml',
         // the URL carries the compile id — content under it never changes
         'Cache-Control': id ? 'public, max-age=31536000, immutable' : 'no-cache',
+      });
+      return res.end(svg);
+    }
+    if (req.method === 'GET' && url.pathname.startsWith('/ship/')) {
+      const n = Number(url.pathname.slice('/ship/'.length).replace(/\.svg$/, ''));
+      const svg = engine.shipping ? await engine.shipping.pageSVG(n).catch(() => null) : null;
+      if (!svg) {
+        res.writeHead(404, { 'Cache-Control': 'no-store' });
+        return res.end('no shipped page');
+      }
+      res.writeHead(200, {
+        'Content-Type': 'image/svg+xml',
+        // the URL carries gen+rev — content under it never changes
+        'Cache-Control': url.searchParams.get('g') ? 'public, max-age=31536000, immutable' : 'no-cache',
       });
       return res.end(svg);
     }

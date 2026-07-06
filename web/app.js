@@ -57,6 +57,10 @@ const pageDivs = new Map();
 let mode = 'structured'; // 'structured' | 'opaque'
 let modeReasons = [];
 let canonical = null; // {id, rev(srcRev), pageCount, paper, inFlight, error}
+// incremental authority (shipping chain): page -> {gen, srcRev}. A shipped
+// page is the SAME fidelity class as a canonical page (a real LuaLaTeX
+// page), it just arrives ~ms after the edit instead of after a full compile.
+const shipPages = new Map();
 let appliedSrcRev = 0;
 const pageDirtyRev = new Map(); // page -> srcRev of the last provisional patch
 let lastRemoveRev = 0; // srcRev of the last provisional remove-pages patch
@@ -378,6 +382,7 @@ function adoptDoc(doc) {
   mode = doc.mode ?? 'structured';
   modeReasons = doc.modeReasons ?? [];
   canonical = doc.canonical ?? null;
+  shipPages.clear();
   for (const dl of doc.pages) {
     renderPage(dl, false);
     pageDls.set(dl.page, dl);
@@ -678,9 +683,14 @@ function updateCanonState(n) {
   const div = pageDivs.get(n);
   if (!div) return;
   const canonAvail = canonical && canonical.id && n <= canonical.pageCount;
-  const fresh = canonAvail && (pageDirtyRev.get(n) ?? 0) <= canonical.rev;
+  const coldFresh = canonAvail && (pageDirtyRev.get(n) ?? 0) <= canonical.rev;
+  const ship = shipPages.get(n);
+  const shipOk = !!ship && (pageDirtyRev.get(n) ?? 0) <= ship.srcRev;
+  // prefer the freshest real-pixels source for THIS page
+  const useShip = shipOk && (!coldFresh || ship.srcRev > canonical.rev);
+  const fresh = coldFresh || useShip;
   let img = div.querySelector('img.canon');
-  if (canonAvail) {
+  if (canonAvail || useShip) {
     if (!img) {
       img = document.createElement('img');
       img.className = 'canon';
@@ -696,7 +706,9 @@ function updateCanonState(n) {
       });
       div.appendChild(img);
     }
-    const src = `/canonical/${n}.svg?c=${canonical.id}`;
+    const src = useShip
+      ? `/ship/${n}.svg?g=${ship.gen}&r=${ship.srcRev}`
+      : `/canonical/${n}.svg?c=${canonical.id}`;
     if (img.dataset.src !== src) {
       img.dataset.src = src;
       img.src = src; // in-DOM swap keeps old pixels until the new SVG decodes
@@ -1239,6 +1251,12 @@ sse.onmessage = (ev) => {
       canonical = msg.canonical;
       if (msg.mode) setMode(msg.mode, modeReasons);
       syncCanonical();
+      return;
+    }
+    if (msg.kind === 'ship') {
+      // one page's real pixels landed from the incremental authority
+      shipPages.set(msg.page, { gen: msg.gen, srcRev: msg.srcRev });
+      if (pageDivs.has(msg.page)) updateCanonState(msg.page);
       return;
     }
     if (msg.kind === 'patches') {

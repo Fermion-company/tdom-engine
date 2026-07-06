@@ -18,6 +18,7 @@
 | [08-canonical-exact-layer.md](./08-canonical-exact-layer.md) | canonical exact layer、安全ゲート、opaque 化、block rescue |
 | [09-visual-fidelity-gate.md](./09-visual-fidelity-gate.md) | visual fidelity gate と exact chunk demotion |
 | [10-edit-hot-path.md](./10-edit-hot-path.md) | 編集ホットパス、checkpoint 再利用、非同期追従 |
+| [11-shipping-chain.md](./11-shipping-chain.md) | shipping chain（incremental canonical）: ページ境界 checkpoint 付き実ラン、`TDOM_SHIP=1` |
 
 ## 現行実装の短い要約
 

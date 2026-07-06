@@ -14,6 +14,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { ShippingChain } from '../engine/checkpoint/shipping.js';
+import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 
 const execFileP = promisify(execFile);
 const WORK = fileURLToPath(new URL('../.tdom-ship-test', import.meta.url));
@@ -130,4 +131,52 @@ test('slice 2: a tail edit resumes from the page checkpoint, wave == cold truth'
   // the whole point: the authority wave is fast (goal: viewed page ≤ 300ms)
   assert.ok(waveMs < 5000, `resume wave took ${waveMs}ms`);
   console.log(`    resume wave: ${waveMs}ms for ${shipped.length - (r.fromPage - 1)} page(s)`);
+});
+
+test('slice 3: engine integration — an edit lands a ship page event', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  const work = path.join(WORK, 'engine');
+  rmSync(work, { recursive: true, force: true });
+  const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
+  try {
+    const arrivals = [];
+    eng.onShipPage = (info) => arrivals.push(info);
+    await eng.open(source);
+    // the ship boot is idle-gated (~800ms) and then ships every page
+    const t0 = Date.now();
+    while ((!eng.shipping?.done || eng.shipBooting) && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(eng.shipping?.done, 'shipping chain booted and completed');
+    // pager PDFs finalize at pager EXIT, which trails the feeder's end
+    const t0b = Date.now();
+    while (arrivals.length < 2 && Date.now() - t0b < 15_000) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(arrivals.length >= 2, `boot shipped pages (${arrivals.length})`);
+
+    // edit tail material: the wave must re-land page 2 at the new srcRev
+    const marker = 'renumbers these very citations';
+    const src = eng.getSource();
+    const at = src.includes(marker) ? src.indexOf(marker) : src.indexOf('renumbers these citations');
+    assert.ok(at > 0);
+    await eng.edit(at, at, 'X');
+    const rev = eng.srcRev;
+    const t1 = Date.now();
+    while (
+      !arrivals.some((a) => a.srcRev === rev && a.page >= 2) &&
+      Date.now() - t1 < 30_000
+    ) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const hit = arrivals.find((a) => a.srcRev === rev && a.page >= 2);
+    assert.ok(hit, 'edited page re-shipped at the new source revision');
+    console.log(`    engine wave: page ${hit.page} in ${Date.now() - t1}ms after edit`);
+    const svg = await eng.shipping.pageSVG(hit.page);
+    assert.ok(svg && svg.includes('<svg'), 'shipped page serves as SVG');
+    assert.equal(eng.shipStale, false, 'no label divergence on a plain edit');
+  } finally {
+    delete process.env.TDOM_SHIP;
+    await eng.close();
+  }
 });
