@@ -56,6 +56,7 @@ import { ensureShim } from './forkshim.js';
 import { ShippingChain } from './shipping.js';
 import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
 import { classifyGalley, demoteFidelity, SAFE_GLYPH } from './fidelity.js';
+import { cropSvg, cropSvgAt, r2 } from './util/svg.js';
 import { statSync, watch } from 'node:fs';
 
 const execFileP = promisify(execFile);
@@ -4907,27 +4908,6 @@ function resolveFont(name) {
   }
 }
 
-/**
- * Normalize a pdftocairo page SVG to the exact box extent (bp): content is
- * anchored at the origin by the driver's \hoffset/\voffset, so setting the
- * viewBox crops precisely regardless of the page size the ship went out at.
- */
-function cropSvg(svg, wBp, hBp) {
-  return svg.replace(
-    /<svg([^>]*?)width="[^"]*" height="[^"]*" viewBox="[^"]*"/,
-    `<svg$1width="${wBp}pt" height="${hBp}pt" viewBox="0 0 ${wBp} ${hBp}"`
-  );
-}
-
-/** cropSvg with an origin offset — for real \@outputpage ships, whose content
- * sits at (oddsidemargin, topmargin+headheight+headsep) under \hoffset=-1in. */
-function cropSvgAt(svg, xBp, yBp, wBp, hBp) {
-  return svg.replace(
-    /<svg([^>]*?)width="[^"]*" height="[^"]*" viewBox="[^"]*"/,
-    `<svg$1width="${wBp}pt" height="${hBp}pt" viewBox="${xBp} ${yBp} ${wBp} ${hBp}"`
-  );
-}
-
 /** Wait until a PDF file exists and ends with %%EOF (flushed completely). */
 async function waitForPdf(p, timeoutMs = 5000) {
   const t0 = Date.now();
@@ -4978,10 +4958,6 @@ function push2(list, kind, key, blockId) {
     list.push(entry);
   }
   if (!entry.affected.includes('blk-' + blockId)) entry.affected.push('blk-' + blockId);
-}
-
-function r2(v) {
-  return Math.round(v * 100) / 100;
 }
 
 class Timer {
