@@ -190,7 +190,14 @@ export class CheckpointEngine {
     this.tocHash = null;
     this.includes = new Map(); // path -> {mtime, text}
     this.watchers = new Map(); // path -> FSWatcher
-    this.maxCheckpoints = 64;
+    // Resident-fork budget. Every checkpoint is a live lualatex process
+    // (~100-300MB unique RSS on package-heavy preambles), so N engines on a
+    // big document multiply into real RAM: 64 forks × 2 audit engines ×
+    // stress preamble ≈ machine death by OOM kill wave (observed: macOS
+    // took down the server AND the editor session). Audit tools run with a
+    // reduced budget via this env; sparse grids only cost ~3ms replay per
+    // skipped block on resume.
+    this.maxCheckpoints = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
 
     // canonical layer: the exact-output authority (see file header)
     this.canonical = new CanonicalRenderer({

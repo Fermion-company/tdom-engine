@@ -18,6 +18,12 @@
 //   defaults: corpus/06-refs-heavy.tex, seed 1, 6 bursts × 4 edits
 //   Reproduce any failure by re-running with the printed seed.
 
+// Audit runs keep TWO engines alive during comparison (incremental + fresh);
+// every resident checkpoint is a live lualatex process, so the default
+// interactive budget (64) × 2 engines on a package-heavy document exhausts
+// a 16GB machine (OOM kill wave). Sparse grids only cost ms-level replay.
+process.env.TDOM_MAX_CHECKPOINTS ||= '12';
+
 import { readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
