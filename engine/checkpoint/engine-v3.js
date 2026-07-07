@@ -176,6 +176,7 @@ export class CheckpointEngine {
     this.isoCache = new Map(); // rescue key -> isolated compile result
     this.isoFailCache = new Map(); // rescue key -> error message (doomed compiles: same inputs fail the same way — don't pay the preamble again on every chain pass over a frozen block)
     this.isoForkBroken = new Set(); // block ids whose iso fork children die (tcolorbox-class fork/dormant incompatibility) — go straight to cold
+    this.dyingPids = new Set(); // DIE'd checkpoint pids not yet exited — #reapDying backpressure
     this.poisoned = new Map(); // block.id -> fnv1a(text) that failed in-chain
     this.hf = new Map(); // page number -> {h: items, f: items} TeX-typeset header/footer
     this.hfSig = null; // page-spec signature the current hf map was built for
@@ -866,6 +867,7 @@ export class CheckpointEngine {
     const block = this.blocks[idx];
     const ck = this.checkpoints.get(idx);
     if (!ck) throw new Error(`no checkpoint at ${idx} for block ${block.id}`);
+    await this.#reapDying(); // bound the live-fork set before minting ckpt idx+1
     let body;
     let jobId;
     let refSnapshot = null;
@@ -1900,7 +1902,44 @@ export class CheckpointEngine {
     const peer = this.checkpoints.get(idx);
     if (peer) {
       peer.send('DIE\n');
+      if (peer.pid) this.dyingPids?.add(peer.pid);
       this.checkpoints.delete(idx);
+    }
+  }
+
+  /**
+   * Live-fork backpressure: a boot/rebuild walk mints one checkpoint per
+   * block and retires off-grid ones with DIE — but a DIE'd child exits
+   * asynchronously, and on a slow box creation outruns the exits (observed:
+   * 100+ live lualatex during a boot; on Linux each holds the FULL dirtied
+   * preamble heap, ~470MB, which OOM-kills a 16GB CI runner). Before
+   * forking the next job, wait for the dying set to shrink; stragglers get
+   * SIGKILL after a grace period (they are retired snapshots — no state is
+   * lost).
+   */
+  async #reapDying(maxDying = 8) {
+    this.dyingPids ??= new Set();
+    const sweep = () => {
+      for (const pid of [...this.dyingPids]) {
+        try {
+          process.kill(pid, 0);
+        } catch {
+          this.dyingPids.delete(pid);
+        }
+      }
+    };
+    sweep();
+    const t0 = Date.now();
+    while (this.dyingPids.size > maxDying) {
+      if (Date.now() - t0 > 2000) {
+        for (const pid of [...this.dyingPids]) {
+          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+          this.dyingPids.delete(pid);
+        }
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 25));
+      sweep();
     }
   }
 
@@ -2311,6 +2350,7 @@ export class CheckpointEngine {
           rekeyed.set(idx + delta, peer);
         } else {
           peer.send('DIE\n');
+          if (peer.pid) this.dyingPids?.add(peer.pid);
         }
       }
       this.checkpoints = rekeyed;
@@ -2442,6 +2482,7 @@ export class CheckpointEngine {
         for (const [idx, peer] of [...this.checkpoints]) {
           if (idx > fgStop) {
             peer.send('DIE\n');
+            if (peer.pid) this.dyingPids?.add(peer.pid);
             this.checkpoints.delete(idx);
           }
         }
