@@ -43,9 +43,10 @@ jobs:
       - name: Fuzz — stress doc (seed 21)
         # two engine armies live simultaneously during the comparison and
         # fork RSS grows with churn — 2×12 residents starved the 7GB hosted
-        # runner ("lost communication") even with canonical disabled. A
-        # 6-fork grid costs ~100ms extra replay per resume, nothing for an
-        # audit.
+        # runner ("lost communication"), 2×6 still drew the OOM killer
+        # (exit 137). A 4-fork grid costs ~150ms extra replay per resume,
+        # nothing for an audit; the historical seed-21 regressions all
+        # manifest by burst 2.
         env:
-          TDOM_MAX_CHECKPOINTS: '6'
-        run: node tools/fuzz.mjs samples/stress-test-ja.tex --seed=21 --bursts=3 --edits=3
+          TDOM_MAX_CHECKPOINTS: '4'
+        run: node tools/fuzz.mjs samples/stress-test-ja.tex --seed=21 --bursts=2 --edits=3
