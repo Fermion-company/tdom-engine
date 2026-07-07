@@ -364,10 +364,16 @@ class PageBuilder {
       if (!e) break;
       // a block's first stream node: record its effective entry offset
       // (space already unavailable on this page: \pagetotal plus whatever
-      // inserts/floats took off \pagegoal). Items requeued onto the next
-      // page re-record, so the FINAL page's value wins — exactly what the
-      // real run's \pagegoal-\pagetotal arithmetic would see.
-      if (e.first && e.bid) {
+      // inserts/floats took off \pagegoal). FIRST-seen wins: this is the
+      // position the block was GIVEN — where the real run's output routine
+      // decides whether/where to break. Recording the post-requeue landing
+      // instead creates a SECOND stable fixpoint for splitting rescues
+      // ("plain galley re-broken by the builder at the next page top" vs
+      // "eject-carrying galley compiled at the given offset"), and which one
+      // an engine settles on depends on edit history (stress seed-21). With
+      // the given position, the isolated real-routine compile is the single
+      // authority for the break and the fixpoint is unique.
+      if (e.first && e.bid && !this.blockEntry.has(e.bid)) {
         this.blockEntry.set(e.bid, this.textheight - this.goal + this.total);
       }
       switch (e.t) {

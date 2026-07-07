@@ -80,7 +80,22 @@ label が動いたとき、後方で定義された label を前方 block が参
 
 現行実装は foreground で長い re-rescue chain を走らせない。`#queueMovedOffsets()` が offset 差分を見て rescue queue に積み、exact pipeline が async に fixed point へ近づける。表示中は stale galley/chunk と canonical overlay が残る。
 
-## 10.9 render と canonical
+## 10.9 壊れた TeX の凍結と決定性の境界
+
+chain と isolated rescue の両方に失敗する block（実 LuaLaTeX 自身が emergency stop するソース — 例: tikz node 内の壊れた色名が pgf 内部でカスケードして子プロセスを殺す）は `#brokenBlockGalley()` で凍結する。未閉鎖の条件文のような軽い破壊は daemon が job 境界で回復するので、ここには来ない。凍結は二形態ある。
+
+- 直前まで正常だった block: 最後の正常 galley と**その exit state をそのまま**保持する。pixel も下流の番号も編集前から一切動かない（打鍵中の番号 churn と全文書 settle を防ぐ）。
+- 履歴のない block（fresh boot が壊れたソースを読んだ場合）: 空 galley で凍結し、exit は entry の素通し。
+
+galley 有りの block は stale-first 経路で async rescue に回り、その isolated compile が失敗している間も凍結として扱う。凍結の判定は `frozenBlockIds()` — hard freeze（`#brokenBlockGalley` が galley に付ける `tdomFrozen`）に加え、「現在の rescue key が isoFailCache にヒットする block」を**導出**する。async 側を粘着フラグにしないのは巻き添えのため: 壊れたウィンドウ中の bogus な page offset で正常テキストの分割系 block の compile が失敗しても、offset が正気に戻れば rescue key も戻り自動的に非凍結へ復帰する（テキスト起因の凍結は key がテキストを含むので、テキストが直るまで凍結のまま）。async rescue の superseded 判定（queue 時と pump 時の rescue key 不一致）は捨てずに現在 key で再 queue する — stale-first 採択が block を rescued に反転させた直後は pageOffset の実体化で key が必ずズレるためで、捨てると exact 化が永遠に来ない。
+
+この二形態は**意図的に一致しない**。壊れたソースには LuaLaTeX 自身が PDF を出さないので収束すべき真値が存在せず、「incremental == fresh boot」の等式は compile 可能なソースにのみ適用される。referee（`tools/fuzz.mjs`）は `tdomFrozen` を見てそのバーストの等式判定をスキップし、バーストを逆編集で復元して治癒経路を検証する。凍結は該当 block のテキストが変わる編集で自然に解け、直後の収束で編集前と同一の署名に戻る（`tests/hot-path.test.js` の凍結 2 テストが固定化）。失敗した isolated compile は rescue key で negative cache され、chain pass が凍結 block を跨ぐたびに同じ失敗 compile を払い直さない。
+
+isolated compile の dormant absorb には暴走上限（fires > 50）があり、上限に達すると材料が破棄される。破棄が起きた run は**成功として採択しない**（`state.json` の `discarded` を見て失敗扱い）。silently 空/欠損の galley を真実として採択すると、その galley 自身が作るページネーションの不動点に嵌って自己修復しなくなる（stress seed-21 burst 2 で発見 — 旧実装ではプレビューから box が消えていた）。失敗にすれば stale-first が直前の正常 pixel を保持し、入力が正気に戻れば rescue key も戻って isoCache の正常結果が再採択される。page-context strut も `\textheight` 内にクランプする。
+
+暴走の主因だった構造的ギャップは splitMode で解消済みである: **分割系 env（mdframed / framed / shaded / longtable / multicols / breakable tcolorbox とプリアンブル定義の breakable 名）の分割は本物の output routine の中でしか走らない**ため、これらの block の isolated compile は `\includepdf` と同じく実 routine を残す。ページが満ちるたびに実ページが ship され、per-page chunk になる（先頭ページは entry strut の下でクロップし、pagebuilder が block の on-page offset に部分 box として置く。中間ページは全 textheight。full フラグは付けない — 通常の文書ページなので preview の page furniture がそのまま乗る）。最終の部分ページは routine が発火しないので page_head に残り、通常の remainder 収穫が正確な寸法で拾う。**分割が不要な box は routine が一度も発火せず、absorb 経路と byte 同一の galley になる** — 恒常 frozen だった stress 文書の 9 block（＋multicols/longtable の 1 block）はこれで exact 化され、boot 時の frozen は 0 になった。referee（fuzz）は依然、壊れた TeX の新規凍結のみ skip+revert し、discard class（残existすれば）は比較自体に判定させる。
+
+## 10.10 render と canonical
 
 hot path の最後に `#scheduleBackground(fgStop, dirtyBlocks)` と `canonical.schedule(source, srcRev)` が呼ばれる。
 
@@ -91,7 +106,7 @@ hot path の最後に `#scheduleBackground(fgStop, dirtyBlocks)` と `canonical.
 
 `canonical.schedule()` は source/rev を保存して timer を張るだけである。実際の full `lualatex` compile は edit response を待たせない。
 
-## 10.10 hot path から外れているもの
+## 10.11 hot path から外れているもの
 
 現行実装では、次は編集同期応答に載らない。
 

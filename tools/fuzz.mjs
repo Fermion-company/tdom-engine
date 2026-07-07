@@ -1,4 +1,4 @@
-// fuzz.mjs — the edit fuzzer (docs/ROADMAP.md Phase 0).
+// fuzz.mjs — the edit fuzzer.
 //
 // Drives seeded random edit sequences through the incremental machinery and
 // checks THE defining equation after every burst: the drained engine state
@@ -6,6 +6,13 @@
 // (galleyHash + stateVec — valid across engines since identity became
 // deterministic, docs/10 §10.5). Incremental bugs are edit-order dependent;
 // this is the only net that catches them systematically.
+//
+// The equation is scoped to compilable sources (docs/10 §10.9): an edit that
+// breaks a block's TeX outright (LuaLaTeX emergency-stops — no ground truth)
+// freezes the block; such bursts are skipped and reverted, which exercises
+// the heal path instead. The structural discard class (splitting envs whose
+// split needs the real output routine) is deterministic on both engines and
+// stays inside the comparison.
 //
 // Usage: node tools/fuzz.mjs [file.tex] [--seed=N] [--bursts=N] [--edits=N]
 //   defaults: corpus/06-refs-heavy.tex, seed 1, 6 bursts × 4 edits
@@ -71,16 +78,61 @@ let failed = false;
 try {
   await eng.open(source);
   await drain(eng);
+  // Baseline freezes: blocks whose exact compile fails already at boot
+  // (e.g. splitting envs whose split needs the real output routine — the
+  // dormant absorb can't make progress and the run discards). Both engines
+  // reach the same kept galley deterministically, so the equation still
+  // holds for them; only freezes INTRODUCED by a burst mean "transiently
+  // broken source" and skip the comparison.
+  // Freezes that gate the equation are BROKEN-TEX freezes (no ground truth
+  // exists). The structural discard class (splitting env whose split needs
+  // the real output routine — deterministic on both engines) is tolerated:
+  // if it ever DID diverge, the signature comparison itself fails loudly.
+  const DISCARD_RE = /discarded runaway material/;
+  const gating = () => eng.frozenBlocks().filter((f) => !DISCARD_RE.test(f.reason));
+  // keyed by text, not id: an edit re-mints the block id, but a reverted
+  // block returns to its baseline text
+  const baseFrozen = new Set(gating().map((f) => f.text));
+  const allBase = eng.frozenBlocks();
+  if (allBase.length) {
+    console.log(`baseline frozen at boot (tolerated): ${allBase.map((f) => f.id).join(',')}`);
+  }
   const applied = [];
   for (let b = 0; b < BURSTS && !failed; b++) {
+    const burstEdits = [];
     for (let e = 0; e < EDITS; e++) {
       const src = eng.getSource();
       const ed = randomEdit(src);
       if (!ed) continue;
       applied.push(ed);
+      burstEdits.push({ ...ed, removed: src.slice(ed.start, ed.end) });
       await eng.edit(ed.start, ed.end, ed.text);
     }
     await drain(eng);
+    // Transiently broken TeX (an edit landed inside tikz coordinates, an
+    // unclosed conditional, …): real LuaLaTeX emergency-stops on such a
+    // source — there is NO ground truth, and the two paths freeze
+    // differently by design (incremental keeps the last good galley and its
+    // exit so numbering doesn't churn; a fresh boot has no history). Skip
+    // the equation, then REVERT the burst like a user fixing their error —
+    // the heal path itself is exercised and the next burst compares again.
+    const newFrozen = gating().filter((f) => !baseFrozen.has(f.text)).map((f) => f.id);
+    if (newFrozen.length) {
+      console.log(
+        `burst ${b + 1}: SKIPPED — source transiently broken (new frozen: ${newFrozen.join(',')}); reverting the burst`
+      );
+      for (const ed of burstEdits.reverse()) {
+        await eng.edit(ed.start, ed.start + ed.text.length, ed.removed);
+      }
+      await drain(eng);
+      const still = gating().filter((f) => !baseFrozen.has(f.text)).map((f) => f.id);
+      if (still.length) {
+        failed = true;
+        console.log(`burst ${b + 1}: FAILED — frozen blocks survived the revert: ${still.join(',')}`);
+        console.log(`  reproduce: node tools/fuzz.mjs ${texFile} --seed=${SEED} --bursts=${b + 1} --edits=${EDITS}`);
+      }
+      continue;
+    }
     // THE equation: incremental result == fresh engine on the same source
     rmSync(workB, { recursive: true, force: true });
     const fresh = new CheckpointEngine({ workDir: workB, docDir: path.dirname(path.resolve(texFile)) });

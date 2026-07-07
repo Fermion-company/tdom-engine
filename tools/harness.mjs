@@ -6,10 +6,19 @@ export async function drain(eng, timeoutMs = 180_000) {
   for (;;) {
     await eng.bgTask?.catch?.(() => {});
     await (eng.hfTask ?? Promise.resolve())?.catch?.(() => {});
-    const busy = eng.pendingChain || eng.bgActive || (eng.rescueQueue?.size ?? 0) > 0;
+    // rescuePumping: the pump dequeues BEFORE awaiting the compile, so an
+    // in-flight async rescue is invisible to rescueQueue.size alone
+    const busy =
+      eng.pendingChain || eng.bgActive || eng.rescuePumping || (eng.rescueQueue?.size ?? 0) > 0;
     if (!busy) {
       await new Promise((r) => setTimeout(r, 400));
-      if (!eng.pendingChain && !eng.bgActive && (eng.rescueQueue?.size ?? 0) === 0) return;
+      if (
+        !eng.pendingChain &&
+        !eng.bgActive &&
+        !eng.rescuePumping &&
+        (eng.rescueQueue?.size ?? 0) === 0
+      )
+        return;
     } else {
       await new Promise((r) => setTimeout(r, 100));
     }

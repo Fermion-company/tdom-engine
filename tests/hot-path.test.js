@@ -6,7 +6,7 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { rmSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -81,10 +81,19 @@ async function drain(eng, timeoutMs = 120_000) {
   const t0 = Date.now();
   for (;;) {
     await eng.bgTask?.catch?.(() => {});
-    const busy = eng.pendingChain || eng.bgActive || (eng.rescueQueue?.size ?? 0) > 0;
+    // rescuePumping: an in-flight async rescue is invisible to
+    // rescueQueue.size alone (the pump dequeues before compiling)
+    const busy =
+      eng.pendingChain || eng.bgActive || eng.rescuePumping || (eng.rescueQueue?.size ?? 0) > 0;
     if (!busy) {
       await new Promise((r) => setTimeout(r, 400));
-      if (!eng.pendingChain && !eng.bgActive && (eng.rescueQueue?.size ?? 0) === 0) return;
+      if (
+        !eng.pendingChain &&
+        !eng.bgActive &&
+        !eng.rescuePumping &&
+        (eng.rescueQueue?.size ?? 0) === 0
+      )
+        return;
     } else {
       await new Promise((r) => setTimeout(r, 100));
     }
@@ -238,4 +247,137 @@ test('idle engine holds no deferred work and a bounded process set', opts, async
     eng.checkpoints.size <= eng.maxCheckpoints + 16,
     `checkpoint processes bounded (${eng.checkpoints.size})`
   );
+});
+
+// Broken-TeX freeze semantics (docs/10 §10.9). The breakage class that
+// freezes is the one that KILLS the typesetting child (found by the fuzzer
+// on seed 21: a broken color name inside a tikz node cascades into a pgf
+// emergency stop — real LuaLaTeX produces no PDF at all for such a source).
+// Milder breakage (an unclosed conditional…) recovers at the job boundary
+// and never reaches this path.
+const tikzDoc = (fill) =>
+  [
+    '\\documentclass{article}',
+    '\\usepackage{tikz}',
+    '\\definecolor{softgreen}{RGB}{200,240,200}',
+    '\\begin{document}',
+    '',
+    '\\section{A}',
+    '',
+    para('Alpha one'),
+    '',
+    '\\begin{tikzpicture}',
+    `\\node[draw,fill=${fill},minimum width=20mm] (a) {Node A};`,
+    '\\end{tikzpicture}',
+    '',
+    para('Gamma three'),
+    '',
+    '\\end{document}',
+    '',
+  ].join('\n');
+
+// The incremental path freezes the killed block at the last good galley AND
+// the last good exit state, so pixels and downstream numbering stay exactly
+// where they were — zero churn while the user is mid-edit — and the block
+// heals on the next edit that fixes it.
+test('broken block freezes at its last good galley, downstream untouched, heals on fix', opts, async () => {
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  try {
+    await e.open(tikzDoc('softgreen'));
+    await drain(e);
+    const preSig = signature(e);
+    const prePages = e.pages.length;
+    const at = e.getSource().indexOf('fill=softgr') + 'fill=softgr'.length;
+    await e.edit(at, at, 'XX'); // fill=softgrXXeen — undefined color, pgf dies
+    await drain(e);
+    const bi = e.blocks.findIndex((b) => b.text.includes('softgrXX'));
+    assert.ok(bi > 0, 'broken block found');
+    assert.ok(e.frozenBlockIds().includes(e.blocks[bi].id), 'block reported frozen');
+    // the freeze is total stasis: same pixels, same exit state, no
+    // downstream wave — the document identity is byte-identical
+    assert.deepEqual(signature(e), preSig, 'signature unchanged under freeze');
+    assert.equal(e.pages.length, prePages, 'pagination unchanged under freeze');
+    // heal: fix the color — the engine reconverges to the exact
+    // pre-breakage state and the frozen mark leaves with the new galley
+    const cut = e.getSource().indexOf('softgrXX');
+    await e.edit(cut + 'softgr'.length, cut + 'softgrXX'.length, '');
+    await drain(e);
+    assert.deepEqual(signature(e), preSig, 'healed back to the exact pre-edit state');
+    assert.deepEqual(e.frozenBlockIds(), [], 'no frozen blocks after heal');
+  } finally {
+    await e.close();
+  }
+});
+
+// The scratch side of the same coin: a fresh boot on a broken source has no
+// last-good galley to freeze — the block renders empty and passes the entry
+// state through. That exit is deliberately DIFFERENT from the incremental
+// freeze above (which keeps pre-breakage counters): real LuaLaTeX produces
+// no output at all for such a source, so there is no ground truth, and the
+// incremental==scratch equation is scoped to compilable sources (the fuzzer
+// skips and reverts when it sees tdomFrozen). This test pins the fresh-boot
+// half: empty freeze, engine alive, state passthrough.
+test('fresh boot on a broken source: empty freeze, engine alive', opts, async () => {
+  rmSync(WORK2, { recursive: true, force: true });
+  const scratch = new CheckpointEngine({ workDir: WORK2 });
+  try {
+    await scratch.open(tikzDoc('softgrXXeen'));
+    await drain(scratch);
+    const bi = scratch.blocks.findIndex((b) => b.text.includes('softgrXX'));
+    assert.ok(bi > 0, 'broken block found');
+    const b = scratch.blocks[bi];
+    assert.equal(b.galley?.tdomFrozen, true, 'block frozen');
+    assert.equal(b.galley?.items?.length ?? 0, 0, 'frozen empty (no history to show)');
+    assert.equal(b.stateVec, scratch.blocks[bi - 1].stateVec, 'exit = entry passthrough');
+    assert.ok(scratch.pages.length > 0, 'document still paginates');
+    // every other block is fully typeset — the failure is local
+    assert.equal(scratch.blocks.filter((k) => !k.galley).length, 0, 'no galley holes elsewhere');
+  } finally {
+    await scratch.close();
+  }
+});
+
+// A backward reference whose label moves to a value that ALREADY appears in
+// the referring block's rendered text ("section 3 … equation (2)" with the
+// equation moving 2→3). The old resolved-check matched substrings of the
+// rendered text and skipped the retypeset, freezing the stale "(2)" forever
+// (found by the fuzzer: corpus/06 seed 1, burst 2). resolvedInGalley now
+// compares the exact values injected at typeset time (galley.tdomRefVals).
+test('backward ref updates when the label moves to a value already visible in the block', opts, async () => {
+  const refsDoc = readFileSync(
+    fileURLToPath(new URL('../corpus/06-refs-heavy.tex', import.meta.url)),
+    'utf8'
+  );
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  try {
+    await e.open(refsDoc);
+    await drain(e);
+    // a new numbered equation ahead of e:y/e:z renumbers both; the Alpha
+    // block (which renders \eqref{e:z} AND the digit 3 via \ref{s:c}) must
+    // re-render with the new (3)
+    const anchor = 'resolve only through the label table.';
+    const at = e.getSource().indexOf(anchor) + anchor.length;
+    await e.edit(at, at, '\n\n\\begin{equation}\n  q^2 = p\n\\end{equation}\n');
+    await drain(e);
+    const scratch = new CheckpointEngine({ workDir: WORK2 + '-scratch' });
+    try {
+      await scratch.open(e.getSource());
+      await drain(scratch);
+      assert.equal(e.blocks.length, scratch.blocks.length, 'same segmentation');
+      const a = signature(e);
+      const b = signature(scratch);
+      const mismatches = [];
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) mismatches.push(`#${i} ${e.blocks[i].id}`);
+      }
+      assert.deepEqual(mismatches, [], 'every block identical to from-scratch');
+    } finally {
+      await scratch.close();
+      rmSync(WORK2 + '-scratch', { recursive: true, force: true });
+    }
+  } finally {
+    await e.close();
+  }
 });

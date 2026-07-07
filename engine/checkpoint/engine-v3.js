@@ -174,6 +174,7 @@ export class CheckpointEngine {
     this.pages = [];
     this.chunks = new Map(); // chunkKey -> {svg, wBp, hBp, v} exact renders
     this.isoCache = new Map(); // rescue key -> isolated compile result
+    this.isoFailCache = new Map(); // rescue key -> error message (doomed compiles: same inputs fail the same way — don't pay the preamble again on every chain pass over a frozen block)
     this.poisoned = new Map(); // block.id -> fnv1a(text) that failed in-chain
     this.hf = new Map(); // page number -> {h: items, f: items} TeX-typeset header/footer
     this.hfSig = null; // page-spec signature the current hf map was built for
@@ -853,6 +854,7 @@ export class CheckpointEngine {
     if (!ck) throw new Error(`no checkpoint at ${idx} for block ${block.id}`);
     let body;
     let jobId;
+    let refSnapshot = null;
     if (override) {
       // raw job (rescue continuation): caller supplies the exact body
       body = Buffer.from(override.body, 'utf8');
@@ -874,6 +876,10 @@ export class CheckpointEngine {
       for (const m of block.text.matchAll(CITE_USE_RE)) {
         for (const k of m[1].split(',')) refKeys.add('cite:' + k.trim());
       }
+      // record the exact values injected below: resolvedInGalley compares
+      // them against the live table instead of guessing from rendered text
+      refSnapshot = {};
+      for (const key of refKeys) refSnapshot[key] = this.labelTable.get(key);
       const defs = [];
       for (const key of refKeys) {
         const val = this.labelTable.get(key);
@@ -928,6 +934,7 @@ export class CheckpointEngine {
       ck.send(`JOB ${jobId} ${idx + 1} ${body.length}\n`);
       ck.sendRaw(body);
       const [galley] = await Promise.all([galleyP, ckptP]);
+      if (refSnapshot) galley.tdomRefVals = refSnapshot;
       this.#retireOffGrid(idx);
       return galley;
     } catch (err) {
@@ -1032,7 +1039,16 @@ export class CheckpointEngine {
   }
 
   /** Freeze a doubly-failed block: last good galley when one exists, an
-   * empty galley carrying the previous block's exit state otherwise. */
+   * empty galley carrying the previous block's exit state otherwise.
+   *
+   * Determinism scope (docs/10): a frozen block's exit state is HISTORY-
+   * DEPENDENT by design — the pixel freeze keeps the pre-breakage exit so
+   * downstream numbering stays stable (no churn while the user is mid-edit),
+   * while a fresh boot on the same broken source has no history and passes
+   * the entry state through. Real LuaLaTeX produces NO output for such a
+   * source (emergency stop), so there is no ground truth to converge on;
+   * the incremental==scratch equation only applies to compilable sources.
+   * tdomFrozen marks both shapes so referees (fuzz) can scope the equation. */
   async #brokenBlockGalley(idx) {
     const block = this.blocks[idx];
     if (block.galley?.state) {
@@ -1040,7 +1056,7 @@ export class CheckpointEngine {
         id: block.id + '@state',
         body: this.#stateJobBody({ state: block.galley.state, labels: block.galley.labels ?? [] }),
       });
-      return { ...block.galley, tdomStale: true };
+      return { ...block.galley, tdomStale: true, tdomFrozen: true };
     }
     const prevVec = idx > 0 ? JSON.parse(this.blocks[idx - 1].stateVec ?? '[]') : [];
     const state = {};
@@ -1054,7 +1070,7 @@ export class CheckpointEngine {
       id: block.id + '@state',
       body: this.#stateJobBody({ state, labels: [] }),
     });
-    return { items: [], floats: [], w: 0, h: 0, d: 0, state, labels: [], toclines: [], refs: block.galley?.refs ?? [], fonts: {} };
+    return { items: [], floats: [], w: 0, h: 0, d: 0, state, labels: [], toclines: [], refs: block.galley?.refs ?? [], fonts: {}, tdomFrozen: true };
   }
 
   /**
@@ -1107,6 +1123,37 @@ export class CheckpointEngine {
     );
   }
 
+  /**
+   * Blocks whose display cannot currently be exact-verified: hard freezes
+   * (#brokenBlockGalley marked the galley) plus blocks whose last exact
+   * compile failed FOR THEIR CURRENT INPUTS (isoFailCache hit on the live
+   * rescue key). Derived, not sticky — a block that froze because a
+   * transient input (mid-breakage page offset, a moved label) poisoned its
+   * compile un-freezes by itself when the input reverts, because the key
+   * reverts with it. Referees (tools/fuzz.mjs) use this to scope the
+   * incremental==scratch equation to compilable states.
+   */
+  frozenBlockIds() {
+    return this.frozenBlocks().map((f) => f.id);
+  }
+
+  /** Frozen blocks with their reasons — referees distinguish broken-TeX
+   * freezes (no ground truth, equation must be skipped) from the known
+   * structural discard class (splitting env needing the real output
+   * routine; deterministic on both engines, so the equation still holds
+   * and the comparison itself referees them). */
+  frozenBlocks() {
+    const out = [];
+    for (let i = 0; i < this.blocks.length; i++) {
+      const b = this.blocks[i];
+      const failMsg = this.isoFailCache.get(this.#rescueCacheKey(b, i));
+      if (b.galley?.tdomFrozen || failMsg) {
+        out.push({ id: b.id, text: b.text, reason: failMsg ?? 'hard-frozen galley' });
+      }
+    }
+    return out;
+  }
+
   async #rescueBlock(idx, why) {
     const block = this.blocks[idx];
     const cacheKey = this.#rescueCacheKey(block, idx);
@@ -1146,6 +1193,8 @@ export class CheckpointEngine {
       toclines: iso.toclines,
       refs: iso.refs ?? [],
       fonts: {},
+      tdomRefVals: iso.refVals ?? {},
+      tdomPageOff: iso.compiledOff ?? 0,
       tdomIsoChunks: iso.chunks,
     };
   }
@@ -1193,6 +1242,15 @@ export class CheckpointEngine {
   }
 
   async #isoCompile(block, idx, why) {
+    // doomed-compile memo: the rescue key carries every input the compile
+    // depends on, so a failure repeats deterministically — rethrow instead
+    // of paying the full preamble load per chain pass over a broken block
+    const negKey = this.#rescueCacheKey(block, idx);
+    const neg = this.isoFailCache.get(negKey);
+    if (neg) throw new Error(neg);
+    // label values as injected into THIS run — recorded on the result so
+    // resolvedInGalley can compare exactly (see #jobBlock's refSnapshot)
+    const labelSnap = new Map(this.labelTable);
     const entry = {};
     const prevVec = idx > 0 ? JSON.parse(this.blocks[idx - 1].stateVec ?? '[]') : [];
     this.counters.forEach((c, i) => {
@@ -1304,7 +1362,10 @@ export class CheckpointEngine {
         'end ' +
         'function tdom_iso_absorb() ' +
         'tdom_iso.fires = tdom_iso.fires + 1 ' +
-        'if tdom_iso.fires > 50 then tex.box[255] = nil return end ' +
+        // runaway page builder (splitting env making no progress — usually a
+        // bogus page context): material is DISCARDED, so the harvest must
+        // not be trusted — count it and let the node side fail the compile
+        'if tdom_iso.fires > 50 then tdom_iso.discarded = (tdom_iso.discarded or 0) + 1 tex.box[255] = nil return end ' +
         'tex.deadcycles = 0 ' +
         'if tdom_iso.ships == 0 then tdom_iso.preabsorbs = (tdom_iso.preabsorbs or 0) + 1 end ' +
         'local b = tex.box[255] ' +
@@ -1330,7 +1391,24 @@ export class CheckpointEngine {
     // dormant absorb would hand their zero-dimension page paintings back to
     // the galley as invisible material (pdfpages draws via a 0pt picture
     // box). Galley-material blocks keep the absorb as before.
-    const realOutput = /\\includepdf\b/.test(block.text);
+    //
+    // SPLITTING environments (mdframed / framed / breakable tcolorbox) also
+    // keep the real routine: their page-splitting machinery only runs
+    // inside \output, so under the dormant absorb a box that must break
+    // simply never makes progress (runaway → discard → failed compile).
+    // With the real routine the box splits exactly as in print: full pages
+    // ship as per-page chunks (page 1 cropped below the entry strut), and
+    // the final partial page stays on the galley for the normal remainder
+    // harvest. A box that FITS never fires the routine, so its galley is
+    // byte-identical to the absorb path.
+    this.#needsRescue(block.text); // populate _breakableRe for this preamble
+    const splitMode =
+      !/\\includepdf\b/.test(block.text) &&
+      (/\\begin\{(mdframed|framed|shaded|longtable|multicols\*?)\}|\\begin\{tcolorbox\}\[[^\]]*breakable/.test(
+        block.text
+      ) ||
+        (this._breakableRe?.test(block.text) ?? false));
+    const realOutput = /\\includepdf\b/.test(block.text) || splitMode;
     if (!realOutput) L.push('\\output={\\directlua{tdom_iso_absorb()}}');
     // material taller than the page inside an output-hijack env (multicols'
     // own routine) ships REAL pages — count them so the harvest knows the
@@ -1346,7 +1424,11 @@ export class CheckpointEngine {
       typeof this.geometry?.topskip === 'object'
         ? this.geometry.topskip.w ?? 0
         : this.geometry?.topskip ?? 0;
-    const strut = Math.max(0, entryOff - topskipW);
+    // clamp inside the page: an offset captured mid-breakage can exceed
+    // \textheight, which would start the box below the page and spin the
+    // dormant absorb (runaway → discard → failed compile)
+    const maxStrut = Math.max(0, (this.geometry?.textheight ?? Infinity) - 1);
+    const strut = Math.min(Math.max(0, entryOff - topskipW), maxStrut);
     if (strut > 0.01) L.push(`\\vskip ${strut.toFixed(4)}bp`);
     L.push('\\special{tdom:isostart}');
     L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(prevPd)}}`);
@@ -1442,6 +1524,7 @@ export class CheckpointEngine {
         'for k, v in pairs(tdom_iso.counters) do table.insert(cnts, jq(k) .. ":" .. v) end ' +
         'f:write(\'{"w":\' .. bp(b.width) .. \',"h":\' .. bp(b.height) .. \',"d":\' .. bp(b.depth) .. ' +
         '\',"ships":\' .. tdom_iso.ships .. ' +
+        '\',"discarded":\' .. (tdom_iso.discarded or 0) .. ' +
         '\',"preabsorbs":\' .. (tdom_iso.preabsorbs or 0) .. ' +
         '\',"labels":[\' .. table.concat(labs, ",") .. \'],"toclines":[\' .. table.concat(tls, ",") .. ' +
         '\'],"refs":[\' .. table.concat(rfs, ",") .. ' +
@@ -1481,9 +1564,26 @@ export class CheckpointEngine {
     const pdf = path.join(jobdir, 'iso.pdf');
     const statePath = path.join(jobdir, 'state.json');
     if (!existsSync(pdf) || !existsSync(statePath)) {
-      throw new Error(`isolated rescue failed for ${block.id} (${why})`);
+      const msg = `isolated rescue failed for ${block.id} (${why})`;
+      if (this.isoFailCache.size > 200) this.isoFailCache.clear();
+      this.isoFailCache.set(negKey, msg);
+      throw new Error(msg);
     }
     const st = JSON.parse(readFileSync(statePath, 'utf8'));
+    if ((st.discarded ?? 0) > 0) {
+      // the dormant absorb hit its runaway cap and THREW MATERIAL AWAY
+      // (splitting env making no progress, usually a bogus page context
+      // captured mid-breakage): the galley would be silently empty/partial.
+      // Fail the compile — stale-first keeps the last good pixels, and once
+      // the inputs return to sane values the rescue key changes back and
+      // the cached good result re-adopts (found via stress seed-21 burst 2:
+      // boxedtheorem/mdframed blocks stranded empty after a broken window).
+      const msg = `isolated rescue discarded runaway material for ${block.id} (${why})`;
+      if (this.isoFailCache.size > 200) this.isoFailCache.clear();
+      this.isoFailCache.set(negKey, msg);
+      if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
+      throw new Error(msg);
+    }
     const ships = st.ships ?? 0;
     const geo = this.geometry ?? {};
     const chunks = [];
@@ -1517,8 +1617,21 @@ export class CheckpointEngine {
       const x0 = geo.oddsidemargin ?? 0;
       const y0 = (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
       const w = geo.textwidth ?? st.w;
-      const h = geo.textheight ?? st.h;
       const key = `${block.id}@p${k}`;
+      if (splitMode) {
+        // a split box's shipped page is a REGULAR document page: page 1
+        // carries the entry strut (the block starts mid-page — crop below
+        // it and let the pagebuilder place the partial box at the block's
+        // offset), later pages span the full text height. No full flag —
+        // the preview stamps its normal page furniture.
+        const cut = k === 1 ? strut : 0;
+        const h = (geo.textheight ?? st.h) - cut;
+        chunks.push({ key, svg: cropSvgAt(svg, x0, y0 + cut, w, h), wBp: w, hBp: h });
+        items.push({ k: 'box', h, d: 0, chunk: key, coff: 0 });
+        items.push({ k: 'eject', v: -10000 });
+        continue;
+      }
+      const h = geo.textheight ?? st.h;
       chunks.push({ key, svg: cropSvgAt(svg, x0, y0, w, h), wBp: w, hBp: h });
       // full: a REAL shipped page — it owns its page style (pdfpages sets
       // \thispagestyle{empty}), so the preview must not stamp a folio on it
@@ -1556,6 +1669,7 @@ export class CheckpointEngine {
     if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
     else console.error('ISO_KEEP', block.id, jobdir);
     // trailing skip for the NEXT block's \addvspace merge: last glue item, sp
+    const compiledOff = entryOff;
     const state = { ...(st.state ?? {}) };
     let trailLs = 0;
     for (const it of items) {
@@ -1571,6 +1685,8 @@ export class CheckpointEngine {
       labels: (st.labels ?? []).map(([k, v, h]) => (h != null ? { k, v, h } : { k, v })),
       toclines: (st.toclines ?? []).map(([e, l, t]) => ({ e, l, t })),
       refs: st.refs ?? [],
+      refVals: Object.fromEntries((st.refs ?? []).map((k) => [k, labelSnap.get(k)])),
+      compiledOff,
       state,
       chunks,
     };
@@ -2841,6 +2957,12 @@ export class CheckpointEngine {
           try {
             await this.#asyncRescueOne(bid, key);
           } catch (err) {
+            // the exact compile failed for the block's CURRENT inputs — the
+            // stale pixels the foreground kept are a freeze for as long as
+            // those inputs persist. No sticky mark here: frozenBlockIds()
+            // derives the state from isoFailCache, so a block that was only
+            // collateral (a sane text re-rescued at a mid-breakage page
+            // offset) un-freezes by itself when its inputs revert.
             this.diagnostics.push(`async rescue ${bid}: ${err.message}`);
           }
         }
@@ -2862,7 +2984,17 @@ export class CheckpointEngine {
     let idx = this.blocks.findIndex((b) => b.id === bid);
     if (idx < 0) return;
     let block = this.blocks[idx];
-    if (this.#rescueCacheKey(block, idx) !== key) return; // superseded
+    // Superseded = the key's inputs moved since queueing. An EDIT re-queues
+    // the block itself (its fresh entry carries the fresh key), but inputs
+    // also move without any edit — the first stale-first adoption of an
+    // in-chain block flips it to rescued, which materializes pageOffset on
+    // the next repagination. Dropping here would strand the block on its
+    // stale pixels forever; re-queue with the current key instead.
+    const nowKey = this.#rescueCacheKey(block, idx);
+    if (nowKey !== key) {
+      this.rescueQueue.set(bid, nowKey);
+      return;
+    }
     if (!this.isoCache.has(key)) {
       const iso = await this.#isoCompile(block, idx, 'async exact rescue');
       this.isoCache.set(key, iso);
@@ -2872,7 +3004,13 @@ export class CheckpointEngine {
       idx = this.blocks.findIndex((b) => b.id === bid);
       if (idx < 0) return 'done';
       block = this.blocks[idx];
-      if (this.#rescueCacheKey(block, idx) !== key) return 'done'; // superseded
+      const lockedKey = this.#rescueCacheKey(block, idx);
+      if (lockedKey !== key) {
+        // same re-queue rationale as the pre-compile check above: inputs
+        // moved without an edit — retry with the fresh key
+        this.rescueQueue.set(bid, lockedKey);
+        return 'done';
+      }
       const before = block.galleyHash + '|' + block.stateVec;
       // cache hit inside → the exact galley adopts in milliseconds; the
       // chain continues to convergence exactly like a foreground edit,
@@ -2932,13 +3070,25 @@ export class CheckpointEngine {
       const block = this.blocks[c];
       if (!block.rescued) continue;
       const want = Math.round((entry.get(block.id) ?? 0) * 100) / 100;
-      const have = block.pageOffset ?? 0;
-      if (Math.abs(want - have) <= 0.05) continue;
+      // "have" is the galley's compile PROVENANCE, not block.pageOffset —
+      // the latter is set optimistically when a re-rescue is queued, so a
+      // compile that never lands (failed, superseded) would otherwise lock
+      // the stale galley in forever (found via stress seed-21 burst 2)
+      const have = block.galley?.tdomPageOff ?? block.pageOffset ?? 0;
+      if (Math.abs(want - have) <= 0.05) {
+        block.pageOffset = want;
+        continue;
+      }
       const items = block.galley?.items ?? [];
       const th = this.geometry?.textheight ?? 0;
       const boxH = (block.galley?.h ?? 0) + (block.galley?.d ?? 0);
+      // offset-independence shortcuts: a leading eject counts only when the
+      // galley was compiled at the page TOP — there the break is intrinsic
+      // to the block (\clearpage & co). Compiled deep in the page, a leading
+      // eject usually means "didn't fit at that offset" (split spill), which
+      // is exactly the offset-DEPENDENT case.
       if (
-        items[0]?.k === 'eject' ||
+        (items[0]?.k === 'eject' && have <= 0.05) ||
         (!items.some((it) => it.k === 'eject') && boxH <= th - want && boxH <= th - have)
       ) {
         block.pageOffset = want;
@@ -4424,30 +4574,17 @@ function extractBraced(text, open) {
  * unresolved ?? marker for it).
  */
 function resolvedInGalley(block, key, labelTable) {
-  const val = labelTable.get(key);
-  if (val === undefined) return false;
-  if (block.__galleyText === undefined || block.__galleyTextHash !== block.galleyHash) {
-    const parts = [];
-    const visit = (items) => {
-      for (const it of items ?? []) {
-        for (const r of it.runs ?? []) if (r.t) parts.push(r.t);
-        if (it.items) visit(it.items);
-      }
-    };
-    visit(block.galley?.items);
-    for (const f of block.galley?.floats ?? []) visit(f.items);
-    block.__galleyText = parts.join(' ');
-    block.__galleyTextHash = block.galleyHash;
-  }
-  if (block.__galleyText.includes('??') || block.__galleyText.includes('[?]')) return false;
-  let needle = String(val);
-  if (key.endsWith('@cref')) {
-    // @cref values are "[type][i][j]<printed label>" — only the printed
-    // label part ever appears in the galley text
-    const m = needle.lastIndexOf(']');
-    if (m >= 0) needle = needle.slice(m + 1);
-  }
-  return block.__galleyText.includes(needle);
+  // Exact bookkeeping, not text matching: every galley records the label
+  // values that were injected when it was typeset (tdomRefVals, from
+  // #jobBlock/#isoCompile). The ref is resolved iff the recorded value
+  // equals the live one. The old substring-over-rendered-text heuristic
+  // false-positived whenever the new value (almost always a small integer)
+  // happened to appear ANYWHERE in the block — e.g. a block reading
+  // "section 3 … equation (2)" was deemed resolved for an equation label
+  // moving 2→3, and kept its stale (2) forever (corpus/06 fuzz seed 1).
+  const rv = block.galley?.tdomRefVals;
+  if (!rv || !Object.prototype.hasOwnProperty.call(rv, key)) return false;
+  return rv[key] === labelTable.get(key);
 }
 
 /** Pull the first TeX error lines out of a lualatex log/stdout capture. */
