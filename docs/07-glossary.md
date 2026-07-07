@@ -52,6 +52,7 @@
 | **プレリュード** | ジョブ本文の前に注入する`\@namedef`群。fork系統間でラベル定義がずれる問題（分岐宇宙問題）の解 |
 | **収束（convergence）** | 「クリーンなブロックを組み直して出力と状態が前回一致」した時点で再組版を止める自己検証つき停止判定 |
 | **スパースチェックポイント** | 大文書でプロセス数を抑えるため、格子間隔でのみチェックポイントを残す方式 |
+| **shipping chain** | `TDOM_SHIP=1` で有効になる任意の増分 canonical 経路。実 output routine の page shipout ごとに page PDF と page 境界 checkpoint を作り、編集後は使える checkpoint から tail を再 ship する |
 | **双子（twin）フォント** | ブラウザが描けないType1数式フォントの代替となるLatin Modern OTF。スロット→Unicode表（mathmap.js）と実寸計測（TWIN）で置換 |
 | **PUAシフト** | スロット値<32のグリフをU+E000台に載せ替えてJSONの制御文字除去を回避する輸送規約 |
 | **dirtyレポート** | 1編集ごとにエンジンが返す「何がdirtyになり、何を再利用したか」の明細。UIのEngine Inspectorが常時表示する |

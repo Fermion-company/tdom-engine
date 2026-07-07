@@ -39,26 +39,3 @@ jobs:
 
       - name: Fuzz — corpus refs (seed 1)
         run: node tools/fuzz.mjs corpus/06-refs-heavy.tex --seed=1 --bursts=6 --edits=4
-
-      - name: Fuzz — stress doc (seed 21, first suite copy)
-        # two engine armies live simultaneously during the comparison; the
-        # full 211-block document exceeds a 7GB private-repo runner however
-        # the grid is tuned (fork RSS growth + iso churn). The document is
-        # three identical section-suite copies — fuzzing up to chapter 2
-        # keeps every environment class (tikz, pgfplots, boxes, multicols,
-        # longtable, chemistry) at a third of the working set. The full
-        # document remains fuzzable locally on a bigger box.
-        env:
-          TDOM_MAX_CHECKPOINTS: '6'
-        run: |
-          ( while true; do
-              echo "--- mem $(date +%T) ---"
-              free -m | awk 'NR==2 {print "used " $3 "MB / " $2 "MB"}'
-              ps -eo rss=,comm= --sort=-rss | head -6 | awk '{printf "  %.0fMB %s\n", $1/1024, $2}'
-              sleep 20
-            done ) &
-          MONPID=$!
-          node --max-old-space-size=1536 tools/fuzz.mjs samples/stress-test-ja.tex --seed=21 --bursts=3 --edits=3 --cut='\chapter{巨大総合章 2' --compare=final
-          rc=$?
-          kill $MONPID 2>/dev/null || true
-          exit $rc

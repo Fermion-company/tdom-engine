@@ -1,0 +1,30 @@
+# The stress-document edit fuzzer — the deepest net, and too heavy for
+# hosted runners as an always-on step: four attempts (fork-grid tuning,
+# canonical/render tiers off, iso-cache LRU, single-army comparison) all
+# ended with "the hosted runner lost communication" while the same code
+# passes the suite/farm/corpus nets. Run it on demand (workflow_dispatch)
+# or locally on an idle box:
+#   TDOM_MAX_CHECKPOINTS=6 node tools/fuzz.mjs samples/stress-test-ja.tex \
+#     --seed=21 --bursts=3 --edits=3 --compare=final
+name: audit-stress
+
+on:
+  workflow_dispatch:
+
+jobs:
+  stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: texlive/texlive:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq nodejs npm poppler-utils qpdf build-essential >/dev/null
+      - name: Fuzz — stress doc (seed 21, first suite copy)
+        env:
+          TDOM_MAX_CHECKPOINTS: '6'
+        run: |
+          node --max-old-space-size=1536 tools/fuzz.mjs samples/stress-test-ja.tex --seed=21 --bursts=3 --edits=3 --cut='\chapter{巨大総合章 2' --compare=final

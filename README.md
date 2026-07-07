@@ -1,224 +1,120 @@
-# TDOM Engine — TeX DOM Runtime
+# TDOM Engine
 
-> **Engine-core build.** This repository is the realtime-preview core
-> extracted from `fermion-tex-engine`. The UI is exactly the TeX source
-> editor, the live preview that converges to the real LuaLaTeX render, and
-> the Engine Inspector, so the screen demonstrates the engine itself. All
-> the document-editing UI (menu, word editor, insert builder, structure,
-> refs, drawing, tables, AI, code-file workbench, click-to-edit overlay,
-> MathLive) has been removed — `web/app.js` is a thin client that only
-> draws. The full editor lives on in `fermion-tex-engine`.
+TDOM Engine は、LaTeX を書いている最中の「少し直すたびに全文コンパイルを待つ」時間を減らすためのエンジンである。
 
-A **resident, incremental TeX/LaTeX typesetting runtime** with two ranked
-rendering paths:
+編集直後は、起動したままの TeX を使って近くの本文だけを素早く組む。裏では普通の `lualatex` も走らせ、最終的な正しさは本物の LaTeX 出力で確認する。
 
-1. **The final display always equals real LuaLaTeX output.** Every page
-   converges to a *canonical render* — a plain `lualatex` compile of the
-   actual source, run asynchronously to its aux fixpoint and served as
-   per-page SVG. The JS page builder, the glyph display lists and every
-   other clever thing in this repository are *provisional* layers that the
-   canonical render is allowed to override, never the other way around.
-2. **Normal edits use a bounded foreground path.** The
-   engine keeps the document state alive between keystrokes in a
-   **fork-checkpointed resident LuaLaTeX**: every block boundary is a
-   copy-on-write process snapshot of the complete TeX state, an edit
-   resumes from the nearest snapshot and retypesets only the edited block
-   plus a bounded verification frontier. Wider propagation is scheduled as
-   asynchronous chain work.
+このリポジトリはエンジン本体と薄い確認用 UI だけを含む。大きな文書編集 UI、構造編集、AI、図表エディタなどはここにはない。`web/app.js` は、エンジンが返す display list、chunk、canonical page を描画する薄いクライアントである。
 
-```text
-            edit                            converge (async)
-┌────────┐ ───────────▶ ┌───────────────────┐ ───────────────▶ ┌───────────────────┐
-│ Editor │              │ provisional layer │                  │ canonical layer   │
-└────────┘              │ checkpoint chain  │                  │ plain lualatex    │
-                        │ + JS pagebuilder  │                  │ → PDF → page SVG  │
-                        └───────────────────┘                  └───────────────────┘
-                          paints instantly,                      ALWAYS wins once
-                          may approximate                        it has landed
-```
+## まず全体像
 
-A **safety gate** decides whether a document may use the structured
-(provisional) layer at all. Page-mechanism-hostile constructs (shipout
-hooks, `twocolumn`, `\marginpar`, mid-document geometry changes …) and
-preambles the resident daemon cannot boot demote the document to the
-**opaque path**: the display becomes the canonical LuaLaTeX pages themselves.
-Block-local output hijacks such as `\includepdf`, `longtable`, `multicols`,
-`landscape`, and breakable framed boxes use block-level exact rescue instead
-of demoting the whole document.
+表示には、四つの道がある。
 
-A second, orthogonal **visual fidelity gate** (`fidelity.js`) protects the
-provisional layer's LOOKS: browser SVG text may only draw lines proven to
-match LuaLaTeX output (the actual TeX font file served, no math, no
-unencoded glyphs). Math lines, legacy CM / OpenType-math glyphs, and
-anything uncertain render as **high-fidelity chunks** instead — the edited
-block re-typeset by the resident checkpoint child, shipped as a tight PDF
-and swapped in as SVG asynchronously, while the previous exact pixels hold
-the band ("a moment stale but clean" always beats "fast but wrong").
-Verified divergence and browser font-load failures demote regions
-per-block, sticky until their source changes.
+| 日本語での役割 | 実装名 | 内容 |
+| --- | --- | --- |
+| 速い仮表示 | checkpoint | 編集した近くの本文だけを再組版する |
+| 正しい全体出力 | canonical | 普通の `lualatex` で PDF を作る |
+| 危ない部分の画像差し替え | exact chunk | 数式や特殊環境などを本物の出力画像に置き換える |
+| ページ単位の増分正本 | shipping chain | `TDOM_SHIP=1` のとき、実際のページ出力を途中から作り直す |
 
-## Quick start
+最初はこれだけ掴めばよい。英語名は実装上の名前であり、役割は上の日本語名の通りである。
+
+## 現在の表示経路
+
+表示には順位がある。
+
+1. **正しい全体出力**  
+   実 source を通常の `lualatex` で最後まで処理し、PDF と page SVG を作る。最終表示、reload 後の正確な表示、PDF export はこの層が正本である。
+
+2. **速い仮表示**  
+   `fork()` で保存した TeX の途中状態と `pagebuilder.js` で、編集直後の表示を作る。これは速度のための層であり、正本ではない。
+
+3. **危ない部分の画像差し替え**  
+   文字として安全に描けない行や block を、本物の LaTeX 出力から作った SVG 画像に置き換える。
+
+4. **ページ単位の増分正本**  
+   `TDOM_SHIP=1` のときだけ有効になる任意機能。実際の LaTeX のページ出力を、編集位置以降だけ作り直す。通常の `lualatex` 全体コンパイルは引き続き PDF export と検証の正本である。
+
+## 安全判定と退避経路
+
+`engine/checkpoint/safety.js` は、document-level に structured path を壊す構造を検出する。shipout hook、`twocolumn`、`\marginpar`、mid-document geometry change などは文書全体を opaque mode に送る。
+
+一方、`\includepdf`、`longtable`、`multicols`、`landscape`、breakable `tcolorbox` などは block-level rescue の対象であり、文書全体を opaque にしない。
+
+opaque mode でも編集は継続できる。表示は canonical page のみになり、TeX error は実 `lualatex` の error として返る。
+
+## 起動
 
 ```bash
 git clone https://github.com/Fermion-company/tdom-engine.git
 cd tdom-engine
-npm start        # no npm install needed — zero dependencies
-# open http://127.0.0.1:4633
+npm start
+# http://127.0.0.1:4633 を開く
 ```
 
-Pick a starter from the **template selector** in the header
-(`templates/*.tex`): an English academic article, a Japanese article
-(luatexja, real kinsoku line breaking), math notes (theorem environments,
-align, matrices) or a minimal skeleton — each preloaded with a table of
-contents, numbered math, floats, footnotes, cross-references and a
-bibliography so every live feature is one edit away. Adding your own
-template is just dropping a `.tex` file with a `%% name:` header into
-`templates/`.
+依存:
 
-Requirements (**mandatory** — the final display must equal real LuaLaTeX
-output, which no fallback engine can promise):
+- Node.js 18+
+- TeX Live の `lualatex`
+- poppler の `pdftocairo`
+- `pdftotext` と `pdfinfo` は検証・paper size 取得に使う
+- `cc` は fork shim の初回 build に使う
 
-- **Node.js 18+**
-- **TeX Live + poppler**:
-  - macOS: `brew install --cask mactex-no-gui && brew install poppler`
-  - Debian/Ubuntu: `apt install texlive-latex-extra texlive-luatex poppler-utils`
-  - needs `lualatex` and `pdftocairo` on PATH (`pdftotext`/`pdfinfo`
-    recommended: they power the exactness verification and paper-size
-    detection)
+`npm install` は不要である。npm 依存はない。
 
-Run the test suite with `npm test` (the LuaLaTeX integration tests skip
-automatically when no TeX installation is found).
+## サーバー API
 
-## Compare view (pdf.js ↔ live preview)
+| API | 内容 |
+| --- | --- |
+| `GET /doc` | source、display list、geometry、font manifest、report |
+| `POST /edit` | `{start,end,text}` の範囲編集 |
+| `POST /open` | source/template で文書を開き直す |
+| `GET /dom` | engine 観測用 JSON |
+| `GET /canonical/:n.svg?c=<id>` | canonical page SVG |
+| `GET /ship/:n.svg?g=<gen>&r=<srcRev>` | shipping chain の page SVG |
+| `GET /chunk/:id.svg` | exact chunk SVG |
+| `GET /font/:key` | TeX が使った font file |
+| `POST /font-fail` | browser font load failure の報告 |
+| `GET /canonical.pdf` | 最後に成功した canonical PDF |
+| `GET /pdf` | 現 source を canonical layer で ensure して PDF を返す |
+| `GET /events` | SSE |
+| `GET /status` | queue/canonical/mode の軽量 status |
 
-The **比較** button in the header opens `/compare`, a full-bleed side-by-side
-page: on the **left**, the *real* PDF — the canonical compile of the current
-source (`/pdf`), rendered by a vendored [pdf.js](web/pdfjs/); on the
-**right**, the engine's live preview. Both columns render at one shared
-width so page *N* sits pixel-for-pixel over page *N*; scroll is synced and
-the engine side stays live over SSE. This is the visual counterpart to the
-built-in verification pass and the `tools/verify-layout.mjs` referee.
+## 主要ファイル
 
-**Full implementation guide (Japanese):** [docs/](docs/README.md) —
-a chapter-by-chapter map of the current codebase, written for readers
-without prior TeX internals knowledge.
+| ファイル | 役割 |
+| --- | --- |
+| `server.js` | HTTP/SSE server、単一 engine instance、toolchain check |
+| `engine/checkpoint/engine-v3.js` | チェックポイントエンジン本体 |
+| `engine/checkpoint/daemon.lua` | resident TeX 内 daemon |
+| `engine/checkpoint/pagebuilder.js` | TeX page builder / LaTeX output routine 相当の再構成 |
+| `engine/checkpoint/canonical.js` | cold canonical renderer |
+| `engine/checkpoint/shipping.js` | 任意で有効化される増分 canonical 経路 |
+| `engine/checkpoint/shipd.lua` | shipping chain の TeX 側 daemon |
+| `engine/checkpoint/safety.js` | safety gate と verification token |
+| `engine/checkpoint/fidelity.js` | glyph / exact / canonical-only 判定 |
+| `engine/checkpoint/mathmap.js` | legacy math font mapping |
+| `engine/segmenter.js` | LaTeX source の block 分割 |
+| `engine/source-store.js` | source buffer |
+| `web/app.js` | preview client |
 
----
+## テスト
 
-TeX / LaTeX互換の入力を受け取り、**文書状態を常駐保持**し、**ソース変更差分から表示差分を生成**する、
-インクリメンタルTeX組版ランタイムです。
-
-エディタでも、latexmkのラッパーでも、PDFリロードでもありません。
-本体は中央にいる**組版エンジン**であり、エディタとビューアはただの薄いクライアントです。
-
-## 現在の2層表示
-
-このエンジンには順位のついた**2つの表示層**があります。
-
-| | canonical層（権威） | provisional層（速度） |
-|---|---|---|
-| 実体 | 素の`lualatex`をauxが安定するまで実行した**実出力** | fork checkpoint常駐TeX + JS出力ルーチン |
-| 更新 | 編集後に非同期・デバウンス（ホットパス外） | キーストローク同期の bounded foreground |
-| 表示 | ページ単位SVG（`/canonical/n.svg`、viewport単位で遅延変換） | グリフ座標display list + 精密チャンク |
-| 権限 | **常に勝つ**。リロード後の表示・PDF書き出しもこの層 | canonicalが未着のページだけを埋める |
-
-編集されたページは即座にprovisionalへ戻り、canonicalの再コンパイルが
-着地した瞬間にexactへ収束します。編集されていないページはcanonicalの
-ピクセルを保持したまま一切再計算されません。プレビュー上部のバッジが
-現在の状態（`✓ exact` / `preview 収束中` / `exact fallback`）を常時表示します。
-
-## Safety gate と opaque モード
-
-structured（provisional）層が扱ってよい文書かを保守的に判定します。
-
-- **静的判定** (`engine/checkpoint/safety.js`): shipout hook・`\twocolumn`・
-  `\marginpar`・mid-document geometry change・eso-pic系パッケージなど、JSページビルダーが
-  再現できない**ページ機構**を検出 → 文書全体をopaqueへ。
-- **動的判定**: プリアンブルのboot失敗・組版フェーズの全面失敗 → opaqueへ
-  demote（そのプリアンブルのままでは再試行しない。直せば自動で復帰）。
-- **一致検証**: canonical着地時に`pdftotext`のページテキストと
-  provisionalのグリフ流をトークン包含率で照合し、乖離したページの
-  ブロックをexactレンダー経路（隔離rescue）へ恒久demote。
-- **ブロック単位のexact rescue**: `\includepdf`、multicols、longtable、
-  landscape、breakable tcolorbox、TikZ等は隔離またはchunk経路の実PDFピクセルで表示。
-
-opaqueモードでも編集は継続できます。表示は常に最後に成功した
-canonicalページで、TeXエラーは実エラーメッセージ付きで表示されます。
-**未知の構造は失敗ではなく、LuaLaTeX出力そのままで正しく表示される対象**です。
-
-## checkpointバックエンド（provisional層の実体）
-
-**fork()チェックポイント式の常駐lualatex。** エンジンプロセスは一度も再起動せず、
-全ブロック境界がfork()による**完全なTeX状態のスナップショット**（コピーオンライト）
-として常駐します。編集は直近のチェックポイントから再開され、キーストロークの
-表側コストは：
-
-```text
-fork + 変更ブロックのKnuth-Plass組版 + bounded foreground verification
-+ ノードリスト直接抽出 + ローカルソケットJSON
-= 編集応答の同期経路。広い伝播・canonical・exact render は非同期
+```bash
+npm test
 ```
 
-ホットパスには**プロセス起動もプリアンブル再処理もフォント再ロードもPDFも
-外部変換も存在しません**。表示リストはTeX自身のグリフ座標を運び、ブラウザは
-**TeXが使ったのと同じフォントファイル**で描画します。
+現行 `npm test` は 6 ファイル、50 件を実行する。
 
-- **ライブ出力ルーチン**（`pagebuilder.js`）: 脚注・figure/tableフロート・
-  目次・文献・前方/後方参照をTeXの実値でライブ配置。
-- **複数ファイル**: `\input`/`\include`をブロック展開しファイル監視で自動更新。
-- **巨大文書**: スパースチェックポイント + viewport遅延のcanonical変換で、
-  通常編集の体感速度は文書全体の長さに比例しません。
-- **日本語**: `\usepackage{luatexja}`で禁則込みの実組版。
-- プリアンブル変更 → resident root の再起動を含む full rebuild。
+- `tests/canonical.test.js`
+- `tests/engine-v3.test.js`
+- `tests/fidelity.test.js`
+- `tests/hot-path.test.js`
+- `tests/server-api.test.js`
+- `tests/shipping.test.js`
 
-## アーキテクチャ（ファイル対応）
+TeX toolchain が無い環境では、該当する integration test は skip される。
 
-```text
-Canonical Render      engine/checkpoint/canonical.js  素lualatex aux固定点コンパイル
-                                                      → ページSVG遅延変換 / PDF書き出し
-Safety Gate / Verify  engine/checkpoint/safety.js     structured可否の静的判定・検証トークン
-Orchestrator          engine/checkpoint/engine-v3.js  checkpoint連鎖・依存追跡・demote制御
-Live output routine   engine/checkpoint/pagebuilder.js TeXページビルダー+LaTeX出力ルーチンのJS転写
-In-TeX daemon         engine/checkpoint/daemon.lua    ソケット通信・fork・ノードリスト収穫
-fork(2) shim          engine/checkpoint/tdomfork.c    Cブリッジ
-Source Store          engine/source-store.js          テキストバッファ + 範囲編集
-Source DOM            engine/segmenter.js             ブロック分割・ハッシュdiff・ID安定化
-常駐サーバー           server.js                       /edit /doc /chunk /canonical /pdf /events
-Thin client           web/app.js                      provisional描画 + canonical収束 + Inspector
-```
+## 詳細 docs
 
-## エンジンAPI
-
-```js
-const eng = new CheckpointEngine({ workDir: '.tdom-v3', docDir: 'samples' });
-await eng.open(texSource);        // フルビルドはこの1回（以後常駐）
-await eng.edit(start, end, text); // 差分 → dirtyレポート + パッチ（+ canonical再スケジュール）
-eng.getDOM();                     // ブロック/依存/ラベル/ページ/mode の観測
-eng.getDisplayLists();            // provisional表示リスト
-eng.canonical.info();             // {rev, pageCount, inFlight, error, ...}
-await eng.canonical.pageSVG(n);   // 実LuaLaTeXページのSVG
-await eng.exportPDF();            // canonical層のPDF（ソース不変ならキャッシュ）
-```
-
-## 現行実装の対応
-
-1. **最終表示 = LuaLaTeX実出力** — canonical層が非同期に必ず追いつき、
-   ページ単位で上書き表示。リロード後・PDF書き出しも同一の実出力。
-2. **未知プリアンブルでも壊れない** — boot失敗はopaque demoteで吸収し、
-   canonicalが表示を持つ。TeXエラーは実メッセージで表示。
-3. **通常編集はO(編集箇所+依存frontier+可視出力)** — 編集ブロックと
-   収束frontierだけをfork再開で再組版。無変更のblock/page/chunkは
-   identityとキャッシュを保って再利用。
-4. **viewport外のexact renderは編集をブロックしない** — canonical変換は
-   ページ要求時（`loading="lazy"`）に行われ、コンパイル自体もホットパス外。
-5. **provisionalが間違っていても最終的にexactが勝つ** — 一致検証が乖離
-   ブロックをopaqueへ降格し、以後は実ピクセルで表示。
-
-## 既知の制限
-
-- structured層は twocolumn・marginpar 等を**扱いません**。これらの文書はcanonicalページのみで表示され、
-  リアルタイム性は失われますが表示は常に正確です。
-- opaqueモードの編集反映はcanonicalコンパイル1回分（文書規模に依存、
-  環境と文書に依存）の遅延を持ちます。
-- 検証パスは`pdftotext`が無い環境ではスキップされます（canonical層の
-  視覚的優先は変わらないため、最終表示の正しさには影響しません）。
+実装地図は [docs/README.md](docs/README.md) から読む。まず [docs/00-first-read.md](docs/00-first-read.md) で全体像を掴む。これは設計方針やロードマップではなく、現在のコードを読むための地図である。

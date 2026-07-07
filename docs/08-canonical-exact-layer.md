@@ -1,10 +1,10 @@
-# 08. canonical exact layer
+# 08. canonical 正本層
 
 この章は、`engine/checkpoint/canonical.js` と、それを使う safety/verification/opaque 経路の地図である。
 
 ## 8.1 canonical renderer
 
-`CanonicalRenderer` は、実 source をそのまま `lualatex` に渡して PDF を作る正本 layer である。checkpoint engine の display list は編集直後の preview であり、PDF export と最終的な page pixels は canonical layer から来る。
+`CanonicalRenderer` は、実 source をそのまま `lualatex` に渡して PDF を作る正本 layer である。チェックポイントエンジンの display list は編集直後の preview であり、PDF export と最終的な page pixels は canonical layer から来る。
 
 主な public method は次である。
 
@@ -65,7 +65,7 @@ fresh canonical が現 source rev に追いついたとき、`#verifyAgainstCano
 - token は `verifyTokens()` の文字 bigram である。Latin word と CJK bigram を別規則にする実装ではない。
 - 同一 page に加えて ±1 page の window を見る。
 - page count mismatch は report されるが、それだけで block demotion しない。
-- window containment が 0.5 未満の confident divergence だけを demotion 候補にする。
+- window containment が 0.5 未満の確実な乖離だけを demotion 候補にする。
 - demotion は block/chunk 単位で、document 全体を opaque にする処理ではない。
 
 glyph layer がズレた block は exact-only へ降格する。すでに exact/rescue 表示だった block がズレた場合は canonical-only へ降格する。降格は block source hash に粘着し、source が変わるまで戻らない。
@@ -88,7 +88,12 @@ boot 失敗は preamble hash に sticky になる。ただし `#scheduleStructur
 
 条件を満たす single-page block について、canonical page SVG から block band を切り出し、chunk cache に登録する。上限は `TDOM_CANON_CROP_MAX`、既定 40 block である。page count が drift しているときや block が page をまたぐときは crop しない。
 
-## 8.9 旧バックエンド
+## 8.9 shipping chain との関係
+
+`TDOM_SHIP=1` のときは、`shipping.js` / `shipd.lua` による増分 canonical 経路も page SVG を供給する。これは実 output routine で ship された page pixels を届ける任意の経路である。
+
+cold canonical は引き続き PDF export、verification、fallback の正本である。shipping chain が無効化された文書や、label 乖離で `shipStale` になった状態では、cold canonical が表示の権威を持つ。
+
+## 8.10 旧バックエンド
 
 v0/v1 バックエンドは現行リポジトリに存在しない。server から選択する経路もない。現行の fallback は、safety gate、block-level rescue、visual fidelity demotion、opaque mode、canonical layer の組み合わせである。
-

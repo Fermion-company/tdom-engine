@@ -94,7 +94,7 @@ CSSの仕様上の癖は意図的な採用です）。
 | cmmi\*（数式イタリック） | latinmodern-math.otf |
 | cmsy\*（数式記号） | latinmodern-math.otf |
 | cmex\*（大型演算子・括弧） | latinmodern-math.otf |
-| cmr/cmbx/cmti/cmsl/cmtt/cmss/cmcsc（OT1テキスト） | lmroman/lmmono/lmsans等の対応OTF（サイズは5/6/7/8/9/10/12/17ptの最近傍） |
+| cmr / cmbx / cmti / cmsl / cmtt / cmss / cmcsc（OT1テキスト） | lmroman / lmmono / lmsans 等の対応OTF（サイズは 5 / 6 / 7 / 8 / 9 / 10 / 12 / 17pt の最近傍） |
 
 **（b）スロット→Unicodeの写像**：Type1時代のフォントは256スロットの
 独自配置で、例えば cmmi10 のスロット0x19は「π」、cmsy10 の0x31は
@@ -153,4 +153,4 @@ display list生成時、cmex由来のrunは
 
 ---
 
-次章は、現行 checkpoint engine が使う共有基盤です。
+次章は、現行チェックポイントエンジンが使う共有基盤です。

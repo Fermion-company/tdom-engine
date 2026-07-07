@@ -12,12 +12,13 @@
 | --- | --- | --- |
 | HTTP/API | `server.js` | 単一 engine instance、編集 API、DOM/PDF API、サンプル UI |
 | source 管理 | `engine/source-store.js` | block id と source 本文の対応 |
-| segmentation | `engine/segmenter.js` | LaTeX ソースを編集単位 block に分割 |
-| checkpoint engine | `engine/checkpoint/engine-v3.js` | resident TeX、差分投入、checkpoint 再利用、表示 state |
+| 分割 | `engine/segmenter.js` | LaTeX ソースを編集単位 block に分割 |
+| チェックポイントエンジン | `engine/checkpoint/engine-v3.js` | resident TeX、差分投入、checkpoint 再利用、表示 state |
 | Lua daemon | `engine/checkpoint/daemon.lua` | TeX 内で JOB/RENDER を処理し、MVL・refs・labels・events を返す |
-| fork shim | `engine/checkpoint/tdomfork.c` | LuaTeX から POSIX `fork()` を呼ぶ小さな C shim |
+| fork shim | `engine/checkpoint/tdomfork.c`, `engine/checkpoint/forkshim.js` | LuaTeX から POSIX `fork()` を呼ぶ C shim と build helper |
 | page builder | `engine/checkpoint/pagebuilder.js` | TeX page builder / LaTeX output routine 相当の再構成 |
 | canonical | `engine/checkpoint/canonical.js` | full `lualatex` による PDF/SVG/text/paper 情報の正本 |
+| shipping | `engine/checkpoint/shipping.js`, `engine/checkpoint/shipd.lua` | `TDOM_SHIP=1` で動くページ境界 checkpoint 付き実ラン |
 | fidelity | `engine/checkpoint/fidelity.js` | exact chunk と構造化 chunk の視覚差分判定 |
 | safety | `engine/checkpoint/safety.js` | unsafe package/body token 検出、verify token 生成 |
 | math/font | `engine/checkpoint/mathmap.js` | legacy math font から Latin Modern twin への写像 |
@@ -73,6 +74,7 @@ canonical は aux fixed point を最大 3 pass で追う。`GET /pdf` は checkp
 | `POST /open` | source/template で文書を開き直す |
 | `GET /dom` | engine 観測用 JSON |
 | `GET /canonical/:n.svg?c=<id>` | canonical page SVG |
+| `GET /ship/:n.svg?g=<gen>&r=<srcRev>` | shipping chain の page SVG |
 | `GET /chunk/:id.svg` | exact chunk SVG |
 | `GET /font/:key` | TeX が使った font file |
 | `POST /font-fail` | browser font load failure の報告 |
@@ -89,10 +91,11 @@ canonical は aux fixed point を最大 3 pass で追う。`GET /pdf` は checkp
 
 | ファイル | 見ている対象 |
 | --- | --- |
-| `tests/engine-v3.test.js` | checkpoint engine、編集、opaque/rescue、export |
+| `tests/engine-v3.test.js` | チェックポイントエンジン、編集、opaque/rescue、export |
 | `tests/canonical.test.js` | canonical fixed-point、SVG/text/paper 情報 |
 | `tests/fidelity.test.js` | visual fidelity gate、token/window 判定 |
 | `tests/hot-path.test.js` | 編集ホットパス、差分範囲、background chain |
 | `tests/server-api.test.js` | HTTP API の基本動作 |
+| `tests/shipping.test.js` | shipping chain と engine 統合 |
 
-現在のテスト総数は 44 件である。
+現在のテスト総数は 50 件である。

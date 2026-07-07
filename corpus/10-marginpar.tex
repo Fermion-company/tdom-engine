@@ -1,0 +1,29 @@
+% Margin placement: \marginpar / \marginnote / todonotes' \todo — the
+% paper-draft review-mark workflow. The document must stay STRUCTURED
+% (canonical-only block tier, engine-v3 #applyFidelity); the margin pixels
+% belong to the canonical layer, so the referee compares the BODY column
+% only (verify-layout excludes out-of-column real-PDF lines).
+\documentclass{article}
+\usepackage{todonotes}
+\usepackage{marginnote}
+\begin{document}
+
+\section{Draft with review marks}
+
+Opening paragraph with enough plain words to make a couple of real lines of
+typeset material for the referee to compare against the real document.
+
+Second paragraph carries a margin note\marginpar{margin!} right in the
+middle of a sentence and keeps flowing so the body layout has to stay
+byte-identical to the real compile around the mark.
+
+Third paragraph has a reviewer mark\todo{fix this claim} attached to a
+word, the todonotes way papers accumulate comments during drafting.
+
+Fourth paragraph uses the other package\marginnote{note here} for the same
+kind of out-of-column material.
+
+Closing paragraph after all the marks, plain again so the trailing spacing
+after margin-bearing blocks is also compared.
+
+\end{document}

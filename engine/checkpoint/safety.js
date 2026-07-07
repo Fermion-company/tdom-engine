@@ -60,11 +60,12 @@ const UNSAFE_PREAMBLE = [
 // Body constructs the JS page assembly cannot represent even per block:
 // they read or change the CURRENT PAGE while it is being built.
 const UNSAFE_BODY = [
-  // Margin placement writes OUTSIDE the galley box: a per-block chunk crops
-  // it away (silently wrong pixels), so no current per-block fallback can
-  // represent it — document-level demotion is the implemented behavior.
-  [/\\marginpar\b/, '\\marginpar (page-margin placement)'],
-  [/\\marginnote\b/, '\\marginnote (page-margin placement)'],
+  // NOT \marginpar/\marginnote (todonotes & co): margin placement writes
+  // OUTSIDE the galley box, which no per-block chunk can represent — but
+  // the block is typeset in-chain for its BODY text and demoted to the
+  // CANONICAL_ONLY fidelity tier (engine-v3 #applyFidelity), so the margin
+  // pixels come from the canonical layer instead of demoting the whole
+  // document. Paper drafts carry \todo marks routinely.
   [/\\newgeometry\b/, '\\newgeometry (mid-document page geometry)'],
   // NOT \includepdf: block-level rescue ships its foreign pages exactly
   // (see OUTPUT_HIJACK_RE in engine-v3.js).

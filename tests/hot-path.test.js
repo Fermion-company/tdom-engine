@@ -338,6 +338,55 @@ test('fresh boot on a broken source: empty freeze, engine alive', opts, async ()
   }
 });
 
+// Margin-bearing blocks (\marginpar / todonotes' \todo — the paper-draft
+// review-mark workflow) must NOT demote the document: the block typesets
+// in-chain for its body text, its fidelity is CANONICAL_ONLY (the canonical
+// page supplies the margin pixels through the 'canon' display band), and
+// keystrokes inside it stay on the fast path.
+test('margin marks stay structured as canonical-only blocks', opts, async () => {
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  try {
+    const r = await e.open(
+      [
+        '\\documentclass{article}',
+        '\\begin{document}',
+        '',
+        para('Plain opening'),
+        '',
+        para('Noted\\marginpar{margin!} middle'),
+        '',
+        para('Plain closing'),
+        '',
+        '\\end{document}',
+        '',
+      ].join('\n')
+    );
+    assert.equal(r.mode, 'structured', `stays structured (${r.modeReasons?.join('; ')})`);
+    await drain(e);
+    const bi = e.blocks.findIndex((b) => /marginpar/.test(b.text));
+    assert.ok(bi >= 0, 'margin block found');
+    assert.equal(e.blocks[bi].fidelity?.level, 'canonical-only', 'canonical-only tier');
+    assert.ok((e.blocks[bi].galley?.items?.length ?? 0) > 0, 'body text typeset in-chain');
+    // the display list advertises the band for referees/clients
+    const dls = e.getDisplayLists();
+    const hasBand = dls.some((dl) => dl.commands.some((c) => c.op === 'canon'));
+    assert.ok(hasBand, "display list carries the 'canon' band");
+    // keystroke inside the margin block stays on the fast path
+    const at = e.getSource().indexOf('margin!') + 'margin!'.length;
+    const r2 = await e.edit(at, at, '!');
+    assert.ok((r2.stats?.typesetUs ?? 1e9) < 5_000_000, 'edit stays fast');
+    await drain(e);
+    assert.equal(
+      e.blocks.find((b) => /marginpar/.test(b.text))?.fidelity?.level,
+      'canonical-only',
+      'tier survives the edit'
+    );
+  } finally {
+    await e.close();
+  }
+});
+
 // A backward reference whose label moves to a value that ALREADY appears in
 // the referring block's rendered text ("section 3 … equation (2)" with the
 // equation moving 2→3). The old resolved-check matched substrings of the

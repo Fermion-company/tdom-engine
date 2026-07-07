@@ -134,6 +134,9 @@ function dlLines(dl) {
     if (cmd.op === 'glyphs') glyphs.push({ x: cmd.x, y: cmd.y });
     else if (cmd.op === 'folio') glyphs.push({ x: cmd.x, y: cmd.y, folio: true });
     else if (cmd.op === 'chunk') chunks.push({ x: cmd.x, y: cmd.y, w: cmd.w, h: cmd.h });
+    // canonical-only bands (margin-bearing blocks): the canonical page owns
+    // these pixels — same coverage semantics as an exact chunk window
+    else if (cmd.op === 'canon') chunks.push({ x: cmd.x, y: cmd.y, w: cmd.w, h: cmd.h });
   }
   return { lines: toLines(glyphs), chunks };
 }
@@ -150,8 +153,20 @@ function insideChunk(line, chunks, pad = 2.5) {
 
 // ---------------------------------------------------------------- compare
 
-function comparePage(pn, engine, truth) {
+function comparePage(pn, engine, truth, geo) {
   const issues = [];
+  // Margin material (\marginpar / todonotes) lives OUTSIDE the text
+  // column and is canonical-only by design (engine-v3 #applyFidelity):
+  // the provisional layer never draws it, the canonical page supplies
+  // the pixels. Real-PDF lines outside the column are therefore not a
+  // divergence — exclude them before the y-matching (a margin note
+  // shares its baseline with the paragraph's first line and would
+  // otherwise steal its engine match).
+  if (geo && truth) {
+    const textL = 72 + (geo.oddsidemargin ?? 0);
+    const textR = textL + (geo.textwidth ?? 1e9);
+    truth = truth.filter((l) => l.x0 >= textL - 2 && l.x0 <= textR + 2);
+  }
   const eLines = engine ? engine.lines.filter((l) => !l.folio) : [];
   const eFolio = engine ? engine.lines.filter((l) => l.folio) : [];
   const chunks = engine ? engine.chunks : [];
@@ -237,7 +252,7 @@ try {
   for (let p = 0; p < n; p++) {
     const e = dls[p] ? dlLines(dls[p]) : null;
     const t = truth[p] ? toLines(truth[p]) : null;
-    const r = comparePage(p + 1, e, t);
+    const r = comparePage(p + 1, e, t, geo);
     totalMatched += r.matched;
     totalLines += r.total;
     const ok = r.issues.length === 0;

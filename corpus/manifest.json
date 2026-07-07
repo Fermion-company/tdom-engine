@@ -38,6 +38,10 @@
       "expect": "structured"
     },
     {
+      "file": "10-marginpar.tex",
+      "expect": "structured"
+    },
+    {
       "file": "../samples/demo-lua.tex",
       "expect": "structured"
     }

@@ -1,4 +1,4 @@
-# 第9章 Visual Fidelity Gate
+# 09. 視覚忠実度ゲート
 
 この章は、`engine/checkpoint/fidelity.js` と `engine-v3.js` の exact chunk
 経路の地図である。safety gate が page assembly を structured path に入れて
@@ -79,7 +79,7 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
   banding される（数式入り脚注も exact）。
 - 隔離rescue済みブロック（multicols 等）は従来どおり per-item chunk。
 
-## 9.5 表示の優先順位 — stale exact > fast chunk > bridge > blank
+## 9.5 表示の優先順位
 
 打鍵直後の各 exact 行は、良い方から:
 

@@ -82,6 +82,12 @@ const BOOT_TIMEOUT = 60_000;
 const OUTPUT_HIJACK_RE =
   /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded)\}|\\begin\{tcolorbox\}\[[^\]]*breakable|\\includepdf\b/;
 
+// Margin placement: material lands OUTSIDE the galley box (page margin), so
+// no per-block chunk can represent it — the block is typeset in-chain for
+// its body text and demoted to CANONICAL_ONLY (#applyFidelity). \todo is
+// todonotes (paper-draft review marks — marginpar underneath).
+const MARGIN_RE = /\\(?:marginpar|marginnote|todo)\b/;
+
 // Definition-bearing body edits: a macro/environment/length defined (or
 // undefined) in a BODY block can change the meaning of every later block in
 // ways the exit-state vector cannot see. Such edits forfeit checkpoint-suffix
@@ -2133,6 +2139,16 @@ export class CheckpointEngine {
     const dem = this.fidelityDemoted.get(block.id);
     if (dem && dem.hash === fnv1a(block.text)) {
       fid = demoteFidelity(fid, dem.level);
+    }
+    // Margin placement (\marginpar / \marginnote / todonotes' \todo) writes
+    // OUTSIDE the galley box — no per-block chunk can show it. The block
+    // still typesets in-chain for its BODY text (layout stays exact), but
+    // its pixels are canonical-only: the provisional layer never patches
+    // this band, so the canonical page (margin note included) shows
+    // through. This is what keeps \todo-bearing paper drafts structured
+    // instead of demoting the whole document.
+    if (MARGIN_RE.test(block.text)) {
+      fid = demoteFidelity(fid, 'canonical');
     }
     block.fidelity = fid;
     block.needsRender = !block.rescued && !fid.canonicalOnly && fid.exact;
@@ -4360,6 +4376,20 @@ export class CheckpointEngine {
         continue;
       }
       flushGfx();
+      if (u.cn) {
+        // canonical-only band (margin-bearing blocks): blank in the
+        // provisional layer, the canonical page supplies the pixels —
+        // advertised so the referee counts real lines here as covered
+        commands.push({
+          op: 'canon',
+          x: r2(L),
+          y: r2(baseline - u.ln.boxH),
+          w: r2(geo.textwidth),
+          h: r2(u.ln.boxH + (u.d ?? 0)),
+          src: u.blockId,
+        });
+        continue;
+      }
       this.#runCommands(commands, u.ln.runs, L, baseline, u.blockId);
     }
     flushGfx();
@@ -4665,6 +4695,10 @@ function buildStream(block, chunks) {
         li: li++,
         h: it.h ?? 0,
         d: it.d ?? 0,
+        // canonical-only band: the blank keeps the layout, the canonical
+        // page shows through — the display list advertises the band (op
+        // 'canon') so referees count real-PDF lines there as covered
+        cn: !gfxChunk && canonicalOnly ? 1 : undefined,
         ln: {
           descent: it.d ?? 0,
           boxH: it.h ?? 0,
