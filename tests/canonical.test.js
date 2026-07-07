@@ -62,7 +62,10 @@ test('safety gate: clean documents pass, page-mechanism hazards demote', () => {
   assert.equal(classifyDocument('\\documentclass{article}\\usepackage{eso-pic}', '').safe, false);
   assert.equal(classifyDocument('\\documentclass[a4paper,twocolumn]{article}', '').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}\\AtBeginShipout{x}', '').safe, false);
-  assert.equal(classifyDocument('\\documentclass{article}', 'a \\marginpar{note} b').safe, false);
+  // \marginpar stays STRUCTURED since the canonical-only block tier
+  // (paper drafts carry \todo marks routinely): the block's body typesets
+  // in-chain, the margin pixels come from the canonical layer
+  assert.equal(classifyDocument('\\documentclass{article}', 'a \\marginpar{note} b').safe, true);
   // \includepdf demotes the BLOCK (isolated exact-render rescue ships its
   // foreign pages), never the document — gate granularity is block-first
   assert.equal(classifyDocument('\\documentclass{article}\\usepackage{pdfpages}', 'a \\includepdf{x.pdf}').safe, true);
