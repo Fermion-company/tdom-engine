@@ -106,6 +106,12 @@ for (const entry of entries) {
   );
   if (!ok && !tolerated) {
     console.log(r.out.split('\n').filter((l) => /DIVERGED|MISMATCH|miss /.test(l)).slice(0, 12).join('\n'));
+    if (r.enginePages === null) {
+      // the referee died before producing a summary (crash, missing tool,
+      // boot failure): surface its actual output instead of null/null
+      console.log('  referee tail:');
+      console.log(r.out.trim().split('\n').slice(-12).map((l) => '  | ' + l).join('\n'));
+    }
   }
 }
 
