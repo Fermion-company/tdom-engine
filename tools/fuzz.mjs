@@ -27,6 +27,11 @@ process.env.TDOM_MAX_CHECKPOINTS ||= '12';
 // (~1GB each on package-heavy docs, × 2 engines) would OOM a 7GB hosted
 // CI runner for output nobody reads.
 process.env.TDOM_NO_CANONICAL ||= '1';
+// Same for the RENDER tier: exact preview chunks never enter the equation,
+// but its resident fork HOLDS pin up to 8 extra lualatex processes per
+// engine — ~500MB each on Linux (Lua GC dirties every COW page).
+process.env.TDOM_NO_RENDER ||= '1';
+process.env.TDOM_RENDER_HOLD_MAX ||= '0';
 
 import { readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';

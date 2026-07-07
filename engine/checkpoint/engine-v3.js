@@ -3535,6 +3535,11 @@ export class CheckpointEngine {
    * jobs by orders of magnitude), paused while a foreground update runs.
    */
   #queueRender(blockId) {
+    // audits compare block identity (galleyHash + stateVec) — the exact
+    // preview chunks the RENDER tier produces never enter the equation,
+    // while its fork holds cost ~500MB each on Linux (the Lua GC dirties
+    // every COW page, materializing the full heap per resident)
+    if (process.env.TDOM_NO_RENDER === '1') return;
     this.renderWant.delete(blockId); // re-insertion moves it to the back = newest
     this.renderWant.set(blockId, true);
     this.#pumpRenders();
