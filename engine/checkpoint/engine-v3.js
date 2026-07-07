@@ -42,7 +42,7 @@
 import net from 'node:net';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
@@ -175,6 +175,7 @@ export class CheckpointEngine {
     this.chunks = new Map(); // chunkKey -> {svg, wBp, hBp, v} exact renders
     this.isoCache = new Map(); // rescue key -> isolated compile result
     this.isoFailCache = new Map(); // rescue key -> error message (doomed compiles: same inputs fail the same way — don't pay the preamble again on every chain pass over a frozen block)
+    this.isoForkBroken = new Set(); // block ids whose iso fork children die (tcolorbox-class fork/dormant incompatibility) — go straight to cold
     this.poisoned = new Map(); // block.id -> fnv1a(text) that failed in-chain
     this.hf = new Map(); // page number -> {h: items, f: items} TeX-typeset header/footer
     this.hfSig = null; // page-spec signature the current hf map was built for
@@ -839,6 +840,12 @@ export class CheckpointEngine {
     L.push('\\vsize=\\maxdimen');
     L.push('\\holdinginserts=1');
     L.push('\\maxdeadcycles=200');
+    // the REAL LaTeX output routine, saved before the dormant absorb takes
+    // over: iso fork children restore it for splitting environments
+    // (mdframed / breakable tcolorbox / longtable / multicols only break
+    // pages inside \output — see #isoCompile splitMode)
+    L.push('\\newtoks\\TDOMrealoutput');
+    L.push('\\TDOMrealoutput=\\output');
     L.push('\\output={\\directlua{tdom_absorb_output()}}');
     // a real box first: flips the page builder's internal page_contents
     // flag to box_there (unreachable from Lua); tdom_seed then swaps the
@@ -1056,7 +1063,7 @@ export class CheckpointEngine {
    * source (emergency stop), so there is no ground truth to converge on;
    * the incremental==scratch equation only applies to compilable sources.
    * tdomFrozen marks both shapes so referees (fuzz) can scope the equation. */
-  async #brokenBlockGalley(idx) {
+  async #brokenBlockGalley(idx, frozen = true) {
     const block = this.blocks[idx];
     if (block.galley?.state) {
       await this.#jobBlock(idx, {
@@ -1077,7 +1084,12 @@ export class CheckpointEngine {
       id: block.id + '@state',
       body: this.#stateJobBody({ state, labels: [] }),
     });
-    return { items: [], floats: [], w: 0, h: 0, d: 0, state, labels: [], toclines: [], refs: block.galley?.refs ?? [], fonts: {}, tdomFrozen: true };
+    // frozen=false: a PENDING placeholder (first-ever rescue queued on the
+    // pump), not a freeze — frozenBlockIds derives real freezes from
+    // isoFailCache if that compile then fails
+    const g = { items: [], floats: [], w: 0, h: 0, d: 0, state, labels: [], toclines: [], refs: block.galley?.refs ?? [], fonts: {} };
+    if (frozen) g.tdomFrozen = true;
+    return g;
   }
 
   /**
@@ -1124,7 +1136,8 @@ export class CheckpointEngine {
     const refVals = (block.galley?.refs ?? []).map(
       (k) => k + '=' + (this.labelTable.get(k) ?? '')
     );
-    const pageOff = Math.round((block.pageOffset ?? 0) * 100) / 100;
+    // same 0.25bp quantum as the iso strut — see #isoCompile
+    const pageOff = Math.round((block.pageOffset ?? 0) * 4) / 4;
     return fnv1a(
       JSON.stringify([block.text, this.blocks[idx - 1]?.stateVec ?? '', this.preHash, refVals, pageOff])
     );
@@ -1181,10 +1194,16 @@ export class CheckpointEngine {
         this.#pumpRescues();
         return { ...block.galley, tdomStale: true };
       }
-      // first-ever rescue of this block (no previous galley to show):
-      // compile synchronously — there is nothing older to display
-      iso = await this.#isoCompile(block, idx, why);
-      this.isoCache.set(cacheKey, iso);
+      // first-ever rescue (nothing older to display): do NOT pay the
+      // compile on the walk — hold an empty placeholder with
+      // entry-passthrough state and land the exact galley through the
+      // async pump, exactly like a stale-first landing. Fork isos arrive
+      // in ~1-3s; the walk stays bounded, and a BOOT walk in particular
+      // (which used to serialize EVERY rescue compile before first paint)
+      // reaches the first page minutes earlier.
+      this.rescueQueue.set(block.id, cacheKey);
+      this.#pumpRescues();
+      return this.#brokenBlockGalley(idx, false);
     }
     // continuation checkpoint carrying the isolated run's exact exit state
     await this.#jobBlock(idx, { id: block.id + '@state', body: this.#stateJobBody(iso) });
@@ -1248,13 +1267,30 @@ export class CheckpointEngine {
     return L.join('\n');
   }
 
-  async #isoCompile(block, idx, why) {
+  async #isoCompile(block, idx, why, forceCold = false) {
     // doomed-compile memo: the rescue key carries every input the compile
     // depends on, so a failure repeats deterministically — rethrow instead
     // of paying the full preamble load per chain pass over a broken block
     const negKey = this.#rescueCacheKey(block, idx);
     const neg = this.isoFailCache.get(negKey);
     if (neg) throw new Error(neg);
+    // Fork mode: rescue in a child forked from the pristine post-preamble
+    // checkpoint (ckpt:0) — the preamble (the 10-15s / 300-500MB part of a
+    // cold iso on package-heavy documents) is already loaded and COW-shared.
+    // Cold mode remains the fallback when no resident root exists (opaque
+    // mode, boot failure) or infra fails before the fork happens.
+    // \includepdf keeps the REAL output routine (page-emitting) — that
+    // cannot run in a fork child yet (inherited dormant page state breaks
+    // it under luatexja), so it always compiles cold. Everything else
+    // forks with the iso absorb; a fork run that DISCARDS (a split was
+    // actually needed at this offset) retries cold with the real routine.
+    const ck0 =
+      !forceCold &&
+      !process.env.TDOM_ISO_COLD &&
+      !this.isoForkBroken.has(block.id) &&
+      !/\\includepdf\b/.test(block.text)
+        ? this.checkpoints.get(0)
+        : null;
     // label values as injected into THIS run — recorded on the result so
     // resolvedInGalley can compare exactly (see #jobBlock's refSnapshot)
     const labelSnap = new Map(this.labelTable);
@@ -1268,10 +1304,37 @@ export class CheckpointEngine {
     const prevNobreak = idx > 0 && prevVec.length >= 2 ? prevVec[prevVec.length - 2] === 1 : false;
     const text = this.store.get(this.file);
     const bounds = documentBounds(text);
+    const jobdir = path.join(this.workDir, `rescue-${block.id}-${fnv1a(block.text)}`);
+    // absolute path injected into inline Lua (fork mode): single-quoted, so
+    // escape the characters that would break the literal
+    const jobdirForBody = jobdir.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     const L = [];
-    L.push(text.slice(bounds.preamble.start, bounds.preamble.end).trimEnd());
-    L.push('\\begin{document}');
+    if (!ck0) {
+      L.push(text.slice(bounds.preamble.start, bounds.preamble.end).trimEnd());
+      L.push('\\begin{document}');
+    } else {
+      // the fork inherits the root's DORMANT regime (ckpt:0 is frozen right
+      // after the dormant setup — \pagegoal=\maxdimen, seed material on the
+      // page). Reset to the REAL height with TeX's own machinery: fire ONE
+      // discarding output routine so the page truly EMPTIES (page_contents
+      // flag included — unreachable from Lua), then the next contribution
+      // re-derives \pagegoal from the restored \vsize. Without this, a
+      // real-output child never fills a page and dies on "Output routine
+      // didn't use all of \box255".
+      L.push(`\\vsize=${Math.max(1, this.geometry?.textheight ?? 550).toFixed(4)}bp`);
+    }
     L.push('\\makeatletter\\pagestyle{empty}\\hoffset=-1in\\voffset=-1in');
+    if (ck0) {
+      L.push('\\output={\\global\\setbox\\voidb@x\\box255}');
+      L.push('\\hbox to0pt{}\\penalty-10000');
+      // re-assert the job cwd right before the ship: package code in the
+      // block body can wander the process cwd, and the PDF output file
+      // opens wherever the FIRST \shipout finds it (observed: child PDFs
+      // landing in the root's workDir instead of the jobdir)
+      L.push(
+        `\\AddToHook{shipout/before}{\\directlua{pcall(function() lfs.chdir('${jobdirForBody}') end)}}`
+      );
+    }
     for (const [key, val] of this.labelTable) {
       if (key.startsWith('cite:')) L.push(`\\global\\@namedef{b@${key.slice(5)}}{${val}}`);
       else L.push(`\\global\\@namedef{r@${key}}${labelDefBody(key, val)}`);
@@ -1287,44 +1350,48 @@ export class CheckpointEngine {
       "\\directlua{tdom_iso_label_cref('\\luaescapestring{#1}'," +
       "'\\luaescapestring{\\detokenize\\expandafter{\\cref@currentlabel}}')}\\fi";
     const isoHref = "'\\luaescapestring{\\ifcsname @currentHref\\endcsname\\@currentHref\\fi}'";
-    L.push('\\let\\TDOMlabel\\label');
+    // save-macro names must NOT collide with the resident daemon's own
+    // shims (\TDOMlabel & co, boot driver): a fork-mode iso inherits those
+    // wrappers, and \let\TDOMlabel\label would overwrite the root's saved
+    // original with the wrapper itself — infinite recursion on first \label
+    L.push('\\let\\TDOMisolabel\\label');
     L.push(
-      "\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}'," + isoHref + ')}' +
+      "\\renewcommand\\label[1]{\\TDOMisolabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}'," + isoHref + ')}' +
         isoCrefCapture + '}'
     );
-    L.push('\\ifdefined\\ltx@label\\let\\TDOMltxlabel\\ltx@label');
+    L.push('\\ifdefined\\ltx@label\\let\\TDOMisoltxlabel\\ltx@label');
     L.push(
-      "\\def\\ltx@label#1{\\TDOMltxlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}'," + isoHref + ')}' +
+      "\\def\\ltx@label#1{\\TDOMisoltxlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}'," + isoHref + ')}' +
         isoCrefCapture + '}\\fi'
     );
     // ref-use recording: a rescued block that references a label must be
     // re-rescued when that label's value changes (the cache key carries the
     // referenced values — see #rescueBlock)
-    L.push('\\let\\TDOMref\\ref');
-    L.push("\\renewcommand\\ref[1]{\\directlua{tdom_iso_ref('\\luaescapestring{#1}')}\\TDOMref{#1}}");
-    L.push('\\let\\TDOMpageref\\pageref');
-    L.push("\\renewcommand\\pageref[1]{\\directlua{tdom_iso_ref('\\luaescapestring{#1}')}\\TDOMpageref{#1}}");
-    L.push('\\ifdefined\\eqref\\let\\TDOMeqref\\eqref');
-    L.push("\\renewcommand\\eqref[1]{\\directlua{tdom_iso_ref('\\luaescapestring{#1}')}\\TDOMeqref{#1}}\\fi");
-    L.push('\\ifdefined\\cref\\let\\TDOMcref\\cref');
-    L.push("\\renewcommand\\cref[1]{\\directlua{tdom_iso_ref_cref('\\luaescapestring{#1}')}\\TDOMcref{#1}}\\fi");
-    L.push('\\ifdefined\\Cref\\let\\TDOMCref\\Cref');
-    L.push("\\renewcommand\\Cref[1]{\\directlua{tdom_iso_ref_cref('\\luaescapestring{#1}')}\\TDOMCref{#1}}\\fi");
+    L.push('\\let\\TDOMisoref\\ref');
+    L.push("\\renewcommand\\ref[1]{\\directlua{tdom_iso_ref('\\luaescapestring{#1}')}\\TDOMisoref{#1}}");
+    L.push('\\let\\TDOMisopageref\\pageref');
+    L.push("\\renewcommand\\pageref[1]{\\directlua{tdom_iso_ref('\\luaescapestring{#1}')}\\TDOMisopageref{#1}}");
+    L.push('\\ifdefined\\eqref\\let\\TDOMisoeqref\\eqref');
+    L.push("\\renewcommand\\eqref[1]{\\directlua{tdom_iso_ref('\\luaescapestring{#1}')}\\TDOMisoeqref{#1}}\\fi");
+    L.push('\\ifdefined\\cref\\let\\TDOMisocref\\cref');
+    L.push("\\renewcommand\\cref[1]{\\directlua{tdom_iso_ref_cref('\\luaescapestring{#1}')}\\TDOMisocref{#1}}\\fi");
+    L.push('\\ifdefined\\Cref\\let\\TDOMisoCref\\Cref');
+    L.push("\\renewcommand\\Cref[1]{\\directlua{tdom_iso_ref_cref('\\luaescapestring{#1}')}\\TDOMisoCref{#1}}\\fi");
     // toc/lof/lot entries born inside the rescued block (longtable captions,
     // sectioning inside output-hijack envs …) — captured exactly like the
     // resident driver captures them, or the contents pages miss the entry
-    L.push('\\let\\TDOMaddcontentsline\\addcontentsline');
+    L.push('\\let\\TDOMisoacl\\addcontentsline');
     L.push(
       '\\renewcommand\\addcontentsline[3]{' +
-        '\\directlua{tdom_iso_in_acl=true}\\TDOMaddcontentsline{#1}{#2}{#3}\\directlua{tdom_iso_in_acl=false}' +
+        '\\directlua{tdom_iso_in_acl=true}\\TDOMisoacl{#1}{#2}{#3}\\directlua{tdom_iso_in_acl=false}' +
         '{\\let\\label\\@gobble\\let\\index\\@gobble\\let\\glossary\\@gobble' +
         '\\protected@edef\\TDOM@tocentry{#3}' +
         "\\directlua{tdom_iso_tocline('\\luaescapestring{#1}','\\luaescapestring{#2}'," +
         "'\\luaescapestring{\\detokenize\\expandafter{\\TDOM@tocentry}}')}}}"
     );
-    L.push('\\let\\TDOMaddtocontents\\addtocontents');
+    L.push('\\let\\TDOMisoatc\\addtocontents');
     L.push(
-      '\\renewcommand\\addtocontents[2]{\\TDOMaddtocontents{#1}{#2}' +
+      '\\renewcommand\\addtocontents[2]{\\TDOMisoatc{#1}{#2}' +
         '{\\let\\label\\@gobble\\let\\index\\@gobble\\let\\glossary\\@gobble' +
         '\\protected@edef\\TDOM@tocentry{#2}' +
         "\\directlua{tdom_iso_tocline('\\luaescapestring{#1}','@raw'," +
@@ -1415,7 +1482,12 @@ export class CheckpointEngine {
         block.text
       ) ||
         (this._breakableRe?.test(block.text) ?? false));
-    const realOutput = /\\includepdf\b/.test(block.text) || splitMode;
+    // fork children always run the iso absorb: the real routine cannot run
+    // against the inherited dormant page state yet (box255/unbox cascades
+    // under luatexja). A fork run whose absorb DISCARDS (the env truly had
+    // to split at this offset) is retried cold below, where the real
+    // routine splits exactly as in print.
+    const realOutput = !ck0 && (/\\includepdf\b/.test(block.text) || splitMode);
     if (!realOutput) L.push('\\output={\\directlua{tdom_iso_absorb()}}');
     // material taller than the page inside an output-hijack env (multicols'
     // own routine) ships REAL pages — count them so the harvest knows the
@@ -1426,7 +1498,11 @@ export class CheckpointEngine {
     // so splitting environments (mdframed & co.) measure the same
     // \pagegoal-\pagetotal as in print. The iso page's own \topskip already
     // contributed, so the strut is the entry \pagetotal minus that.
-    const entryOff = block.pageOffset ?? 0;
+    // 0.25bp quantum (≈0.09mm — invisible): keys, struts and the
+    // moved-offset comparison all use the same grid, so float-noise drifts
+    // can never force a recompile, and both engines compile identical
+    // galleys for offsets inside one quantum (condition D stays exact)
+    const entryOff = Math.round((block.pageOffset ?? 0) * 4) / 4;
     const topskipW =
       typeof this.geometry?.topskip === 'object'
         ? this.geometry.topskip.w ?? 0
@@ -1544,32 +1620,97 @@ export class CheckpointEngine {
     );
     L.push('\\shipout\\box255');
     L.push('\\csname @@end\\endcsname');
-    const jobdir = path.join(this.workDir, `rescue-${block.id}-${fnv1a(block.text)}`);
     mkdirSync(jobdir, { recursive: true });
-    rmSync(path.join(jobdir, 'iso.pdf'), { force: true });
-    rmSync(path.join(jobdir, 'state.json'), { force: true });
-    writeFileSync(path.join(jobdir, 'iso.tex'), L.join('\n') + '\n');
-    // tracked so teardown/close can reap in-flight isolated compiles; edits
-    // do NOT kill these — with stale-first rescues they already run off the
-    // hot path, and a finished compile is a cache entry worth keeping.
-    // nice(1): isolated compiles must lose CPU contests against the
-    // resident fork jobs that answer keystrokes
-    const run = execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
-      cwd: jobdir,
-      timeout: 120_000,
-      // doc-relative assets (\includegraphics, \includepdf …) resolve the
-      // same way the canonical compile resolves them
-      env: {
-        ...process.env,
-        TEXINPUTS: `${this.docDir}:${process.env.TEXINPUTS || ''}`,
-        LUAINPUTS: `${this.docDir}:${process.env.LUAINPUTS || ''}`,
-      },
-    });
-    this.isoChildren.add(run.child);
-    await run.catch(() => {});
-    this.isoChildren.delete(run.child);
-    const pdf = path.join(jobdir, 'iso.pdf');
+    const pdf = path.join(jobdir, ck0 ? 'driver.pdf' : 'iso.pdf');
     const statePath = path.join(jobdir, 'state.json');
+    rmSync(pdf, { force: true });
+    rmSync(statePath, { force: true });
+    writeFileSync(path.join(jobdir, 'iso.tex'), L.join('\n') + '\n');
+    if (ck0) {
+      // fork path: the ISO child chdir's to the jobdir, its lazily-opened
+      // PDF (\jobname = driver) and state.json land there, and DONE fires
+      // from finish_pdffile like the RENDER protocol
+      const isoId = `iso@${fnv1a(jobdir + ':' + Date.now())}`;
+      const body = Buffer.from(L.join('\n') + '\n', 'utf8');
+      this.renderPids ??= new Map();
+      this.renderPids.set(isoId, 0); // armed: FORKED fills the pid
+      const done = this.#await('render:' + isoId, Number(process.env.TDOM_ISO_TIMEOUT || 120_000));
+      // fail fast when the child dies without finishing (broken TeX
+      // emergency-stops in the fork exactly like cold lualatex would):
+      // poll the forked pid instead of running out the long timeout
+      const poll = setInterval(() => {
+        const pid = this.renderPids.get(isoId);
+        if (pid) {
+          try {
+            process.kill(pid, 0);
+          } catch {
+            this._reject('render:' + isoId, new Error(`iso child exited for ${block.id}`));
+          }
+        }
+      }, 200);
+      let forked = false;
+      try {
+        ck0.send(`ISO ${isoId} ${jobdir} ${body.length}\n`);
+        ck0.sendRaw(body);
+        await done;
+        if (!existsSync(pdf)) {
+          // belt-and-braces: if the child's PDF still opened against the
+          // root's workDir (cwd wandered before the re-chdir hook landed),
+          // claim it — the pump is serial and nothing else ships there
+          // (canonical is sandboxed in workDir/canonical)
+          const stray = path.join(this.workDir, 'driver.pdf');
+          await waitForPdf(stray).catch(() => {});
+          if (existsSync(stray)) {
+            try { renameSync(stray, pdf); } catch { /* raced away */ }
+          }
+        }
+        await waitForPdf(pdf).catch(() => {});
+        forked = true;
+      } catch {
+        // a child that actually forked and failed IS the verdict — the
+        // missing-artifact check below classifies it exactly like a cold
+        // failure. Only an infra miss (peer gone before FORKED) retries
+        // cold with a full standalone compile.
+        forked = (this.renderPids.get(isoId) ?? 0) !== 0;
+        const pid = this.renderPids.get(isoId);
+        if (pid) {
+          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        }
+      } finally {
+        clearInterval(poll);
+        this.renderPids.delete(isoId);
+      }
+      if (!forked) return this.#isoCompile(block, idx, why, true);
+    } else {
+      // cold path: no resident root — pay the full standalone compile.
+      // Tracked so teardown/close can reap in-flight isolated compiles;
+      // edits do NOT kill these — with stale-first rescues they already run
+      // off the hot path, and a finished compile is a cache entry worth
+      // keeping. nice(1): isolated compiles must lose CPU contests against
+      // the resident fork jobs that answer keystrokes
+      const run = execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
+        cwd: jobdir,
+        timeout: 120_000,
+        // doc-relative assets (\includegraphics, \includepdf …) resolve the
+        // same way the canonical compile resolves them
+        env: {
+          ...process.env,
+          TEXINPUTS: `${this.docDir}:${process.env.TEXINPUTS || ''}`,
+          LUAINPUTS: `${this.docDir}:${process.env.LUAINPUTS || ''}`,
+        },
+      });
+      this.isoChildren.add(run.child);
+      await run.catch(() => {});
+      this.isoChildren.delete(run.child);
+    }
+    if (ck0 && (!existsSync(pdf) || !existsSync(statePath))) {
+      // the FORK died without producing the artifacts. Some environments
+      // (tcolorbox-class) are incompatible with the fork's inherited
+      // dormant state in ways a cold compile is not — remember that for
+      // this block and retry cold, whose verdict is final.
+      this.isoForkBroken.add(block.id);
+      return this.#isoCompile(block, idx, why, true);
+    }
     if (!existsSync(pdf) || !existsSync(statePath)) {
       const msg = `isolated rescue failed for ${block.id} (${why})`;
       if (this.isoFailCache.size > 200) this.isoFailCache.clear();
@@ -1578,17 +1719,20 @@ export class CheckpointEngine {
     }
     const st = JSON.parse(readFileSync(statePath, 'utf8'));
     if ((st.discarded ?? 0) > 0) {
-      // the dormant absorb hit its runaway cap and THREW MATERIAL AWAY
-      // (splitting env making no progress, usually a bogus page context
-      // captured mid-breakage): the galley would be silently empty/partial.
-      // Fail the compile — stale-first keeps the last good pixels, and once
-      // the inputs return to sane values the rescue key changes back and
-      // the cached good result re-adopts (found via stress seed-21 burst 2:
-      // boxedtheorem/mdframed blocks stranded empty after a broken window).
+      // the dormant absorb hit its runaway cap and THREW MATERIAL AWAY —
+      // the galley would be silently empty/partial (found via stress
+      // seed-21 burst 2: boxedtheorem/mdframed blocks stranded empty after
+      // a broken window). In FORK mode this is the expected signal that
+      // the env truly has to SPLIT at this offset: retry cold, where the
+      // real output routine splits exactly as in print. In cold mode it is
+      // final — fail; stale-first keeps the last good pixels, and once the
+      // inputs return to sane values the rescue key changes back and the
+      // cached good result re-adopts.
+      if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
+      if (ck0) return this.#isoCompile(block, idx, why, true);
       const msg = `isolated rescue discarded runaway material for ${block.id} (${why})`;
       if (this.isoFailCache.size > 200) this.isoFailCache.clear();
       this.isoFailCache.set(negKey, msg);
-      if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
       throw new Error(msg);
     }
     const ships = st.ships ?? 0;
@@ -1675,6 +1819,10 @@ export class CheckpointEngine {
     }
     if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
     else console.error('ISO_KEEP', block.id, jobdir);
+    // a success supersedes any earlier failure recorded for the same inputs
+    // (retry ladders, transient infra) — stale entries would keep
+    // frozenBlockIds reporting a healed block forever
+    this.isoFailCache.delete(negKey);
     // trailing skip for the NEXT block's \addvspace merge: last glue item, sp
     const compiledOff = entryOff;
     const state = { ...(st.state ?? {}) };
@@ -3076,13 +3224,16 @@ export class CheckpointEngine {
     for (let c = 0; c < this.blocks.length; c++) {
       const block = this.blocks[c];
       if (!block.rescued) continue;
-      const want = Math.round((entry.get(block.id) ?? 0) * 100) / 100;
+      // 0.25bp quantum shared with the rescue key and the iso strut: a
+      // want/have pair inside one quantum compiles to the same galley by
+      // construction, so only a real grid step queues work
+      const want = Math.round((entry.get(block.id) ?? 0) * 4) / 4;
       // "have" is the galley's compile PROVENANCE, not block.pageOffset —
       // the latter is set optimistically when a re-rescue is queued, so a
       // compile that never lands (failed, superseded) would otherwise lock
       // the stale galley in forever (found via stress seed-21 burst 2)
       const have = block.galley?.tdomPageOff ?? block.pageOffset ?? 0;
-      if (Math.abs(want - have) <= 0.05) {
+      if (Math.abs(want - have) <= 0.001) {
         block.pageOffset = want;
         continue;
       }
@@ -3095,7 +3246,7 @@ export class CheckpointEngine {
       // eject usually means "didn't fit at that offset" (split spill), which
       // is exactly the offset-DEPENDENT case.
       if (
-        (items[0]?.k === 'eject' && have <= 0.05) ||
+        (items[0]?.k === 'eject' && have <= 0.26) ||
         (!items.some((it) => it.k === 'eject') && boxH <= th - want && boxH <= th - have)
       ) {
         block.pageOffset = want;

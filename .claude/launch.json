@@ -3,9 +3,10 @@
   "configurations": [
     {
       "name": "tdom-engine",
-      "runtimeExecutable": "node",
+      "runtimeExecutable": "bash",
       "runtimeArgs": [
-        "server.js"
+        "-lc",
+        "while true; do TDOM_MAX_CHECKPOINTS=24 node server.js; echo \"[respawn] server exited ($?), restarting in 2s\"; sleep 2; done"
       ],
       "port": 4633
     },

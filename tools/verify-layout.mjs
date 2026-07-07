@@ -21,6 +21,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 import { pdfRuns } from './pdf-lines.mjs';
+import { drain } from './harness.mjs';
 
 const execFileP = promisify(execFile);
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -49,9 +50,10 @@ async function enginePages() {
   });
   try {
     await engine.open(texSource);
-    // let the background chain AND the exact-render tier settle so the
-    // display lists carry their final chunk overlays
-    await engine.bgTask.catch(() => {});
+    // let the background chain, the async rescue pump AND the exact-render
+    // tier settle so the display lists carry their final chunk overlays
+    // (first-ever rescues are placeholders until the pump lands them)
+    await drain(engine);
     await (engine.renderTask ?? Promise.resolve()).catch(() => {});
     await (engine.hfTask ?? Promise.resolve()).catch(() => {});
     const dls = engine.getDisplayLists();

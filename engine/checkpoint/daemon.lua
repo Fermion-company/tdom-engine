@@ -1319,8 +1319,62 @@ function tdom_wait()
       else
         conn:send('FORKED ' .. id .. ' ' .. pid .. '\n')
       end
+    elseif cmd == 'ISO' then
+      -- isolated rescue in a fork: the child already holds the loaded
+      -- preamble (10-15s and 300-500MB saved vs a cold lualatex per
+      -- rescue). The body is a COMPLETE program — it leaves the dormant
+      -- regime, installs its own output routine (iso absorb or the saved
+      -- real one), typesets the block, writes state.json, ships its galley
+      -- and ends — so it is injected raw, without the JOB/RENDER wrappers.
+      local id = a
+      local jobdir = b
+      local len = tonumber(c) or 0
+      local body = len > 0 and conn:receive(len) or ''
+      local pid = fk.fork()
+      if pid == 0 then
+        JOB = { id = id, ckpt = -1, body = body }
+        RENDER_MODE = false
+        reconnect('iso', 0)
+        local rootcwd = lfs.currentdir()
+        lfs.chdir(jobdir)
+        local notify = function()
+          -- the PDF backend can resolve \jobname.pdf against the process's
+          -- ORIGINAL cwd (package code in the body may also wander it):
+          -- finish_pdffile fires while the file is still open, and a POSIX
+          -- rename keeps the remaining writes flowing into the moved inode
+          -- — so claim it into the jobdir deterministically, then notify
+          pcall(function()
+            if lfs.attributes(jobdir .. '/driver.pdf') == nil and
+               lfs.attributes(rootcwd .. '/driver.pdf') ~= nil then
+              os.rename(rootcwd .. '/driver.pdf', jobdir .. '/driver.pdf')
+            end
+          end)
+          pcall(function()
+            conn:send('DONE ' .. id .. '\n')
+          end)
+        end
+        if luatexbase and luatexbase.add_to_callback then
+          pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdom')
+        else
+          pcall(callback.register, 'finish_pdffile', notify)
+        end
+        inject_raw(body)
+        return
+      else
+        conn:send('FORKED ' .. id .. ' ' .. pid .. '\n')
+      end
     end
   end
+end
+
+function inject_raw(body)
+  -- feed a self-contained program (iso rescue): no \par, no harvest, no
+  -- report — the body carries its own ending (\shipout + @@end)
+  local lines = {}
+  for l in (body .. '\n'):gmatch('(.-)\n') do
+    lines[#lines + 1] = l
+  end
+  tex.print(lines)
 end
 
 function inject_job(body, ship)

@@ -327,7 +327,7 @@ test('fresh boot on a broken source: empty freeze, engine alive', opts, async ()
     const bi = scratch.blocks.findIndex((b) => b.text.includes('softgrXX'));
     assert.ok(bi > 0, 'broken block found');
     const b = scratch.blocks[bi];
-    assert.equal(b.galley?.tdomFrozen, true, 'block frozen');
+    assert.ok(scratch.frozenBlockIds().includes(b.id), 'block reported frozen');
     assert.equal(b.galley?.items?.length ?? 0, 0, 'frozen empty (no history to show)');
     assert.equal(b.stateVec, scratch.blocks[bi - 1].stateVec, 'exit = entry passthrough');
     assert.ok(scratch.pages.length > 0, 'document still paginates');
