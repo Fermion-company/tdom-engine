@@ -40,7 +40,7 @@
 // into an SVG chunk, swapped in asynchronously.
 
 import net from 'node:net';
-import { spawn, execFile, execFileSync } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, renameSync } from 'node:fs';
 import path from 'node:path';
@@ -78,6 +78,7 @@ import {
   resolvedInGalley,
   stableFontKey,
 } from './util/galley.js';
+import { waitForPdf, resolveFont } from './util/fs.js';
 import { statSync, watch } from 'node:fs';
 
 const execFileP = promisify(execFile);
@@ -4773,29 +4774,6 @@ function miniUnits(items, blockId, chunkRef, suppress = false) {
     y += (it.h ?? 0) + (it.d ?? 0);
   }
   return units;
-}
-
-function resolveFont(name) {
-  try {
-    return execFileSync('kpsewhich', [name], { encoding: 'utf8' }).trim();
-  } catch {
-    return '';
-  }
-}
-
-/** Wait until a PDF file exists and ends with %%EOF (flushed completely). */
-async function waitForPdf(p, timeoutMs = 5000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < timeoutMs) {
-    try {
-      const buf = readFileSync(p);
-      if (buf.length > 8 && buf.subarray(-32).toString('latin1').includes('%%EOF')) return;
-    } catch {
-      /* not there yet */
-    }
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  throw new Error('render child produced no complete PDF');
 }
 
 const EMPTY_UNITS = [];
