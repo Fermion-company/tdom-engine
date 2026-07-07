@@ -1,0 +1,43 @@
+# The deep verification net (docs/06): the full suite, the farm referee and
+# the edit fuzzer are too heavy to run on a 16GB dev machine next to a live
+# resident engine — they run here on every push instead. Local development
+# keeps only the light pair (farm + hot-path, ~3min).
+name: audit
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: texlive/texlive:latest
+    env:
+      TDOM_MAX_CHECKPOINTS: '12'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System deps (node + poppler + cc for the fork shim)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq nodejs npm poppler-utils build-essential >/dev/null
+          node --version && lualatex --version | head -1 && pdftocairo -v 2>&1 | head -1
+
+      - name: Full test suite
+        run: npm test
+
+      - name: Farm (pseudo == real referee)
+        run: npm run farm
+
+      - name: Fuzz — corpus refs (seed 1)
+        run: node tools/fuzz.mjs corpus/06-refs-heavy.tex --seed=1 --bursts=6 --edits=4
+
+      - name: Fuzz — stress doc (seed 21)
+        run: node tools/fuzz.mjs samples/stress-test-ja.tex --seed=21 --bursts=3 --edits=3
