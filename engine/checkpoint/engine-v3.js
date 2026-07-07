@@ -58,6 +58,7 @@ import { Peer } from './peer.js';
 import { Timer } from './timer.js';
 import { buildStream } from './stream.js';
 import { buildDisplayList } from './display-list.js';
+import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -65,7 +66,7 @@ import {
   buildIsoCompileSource,
 } from './tex-templates.js';
 import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
-import { classifyGalley, demoteFidelity, SAFE_GLYPH } from './fidelity.js';
+import { classifyGalley, demoteFidelity } from './fidelity.js';
 import { cropSvg, cropSvgAt } from './util/svg.js';
 import {
   luaStr,
@@ -355,50 +356,20 @@ export class CheckpointEngine {
   }
 
   getDOM() {
-    const blockPages = new Map();
-    for (const page of this.pages) {
-      for (const d of page.draw ?? []) {
-        const bid = d.u?.blockId;
-        if (!bid) continue;
-        if (!blockPages.has(bid)) blockPages.set(bid, []);
-        const arr = blockPages.get(bid);
-        if (arr[arr.length - 1] !== page.number) arr.push(page.number);
-      }
-    }
-    return {
+    return buildDomSnapshot({
       rev: this.rev,
-      backend: this.backendName,
+      backendName: this.backendName,
       mode: this.mode,
       modeReasons: this.modeReasons,
-      canonical: this.canonical.info(),
-      pageCount: this.pages.length,
-      checkpoints: [...this.checkpoints.keys()].sort((a, b) => a - b),
-      blocks: this.blocks.map((b, i) => {
-        const chunkKeys = this.#chunkTargets(b).map((t) => t.key);
-        return {
-          id: b.id,
-          index: i,
-          type: b.kind ?? 'block',
-          gfx: chunkKeys.length > 0,
-          gfxChunks: chunkKeys,
-          fidelity: b.fidelity?.level ?? null,
-          exactLines: b.fidelity?.exactLines ?? 0,
-          source: {
-            file: this.file,
-            start: this.store.position(this.file, b.start),
-            end: this.store.position(this.file, b.end),
-          },
-          labels: (b.galley?.labels ?? []).map((l) => l.k),
-          refs: b.galley?.refs ?? [],
-          pages: blockPages.get(b.id) ?? [],
-          // raw offsets into the main buffer for in-preview box editing;
-          // blocks expanded from \input files are not editable in-place
-          file: b.file ?? null,
-          span: b.file ? null : { start: b.start, end: b.end },
-        };
-      }),
-      labels: Object.fromEntries(this.labelTable),
-    };
+      canonicalInfo: this.canonical.info(),
+      pages: this.pages,
+      checkpoints: this.checkpoints,
+      blocks: this.blocks,
+      chunkTargets: (b) => this.#chunkTargets(b),
+      file: this.file,
+      position: (file, offset) => this.store.position(file, offset),
+      labelTable: this.labelTable,
+    });
   }
 
   async exportPDF() {
@@ -2214,26 +2185,12 @@ export class CheckpointEngine {
 
   /** Inspector counters for the visual fidelity gate. */
   #fidelitySummary() {
-    let safe = 0;
-    let exact = 0;
-    let canonicalOnly = 0;
-    let exactLines = 0;
-    for (const b of this.blocks) {
-      const f = b.fidelity;
-      if (!f || f.level === SAFE_GLYPH) safe++;
-      else if (f.canonicalOnly) canonicalOnly++;
-      else exact++;
-      exactLines += f?.exactLines ?? 0;
-    }
-    return {
-      safeBlocks: safe,
-      exactBlocks: exact,
-      canonicalOnlyBlocks: canonicalOnly,
-      exactLines,
-      demoted: this.fidelityDemoted.size,
-      demotedFonts: [...this.demotedFamilies],
-      pendingRenders: this.renderWant.size,
-    };
+    return buildFidelitySummary({
+      blocks: this.blocks,
+      fidelityDemoted: this.fidelityDemoted,
+      demotedFamilies: this.demotedFamilies,
+      renderWant: this.renderWant,
+    });
   }
 
   // ------------------------------------------------- opaque document mode
