@@ -57,7 +57,7 @@ import { ShippingChain } from './shipping.js';
 import { Peer } from './peer.js';
 import { Timer } from './timer.js';
 import { buildStream } from './stream.js';
-import { buildDriverSource, buildStateJobBody } from './tex-templates.js';
+import { buildDriverSource, buildStateJobBody, buildVolatilePrelude } from './tex-templates.js';
 import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
 import { classifyGalley, demoteFidelity, SAFE_GLYPH } from './fidelity.js';
 import { cropSvg, cropSvgAt, r2 } from './util/svg.js';
@@ -1005,15 +1005,11 @@ export class CheckpointEngine {
    * here — the hot path stays byte-identical to a continuous run.
    */
   #volatilePrelude(idx) {
-    const prevVec = parseVec(this.blocks[idx - 1]?.stateVec);
-    if (!prevVec.length) return '';
-    const state = {};
-    this.counters.forEach((c, i) => {
-      state[c] = prevVec[i] ?? 0;
+    return buildVolatilePrelude({
+      stateVecJson: this.blocks[idx - 1]?.stateVec,
+      counters: this.counters,
+      hyperref: this.geometry?.hyperref === 1,
     });
-    state['tdom@pd'] = prevVec[prevVec.length - 3] ?? -65536000;
-    state['tdom@nobreak'] = prevVec[prevVec.length - 2] ?? 0;
-    return this.#stateJobBody({ state, labels: [] }) + '\n';
   }
 
   #stateJobBody(iso) {

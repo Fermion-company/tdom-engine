@@ -1,4 +1,5 @@
 import { luaStr, labelDefBody } from './util/tex.js';
+import { parseVec } from './util/galley.js';
 
 export function buildDriverSource({
   preamble,
@@ -288,4 +289,16 @@ export function buildStateJobBody({ iso, counters, hyperref }) {
   L.push('\\makeatother');
   L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(iso.state['tdom@pd'] ?? -65536000)}}`);
   return L.join('\n');
+}
+
+export function buildVolatilePrelude({ stateVecJson, counters, hyperref }) {
+  const prevVec = parseVec(stateVecJson);
+  if (!prevVec.length) return '';
+  const state = {};
+  counters.forEach((c, i) => {
+    state[c] = prevVec[i] ?? 0;
+  });
+  state['tdom@pd'] = prevVec[prevVec.length - 3] ?? -65536000;
+  state['tdom@nobreak'] = prevVec[prevVec.length - 2] ?? 0;
+  return buildStateJobBody({ iso: { state, labels: [] }, counters, hyperref }) + '\n';
 }
