@@ -31,11 +31,23 @@ const MAX_PASSES = 3;
 const SVG_CACHE_MAX = 400; // pages kept as SVG strings (LRU)
 
 export class CanonicalRenderer {
-  constructor({ workDir, docDir, debounceMs = Number(process.env.TDOM_CANON_DEBOUNCE ?? 350) }) {
+  constructor({
+    workDir,
+    docDir,
+    // Structured mode: canonical is the AUTHORITY, consumed when the user
+    // pauses to look — not per keystroke. A long idle debounce makes it a
+    // "confirm after writing for a while" pass instead of a constant
+    // follower, so active editing spends no canonical CPU/memory (the
+    // real-time provisional layer owns the live display). Opaque mode uses
+    // the short displayDebounceMs below (canonical IS the display there).
+    debounceMs = Number(process.env.TDOM_CANON_DEBOUNCE ?? 2500),
+    displayDebounceMs = Number(process.env.TDOM_CANON_DISPLAY_DEBOUNCE ?? 350),
+  }) {
     this.workDir = path.resolve(workDir);
     this.docDir = docDir ? path.resolve(docDir) : this.workDir;
     mkdirSync(this.workDir, { recursive: true });
     this.debounceMs = debounceMs;
+    this.displayDebounceMs = displayDebounceMs;
     this.timer = null;
     this.running = null; // in-flight compile promise
     this.pendingJob = null; // {source, rev} superseding the in-flight compile
@@ -101,7 +113,11 @@ export class CanonicalRenderer {
    * keeps editing — instead of back-to-back. Public for tests.
    */
   delayFor() {
-    if (this.pressure !== 'authority' || !this.last?.ms) return this.debounceMs;
+    // opaque mode: canonical IS the display — stay responsive (short
+    // debounce, no cost cooldown). structured mode: canonical is the
+    // post-pause confirmation — long idle debounce plus the cost cooldown.
+    if (this.pressure !== 'authority') return this.displayDebounceMs;
+    if (!this.last?.ms) return this.debounceMs;
     const cooldown = Math.min(this.last.ms * this.cooldownFactor, this.cooldownCapMs);
     const since = Date.now() - this.lastEndAt;
     return Math.max(this.debounceMs, cooldown - since);

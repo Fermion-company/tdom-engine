@@ -1883,6 +1883,32 @@ export class CheckpointEngine {
     return Math.max(1, Math.ceil((this.blocks.length + 1) / this.maxCheckpoints));
   }
 
+  /**
+   * Hard cap on live checkpoints. `#retireOffGrid` only retires the single
+   * index a JOB just processed, so passes that resume mid-document
+   * (rescue pump, settle, chain, backward-ref) leave an orphan checkpoint
+   * at every STOP point that no later JOB retires — the live set creeps far
+   * past maxCheckpoints (observed: 25 live at budget 8, monotonic climb as
+   * the boot rescue pump churns 55 blocks). Each checkpoint is a resident
+   * lualatex holding its accumulated dormant page, so this is real memory.
+   *
+   * Collapse to the grid: keep checkpoint 0, every grid-aligned boundary,
+   * and the edit-locus / render pins; DIE the rest. Idempotent — safe to
+   * call after any checkpoint-creating pass.
+   */
+  #enforceCheckpointCap() {
+    const grid = this.#ckptGrid();
+    if (grid <= 1) return; // small doc: all boundaries fit under the budget
+    for (const [idx, peer] of [...this.checkpoints]) {
+      if (idx === 0 || idx % grid === 0) continue; // grid skeleton
+      if (this.editHold.includes(idx)) continue; // block being typed in
+      if (this.renderHold.has(idx)) continue; // awaiting an exact chunk
+      peer.send('DIE\n');
+      if (peer.pid) this.dyingPids?.add(peer.pid);
+      this.checkpoints.delete(idx);
+    }
+  }
+
   #retireOffGrid(idx) {
     const grid = this.#ckptGrid();
     if (grid <= 1 || idx === 0 || idx % grid === 0) return;
@@ -2651,6 +2677,10 @@ export class CheckpointEngine {
     t.lap('paginate');
 
     // ---- async work: rebuild remaining checkpoint chain + gfx renders --
+    // the boot/edit walk left a checkpoint at every block it typeset —
+    // collapse to the grid before scheduling background work (a full boot
+    // walk of a large document is the worst offender)
+    this.#enforceCheckpointCap();
     this.#scheduleBackground(fgStop, dirtyBlocks);
     t.lap('schedule');
 
@@ -3276,6 +3306,9 @@ export class CheckpointEngine {
       }
       if (before !== block.galleyHash + '|' + block.stateVec) this.#asyncRepaginate();
       this.#queueMovedOffsets();
+      // the resume walk left checkpoints at the blocks it re-typeset — collapse
+      // back to the grid so the boot rescue storm can't creep the live set
+      this.#enforceCheckpointCap();
       return 'done';
     });
     if (outcome === 'aborted') {
@@ -3479,6 +3512,9 @@ export class CheckpointEngine {
     } finally {
       this.bgActive = false;
       this.progress = null;
+      // the settle/rebuild/after walks left checkpoints at every block they
+      // re-typeset — collapse back to the grid
+      this.#enforceCheckpointCap();
     }
   }
 

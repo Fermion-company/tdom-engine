@@ -104,7 +104,11 @@ hot path の最後に `#scheduleBackground(fgStop, dirtyBlocks)`、`#shipUpdate(
 - pending chain があれば idle 後に chain pass を走らせる。
 - dirty block 数が `TDOM_RENDER_HOT_MAX` 以下なら、needsRender な hot block を resident RENDER queue に積む。
 
-`canonical.schedule()` は source/rev を保存して timer を張るだけである。実際の full `lualatex` compile は edit response を待たせない。
+`canonical.schedule()` は source/rev を保存して timer を張るだけである。実際の full `lualatex` compile は edit response を待たせない。structured モードでは canonical は「権威」であって表示の主役ではない（リアルタイム provisional が主役）ので、idle debounce は長い（既定 2500ms = 手が止まって数秒後に 1 回）＋コスト比例 cooldown で、能動編集中は canonical CPU/メモリをほぼ使わない。opaque モードでは canonical が唯一の表示なので `displayDebounceMs`（既定 350ms）で即応を保つ（`delayFor()` が pressure で分岐）。
+
+## 10.10b checkpoint 予算の硬い上限
+
+`maxCheckpoints`（既定は env、主サーバは 8）は `#ckptGrid()` の粗さを決めるが、それだけでは生存 checkpoint 数の上限にならない。`#retireOffGrid(idx)` は「その JOB が処理した 1 index」しか退役させないので、mid-document から resume する pass（rescue pump・settle・chain・backward-ref）は各停止点に orphan checkpoint を残し、誰も retire しないまま生存集合が creep する（実測: budget 8 指定でも 25 個生存、boot 時 55 個超で 16GB 機が窒息）。`#enforceCheckpointCap()` が「ckpt0 ＋グリッド点 ＋ editHold ＋ renderHold だけ残し、他は DIE」で grid に畳み直す。`#updateInner()` 末（boot/edit walk 後）・`#asyncRescueOne` 後・`#runChainPass` の finally で呼ぶ。各 checkpoint は累積 dormant page を保持する常駐 lualatex なので、これは実メモリの上限である。
 
 `#shipUpdate()` は `TDOM_SHIP=1` のときだけ意味を持つ。現在の source を shipping chain に渡し、unit diff から resume できるかを判定する。実際の page ship と SVG 化は非同期で、`onShipPage` と SSE `ship` として着地する。
 
