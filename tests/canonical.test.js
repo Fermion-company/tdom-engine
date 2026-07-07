@@ -42,10 +42,12 @@ test('authority pressure paces recompiles by compile cost; display does not', ()
     c.last = { ms: 8000 };
     c.lastEndAt = Date.now() - 8000 * c.cooldownFactor - 1000;
     assert.equal(c.delayFor(), c.debounceMs);
-    // opaque mode: the compile IS the display — never pace it
+    // opaque mode: the compile IS the display — never pace it, and use the
+    // short display debounce (structured mode's long idle debounce would
+    // make the only visible layer sluggish)
     c.pressure = 'display';
     c.lastEndAt = Date.now();
-    assert.equal(c.delayFor(), c.debounceMs);
+    assert.equal(c.delayFor(), c.displayDebounceMs);
   } finally {
     c.dispose();
   }
