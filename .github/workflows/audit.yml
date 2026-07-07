@@ -28,8 +28,8 @@ jobs:
       - name: System deps (node + poppler + cc for the fork shim)
         run: |
           apt-get update -qq
-          apt-get install -y -qq nodejs npm poppler-utils build-essential >/dev/null
-          node --version && lualatex --version | head -1 && pdftocairo -v 2>&1 | head -1
+          apt-get install -y -qq nodejs npm poppler-utils qpdf build-essential >/dev/null
+          node --version && lualatex --version | head -1 && pdftocairo -v 2>&1 | head -1 && qpdf --version | head -1
 
       - name: Full test suite
         run: npm test
