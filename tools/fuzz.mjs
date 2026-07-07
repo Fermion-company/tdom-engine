@@ -41,8 +41,22 @@ const texFile = args.find((a) => !a.startsWith('--')) ?? path.join(ROOT, 'corpus
 const SEED = Number((args.find((a) => a.startsWith('--seed=')) ?? '--seed=1').slice(7));
 const BURSTS = Number((args.find((a) => a.startsWith('--bursts=')) ?? '--bursts=6').slice(9));
 const EDITS = Number((args.find((a) => a.startsWith('--edits=')) ?? '--edits=4').slice(8));
+// --cut=STRING truncates the body before the first occurrence of STRING —
+// memory-bounded runners fuzz one section-suite copy of a repetitive stress
+// document instead of all three (same environment classes, a third of the
+// engine armies' working set)
+const CUT = (args.find((a) => a.startsWith('--cut=')) ?? '').slice(6);
 
-const source = readFileSync(path.resolve(texFile), 'utf8');
+let source = readFileSync(path.resolve(texFile), 'utf8');
+if (CUT) {
+  const at = source.indexOf(CUT);
+  if (at < 0) {
+    console.error(`--cut marker not found: ${CUT}`);
+    process.exit(2);
+  }
+  source = source.slice(0, at) + '\n\\end{document}\n';
+  console.log(`cut at ${JSON.stringify(CUT)} — ${source.length} chars remain`);
+}
 // package-heavy documents defer ~50 first rescues to the async pump at
 // boot; on a 2-core CI runner they take well past the default 3 minutes
 const DRAIN_MS = 20 * 60_000;

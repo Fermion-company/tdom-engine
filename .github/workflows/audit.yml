@@ -40,13 +40,14 @@ jobs:
       - name: Fuzz — corpus refs (seed 1)
         run: node tools/fuzz.mjs corpus/06-refs-heavy.tex --seed=1 --bursts=6 --edits=4
 
-      - name: Fuzz — stress doc (seed 21)
-        # two engine armies live simultaneously during the comparison and
-        # fork RSS grows with churn — 2×12 residents starved the 7GB hosted
-        # runner ("lost communication"), 2×6 still drew the OOM killer
-        # (exit 137). A 4-fork grid costs ~150ms extra replay per resume,
-        # nothing for an audit; the historical seed-21 regressions all
-        # manifest by burst 2.
+      - name: Fuzz — stress doc (seed 21, first suite copy)
+        # two engine armies live simultaneously during the comparison; the
+        # full 211-block document exceeds a 7GB private-repo runner however
+        # the grid is tuned (fork RSS growth + iso churn). The document is
+        # three identical section-suite copies — fuzzing up to chapter 2
+        # keeps every environment class (tikz, pgfplots, boxes, multicols,
+        # longtable, chemistry) at a third of the working set. The full
+        # document remains fuzzable locally on a bigger box.
         env:
-          TDOM_MAX_CHECKPOINTS: '4'
-        run: node tools/fuzz.mjs samples/stress-test-ja.tex --seed=21 --bursts=2 --edits=3
+          TDOM_MAX_CHECKPOINTS: '6'
+        run: node tools/fuzz.mjs samples/stress-test-ja.tex --seed=21 --bursts=3 --edits=3 --cut='\chapter{巨大総合章 2'
