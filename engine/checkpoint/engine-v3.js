@@ -436,6 +436,7 @@ export class CheckpointEngine {
     this.peers.add(peer);
     sock.on('close', () => {
       this.peers.delete(peer);
+      if (peer.pid) this.dyingPids?.delete(peer.pid);
       for (const [idx, p] of this.checkpoints) {
         if (p === peer) this.checkpoints.delete(idx);
       }
