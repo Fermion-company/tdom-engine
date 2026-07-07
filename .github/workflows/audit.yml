@@ -58,7 +58,7 @@ jobs:
               sleep 20
             done ) &
           MONPID=$!
-          node --max-old-space-size=1536 tools/fuzz.mjs samples/stress-test-ja.tex --seed=21 --bursts=3 --edits=3 --cut='\chapter{巨大総合章 2'
+          node --max-old-space-size=1536 tools/fuzz.mjs samples/stress-test-ja.tex --seed=21 --bursts=3 --edits=3 --cut='\chapter{巨大総合章 2' --compare=final
           rc=$?
           kill $MONPID 2>/dev/null || true
           exit $rc

@@ -51,6 +51,12 @@ const EDITS = Number((args.find((a) => a.startsWith('--edits=')) ?? '--edits=4')
 // document instead of all three (same environment classes, a third of the
 // engine armies' working set)
 const CUT = (args.find((a) => a.startsWith('--cut=')) ?? '').slice(6);
+// --compare=final keeps only ONE engine army alive at a time: the fresh
+// engine boots after the incremental one is snapshotted and closed. Any
+// per-burst divergence still lands in the final signature — detection is
+// intact, diagnosis is coarser — and peak memory halves (memory-bound
+// runners: each resident lualatex holds ~470MB of dirtied heap on Linux).
+const FINAL_ONLY = args.includes('--compare=final');
 
 let source = readFileSync(path.resolve(texFile), 'utf8');
 if (CUT) {
@@ -165,6 +171,10 @@ try {
       }
       continue;
     }
+    if (FINAL_ONLY) {
+      console.log(`burst ${b + 1}: applied (comparison deferred to the end)`);
+      continue;
+    }
     // THE equation: incremental result == fresh engine on the same source
     rmSync(workB, { recursive: true, force: true });
     const fresh = new CheckpointEngine({ workDir: workB, docDir: path.dirname(path.resolve(texFile)) });
@@ -191,6 +201,41 @@ try {
         console.log(`  reproduce: node tools/fuzz.mjs ${texFile} --seed=${SEED} --bursts=${b + 1} --edits=${EDITS}`);
       } else {
         console.log(`burst ${b + 1}: OK (${a.length} blocks, ${eng.pages.length} pages, ${applied.length} edits so far)`);
+      }
+    } finally {
+      await fresh.close();
+    }
+  }
+  if (FINAL_ONLY && !failed) {
+    // snapshot, release the first army, then boot the fresh one
+    const a = signature(eng);
+    const pagesA = eng.pages.length;
+    const finalSrc = eng.getSource();
+    await eng.close();
+    rmSync(workB, { recursive: true, force: true });
+    const fresh = new CheckpointEngine({ workDir: workB, docDir: path.dirname(path.resolve(texFile)) });
+    try {
+      await fresh.open(finalSrc);
+      await drain(fresh, DRAIN_MS);
+      const c = signature(fresh);
+      const mismatches = [];
+      for (let i = 0; i < Math.max(a.length, c.length); i++) {
+        if (a[i] !== c[i]) mismatches.push(i);
+      }
+      const pagesOk = pagesA === fresh.pages.length;
+      if (mismatches.length || !pagesOk) {
+        failed = true;
+        console.log(
+          `final: FAILED — blocks ${mismatches.length ? mismatches.join(',') : 'ok'}; ` +
+            `pages ${pagesA}/${fresh.pages.length}`
+        );
+        for (const i of mismatches.slice(0, 4)) {
+          console.log(`  #${i} inc=${a[i]?.slice(0, 60)}`);
+          console.log(`      scr=${c[i]?.slice(0, 60)}`);
+        }
+        console.log(`  reproduce: node tools/fuzz.mjs ${texFile} --seed=${SEED} --bursts=${BURSTS} --edits=${EDITS}`);
+      } else {
+        console.log(`final: OK (${a.length} blocks, ${pagesA} pages, ${applied.length} edits)`);
       }
     } finally {
       await fresh.close();
