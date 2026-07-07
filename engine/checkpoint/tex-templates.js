@@ -268,3 +268,24 @@ export function buildDriverSource({
   L.push('');
   return L.join('\n');
 }
+
+export function buildStateJobBody({ iso, counters, hyperref }) {
+  const L = ['\\makeatletter'];
+  for (const name of counters) {
+    const v = iso.state[name];
+    if (v !== undefined) L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${v}}\\fi`);
+  }
+  for (const l of iso.labels ?? []) {
+    // stale-first passes real galley labels through here, which can
+    // include \bibitem captures (cite: keys) — those live under b@
+    if (l.k.startsWith('cite:')) {
+      L.push(`\\global\\@namedef{b@${l.k.slice(5)}}{${l.v}}`);
+    } else {
+      L.push(`\\global\\@namedef{r@${l.k}}${labelDefBody(l.k, l.v, hyperref, l.h)}`);
+    }
+  }
+  L.push(iso.state['tdom@nobreak'] === 1 ? '\\global\\@nobreaktrue' : '\\global\\@nobreakfalse');
+  L.push('\\makeatother');
+  L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(iso.state['tdom@pd'] ?? -65536000)}}`);
+  return L.join('\n');
+}

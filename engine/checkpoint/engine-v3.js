@@ -57,7 +57,7 @@ import { ShippingChain } from './shipping.js';
 import { Peer } from './peer.js';
 import { Timer } from './timer.js';
 import { buildStream } from './stream.js';
-import { buildDriverSource } from './tex-templates.js';
+import { buildDriverSource, buildStateJobBody } from './tex-templates.js';
 import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
 import { classifyGalley, demoteFidelity, SAFE_GLYPH } from './fidelity.js';
 import { cropSvg, cropSvgAt, r2 } from './util/svg.js';
@@ -1017,24 +1017,11 @@ export class CheckpointEngine {
   }
 
   #stateJobBody(iso) {
-    const L = ['\\makeatletter'];
-    for (const name of this.counters) {
-      const v = iso.state[name];
-      if (v !== undefined) L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${v}}\\fi`);
-    }
-    for (const l of iso.labels ?? []) {
-      // stale-first passes real galley labels through here, which can
-      // include \bibitem captures (cite: keys) — those live under b@
-      if (l.k.startsWith('cite:')) {
-        L.push(`\\global\\@namedef{b@${l.k.slice(5)}}{${l.v}}`);
-      } else {
-        L.push(`\\global\\@namedef{r@${l.k}}${labelDefBody(l.k, l.v, this.geometry?.hyperref === 1, l.h)}`);
-      }
-    }
-    L.push(iso.state['tdom@nobreak'] === 1 ? '\\global\\@nobreaktrue' : '\\global\\@nobreakfalse');
-    L.push('\\makeatother');
-    L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(iso.state['tdom@pd'] ?? -65536000)}}`);
-    return L.join('\n');
+    return buildStateJobBody({
+      iso,
+      counters: this.counters,
+      hyperref: this.geometry?.hyperref === 1,
+    });
   }
 
   async #isoCompile(block, idx, why, forceCold = false) {
