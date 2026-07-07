@@ -17,10 +17,11 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # NB: no global TDOM_MAX_CHECKPOINTS here — the runner is a dedicated
+    # 16GB box, and some tests assert the default all-boundaries budget;
+    # the fuzzer sets its own reduced budget internally.
     container:
       image: texlive/texlive:latest
-    env:
-      TDOM_MAX_CHECKPOINTS: '12'
     steps:
       - uses: actions/checkout@v4
 

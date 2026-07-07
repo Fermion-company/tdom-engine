@@ -12,6 +12,7 @@ import { promisify } from 'node:util';
 import { CanonicalRenderer } from '../engine/checkpoint/canonical.js';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 import { classifyDocument, verifyTokens, tokenContainment } from '../engine/checkpoint/safety.js';
+import { drain } from '../tools/harness.mjs';
 
 const WORK = fileURLToPath(new URL('../.tdom-canon-test', import.meta.url));
 const available = await promisify(execFile)('lualatex', ['--version'], { timeout: 15_000 }).then(
@@ -217,6 +218,8 @@ test('\\includepdf stays structured: the block rescues, the document does not de
       ].join('\n')
     );
     assert.equal(r.mode, 'structured', `stays structured (${r.modeReasons?.join('; ')})`);
+    // first-ever rescues land through the async pump (placeholder at open)
+    await drain(eng);
     const blk = eng.blocks.find((b) => /includepdf/.test(b.text));
     assert.ok(blk?.rescued, 'the \\includepdf block took the exact-render rescue');
     assert.ok(eng.pages.length >= 2, `foreign page paginates (got ${eng.pages.length})`);
