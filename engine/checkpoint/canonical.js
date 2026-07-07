@@ -82,6 +82,9 @@ export class CanonicalRenderer {
    */
   schedule(source, rev) {
     if (this.disposed) return;
+    // audit runs (fuzz on CI) compare provisional state only — a full
+    // lualatex per engine would OOM a 7GB hosted runner for nothing
+    if (process.env.TDOM_NO_CANONICAL === '1') return;
     this.pendingJob = { source, rev };
     clearTimeout(this.timer);
     this.timer = setTimeout(() => {

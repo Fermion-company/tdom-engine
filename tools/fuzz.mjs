@@ -23,6 +23,10 @@
 // interactive budget (64) × 2 engines on a package-heavy document exhausts
 // a 16GB machine (OOM kill wave). Sparse grids only cost ms-level replay.
 process.env.TDOM_MAX_CHECKPOINTS ||= '12';
+// The equation compares provisional state only — canonical full compiles
+// (~1GB each on package-heavy docs, × 2 engines) would OOM a 7GB hosted
+// CI runner for output nobody reads.
+process.env.TDOM_NO_CANONICAL ||= '1';
 
 import { readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
