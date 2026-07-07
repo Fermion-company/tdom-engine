@@ -39,6 +39,9 @@ const BURSTS = Number((args.find((a) => a.startsWith('--bursts=')) ?? '--bursts=
 const EDITS = Number((args.find((a) => a.startsWith('--edits=')) ?? '--edits=4').slice(8));
 
 const source = readFileSync(path.resolve(texFile), 'utf8');
+// package-heavy documents defer ~50 first rescues to the async pump at
+// boot; on a 2-core CI runner they take well past the default 3 minutes
+const DRAIN_MS = 20 * 60_000;
 const rand = rng(SEED);
 const pick = (arr) => arr[Math.floor(rand() * arr.length)];
 
@@ -83,7 +86,7 @@ const eng = new CheckpointEngine({ workDir: workA, docDir: path.dirname(path.res
 let failed = false;
 try {
   await eng.open(source);
-  await drain(eng);
+  await drain(eng, DRAIN_MS);
   // Baseline freezes: blocks whose exact compile fails already at boot
   // (e.g. splitting envs whose split needs the real output routine — the
   // dormant absorb can't make progress and the run discards). Both engines
@@ -114,7 +117,7 @@ try {
       burstEdits.push({ ...ed, removed: src.slice(ed.start, ed.end) });
       await eng.edit(ed.start, ed.end, ed.text);
     }
-    await drain(eng);
+    await drain(eng, DRAIN_MS);
     // Transiently broken TeX (an edit landed inside tikz coordinates, an
     // unclosed conditional, …): real LuaLaTeX emergency-stops on such a
     // source — there is NO ground truth, and the two paths freeze
@@ -130,7 +133,7 @@ try {
       for (const ed of burstEdits.reverse()) {
         await eng.edit(ed.start, ed.start + ed.text.length, ed.removed);
       }
-      await drain(eng);
+      await drain(eng, DRAIN_MS);
       const still = gating().filter((f) => !baseFrozen.has(f.text)).map((f) => f.id);
       if (still.length) {
         failed = true;
@@ -144,7 +147,7 @@ try {
     const fresh = new CheckpointEngine({ workDir: workB, docDir: path.dirname(path.resolve(texFile)) });
     try {
       await fresh.open(eng.getSource());
-      await drain(fresh);
+      await drain(fresh, DRAIN_MS);
       const a = signature(eng);
       const c = signature(fresh);
       const mismatches = [];
