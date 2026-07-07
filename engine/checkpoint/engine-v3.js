@@ -1174,10 +1174,31 @@ export class CheckpointEngine {
     return out;
   }
 
+  /** LRU-bounded iso result cache: each entry carries the block's chunk
+   * SVGs (MBs on package-heavy docs), so an unbounded map grows into the
+   * gigabytes across offset-keyed re-rescues — enough to OOM a 7GB CI
+   * runner during a boot drain. Evictions only cost a re-fork (~2-5s). */
+  #isoCacheGet(key) {
+    const hit = this.isoCache.get(key);
+    if (hit !== undefined) {
+      this.isoCache.delete(key);
+      this.isoCache.set(key, hit); // refresh recency
+    }
+    return hit;
+  }
+
+  #isoCacheSet(key, iso) {
+    this.isoCache.set(key, iso);
+    const cap = Math.max(8, Number(process.env.TDOM_ISO_CACHE || 48));
+    while (this.isoCache.size > cap) {
+      this.isoCache.delete(this.isoCache.keys().next().value);
+    }
+  }
+
   async #rescueBlock(idx, why) {
     const block = this.blocks[idx];
     const cacheKey = this.#rescueCacheKey(block, idx);
-    let iso = this.isoCache.get(cacheKey);
+    let iso = this.#isoCacheGet(cacheKey);
     if (!iso) {
       if (block.galley?.state) {
         // STALE-FIRST: an isolated compile takes seconds and must never sit
@@ -3150,9 +3171,9 @@ export class CheckpointEngine {
       this.rescueQueue.set(bid, nowKey);
       return;
     }
-    if (!this.isoCache.has(key)) {
+    if (this.#isoCacheGet(key) === undefined) {
       const iso = await this.#isoCompile(block, idx, 'async exact rescue');
-      this.isoCache.set(key, iso);
+      this.#isoCacheSet(key, iso);
     }
     const outcome = await this.#locked(async () => {
       if (this.mode !== 'structured') return 'done';
