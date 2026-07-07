@@ -55,6 +55,7 @@ import { CanonicalRenderer } from './canonical.js';
 import { ensureShim } from './forkshim.js';
 import { ShippingChain } from './shipping.js';
 import { Peer } from './peer.js';
+import { Timer } from './timer.js';
 import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
 import { classifyGalley, demoteFidelity, SAFE_GLYPH } from './fidelity.js';
 import { cropSvg, cropSvgAt, r2 } from './util/svg.js';
@@ -4694,20 +4695,3 @@ function miniUnits(items, blockId, chunkRef, suppress = false) {
 }
 
 const EMPTY_UNITS = [];
-
-class Timer {
-  constructor() {
-    this.t0 = performance.now();
-    this.last = this.t0;
-    this.laps = {};
-  }
-  lap(name) {
-    const now = performance.now();
-    this.laps[name + 'Us'] = Math.round((now - this.last) * 1000);
-    this.last = now;
-  }
-  done() {
-    this.laps.totalUs = Math.round((performance.now() - this.t0) * 1000);
-    return this.laps;
-  }
-}
