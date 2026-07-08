@@ -40,8 +40,6 @@
 // into an SVG chunk, swapped in asynchronously.
 
 import net from 'node:net';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,9 +75,8 @@ import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
 import { brokenBlockGalley as brokenBlockGalleyHelper } from './broken-galley.js';
 import { mayNeedRender, releaseRenderHold } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
-import { cropRenderTargets } from './render-chunks.js';
 import { renderResidentBlock } from './resident-render.js';
-import { buildIsolatedRenderSource } from './isolated-render-source.js';
+import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { compareCanonicalText } from './canonical-verification.js';
 import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
@@ -120,10 +117,8 @@ import { runColdIsoCompile, runForkIsoCompile } from './iso-runner.js';
 import { classifyDocument } from './safety.js';
 import { cropSvg, cropSvgAt } from './util/svg.js';
 import { parseVec, vecCountersEqual, vecLocalsEqual, push2, resolvedInGalley } from './util/galley.js';
-import { waitForPdf } from './util/fs.js';
 import { buildJobBlockBody } from './job-body.js';
 
-const execFileP = promisify(execFile);
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
 const BASE_COUNTERS = [
@@ -1938,98 +1933,14 @@ export class CheckpointEngine {
    * (full preamble per render) but pixel-exact all the same.
    */
   async #renderIsolated(block, idx) {
-    // isolated renders are FULL lualatex runs of the document preamble —
-    // dozens in parallel overload the machine, hit the 90s timeout and
-    // leave truncated PDFs ('Invalid XRef'). Serialize them; each result
-    // is cached by galley hash so the queue drains once per content.
-    this.isoRenderQueue = (this.isoRenderQueue ?? Promise.resolve()).then(() =>
-      this.#renderIsolatedInner(block, idx).catch((err) => {
-        this.diagnostics.push(`render ${block.id}: ${err.message}`);
+    return queueIsolatedRender(this, block, idx, (b, i) =>
+      renderIsolatedBlock(this, {
+        block: b,
+        idx: i,
+        chunkTargets: (targetBlock) => this.#chunkTargets(targetBlock),
+        asyncRepaginate: () => this.#asyncRepaginate(),
       })
     );
-    return this.isoRenderQueue;
-  }
-
-  /**
-   * Isolated renders are the LOWEST-priority work in the system: a full
-   * preamble compile (~minutes on package-heavy documents) per gfx block,
-   * purely to upgrade the provisional preview's block chunks. The canonical
-   * layer already guarantees exact final pixels, so these must never
-   * compete with typing (rescue queue), the canonical compile, or an edit
-   * burst — CPU saturation here slows the resident fork jobs by orders of
-   * magnitude.
-   */
-  async #renderIdleGate() {
-    for (;;) {
-      const busy =
-        this.rescueQueue.size > 0 ||
-        this.canonical.info().inFlight ||
-        Date.now() - (this.lastEditAt ?? 0) < 3000;
-      if (!busy) return;
-      await new Promise((r) => setTimeout(r, 500));
-    }
-  }
-
-  async #renderIsolatedInner(block, idx) {
-    await this.#renderIdleGate();
-    if (!block.galley || !this.blocks.includes(block)) return; // superseded (reboot nulls galleys)
-    const forGalley = block.galleyHash;
-    // a full-preamble compile is minutes on package-heavy documents: never
-    // pay it when every chunk is already fresh (idle-gate wait races)
-    if (!this.#chunkTargets(block).some((t) => this.chunks.get(t.key)?.forGalley !== forGalley)) {
-      return;
-    }
-    const inflightKey = 'iso:' + block.id + ':' + forGalley;
-    this.rendering ??= new Set();
-    if (this.rendering.has(inflightKey)) return;
-    this.rendering.add(inflightKey);
-    try {
-      // entry counters = the previous block's REAL exit vector (captured
-      // from TeX by the galley report); zeros at the document start
-      const entry = {};
-      const prevVec = idx > 0 ? JSON.parse(this.blocks[idx - 1].stateVec ?? '[]') : [];
-      this.counters.forEach((c, i) => {
-        entry[c] = prevVec[i] ?? 0;
-      });
-      // cross-block layout state from the previous block's REAL exit vector:
-      // [..counters.., tdom@pd, tdom@nobreak, tdom@ls] — prevdepth reproduces
-      // the exact leading interline glue, @nobreak the post-heading \everypar
-      const prevPd = idx > 0 && prevVec.length >= 3 ? prevVec[prevVec.length - 3] : -65536000;
-      const prevNobreak = idx > 0 && prevVec.length >= 2 ? prevVec[prevVec.length - 2] === 1 : false;
-      const text = this.store.get(this.file);
-      const bounds = documentBounds(text);
-      const isoTex = buildIsolatedRenderSource({
-        preamble: text.slice(bounds.preamble.start, bounds.preamble.end),
-        labelTable: this.labelTable,
-        geometry: this.geometry,
-        hrefTable: this.hrefTable,
-        entry,
-        prevPd,
-        prevNobreak,
-        blockText: block.text,
-      });
-      const jobdir = path.join(this.workDir, `render-${block.id}-${forGalley}`);
-      mkdirSync(jobdir, { recursive: true });
-      rmSync(path.join(jobdir, 'iso.pdf'), { force: true });
-      writeFileSync(path.join(jobdir, 'iso.tex'), isoTex);
-      // lowest-priority CPU: see #isoCompile
-      await execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
-        cwd: jobdir,
-        timeout: 90_000,
-      }).catch(() => {});
-      const pdf = path.join(jobdir, 'iso.pdf');
-      if (!existsSync(pdf)) throw new Error('isolated render produced no PDF');
-      await waitForPdf(pdf); // %%EOF flushed before pdftocairo reads it
-      // same page map as the resident RENDER path: galley, floats, feet
-      const targets = this.#chunkTargets(block).filter(
-        (t) => this.chunks.get(t.key)?.forGalley !== forGalley
-      );
-      await cropRenderTargets({ jobdir, pdf, targets, chunks: this.chunks, forGalley, prefix: 'iso' });
-      if (block.galleyHash === forGalley) this.#asyncRepaginate();
-      rmSync(jobdir, { recursive: true, force: true });
-    } finally {
-      this.rendering.delete(inflightKey);
-    }
   }
 
   #asyncRepaginate() {
