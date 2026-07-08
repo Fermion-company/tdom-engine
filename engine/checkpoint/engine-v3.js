@@ -93,6 +93,7 @@ import {
 } from './checkpoint-retirement.js';
 import { shippingLabelSeed } from './shipping-seeds.js';
 import { buildUpdateResponse, buildOpaqueUpdateResponse } from './update-response.js';
+import { scheduleStructuredReprobe as scheduleStructuredReprobeHelper } from './structured-reprobe.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -2037,16 +2038,7 @@ export class CheckpointEngine {
    * opaque fallback without a retry storm).
    */
   #scheduleStructuredReprobe(preHash) {
-    if (this.reprobedPre === preHash) return; // one shot per preamble
-    this.reprobedPre = preHash;
-    const t = setTimeout(() => {
-      if (this.closed || this.mode !== 'opaque') return;
-      if (this.opaqueStickyPre !== preHash) return; // preamble moved on
-      this.diagnostics.push('opaque self-heal: re-probing the structured boot');
-      this.opaqueStickyPre = null;
-      this.#update({ editLabel: 'structured-reprobe' }).catch(() => {});
-    }, Number(process.env.TDOM_REPROBE_MS || 20_000));
-    t.unref?.(); // never keep the process alive for a reprobe
+    scheduleStructuredReprobeHelper(this, preHash, (args) => this.#update(args));
   }
 
   /** Free the resident process tree (opaque mode needs none of it). */
