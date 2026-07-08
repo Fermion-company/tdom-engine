@@ -76,6 +76,7 @@ import {
   releaseRenderHold,
 } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
+import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -315,29 +316,27 @@ export class CheckpointEngine {
   }
 
   getSource() {
-    return this.store.get(this.file);
+    return source(this.store, this.file);
   }
 
   getDisplayLists() {
-    return this.pages.map((p) => p.dl);
+    return displayLists(this.pages);
   }
 
   getGeometry() {
-    return this.geometry;
+    return geometry(this.geometry);
   }
 
   getFontFile(key) {
-    const p = this.fontFiles.get(key);
-    if (!p || !existsSync(p)) return null;
-    return readFileSync(p);
+    return fontFile(this.fontFiles, key);
   }
 
   getFontManifest() {
-    return [...this.fontFiles.keys()];
+    return fontManifest(this.fontFiles);
   }
 
   getChunkSVG(id) {
-    return this.chunks.get(id)?.svg ?? null;
+    return chunkSvg(this.chunks, id);
   }
 
   getDOM() {
