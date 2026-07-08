@@ -87,6 +87,7 @@ import {
   labelReferenceCandidates,
   pushLabelDependencies,
 } from './reference-deps.js';
+import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -1641,36 +1642,18 @@ export class CheckpointEngine {
     // boundaries INSIDE the window die. Whether the suffix may be TRUSTED
     // is decided after the foreground walk (verdict): definition edits and
     // untracked-state leaks still kill and rebuild it, off the hot path.
-    {
-      const { prefixLen, oldSuffixStart, newSuffixStart } = diff.bounds;
-      const delta = newSuffixStart - oldSuffixStart;
-      const rekeyed = new Map();
-      for (const [idx, peer] of this.checkpoints) {
-        if (idx <= prefixLen) {
-          rekeyed.set(idx, peer);
-        } else if (idx >= oldSuffixStart) {
-          peer.vstale = true;
-          rekeyed.set(idx + delta, peer);
-        } else {
-          peer.send('DIE\n');
-          if (peer.pid) this.dyingPids?.add(peer.pid);
-        }
-      }
-      this.checkpoints = rekeyed;
-      const holds = new Map();
-      for (const [idx, id] of this.renderHold) {
-        if (idx <= prefixLen) holds.set(idx, id);
-        else if (idx >= oldSuffixStart) holds.set(idx + delta, id);
-      }
-      this.renderHold = holds;
-      this.editHold = this.editHold
-        .map((idx) => (idx <= prefixLen ? idx : idx >= oldSuffixStart ? idx + delta : -1))
-        .filter((idx) => idx >= 0);
-      if (this.pendingChain) {
-        const f = this.pendingChain.from;
-        this.pendingChain.from = f <= prefixLen ? f : f >= oldSuffixStart ? f + delta : prefixLen;
-      }
-    }
+    ({
+      checkpoints: this.checkpoints,
+      renderHold: this.renderHold,
+      editHold: this.editHold,
+    } = preserveCheckpointSuffix({
+      checkpoints: this.checkpoints,
+      renderHold: this.renderHold,
+      editHold: this.editHold,
+      pendingChain: this.pendingChain,
+      bounds: diff.bounds,
+      dyingPids: this.dyingPids,
+    }));
 
     // ---- foreground typeset: resume from the nearest kept snapshot -----
     // Any failure in the typeset phase (dead checkpoint, TeX emergency
