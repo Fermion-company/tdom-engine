@@ -56,6 +56,7 @@ import { acceptPeer } from './peer-accept.js';
 import { handlePeerMessage } from './peer-message.js';
 import { closeEngine } from './lifecycle.js';
 import { resetOpenState } from './open-state.js';
+import { awaitWaiter, fulfillWaiter, rejectWaiter } from './waiters.js';
 import { Timer } from './timer.js';
 import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
@@ -359,31 +360,15 @@ export class CheckpointEngine {
   }
 
   #await(key, timeout = JOB_TIMEOUT) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.waiters.delete(key);
-        reject(new Error(`timeout waiting for ${key}`));
-      }, timeout);
-      this.waiters.set(key, { resolve, reject, timer });
-    });
+    return awaitWaiter(this.waiters, key, timeout);
   }
 
   _fulfill(key, value) {
-    const w = this.waiters.get(key);
-    if (w) {
-      clearTimeout(w.timer);
-      this.waiters.delete(key);
-      w.resolve(value);
-    }
+    fulfillWaiter(this.waiters, key, value);
   }
 
   _reject(key, err) {
-    const w = this.waiters.get(key);
-    if (w) {
-      clearTimeout(w.timer);
-      this.waiters.delete(key);
-      w.reject(err);
-    }
+    rejectWaiter(this.waiters, key, err);
   }
 
   // message dispatch from Peer
