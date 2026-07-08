@@ -81,6 +81,7 @@ import { compareCanonicalText } from './canonical-verification.js';
 import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
 import { normalizeHeaderFooterPayload } from './header-footer.js';
 import { firstDirtyIndex, hasDefinitionEdit, nextEditHold } from './update-helpers.js';
+import { buildPagePatches } from './page-patches.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -1901,18 +1902,9 @@ export class CheckpointEngine {
     // ---- pages, display lists, patches ---------------------------------
     const pagesRaw = this.#paginateNow();
     const { pages, reused, rebuilt } = reconcile(pagesRaw, this.pages);
-    const prevHashes = new Map(this.pages.map((p) => [p.number, p.dl?.hash]));
-    const prevCount = this.pages.length;
-    const patches = [];
-    const dirtyPages = [];
-    for (const page of pages) {
-      if (!page.dl || page.dl.hfSig !== this.hfSig) page.dl = this.#displayList(page);
-      if (page.dl.hash !== prevHashes.get(page.number)) {
-        dirtyPages.push(page.number);
-        patches.push({ type: 'replace-page', page: page.number, displayList: page.dl });
-      }
-    }
-    if (pages.length < prevCount) patches.push({ type: 'remove-pages', from: pages.length + 1 });
+    const { patches, dirtyPages } = buildPagePatches(pages, this.pages, this.hfSig, (page) =>
+      this.#displayList(page)
+    );
     this.pages = pages;
     this.#scheduleHeaders();
     t.lap('paginate');
@@ -3138,17 +3130,7 @@ export class CheckpointEngine {
     // patches through the async channel (SSE)
     const rawPages = this.#paginateNow();
     const { pages } = reconcile(rawPages, this.pages);
-    const prevHashes = new Map(this.pages.map((p) => [p.number, p.dl?.hash]));
-    const patches = [];
-    for (const page of pages) {
-      if (!page.dl || page.dl.hfSig !== this.hfSig) page.dl = this.#displayList(page);
-      if (page.dl.hash !== prevHashes.get(page.number)) {
-        patches.push({ type: 'replace-page', page: page.number, displayList: page.dl });
-      }
-    }
-    if (pages.length < this.pages.length) {
-      patches.push({ type: 'remove-pages', from: pages.length + 1 });
-    }
+    const { patches } = buildPagePatches(pages, this.pages, this.hfSig, (page) => this.#displayList(page));
     this.pages = pages;
     if (patches.length && this.onAsyncPatches) {
       this.rev++;
