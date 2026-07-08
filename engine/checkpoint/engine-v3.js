@@ -62,6 +62,7 @@ import { computeToc, pageSpecs, hfJobBody } from './page-metadata.js';
 import { chunkTargets } from './chunk-targets.js';
 import { EMPTY_UNITS, paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, watchInclude } from './include-expander.js';
+import { needsRescue } from './rescue-classifier.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -102,20 +103,6 @@ const BASE_COUNTERS = [
 const HEADING_RE = /^\s*\\(chapter|section|subsection|subsubsection|paragraph)\b/;
 const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 12_000);
 const BOOT_TIMEOUT = 60_000;
-// Environments that drive TeX's page builder themselves (own \output,
-// column balancing against \vsize) or that MUST break across real pages
-// (longtable's page-splitting, landscape's rotated geometry). On the
-// dormant \vsize=\maxdimen page they yield garbage or a single giant
-// galley — route them through the isolated exact-render rescue, where a
-// real lualatex with the real \textheight typesets them exactly as print
-// (taller-than-page material ships real pages → per-page chunks with
-// forced breaks).
-// environments the dormant galley cannot represent: output-routine swappers
-// (multicols, longtable …) and page-context readers that split against
-// \pagegoal-\pagetotal (mdframed, framed, breakable tcolorbox)
-const OUTPUT_HIJACK_RE =
-  /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded)\}|\\begin\{tcolorbox\}\[[^\]]*breakable|\\includepdf\b/;
-
 // Margin placement: material lands OUTSIDE the galley box (page margin), so
 // no per-block chunk can represent it — the block is typeset in-chain for
 // its body text and demoted to CANONICAL_ONLY (#applyFidelity). \todo is
@@ -818,26 +805,16 @@ export class CheckpointEngine {
     return g;
   }
 
-  /**
-   * Rescue triggers: the static hijack list plus breakable tcolorbox
-   * environments the PREAMBLE defines (\newtcolorbox/\newtcbtheorem with
-   * a `breakable` option create page-splitting envs under custom names).
-   */
   #needsRescue(text) {
-    if (OUTPUT_HIJACK_RE.test(text)) return true;
-    if (this._breakableFor !== this.preHash) {
-      const src = this.store.get(this.file) ?? '';
-      const b = documentBounds(src);
-      const pre = src.slice(b.preamble.start, b.preamble.end);
-      const names = [];
-      for (const m of pre.matchAll(/\\newtcolorbox\{([A-Za-z@]+)\}[^\n]*?breakable/g)) names.push(m[1]);
-      for (const m of pre.matchAll(/\\newtcbtheorem(?:\[[^\]]*\])?\{([A-Za-z@]+)\}[^\n]*?breakable/g)) names.push(m[1]);
-      this._breakableRe = names.length
-        ? new RegExp(`\\\\begin\\{(?:${names.join('|')})\\}`)
-        : null;
-      this._breakableFor = this.preHash;
-    }
-    return this._breakableRe ? this._breakableRe.test(text) : false;
+    const result = needsRescue(text, {
+      preHash: this.preHash,
+      breakableFor: this._breakableFor,
+      breakableRe: this._breakableRe,
+      source: () => this.store.get(this.file) ?? '',
+    });
+    if (result.breakableFor !== this._breakableFor) this._breakableFor = result.breakableFor;
+    if (result.breakableRe !== this._breakableRe) this._breakableRe = result.breakableRe;
+    return result.needs;
   }
 
   /**
