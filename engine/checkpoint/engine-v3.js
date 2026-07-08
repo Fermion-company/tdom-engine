@@ -81,6 +81,7 @@ import { compareCanonicalText } from './canonical-verification.js';
 import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
 import { firstDirtyIndex, hasDefinitionEdit, nextEditHold } from './update-helpers.js';
 import { buildPagePatches } from './page-patches.js';
+import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
 import {
   flushVanishedLabels,
   labelReferenceCandidates,
@@ -2544,29 +2545,13 @@ export class CheckpointEngine {
   }
 
   #asyncRepaginate() {
-    // rebuild display lists after async galley/chunk arrivals and push
-    // patches through the async channel (SSE)
-    const rawPages = this.#paginateNow();
-    const { pages } = reconcile(rawPages, this.pages);
-    const { patches } = buildPagePatches(pages, this.pages, this.hfSig, (page) => this.#displayList(page));
-    this.pages = pages;
-    if (patches.length && this.onAsyncPatches) {
-      this.rev++;
-      this.onAsyncPatches({ rev: this.rev, patches });
-    }
-    // toc drift: an async landing (header job, rescue offsets, chunk
-    // adoption) moved provisional page numbers AFTER the last toc pass —
-    // the \tableofcontents blocks would keep printing the older numbers
-    // (the one identity gap the farm's incremental-vs-scratch check kept
-    // finding). Queue the settle pass; #chainAfterPass runs the toc
-    // fixpoint once the stream is quiet.
-    if (this.mode === 'structured' && !this.pendingChain) {
-      const consumer = this.blocks.findIndex((b) => b.consumesToc);
-      if (consumer >= 0 && this.#computeToc(pages).hash !== this.tocHash) {
-        this.#queueChainWork('settle', consumer, []);
-        this.#scheduleBackground(consumer, []);
-      }
-    }
+    asyncRepaginateHelper(this, {
+      paginateNow: () => this.#paginateNow(),
+      displayList: (page) => this.#displayList(page),
+      computeToc: (pages) => this.#computeToc(pages),
+      queueChainWork: (kind, from, labels) => this.#queueChainWork(kind, from, labels),
+      scheduleBackground: (fromIdx, dirtyBlocks) => this.#scheduleBackground(fromIdx, dirtyBlocks),
+    });
   }
 
   // --------------------------------------------------------------- units
