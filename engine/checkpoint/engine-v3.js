@@ -50,7 +50,6 @@ import { SourceStore } from '../source-store.js';
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { reconcile } from './pagebuilder.js';
-import { mapLegacyFont } from './mathmap.js';
 import { CanonicalRenderer } from './canonical.js';
 import { ensureShim } from './forkshim.js';
 import { ShippingChain } from './shipping.js';
@@ -63,6 +62,7 @@ import { chunkTargets } from './chunk-targets.js';
 import { EMPTY_UNITS, paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, watchInclude } from './include-expander.js';
 import { needsRescue } from './rescue-classifier.js';
+import { normalizeGalleyFonts, registerFont } from './font-registry.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -91,7 +91,7 @@ import {
   resolvedInGalley,
   stableFontKey,
 } from './util/galley.js';
-import { waitForPdf, resolveFont } from './util/fs.js';
+import { waitForPdf } from './util/fs.js';
 
 const execFileP = promisify(execFile);
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -1492,38 +1492,11 @@ export class CheckpointEngine {
     this.#indexBlock(blockId, EMPTY_UNITS, EMPTY_UNITS);
   }
 
-  /**
-   * Rewrite the galley's numeric daemon font ids to stable keys BEFORE
-   * anything hashes or stores it. Daemon ids are allocation-order artifacts
-   * of one fork lineage: replaying the same block in a different lineage
-   * (chain preservation, background rebuild, engine restart) yields
-   * different ids for identical output — which used to make galleyHash /
-   * page identity churn, mark untouched pages dirty and peel their
-   * canonical overlays. After this pass, galley identity is a pure function
-   * of TeX's output.
-   */
   #normalizeGalleyFonts(galley) {
-    const map = new Map();
-    for (const [fid, meta] of Object.entries(galley.fonts ?? {})) {
-      const key = stableFontKey(meta);
-      map.set(Number(fid), key);
-      this.#registerFont(key, meta);
-    }
-    if (galley.fontsNormalized) return; // stale-first reuse re-adopts objects
-    const rewrite = (r) => {
-      if (r.rule || r.f == null) return;
-      const key = map.get(r.f);
-      if (key) r.f = key;
-      else if (typeof r.f === 'number' && map.size) {
-        // a PARTIALLY mapped galley is a real bug (the daemon reports every
-        // id its runs use); rescued iso galleys legitimately carry no font
-        // table at all — their pixels come from chunks, runs only size them
-        this.diagnostics.push(`font id ${r.f} missing from galley font table`);
-      }
-    };
-    walkItemRuns(galley.items, rewrite);
-    for (const f of galley.floats ?? []) walkItemRuns(f.items, rewrite);
-    galley.fontsNormalized = true;
+    normalizeGalleyFonts(galley, {
+      registerFont: (key, meta) => this.#registerFont(key, meta),
+      diagnostics: this.diagnostics,
+    });
   }
 
   #adoptGalley(block, galley) {
@@ -1610,39 +1583,10 @@ export class CheckpointEngine {
   }
 
   #registerFont(key, meta) {
-    if (this.fonts.has(key)) return;
-    const base = path.basename(meta.file || meta.name || '');
-    const browserLoadable = /\.(otf|ttf)$/i.test(base);
-    const legacy = !browserLoadable ? mapLegacyFont(meta.name) : null;
-    // delivery tier (fidelity gate input): only the ACTUAL TeX font file,
-    // present on disk and browser-loadable, is 'native'. Legacy fonts with
-    // a Latin Modern twin are 'twin' (a substitution — never exact); every
-    // other case (pfb without a twin, missing file) is 'none': the glyph
-    // layer must not fake those at all.
-    let familyKey;
-    let tier;
-    if (legacy) {
-      familyKey = 'twin-' + legacy.twin;
-      if (!this.fontFiles.has(familyKey)) {
-        this.fontFiles.set(familyKey, resolveFont(legacy.twin));
-      }
-      const twinPath = this.fontFiles.get(familyKey);
-      tier = twinPath && existsSync(twinPath) ? 'twin' : 'none';
-    } else if (browserLoadable && meta.file && existsSync(meta.file)) {
-      familyKey = 'f-' + fnv1a(meta.file);
-      if (!this.fontFiles.has(familyKey)) this.fontFiles.set(familyKey, meta.file);
-      tier = 'native';
-    } else {
-      familyKey = 'f-' + fnv1a(meta.file || meta.name || String(key));
-      tier = 'none';
-    }
-    if (this.demotedFamilies.has(familyKey)) tier = 'none';
-    this.fonts.set(key, {
-      ...meta,
-      family: familyKey,
-      remap: legacy?.map ?? null,
-      omx: !!legacy?.omx,
-      tier,
+    registerFont(key, meta, {
+      fonts: this.fonts,
+      fontFiles: this.fontFiles,
+      demotedFamilies: this.demotedFamilies,
     });
   }
 
