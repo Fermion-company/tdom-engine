@@ -61,6 +61,7 @@ import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
 import { computeToc, pageSpecs, hfJobBody } from './page-metadata.js';
 import { chunkTargets } from './chunk-targets.js';
 import { EMPTY_UNITS, paginateNow, rebuildUnits } from './units.js';
+import { expandIncludes, watchInclude } from './include-expander.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -90,7 +91,6 @@ import {
   stableFontKey,
 } from './util/galley.js';
 import { waitForPdf, resolveFont } from './util/fs.js';
-import { statSync, watch } from 'node:fs';
 
 const execFileP = promisify(execFile);
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -3546,47 +3546,17 @@ export class CheckpointEngine {
   }
 
   #expandIncludes(segs, depth) {
-    if (depth > 3) return segs;
-    const out = [];
-    for (const seg of segs) {
-      const m = seg.text.match(/^\s*\\(input|include)\s*\{([^}]+)\}\s*$/);
-      if (!m) {
-        out.push(seg);
-        continue;
-      }
-      let rel = m[2];
-      if (!/\.tex$/i.test(rel)) rel += '.tex';
-      const full = path.resolve(this.docDir ?? this.workDir, rel);
-      let text = null;
-      try {
-        const st = statSync(full);
-        const cached = this.includes.get(full);
-        text = cached && cached.mtime === st.mtimeMs ? cached.text : readFileSync(full, 'utf8');
-        this.includes.set(full, { mtime: st.mtimeMs, text });
-        this.#watchInclude(full);
-      } catch {
-        this.diagnostics.push(`\\input file not found: ${rel} (typeset literally)`);
-        out.push(seg);
-        continue;
-      }
-      const subs = this.#expandIncludes(segmentBody(text, 0), depth + 1);
-      for (const s of subs) out.push({ ...s, file: full, hash: fnv1a(full + '|' + s.text) });
-    }
-    return out;
+    return expandIncludes(segs, depth, {
+      docDir: this.docDir,
+      workDir: this.workDir,
+      includes: this.includes,
+      diagnostics: this.diagnostics,
+      watchInclude: (full) => this.#watchInclude(full),
+    });
   }
 
   #watchInclude(full) {
-    if (this.watchers.has(full)) return;
-    try {
-      let timer = null;
-      const w = watch(full, () => {
-        clearTimeout(timer);
-        timer = setTimeout(() => this.onExternalChange?.(full), 120);
-      });
-      this.watchers.set(full, w);
-    } catch {
-      /* watching is best-effort */
-    }
+    watchInclude(full, this.watchers, (changed) => this.onExternalChange?.(changed));
   }
 
   async refresh() {
