@@ -55,6 +55,7 @@ import { ensureShim } from './forkshim.js';
 import { acceptPeer } from './peer-accept.js';
 import { handlePeerMessage } from './peer-message.js';
 import { closeEngine } from './lifecycle.js';
+import { resetOpenState } from './open-state.js';
 import { Timer } from './timer.js';
 import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
@@ -273,25 +274,7 @@ export class CheckpointEngine {
   // ------------------------------------------------------------ lifecycle
 
   async open(text, file = 'main.tex') {
-    this.file = file;
-    this.store.open(file, text);
-    this.blocks = [];
-    this.labelTable = new Map();
-    this.hrefTable = new Map();
-    this.blockLabelIdx = new Map();
-    this.blockRefIdx = new Map();
-    this.labelCount = new Map();
-    this.refIndex = new Map();
-    this.vanishedLabels = new Set();
-    this._pageRun = null;
-    this.pages = [];
-    // a fresh document gets a fresh chance at the structured layer
-    this.mode = 'structured';
-    this.modeReasons = [];
-    this.opaqueStickyPre = null;
-    this.verifyState = null;
-    this.pendingChain = null;
-    this.editHold = [];
+    resetOpenState(this, text, file);
     return this.#update({ editLabel: 'open' });
   }
 
