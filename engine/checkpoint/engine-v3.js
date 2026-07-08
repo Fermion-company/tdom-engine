@@ -88,6 +88,7 @@ import {
   pushLabelDependencies,
 } from './reference-deps.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
+import { adoptGalleyBlock } from './galley-adoption.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -1443,52 +1444,12 @@ export class CheckpointEngine {
       (galley.labels ?? []).map((l) => l.k),
       galley.refs ?? []
     );
-    block.galley = galley;
-    block.galleyHash = fnv1a(
-      JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events])
-    );
-    if (galley.tdomIsoChunks) {
-      // rescued block: the isolated run's print-identical pixels are the
-      // chunks — registered here so forGalley matches the adopted hash
-      for (const c of galley.tdomIsoChunks) {
-        const prev = this.chunks.get(c.key);
-        this.chunks.set(c.key, {
-          svg: c.svg,
-          wBp: c.wBp,
-          hBp: c.hBp,
-          v: (prev?.v ?? 0) + 1,
-          forGalley: block.galleyHash,
-        });
-      }
-      delete galley.tdomIsoChunks;
-      block.rescued = true;
-    } else if (galley.tdomStale) {
-      // stale-first rescue: the previous (rescued) galley is being reused
-      // verbatim — its chunks are already registered under the same hash
-      delete galley.tdomStale;
-      block.rescued = true;
-    } else {
-      block.rescued = false;
-    }
-    // exit state = tracked counters + cross-block layout state (prevdepth,
-    // \if@nobreak) — any change forces the convergence chain onward
-    block.stateVec = JSON.stringify([
-      ...this.counters.map((c) => galley.state?.[c] ?? 0),
-      galley.state?.['tdom@pd'] ?? 0,
-      galley.state?.['tdom@nobreak'] ?? 0,
-      galley.state?.['tdom@ls'] ?? 0,
-    ]);
-    block.gfx = !!galley.gfx;
-    // fonts were registered by #normalizeGalleyFonts BEFORE the fidelity
-    // gate reads their tiers
-    this.#applyFidelity(block, galley);
-    block.consumesToc = /\\(tableofcontents|listoffigures|listoftables)\b/.test(block.text);
-    block.kind = HEADING_RE.test(block.text)
-      ? 'heading'
-      : block.gfx
-        ? 'graphics'
-        : 'paragraph';
-    block.units = null;
+    adoptGalleyBlock(block, galley, {
+      counters: this.counters,
+      chunks: this.chunks,
+      headingRe: HEADING_RE,
+      applyFidelity: (b, g) => this.#applyFidelity(b, g),
+    });
   }
 
   #applyFidelity(block, galley) {
