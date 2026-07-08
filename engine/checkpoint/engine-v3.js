@@ -92,6 +92,7 @@ import {
   retireOffGrid as retireOffGridHelper,
 } from './checkpoint-retirement.js';
 import { shippingLabelSeed } from './shipping-seeds.js';
+import { buildUpdateResponse } from './update-response.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -1825,45 +1826,36 @@ export class CheckpointEngine {
     // LuaLaTeX's own pixels
     this.canonical.schedule(text, this.srcRev);
     this.#shipUpdate(text);
-    return {
+    return buildUpdateResponse({
       rev: this.rev,
       srcRev: this.srcRev,
-      edit: editLabel,
-      backend: this.backendName,
+      editLabel,
+      backendName: this.backendName,
       mode: this.mode,
       modeReasons: this.modeReasons,
       canonical: this.canonical.info(),
-      dirtySourceNodes: [...dirtySource].map((id) => 'src-' + id),
-      dirtySemanticNodes: dirtyBlocks.map((id) => 'blk-' + id),
-      dirtyDependencies: depDirty,
-      dirtyLayoutNodes: dirtyBlocks.map((id) => 'galley-' + id),
+      dirtySource,
+      dirtyBlocks,
+      depDirty,
       dirtyPages,
       patches,
-      stats: {
-        ...t.done(),
-        blocksTotal: this.blocks.length,
-        blocksTypeset: typesetCount,
-        blocksReparsed: typesetCount,
-        semanticCacheHits: this.blocks.length - typesetCount,
-        layoutCacheHits: this.blocks.length - typesetCount,
-        layoutCacheMisses: typesetCount,
-        typesetMs: Math.round(forkMs * 100) / 100,
-        rebooted,
-        checkpoints: this.checkpoints.size,
-        chainVerdict: verdict ?? 'walked',
-        chainPending: this.pendingChain
-          ? { kind: this.pendingChain.kind, from: this.pendingChain.from }
-          : null,
-        pagesReused: reused,
-        pagesRebuilt: rebuilt,
-        pageCount: pages.length,
-        macrosChanged: [],
-        labelsChanged: [...changedLabels],
-        verify: this.verifyState,
-        fidelity: this.#fidelitySummary(),
-        diagnostics: [...diagnostics, ...this.diagnostics.splice(0)],
-      },
-    };
+      timerStats: t.done(),
+      blocks: this.blocks,
+      typesetCount,
+      forkMs,
+      rebooted,
+      checkpoints: this.checkpoints,
+      verdict,
+      pendingChain: this.pendingChain,
+      reused,
+      rebuilt,
+      pages,
+      changedLabels,
+      verifyState: this.verifyState,
+      fidelity: this.#fidelitySummary(),
+      diagnostics,
+      engineDiagnostics: this.diagnostics,
+    });
   }
 
   /** Inspector counters for the visual fidelity gate. */
