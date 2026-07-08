@@ -81,6 +81,7 @@ import { queueMovedOffsets as queueMovedOffsetsHelper } from './rescue-offsets.j
 import { scheduleBackground as scheduleBackgroundHelper } from './background-scheduler.js';
 import { typesetBlock as typesetBlockHelper } from './typeset-dispatch.js';
 import { rescueBlock as rescueBlockHelper } from './rescue-block.js';
+import { runChainPass as runChainPassHelper, chainAfterPass as chainAfterPassHelper } from './chain-pass.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import {
   onCanonicalResult as onCanonicalResultHelper,
@@ -1320,141 +1321,28 @@ export class CheckpointEngine {
     });
   }
 
-  /**
-   * The deferred chain pass. 'settle': re-typeset forward from the stop
-   * point until a clean block reproduces its galley AND exit state exactly
-   * (the moving counters have been chased to convergence). 'rebuild': same
-   * walk but to the end of the document — after a definition edit or an
-   * untracked-state leak no early convergence can be trusted. Both are
-   * resumable: bgAbort (set by the next edit) exits between blocks with
-   * work.from advanced, and the pass re-runs after that edit's own
-   * foreground. Changed galleys stream to the client through the async
-   * patch channel; stale galleys stay on screen meanwhile (old-but-clean
-   * beats fast-but-wrong, and canonical owns the final pixels regardless).
-   */
   async #runChainPass() {
-    const work = this.pendingChain;
-    if (!work) return;
-    this.bgActive = true;
-    try {
-      if (work.phase === 'blocks') {
-        let sinceRepaint = 0;
-        let j = this.#nearestCheckpoint(Math.min(work.from, this.blocks.length));
-        while (j < this.blocks.length) {
-          if (this.bgAbort) {
-            work.from = Math.min(work.from, j);
-            return;
-          }
-          this.progress = { phase: 'chain', at: j + 1, total: this.blocks.length };
-          const block = this.blocks[j];
-          const before = { hash: block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
-          let galley;
-          try {
-            galley = await this.#typesetBlock(j);
-          } catch {
-            work.from = Math.min(work.from, j);
-            return; // killed by an incoming edit — resume afterwards
-          }
-          this.#adoptGalley(block, galley);
-          for (const l of galley.labels ?? []) {
-            if (this.labelTable.get(l.k) !== l.v) {
-              work.labels.add(l.k);
-              this.labelTable.set(l.k, l.v);
-            }
-            if (l.h != null) this.hrefTable.set(l.k, l.h);
-          }
-          const changed = block.galleyHash !== before.hash || block.stateVec !== before.state;
-          if (changed) {
-            if (block.needsRender) this.#queueRender(block.id);
-            if (++sinceRepaint >= 8) {
-              this.#asyncRepaginate();
-              sinceRepaint = 0;
-            }
-          }
-          j++;
-          work.from = Math.max(work.from, j);
-          if (
-            work.kind === 'settle' &&
-            before.hadGalley &&
-            !changed &&
-            !this.blocks.slice(j).some((b) => !b.galley)
-          ) {
-            break; // exit state converged — the untouched suffix is exact
-          }
-        }
-        if (sinceRepaint) this.#asyncRepaginate();
-        work.phase = 'after';
-      }
-      if (this.bgAbort) return;
-      await this.#chainAfterPass(work);
-      if (this.bgAbort) return;
-      if (this.pendingChain === work) this.pendingChain = null;
-    } finally {
-      this.bgActive = false;
-      this.progress = null;
-      // the settle/rebuild/after walks left checkpoints at every block they
-      // re-typeset — collapse back to the grid
-      this.#enforceCheckpointCap();
-    }
+    return runChainPassHelper(this, {
+      nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
+      typesetBlock: (idx) => this.#typesetBlock(idx),
+      adoptGalley: (block, galley) => this.#adoptGalley(block, galley),
+      queueRender: (blockId) => this.#queueRender(blockId),
+      asyncRepaginate: () => this.#asyncRepaginate(),
+      chainAfterPass: (work) => this.#chainAfterPass(work),
+      enforceCheckpointCap: () => this.#enforceCheckpointCap(),
+    });
   }
 
-  /**
-   * Post-settle dependency passes — the async twins of the foreground's
-   * inline backward-reference and toc sections, run once the suffix state
-   * has stopped moving. Abortable and re-entrant (work.phase = 'after').
-   */
   async #chainAfterPass(work) {
-    const changedLabels = work.labels;
-    if (changedLabels.size) {
-      const candidates = new Set();
-      for (const k of changedLabels) {
-        for (const bid of this.refIndex.get(k) ?? []) candidates.add(bid);
-      }
-      for (let c = 0; c < this.blocks.length && candidates.size; c++) {
-        if (this.bgAbort) return;
-        const block = this.blocks[c];
-        if (!candidates.has(block.id)) continue;
-        candidates.delete(block.id);
-        const hit = (block.galley?.refs ?? []).some(
-          (k) => changedLabels.has(k) && !resolvedInGalley(block, k, this.labelTable)
-        );
-        if (!hit) continue;
-        const n = await this.#retypesetChain(
-          this.#nearestCheckpoint(c),
-          c,
-          () => {},
-          () => this.bgAbort
-        );
-        if (n < 0) return;
-      }
-    }
-    for (let pass = 0; pass < 3; pass++) {
-      if (this.bgAbort) return;
-      const prov = this.#paginateNow();
-      const toc = this.#computeToc(prov);
-      if (toc.hash === this.tocHash) break;
-      this.tocHash = toc.hash;
-      for (const [ext, content] of Object.entries(toc.contents)) {
-        writeFileSync(path.join(this.workDir, `driver.${ext}`), content);
-      }
-      let anyConsumer = false;
-      for (let c = 0; c < this.blocks.length; c++) {
-        if (this.bgAbort) return;
-        const block = this.blocks[c];
-        if (!block.consumesToc) continue;
-        anyConsumer = true;
-        const n = await this.#retypesetChain(
-          this.#nearestCheckpoint(c),
-          c,
-          () => {},
-          () => this.bgAbort
-        );
-        if (n < 0) return;
-      }
-      if (!anyConsumer) break;
-    }
-    this.#queueMovedOffsets();
-    this.#asyncRepaginate();
+    return chainAfterPassHelper(this, work, {
+      nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
+      retypesetChain: (from, target, onBlock, shouldAbort) =>
+        this.#retypesetChain(from, target, onBlock, shouldAbort),
+      paginateNow: () => this.#paginateNow(),
+      computeToc: (pages) => this.#computeToc(pages),
+      queueMovedOffsets: () => this.#queueMovedOffsets(),
+      asyncRepaginate: () => this.#asyncRepaginate(),
+    });
   }
 
   /**
