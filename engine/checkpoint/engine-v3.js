@@ -77,13 +77,14 @@ import {
 } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
+import { compareCanonicalText } from './canonical-verification.js';
 import {
   buildDriverSource,
   buildStateJobBody,
   buildVolatilePrelude,
   buildIsoCompileSource,
 } from './tex-templates.js';
-import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
+import { classifyDocument } from './safety.js';
 import { cropSvg, cropSvgAt } from './util/svg.js';
 import {
   luaStr,
@@ -2380,50 +2381,7 @@ export class CheckpointEngine {
     const texts = await this.canonical.pageTexts(info.id);
     if (!texts) return; // pdftotext unavailable — canonical overlay still wins visually
     if (this.srcRev !== info.rev || this.mode !== 'structured') return; // superseded meanwhile
-    const mismatches = [];
-    // Pagination drift (different page count, or content landing a page
-    // early/late) is NOT block-level wrongness: the canonical overlay
-    // already owns those pages visually, and demoting their blocks to the
-    // rescue path cannot fix an offset — it would only poison the editing
-    // hot path with full compiles. Demote only for genuine content
-    // divergence: same page count AND the page's text matches neither its
-    // own canonical page nor a ±1 neighbor.
-    const countsMatch = this.pages.length === info.pageCount;
-    if (!countsMatch) {
-      mismatches.push(`page count: provisional ${this.pages.length} vs LuaLaTeX ${info.pageCount}`);
-    }
-    const demote = new Set();
-    for (const page of this.pages) {
-      const provTokens = [];
-      for (const d of page.draw ?? []) {
-        for (const r of d.u?.ln?.runs ?? []) {
-          if (r.t) provTokens.push(...verifyTokens(r.t));
-        }
-      }
-      if (provTokens.length < 20) continue; // chunk/gfx pages carry exact pixels already
-      const n = page.number;
-      const c = tokenContainment(provTokens, verifyTokens(texts[n - 1] ?? ''));
-      if (c >= 0.8) continue;
-      const window = Math.max(
-        c,
-        tokenContainment(provTokens, verifyTokens(texts[n - 2] ?? '')),
-        tokenContainment(provTokens, verifyTokens(texts[n] ?? ''))
-      );
-      if (window >= 0.8) {
-        mismatches.push(`page ${n}: drifted (content found on a neighboring page)`);
-        continue;
-      }
-      mismatches.push(`page ${n}: ${Math.round(window * 100)}% of preview text found`);
-      // demote only on CONFIDENT divergence — the canonical overlay already
-      // guarantees the final pixels page-granularly, so a demotion buys
-      // exact provisional rendering at real hot-path cost; borderline
-      // scores (kerning artifacts, extraction quirks) are report-only
-      if (!countsMatch || window >= 0.5) continue;
-      for (const d of page.draw ?? []) {
-        const bid = d.u?.blockId;
-        if (bid) demote.add(bid);
-      }
-    }
+    const { mismatches, demote } = compareCanonicalText(this.pages, texts, info.pageCount);
     this.verifyState = {
       rev: info.rev,
       canonicalId: info.id,
