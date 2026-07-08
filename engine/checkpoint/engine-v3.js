@@ -54,6 +54,7 @@ import { CanonicalRenderer } from './canonical.js';
 import { ensureShim } from './forkshim.js';
 import { Peer } from './peer.js';
 import { handlePeerMessage } from './peer-message.js';
+import { closeEngine } from './lifecycle.js';
 import { Timer } from './timer.js';
 import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
@@ -303,31 +304,7 @@ export class CheckpointEngine {
   }
 
   async close() {
-    this.closed = true;
-    this.bgAbort = true;
-    this.canonical.dispose();
-    clearTimeout(this.shipBootTimer);
-    if (this.shipping) await this.shipping.close().catch(() => {});
-    this.rescueQueue.clear();
-    for (const child of this.isoChildren) {
-      try { child.kill('SIGKILL'); } catch { /* gone */ }
-    }
-    for (const w of this.watchers.values()) {
-      try { w.close(); } catch { /* already closed */ }
-    }
-    this.watchers.clear();
-    for (const peer of this.peers) {
-      peer.send('DIE\n');
-      if (peer.pid) {
-        try { process.kill(peer.pid, 'SIGKILL'); } catch { /* already gone */ }
-      }
-    }
-    if (this.root) {
-      try { this.root.kill('SIGKILL'); } catch { /* gone */ }
-    }
-    if (this.server) this.server.close();
-    this.checkpoints.clear();
-    this.peers.clear();
+    return closeEngine(this);
   }
 
   getSource() {
