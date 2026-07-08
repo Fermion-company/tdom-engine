@@ -52,7 +52,7 @@ import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { reconcile } from './pagebuilder.js';
 import { CanonicalRenderer } from './canonical.js';
 import { ensureShim } from './forkshim.js';
-import { Peer } from './peer.js';
+import { acceptPeer } from './peer-accept.js';
 import { handlePeerMessage } from './peer-message.js';
 import { closeEngine } from './lifecycle.js';
 import { Timer } from './timer.js';
@@ -372,24 +372,7 @@ export class CheckpointEngine {
   }
 
   #accept(sock) {
-    const peer = new Peer(sock, this);
-    this.peers.add(peer);
-    sock.on('close', () => {
-      this.peers.delete(peer);
-      if (peer.pid) this.dyingPids?.delete(peer.pid);
-      for (const [idx, p] of this.checkpoints) {
-        if (p === peer) this.checkpoints.delete(idx);
-      }
-      // fail fast: if the process carrying the in-flight job dies (TeX
-      // emergency stop on a broken block, missing file, ...), reject its
-      // waiters immediately instead of running out the 30s timeout
-      const job = this.currentJob;
-      if (job && (peer === job.parent || (job.pid && peer.pid === job.pid))) {
-        const err = new Error('typesetting process died (TeX error in this block?)');
-        this._reject(job.galleyKey, err);
-        this._reject(job.ckptKey, err);
-      }
-    });
+    acceptPeer(this, sock);
   }
 
   #await(key, timeout = JOB_TIMEOUT) {
