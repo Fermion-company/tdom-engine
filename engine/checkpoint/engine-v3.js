@@ -40,16 +40,17 @@
 // into an SVG chunk, swapped in asynchronously.
 
 import net from 'node:net';
-import { spawn, execFile } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { fnv1a } from '../hash.js';
-import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
+import { segmentBody, diffBlocks } from '../segmenter.js';
 import { reconcile } from './pagebuilder.js';
 import { ensureShim } from './forkshim.js';
+import { bootRoot as bootRootHelper } from './boot-root.js';
 import { acceptPeer } from './peer-accept.js';
 import { handlePeerMessage } from './peer-message.js';
 import { closeEngine } from './lifecycle.js';
@@ -118,8 +119,6 @@ import {
   extractBraced,
   startsVertical,
   startsAddvspace,
-  scanCounterDefs,
-  texErrorFrom,
 } from './util/tex.js';
 import { parseVec, vecCountersEqual, vecLocalsEqual, push2, resolvedInGalley } from './util/galley.js';
 import { waitForPdf } from './util/fs.js';
@@ -268,90 +267,15 @@ export class CheckpointEngine {
   }
 
   async #bootRoot() {
-    await this.#ensureShim();
-    await this.#ensureServer();
-    // tear down any previous tree — DIE for the well-behaved residents plus
-    // SIGKILL by pid, because a child stuck in a TeX loop never reads DIE
-    for (const peer of this.peers) {
-      peer.send('DIE\n');
-      if (peer.pid) {
-        try { process.kill(peer.pid, 'SIGKILL'); } catch { /* already gone */ }
-      }
-    }
-    this.checkpoints.clear();
-    if (this.root) {
-      try { this.root.kill('SIGKILL'); } catch { /* gone */ }
-      this.root = null;
-    }
-    this.fonts.clear();
-
-    const text = this.store.get(this.file);
-    const bounds = documentBounds(text);
-    const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
-    this.counters = [...BASE_COUNTERS, ...scanCounterDefs(preamble)];
-    // \pagestyle set in the preamble runs before the driver shims exist —
-    // scan for it; otherwise book-family classes default to 'headings'
-    const psMatch = preamble.match(/^[^%\n]*\\pagestyle\s*\{(\w+)\}/m);
-    this.initialStyle = psMatch
-      ? psMatch[1]
-      : /\\documentclass[^{]*\{[^}]*(book|report)[^}]*\}/.test(preamble)
-        ? 'headings'
-        : 'plain';
-    this.hf = new Map();
-    this.hfSig = null;
-    writeFileSync(path.join(this.workDir, 'driver.tex'), this.#driverSource(preamble));
-
-    // The aux family is a BYPRODUCT of the previous process tree, not state:
-    // everything persistent lives in the orchestrator (labelTable, hrefTable,
-    // #computeToc regenerates driver.toc after the first pagination). A tree
-    // that died mid-write (SIGKILL, crash, power) leaves truncated/NUL-ridden
-    // files behind, and \begin{document} reading them kills the boot ("Text
-    // line contains an invalid character") — demoting a perfectly good
-    // document to opaque. Boot from a clean slate, always.
-    for (const ext of ['aux', 'toc', 'lof', 'lot', 'loa', 'lol', 'idx', 'out', 'nav', 'snm', 'vrb']) {
-      rmSync(path.join(this.workDir, `driver.${ext}`), { force: true });
-    }
-    rmSync(path.join(this.workDir, 'driver.pdf'), { force: true });
-    const ckptReady = this.#await('ckpt:0', BOOT_TIMEOUT);
-    const geoReady = this.#await('geo', BOOT_TIMEOUT);
-    this.root = spawn(
-      'lualatex',
-      ['--shell-escape', '-interaction=nonstopmode', 'driver.tex'],
-      {
-        cwd: this.workDir,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          TEXINPUTS: `${this.docDir}:${process.env.TEXINPUTS || ''}`,
-          LUAINPUTS: `${this.docDir}:${process.env.LUAINPUTS || ''}`,
-        },
-      }
-    );
-    let rootLog = '';
-    this.root.stdout.on('data', (d) => { rootLog += d; if (rootLog.length > 65536) rootLog = rootLog.slice(-32768); });
-    this.root.stderr.on('data', (d) => { rootLog += d; });
-    const rootRef = this.root;
-    this.root.on('exit', () => {
-      if (this.root !== rootRef) return; // a superseded root dying is expected
-      this.rootLog = rootLog;
-      // a dead root can never announce ckpt:0 — fail the boot immediately
-      // (a broken preamble in nonstopmode still prompts on missing files
-      // and emergency-stops on EOF)
-      const err = new Error('lualatex exited during preamble: ' + texErrorFrom(rootLog));
-      this._reject('ckpt:0', err);
-      this._reject('geo', err);
-      this.checkpoints.clear();
+    return bootRootHelper(this, {
+      ensureShim: () => this.#ensureShim(),
+      ensureServer: () => this.#ensureServer(),
+      driverSource: (preamble) => this.#driverSource(preamble),
+      awaitReady: (key, timeout) => this.#await(key, timeout),
+      reject: (key, err) => this._reject(key, err),
+      baseCounters: BASE_COUNTERS,
+      bootTimeout: BOOT_TIMEOUT,
     });
-    this.rootLogRef = () => rootLog;
-
-    await Promise.all([ckptReady, geoReady]).catch((err) => {
-      throw new Error(`preamble build failed — ${texErrorFrom(rootLog) || err.message}`);
-    });
-    // hyperref (and friends) write PDF objects during \begin{document},
-    // which opens the shared output file at the root — checkpoint children
-    // can then no longer ship their own tight pages. Fall back to isolated
-    // per-block compiles for the exact-render tier in that case.
-    this.pdfOpenedAtRoot = existsSync(path.join(this.workDir, 'driver.pdf'));
   }
 
   #driverSource(preamble) {
