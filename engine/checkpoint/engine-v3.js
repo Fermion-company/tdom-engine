@@ -67,6 +67,11 @@ import { applyFidelity } from './fidelity-gate.js';
 import { indexBlock, unindexBlock } from './block-index.js';
 import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
 import {
+  mayNeedRender,
+  maybeHoldRenderCheckpoint,
+  releaseRenderHold,
+} from './render-hold.js';
+import {
   buildDriverSource,
   buildStateJobBody,
   buildVolatilePrelude,
@@ -112,14 +117,6 @@ const BOOT_TIMEOUT = 60_000;
 // suffix, off the hot path.
 const DEF_RE =
   /\\(def|edef|gdef|xdef|newcommand|renewcommand|providecommand|DeclareRobustCommand|DeclareMathOperator|let|futurelet|newenvironment|renewenvironment|newcounter|newtheorem|newlength|newsavebox|setlength|addtolength|makeatletter|catcode|pagestyle)\b/;
-
-// cheap "will want an exact preview chunk" scan for blocks with no fidelity
-// verdict yet (checkpoint render-hold heuristic — a miss only costs the
-// slower isolated render path)
-const MATHY_RE =
-  /\$|\\\[|\\\(|\\begin\{(equation|align|gather|multline|eqnarray|math|displaymath|tikzpicture)/;
-// how many off-grid checkpoints may stay alive awaiting their block's chunk
-const RENDER_HOLD_MAX = Number(process.env.TDOM_RENDER_HOLD_MAX || 8);
 
 export class CheckpointEngine {
   constructor({ workDir, docDir }) {
@@ -1321,16 +1318,7 @@ export class CheckpointEngine {
     // the one being edited) keeps its checkpoint alive until the chunk
     // lands. Small budget: a boot-time flood must not hold half the
     // document's process tree — beyond it the isolated render path covers.
-    const block = this.blocks[idx];
-    if (
-      block &&
-      !this.renderHold.has(idx) &&
-      this.renderHold.size < RENDER_HOLD_MAX &&
-      this.#mayNeedRender(block)
-    ) {
-      this.renderHold.set(idx, block.id);
-      return;
-    }
+    if (maybeHoldRenderCheckpoint(idx, this.blocks[idx], this.renderHold)) return;
     const peer = this.checkpoints.get(idx);
     if (peer) {
       peer.send('DIE\n');
@@ -1375,17 +1363,14 @@ export class CheckpointEngine {
     }
   }
 
-  /** Will this block plausibly want an exact preview chunk? Known from its
-   * last fidelity verdict; brand-new blocks get a cheap math/gfx scan. */
   #mayNeedRender(block) {
-    if (block.fidelity) return !!block.needsRender;
-    return MATHY_RE.test(block.text);
+    return mayNeedRender(block);
   }
 
   /** A held checkpoint has served its render (or the hold went stale):
    * resume normal grid retirement. */
   #releaseRenderHold(idx) {
-    if (!this.renderHold.delete(idx)) return;
+    if (!releaseRenderHold(this.renderHold, idx)) return;
     this.#retireOffGrid(idx);
   }
 
