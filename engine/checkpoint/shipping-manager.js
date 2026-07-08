@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { ShippingChain } from './shipping.js';
+import { shippingLabelSeed } from './shipping-seeds.js';
 
 export function makeShippingChain(engine, queueShipBoot) {
   const chain = new ShippingChain({
@@ -28,6 +29,44 @@ export function makeShippingChain(engine, queueShipBoot) {
     }
   };
   return chain;
+}
+
+export async function bootShipping(engine, { makeShipping, paginateNow, computeToc, shipUpdate }) {
+  if (!engine.shipping || engine.mode !== 'structured' || engine.shipBooting) return;
+  engine.shipBooting = true;
+  try {
+    const text = engine.store.get(engine.file);
+    const preHash = engine.preHash;
+    if (engine.shipBootedFor !== preHash) engine.shipBootTries = 0;
+    if (engine.shipBootedFor !== null || engine.shipping.rootPeer || engine.shipping.disposed) {
+      // a previous run exists: replace the whole instance (its net server
+      // and process tree die with it)
+      await engine.shipping.close().catch(() => {});
+      engine.shipping = makeShipping();
+    }
+    const prov = paginateNow();
+    const labelSeed = shippingLabelSeed(
+      engine.pages,
+      engine.blockLabelIdx,
+      engine.labelTable,
+      engine.shipLabelOverrides
+    );
+    const toc = computeToc(prov);
+    engine.shipStale = false;
+    engine.shipGenRev.clear();
+    engine.shipGenRev.set(0, engine.srcRev);
+    engine.shipBootTries = engine.shipBootedFor === preHash ? engine.shipBootTries + 1 : 1;
+    await engine.shipping.open(text, { labelSeed, contents: toc.contents });
+    engine.shipBootedFor = preHash;
+    // an edit landed while booting: converge the wave to it now
+    const now = engine.store.get(engine.file);
+    if (now !== text) shipUpdate(now);
+  } catch (err) {
+    engine.diagnostics.push('shipping boot failed: ' + err.message);
+    engine.shipBootedFor = null;
+  } finally {
+    engine.shipBooting = false;
+  }
 }
 
 export function queueShipBoot(engine, bootShipping) {

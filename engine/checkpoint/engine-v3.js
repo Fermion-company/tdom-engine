@@ -94,8 +94,8 @@ import {
   enforceCheckpointCap as enforceCheckpointCapHelper,
   retireOffGrid as retireOffGridHelper,
 } from './checkpoint-retirement.js';
-import { shippingLabelSeed } from './shipping-seeds.js';
 import {
+  bootShipping as bootShippingHelper,
   makeShippingChain,
   queueShipBoot as queueShipBootHelper,
   shipUpdate as shipUpdateHelper,
@@ -1789,36 +1789,12 @@ export class CheckpointEngine {
    * source comparison at the end.
    */
   async #bootShipping() {
-    if (!this.shipping || this.mode !== 'structured' || this.shipBooting) return;
-    this.shipBooting = true;
-    try {
-      const text = this.store.get(this.file);
-      const preHash = this.preHash;
-      if (this.shipBootedFor !== preHash) this.shipBootTries = 0;
-      if (this.shipBootedFor !== null || this.shipping.rootPeer || this.shipping.disposed) {
-        // a previous run exists: replace the whole instance (its net server
-        // and process tree die with it)
-        await this.shipping.close().catch(() => {});
-        this.shipping = this.#makeShipping();
-      }
-      const prov = this.#paginateNow();
-      const labelSeed = shippingLabelSeed(this.pages, this.blockLabelIdx, this.labelTable, this.shipLabelOverrides);
-      const toc = this.#computeToc(prov);
-      this.shipStale = false;
-      this.shipGenRev.clear();
-      this.shipGenRev.set(0, this.srcRev);
-      this.shipBootTries = this.shipBootedFor === preHash ? this.shipBootTries + 1 : 1;
-      await this.shipping.open(text, { labelSeed, contents: toc.contents });
-      this.shipBootedFor = preHash;
-      // an edit landed while booting: converge the wave to it now
-      const now = this.store.get(this.file);
-      if (now !== text) this.#shipUpdate(now);
-    } catch (err) {
-      this.diagnostics.push('shipping boot failed: ' + err.message);
-      this.shipBootedFor = null;
-    } finally {
-      this.shipBooting = false;
-    }
+    return bootShippingHelper(this, {
+      makeShipping: () => this.#makeShipping(),
+      paginateNow: () => this.#paginateNow(),
+      computeToc: (pages) => this.#computeToc(pages),
+      shipUpdate: (text) => this.#shipUpdate(text),
+    });
   }
 
   #queueShipBoot() {
