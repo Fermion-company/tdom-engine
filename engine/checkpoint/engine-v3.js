@@ -61,6 +61,7 @@ import { chunkTargets } from './chunk-targets.js';
 import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, watchInclude } from './include-expander.js';
 import { needsRescue } from './rescue-classifier.js';
+import { scheduleHeaders as scheduleHeadersHelper } from './header-scheduler.js';
 import {
   normalizeGalleyFonts,
   registerFont,
@@ -74,7 +75,6 @@ import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { compareCanonicalText } from './canonical-verification.js';
 import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
-import { normalizeHeaderFooterPayload } from './header-footer.js';
 import { firstDirtyIndex, hasDefinitionEdit, nextEditHold } from './update-helpers.js';
 import { buildPagePatches } from './page-patches.js';
 import {
@@ -2953,43 +2953,13 @@ export class CheckpointEngine {
   }
 
   #scheduleHeaders() {
-    const pages = this.pages;
-    if (!pages?.length) return;
-    const specs = this.#pageSpecs(pages);
-    const sig = fnv1a(JSON.stringify(specs));
-    if (sig === this.hfSig || sig === this.hfPending) return;
-    const ck = this.checkpoints.get(0);
-    if (!ck) return;
-    this.hfPending = sig;
-    this.hfTask = (async () => {
-      const body = Buffer.from(this.#hfJobBody(specs), 'utf8');
-      const done = this.#await('galley:__hf', 60_000);
-      done.catch(() => {});
-      ck.send(`RENDER __hf ${this.workDir} ${body.length}\n`);
-      ck.sendRaw(body);
-      const payload = await done;
-      const map = normalizeHeaderFooterPayload(payload, (key, meta) => this.#registerFont(key, meta));
-      // apply only between updates — never mid-#update (see this.updating)
-      await new Promise((resolve) => {
-        const apply = () => {
-          if (this.updating) {
-            setTimeout(apply, 10);
-            return;
-          }
-          this.hf = map;
-          this.hfSig = sig;
-          this.#asyncRepaginate();
-          resolve();
-        };
-        apply();
-      });
-    })()
-      .catch((err) => {
-        this.diagnostics.push('header job failed: ' + err.message);
-      })
-      .finally(() => {
-        if (this.hfPending === sig) this.hfPending = null;
-      });
+    scheduleHeadersHelper(this, {
+      pageSpecs: (pages) => this.#pageSpecs(pages),
+      hfJobBody: (specs) => this.#hfJobBody(specs),
+      awaitGalley: (key, timeout) => this.#await(key, timeout),
+      registerFont: (key, meta) => this.#registerFont(key, meta),
+      asyncRepaginate: () => this.#asyncRepaginate(),
+    });
   }
 
   #expandIncludes(segs, depth) {
