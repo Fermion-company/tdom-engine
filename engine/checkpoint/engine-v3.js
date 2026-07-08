@@ -62,7 +62,11 @@ import { chunkTargets } from './chunk-targets.js';
 import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, watchInclude } from './include-expander.js';
 import { needsRescue } from './rescue-classifier.js';
-import { normalizeGalleyFonts, registerFont } from './font-registry.js';
+import {
+  normalizeGalleyFonts,
+  registerFont,
+  demoteFontFamily as demoteRegisteredFontFamily,
+} from './font-registry.js';
 import { applyFidelity } from './fidelity-gate.js';
 import { indexBlock, unindexBlock } from './block-index.js';
 import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
@@ -1508,15 +1512,10 @@ export class CheckpointEngine {
    * exact-preview-required with no glyph bridge.
    */
   demoteFontFamily(familyKey) {
-    if (!familyKey || this.demotedFamilies.has(familyKey)) return false;
-    this.demotedFamilies.add(familyKey);
-    let touched = false;
-    for (const meta of this.fonts.values()) {
-      if (meta.family === familyKey && meta.tier !== 'none') {
-        meta.tier = 'none';
-        touched = true;
-      }
-    }
+    const touched = demoteRegisteredFontFamily(familyKey, {
+      demotedFamilies: this.demotedFamilies,
+      fonts: this.fonts,
+    });
     if (!touched) return false;
     this.diagnostics.push(`fidelity gate: font ${familyKey} failed in the browser — demoted to exact preview`);
     this.fidelityEpoch++;

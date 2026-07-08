@@ -75,3 +75,16 @@ export function registerFont(key, meta, { fonts, fontFiles, demotedFamilies }) {
     tier,
   });
 }
+
+export function demoteFontFamily(familyKey, { demotedFamilies, fonts }) {
+  if (!familyKey || demotedFamilies.has(familyKey)) return false;
+  demotedFamilies.add(familyKey);
+  let touched = false;
+  for (const meta of fonts.values()) {
+    if (meta.family === familyKey && meta.tier !== 'none') {
+      meta.tier = 'none';
+      touched = true;
+    }
+  }
+  return touched;
+}
