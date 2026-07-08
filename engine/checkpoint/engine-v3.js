@@ -77,6 +77,7 @@ import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
 import { brokenBlockGalley as brokenBlockGalleyHelper } from './broken-galley.js';
 import { mayNeedRender, releaseRenderHold } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
+import { cropRenderTargets } from './render-chunks.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { compareCanonicalText } from './canonical-verification.js';
 import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
@@ -2107,23 +2108,7 @@ export class CheckpointEngine {
     // DONE fires from finish_pdffile, but the child's stdio buffers reach
     // the disk only on _exit — wait until the file is complete (%%EOF)
     await waitForPdf(pdf);
-    for (const tgt of targets) {
-      const svgPath = path.join(jobdir, `chunk-${tgt.page}.svg`);
-      await execFileP(
-        'pdftocairo',
-        ['-svg', '-f', String(tgt.page), '-l', String(tgt.page), pdf, svgPath],
-        { timeout: 30_000 }
-      );
-      const svg = cropSvg(readFileSync(svgPath, 'utf8'), tgt.w, tgt.h);
-      const prev = this.chunks.get(tgt.key);
-      this.chunks.set(tgt.key, {
-        svg,
-        wBp: tgt.w,
-        hBp: tgt.h,
-        v: (prev?.v ?? 0) + 1,
-        forGalley,
-      });
-    }
+    await cropRenderTargets({ jobdir, pdf, targets, chunks: this.chunks, forGalley, prefix: 'chunk' });
     if (block.galleyHash === forGalley) this.#asyncRepaginate();
     } finally {
       this.rendering.delete(inflightKey);
@@ -2323,26 +2308,7 @@ export class CheckpointEngine {
       const targets = this.#chunkTargets(block).filter(
         (t) => this.chunks.get(t.key)?.forGalley !== forGalley
       );
-      for (const tgt of targets) {
-        const svgPath = path.join(jobdir, `iso-${tgt.page}.svg`);
-        await execFileP(
-          'pdftocairo',
-          ['-svg', '-f', String(tgt.page), '-l', String(tgt.page), pdf, svgPath],
-          { timeout: 30_000 }
-        );
-        // the shipped page can come out paper-sized when a class hooks the
-        // shipout (luatexja); the box sits at the origin (\hoffset=-1in), so
-        // cropping the viewBox to the known extent is always exact
-        const svg = cropSvg(readFileSync(svgPath, 'utf8'), tgt.w, tgt.h);
-        const prev = this.chunks.get(tgt.key);
-        this.chunks.set(tgt.key, {
-          svg,
-          wBp: tgt.w,
-          hBp: tgt.h,
-          v: (prev?.v ?? 0) + 1,
-          forGalley,
-        });
-      }
+      await cropRenderTargets({ jobdir, pdf, targets, chunks: this.chunks, forGalley, prefix: 'iso' });
       if (block.galleyHash === forGalley) this.#asyncRepaginate();
       rmSync(jobdir, { recursive: true, force: true });
     } finally {
