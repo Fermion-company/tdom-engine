@@ -52,7 +52,6 @@ import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { reconcile } from './pagebuilder.js';
 import { CanonicalRenderer } from './canonical.js';
 import { ensureShim } from './forkshim.js';
-import { ShippingChain } from './shipping.js';
 import { Peer } from './peer.js';
 import { Timer } from './timer.js';
 import { buildDisplayList } from './display-list.js';
@@ -92,6 +91,11 @@ import {
   retireOffGrid as retireOffGridHelper,
 } from './checkpoint-retirement.js';
 import { shippingLabelSeed } from './shipping-seeds.js';
+import {
+  makeShippingChain,
+  queueShipBoot as queueShipBootHelper,
+  shipUpdate as shipUpdateHelper,
+} from './shipping-manager.js';
 import { buildUpdateResponse, buildOpaqueUpdateResponse } from './update-response.js';
 import { scheduleStructuredReprobe as scheduleStructuredReprobeHelper } from './structured-reprobe.js';
 import { teardownResidentTree } from './teardown-tree.js';
@@ -1882,32 +1886,7 @@ export class CheckpointEngine {
   // ------------------------------------------- shipping chain (phase 1)
 
   #makeShipping() {
-    const chain = new ShippingChain({
-      workDir: path.join(this.workDir, 'ship'),
-      docDir: this.docDir,
-    });
-    chain.onPaged = ({ page, gen }) => {
-      if (this.shipStale || chain !== this.shipping) return;
-      this.onShipPage?.({ page, gen, srcRev: this.shipGenRev.get(gen) ?? 0 });
-    };
-    chain.onLabel = ({ key, val }) => {
-      const known = this.labelTable.get(key);
-      const seeded = this.shipLabelOverrides.get(key) ?? known;
-      if (seeded !== undefined && String(seeded) !== String(val) && !this.shipStale) {
-        // backward effect: a label value the seeds promised has moved —
-        // EARLIER pages may print stale numbers. Record the SHIP-observed
-        // truth and reboot with corrected seeds (bounded: a divergence the
-        // reseed cannot absorb must not loop). Until then the cold
-        // canonical owns the display truth.
-        this.shipStale = true;
-        this.shipLabelOverrides.set(key, val);
-        this.diagnostics.push(`shipping: label ${key} diverged (${seeded} -> ${val}) — reseeding`);
-        this.#queueShipBoot();
-      } else if (seeded === undefined) {
-        this.shipLabelOverrides.set(key, val);
-      }
-    };
-    return chain;
+    return makeShippingChain(this, () => this.#queueShipBoot());
   }
 
   /**
@@ -1950,55 +1929,12 @@ export class CheckpointEngine {
   }
 
   #queueShipBoot() {
-    if (!this.shipping || this.shipBootTimer) return;
-    if (this.shipBootTries >= 3) return; // stays cold-covered; a preamble
-    // edit resets the budget (a genuinely divergent doc must not loop)
-    const arm = () => {
-      this.shipBootTimer = setTimeout(() => {
-        this.shipBootTimer = null;
-        // a stale-but-running run is a TRUTH HARVESTER: every divergent
-        // label it reports lands in shipLabelOverrides, so ONE reboot with
-        // the complete truth converges. Killing it at the first divergence
-        // would relearn one label per boot and exhaust the budget.
-        if (this.shipping && !this.shipping.done && this.shipping.rootPeer?.alive && !this.shipping.err) {
-          arm();
-          return;
-        }
-        this.#bootShipping().catch(() => {});
-      }, 800);
-      this.shipBootTimer.unref?.();
-    };
-    arm();
+    queueShipBootHelper(this, () => this.#bootShipping());
   }
 
   /** Hot-path hook: cheap (a unit diff + one socket line). */
   #shipUpdate(text) {
-    if (!this.shipping || this.mode !== 'structured') return;
-    if (this.shipBooting) return; // boot-end convergence will catch up
-    if (
-      this.shipping.err?.message?.startsWith('pdf-opened-at-root') &&
-      this.shipBootedFor === this.preHash &&
-      this.shipDisabledFor !== this.preHash
-    ) {
-      // hyperref-class document: the per-page lazy-open scheme cannot work;
-      // the cold canonical owns the display. Disabled PER PREAMBLE — a
-      // preamble edit (or another document) gets a fresh chance.
-      this.shipDisabledFor = this.preHash;
-      this.diagnostics.push('shipping disabled for this preamble: ' + this.shipping.err.message);
-    }
-    if (this.shipDisabledFor === this.preHash) return;
-    if (this.shipBootedFor !== this.preHash || this.shipStale || this.shipping.err) {
-      this.#queueShipBoot();
-      return;
-    }
-    const r = this.shipping.resume(text);
-    if (r.mode === 'resumed') {
-      this.shipGenRev.set(this.shipping.gen, this.srcRev);
-    } else if (r.mode === 'unchanged') {
-      this.shipGenRev.set(this.shipping.gen, this.srcRev);
-    } else if (r.mode === 'reboot-needed') {
-      this.#queueShipBoot();
-    }
+    shipUpdateHelper(this, text, () => this.#queueShipBoot());
   }
 
   #opaqueUpdate(editLabel, t, reasons) {
