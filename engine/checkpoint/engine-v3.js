@@ -43,7 +43,6 @@ import net from 'node:net';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { reconcile } from './pagebuilder.js';
 import { ensureShim } from './forkshim.js';
 import { bootRoot as bootRootHelper } from './boot-root.js';
 import { acceptPeer } from './peer-accept.js';
@@ -81,14 +80,13 @@ import { rescueBlock as rescueBlockHelper } from './rescue-block.js';
 import { runChainPass as runChainPassHelper, chainAfterPass as chainAfterPassHelper } from './chain-pass.js';
 import { runUpdateTypesetPhase } from './update-typeset-phase.js';
 import { prepareUpdate } from './update-prepare.js';
+import { finalizeUpdate } from './update-finalize.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import {
   onCanonicalResult as onCanonicalResultHelper,
   cropCanonicalChunks as cropCanonicalChunksHelper,
   verifyAgainstCanonical as verifyAgainstCanonicalHelper,
 } from './canonical-arrival.js';
-import { nextEditHold } from './update-helpers.js';
-import { buildPagePatches } from './page-patches.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
 import { adoptGalleyBlock } from './galley-adoption.js';
 import { checkpointGrid, nearestCheckpoint } from './checkpoint-selection.js';
@@ -103,7 +101,6 @@ import {
   queueShipBoot as queueShipBootHelper,
   shipUpdate as shipUpdateHelper,
 } from './shipping-manager.js';
-import { buildUpdateResponse } from './update-response.js';
 import { opaqueUpdate as opaqueUpdateHelper } from './opaque-mode.js';
 import { scheduleStructuredReprobe as scheduleStructuredReprobeHelper } from './structured-reprobe.js';
 import { teardownResidentTree } from './teardown-tree.js';
@@ -745,65 +742,23 @@ export class CheckpointEngine {
       this.opaqueStickyPre = this.preHash;
       return this.#opaqueUpdate(editLabel, t, [`structured typeset failed: ${err.message}`]);
     }
-    const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict } =
-      this._typesetResult;
-    // pin the edit locus so the next keystroke is fork-once, typeset-once
-    this.editHold = nextEditHold(fgStop, dirtyBlocks, this.blocks, this.editHold);
-
-    // ---- pages, display lists, patches ---------------------------------
-    const pagesRaw = this.#paginateNow();
-    const { pages, reused, rebuilt } = reconcile(pagesRaw, this.pages);
-    const { patches, dirtyPages } = buildPagePatches(pages, this.pages, this.hfSig, (page) =>
-      this.#displayList(page)
-    );
-    this.pages = pages;
-    this.#scheduleHeaders();
-    t.lap('paginate');
-
-    // ---- async work: rebuild remaining checkpoint chain + gfx renders --
-    // the boot/edit walk left a checkpoint at every block it typeset —
-    // collapse to the grid before scheduling background work (a full boot
-    // walk of a large document is the worst offender)
-    this.#enforceCheckpointCap();
-    this.#scheduleBackground(fgStop, dirtyBlocks);
-    t.lap('schedule');
-
-    this.rev++;
-    this.srcRev++;
-    // converge to exact: the canonical compile of THIS source is scheduled
-    // off the hot path; when it lands the client swaps every clean page to
-    // LuaLaTeX's own pixels
-    this.canonical.schedule(text, this.srcRev);
-    this.#shipUpdate(text);
-    return buildUpdateResponse({
-      rev: this.rev,
-      srcRev: this.srcRev,
+    return finalizeUpdate(this, {
+      text,
       editLabel,
-      backendName: this.backendName,
-      mode: this.mode,
-      modeReasons: this.modeReasons,
-      canonical: this.canonical.info(),
       dirtySource,
-      dirtyBlocks,
-      depDirty,
-      dirtyPages,
-      patches,
-      timerStats: t.done(),
-      blocks: this.blocks,
-      typesetCount,
-      forkMs,
+      typesetResult: this._typesetResult,
       rebooted,
-      checkpoints: this.checkpoints,
-      verdict,
-      pendingChain: this.pendingChain,
-      reused,
-      rebuilt,
-      pages,
-      changedLabels,
-      verifyState: this.verifyState,
-      fidelity: this.#fidelitySummary(),
       diagnostics,
-      engineDiagnostics: this.diagnostics,
+      timer: t,
+      callbacks: {
+        paginateNow: () => this.#paginateNow(),
+        displayList: (page) => this.#displayList(page),
+        scheduleHeaders: () => this.#scheduleHeaders(),
+        enforceCheckpointCap: () => this.#enforceCheckpointCap(),
+        scheduleBackground: (fgStop, dirtyBlocks) => this.#scheduleBackground(fgStop, dirtyBlocks),
+        shipUpdate: (sourceText) => this.#shipUpdate(sourceText),
+        fidelitySummary: () => this.#fidelitySummary(),
+      },
     });
   }
 
