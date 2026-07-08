@@ -94,6 +94,7 @@ import {
 import { shippingLabelSeed } from './shipping-seeds.js';
 import { buildUpdateResponse, buildOpaqueUpdateResponse } from './update-response.js';
 import { scheduleStructuredReprobe as scheduleStructuredReprobeHelper } from './structured-reprobe.js';
+import { teardownResidentTree } from './teardown-tree.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -2043,32 +2044,7 @@ export class CheckpointEngine {
 
   /** Free the resident process tree (opaque mode needs none of it). */
   #teardownTree() {
-    for (const peer of this.peers) {
-      peer.send('DIE\n');
-      if (peer.pid) {
-        try { process.kill(peer.pid, 'SIGKILL'); } catch { /* already gone */ }
-      }
-    }
-    this.checkpoints.clear();
-    if (this.root) {
-      try { this.root.kill('SIGKILL'); } catch { /* gone */ }
-      this.root = null;
-    }
-    this.rescueQueue.clear();
-    this.renderWant.clear();
-    this.renderHold.clear();
-    this.pendingChain = null;
-    this.editHold = [];
-    clearTimeout(this.shipBootTimer);
-    this.shipBootTimer = null;
-    this.shipBootedFor = null;
-    if (this.shipping) this.shipping.close().catch(() => {});
-    for (const child of this.isoChildren) {
-      try { child.kill('SIGKILL'); } catch { /* gone */ }
-    }
-    this.preHash = null; // a later promotion must reboot from scratch
-    this.pages = [];
-    this._pageRun = null;
+    teardownResidentTree(this);
   }
 
   // ------------------------------------- canonical arrival + verification
