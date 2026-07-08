@@ -43,8 +43,6 @@ import net from 'node:net';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fnv1a } from '../hash.js';
-import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { reconcile } from './pagebuilder.js';
 import { ensureShim } from './forkshim.js';
 import { bootRoot as bootRootHelper } from './boot-root.js';
@@ -82,16 +80,16 @@ import { typesetBlock as typesetBlockHelper } from './typeset-dispatch.js';
 import { rescueBlock as rescueBlockHelper } from './rescue-block.js';
 import { runChainPass as runChainPassHelper, chainAfterPass as chainAfterPassHelper } from './chain-pass.js';
 import { runUpdateTypesetPhase } from './update-typeset-phase.js';
+import { prepareUpdate } from './update-prepare.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import {
   onCanonicalResult as onCanonicalResultHelper,
   cropCanonicalChunks as cropCanonicalChunksHelper,
   verifyAgainstCanonical as verifyAgainstCanonicalHelper,
 } from './canonical-arrival.js';
-import { firstDirtyIndex, nextEditHold } from './update-helpers.js';
+import { nextEditHold } from './update-helpers.js';
 import { buildPagePatches } from './page-patches.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
-import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { adoptGalleyBlock } from './galley-adoption.js';
 import { checkpointGrid, nearestCheckpoint } from './checkpoint-selection.js';
 import { reapDyingPids } from './dying-pids.js';
@@ -115,7 +113,6 @@ import {
   buildVolatilePrelude,
 } from './tex-templates.js';
 import { isoCompile as isoCompileHelper } from './iso-compile.js';
-import { classifyDocument } from './safety.js';
 import { buildJobBlockBody } from './job-body.js';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -692,93 +689,19 @@ export class CheckpointEngine {
 
   async #updateInner({ editLabel, retry = false }) {
     const t = new Timer();
-    const text = this.store.get(this.file);
-    const diagnostics = [];
-
-    const bounds = documentBounds(text);
-    const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
-    const preHash = fnv1a(preamble);
-
-    // ---- safety gate -----------------------------------------------------
-    // Structured is a privilege, not a default: page-mechanism-hostile
-    // constructs and previously-failed preambles take the opaque path,
-    // where the display is the canonical LuaLaTeX output itself.
-    const gate = classifyDocument(preamble, text.slice(bounds.body.start, bounds.body.end));
-    if (!gate.safe) {
-      return this.#opaqueUpdate(editLabel, t, gate.reasons.map((r) => `safety gate: ${r}`));
-    }
-    if (this.opaqueStickyPre === preHash) {
-      // dynamically demoted on this exact preamble — don't pay a doomed
-      // boot per keystroke; a preamble edit (or reopen) retries structured
-      return this.#opaqueUpdate(editLabel, t, this.modeReasons);
-    }
-    if (this.mode === 'opaque') {
-      this.mode = 'structured';
-      this.modeReasons = [];
-      this.preHash = null; // the resident tree was torn down — force a boot
-      this.canonical.pressure = 'authority'; // provisional carries the display again
-      this.diagnostics.push('safety gate: structured layer re-enabled');
-    }
-
-    let rebooted = false;
-    if (preHash !== this.preHash) {
-      if (process.env.TDOM_DEBUG_BOOT) {
-        console.error(
-          `[tdom-debug] preHash mismatch: have=${this.preHash} want=${preHash} ` +
-            `preambleLen=${preamble.length} bodyStart=${bounds.body.start} edit=${editLabel}`
-        );
-      }
-      // Structure-changing edit: the honest full-rebuild path. A preamble
-      // the daemon cannot boot (unknown packages breaking the driver shims,
-      // TeX errors before \begin{document} …) is not an error state: the
-      // document demotes to opaque and the canonical layer keeps rendering.
-      this.progress = { phase: 'boot' }; // /status: preamble reload running
-      try {
-        await this.#bootRoot();
-      } catch (err) {
-        this.opaqueStickyPre = preHash;
-        this.#scheduleStructuredReprobe(preHash);
-        return this.#opaqueUpdate(editLabel, t, [`structured boot failed: ${err.message}`]);
-      }
-      this.preHash = preHash;
-      rebooted = true;
-      for (const b of this.blocks) {
-        b.galley = null;
-        b.units = null;
-      }
-    }
-    t.lap('boot');
-
-    const oldBlocks = this.blocks;
-    let segs = segmentBody(text.slice(bounds.body.start, bounds.body.end), bounds.body.start);
-    segs = this.#expandIncludes(segs, 0);
-    const diff = diffBlocks(this.blocks, segs, () => this.idSeq++);
-    this.blocks = diff.blocks;
-    for (const id of diff.removed) this.#unindexBlock(id);
-    const dirtySource = new Set(diff.dirty);
-    t.lap('segment');
-
-    const firstDirty = firstDirtyIndex(oldBlocks, this.blocks, dirtySource, diff);
-    // Checkpoint-suffix preservation (docs/10 §I2): boundaries outside the
-    // edited window survive the edit. Prefix boundaries are exact; suffix
-    // boundaries move by the window's index delta and are marked
-    // volatile-stale — a job forked from one re-seeds counters/\prevdepth/
-    // \if@nobreak from the orchestrator's stateVec (#volatilePrelude). Only
-    // boundaries INSIDE the window die. Whether the suffix may be TRUSTED
-    // is decided after the foreground walk (verdict): definition edits and
-    // untracked-state leaks still kill and rebuild it, off the hot path.
-    ({
-      checkpoints: this.checkpoints,
-      renderHold: this.renderHold,
-      editHold: this.editHold,
-    } = preserveCheckpointSuffix({
-      checkpoints: this.checkpoints,
-      renderHold: this.renderHold,
-      editHold: this.editHold,
-      pendingChain: this.pendingChain,
-      bounds: diff.bounds,
-      dyingPids: this.dyingPids,
-    }));
+    const prepared = await prepareUpdate(this, {
+      editLabel,
+      timer: t,
+      callbacks: {
+        opaqueUpdate: (label, timer, reasons) => this.#opaqueUpdate(label, timer, reasons),
+        bootRoot: () => this.#bootRoot(),
+        scheduleStructuredReprobe: (preHash) => this.#scheduleStructuredReprobe(preHash),
+        expandIncludes: (segs, depth) => this.#expandIncludes(segs, depth),
+        unindexBlock: (id) => this.#unindexBlock(id),
+      },
+    });
+    if (prepared.response) return prepared.response;
+    const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
 
     // ---- foreground typeset: resume from the nearest kept snapshot -----
     // Any failure in the typeset phase (dead checkpoint, TeX emergency
