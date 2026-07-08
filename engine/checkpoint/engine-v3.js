@@ -78,6 +78,7 @@ import { brokenBlockGalley as brokenBlockGalleyHelper } from './broken-galley.js
 import { mayNeedRender, releaseRenderHold } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { cropRenderTargets } from './render-chunks.js';
+import { renderResidentBlock } from './resident-render.js';
 import { buildIsolatedRenderSource } from './isolated-render-source.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { compareCanonicalText } from './canonical-verification.js';
@@ -118,9 +119,6 @@ import { readIsoCompileResult } from './iso-result.js';
 import { runColdIsoCompile, runForkIsoCompile } from './iso-runner.js';
 import { classifyDocument } from './safety.js';
 import { cropSvg, cropSvgAt } from './util/svg.js';
-import {
-  braceImbalance,
-} from './util/tex.js';
 import { parseVec, vecCountersEqual, vecLocalsEqual, push2, resolvedInGalley } from './util/galley.js';
 import { waitForPdf } from './util/fs.js';
 import { buildJobBlockBody } from './job-body.js';
@@ -2001,61 +1999,18 @@ export class CheckpointEngine {
       this.#renderIsolated(block, idx);
       return;
     }
-    const inflightKey = block.id + ':' + forGalley;
-    this.rendering ??= new Set();
-    if (this.rendering.has(inflightKey)) return;
-    this.rendering.add(inflightKey);
-    try {
-    const jobdir = path.join(this.workDir, `render-${block.id}-${forGalley}`);
-    mkdirSync(jobdir, { recursive: true });
-    rmSync(path.join(jobdir, 'driver.pdf'), { force: true });
-    const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
-    const body = Buffer.from(block.text + guard, 'utf8');
-    // renders are latency work, not correctness work (canonical always
-    // wins): give up quickly on a spinning child rather than parking a
-    // pump lane on it
-    this.renderPids ??= new Map();
-    this.renderPids.set(block.id, 0); // armed: FORKED will fill the pid
-    const done = this.#await('render:' + block.id, Number(process.env.TDOM_RENDER_TIMEOUT || 20_000));
-    ck.send(`RENDER ${block.id} ${jobdir} ${body.length}\n`);
-    ck.sendRaw(body);
-    try {
-      await done;
-    } catch (err) {
-      if (/timeout/.test(String(err?.message))) {
-        // deep-lineage luatexja wall: the forked render child spins in
-        // luahbtex exactly like in-chain jobs do. Kill it (it never reads
-        // its socket again) and let the canonical-crop pass supply the
-        // exact pixels instead.
-        const pid = this.renderPids.get(block.id);
-        if (pid) {
-          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
-        }
-        // exact pixels still arrive two ways: the canonical-crop pass, or
-        // (for drifting documents it cannot serve) the idle-gated isolated
-        // queue — a fresh process typesets wall blocks at normal speed
-        this.#renderIsolated(block, idx);
-      }
-      throw err;
-    } finally {
-      this.renderPids.delete(block.id);
-    }
-    const pdf = path.join(jobdir, 'driver.pdf');
-    // DONE fires from finish_pdffile, but the child's stdio buffers reach
-    // the disk only on _exit — wait until the file is complete (%%EOF)
-    await waitForPdf(pdf);
-    await cropRenderTargets({ jobdir, pdf, targets, chunks: this.chunks, forGalley, prefix: 'chunk' });
-    if (block.galleyHash === forGalley) this.#asyncRepaginate();
-    } finally {
-      this.rendering.delete(inflightKey);
-      // fresh chunks (or a superseding edit) end the checkpoint's reprieve
-      if (
-        this.blocks[idx] !== block ||
-        !this.#chunkTargets(block).some((t) => this.chunks.get(t.key)?.forGalley !== block.galleyHash)
-      ) {
-        this.#releaseRenderHold(idx);
-      }
-    }
+    await renderResidentBlock(this, {
+      block,
+      idx,
+      ck,
+      targets,
+      forGalley,
+      awaitRender: (key, timeout) => this.#await(key, timeout),
+      renderIsolated: (b, i) => this.#renderIsolated(b, i),
+      asyncRepaginate: () => this.#asyncRepaginate(),
+      chunkTargets: (b) => this.#chunkTargets(b),
+      releaseRenderHold: (i) => this.#releaseRenderHold(i),
+    });
   }
 
   /**
