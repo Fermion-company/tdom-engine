@@ -79,6 +79,7 @@ import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { compareCanonicalText } from './canonical-verification.js';
 import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
+import { normalizeHeaderFooterPayload } from './header-footer.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -97,15 +98,7 @@ import {
   scanCounterDefs,
   texErrorFrom,
 } from './util/tex.js';
-import {
-  walkItemRuns,
-  parseVec,
-  vecCountersEqual,
-  vecLocalsEqual,
-  push2,
-  resolvedInGalley,
-  stableFontKey,
-} from './util/galley.js';
+import { parseVec, vecCountersEqual, vecLocalsEqual, push2, resolvedInGalley } from './util/galley.js';
 import { waitForPdf } from './util/fs.js';
 
 const execFileP = promisify(execFile);
@@ -3272,24 +3265,7 @@ export class CheckpointEngine {
       ck.send(`RENDER __hf ${this.workDir} ${body.length}\n`);
       ck.sendRaw(body);
       const payload = await done;
-      // same stable-key rewrite as galleys (lineage-independent identity)
-      const fkeys = new Map();
-      for (const [fid, meta] of Object.entries(payload.fonts ?? {})) {
-        const key = stableFontKey(meta);
-        fkeys.set(Number(fid), key);
-        this.#registerFont(key, meta);
-      }
-      const rewrite = (r) => {
-        if (r.rule || r.f == null) return;
-        const key = fkeys.get(r.f);
-        if (key) r.f = key;
-      };
-      const map = new Map();
-      for (const [pageStr, entry] of Object.entries(payload.hf ?? {})) {
-        walkItemRuns(entry.h, rewrite);
-        walkItemRuns(entry.f, rewrite);
-        map.set(Number(pageStr.replace(/^p/, '')), entry);
-      }
+      const map = normalizeHeaderFooterPayload(payload, (key, meta) => this.#registerFont(key, meta));
       // apply only between updates — never mid-#update (see this.updating)
       await new Promise((resolve) => {
         const apply = () => {
