@@ -89,6 +89,7 @@ import {
 } from './reference-deps.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { adoptGalleyBlock } from './galley-adoption.js';
+import { checkpointGrid, nearestCheckpoint } from './checkpoint-selection.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -1277,7 +1278,7 @@ export class CheckpointEngine {
   // stays resident. Edits resume from the nearest kept snapshot and simply
   // retypeset a few extra clean blocks (~3ms each).
   #ckptGrid() {
-    return Math.max(1, Math.ceil((this.blocks.length + 1) / this.maxCheckpoints));
+    return checkpointGrid(this.blocks.length, this.maxCheckpoints);
   }
 
   /**
@@ -1375,11 +1376,7 @@ export class CheckpointEngine {
   }
 
   #nearestCheckpoint(idx) {
-    let best = 0;
-    for (const k of this.checkpoints.keys()) {
-      if (k <= idx && k > best) best = k;
-    }
-    return best;
+    return nearestCheckpoint(this.checkpoints, idx);
   }
 
   /**
