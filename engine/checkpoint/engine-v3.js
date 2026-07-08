@@ -59,11 +59,12 @@ import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
 import { computeToc, pageSpecs, hfJobBody } from './page-metadata.js';
 import { chunkTargets } from './chunk-targets.js';
-import { EMPTY_UNITS, paginateNow, rebuildUnits } from './units.js';
+import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, watchInclude } from './include-expander.js';
 import { needsRescue } from './rescue-classifier.js';
 import { normalizeGalleyFonts, registerFont } from './font-registry.js';
 import { applyFidelity } from './fidelity-gate.js';
+import { indexBlock, unindexBlock } from './block-index.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -1448,42 +1449,23 @@ export class CheckpointEngine {
 
   /** Keep the label/ref indexes in sync with one block's galley change. */
   #indexBlock(blockId, labels, refs) {
-    const oldLabels = this.blockLabelIdx.get(blockId) ?? EMPTY_UNITS;
-    for (const k of oldLabels) {
-      const n = (this.labelCount.get(k) ?? 1) - 1;
-      if (n <= 0) {
-        this.labelCount.delete(k);
-        this.vanishedLabels.add(k);
-      } else {
-        this.labelCount.set(k, n);
-      }
-    }
-    for (const k of labels) {
-      this.labelCount.set(k, (this.labelCount.get(k) ?? 0) + 1);
-      this.vanishedLabels.delete(k);
-    }
-    if (labels.length) this.blockLabelIdx.set(blockId, labels);
-    else this.blockLabelIdx.delete(blockId);
-
-    const oldRefs = this.blockRefIdx.get(blockId) ?? EMPTY_UNITS;
-    for (const k of oldRefs) {
-      const set = this.refIndex.get(k);
-      if (set) {
-        set.delete(blockId);
-        if (!set.size) this.refIndex.delete(k);
-      }
-    }
-    for (const k of refs) {
-      let set = this.refIndex.get(k);
-      if (!set) this.refIndex.set(k, (set = new Set()));
-      set.add(blockId);
-    }
-    if (refs.length) this.blockRefIdx.set(blockId, refs);
-    else this.blockRefIdx.delete(blockId);
+    indexBlock(blockId, labels, refs, {
+      blockLabelIdx: this.blockLabelIdx,
+      labelCount: this.labelCount,
+      vanishedLabels: this.vanishedLabels,
+      blockRefIdx: this.blockRefIdx,
+      refIndex: this.refIndex,
+    });
   }
 
   #unindexBlock(blockId) {
-    this.#indexBlock(blockId, EMPTY_UNITS, EMPTY_UNITS);
+    unindexBlock(blockId, {
+      blockLabelIdx: this.blockLabelIdx,
+      labelCount: this.labelCount,
+      vanishedLabels: this.vanishedLabels,
+      blockRefIdx: this.blockRefIdx,
+      refIndex: this.refIndex,
+    });
   }
 
   #normalizeGalleyFonts(galley) {
