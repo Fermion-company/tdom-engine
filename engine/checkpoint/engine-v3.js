@@ -90,6 +90,7 @@ import {
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { adoptGalleyBlock } from './galley-adoption.js';
 import { checkpointGrid, nearestCheckpoint } from './checkpoint-selection.js';
+import { reapDyingPids } from './dying-pids.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -1340,28 +1341,7 @@ export class CheckpointEngine {
    */
   async #reapDying(maxDying = 8) {
     this.dyingPids ??= new Set();
-    const sweep = () => {
-      for (const pid of [...this.dyingPids]) {
-        try {
-          process.kill(pid, 0);
-        } catch {
-          this.dyingPids.delete(pid);
-        }
-      }
-    };
-    sweep();
-    const t0 = Date.now();
-    while (this.dyingPids.size > maxDying) {
-      if (Date.now() - t0 > 2000) {
-        for (const pid of [...this.dyingPids]) {
-          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
-          this.dyingPids.delete(pid);
-        }
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 25));
-      sweep();
-    }
+    await reapDyingPids(this.dyingPids, maxDying);
   }
 
   #mayNeedRender(block) {
