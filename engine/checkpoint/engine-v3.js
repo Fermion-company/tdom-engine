@@ -100,7 +100,8 @@ import {
   queueShipBoot as queueShipBootHelper,
   shipUpdate as shipUpdateHelper,
 } from './shipping-manager.js';
-import { buildUpdateResponse, buildOpaqueUpdateResponse } from './update-response.js';
+import { buildUpdateResponse } from './update-response.js';
+import { opaqueUpdate as opaqueUpdateHelper } from './opaque-mode.js';
 import { scheduleStructuredReprobe as scheduleStructuredReprobeHelper } from './structured-reprobe.js';
 import { teardownResidentTree } from './teardown-tree.js';
 import {
@@ -1807,30 +1808,9 @@ export class CheckpointEngine {
   }
 
   #opaqueUpdate(editLabel, t, reasons) {
-    const text = this.store.get(this.file);
-    if (this.mode !== 'opaque') {
-      this.mode = 'opaque';
-      // the compile IS the display now: recompile promptly on every pause
-      this.canonical.pressure = 'display';
-      this.diagnostics.push(`structured layer demoted to opaque: ${reasons.join('; ')}`);
-      this.#teardownTree();
-    }
-    this.modeReasons = reasons;
-    t.lap('gate');
-    this.rev++;
-    this.srcRev++;
-    this.canonical.schedule(text, this.srcRev);
-    this.#shipUpdate(text);
-    return buildOpaqueUpdateResponse({
-      rev: this.rev,
-      srcRev: this.srcRev,
-      editLabel,
-      backendName: this.backendName,
-      mode: this.mode,
-      modeReasons: this.modeReasons,
-      canonical: this.canonical.info(),
-      timerStats: t.done(),
-      diagnostics: this.diagnostics,
+    return opaqueUpdateHelper(this, editLabel, t, reasons, {
+      teardownTree: () => this.#teardownTree(),
+      shipUpdate: (text) => this.#shipUpdate(text),
     });
   }
 
