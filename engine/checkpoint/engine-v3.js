@@ -80,6 +80,7 @@ import { queueRender as queueRenderHelper } from './render-pump.js';
 import { queueMovedOffsets as queueMovedOffsetsHelper } from './rescue-offsets.js';
 import { scheduleBackground as scheduleBackgroundHelper } from './background-scheduler.js';
 import { typesetBlock as typesetBlockHelper } from './typeset-dispatch.js';
+import { rescueBlock as rescueBlockHelper } from './rescue-block.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import {
   onCanonicalResult as onCanonicalResultHelper,
@@ -432,54 +433,14 @@ export class CheckpointEngine {
   }
 
   async #rescueBlock(idx, why) {
-    const block = this.blocks[idx];
-    const cacheKey = this.#rescueCacheKey(block, idx);
-    let iso = this.#isoCacheGet(cacheKey);
-    if (!iso) {
-      if (block.galley?.state) {
-        // STALE-FIRST: an isolated compile takes seconds and must never sit
-        // on the editing hot path. Keep the previous galley on screen (the
-        // provisional layer is allowed to be temporarily stale — canonical
-        // guarantees the final pixels), seed the continuation checkpoint
-        // from the stale exit state so the chain stays consistent, and let
-        // the exact compile land asynchronously.
-        await this.#jobBlock(idx, {
-          id: block.id + '@state',
-          body: this.#stateJobBody({ state: block.galley.state, labels: block.galley.labels ?? [] }),
-        });
-        this.rescueQueue.set(block.id, cacheKey);
-        this.#pumpRescues();
-        return { ...block.galley, tdomStale: true };
-      }
-      // first-ever rescue (nothing older to display): do NOT pay the
-      // compile on the walk — hold an empty placeholder with
-      // entry-passthrough state and land the exact galley through the
-      // async pump, exactly like a stale-first landing. Fork isos arrive
-      // in ~1-3s; the walk stays bounded, and a BOOT walk in particular
-      // (which used to serialize EVERY rescue compile before first paint)
-      // reaches the first page minutes earlier.
-      this.rescueQueue.set(block.id, cacheKey);
-      this.#pumpRescues();
-      return this.#brokenBlockGalley(idx, false);
-    }
-    // continuation checkpoint carrying the isolated run's exact exit state
-    await this.#jobBlock(idx, { id: block.id + '@state', body: this.#stateJobBody(iso) });
-    return {
-      items: iso.items,
-      floats: [],
-      w: iso.w,
-      h: iso.h,
-      d: iso.d,
-      gfx: true,
-      state: iso.state,
-      labels: iso.labels,
-      toclines: iso.toclines,
-      refs: iso.refs ?? [],
-      fonts: {},
-      tdomRefVals: iso.refVals ?? {},
-      tdomPageOff: iso.compiledOff ?? 0,
-      tdomIsoChunks: iso.chunks,
-    };
+    return rescueBlockHelper(this, idx, why, {
+      rescueCacheKey: (block, blockIdx) => this.#rescueCacheKey(block, blockIdx),
+      isoCacheGet: (cacheKey) => this.#isoCacheGet(cacheKey),
+      jobBlock: (blockIdx, override) => this.#jobBlock(blockIdx, override),
+      stateJobBody: (iso) => this.#stateJobBody(iso),
+      pumpRescues: () => this.#pumpRescues(),
+      brokenBlockGalley: (blockIdx, frozen) => this.#brokenBlockGalley(blockIdx, frozen),
+    });
   }
 
   /**
