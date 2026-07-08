@@ -40,7 +40,7 @@
 // into an SVG chunk, swapped in asynchronously.
 
 import net from 'node:net';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { writeFileSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
@@ -118,9 +118,7 @@ import {
   buildStateJobBody,
   buildVolatilePrelude,
 } from './tex-templates.js';
-import { prepareIsoCompileJob } from './iso-context.js';
-import { readIsoCompileResult } from './iso-result.js';
-import { runColdIsoCompile, runForkIsoCompile } from './iso-runner.js';
+import { isoCompile as isoCompileHelper } from './iso-compile.js';
 import { classifyDocument } from './safety.js';
 import { parseVec, vecCountersEqual, vecLocalsEqual, push2, resolvedInGalley } from './util/galley.js';
 import { buildJobBlockBody } from './job-body.js';
@@ -469,72 +467,14 @@ export class CheckpointEngine {
   }
 
   async #isoCompile(block, idx, why, forceCold = false) {
-    // doomed-compile memo: the rescue key carries every input the compile
-    // depends on, so a failure repeats deterministically — rethrow instead
-    // of paying the full preamble load per chain pass over a broken block
-    const negKey = this.#rescueCacheKey(block, idx);
-    const neg = this.isoFailCache.get(negKey);
-    if (neg) throw new Error(neg);
-    const text = this.store.get(this.file);
-    const { ck0, labelSnap, jobdir, pdf, statePath, splitMode, strut, entryOff, isoTex } =
-      prepareIsoCompileJob({
-        block,
-        idx,
-        forceCold,
-        checkpoints: this.checkpoints,
-        isoForkBroken: this.isoForkBroken,
-        blocks: this.blocks,
-        counters: this.counters,
-        text,
-        workDir: this.workDir,
-        labelTable: this.labelTable,
-        geometry: this.geometry,
-        needsRescue: (blockText) => this.#needsRescue(blockText),
-        breakableRe: () => this._breakableRe,
-    });
-    mkdirSync(jobdir, { recursive: true });
-    rmSync(pdf, { force: true });
-    rmSync(statePath, { force: true });
-    writeFileSync(path.join(jobdir, 'iso.tex'), isoTex);
-    if (ck0) {
-      const forked = await runForkIsoCompile(this, {
-        ck0,
-        block,
-        jobdir,
-        pdf,
-        isoTex,
-        awaitRender: (key, timeout) => this.#await(key, timeout),
-      });
-      if (!forked) return this.#isoCompile(block, idx, why, true);
-    } else {
-      await runColdIsoCompile(this, jobdir);
-    }
-    if (ck0 && (!existsSync(pdf) || !existsSync(statePath))) {
-      // the FORK died without producing the artifacts. Some environments
-      // (tcolorbox-class) are incompatible with the fork's inherited
-      // dormant state in ways a cold compile is not — remember that for
-      // this block and retry cold, whose verdict is final.
-      this.isoForkBroken.add(block.id);
-      return this.#isoCompile(block, idx, why, true);
-    }
-    if (!existsSync(pdf) || !existsSync(statePath)) {
-      const msg = `isolated rescue failed for ${block.id} (${why})`;
-      if (this.isoFailCache.size > 200) this.isoFailCache.clear();
-      this.isoFailCache.set(negKey, msg);
-      throw new Error(msg);
-    }
-    return readIsoCompileResult(this, {
+    return isoCompileHelper(this, {
       block,
-      jobdir,
-      pdf,
-      statePath,
-      ck0,
+      idx,
       why,
-      negKey,
-      splitMode,
-      strut,
-      entryOff,
-      labelSnap,
+      forceCold,
+      rescueCacheKey: (targetBlock, blockIdx) => this.#rescueCacheKey(targetBlock, blockIdx),
+      needsRescue: (blockText) => this.#needsRescue(blockText),
+      awaitRender: (key, timeout) => this.#await(key, timeout),
       isoCompileCold: () => this.#isoCompile(block, idx, why, true),
     });
   }
