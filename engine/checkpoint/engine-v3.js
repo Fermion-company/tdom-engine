@@ -92,7 +92,7 @@ import {
   retireOffGrid as retireOffGridHelper,
 } from './checkpoint-retirement.js';
 import { shippingLabelSeed } from './shipping-seeds.js';
-import { buildUpdateResponse } from './update-response.js';
+import { buildUpdateResponse, buildOpaqueUpdateResponse } from './update-response.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -2014,40 +2014,17 @@ export class CheckpointEngine {
     this.srcRev++;
     this.canonical.schedule(text, this.srcRev);
     this.#shipUpdate(text);
-    return {
+    return buildOpaqueUpdateResponse({
       rev: this.rev,
       srcRev: this.srcRev,
-      edit: editLabel,
-      backend: this.backendName,
+      editLabel,
+      backendName: this.backendName,
       mode: this.mode,
       modeReasons: this.modeReasons,
       canonical: this.canonical.info(),
-      dirtySourceNodes: [],
-      dirtySemanticNodes: [],
-      dirtyDependencies: [],
-      dirtyLayoutNodes: [],
-      dirtyPages: [],
-      patches: [],
-      stats: {
-        ...t.done(),
-        blocksTotal: 0,
-        blocksTypeset: 0,
-        blocksReparsed: 0,
-        semanticCacheHits: 0,
-        layoutCacheHits: 0,
-        layoutCacheMisses: 0,
-        typesetMs: 0,
-        rebooted: false,
-        checkpoints: 0,
-        pagesReused: 0,
-        pagesRebuilt: 0,
-        pageCount: this.canonical.info().pageCount,
-        macrosChanged: [],
-        labelsChanged: [],
-        verify: null,
-        diagnostics: this.diagnostics.splice(0),
-      },
-    };
+      timerStats: t.done(),
+      diagnostics: this.diagnostics,
+    });
   }
 
   /**

@@ -68,3 +68,50 @@ export function buildUpdateResponse({
     },
   };
 }
+
+export function buildOpaqueUpdateResponse({
+  rev,
+  srcRev,
+  editLabel,
+  backendName,
+  mode,
+  modeReasons,
+  canonical,
+  timerStats,
+  diagnostics,
+}) {
+  return {
+    rev,
+    srcRev,
+    edit: editLabel,
+    backend: backendName,
+    mode,
+    modeReasons,
+    canonical,
+    dirtySourceNodes: [],
+    dirtySemanticNodes: [],
+    dirtyDependencies: [],
+    dirtyLayoutNodes: [],
+    dirtyPages: [],
+    patches: [],
+    stats: {
+      ...timerStats,
+      blocksTotal: 0,
+      blocksTypeset: 0,
+      blocksReparsed: 0,
+      semanticCacheHits: 0,
+      layoutCacheHits: 0,
+      layoutCacheMisses: 0,
+      typesetMs: 0,
+      rebooted: false,
+      checkpoints: 0,
+      pagesReused: 0,
+      pagesRebuilt: 0,
+      pageCount: canonical.pageCount,
+      macrosChanged: [],
+      labelsChanged: [],
+      verify: null,
+      diagnostics: diagnostics.splice(0),
+    },
+  };
+}
