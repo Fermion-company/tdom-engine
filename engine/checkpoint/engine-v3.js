@@ -53,6 +53,7 @@ import { reconcile } from './pagebuilder.js';
 import { CanonicalRenderer } from './canonical.js';
 import { ensureShim } from './forkshim.js';
 import { Peer } from './peer.js';
+import { handlePeerMessage } from './peer-message.js';
 import { Timer } from './timer.js';
 import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
@@ -444,43 +445,7 @@ export class CheckpointEngine {
 
   // message dispatch from Peer
   _onMessage(peer, msg) {
-    switch (msg.kind) {
-      case 'HELLO':
-        peer.role = msg.role;
-        peer.pid = msg.pid;
-        peer.idxAnnounced = msg.idx;
-        if (msg.role === 'ckpt' && msg.idx === 0) {
-          this.checkpoints.set(0, peer);
-          this._fulfill('ckpt:0', peer);
-        }
-        break;
-      case 'GEO':
-        this.geometry = msg.json;
-        this._fulfill('geo', msg.json);
-        break;
-      case 'TWIN':
-        this.twinMetrics = msg.json; // unicode -> [height, depth] bp at 10pt
-        break;
-      case 'GALLEY':
-        this._fulfill('galley:' + msg.id, msg.json);
-        break;
-      case 'CKPT':
-        this.checkpoints.set(msg.idx, peer);
-        this._fulfill('ckpt:' + msg.idx, peer);
-        break;
-      case 'DONE':
-        this._fulfill('render:' + msg.id, true);
-        break;
-      case 'FORKED':
-        if (this.currentJob && this.currentJob.galleyKey === 'galley:' + msg.id) {
-          this.currentJob.pid = msg.pid;
-        }
-        // render children announce the same way — remember the pid so a
-        // timed-out render (deep-lineage luahbtex spin) can be SIGKILLed
-        // instead of burning a core forever
-        if (this.renderPids?.has(msg.id)) this.renderPids.set(msg.id, msg.pid);
-        break;
-    }
+    handlePeerMessage(this, peer, msg);
   }
 
   async #bootRoot() {
