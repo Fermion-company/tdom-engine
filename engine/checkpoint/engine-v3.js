@@ -77,6 +77,11 @@ import { mayNeedRender, releaseRenderHold } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
 import { queueRender as queueRenderHelper } from './render-pump.js';
+import {
+  pumpRescues as pumpRescuesHelper,
+  asyncRescueOne as asyncRescueOneHelper,
+  queueMovedOffsets as queueMovedOffsetsHelper,
+} from './rescue-pump.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { compareCanonicalText } from './canonical-verification.js';
 import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
@@ -1440,115 +1445,22 @@ export class CheckpointEngine {
   // queue entry carries the fresh inputs.
 
   #pumpRescues() {
-    if (this.rescuePumping) return;
-    this.rescuePumping = true;
-    (async () => {
-      try {
-        while (this.rescueQueue.size) {
-          const [bid, key] = this.rescueQueue.entries().next().value;
-          this.rescueQueue.delete(bid);
-          try {
-            await this.#asyncRescueOne(bid, key);
-          } catch (err) {
-            // the exact compile failed for the block's CURRENT inputs — the
-            // stale pixels the foreground kept are a freeze for as long as
-            // those inputs persist. No sticky mark here: frozenBlockIds()
-            // derives the state from isoFailCache, so a block that was only
-            // collateral (a sane text re-rescued at a mid-breakage page
-            // offset) un-freezes by itself when its inputs revert.
-            this.diagnostics.push(`async rescue ${bid}: ${err.message}`);
-          }
-        }
-      } finally {
-        this.rescuePumping = false;
-      }
-    })();
+    pumpRescuesHelper(this, (bid, key) => this.#asyncRescueOne(bid, key));
   }
 
   async #asyncRescueOne(bid, key) {
-    if (this.mode !== 'structured') return;
-    // typing-burst quiescence: a keystroke inside/near a rescue block
-    // supersedes the previous compile anyway — wait for a short pause so
-    // bursts cost ONE compile instead of one per keystroke, and the
-    // resident fork jobs keep the CPU while the user is typing
-    while (Date.now() - (this.lastEditAt ?? 0) < 800) {
-      await new Promise((r) => setTimeout(r, 200));
-    }
-    let idx = this.blocks.findIndex((b) => b.id === bid);
-    if (idx < 0) return;
-    let block = this.blocks[idx];
-    // Superseded = the key's inputs moved since queueing. An EDIT re-queues
-    // the block itself (its fresh entry carries the fresh key), but inputs
-    // also move without any edit — the first stale-first adoption of an
-    // in-chain block flips it to rescued, which materializes pageOffset on
-    // the next repagination. Dropping here would strand the block on its
-    // stale pixels forever; re-queue with the current key instead.
-    const nowKey = this.#rescueCacheKey(block, idx);
-    if (nowKey !== key) {
-      this.rescueQueue.set(bid, nowKey);
-      return;
-    }
-    if (this.#isoCacheGet(key) === undefined) {
-      const iso = await this.#isoCompile(block, idx, 'async exact rescue');
-      this.#isoCacheSet(key, iso);
-    }
-    const outcome = await this.#locked(async () => {
-      if (this.mode !== 'structured') return 'done';
-      idx = this.blocks.findIndex((b) => b.id === bid);
-      if (idx < 0) return 'done';
-      block = this.blocks[idx];
-      const lockedKey = this.#rescueCacheKey(block, idx);
-      if (lockedKey !== key) {
-        // same re-queue rationale as the pre-compile check above: inputs
-        // moved without an edit — retry with the fresh key
-        this.rescueQueue.set(bid, lockedKey);
-        return 'done';
-      }
-      const before = block.galleyHash + '|' + block.stateVec;
-      // cache hit inside → the exact galley adopts in milliseconds; the
-      // chain continues to convergence exactly like a foreground edit,
-      // but YIELDS to an incoming edit and re-queues so the propagation
-      // resumes afterwards. bgActive lets the edit KILL the in-flight
-      // job instead of waiting out a deep-lineage spin (#update).
-      this.bgActive = true;
-      let n;
-      try {
-        n = await this.#retypesetChain(
-          this.#nearestCheckpoint(idx),
-          idx,
-          () => {},
-          () => this.bgAbort
-        );
-      } catch (err) {
-        if (this.bgAbort) return 'aborted';
-        throw err;
-      } finally {
-        this.bgActive = false;
-      }
-      // retypesetChain swallows a killed job into an early break — treat
-      // any abort-flagged pass as pre-empted so the queue entry retries
-      if (n < 0 || this.bgAbort) return 'aborted';
-      for (const l of block.galley?.labels ?? []) {
-        if (l.v !== undefined) {
-          this.labelTable.set(l.k, l.v);
-          if (l.h != null) this.hrefTable.set(l.k, l.h);
-        }
-      }
-      if (before !== block.galleyHash + '|' + block.stateVec) this.#asyncRepaginate();
-      this.#queueMovedOffsets();
-      // the resume walk left checkpoints at the blocks it re-typeset — collapse
-      // back to the grid so the boot rescue storm can't creep the live set
-      this.#enforceCheckpointCap();
-      return 'done';
+    return asyncRescueOneHelper(this, bid, key, {
+      rescueCacheKey: (block, idx) => this.#rescueCacheKey(block, idx),
+      isoCacheGet: (cacheKey) => this.#isoCacheGet(cacheKey),
+      isoCompile: (block, idx, why) => this.#isoCompile(block, idx, why),
+      isoCacheSet: (cacheKey, iso) => this.#isoCacheSet(cacheKey, iso),
+      locked: (fn) => this.#locked(fn),
+      nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
+      retypesetChain: (from, to, onBlock, shouldAbort) => this.#retypesetChain(from, to, onBlock, shouldAbort),
+      asyncRepaginate: () => this.#asyncRepaginate(),
+      queueMovedOffsets: () => this.#queueMovedOffsets(),
+      enforceCheckpointCap: () => this.#enforceCheckpointCap(),
     });
-    if (outcome === 'aborted') {
-      // resume after the edit that pre-empted us (waiting OUTSIDE the lock
-      // — the edit needs it); the queue entry revalidates on retry
-      this.rescueQueue.set(bid, key);
-      while (this.bgAbort) {
-        await new Promise((r) => setTimeout(r, 25));
-      }
-    }
   }
 
   /**
@@ -1558,46 +1470,11 @@ export class CheckpointEngine {
    * same offset-independence shortcuts as the foreground pass apply.
    */
   #queueMovedOffsets() {
-    if (this.mode !== 'structured') return;
-    const prov = this.#paginateNow();
-    const entry = prov.blockEntry ?? new Map();
-    let queued = false;
-    for (let c = 0; c < this.blocks.length; c++) {
-      const block = this.blocks[c];
-      if (!block.rescued) continue;
-      // 0.25bp quantum shared with the rescue key and the iso strut: a
-      // want/have pair inside one quantum compiles to the same galley by
-      // construction, so only a real grid step queues work
-      const want = Math.round((entry.get(block.id) ?? 0) * 4) / 4;
-      // "have" is the galley's compile PROVENANCE, not block.pageOffset —
-      // the latter is set optimistically when a re-rescue is queued, so a
-      // compile that never lands (failed, superseded) would otherwise lock
-      // the stale galley in forever (found via stress seed-21 burst 2)
-      const have = block.galley?.tdomPageOff ?? block.pageOffset ?? 0;
-      if (Math.abs(want - have) <= 0.001) {
-        block.pageOffset = want;
-        continue;
-      }
-      const items = block.galley?.items ?? [];
-      const th = this.geometry?.textheight ?? 0;
-      const boxH = (block.galley?.h ?? 0) + (block.galley?.d ?? 0);
-      // offset-independence shortcuts: a leading eject counts only when the
-      // galley was compiled at the page TOP — there the break is intrinsic
-      // to the block (\clearpage & co). Compiled deep in the page, a leading
-      // eject usually means "didn't fit at that offset" (split spill), which
-      // is exactly the offset-DEPENDENT case.
-      if (
-        (items[0]?.k === 'eject' && have <= 0.26) ||
-        (!items.some((it) => it.k === 'eject') && boxH <= th - want && boxH <= th - have)
-      ) {
-        block.pageOffset = want;
-        continue;
-      }
-      block.pageOffset = want;
-      this.rescueQueue.set(block.id, this.#rescueCacheKey(block, c));
-      queued = true;
-    }
-    if (queued) this.#pumpRescues();
+    queueMovedOffsetsHelper(this, {
+      paginateNow: () => this.#paginateNow(),
+      rescueCacheKey: (block, idx) => this.#rescueCacheKey(block, idx),
+      pumpRescues: () => this.#pumpRescues(),
+    });
   }
 
   /**
