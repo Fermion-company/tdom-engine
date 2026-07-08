@@ -70,11 +70,7 @@ import {
 import { applyFidelity } from './fidelity-gate.js';
 import { indexBlock, unindexBlock } from './block-index.js';
 import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
-import {
-  mayNeedRender,
-  maybeHoldRenderCheckpoint,
-  releaseRenderHold,
-} from './render-hold.js';
+import { mayNeedRender, releaseRenderHold } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { compareCanonicalText } from './canonical-verification.js';
@@ -91,6 +87,10 @@ import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { adoptGalleyBlock } from './galley-adoption.js';
 import { checkpointGrid, nearestCheckpoint } from './checkpoint-selection.js';
 import { reapDyingPids } from './dying-pids.js';
+import {
+  enforceCheckpointCap as enforceCheckpointCapHelper,
+  retireOffGrid as retireOffGridHelper,
+} from './checkpoint-retirement.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -1296,37 +1296,25 @@ export class CheckpointEngine {
    * call after any checkpoint-creating pass.
    */
   #enforceCheckpointCap() {
-    const grid = this.#ckptGrid();
-    if (grid <= 1) return; // small doc: all boundaries fit under the budget
-    for (const [idx, peer] of [...this.checkpoints]) {
-      if (idx === 0 || idx % grid === 0) continue; // grid skeleton
-      if (this.editHold.includes(idx)) continue; // block being typed in
-      if (this.renderHold.has(idx)) continue; // awaiting an exact chunk
-      peer.send('DIE\n');
-      if (peer.pid) this.dyingPids?.add(peer.pid);
-      this.checkpoints.delete(idx);
-    }
+    enforceCheckpointCapHelper({
+      checkpoints: this.checkpoints,
+      grid: this.#ckptGrid(),
+      editHold: this.editHold,
+      renderHold: this.renderHold,
+      dyingPids: this.dyingPids,
+    });
   }
 
   #retireOffGrid(idx) {
-    const grid = this.#ckptGrid();
-    if (grid <= 1 || idx === 0 || idx % grid === 0) return;
-    if (!this.checkpoints.has(idx + 1)) return; // successor must exist first
-    // edit-locus pin: keep the boundaries around the block being typed in,
-    // so a keystroke burst never pays a grid replay
-    if (this.editHold.includes(idx)) return;
-    // Render hold: the resident RENDER path needs the state AT the block,
-    // so a block that will want a high-fidelity chunk (math/gfx — typically
-    // the one being edited) keeps its checkpoint alive until the chunk
-    // lands. Small budget: a boot-time flood must not hold half the
-    // document's process tree — beyond it the isolated render path covers.
-    if (maybeHoldRenderCheckpoint(idx, this.blocks[idx], this.renderHold)) return;
-    const peer = this.checkpoints.get(idx);
-    if (peer) {
-      peer.send('DIE\n');
-      if (peer.pid) this.dyingPids?.add(peer.pid);
-      this.checkpoints.delete(idx);
-    }
+    retireOffGridHelper({
+      idx,
+      grid: this.#ckptGrid(),
+      checkpoints: this.checkpoints,
+      editHold: this.editHold,
+      renderHold: this.renderHold,
+      block: this.blocks[idx],
+      dyingPids: this.dyingPids,
+    });
   }
 
   /**
