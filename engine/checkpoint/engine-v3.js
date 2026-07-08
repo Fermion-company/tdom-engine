@@ -63,6 +63,7 @@ import { EMPTY_UNITS, paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, watchInclude } from './include-expander.js';
 import { needsRescue } from './rescue-classifier.js';
 import { normalizeGalleyFonts, registerFont } from './font-registry.js';
+import { applyFidelity } from './fidelity-gate.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -70,7 +71,6 @@ import {
   buildIsoCompileSource,
 } from './tex-templates.js';
 import { classifyDocument, verifyTokens, tokenContainment } from './safety.js';
-import { classifyGalley, demoteFidelity } from './fidelity.js';
 import { cropSvg, cropSvgAt } from './util/svg.js';
 import {
   luaStr,
@@ -103,12 +103,6 @@ const BASE_COUNTERS = [
 const HEADING_RE = /^\s*\\(chapter|section|subsection|subsubsection|paragraph)\b/;
 const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 12_000);
 const BOOT_TIMEOUT = 60_000;
-// Margin placement: material lands OUTSIDE the galley box (page margin), so
-// no per-block chunk can represent it — the block is typeset in-chain for
-// its body text and demoted to CANONICAL_ONLY (#applyFidelity). \todo is
-// todonotes (paper-draft review marks — marginpar underneath).
-const MARGIN_RE = /\\(?:marginpar|marginnote|todo)\b/;
-
 // Definition-bearing body edits: a macro/environment/length defined (or
 // undefined) in a BODY block can change the meaning of every later block in
 // ways the exit-state vector cannot see. Such edits forfeit checkpoint-suffix
@@ -1554,32 +1548,11 @@ export class CheckpointEngine {
     block.units = null;
   }
 
-  /**
-   * Visual fidelity gate, applied per adopted galley: classify every line
-   * (safe-glyph vs exact-preview-required), merge any sticky verification
-   * demotion, and derive whether the block needs a high-fidelity chunk.
-   * Rescued blocks already carry print-identical chunks — the resident
-   * RENDER path (dormant-page reship) must not overwrite them.
-   */
   #applyFidelity(block, galley) {
-    let fid = classifyGalley(galley, this.fonts);
-    const dem = this.fidelityDemoted.get(block.id);
-    if (dem && dem.hash === fnv1a(block.text)) {
-      fid = demoteFidelity(fid, dem.level);
-    }
-    // Margin placement (\marginpar / \marginnote / todonotes' \todo) writes
-    // OUTSIDE the galley box — no per-block chunk can show it. The block
-    // still typesets in-chain for its BODY text (layout stays exact), but
-    // its pixels are canonical-only: the provisional layer never patches
-    // this band, so the canonical page (margin note included) shows
-    // through. This is what keeps \todo-bearing paper drafts structured
-    // instead of demoting the whole document.
-    if (MARGIN_RE.test(block.text)) {
-      fid = demoteFidelity(fid, 'canonical');
-    }
-    block.fidelity = fid;
-    block.needsRender = !block.rescued && !fid.canonicalOnly && fid.exact;
-    block.units = null;
+    applyFidelity(block, galley, {
+      fonts: this.fonts,
+      fidelityDemoted: this.fidelityDemoted,
+    });
   }
 
   #registerFont(key, meta) {
