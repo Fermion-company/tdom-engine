@@ -80,6 +80,7 @@ import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from
 import { compareCanonicalText } from './canonical-verification.js';
 import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
 import { normalizeHeaderFooterPayload } from './header-footer.js';
+import { firstDirtyIndex, hasDefinitionEdit, nextEditHold } from './update-helpers.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -1625,28 +1626,7 @@ export class CheckpointEngine {
     const dirtySource = new Set(diff.dirty);
     t.lap('segment');
 
-    // First index whose checkpoint chain is invalid. A checkpoint at idx
-    // holds the state after blocks[0..idx-1], so it survives exactly when
-    // that prefix is unchanged — pure deletions/insertions invalidate from
-    // the end of the common prefix even when no block is "dirty".
-    let commonPrefix = 0;
-    while (
-      commonPrefix < oldBlocks.length &&
-      commonPrefix < this.blocks.length &&
-      oldBlocks[commonPrefix].hash === this.blocks[commonPrefix].hash
-    ) {
-      commonPrefix++;
-    }
-    let firstDirty = this.blocks.length;
-    for (let i = 0; i < this.blocks.length; i++) {
-      if (!this.blocks[i].galley || dirtySource.has(this.blocks[i].id)) {
-        firstDirty = i;
-        break;
-      }
-    }
-    if (oldBlocks.length !== this.blocks.length || diff.removed.length) {
-      firstDirty = Math.min(firstDirty, commonPrefix);
-    }
+    const firstDirty = firstDirtyIndex(oldBlocks, this.blocks, dirtySource, diff);
     // Checkpoint-suffix preservation (docs/10 §I2): boundaries outside the
     // edited window survive the edit. Prefix boundaries are exact; suffix
     // boundaries move by the window's index delta and are marked
@@ -1700,16 +1680,7 @@ export class CheckpointEngine {
 
     // Definition-bearing edits (docs/10 §I2b) forfeit suffix trust: scan the
     // changed window's old AND new text before deciding anything.
-    let defEdit = false;
-    {
-      const { prefixLen, oldSuffixStart, newSuffixStart } = diff.bounds;
-      for (let k = prefixLen; k < oldSuffixStart && !defEdit; k++) {
-        defEdit = DEF_RE.test(oldBlocks[k]?.text ?? '');
-      }
-      for (let k = prefixLen; k < newSuffixStart && !defEdit; k++) {
-        defEdit = DEF_RE.test(this.blocks[k]?.text ?? '');
-      }
-    }
+    const defEdit = hasDefinitionEdit(oldBlocks, this.blocks, diff.bounds, DEF_RE);
 
     // Bounded foreground walk (docs/10 §I1): typeset the edited region plus
     // its verification blocks, then STOP with a verdict — never walk the
@@ -1925,12 +1896,7 @@ export class CheckpointEngine {
     const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict } =
       this._typesetResult;
     // pin the edit locus so the next keystroke is fork-once, typeset-once
-    const locusPins = [fgStop];
-    for (const id of dirtyBlocks) {
-      const idx = this.blocks.findIndex((b) => b.id === id);
-      if (idx >= 0) locusPins.push(idx, idx + 1);
-    }
-    this.editHold = [...new Set([...locusPins, ...this.editHold])].slice(0, 8);
+    this.editHold = nextEditHold(fgStop, dirtyBlocks, this.blocks, this.editHold);
 
     // ---- pages, display lists, patches ---------------------------------
     const pagesRaw = this.#paginateNow();
