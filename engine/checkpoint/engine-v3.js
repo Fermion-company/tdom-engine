@@ -65,6 +65,7 @@ import { needsRescue } from './rescue-classifier.js';
 import { normalizeGalleyFonts, registerFont } from './font-registry.js';
 import { applyFidelity } from './fidelity-gate.js';
 import { indexBlock, unindexBlock } from './block-index.js';
+import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -822,23 +823,12 @@ export class CheckpointEngine {
    * creates the next checkpoint so the resident chain continues with the
    * exact exit state.
    */
-  /**
-   * The rescue cache key carries every input the isolated compile depends
-   * on: the block text, the previous block's exit state, the preamble, the
-   * CURRENT values of every label the block referenced in its last compile
-   * (when a referenced label moves, the key misses and the block re-rescues
-   * with fresh seeds), and the block's on-page start offset (splitting
-   * environments — mdframed, breakable tcolorbox — break by page position).
-   */
   #rescueCacheKey(block, idx) {
-    const refVals = (block.galley?.refs ?? []).map(
-      (k) => k + '=' + (this.labelTable.get(k) ?? '')
-    );
-    // same 0.25bp quantum as the iso strut — see #isoCompile
-    const pageOff = Math.round((block.pageOffset ?? 0) * 4) / 4;
-    return fnv1a(
-      JSON.stringify([block.text, this.blocks[idx - 1]?.stateVec ?? '', this.preHash, refVals, pageOff])
-    );
+    return rescueCacheKey(block, idx, {
+      blocks: this.blocks,
+      labelTable: this.labelTable,
+      preHash: this.preHash,
+    });
   }
 
   /**
@@ -872,25 +862,12 @@ export class CheckpointEngine {
     return out;
   }
 
-  /** LRU-bounded iso result cache: each entry carries the block's chunk
-   * SVGs (MBs on package-heavy docs), so an unbounded map grows into the
-   * gigabytes across offset-keyed re-rescues — enough to OOM a 7GB CI
-   * runner during a boot drain. Evictions only cost a re-fork (~2-5s). */
   #isoCacheGet(key) {
-    const hit = this.isoCache.get(key);
-    if (hit !== undefined) {
-      this.isoCache.delete(key);
-      this.isoCache.set(key, hit); // refresh recency
-    }
-    return hit;
+    return isoCacheGet(this.isoCache, key);
   }
 
   #isoCacheSet(key, iso) {
-    this.isoCache.set(key, iso);
-    const cap = Math.max(8, Number(process.env.TDOM_ISO_CACHE || 48));
-    while (this.isoCache.size > cap) {
-      this.isoCache.delete(this.isoCache.keys().next().value);
-    }
+    isoCacheSet(this.isoCache, key, iso);
   }
 
   async #rescueBlock(idx, why) {
