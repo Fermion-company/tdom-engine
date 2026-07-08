@@ -71,6 +71,7 @@ import {
   maybeHoldRenderCheckpoint,
   releaseRenderHold,
 } from './render-hold.js';
+import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -839,7 +840,7 @@ export class CheckpointEngine {
    * incremental==scratch equation to compilable states.
    */
   frozenBlockIds() {
-    return this.frozenBlocks().map((f) => f.id);
+    return collectFrozenBlockIds(this.blocks, this.isoFailCache, (block, idx) => this.#rescueCacheKey(block, idx));
   }
 
   /** Frozen blocks with their reasons — referees distinguish broken-TeX
@@ -848,15 +849,7 @@ export class CheckpointEngine {
    * routine; deterministic on both engines, so the equation still holds
    * and the comparison itself referees them). */
   frozenBlocks() {
-    const out = [];
-    for (let i = 0; i < this.blocks.length; i++) {
-      const b = this.blocks[i];
-      const failMsg = this.isoFailCache.get(this.#rescueCacheKey(b, i));
-      if (b.galley?.tdomFrozen || failMsg) {
-        out.push({ id: b.id, text: b.text, reason: failMsg ?? 'hard-frozen galley' });
-      }
-    }
-    return out;
+    return collectFrozenBlocks(this.blocks, this.isoFailCache, (block, idx) => this.#rescueCacheKey(block, idx));
   }
 
   #isoCacheGet(key) {
