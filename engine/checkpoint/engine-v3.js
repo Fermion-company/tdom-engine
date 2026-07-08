@@ -78,6 +78,7 @@ import {
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { compareCanonicalText } from './canonical-verification.js';
+import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
 import {
   buildDriverSource,
   buildStateJobBody,
@@ -2314,22 +2315,8 @@ export class CheckpointEngine {
     if (this.pages.length !== info.pageCount) return;
     const geo = this.geometry;
     if (!geo) return;
-    const T = 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
-    const L = 72 + (geo.oddsidemargin ?? 0);
-    // block -> its vertical band, only when the block sits on ONE page
-    // (page-spanning galleys cannot be one chunk box)
-    const bands = new Map();
-    for (const page of this.pages) {
-      for (const d of page.draw ?? []) {
-        const bid = d.u?.blockId;
-        if (!bid) continue;
-        const top = T + d.y - (d.u.ln?.boxH ?? d.u.h ?? 0);
-        const cur = bands.get(bid);
-        if (!cur) bands.set(bid, { page: page.number, top });
-        else if (cur.page !== page.number) cur.split = true;
-        else cur.top = Math.min(cur.top, top);
-      }
-    }
+    const cropMetrics = canonicalCropMetrics(geo);
+    const bands = canonicalBlockBands(this.pages, cropMetrics.top);
     let budget = Number(process.env.TDOM_CANON_CROP_MAX || 40);
     let changed = false;
     for (const block of this.blocks) {
@@ -2340,13 +2327,7 @@ export class CheckpointEngine {
       if (this.renderWant.has(block.id)) continue; // a hot render is coming
       const band = bands.get(block.id);
       if (!band || band.split) continue;
-      // chunk coordinates start at the galley TOP (leading glue included in
-      // the shipped vpack) — rewind the first drawn box by the leading skips
-      let lead = 0;
-      for (const it of block.galley.items ?? []) {
-        if (it.k === 'box') break;
-        if (it.k === 'glue' || it.k === 'kern') lead += it.a ?? 0;
-      }
+      const lead = leadingGalleySkip(block.galley);
       const h = block.galley.h + block.galley.d;
       const w = block.galley.w;
       if (!(h > 0) || !(w > 0)) continue;
@@ -2355,7 +2336,7 @@ export class CheckpointEngine {
       if (this.srcRev !== info.rev) return; // superseded mid-pass
       const prev = this.chunks.get(block.id);
       this.chunks.set(block.id, {
-        svg: cropSvgAt(pageSvg, L, band.top - lead, w, h),
+        svg: cropSvgAt(pageSvg, cropMetrics.left, band.top - lead, w, h),
         wBp: w,
         hBp: h,
         v: (prev?.v ?? 0) + 1,
