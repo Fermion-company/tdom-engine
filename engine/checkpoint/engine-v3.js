@@ -46,16 +46,15 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, renameSync 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { SourceStore } from '../source-store.js';
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { reconcile } from './pagebuilder.js';
-import { CanonicalRenderer } from './canonical.js';
 import { ensureShim } from './forkshim.js';
 import { acceptPeer } from './peer-accept.js';
 import { handlePeerMessage } from './peer-message.js';
 import { closeEngine } from './lifecycle.js';
 import { resetOpenState } from './open-state.js';
+import { initializeEngineState } from './constructor-state.js';
 import { awaitWaiter, fulfillWaiter, rejectWaiter } from './waiters.js';
 import { Timer } from './timer.js';
 import { buildDisplayList } from './display-list.js';
@@ -145,122 +144,13 @@ const DEF_RE =
 
 export class CheckpointEngine {
   constructor({ workDir, docDir }) {
-    this.workDir = path.resolve(workDir);
-    this.docDir = docDir ? path.resolve(docDir) : this.workDir;
-    mkdirSync(this.workDir, { recursive: true });
-    this.store = new SourceStore();
-    this.file = 'main.tex';
-    this.blocks = [];
-    this.idSeq = 1;
-    this.rev = 0; // patch-stream ordering (advances on async repaints too)
-    this.srcRev = 0; // SOURCE revisions only — what canonical compiles chase
-
-    this.server = null;
-    this.port = 0;
-    this.root = null; // ChildProcess of the root lualatex
-    this.checkpoints = new Map(); // idx -> Peer (state after blocks[0..idx-1])
-    this.peers = new Set();
-    this.waiters = new Map(); // key -> {resolve, reject, timer}
-
-    this.geometry = null;
-    this.counters = [...BASE_COUNTERS];
-    this.preHash = null;
-    this.labelTable = new Map(); // key -> value (for reboot injection)
-    this.hrefTable = new Map(); // key -> hyperref anchor (\@currentHref at \label)
-    // incremental label/ref bookkeeping — the hot path must never scan
-    // every block × every label (O(L×B) melts on long documents)
-    this.blockLabelIdx = new Map(); // blockId -> [label keys its galley defines]
-    this.blockRefIdx = new Map(); // blockId -> [label keys its galley references]
-    this.labelCount = new Map(); // label key -> number of defining blocks
-    this.refIndex = new Map(); // label key -> Set<blockId> of referencing blocks
-    this.vanishedLabels = new Set(); // keys whose defining count dropped to 0
-    this.fonts = new Map(); // fid -> {file,name,size,fmt, family, remap}
-    this.fontFiles = new Map(); // familyKey -> absolute path
-    this.pages = [];
-    this.chunks = new Map(); // chunkKey -> {svg, wBp, hBp, v} exact renders
-    this.isoCache = new Map(); // rescue key -> isolated compile result
-    this.isoFailCache = new Map(); // rescue key -> error message (doomed compiles: same inputs fail the same way — don't pay the preamble again on every chain pass over a frozen block)
-    this.isoForkBroken = new Set(); // block ids whose iso fork children die (tcolorbox-class fork/dormant incompatibility) — go straight to cold
-    this.dyingPids = new Set(); // DIE'd checkpoint pids not yet exited — #reapDying backpressure
-    this.poisoned = new Map(); // block.id -> fnv1a(text) that failed in-chain
-    this.hf = new Map(); // page number -> {h: items, f: items} TeX-typeset header/footer
-    this.hfSig = null; // page-spec signature the current hf map was built for
-    this.hfPending = null; // spec signature of an in-flight header job
-    this.initialStyle = 'plain'; // \pagestyle in effect at \begin{document}
-    this.bgAbort = false;
-    this.bgActive = false; // a background pass holds the chain lock right now
-    this.bgTask = Promise.resolve();
-    this.onAsyncPatches = null; // callback(report-ish) for gfx swaps
-    this.onExternalChange = null; // callback when an \input file changes
-    this.backendName = 'checkpoint';
-    this.diagnostics = [];
-    this.tocHash = null;
-    this.includes = new Map(); // path -> {mtime, text}
-    this.watchers = new Map(); // path -> FSWatcher
-    // Resident-fork budget. Every checkpoint is a live lualatex process
-    // (~100-300MB unique RSS on package-heavy preambles), so N engines on a
-    // big document multiply into real RAM: 64 forks × 2 audit engines ×
-    // stress preamble ≈ machine death by OOM kill wave (observed: macOS
-    // took down the server AND the editor session). Audit tools run with a
-    // reduced budget via this env; sparse grids only cost ~3ms replay per
-    // skipped block on resume.
-    this.maxCheckpoints = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
-
-    // canonical layer: the exact-output authority (see file header)
-    this.canonical = new CanonicalRenderer({
-      workDir: path.join(this.workDir, 'canonical'),
-      docDir: this.docDir,
+    initializeEngineState(this, {
+      workDir,
+      docDir,
+      baseCounters: BASE_COUNTERS,
+      makeShipping: () => this.#makeShipping(),
+      onCanonicalResult: (info) => this.#onCanonicalResult(info),
     });
-    this.canonical.onResult = (info) => this.#onCanonicalResult(info);
-    this.onCanonical = null; // callback(info) for the server's SSE fanout
-
-    // shipping chain: the INCREMENTAL authority (goal "invisible canonical",
-    // phase 1). Feature-flagged while the ja long-document numbers are
-    // gathered; the cold canonical stays as the demand-paced final audit.
-    this.onShipPage = null; // callback({page, gen, srcRev}) for SSE fanout
-    this.shipGenRev = new Map(); // wave generation -> srcRev it converges to
-    this.shipBootedFor = null; // preamble hash the chain booted with
-    this.shipStale = false; // a label diverged from its seed: cold owns truth
-    this.shipBooting = false;
-    this.shipBootTimer = null;
-    this.shipLabelOverrides = new Map(); // ship-observed truth for reseeding
-    this.shipBootTries = 0; // bounded per preamble: a reboot loop burns CPU
-    this.shipping = process.env.TDOM_SHIP === '1' ? this.#makeShipping() : null;
-    this.mode = 'structured'; // 'structured' | 'opaque'
-    this.modeReasons = [];
-    this.opaqueStickyPre = null; // preamble hash a dynamic demotion sticks to
-    this.verifyState = null; // last exactness-verification outcome
-
-    // stale-first rescue machinery: exact isolated compiles are queued and
-    // run OFF the editing hot path; the chain lock serializes everything
-    // that touches the resident checkpoint chain (updates, background chain
-    // rebuild, async rescue adoption)
-    this.chainLock = Promise.resolve();
-    this.rescueQueue = new Map(); // block.id -> cacheKey at queue time
-    this.rescuePumping = false;
-    this.isoChildren = new Set(); // in-flight isolated lualatex processes
-
-    // visual fidelity gate state (fidelity.js): verification demotions are
-    // sticky per (block, text) — a region caught diverging never uses the
-    // glyph layer again until its source changes
-    this.fidelityDemoted = new Map(); // block.id -> {hash, level:'exact'|'canonical'}
-    this.demotedFamilies = new Set(); // font family keys the browser failed to load
-    this.fidelityEpoch = 0; // bumped when font tiers change (busts unit sigs)
-    // high-fidelity chunk queue: latest-wins per block, LIFO across blocks
-    // (the block just edited gets its exact pixels first), small
-    // concurrency so an edit burst never forks a render storm
-    this.renderWant = new Map(); // block.id -> queue marker
-    this.renderPumping = 0;
-    this.renderTask = Promise.resolve();
-    this.renderHold = new Map(); // ckpt idx kept alive for a pending render -> block.id
-    // Edit-locus pinning: the checkpoints at (and right after) the block the
-    // user is typing in are exempt from grid retirement, so a keystroke burst
-    // is always "fork once + typeset one block", never a grid replay.
-    this.editHold = []; // boundary indices (most recent loci, capped)
-    // Deferred chain work (the ONLY background chain activity): 'rebuild'
-    // re-typesets the suffix serially (definition edits, untracked-state
-    // leaks). Idle-gated, preemptible, resumable — see #runChainPass.
-    this.pendingChain = null; // {kind:'rebuild', from, phase:'blocks'|'after', labels:Set}
   }
 
   /** Serialize access to the resident chain (jobBlock/currentJob users). */
