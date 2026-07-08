@@ -83,6 +83,11 @@ import { normalizeHeaderFooterPayload } from './header-footer.js';
 import { firstDirtyIndex, hasDefinitionEdit, nextEditHold } from './update-helpers.js';
 import { buildPagePatches } from './page-patches.js';
 import {
+  flushVanishedLabels,
+  labelReferenceCandidates,
+  pushLabelDependencies,
+} from './reference-deps.js';
+import {
   buildDriverSource,
   buildStateJobBody,
   buildVolatilePrelude,
@@ -1782,16 +1787,7 @@ export class CheckpointEngine {
       this.#queueChainWork(verdict === 'leak' ? 'rebuild' : 'settle', fgStop, changedLabels);
     }
 
-    // labels whose defining blocks all disappeared — index-driven, no
-    // labels × blocks scan on the hot path
-    for (const key of [...this.vanishedLabels]) {
-      this.vanishedLabels.delete(key);
-      if (this.labelCount.has(key)) continue; // redefined meanwhile
-      if (this.labelTable.has(key)) {
-        this.labelTable.delete(key);
-        changedLabels.add(key);
-      }
-    }
+    flushVanishedLabels(this.vanishedLabels, this.labelCount, this.labelTable, changedLabels);
 
     // Backward references: a label defined LATER in the chain (new figure,
     // renamed equation...) can be referenced by EARLIER blocks, which the
@@ -1800,10 +1796,7 @@ export class CheckpointEngine {
     // work pending, labels are still moving: the async pass runs this after
     // the suffix settles (#chainAfterPass) instead.
     if (changedLabels.size && !this.pendingChain) {
-      const candidates = new Set();
-      for (const k of changedLabels) {
-        for (const bid of this.refIndex.get(k) ?? []) candidates.add(bid);
-      }
+      const candidates = labelReferenceCandidates(changedLabels, this.refIndex);
       for (let c = 0; c < this.blocks.length && candidates.size; c++) {
         const block = this.blocks[c];
         if (!candidates.has(block.id)) continue;
@@ -1828,9 +1821,7 @@ export class CheckpointEngine {
     }
     t.lap('typeset');
 
-    for (const key of changedLabels) {
-      for (const bid of this.refIndex.get(key) ?? []) push2(depDirty, 'label', key, bid);
-    }
+    pushLabelDependencies(depDirty, changedLabels, this.refIndex);
 
     // ---- live table of contents -----------------------------------------
     // Provisional pagination gives page numbers; if the toc data moved,
