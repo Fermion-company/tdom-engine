@@ -1,0 +1,606 @@
+% TDOM paper (Japanese) — compile with lualatex (2 passes).
+% 実測値は measurements.json から gen-numbers.mjs が numbers.tex に生成する。
+\documentclass[a4paper,11pt]{ltjsarticle}
+
+\usepackage[haranoaji]{luatexja-preset}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[top=27mm,bottom=30mm,left=26mm,right=26mm]{geometry}
+\usepackage{microtype}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,fit}
+\usepackage[hidelinks]{hyperref}
+
+\input{numbers} % 実測値マクロ(自動生成)
+
+% 和文中の長い欧文コード語で行が溢れないための緩衝
+\setlength{\emergencystretch}{2em}
+
+\newcommand{\tdom}{TDOM}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\tdom{}: TeXのためのDocument Object Modelと\\
+無改造LuaTeXにおける検証つき増分組版\\[1.5mm]
+{\normalsize\mdseries TDOM: A Document Object Model for \TeX{} ---
+Verified Incremental Typesetting on Unmodified LuaTeX}}
+
+\author{川口 晃世 \quad 幸川 卓実\\[1mm]
+{\normalsize 株式会社Fermion}\\
+{\normalsize \texttt{contact@fermion.company}}}
+
+\date{2026年8月18日}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\LaTeX{}による執筆では、わずかな修正であっても文書全体の再コンパイルを経なければ
+結果を確認できず、その待ち時間は文書の成長とともに増大して執筆の反復を妨げる。
+本稿は、かつてWebブラウザが静的ページの再読込をDOM(Document Object Model)に
+基づく増分再描画へ置き換えたのと同じ移行を、無改造のLuaTeXの上で実現する
+組版ランタイム\tdom{}(TeX Document Object Model)を提案する。
+\TeX{}のマクロ言語は実行中に字句規則を変更しうるため、Webにおけるような構文木を
+静的に定めることはできない。そこで\tdom{}は文書をブロックの列に分割し、
+各ブロック境界まで処理を終えたTeXプロセスの全状態を\code{fork(2)}の
+copy-on-writeスナップショットとして保持することで、構文木の代わりに
+実行状態の列を文書の内部表現とする。編集は変更ブロックとその影響範囲の
+再組版として処理され、改ページ・フロート・脚注・相互参照・目次を含む
+大域的なレイアウトも、全文の再コンパイルを待たずに増分的に収束する。
+表示が通常のLuaLaTeX出力と一致することは、PDFコンテンツストリームに基づく
+0.1\,bp精度のレイアウト照合、および無作為な編集列の後で増分状態が
+新規構築状態と一致することの検査を含む4系統の手続きで機械的に確認され、
+一致を保証できない構文は行・ブロック・文書の各粒度で実出力による表示へ退避する。
+評価では、4ページから\nLpages ページの文書に対して定常の打鍵応答が
+p50で12〜\nWorstP\,ms、p95で100\,msを下回り、文書規模にほとんど
+依存しないことを確認した。
+\end{abstract}
+
+\begin{center}
+\begin{minipage}{0.92\textwidth}
+\small
+\textbf{Abstract.}
+Editing a \LaTeX{} document still requires recompiling the entire file before any
+change can be inspected, and the delay grows with the document. This paper
+presents \tdom{} (TeX Document Object Model), a typesetting runtime that carries
+over to unmodified LuaTeX the transition the Web once made from page reloads to
+incremental re-rendering over the DOM. Because the \TeX{} macro language can
+alter its own lexical rules during execution, no syntax tree of the source can
+be defined statically; \tdom{} therefore represents the document as a sequence
+of blocks whose boundary states are complete TeX processes, preserved as
+\code{fork(2)} copy-on-write snapshots. An edit is processed as retypesetting
+of the changed block and its bounded range of influence, while page breaking,
+floats, footnotes, cross-references and the table of contents converge
+incrementally rather than awaiting a full recompilation. Agreement between the
+display and genuine LuaLaTeX output is checked mechanically by four independent
+procedures, including layout comparison at 0.1\,bp precision against PDF
+content streams and an equivalence test between incrementally maintained and
+freshly built engine states under randomized edits; constructs whose agreement
+cannot be established fall back to display taken from the real output, at line,
+block or document granularity. In our evaluation, steady-state keystroke
+response remains at 12--\nWorstP\,ms (p50) and below 100\,ms (p95) on documents
+of 4 to \nLpages{} pages, largely independent of document size.
+\end{minipage}
+\end{center}
+
+\section{はじめに}\label{sec:intro}
+
+\LaTeX{}を用いた執筆では、原稿に手を入れるたびに文書全体をコンパイルし直し、
+生成されたPDFを開いて該当箇所を確かめるという手順が繰り返される。
+コンパイルの所要時間は文書の規模とともに延び、パッケージを多用する
+100ページ規模の書籍では1回あたり10〜30秒に達することが報告されている\cite{lode2026}。
+この待ち時間は一回ごとに見れば小さいが、修正と確認のあいだに毎回挟まることで
+執筆の反復そのものを重くし、書き手は結果の確認を後回しにするか、
+確認のたびに思考を中断するかの選択を迫られる。組版品質の点で\LaTeX{}に
+代わるものがない分野ほど、この編集と表示の断絶は避けがたい負担であり続けてきた。
+
+同種の断絶が解消された先例として、Webの変遷が参考になる。1990年代のWebページは
+操作のたびに全体をサーバから読み直すものであったが、DOM(Document Object
+Model)\cite{w3cdom}の標準化を境に、文書はブラウザ内に保持されるオブジェクトの
+木となり、スクリプトによる木の変更に対してレイアウトエンジンが影響範囲だけを
+再計算して再描画する構成へと移行した。ページの再読込が木の変更に置き換えられた
+ことは単なる高速化にとどまらず、のちの対話的なWebアプリケーションが成立する
+基盤となった。
+
+\TeX{}についても、遅さの原因が組版アルゴリズムそのものにないことは
+実測から知られている。Knuth--Plassの行分割\cite{knuthplass}は1段落あたり
+1\,ms程度で完了する\cite{lode2026}。時間を要しているのはむしろ、入力を読み、
+全体を処理し、出力を書き、内部状態を残さず破棄するという使い捨ての
+プロセスモデルの方であって、このモデルを保ったままでは、キャッシュや並列化を
+導入しても所要時間は文書規模への比例を脱しない。文書を実行中のランタイムの
+内部に保持し、編集を保持された状態への変更として扱うことができれば、
+組版品質に触れることなく、編集応答だけを対話的な水準へ引き下げられるはずである。
+
+本稿で提案する\tdom{}(TeX Document Object Model)は、この構成をLuaTeXの上で
+実現するものである。ただし、WebのDOMを\TeX{}へそのまま持ち込むことはできない。
+\TeX{}のマクロ言語は実行中に字句規則(catcode)自体を書き換えられるため、
+ソースの静的な解析によって構文木を得ることが一般にはできないからである
+\cite{texbook}。\tdom{}はこの制約を、木のノードにパース結果ではなく実行状態を
+対応させることで回避する。ブロック$k$に対応するノードの実体は、
+ブロック$1..k$を組版し終えた時点のTeXプロセスそのものであり、
+POSIXの\code{fork(2)}が提供するcopy-on-write機構によって、マクロも
+カウンタもフォントもcatcodeも含む全状態が一つのスナップショットとして
+保持される。個々の状態を列挙して保存・復元する必要はない。
+
+編集された箇所だけを再コンパイルするという方向は、近年独立に追求されている。
+Lode\cite{lode2026}は行分割が段落の外部に依存しないことに着目し、
+編集された1段落だけを常駐LuaTeXで再コンパイルすれば約1\,msで完了することを
+示した。この結果は本研究の前提を実測の面から裏づけるものであるが、
+同システムでは段落が文書の文脈から切り離してコンパイルされるため、
+カウンタや相互参照、周辺コードの設定する\code{\textbackslash parshape}等に
+依存する内容は高速経路の対象にならず、改ページ・フロート・脚注・ページ番号の
+更新は周期的に走る全文再コンパイルに委ねられる。さらに、高速表示が実際の
+\LaTeX{}出力と一致していることを確かめる機構は備えていない。本研究が扱うのは
+この三点、すなわち文脈の保存、大域効果の増分的な収束、出力の機械的な検証である。
+
+本稿の貢献は次の四点に要約される。
+第一に、素のLuaTeXに71行のCシムをロードするだけで、fork checkpointにより
+文書の実行状態の列を維持する構成を示す(\S\ref{sec:arch})。エンジンの改造を
+必要としたTeXpresso\cite{bour2023}と異なり、既存のCTAN資産にも将来の
+TeX Live更新にもそのまま追従できる。
+第二に、各ブロックの出口状態ベクトルと組版結果ハッシュに基づく増分再組版を示す
+(\S\ref{sec:arch})。編集時の同期処理は有界個数のブロック検証で打ち切られ、
+残りは非同期に収束するため、相互参照・目次・改ページ・フロート・脚注が
+全文再コンパイルを待たずに更新される。
+第三に、表示の正しさそのものを検査対象とする構成を示す(\S\ref{sec:verify})。
+表示は3値の忠実度判定に従い、判定できない行は実出力へ退避したうえで、
+表示とLuaLaTeX実出力の一致が4系統の手続きで機械的に検査される。
+第四に、実測により、定常打鍵応答が文書規模にほとんど依存せず、
+すべての規模と編集位置でp95が100\,msを下回ることを示す(\S\ref{sec:eval})。
+
+\section{背景}\label{sec:background}
+
+\subsection{バッチ型のプロセスモデル}
+
+\code{lualatex main.tex}の1回の実行は、プロセス起動とフォーマット読込に約0.3秒、
+プリアンブル処理に0.1〜5秒を要したのち、本文を先頭から末尾まで逐次組版し、
+PDFを書き出して内部状態を破棄する。これに多重パスの問題が重なる。
+相互参照や目次のページ番号は組版後にしか確定しないから、\LaTeX{}は1回目の
+実行で参照情報を補助ファイル(aux)に書き出し、2回目以降の実行でそれを
+読み戻して正しい番号を印字する。したがって正しい出力を得るには最低2回、
+目次がページ数を動かす場合には3回の全文コンパイルが必要になる。
+編集のたびにこの手順を繰り返すという点で、今日の\LaTeX{}執筆は
+Webにおけるページ再読込と同じ形のループを保ったままである。
+
+\subsection{関連研究}
+
+主な先行アプローチを表\ref{tab:prior}に整理する。
+TeXpresso\cite{bour2023}はXeTeXエンジンを改造し、プロセスの\code{fork(2)}を
+チェックポイントとして編集位置以降を再実行するもので、実行状態を
+プロセスとして保存する点は本研究と共通するが、エンジン本体への改造を
+必要とする点で異なる。SwiftLaTeX\cite{swiftlatex}とBusyTeX\cite{busytex}は
+\TeX{}をWebAssemblyへコンパイルしてブラウザ内で実行するものであり、
+起動や配布の形態は変わるものの、コンパイルそのものは毎回全文である。
+Typst\cite{haug2022,typst}は増分計算を言語設計に組み込んだ新しい組版系で
+あるが、\LaTeX{}との互換性を持たず、また増分再コンパイルの時間は
+文書規模に対して線形に増加することが報告されている\cite{lode2026}。
+Lode\cite{lode2026}は前節で述べたとおり無改造LuaTeXにおける段落単位の
+再コンパイルを示したが、文脈の保存、大域効果の増分更新、出力の検証は
+扱っていない。
+
+\begin{table}[tb]
+  \centering\footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \caption{リアルタイム\LaTeX{}への先行アプローチと\tdom{}}
+  \label{tab:prior}
+  \begin{tabular}{@{}lccccc@{}}
+    \toprule
+    & エンジン改造 & 増分の単位 & 文脈保存 & 大域のライブ収束 & 出力の機械検証\\
+    \midrule
+    latexmk等の自動再実行 & 不要 & 文書全体 & --- & (全文) & なし\\
+    TeXpresso\cite{bour2023} & 必要 & 編集位置以降 & あり & 再実行で収束 & なし\\
+    SwiftLaTeX/BusyTeX & 不要 & 文書全体 & --- & (全文) & なし\\
+    Typst\cite{haug2022} & (新エンジン) & 式単位・$O(n)$ & あり & 毎回全体再収束 & なし\\
+    Lode\cite{lode2026} & 不要 & 段落・$O(1)$ & なし & 全文コンパイル待ち & なし\\
+    \tdom{}(本稿) & 不要 & ブロック・有界 & あり & ライブ & あり(4系統)\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{設計}\label{sec:concept}
+
+\tdom{}の名称はWebのDOMに由来し、その対応は表\ref{tab:dom}に示すとおり
+構成の各層に及ぶ。DOMがHTMLのパース結果を保持するのに対して、
+\tdom{}が保持するのは実行状態である。この違いは前節で述べた\TeX{}の
+言語的性質からの帰結であって、それを除けば編集ループの構造は同型である。
+すなわち、木の一部が変更されると、変更されたノードとその影響範囲だけが
+再計算され、表示には差分のみが送られる。
+
+\begin{table}[tb]
+  \centering\small
+  \caption{WebのDOMと\tdom{}の対応}
+  \label{tab:dom}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    & Webブラウザ & \tdom{}\\
+    \midrule
+    文書の内部表現 & DOMツリー(パース結果) & ブロック列+fork済みTeXプロセス(実行状態)\\
+    変更の単位 & ノード・属性 & ブロック(\code{\textbackslash par}境界・環境は不可分)\\
+    影響範囲の追跡 & スタイル無効化・dirty bit & 出口状態ベクトル+組版結果ハッシュ+依存表\\
+    再レイアウト & 増分reflow & 有界の同期再組版+非同期収束\\
+    再描画 & 差分ペイント & display listのページ単位パッチ\\
+    最終的な出力 & (レンダラ自身) & 通常のLuaLaTeX出力(canonical層)\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+設計にあたっては、次の三点を方針とした。
+
+第一は文脈の保存である。ブロックを文書から切り離して単体でコンパイルする
+ことはせず、ブロック$k$の組版は、ブロック$1..k{-}1$を処理し終えた
+プロセスからforkした子が実際のmain vertical list上で行う。この構成では、
+カウンタ、マクロ定義、フォント状態、\code{\textbackslash prevdepth}、
+段落間空白のmax合成といった文脈依存の要素が構成上正しくなり、
+収穫されるノードストリームは連続実行の結果とバイト単位で一致する。
+
+第二は表示の検証である。高速な表示は、通常のLuaLaTeX出力と一致すると
+判定できた範囲に限って用い、判定できない行は実出力から生成した画像で
+置き換える。さらに事後の照合で乖離が確認された領域は自動的に降格させる。
+表示が一時的に古いことは許容するが、実出力と異なる表示は許容しないという
+規律で全体を構成した。
+
+第三は段階的な退避である。CTANに蓄積された膨大な資産のすべてを
+高速経路で扱うことは現実的でないから、扱えない構文は、行(数式行の画像化)、
+ブロック(隔離コンパイル)、文書(canonical表示のみ)の3粒度で退避させる。
+どの粒度に退避してもソースの編集は継続できる。
+
+\section{アーキテクチャ}\label{sec:arch}
+
+\begin{figure}[tb]
+  \centering
+  \begin{tikzpicture}[
+    font=\small,
+    box/.style={draw, rounded corners=2pt, align=center, inner sep=5pt, fill=black!4},
+    proc/.style={draw, rounded corners=2pt, align=center, inner sep=4pt, fill=blue!6},
+    truth/.style={draw, rounded corners=2pt, align=center, inner sep=5pt, fill=orange!10},
+    arr/.style={-{Stealth[length=2.4mm]}, thick},
+    lab/.style={font=\scriptsize, midway}
+  ]
+    \node[box, minimum width=36mm] (editor) {エディタ / ブラウザ\\\scriptsize SVG + 実フォント配信};
+    \node[box, minimum width=42mm, below=10mm of editor] (orch) {オーケストレータ (Node.js)\\\scriptsize 差分・依存表・JSページビルダー\\忠実度判定・検証};
+    \node[proc, right=16mm of orch, minimum width=12mm] (ck0) {ckpt$_0$};
+    \node[proc, right=4mm of ck0, minimum width=12mm] (ck1) {ckpt$_1$};
+    \node[proc, right=4mm of ck1, minimum width=12mm] (ck2) {ckpt$_2$};
+    \node[font=\small, right=2.5mm of ck2] (dots) {$\cdots$};
+    \node[proc, below=7mm of ck1, minimum width=28mm] (job) {JOB子 / RENDER子\\\scriptsize 1ブロック組版 / 実PDF出荷};
+    \node[draw, dashed, rounded corners=3pt, fit=(ck0)(ck1)(ck2)(dots)(job), inner sep=3mm,
+          label={[font=\scriptsize]north:常駐 lualatex プロセス木(無改造・Cシム71行)}] (tree) {};
+    \node[truth, below=21mm of orch, minimum width=42mm] (canon) {canonical層\\\scriptsize 素の lualatex 全文コンパイル(非同期)\\= 表示の最終出力・検証の基準};
+    \node[truth, below=8mm of tree.south, anchor=north, minimum width=44mm] (ship) {shipping chain(任意)\\\scriptsize 実出力ルーチンのページ境界checkpoint\\編集後は尾部だけ再ship};
+
+    \draw[arr] (editor) -- node[lab, right]{編集 \{start,end,text\}} (orch);
+    \draw[arr] ([xshift=-10mm]orch.north) -- node[lab, left]{display listパッチ(ms)} ([xshift=-10mm]editor.south);
+    \draw[arr] (orch) -- node[lab, above]{JOB} (ck0);
+    \draw[arr] (ck1) -- node[lab, right]{fork} (job);
+    \draw[arr] (job.west) -- node[lab, above, sloped]{ガレーJSON} (orch.east);
+    \draw[arr] ([xshift=6mm]orch.south) -- node[lab, right]{スケジュール} ([xshift=6mm]canon.north);
+    \draw[arr] ([xshift=-6mm]canon.north) -- node[lab, left]{検証・降格・crop} ([xshift=-6mm]orch.south);
+    \draw[arr, dashed] (tree.south) -- node[lab, right]{ページ境界fork} (ship.north);
+  \end{tikzpicture}
+  \caption{\tdom{}の全体構成。常駐プロセス木が保持された実行状態の実体であり、
+  canonical層とその増分化であるshipping chainが最終的な出力を供給する。}
+  \label{fig:arch}
+\end{figure}
+
+\subsection{fork checkpoint}
+
+常駐ルートは素の\code{lualatex}として起動され、その中の
+\code{\textbackslash directlua}から71行のCシムを\code{package.loadlib}で
+ロードする。このシムが公開するのは\code{fork}、\code{waitpid}、
+\code{\_exit}等の数個のシステムコールにすぎず、エンジンにも
+LaTeXカーネルにも変更を加えない。ブロック境界$k$のcheckpointは
+ブロック$1..k$を処理し終えたプロセスであり、編集の際には最寄りの
+checkpointから子をforkし、編集されたブロックを注入して組版させ、
+完了した子が次のcheckpointとなる。プロセス数はグリッド間隔と
+編集位置のピン留めによって上限管理され(既定は最大64、後述の検証実行時は8)、
+疎なグリッドから再開する場合の追加費用はクリーンブロック1個あたり
+約3\,msの再組版にとどまる。
+
+\subsection{ノードストリームの収穫}
+
+各ブロックの組版結果は、PDFを経由することなく、\TeX{}内部の
+main vertical list、すなわち\code{tex.lists.page\_head}から直接取り出す。このあいだページビルダーは
+休止させておく。すなわち\code{\textbackslash vsize}を
+\code{\textbackslash maxdimen}に設定し、脚注は
+\code{\textbackslash holdinginserts=1}によって本文の流れに保持したまま、
+行ボックス、伸縮量と次数を含むグルー、ペナルティ、脚注インサート、
+フロートアンカーをJSONとして収穫する。グルーの実効値はLuaTeXの
+\code{node.effective\_glue}で解決するから、得られるグリフ座標は
+出荷されるPDFのそれと一致する。この抽出が改行の後かつ改ページの前で
+行われる点が本設計の要であり、改ページの入力となるグルーとペナルティが
+保存されたまま手に入るからこそ、次節のページビルダーが\TeX{}と同じ
+判断基準で改ページを再実行できる。
+
+\subsection{ページビルダー}
+
+収穫したストリームに対しては、JavaScript側のページビルダーが\TeX{}の
+ページ分割と\LaTeX{}の出力ルーチンに相当する処理を編集のたびに実行する。
+badness計算はtex.web \S108に対応する移植であり、フロート配置、脚注の
+組み付け、\code{\textbackslash topskip}、柱とノンブル、
+\code{\textbackslash cleardoublepage}の偶奇処理と空白ページの挿入までを
+扱う。\code{\textbackslash topfraction}などのパラメータはすべて実行中の
+\TeX{}から実測値として取得しており、この層が独自の寸法を持ち込むことはない。
+ページ境界のスナップショットを保持しているため、再ページ付けの費用は
+編集近傍のページ数に比例する範囲に収まる。Lode\cite{lode2026}が改ページの
+更新を周期的な全文コンパイルに委ねたのに対し、\tdom{}では改ページも
+編集と同じ応答の中で更新される点が異なる。
+
+\subsection{影響範囲の計算}
+
+各ノードは組版結果のハッシュと出口状態ベクトル(全カウンタ、
+\code{\textbackslash prevdepth}、\code{\textbackslash if@nobreak}、
+末尾の\code{\textbackslash lastskip})を持つ。編集時の同期処理では、
+編集されたブロックに続くクリーンブロックを、出力と状態が完全に再現される
+ことを確認するまで再組版する。ただしこの検証は有界であり、レイアウトが
+結合しているブロックについて8個、局所状態の波及について4個で打ち切る。
+打ち切り時点の判定は3値である。収束を確認すればclean、カウンタ等のみが
+動いていればcounters、マクロ定義の変更などによって下流を信用できなければ
+leakと判定し、後二者の残余は編集応答に含めず、編集が300\,ms途絶えてから
+走る非同期の収束処理(countersに対するsettle、leakに対するrebuild)に
+委ねる。この処理は次の編集が来れば直ちに中断し、進捗位置から再開する。
+相互参照については、auxファイルの代わりに\code{\textbackslash r@...}マクロを
+実行時に定義するラベル表と参照インデックスで追跡し、後方参照の再組版と
+目次の不動点処理(最大3パス)も同じ枠組みの中で収束させる。
+
+\subsection{忠実度判定とexact chunk}
+
+ブラウザでのグリフ描画には、\TeX{}が実際に使用したフォントファイルを
+そのまま配信し、ブラウザ側の整形(カーニングとリガチャ)を無効化したうえで、
+行内の位置をフォントの字送りから再現する方式を用いる。それでも一致を
+保証できない行が残る。ブラウザの読めないType1数式フォントやcmap外の
+サイズバリアントを含む数式行、TikZなどのPDFリテラルを含む行がそれであり、
+これらは行単位で実出力の画像、すなわちcheckpoint子が
+\code{\textbackslash shipout}した単ページPDFをSVG化したものに置き換える。
+出力ルーチン自体に介入する環境(\code{multicols}、\code{longtable}、
+分割可能な\code{tcolorbox}など)はブロック単位の隔離コンパイルへ退避させ、
+ページ上の開始位置を0.25\,bp単位で再現したうえで、分割の判断は実際の
+出力ルーチンに行わせる。文書全体に影響する構文(shipoutフック、
+\code{twocolumn}など)を含む場合は文書単位でcanonical表示へ退避する。
+いずれの退避においても、ソースの編集が中断されることはない。
+
+\subsection{canonical層とshipping chain}
+
+表示の最終的な出力は常に、素の\code{lualatex}をaux不動点まで実行した
+通常のコンパイル結果である(canonical層)。このコンパイルは編集応答には
+含めず、編集が途絶えてから要求駆動で実行する。完了すると、変更のない
+ページはLuaLaTeX自身の出力画像に置き換わり、同時に次節で述べる検証が走る。
+さらに任意機能として、実際の出力ルーチンの\code{shipout}ごとに
+ページ境界checkpointを取る第2の常駐実行(shipping chain)を備える。
+編集後は、最初に変更されたブロックより前のカーソルを持つページcheckpoint
+から末尾側だけを再shipすればよいから、最終出力の更新に要する時間も
+全文の再コンパイルではなく、編集位置以降のページ数に比例する量となる。
+
+\section{検証}\label{sec:verify}
+
+表示が実出力と一致するという性質を、主張ではなく検査可能な条件として
+扱うために、\tdom{}は独立な4系統の検証を備える(表\ref{tab:referee})。
+その中心にあるのは増分状態と新規構築状態の同一性である。すなわち、
+任意の編集列を処理した後のエンジンの全ブロック状態(組版結果ハッシュと
+状態ベクトル)は、最終ソースを新しいエンジンで開き直した結果と一致し
+なければならない。シードを固定したランダム編集による検査がこの条件を
+編集バーストごとに確認しており、開発の過程では、参照値の記帳誤りや
+ページ文脈に依存するブロックの固着といった増分処理の欠陥が、
+いずれもこの検査によって発見され修正された。なお、コンパイル不能な
+ソース(入力途中の不完全な\TeX{})には収束すべき真値が存在しないから、
+このときは最後の正常状態を凍結して番号の変動を抑え、ソースの修正と
+ともに自動的に回復させる。凍結と回復の経路もまた同じ検査の対象である。
+
+\begin{table}[tb]
+  \centering\small
+  \caption{\tdom{}の検証系統。いずれも通常のLuaLaTeX出力を基準とする。}
+  \label{tab:referee}
+  \begin{tabular}{@{}p{31mm}p{63mm}p{18mm}p{22mm}@{}}
+    \toprule
+    検証 & 内容 & 精度 & 実行\\
+    \midrule
+    レイアウト照合\newline(\code{verify-layout}/farm) & 全行のベースライン座標を、実PDFのコンテンツストリーム直読(ラスタライザ非経由)と照合 & 0.1\,bp & コーパス11文書・CI必須\\
+    ノードストリーム照合\newline(\code{compare-breaks}) & 実\TeX{}の出力ルーチン発火ごとに自然グルー値とbox寸法をダンプし、ページビルダーと突合 & 0.02\,bp & 診断時\\
+    増分同一性検査\newline(\code{fuzz}) & ランダム編集バースト後に、増分状態と新規構築状態の全ブロックを比較 & 完全一致 & CI(シード固定)\\
+    増分正本の照合\newline(shipping検査) & 再shipされた各ページのテキストが冷間の全文コンパイルと一致 & ページ単位 & CI\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+検証は実行時にも働く。canonical層のコンパイルが完了するたびに、
+表示テキストとの照合が文字バイグラムの含有率に基づいて行われ
+(この規則はラテン文字とCJKを同一に扱える)、確信度の高い乖離が
+見られたブロックだけが自動的に降格する。ブラウザ側でフォントの読込に
+失敗した場合もサーバへ報告され、該当ファミリを使う行は実出力画像による
+表示に切り替わる。このように検証は、表示経路の外側に置かれた検査ではなく、
+表示の選択そのものを制御する情報として系の内部に組み込まれている。
+
+\section{評価}\label{sec:eval}
+
+\subsection{設定}
+
+計測環境は\benchCpu、メモリ\benchMem\,GB、\benchTexlive である。
+文書には\code{article}クラスの英文書を3規模用意した(S: \nSpages ページ・
+\nSblocks ブロック、M: \nMpages ページ・\nMblocks ブロック、L: \nLpages ページ・
+\nLblocks ブロック。各節は4つの段落、番号つき数式1つ、前方参照と後方参照を
+含む)。プリアンブルは\code{amsmath}のみの軽量な構成であり、全文コンパイル
+時間としては下界に近い条件にあたるから、実際の文書では以下で示す差は
+さらに開くことになる。エンジンはcheckpoint上限8で起動した。これは既定値64
+より大幅に疎な省メモリ設定であり、後述のとおり初回打鍵の再生距離を
+長くする、本手法にとって不利な側の設定である。canonicalと精密レンダーの
+非同期層は、設計上編集応答に含まれないため(\S\ref{sec:arch})、本計測では
+無効化した。打鍵は文書の25\%、60\%、92\%の3箇所で各12打(1文字挿入)を行い、
+同期応答(\code{edit()}の往復)の分布を取った。比較の基準としては、
+同一文書の通常の全文コンパイル(\code{lualatex} 2パス)を同一機で計測した。
+計測スクリプトと生データは実装とともに公開している\cite{tdomrepo}。
+
+\subsection{結果}
+
+\begin{table}[tb]
+  \centering\small
+  \caption{文書規模と編集応答(打鍵は1文字挿入、3箇所$\times$12打の最悪箇所値)。
+  「定常」は編集位置ピン確立後(2打目以降)、「初回」はカーソル移動直後の
+  checkpointグリッド再生を含む1打目。全文コンパイルは\code{lualatex} 2パスの実測。}
+  \label{tab:latency}
+  \begin{tabular}{@{}lrrr@{}}
+    \toprule
+    & S(\nSpages p) & M(\nMpages p) & L(\nLpages p)\\
+    \midrule
+    全文コンパイル(2パス) & \nScoldSec\,s & \nMcoldSec\,s & \nLcoldSec\,s\\
+    \tdom{}起動(1回のみ) & \nSbootSec\,s & \nMbootSec\,s & \nLbootSec\,s\\
+    \midrule
+    定常打鍵 p50 & \nStypP\,ms & \nMtypP\,ms & \nLtypP\,ms\\
+    定常打鍵 p95 & \nStypPP\,ms & \nMtypPP\,ms & \nLtypPP\,ms\\
+    カーソル移動後の初回打鍵 & \nSfirst\,ms & \nMfirst\,ms & \nLfirst\,ms\\
+    節の挿入(番号繰り下げ) & \nSsecIns\,ms & \nMsecIns\,ms & \nLsecIns\,ms\\
+    マクロ定義の変更 & \nSdefEd\,ms & \nMdefEd\,ms & \nLdefEd\,ms\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+結果を表\ref{tab:latency}に示す。まず定常の打鍵応答は、文書規模に
+ほとんど依存しなかった。規模がSからLへ7倍になっても定常打鍵はp50で
+\nStypP〜\nLtypP\,ms、p95でも最悪\nWorstPP\,msにとどまり、すべての規模と
+編集位置で、対話的応答の目安とされる100\,ms\cite{card1983}を下回った。
+これに対して全文コンパイルの時間は、この軽量な文書群でも規模とともに
+増加する(\nScoldSec 秒から\nLcoldSec 秒)。両者の比は本計測の下界条件で
+約\nSpeedup 倍であるが、実際の文書では全文コンパイルが10〜30秒に達する
+\cite{lode2026}ことを考えれば、差はさらに大きい。編集のたびに要していた
+時間は、起動時に一度だけ要する時間(Lで\nLbootSec 秒)に置き換えられた
+ことになる。
+
+応答分布の裾については要因を特定できる。カーソル移動直後の初回打鍵だけは
+最大\nLfirst\,ms(L、中間部)を要したが、これは新しい編集位置での1打目が、
+疎なcheckpointグリッドからクリーンブロックを再生する費用を負担するため
+であり、2打目以降は編集位置のピン留めによって定常値に戻る。グリッドの
+再生距離は上限数に反比例するから、既定の上限64の下ではこの距離は本計測の
+約8分の1になる。観測された裾は原理的な限界ではなく、メモリ使用量と
+初回応答とのあいだの設定可能なトレードオフである。
+
+影響範囲の大きい編集も有界の時間で応答した。節の挿入は以降のすべての
+節番号と参照を動かす編集であるが、応答は\nLsecIns\,ms(L)であり、
+番号の伝播は非同期処理に委ねられて編集応答はそれを待たない。マクロ定義の
+変更は下流全体の再組版を要する最悪の編集にあたるが、同期応答は
+\nLdefEd\,msにとどまり、再構築は背景で収束した。編集体験を決めるのは
+平均値だけではないから、最悪の編集で応答が有界であることには
+平均値と同等以上の意味がある。
+
+最後に、以上の数値は検証に合格している実装から得られたものである。
+本計測と同一の設定で、数式・フロート・脚注・参照・日本語混植・rescue環境を
+含む公式コーパス11文書のレイアウト照合は\nFarmLines 行のベースライン照合で
+\nFarmResult となり、編集ホットパス不変量のテストは\nHotpath を通過した。
+
+\subsection{先行システムとの関係}
+
+Lode\cite{lode2026}は段落単体の再コンパイルが0.1〜2\,ms、Typstの増分
+再コンパイルが10、100、300ページに対して12.6、76、206\,msであったと
+報告している(いずれも同論文の計測環境による値である)。\tdom{}の打鍵応答は
+これらと同じく文書規模に依存しない階級に属するが、計測に含まれる処理の
+範囲が異なる。\tdom{}の数値には、forkによる文脈の保存、改ページの再実行、
+フロートと脚注の配置、参照の追跡までが含まれており、Lodeの高速経路が
+対象外とした大域効果を処理に含めたうえで、なお応答が同じミリ秒台に
+とどまることを示している。この点が本稿の主要な実測結果である。
+
+\section{応用}\label{sec:apps}
+
+文書が実行状態を保持する木として管理されることの意味は、待ち時間の
+短縮にとどまらない。ここでは本構成の上に成り立つ応用の方向を三つ挙げる。
+
+第一は直接編集である。\tdom{}のdisplay listでは全描画命令がソース位置への
+逆写像(ブロックidとオフセット)を保持しているから、プレビュー上の任意の
+文字から対応するソース範囲を引くことができる。これをミリ秒の編集応答と
+組み合わせれば、組版結果の上で直接テキストを編集し、組版がその場で追従する
+というワードプロセッサ型の操作を、\LaTeX{}の組版品質のまま構成できる。
+数式についても事情は同じであり、数式行は行単位のexact chunkとしてソース
+範囲に対応付けられているから、数式を選択してその\TeX{}記述を編集し、
+検証済みの組版で確認するという操作が同じ機構の上に成り立つ。WYSIWYG編集で
+問題となってきた表示と最終出力の乖離は、\S\ref{sec:verify}の検証層が抑える。
+
+第二は、大規模言語モデルに対する構造化された文脈の供給である。現状、
+モデルに\LaTeX{}文書を扱わせる際の入力は生の\code{.tex}文字列かPDFであり、
+どちらも文書の構造を保持していない。\tdom{}の内部表現は、ブロック単位の
+構造、各ブロックの依存関係(参照するラベルと消費する目次)、編集ごとの
+正確な変更集合、描画座標とソースの双方向対応を備えた中間表現であるから、
+変更に関係する部分木とその組版状態だけを文脈として渡すことも、モデルの
+提案を編集APIに適用してミリ秒で組版と検証の結果を得ることもできる。
+バッチコンパイルの所要時間は、このような反復をこれまで実用の外に
+置いてきた。
+
+第三に、display listのパッチは複数クライアントへの同報が可能であるから
+共同編集の基盤となり、また増分正本(shipping chain)は印刷と同一のページが
+編集に追従して得られるという性質から、出版工程における校正の反復にも
+応用できる。
+
+\section{制限}\label{sec:limits}
+
+現在の実装には次の制限がある。第一に、\code{microtype}(文字の突出しと
+伸縮)には対応しておらず、使用した文書ではグリフ層の座標が微小にずれる
+可能性がある。検出時の退避と対応は今後の課題である。第二に、二段組、
+カスタム出力ルーチン、shipoutフック系のパッケージは文書単位でcanonical
+表示へ退避する(編集は継続できる)。第三に、脚注のページまたぎ分割は
+未実装であり、分割が必要な場合は早い改ページで近似したうえでcanonical層が
+最終形を示す。第四に、常駐プロセス木は\code{fork(2)}に依存するため、
+ネイティブWindowsは対象外である。第五に、checkpointは実プロセスである
+から、メモリ使用量は規模と上限設定に比例する(本評価設定での常駐プロセス
+木の見かけRSS合計は約\nMrss\,MBであるが、これはcopy-on-write共有ページを
+各プロセスに重複計上した値であり、実効はこれより小さい)。第六に、
+単一fork系譜の深さには現在限界がある。120節・721ブロック(60ページ)の
+予備実験では、系譜の劣化により組版ジョブが既定タイムアウト(12秒)に達し、
+起動にも331秒を要した(生データは同梱の\code{measurements-l120.json}に
+収めた)。本評価の範囲(\nLblocks ブロック)はこの限界の手前にある。
+これらのうち第二・第三の項目は段階的退避の枠組みの中で対応でき、
+第一はグリフ層の拡張、第四は分離コンパイル型の縮退モード、第六は
+checkpointの定期再生成による系譜の平坦化によって対応できると考えている。
+
+\section{結論}\label{sec:conclusion}
+
+本稿では、文書を実行状態の列として保持する組版ランタイム\tdom{}を提案し、
+無改造のLuaTeXの上で、編集応答を文書規模からほぼ独立なミリ秒台に
+できることを実装と実測によって示した。編集はブロック単位の増分再組版として
+処理され、改ページ・フロート・脚注・相互参照・目次は全文の再コンパイルを
+待たずに更新される。表示と実出力の一致は4系統の検証によって機械的に
+検査され、検証できない構文は実出力による表示へ段階的に退避する。評価では、
+プリアンブルが軽量な下界条件においても全文コンパイル\nLcoldSec 秒に対して
+定常打鍵p95 \nLtypPP\,msが得られ、全文コンパイルが10〜30秒に達する実際の
+文書\cite{lode2026}では、この差は3桁を超える。
+
+この短縮は、組版アルゴリズムの変更や近似によって得られたものではない。
+使い捨てのプロセスモデルを、状態を保持するランタイムに置き換えたことの
+帰結である。Webにおいて文書が生きた木となったことが対話的な
+アプリケーションの基盤となったように、組版においても同じ移行が可能である
+ことを、本稿の実装と測定は示している。
+
+\begin{thebibliography}{99}\small
+\bibitem{lode2026} C.~Lode.
+  Real-Time LuaTeX: Recompiling Large Documents in 1\,ms.
+  \emph{TUGboat}, draft, 2026.
+\bibitem{bour2023} F.~Bour.
+  TeXpresso: Live rendering and error reporting for \LaTeX.
+  \emph{TUGboat}, 44(2):185--192, 2023.
+\bibitem{knuthplass} D.~E.~Knuth and M.~F.~Plass.
+  Breaking Paragraphs into Lines.
+  \emph{Software---Practice and Experience}, 11(11):1119--1184, 1981.
+\bibitem{texbook} D.~E.~Knuth.
+  \emph{The \TeX book}. Addison-Wesley, 1986.
+\bibitem{card1983} S.~K.~Card, T.~P.~Moran, and A.~Newell.
+  \emph{The Psychology of Human-Computer Interaction}.
+  Lawrence Erlbaum Associates, 1983.
+\bibitem{haug2022} M.~Haug.
+  Fast typesetting with incremental compilation.
+  Master's thesis, Technische Universit\"at Berlin, 2022.
+\bibitem{typst} Typst. \url{https://typst.app/} (2026年8月閲覧).
+\bibitem{swiftlatex} SwiftLaTeX: The visual \LaTeX{} editor.
+  \url{https://github.com/SwiftLaTeX/SwiftLaTeX}.
+\bibitem{busytex} TeXlyre. BusyTeX: \TeX{} live compiled to WebAssembly.
+  \url{https://github.com/TeXlyre/texlyre-busytex}, 2026.
+\bibitem{thanh2000} H.~T.~Th\`anh.
+  \emph{Micro-typographic extensions to the \TeX{} typesetting system}.
+  PhD thesis, Masaryk University Brno, 2000.
+\bibitem{schlicht} R.~Schlicht.
+  The \code{microtype} package: Subliminal refinements towards typographical perfection.
+  \url{https://ctan.org/pkg/microtype}, 2024.
+\bibitem{w3cdom} W3C.
+  Document Object Model (DOM) Level~1 Specification.
+  W3C Recommendation, 1998.
+\bibitem{luatex} LuaTeX development team.
+  \emph{LuaTeX Reference Manual}. \url{https://www.luatex.org/}.
+\bibitem{tdomrepo} \tdom{} Engine (ソースコード・検証スイート・本稿の計測スクリプト).
+  \url{https://github.com/Fermion-company/tdom-engine}, 2026.
+\end{thebibliography}
+
+\end{document}

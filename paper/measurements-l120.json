@@ -1,0 +1,157 @@
+{
+  "date": "2026-08-17T17:03:00.142Z",
+  "host": "Apple M5",
+  "memGB": 16,
+  "docs": [
+    {
+      "label": "S",
+      "sections": 8,
+      "cold": {
+        "ms": 730,
+        "pages": 4
+      },
+      "bootMs": 1420,
+      "blocks": 49,
+      "pages": 4,
+      "checkpoints": 15,
+      "rssMB": 2831,
+      "typing": {
+        "prose25": {
+          "p50": 6.6,
+          "p95": 10.3,
+          "max": 10.3,
+          "typesetP50": 5.5,
+          "typesetP95": 9.3,
+          "worstBlocks": 3
+        },
+        "mid60": {
+          "p50": 6.1,
+          "p95": 19.9,
+          "max": 19.9,
+          "typesetP50": 5.1,
+          "typesetP95": 19,
+          "worstBlocks": 4
+        },
+        "tail92": {
+          "p50": 14.8,
+          "p95": 30.1,
+          "max": 30.1,
+          "typesetP50": 12.5,
+          "typesetP95": 27.9,
+          "worstBlocks": 5
+        }
+      },
+      "sectionInsert": {
+        "wallMs": 25.8,
+        "verdict": "counters",
+        "blocksTypeset": 4
+      },
+      "defEdit": {
+        "wallMs": 42.2,
+        "verdict": "leak",
+        "blocksTypeset": 1
+      },
+      "rssAfterMB": 3422
+    },
+    {
+      "label": "M",
+      "sections": 40,
+      "cold": {
+        "ms": 793,
+        "pages": 20
+      },
+      "bootMs": 2025,
+      "blocks": 241,
+      "pages": 20,
+      "checkpoints": 17,
+      "rssMB": 2532,
+      "typing": {
+        "prose25": {
+          "p50": 10.7,
+          "p95": 14.7,
+          "max": 14.7,
+          "typesetP50": 8,
+          "typesetP95": 11.4,
+          "worstBlocks": 3
+        },
+        "mid60": {
+          "p50": 9.3,
+          "p95": 96.2,
+          "max": 96.2,
+          "typesetP50": 7.3,
+          "typesetP95": 90.8,
+          "worstBlocks": 24
+        },
+        "tail92": {
+          "p50": 5.1,
+          "p95": 16.8,
+          "max": 16.8,
+          "typesetP50": 4,
+          "typesetP95": 15.5,
+          "worstBlocks": 7
+        }
+      },
+      "sectionInsert": {
+        "wallMs": 60.4,
+        "verdict": "counters",
+        "blocksTypeset": 19
+      },
+      "defEdit": {
+        "wallMs": 40.8,
+        "verdict": "leak",
+        "blocksTypeset": 1
+      },
+      "rssAfterMB": 3327
+    },
+    {
+      "label": "L",
+      "sections": 120,
+      "cold": {
+        "ms": 1065,
+        "pages": 60
+      },
+      "bootMs": 331571,
+      "blocks": 721,
+      "pages": 60,
+      "checkpoints": 17,
+      "rssMB": 187,
+      "typing": {
+        "prose25": {
+          "p50": 11.3,
+          "p95": 32.4,
+          "max": 32.4,
+          "typesetP50": 6.9,
+          "typesetP95": 28,
+          "worstBlocks": 3
+        },
+        "mid60": {
+          "p50": 12005.9,
+          "p95": 12126.3,
+          "max": 12126.3,
+          "typesetP50": 12002.7,
+          "typesetP95": 12116.4,
+          "worstBlocks": 71
+        },
+        "tail92": {
+          "p50": 12005.4,
+          "p95": 12035.1,
+          "max": 12035.1,
+          "typesetP50": 12002.5,
+          "typesetP95": 12031.9,
+          "worstBlocks": 28
+        }
+      },
+      "sectionInsert": {
+        "wallMs": 24076.3,
+        "verdict": "clean",
+        "blocksTypeset": 42
+      },
+      "defEdit": {
+        "wallMs": 45.1,
+        "verdict": "leak",
+        "blocksTypeset": 1
+      },
+      "rssAfterMB": 454
+    }
+  ]
+}
