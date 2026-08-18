@@ -8,11 +8,8 @@
 </head>
 <body>
 <header id="topbar">
-  <div class="brand">
-    <span class="logo">Ψ</span>
-    <span class="name">TDOM Engine</span>
-  </div>
-  <span id="livestatus" class="pill ok" title="エンジンの状態: 稼働中 / 組版中 / 停止">●</span>
+  <span class="brand">TDOM Engine</span>
+  <span id="livestatus" class="pill ok" title="エンジンの状態"></span>
   <div class="status" id="status"></div>
   <div class="actions">
     <select id="layout-view" title="表示するペイン">
@@ -20,12 +17,7 @@
       <option value="workspace">エディタのみ</option>
       <option value="preview">プレビューのみ</option>
     </select>
-    <select id="tpl-select" title="テンプレートから新規作成">
-      <option value="">テンプレート</option>
-    </select>
-    <button id="btn-pdf" title="ソースを lualatex でフルコンパイルして PDF を開く">PDF</button>
-    <button id="btn-compare" title="本物のPDF (lualatex→pdf.js) と擬似PDFを別ページで並べて比較">比較</button>
-    <button id="btn-reset" title="サンプル文書に戻す">リセット</button>
+    <button id="btn-compare" title="lualatex の実出力と増分プレビューを別ページで並べる">比較</button>
   </div>
 </header>
 
@@ -33,7 +25,7 @@
   <section id="workspace-pane">
     <div class="code-editor-pane">
       <div class="code-editor-head">
-        <span>main.tex</span>
+        <span class="file">main.tex</span>
         <span>LuaLaTeX</span>
       </div>
       <div class="code-editor-shell">
@@ -46,11 +38,14 @@
   <div id="workspace-preview-splitter" role="separator" aria-orientation="vertical" aria-valuemin="35" aria-valuemax="70" aria-valuenow="48" tabindex="0" title="ドラッグしてエディタとプレビューの比率を変更"></div>
 
   <section id="preview-pane">
-    <div class="pane-title">Preview <span id="doc-state"></span> <span class="hint">パッチされたページだけが光ります</span>
+    <div class="pane-title">
+      <span class="pane-name">プレビュー</span>
+      <span id="doc-state"></span>
+      <span class="spacer"></span>
       <span class="zoomctl">
-        <button id="zoom-out" title="縮小 (⌘/Ctrl+ホイールでも)">−</button>
+        <button id="zoom-out" title="縮小（⌘/Ctrl+ホイールでも）">−</button>
         <span id="zoom-level">100%</span>
-        <button id="zoom-in" title="拡大 (⌘/Ctrl+ホイールでも)">＋</button>
+        <button id="zoom-in" title="拡大（⌘/Ctrl+ホイールでも）">+</button>
         <button id="zoom-fit" title="幅に合わせる">合わせる</button>
       </span>
     </div>
@@ -58,9 +53,11 @@
   </section>
 
   <aside id="inspector-pane">
-    <div id="insp-reopen" title="インスペクタを表示">⟨</div>
-    <div class="pane-title">Engine Inspector
-      <button id="insp-toggle" title="インスペクタを隠してプレビューを拡大">⟩⟩ 隠す</button>
+    <div id="insp-reopen" title="インスペクタを表示">‹</div>
+    <div class="pane-title">
+      <span class="pane-name">エンジン インスペクタ</span>
+      <span class="spacer"></span>
+      <button id="insp-toggle" title="インスペクタを隠す">隠す</button>
     </div>
     <div id="inspector">
       <div class="empty">まだ編集がありません</div>

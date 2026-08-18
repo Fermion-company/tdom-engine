@@ -21,7 +21,6 @@ const pagesEl = document.getElementById('pages');
 const statusEl = document.getElementById('status');
 const inspectorEl = document.getElementById('inspector');
 const layoutViewEl = document.getElementById('layout-view');
-const templateSelectEl = document.getElementById('tpl-select');
 const layoutSplitterEl = document.getElementById('workspace-preview-splitter');
 const layoutEl = document.getElementById('layout');
 const workspacePaneEl = document.getElementById('workspace-pane');
@@ -144,12 +143,26 @@ function nudgeLayoutSplit(delta) {
 
 // --------------------------------------------------------- editor highlight
 
+// One left-to-right pass, escaping each token as it is emitted. Chained
+// .replace() calls over already-emitted markup used to corrupt it: an
+// escaped percent started a comment span, and the command rule then matched
+// the backslash-plus-'<' of that span's own opening tag, so the tag leaked
+// into the editor as literal text. Alternation order is precedence: a
+// control sequence (an escaped percent included) never starts a comment.
+const TOKEN_RE = /(\\[A-Za-z@]+|\\.)|(%[^\n]*)|(\{[^{}\n]*\})|(\$[^$\n]*\$)/g;
+
 function highlightLineHtml(line) {
-  return escapeHtml(line)
-    .replace(/(%[^\n]*)/g, '<span class="tok-comment">$1</span>')
-    .replace(/(\\(?:[A-Za-z@]+|.))/g, '<span class="tok-command">$1</span>')
-    .replace(/(\{[^{}\n]*\})/g, '<span class="tok-brace">$1</span>')
-    .replace(/(\$[^$\n]*\$)/g, '<span class="tok-math">$1</span>');
+  let out = '';
+  let last = 0;
+  TOKEN_RE.lastIndex = 0;
+  let m;
+  while ((m = TOKEN_RE.exec(line))) {
+    out += escapeHtml(line.slice(last, m.index));
+    const cls = m[1] ? 'tok-command' : m[2] ? 'tok-comment' : m[3] ? 'tok-brace' : 'tok-math';
+    out += `<span class="${cls}">${escapeHtml(m[0])}</span>`;
+    last = m.index + m[0].length;
+  }
+  return out + escapeHtml(line.slice(last));
 }
 
 // Incremental highlight: one <span> per source line (the tokenizer is
@@ -274,7 +287,7 @@ function enhanceTopbarSelect(select) {
       item.setAttribute('aria-selected', option.selected ? 'true' : 'false');
       item.disabled = option.disabled;
       item.addEventListener('click', () => {
-        if (option.value === select.value && select.id !== 'tpl-select') {
+        if (option.value === select.value) {
           close();
           return;
         }
@@ -756,20 +769,20 @@ function updateBadge() {
   if (mode === 'opaque') {
     if (canonical?.id && !canonical.inFlight && !err && canonical.rev >= appliedSrcRev) {
       cls = 'state-exact';
-      text = '✓ exact — LuaLaTeX直描画';
+      text = 'LuaLaTeX 直描画';
     } else {
-      text = err ? 'TeXエラー（前回の正確な表示を保持）' : 'exact fallback — コンパイル中…';
+      text = err ? 'TeXエラー（前回の表示を保持）' : 'コンパイル中';
       if (err) cls = 'state-error';
     }
     parts.push(text);
   } else if (err && canonical.errorRev >= appliedSrcRev) {
     cls = 'state-error';
-    parts.push('TeXエラー — 検証コンパイル失敗（プレビュー続行）');
+    parts.push('TeXエラー（検証コンパイル失敗）');
   } else if (canonical?.id && canonical.rev >= appliedSrcRev && pageDirtyRev.size === 0 && !canonical.inFlight) {
     cls = 'state-exact';
-    parts.push('✓ exact — LuaLaTeX出力と一致');
+    parts.push('LuaLaTeX 出力と一致');
   } else {
-    parts.push('preview — exactへ収束中…');
+    parts.push('照合待ち');
   }
   docStateEl.className = cls;
   docStateEl.textContent = parts.join(' ');
@@ -795,11 +808,13 @@ function diffText(oldStr, newStr) {
 
 function scheduleSync() {
   scheduleHighlight();
-  // the resident engine absorbs every keystroke: send immediately — the
-  // serialized `sending` chain coalesces bursts into single diffs (in
-  // opaque mode the edit is a source-apply + canonical reschedule, cheaper
-  // still)
-  flushSync();
+  // Short debounce: the resident engine absorbs keystrokes in
+  // milliseconds, but one POST per keystroke is still one full engine
+  // update per keystroke — 80ms coalesces a fast burst into a single
+  // diff without being perceptible (the serialized `sending` chain
+  // additionally coalesces whatever lands while a POST is in flight).
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(flushSync, 80);
 }
 
 function flushSync() {
@@ -814,8 +829,22 @@ function flushSync() {
       const res = await fetch('/edit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(d),
+        // rev: optimistic-concurrency token — the server 409s instead of
+        // silently applying our offsets to a source that moved under us
+        body: JSON.stringify({ ...d, rev: appliedSrcRev }),
       });
+      if (res.status === 409) {
+        // the source moved (another client/tab): resync our base text and
+        // let the next flush recompute the diff against the fresh source
+        const doc = await fetch('/doc').then((r) => r.json());
+        serverText = doc.source;
+        if (document.activeElement !== editor) {
+          editor.value = doc.source;
+          syncEditorHighlight();
+        }
+        flushSync();
+        return;
+      }
       const report = await res.json();
       if (report.error) throw new Error(report.error);
       serverText = current;
@@ -824,12 +853,12 @@ function flushSync() {
       renderInspector(report, rtt);
       const engineMs =
         report.mode === 'opaque'
-          ? `opaque（canonical再コンパイル待ち）/ ${fmtUs(report.stats.totalUs)}`
+          ? `opaque（canonical 再コンパイル待ち）/ ${fmtUs(report.stats.totalUs)}`
           : `組版 ${report.stats.typesetMs ?? 0} ms / 全体 ${fmtUs(report.stats.totalUs)}`;
       statusEl.textContent =
-        `update #${report.rev} — ${engineMs} / 往復 ${rtt.toFixed(0)} ms` +
+        `update #${report.rev} / ${engineMs} / 往復 ${rtt.toFixed(0)} ms` +
         (report.dirtyPages.length
-          ? ` / patched pages: ${report.dirtyPages.join(', ')}`
+          ? ` / 再描画 page ${report.dirtyPages.join(', ')}`
           : report.mode === 'opaque'
             ? ''
             : ' / 表示差分なし');
@@ -863,7 +892,7 @@ function pill(state, text) {
 function noteEditStart() {
   pillEdits++;
   if (!pillBusySince) pillBusySince = Date.now();
-  pill('busy', '⏳ 組版中…');
+  pill('busy', '組版中');
 }
 
 function noteEditEnd() {
@@ -884,21 +913,21 @@ async function pollStatus() {
       const secs = Math.floor((Date.now() - pillBusySince) / 1000);
       const prog =
         s.progress?.phase === 'typeset' && s.progress.total
-          ? ` ${s.progress.at}/${s.progress.total}ブロック`
+          ? ` ${s.progress.at}/${s.progress.total} ブロック`
           : s.progress?.phase === 'boot'
             ? '（プリアンブル再構築）'
             : '';
-      pill('busy', `⏳ 組版中${prog}${secs >= 2 ? ` — ${secs}秒` : '…'}`);
+      pill('busy', `組版中${prog}${secs >= 2 ? ` ${secs}秒` : ''}`);
     } else if (s.canonical?.inFlight) {
       pillBusySince = 0;
-      pill('busy', '⏳ canonical コンパイル中');
+      pill('busy', 'canonical コンパイル中');
     } else {
       pillBusySince = 0;
-      pill('ok', '✓ 稼働中');
+      pill('ok', '待機中');
     }
   } catch {
     pillBusySince = 0;
-    pill('down', '✕ サーバー停止・応答なし');
+    pill('down', 'サーバー応答なし');
   }
 }
 
@@ -933,7 +962,7 @@ pagesEl.addEventListener('click', async (ev) => {
   editor.setSelectionRange(offset, offset);
   const lineTop = editor.value.slice(0, offset).split('\n').length - 1;
   editor.scrollTop = Math.max(0, lineTop * 19 - editor.clientHeight / 2);
-  statusEl.textContent = `ソース対応: ${src} → main.tex:${block.source.start.line} (${block.type})`;
+  statusEl.textContent = `ソース対応 ${src} → main.tex:${block.source.start.line} (${block.type})`;
 });
 
 function lineColToOffset(text, line, col) {
@@ -989,7 +1018,6 @@ layoutViewEl?.addEventListener('change', () => {
   applySplitRatio();
 });
 enhanceTopbarSelect(layoutViewEl);
-enhanceTopbarSelect(templateSelectEl);
 layoutSplitterEl?.addEventListener('pointerdown', beginLayoutResize);
 layoutSplitterEl?.addEventListener('keydown', (ev) => {
   if (ev.key === 'ArrowLeft') {
@@ -1010,68 +1038,10 @@ window.addEventListener('resize', () => applySplitRatio());
 applyLayoutView();
 applySplitRatio();
 
-// -------------------------------------------------------- template + buttons
-
-async function loadTemplateList(selectedId = '') {
-  try {
-    const list = await fetch('/templates').then((r) => r.json());
-    const sel = templateSelectEl;
-    if (!sel) return;
-    sel.textContent = '';
-    const placeholder = document.createElement('option');
-    placeholder.value = '';
-    placeholder.textContent = 'テンプレート';
-    sel.appendChild(placeholder);
-    for (const t of list) {
-      const opt = document.createElement('option');
-      opt.value = t.id;
-      opt.textContent = t.custom ? `カスタム: ${t.name}` : t.name;
-      opt.title = t.desc;
-      sel.appendChild(opt);
-    }
-    const demo = document.createElement('option');
-    demo.value = '__demo';
-    demo.textContent = 'デモ文書';
-    sel.appendChild(demo);
-    sel.value = selectedId && list.some((t) => t.id === selectedId) ? selectedId : '';
-  } catch {
-    /* templates are optional */
-  }
-}
-
-templateSelectEl?.addEventListener('change', async (ev) => {
-  const id = ev.target.value;
-  ev.target.value = '';
-  if (!id) return;
-  if (!confirm('現在の内容を破棄してテンプレートから新規作成しますか？')) return;
-  const body = id === '__demo' ? '{}' : JSON.stringify({ template: id });
-  const res = await fetch('/open', { method: 'POST', body });
-  const doc = await res.json();
-  if (doc.error) {
-    statusEl.textContent = `エラー: ${doc.error}`;
-    return;
-  }
-  adoptDoc(doc);
-  history.length = 0;
-  renderInspector(doc.report, null);
-  statusEl.textContent = `テンプレート「${id}」から開始 — ${doc.report.stats.pageCount} pages`;
-});
-
-document.getElementById('btn-pdf').addEventListener('click', () => {
-  statusEl.textContent = 'PDF生成中（canonical層から配信）…';
-  window.open('/pdf', '_blank');
-});
+// ------------------------------------------------------------------ buttons
 
 document.getElementById('btn-compare')?.addEventListener('click', () => {
   window.open('/compare', '_blank');
-});
-
-document.getElementById('btn-reset').addEventListener('click', async () => {
-  const doc = await fetch('/open', { method: 'POST', body: '{}' }).then((r) => r.json());
-  adoptDoc(doc);
-  history.length = 0;
-  renderInspector(doc.report, null);
-  statusEl.textContent = 'サンプル文書に戻しました';
 });
 
 // ---------------------------------------------------------------- inspector
@@ -1115,15 +1085,15 @@ function renderInspector(report, rtt) {
   const c = report.canonical ?? canonical ?? {};
   const verify = s.verify;
   const canonState = c.error
-    ? `<span class="v" style="color:var(--warn)">TeXエラー</span>`
+    ? `<span class="v" style="color:var(--err)">TeXエラー</span>`
     : c.inFlight
-      ? `<span class="v" style="color:var(--accent-2)">コンパイル中…</span>`
+      ? `<span class="v" style="color:var(--warn)">コンパイル中</span>`
       : c.rev >= (report.srcRev ?? 0)
-        ? `<span class="v good">✓ 現行ソースと一致</span>`
+        ? `<span class="v good">現行ソースと一致</span>`
         : `<span class="v">srcRev ${c.rev} 待ち</span>`;
   const canonicalCard = `
     <div class="card">
-      <h3>Canonical — LuaLaTeX exact render（最終表示の権威）</h3>
+      <h3>Canonical（LuaLaTeX 実出力・最終表示の権威）</h3>
       <div class="kv">
         <span class="k">状態</span>${canonState}
         <span class="k">コンパイル済み / 現在</span><span class="v">srcRev ${c.rev ?? 0} / ${report.srcRev ?? 0}</span>
@@ -1134,7 +1104,7 @@ function renderInspector(report, rtt) {
             ? `<span class="k">一致検証</span><span class="v ${verify.mismatches?.length ? '' : 'good'}">${
                 verify.mismatches?.length
                   ? escapeHtml(verify.mismatches[0])
-                  : `✓ ${verify.pagesChecked}ページ一致`
+                  : `${verify.pagesChecked} ページ一致`
               }</span>`
             : ''
         }
@@ -1154,8 +1124,8 @@ function renderInspector(report, rtt) {
 
   const opaqueCard = isOpaque
     ? `<div class="card">
-        <h3>Opaque mode — exact fallback</h3>
-        <div class="diag">structured層は停止中。表示はLuaLaTeX実出力のみ（編集は継続可能）。</div>
+        <h3>Opaque モード</h3>
+        <div class="diag">structured 層は停止中。表示は LuaLaTeX 実出力のみ。編集は続けられる。</div>
         ${(report.modeReasons ?? modeReasons ?? []).map((r) => `<div class="diag">${escapeHtml(r)}</div>`).join('')}
       </div>`
     : '';
@@ -1179,7 +1149,7 @@ function renderInspector(report, rtt) {
     </div>
 
     <div class="card">
-      <h3>キャッシュ / 再利用</h3>
+      <h3>キャッシュと再利用</h3>
       <div class="kv">${cacheRows}</div>
     </div>
 
@@ -1282,15 +1252,23 @@ sse.onmessage = (ev) => {
     if (msg.kind === 'update' && msg.report.rev > appliedRev) {
       applyReport(msg.report);
       renderInspector(msg.report, null);
-      fetch('/doc')
-        .then((r) => r.json())
-        .then((doc) => {
-          if (doc.report.rev === appliedRev && editor.value !== doc.source && document.activeElement !== editor) {
-            serverText = doc.source;
-            editor.value = doc.source;
-            syncEditorHighlight();
-          }
-        });
+      // Editor-source sync exists for OTHER clients' edits (a second tab
+      // must see the new text). The old unconditional fetch also fired on
+      // our OWN edit's echo — re-serializing the entire document (source +
+      // every page's display list) once per keystroke. While we are the
+      // editing client (focused editor or an in-flight POST of ours), the
+      // patches in this report are all we need.
+      if (document.activeElement !== editor && !inFlight) {
+        fetch('/doc')
+          .then((r) => r.json())
+          .then((doc) => {
+            if (doc.report.rev === appliedRev && editor.value !== doc.source && document.activeElement !== editor) {
+              serverText = doc.source;
+              editor.value = doc.source;
+              syncEditorHighlight();
+            }
+          });
+      }
     } else if (msg.kind === 'reset') {
       if (document.activeElement !== editor) boot();
     }
@@ -1309,4 +1287,3 @@ document.getElementById('insp-reopen').addEventListener('click', () => setInspec
 setInspector(localStorage.getItem('tdom-inspector') === 'hidden');
 
 boot();
-loadTemplateList();

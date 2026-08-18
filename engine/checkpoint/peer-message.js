@@ -20,8 +20,21 @@ export function handlePeerMessage(engine, peer, msg) {
       engine._fulfill('galley:' + msg.id, msg.json);
       break;
     case 'CKPT':
-      engine.checkpoints.set(msg.idx, peer);
-      engine._fulfill('ckpt:' + msg.idx, peer);
+      // accept only ANNOUNCED checkpoints someone is waiting for: a late
+      // CKPT from a timed-out lineage (the SIGKILL lost the race) would
+      // otherwise overwrite the slot with a peer whose TeX state predates
+      // the rescue/retry that replaced it, and future jobs would fork
+      // from the wrong state
+      if (engine.waiters.has('ckpt:' + msg.idx)) {
+        engine.checkpoints.set(msg.idx, peer);
+        engine._fulfill('ckpt:' + msg.idx, peer);
+      } else {
+        peer.send('DIE\n');
+        if (peer.pid) {
+          engine.dyingPids ??= new Set();
+          engine.dyingPids.add(peer.pid);
+        }
+      }
       break;
     case 'DONE':
       engine._fulfill('render:' + msg.id, true);

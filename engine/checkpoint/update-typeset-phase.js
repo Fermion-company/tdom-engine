@@ -43,6 +43,17 @@ export async function runUpdateTypesetPhase(engine, {
   let verdict = null;
   let verifyGalleyBudget = 8; // layout-coupled clean blocks absorbed inline
   let verifyLocalBudget = 4; // \prevdepth/\lastskip ripple blocks absorbed inline
+  // Highest index still missing a galley at walk start. The walk fills
+  // galleys monotonically at its own index, so "any hole at >= i" is
+  // exactly i <= lastNoGalley — the old per-iteration blocks.slice(i)
+  // .some() scan was O(blocks²) on long walks (boot, paste, leak).
+  let lastNoGalley = -1;
+  for (let k = engine.blocks.length - 1; k >= 0; k--) {
+    if (!engine.blocks[k].galley) {
+      lastNoGalley = k;
+      break;
+    }
+  }
   let i = nearestCheckpoint(Math.min(firstDirty, engine.blocks.length));
   while (i < engine.blocks.length) {
     // /status liveness marker: which block the foreground pass is on —
@@ -77,7 +88,7 @@ export async function runUpdateTypesetPhase(engine, {
       // an EDITED block that reproduced its galley AND exit state exactly
       // (stale-first rescue reuse, comment-only change) moved nothing:
       // converge without paying a verification job
-      if (!changed && before.hadGalley && !engine.blocks.slice(i).some((b) => !b.galley)) {
+      if (!changed && before.hadGalley && i > lastNoGalley) {
         verdict = 'clean';
         break;
       }
@@ -87,7 +98,7 @@ export async function runUpdateTypesetPhase(engine, {
       // convergence: exit state and galley reproduced exactly. Galley-less
       // blocks ahead (boot/reboot fill) still need a walk; moved-label
       // dependents are handled by the backward-reference pass below.
-      const holes = engine.blocks.slice(i).some((b) => !b.galley);
+      const holes = i <= lastNoGalley;
       if (!holes) {
         verdict = 'clean';
         break;

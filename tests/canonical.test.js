@@ -23,31 +23,43 @@ const opts = available ? {} : { skip: 'lualatex not installed' };
 
 // -------------------------------------------- demand-paced authority cadence
 
-test('authority pressure paces recompiles by compile cost; display does not', () => {
+test('authority pressure: fast baseline, then deep idle + cost cooldown', () => {
   const c = new CanonicalRenderer({ workDir: WORK + '-pace' });
   try {
     // no compile yet: base debounce only (fast first exactness)
     assert.equal(c.delayFor(), c.debounceMs);
-    // a 8s compile just finished: the next one must wait ~factor× its cost
+    // an 8s compile just finished: the next one waits at least factor× its
+    // cost AND the writing-idle gate — active writing never pays a compile
     c.last = { ms: 8000 };
     c.lastEndAt = Date.now();
     assert.ok(
       c.delayFor() >= 8000 * c.cooldownFactor - 100,
       `cooldown scales with compile cost (got ${c.delayFor()})`
     );
-    // the cooldown is capped (a pathological 5-minute doc must still refresh)
+    assert.ok(c.delayFor() >= c.idleMs, 'never below the writing-idle gate');
+    // the cooldown is capped (a pathological compile must still refresh
+    // eventually) — but the cap is far above real compile times so it can
+    // no longer break the duty-cycle bound the way the old 30s cap did
     c.last = { ms: 600_000 };
     assert.ok(c.delayFor() <= c.cooldownCapMs, 'cooldown capped');
-    // once the cooldown has elapsed, only the base debounce remains
+    assert.ok(c.cooldownCapMs >= 8 * 60_000 || process.env.TDOM_CANON_COOLDOWN_CAP, 'cap far above real compiles');
+    // once the cooldown has elapsed, the writing-idle gate remains: a
+    // recompile happens only after the user has actually stopped writing
     c.last = { ms: 8000 };
     c.lastEndAt = Date.now() - 8000 * c.cooldownFactor - 1000;
-    assert.equal(c.delayFor(), c.debounceMs);
-    // opaque mode: the compile IS the display — never pace it, and use the
-    // short display debounce (structured mode's long idle debounce would
-    // make the only visible layer sluggish)
+    assert.equal(c.delayFor(), c.idleMs);
+    // opaque mode: the compile IS the display — short debounce once the
+    // half-duty cooldown has passed…
     c.pressure = 'display';
-    c.lastEndAt = Date.now();
     assert.equal(c.delayFor(), c.displayDebounceMs);
+    // …but a compile that just ended paces the next by its own cost, so a
+    // long document cannot recompile back-to-back while the user types
+    c.lastEndAt = Date.now();
+    c.last = { ms: 8000 };
+    assert.ok(
+      c.delayFor() >= 8000 * c.displayCooldownFactor - 100,
+      `display pacing scales with compile cost (got ${c.delayFor()})`
+    );
   } finally {
     c.dispose();
   }

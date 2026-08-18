@@ -68,8 +68,12 @@ export async function bootRoot(
     }
   );
   let rootLog = '';
-  engine.root.stdout.on('data', (d) => { rootLog += d; if (rootLog.length > 65536) rootLog = rootLog.slice(-32768); });
-  engine.root.stderr.on('data', (d) => { rootLog += d; });
+  const appendLog = (d) => {
+    rootLog += d;
+    if (rootLog.length > 65536) rootLog = rootLog.slice(-32768);
+  };
+  engine.root.stdout.on('data', appendLog);
+  engine.root.stderr.on('data', appendLog); // uncapped before: any chatty preamble grew this string for the root's whole life
   const rootRef = engine.root;
   engine.root.on('exit', () => {
     if (engine.root !== rootRef) return; // a superseded root dying is expected

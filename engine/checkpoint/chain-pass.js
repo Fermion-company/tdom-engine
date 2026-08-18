@@ -30,6 +30,16 @@ export async function runChainPass(engine, callbacks) {
   try {
     if (work.phase === 'blocks') {
       let sinceRepaint = 0;
+      // highest galley-less index at pass start — the walk fills galleys at
+      // its own index only, so "holes at >= j" is j <= lastNoGalley (the
+      // old per-block suffix scan was O(blocks²) over a long settle)
+      let lastNoGalley = -1;
+      for (let k = engine.blocks.length - 1; k >= 0; k--) {
+        if (!engine.blocks[k].galley) {
+          lastNoGalley = k;
+          break;
+        }
+      }
       let j = nearestCheckpoint(Math.min(work.from, engine.blocks.length));
       while (j < engine.blocks.length) {
         if (engine.bgAbort) {
@@ -64,12 +74,7 @@ export async function runChainPass(engine, callbacks) {
         }
         j++;
         work.from = Math.max(work.from, j);
-        if (
-          work.kind === 'settle' &&
-          before.hadGalley &&
-          !changed &&
-          !engine.blocks.slice(j).some((b) => !b.galley)
-        ) {
+        if (work.kind === 'settle' && before.hadGalley && !changed && j > lastNoGalley) {
           break; // exit state converged — the untouched suffix is exact
         }
       }

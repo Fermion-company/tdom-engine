@@ -60,6 +60,9 @@ export async function isoCompile(
     const msg = `isolated rescue failed for ${block.id} (${why})`;
     if (engine.isoFailCache.size > 200) engine.isoFailCache.clear();
     engine.isoFailCache.set(negKey, msg);
+    // readIsoCompileResult cleans the job dir on the paths it owns — this
+    // throw path used to leak the dir (tex + partial artifacts) per failure
+    if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
     throw new Error(msg);
   }
   return readIsoCompileResult(engine, {

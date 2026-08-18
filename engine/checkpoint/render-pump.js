@@ -35,7 +35,7 @@ function pumpRenders(engine, callbacks) {
         const block = engine.blocks.find((b) => b.id === id);
         if (!block || !block.galley || !block.needsRender) continue;
         await renderBlock(engine, block, callbacks).catch((err) => {
-          engine.diagnostics.push(`render ${id}: ${err.message}`);
+          engine.diagnostics.push(`render ${id}: ${err?.message ?? err}`);
         });
       }
     } finally {

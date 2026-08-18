@@ -104,7 +104,7 @@ hot path の最後に `#scheduleBackground(fgStop, dirtyBlocks)`、`#shipUpdate(
 - pending chain があれば idle 後に chain pass を走らせる。
 - dirty block 数が `TDOM_RENDER_HOT_MAX` 以下なら、needsRender な hot block を resident RENDER queue に積む。
 
-`canonical.schedule()` は source/rev を保存して timer を張るだけである。実際の full `lualatex` compile は edit response を待たせない。structured モードでは canonical は「権威」であって表示の主役ではない（リアルタイム provisional が主役）ので、idle debounce は長い（既定 2500ms = 手が止まって数秒後に 1 回）＋コスト比例 cooldown で、能動編集中は canonical CPU/メモリをほぼ使わない。opaque モードでは canonical が唯一の表示なので `displayDebounceMs`（既定 350ms）で即応を保つ（`delayFor()` が pressure で分岐）。
+`canonical.schedule()` は source/rev を保存して timer を張るだけである。実際の full `lualatex` compile は edit response を待たせない。structured モードでは canonical は「権威」であって表示の主役ではない（リアルタイム provisional が主役）。cadence は「執筆中は走らない」設計である: 文書ごとの初回だけ `debounceMs`（既定 2500ms）で速攻の baseline を 1 回取り、以降は `idleMs`（既定 30s = 手が本当に止まった状態）＋コスト比例 cooldown（factor 2、cap は既定 600s — 旧 30s cap は長文書の duty 比バウンドを壊していた）を両方満たすまで再コンパイルしない。opaque モードでは canonical が唯一の表示なので `displayDebounceMs`（既定 350ms）で即応しつつ、half-duty の cost cooldown（factor 1、cap 60s）で長文書の連続再コンパイルを防ぐ（`delayFor()` が pressure で分岐）。`ensure()`（export 経路）は渡された snapshot だけを compile し、compile 中に届いた打鍵を loop で追いかけない。
 
 ## 10.10b checkpoint 予算の硬い上限
 

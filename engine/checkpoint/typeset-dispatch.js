@@ -23,16 +23,23 @@ export async function typesetBlock(engine, idx, callbacks) {
   // one), the chain continues with a consistent state, and the block
   // heals automatically on the next edit that changes its text. The
   // canonical layer keeps showing LuaLaTeX's own error-recovery output.
+  // The abort flag is a BACKGROUND yield signal (the next edit sets it to
+  // pre-empt chain/rescue passes). A foreground update must never see it:
+  // a second #update pre-arms the flag before taking the chain lock, and an
+  // aborted foreground walk used to escalate into a full reboot retry that
+  // failed the same way and pinned the document in opaque (reprobe racing a
+  // keystroke, or two concurrent edit() calls in an editor embedding).
+  const aborted = () => engine.bgAbort && engine.bgActive;
   const rescueSafely = async (why) => {
     try {
       return await rescueBlock(idx, why);
     } catch (err) {
-      if (engine.bgAbort) throw err; // an edit is waiting — no freeze jobs now
+      if (aborted()) throw err; // an edit is waiting — no freeze jobs now
       engine.diagnostics.push(`${block.id}: rescue failed (${err.message}) — freezing the block`);
       return brokenBlockGalley(idx);
     }
   };
-  if (engine.bgAbort) throw new Error('background pass aborted (edit waiting)');
+  if (aborted()) throw new Error('background pass aborted (edit waiting)');
   if (needsRescue(block.text)) {
     const g = await rescueSafely('output-routine environment needs a real page');
     TRACE?.('rescue(env)', T0);
@@ -60,7 +67,7 @@ export async function typesetBlock(engine, idx, callbacks) {
     // poisoning it (its job may have been killed mid-flight, not broken)
     // and without paying for rescue/state follow-up jobs — the next
     // rebuild retries from scratch
-    if (engine.bgAbort) throw err;
+    if (aborted()) throw err;
     engine.poisoned.set(block.id, sig);
     const isTimeout = /timeout/.test(err.message);
     engine.chainTimeouts = isTimeout ? (engine.chainTimeouts ?? 0) + 1 : 0;

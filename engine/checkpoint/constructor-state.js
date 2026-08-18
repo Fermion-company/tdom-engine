@@ -3,6 +3,26 @@ import path from 'node:path';
 import { SourceStore } from '../source-store.js';
 import { CanonicalRenderer } from './canonical.js';
 
+/** Chunk store with a write generation: every set/delete bumps `.rev`, so
+ * rebuildUnits can skip its per-block signature sweep when nothing about
+ * the chunk world changed since the block's last rebuild. */
+export function makeChunkMap() {
+  const m = new Map();
+  m.rev = 0;
+  const set = m.set.bind(m);
+  const del = m.delete.bind(m);
+  m.set = (k, v) => {
+    m.rev++;
+    return set(k, v);
+  };
+  m.delete = (k) => {
+    const had = del(k);
+    if (had) m.rev++;
+    return had;
+  };
+  return m;
+}
+
 export function initializeEngineState(
   engine,
   { workDir, docDir, baseCounters, makeShipping, onCanonicalResult }
@@ -39,7 +59,7 @@ export function initializeEngineState(
   engine.fonts = new Map(); // fid -> {file,name,size,fmt, family, remap}
   engine.fontFiles = new Map(); // familyKey -> absolute path
   engine.pages = [];
-  engine.chunks = new Map(); // chunkKey -> {svg, wBp, hBp, v} exact renders
+  engine.chunks = makeChunkMap(); // chunkKey -> {svg, wBp, hBp, v} exact renders
   engine.isoCache = new Map(); // rescue key -> isolated compile result
   engine.isoFailCache = new Map(); // rescue key -> error message (doomed compiles: same inputs fail the same way — don't pay the preamble again on every chain pass over a frozen block)
   engine.isoForkBroken = new Set(); // block ids whose iso fork children die (tcolorbox-class fork/dormant incompatibility) — go straight to cold
@@ -48,6 +68,8 @@ export function initializeEngineState(
   engine.hf = new Map(); // page number -> {h: items, f: items} TeX-typeset header/footer
   engine.hfSig = null; // page-spec signature the current hf map was built for
   engine.hfPending = null; // spec signature of an in-flight header job
+  engine.hfQueued = null; // {specs, sig} newest layout waiting behind the in-flight job
+  engine.hfQueuedSig = null;
   engine.initialStyle = 'plain'; // \pagestyle in effect at \begin{document}
   engine.bgAbort = false;
   engine.bgActive = false; // a background pass holds the chain lock right now
@@ -92,6 +114,12 @@ export function initializeEngineState(
   engine.modeReasons = [];
   engine.opaqueStickyPre = null; // preamble hash a dynamic demotion sticks to
   engine.verifyState = null; // last exactness-verification outcome
+  // safety-gate memos: the preamble verdict is keyed by preamble hash, the
+  // body verdict lives per block and is re-scanned only when a block's
+  // text changes (the old design ran a whole-document regex sweep per
+  // keystroke)
+  engine.preGate = null; // {preHash, gate}
+  engine.unsafeBodyBlocks = new Map(); // block.id -> unsafe-body reason
 
   // stale-first rescue machinery: exact isolated compiles are queued and
   // run OFF the editing hot path; the chain lock serializes everything

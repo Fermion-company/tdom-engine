@@ -134,9 +134,8 @@ function renderEngine(pages, mode) {
   engineScroll.innerHTML = '';
   if (mode === 'opaque') {
     engineScroll.innerHTML =
-      '<div class="cmp-empty">opaqueモード: この文書はstructured層の対象外です<br>' +
-      '(safety gateによるexact fallback)。provisional層は存在せず、<br>' +
-      'メインプレビューは左と同じLuaLaTeX実出力を表示しています。</div>';
+      '<div class="cmp-empty">opaque モード。safety gate により structured 層を停止しているため<br>' +
+      'provisional 層は存在せず、メインプレビューも左と同じ LuaLaTeX 実出力を表示する。</div>';
     return;
   }
   if (!pages?.length) {
@@ -150,7 +149,7 @@ async function loadEngine() {
   const doc = await fetch('/doc').then((r) => r.json());
   geometry = doc.geometry;
   backend = doc.backend ?? 'checkpoint';
-  backendTag.textContent = doc.mode === 'opaque' ? 'opaqueモード (exact fallback)' : `provisional層 (${backend})`;
+  backendTag.textContent = doc.mode === 'opaque' ? 'opaque モード（exact fallback）' : backend;
   injectFonts(doc.fonts);
   applyPageWidth();
   renderEngine(doc.pages, doc.mode);
@@ -191,23 +190,23 @@ async function renderReal(force = false) {
 
 async function renderRealInner(force) {
   if (force) {
-    realScroll.innerHTML = '<div class="cmp-empty">本物のPDFをlualatexでコンパイル中…</div>';
-    status('lualatex コンパイル中…');
+    realScroll.innerHTML = '<div class="cmp-empty">lualatex でコンパイル中</div>';
+    status('lualatex コンパイル中');
   }
   let buf;
   try {
     let resp = force ? await fetch('/pdf') : await fetch('/canonical.pdf');
     if (!force && resp.status === 404) {
       // no canonical compile has landed yet (fresh boot): compile one
-      realScroll.innerHTML = '<div class="cmp-empty">本物のPDFをlualatexでコンパイル中…</div>';
-      status('canonical未着 — lualatex コンパイル中…');
+      realScroll.innerHTML = '<div class="cmp-empty">lualatex でコンパイル中</div>';
+      status('canonical 未着 / lualatex コンパイル中');
       resp = await fetch('/pdf');
     }
     if (!resp.ok) throw new Error(`${resp.url.split('/').pop()} → ${resp.status}`);
     buf = await resp.arrayBuffer();
   } catch (err) {
-    realScroll.innerHTML = `<div class="cmp-empty">本物のPDFを取得できませんでした<br>${escapeXml(err.message)}<br><br>lualatex が必要です。</div>`;
-    status('本物のPDFの取得に失敗');
+    realScroll.innerHTML = `<div class="cmp-empty">PDF を取得できなかった<br>${escapeXml(err.message)}<br><br>lualatex が必要。</div>`;
+    status('PDF の取得に失敗');
     return;
   }
   try {

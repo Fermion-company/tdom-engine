@@ -74,20 +74,23 @@ const UNSAFE_BODY = [
 ];
 
 /** Strip TeX comments (unescaped % to end of line) so commented-out
- * dangers don't demote the document. */
-function stripComments(text) {
+ * dangers don't demote the document. Shared with the other gates
+ * (rescue classifier, margin demotion, definition-edit scan) — they used
+ * to test raw text, so a commented-out `% \marginpar` or `% \newcommand`
+ * silently routed blocks to the slow tiers. */
+export function stripComments(text) {
   return String(text ?? '').replace(/(^|[^\\])%[^\n]*/g, '$1');
 }
 
 /**
- * Classify a document for the structured layer.
+ * Preamble half of the gate: unsafe packages + page-production takeovers.
+ * Memoizable by preamble hash — the preamble does not change while the
+ * user types in the body, so this never runs per keystroke.
  * @returns {{safe: boolean, reasons: string[]}}
  */
-export function classifyDocument(preamble, body) {
+export function classifyPreamble(preamble) {
   const reasons = [];
   const pre = stripComments(preamble);
-  const bod = stripComments(body);
-
   const pkgRe = /\\(?:usepackage|RequirePackage)\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}/g;
   let m;
   while ((m = pkgRe.exec(pre))) {
@@ -99,6 +102,32 @@ export function classifyDocument(preamble, body) {
   for (const [re, why] of UNSAFE_PREAMBLE) {
     if (re.test(pre)) reasons.push(why);
   }
+  return { safe: reasons.length === 0, reasons: [...new Set(reasons)] };
+}
+
+/**
+ * Body half of the gate, per block: returns the reason string when this
+ * block carries a construct the JS page assembly cannot represent, else
+ * null. Called only for blocks whose text actually changed — the old
+ * whole-body regex sweep ran on every keystroke and never saw \input'ed
+ * content (which arrives here as expanded blocks).
+ */
+export function classifyBodyBlock(text) {
+  const bod = stripComments(text);
+  for (const [re, why] of UNSAFE_BODY) {
+    if (re.test(bod)) return why;
+  }
+  return null;
+}
+
+/**
+ * Classify a whole document for the structured layer (composition of the
+ * two halves; kept for tests and one-shot callers).
+ * @returns {{safe: boolean, reasons: string[]}}
+ */
+export function classifyDocument(preamble, body) {
+  const reasons = [...classifyPreamble(preamble).reasons];
+  const bod = stripComments(body);
   for (const [re, why] of UNSAFE_BODY) {
     if (re.test(bod)) reasons.push(why);
   }

@@ -27,9 +27,10 @@
 
 編集 API は `POST /edit` で LaTeX ソースの範囲差分を受け取る。エンジン側では、おおまかに次の順に進む。
 
-1. safety gate が document-level に危険な package/body token を調べる。
-2. `segmenter.js` が source を block 列に分ける。
-3. 前回 block 列との差分を取り、prefix/suffix で再利用できる checkpoint を付け替える。
+1. safety gate（preamble 半分）が危険な package/preamble token を調べる。preamble hash でメモ化され、本文打鍵中は hash 比較 1 回で済む。
+2. `segmenter.js` が source を block 列に分け（verbatim/lstlisting 内はリテラル扱い）、前回 block 列との差分を取る。
+3. safety gate（body 半分）が **dirty block だけ** を増分スキャンする（`\input` 先の block も対象）。
+4. prefix/suffix で再利用できる checkpoint を付け替える。
 4. resident TeX daemon に必要な block を JOB として投入する。
 5. daemon は real MVL、labels/refs、toc lines、shipout events、font 情報などを返す。
 6. `pagebuilder.js` が galley・float・footnote をページに組む。

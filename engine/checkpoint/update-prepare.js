@@ -1,6 +1,6 @@
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
-import { classifyDocument } from './safety.js';
+import { classifyPreamble, classifyBodyBlock } from './safety.js';
 import { firstDirtyIndex } from './update-helpers.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 
@@ -13,19 +13,70 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
   const preHash = fnv1a(preamble);
 
-  // ---- safety gate -----------------------------------------------------
+  // ---- safety gate, preamble half --------------------------------------
   // Structured is a privilege, not a default: page-mechanism-hostile
-  // constructs and previously-failed preambles take the opaque path,
-  // where the display is the canonical LuaLaTeX output itself.
-  const gate = classifyDocument(preamble, text.slice(bounds.body.start, bounds.body.end));
-  if (!gate.safe) {
-    return { response: opaqueUpdate(editLabel, timer, gate.reasons.map((r) => `safety gate: ${r}`)) };
+  // constructs take the opaque path, where the display is the canonical
+  // LuaLaTeX output itself. Memoized per preamble hash — while the user
+  // types in the body this costs one hash compare, not a full regex sweep.
+  if (engine.preGate?.preHash !== preHash) {
+    engine.preGate = { preHash, gate: classifyPreamble(preamble) };
+  }
+  if (!engine.preGate.gate.safe) {
+    return {
+      response: opaqueUpdate(editLabel, timer, engine.preGate.gate.reasons.map((r) => `safety gate: ${r}`)),
+    };
   }
   if (engine.opaqueStickyPre === preHash) {
     // dynamically demoted on this exact preamble — don't pay a doomed
     // boot per keystroke; a preamble edit (or reopen) retries structured
     return { response: opaqueUpdate(editLabel, timer, engine.modeReasons) };
   }
+
+  // ---- segmentation + diff ---------------------------------------------
+  // Independent of the resident boot, so it runs BEFORE the mode flip:
+  // the body half of the safety gate needs the fresh block list, and a
+  // body-unsafe document must not boot the structured tree per keystroke.
+  const oldBlocks = engine.blocks;
+  let segs = segmentBody(text.slice(bounds.body.start, bounds.body.end), bounds.body.start);
+  segs = expandIncludes(segs, 0);
+  const diff = diffBlocks(engine.blocks, segs, () => engine.idSeq++);
+  engine.blocks = diff.blocks;
+  for (const id of diff.removed) {
+    unindexBlock(id);
+    engine.unsafeBodyBlocks.delete(id);
+    // a removed block's per-block state must die with it — chunks in
+    // particular hold full SVG strings and used to accumulate forever
+    engine.poisoned.delete(id);
+    engine.fidelityDemoted.delete(id);
+    engine.isoForkBroken.delete(id);
+    engine.renderWant.delete(id);
+    engine.rescueQueue.delete(id);
+    for (const key of engine.chunks.keys()) {
+      if (key === id || key.startsWith(id + '#') || key.startsWith(id + '@')) {
+        engine.chunks.delete(key);
+      }
+    }
+  }
+  const dirtySource = new Set(diff.dirty);
+
+  // ---- safety gate, body half (incremental) ----------------------------
+  // Only blocks whose text changed are re-scanned; the verdict for clean
+  // blocks persists. This also closes the old gate's include blindness:
+  // \input'ed content arrives here as expanded blocks and is scanned like
+  // any other block, where the old whole-body scan saw only the main file.
+  for (const b of engine.blocks) {
+    if (!dirtySource.has(b.id)) continue;
+    const why = classifyBodyBlock(b.text);
+    if (why) engine.unsafeBodyBlocks.set(b.id, why);
+    else engine.unsafeBodyBlocks.delete(b.id);
+  }
+  if (engine.unsafeBodyBlocks.size) {
+    const reasons = [...new Set(engine.unsafeBodyBlocks.values())].map((r) => `safety gate: ${r}`);
+    return { response: opaqueUpdate(editLabel, timer, reasons) };
+  }
+  timer.lap('segment');
+
+  // ---- structured re-enable + boot -------------------------------------
   if (engine.mode === 'opaque') {
     engine.mode = 'structured';
     engine.modeReasons = [];
@@ -62,15 +113,6 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
     }
   }
   timer.lap('boot');
-
-  const oldBlocks = engine.blocks;
-  let segs = segmentBody(text.slice(bounds.body.start, bounds.body.end), bounds.body.start);
-  segs = expandIncludes(segs, 0);
-  const diff = diffBlocks(engine.blocks, segs, () => engine.idSeq++);
-  engine.blocks = diff.blocks;
-  for (const id of diff.removed) unindexBlock(id);
-  const dirtySource = new Set(diff.dirty);
-  timer.lap('segment');
 
   const firstDirty = firstDirtyIndex(oldBlocks, engine.blocks, dirtySource, diff);
   // Checkpoint-suffix preservation (docs/10 §I2): boundaries outside the

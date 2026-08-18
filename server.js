@@ -343,7 +343,58 @@ function claimWorkDir(base) {
   }
   mkdirSync(dir, { recursive: true });
   writeFileSync(lock, String(process.pid));
+  sweepStaleArtifacts(dir, base);
   return dir;
+}
+
+// Previous sessions leave per-job artifacts behind (render/rescue job dirs,
+// superseded canonical PDFs, fallback workdirs whose owner died). None are
+// live state — the engine reconstructs everything — so reclaim the disk at
+// boot instead of growing forever (observed: 464 render dirs / 73MB).
+function sweepStaleArtifacts(dir, base) {
+  try {
+    for (const f of readdirSync(dir, { withFileTypes: true })) {
+      if (f.isDirectory() && /^(render|rescue|iso)-/.test(f.name)) {
+        rmSync(path.join(dir, f.name), { recursive: true, force: true });
+      }
+    }
+  } catch { /* fresh dir */ }
+  try {
+    const canonDir = path.join(dir, 'canonical');
+    for (const f of readdirSync(canonDir)) {
+      if (/^canon(-\d+)?\.(pdf|svg)$/.test(f) || /^canon-\d+-p\d+\.svg$/.test(f)) {
+        rmSync(path.join(canonDir, f), { force: true });
+      }
+    }
+  } catch { /* no canonical dir yet */ }
+  // sibling PID-fallback workdirs (.tdom-v3-<pid>) whose owner is gone.
+  // Strictly `${base}-<digits>` WITH a dead-owner lockfile: anything else
+  // (test workdirs like .tdom-v3-test carry no lock) is not ours to touch.
+  try {
+    const fallbackRe = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-\\d+$`);
+    for (const f of readdirSync(ROOT, { withFileTypes: true })) {
+      if (!f.isDirectory() || !fallbackRe.test(f.name)) continue;
+      const sib = path.join(ROOT, f.name);
+      let dead = false;
+      try {
+        const pid = Number(readFileSync(path.join(sib, '.tdom-owner'), 'utf8'));
+        if (!pid) continue;
+        process.kill(pid, 0); // throws when the owner is gone
+      } catch (err) {
+        dead = err?.code === 'ESRCH' || err?.code === 'ENOENT' ? err.code === 'ESRCH' : false;
+      }
+      if (dead) rmSync(sib, { recursive: true, force: true });
+    }
+  } catch { /* nothing to sweep */ }
+  // AI style previews: keep only the newest handful
+  try {
+    const previews = readdirSync(AI_PREVIEWS_DIR)
+      .filter((f) => f.endsWith('.pdf'))
+      .sort();
+    for (const f of previews.slice(0, Math.max(0, previews.length - 20))) {
+      rmSync(path.join(AI_PREVIEWS_DIR, f), { force: true });
+    }
+  } catch { /* no previews dir */ }
 }
 const engine = new CheckpointEngine({
   workDir: claimWorkDir(workDirName),
@@ -384,9 +435,26 @@ function withEngine(fn) {
 }
 
 const sseClients = new Set();
+// A stalled client (suspended tab, slept laptop) must not buffer every
+// patch payload in this process forever: past the high-water mark we drop
+// the connection — EventSource reconnects and resyncs by itself.
+const SSE_MAX_BUFFER = 8 * 1024 * 1024;
+function broadcastRaw(jsonStr) {
+  const data = `data: ${jsonStr}\n\n`;
+  for (const res of sseClients) {
+    try {
+      res.write(data);
+      if (res.writableLength > SSE_MAX_BUFFER) {
+        sseClients.delete(res);
+        res.destroy();
+      }
+    } catch {
+      sseClients.delete(res);
+    }
+  }
+}
 function broadcast(payload) {
-  const data = `data: ${JSON.stringify(payload)}\n\n`;
-  for (const res of sseClients) res.write(data);
+  broadcastRaw(JSON.stringify(payload));
 }
 
 // async patches (TikZ renders, late chain discoveries) from the checkpoint engine
@@ -455,12 +523,31 @@ function json(res, obj, status = 200) {
   res.end(JSON.stringify(obj));
 }
 
+const MAX_BODY = 32 * 1024 * 1024;
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
+    let size = 0;
+    let done = false;
+    const finish = (fn, v) => {
+      if (done) return;
+      done = true;
+      fn(v);
+    };
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY) {
+        finish(reject, new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => finish(resolve, Buffer.concat(chunks).toString('utf8')));
+    req.on('error', (err) => finish(reject, err));
+    // an aborted POST fires close without end — without this the promise
+    // never settles and the handler (plus its buffers) leaks per abort
+    req.on('close', () => finish(reject, new Error('client aborted request')));
   });
 }
 
@@ -621,7 +708,11 @@ const server = http.createServer(async (req, res) => {
     // Demote the family so affected lines switch to exact preview chunks.
     if (req.method === 'POST' && url.pathname === '/font-fail') {
       const body = JSON.parse(await readBody(req));
-      const demoted = engine.demoteFontFamily ? engine.demoteFontFamily(String(body.family ?? '')) : false;
+      // demotion repaginates the whole document — run it on the engine
+      // queue like every other mutation, never between an update's awaits
+      const demoted = await withEngine(() =>
+        engine.demoteFontFamily ? engine.demoteFontFamily(String(body.family ?? '')) : false
+      );
       return json(res, { demoted });
     }
     // the last LANDED canonical compile, byte-identical to what the main
@@ -667,9 +758,32 @@ const server = http.createServer(async (req, res) => {
       if (typeof start !== 'number' || typeof end !== 'number' || typeof text !== 'string') {
         return json(res, { error: 'edit requires {start, end, text}' }, 400);
       }
-      lastReport = await withEngine(() => engine.edit(start, end, text));
-      broadcast({ kind: 'update', report: lastReport });
-      return json(res, lastReport);
+      try {
+        lastReport = await withEngine(() => {
+          // optional optimistic-concurrency guard: a client that states the
+          // source revision its offsets were computed against gets a 409
+          // instead of a silent mis-application when it fell behind
+          // (editor integrations with retries/multiple sources of edits)
+          if (typeof body.rev === 'number' && body.rev !== engine.srcRev) {
+            const err = new Error('revision mismatch');
+            err.status = 409;
+            err.srcRev = engine.srcRev;
+            throw err;
+          }
+          return engine.edit(start, end, text);
+        });
+      } catch (err) {
+        if (err?.status === 409) {
+          return json(res, { error: 'revision mismatch', srcRev: err.srcRev }, 409);
+        }
+        throw err;
+      }
+      // one serialization for both consumers: the SSE fanout and the HTTP
+      // response used to stringify the full report (all patches) twice
+      const reportJson = JSON.stringify(lastReport);
+      broadcastRaw(`{"kind":"update","report":${reportJson}}`);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(reportJson);
     }
     if (req.method === 'POST' && url.pathname === '/open') {
       const raw = await readBody(req);
@@ -699,11 +813,25 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`[tdom] Fermion TeX Engine (${backend}) listening on http://127.0.0.1:${PORT}`);
 });
 
-process.on('SIGINT', async () => {
-  if (engine.close) await engine.close();
+// Shutdown: close the engine (kills the resident tree, canonical children,
+// isolated compiles), but never hang — a stuck child must not keep the
+// process alive, so a watchdog force-exits after a grace period.
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const watchdog = setTimeout(() => {
+    console.error(`[tdom] ${signal}: shutdown watchdog fired — forcing exit`);
+    process.exit(1);
+  }, 5000);
+  watchdog.unref?.();
+  try {
+    if (engine.close) await engine.close();
+  } catch (err) {
+    console.error('[tdom] shutdown error:', err);
+  }
   process.exit(0);
-});
-process.on('SIGTERM', async () => {
-  if (engine.close) await engine.close();
-  process.exit(0);
-});
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGHUP', () => shutdown('SIGHUP'));

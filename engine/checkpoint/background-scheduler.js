@@ -15,7 +15,7 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks) {
     if (engine.bgAbort || !engine.pendingChain) return;
     await locked(() => runChainPass());
   })().catch((err) => {
-    engine.diagnostics.push('chain pass failed: ' + err.message);
+    engine.diagnostics.push('chain pass failed: ' + (err?.message ?? err));
   });
   // High-fidelity chunk renders go to the pump ONLY for the blocks this
   // edit touched: their checkpoint is warm (render hold). COLD blocks

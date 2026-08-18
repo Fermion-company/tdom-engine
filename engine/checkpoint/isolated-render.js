@@ -14,10 +14,21 @@ export function queueIsolatedRender(engine, block, idx, renderBlock) {
   // dozens in parallel overload the machine, hit the 90s timeout and
   // leave truncated PDFs ('Invalid XRef'). Serialize them; each result
   // is cached by galley hash so the queue drains once per content.
+  // Dedup per block BEFORE queueing: during a typing session the idle
+  // gate stays shut, and the same block used to be enqueued once per
+  // trigger — the whole backlog then drained as serial full-preamble
+  // compiles when the user finally paused.
+  engine.isoRenderPending ??= new Set();
+  if (engine.isoRenderPending.has(block.id)) return engine.isoRenderQueue;
+  engine.isoRenderPending.add(block.id);
   engine.isoRenderQueue = (engine.isoRenderQueue ?? Promise.resolve()).then(() =>
-    renderBlock(block, idx).catch((err) => {
-      engine.diagnostics.push(`render ${block.id}: ${err.message}`);
-    })
+    renderBlock(block, idx)
+      .catch((err) => {
+        engine.diagnostics.push(`render ${block.id}: ${err?.message ?? err}`);
+      })
+      .finally(() => {
+        engine.isoRenderPending.delete(block.id);
+      })
   );
   return engine.isoRenderQueue;
 }
@@ -44,7 +55,12 @@ async function renderIdleGate(engine) {
 
 export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, asyncRepaginate }) {
   await renderIdleGate(engine);
-  if (!block.galley || !engine.blocks.includes(block)) return; // superseded (reboot nulls galleys)
+  // the idle gate can hold this job for minutes — the index captured at
+  // queue time is stale after any insertion/deletion above the block, and
+  // blocks[idx-1] would then be a DIFFERENT block's exit state (wrong
+  // counters/prevdepth typeset into the exact chunk). Re-locate it.
+  idx = engine.blocks.indexOf(block);
+  if (!block.galley || idx < 0) return; // superseded (reboot nulls galleys)
   const forGalley = block.galleyHash;
   // a full-preamble compile is minutes on package-heavy documents: never
   // pay it when every chunk is already fresh (idle-gate wait races)
@@ -81,24 +97,34 @@ export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, as
       blockText: block.text,
     });
     const jobdir = path.join(engine.workDir, `render-${block.id}-${forGalley}`);
-    mkdirSync(jobdir, { recursive: true });
-    rmSync(path.join(jobdir, 'iso.pdf'), { force: true });
-    writeFileSync(path.join(jobdir, 'iso.tex'), isoTex);
-    // lowest-priority CPU: see #isoCompile
-    await execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
-      cwd: jobdir,
-      timeout: 90_000,
-    }).catch(() => {});
-    const pdf = path.join(jobdir, 'iso.pdf');
-    if (!existsSync(pdf)) throw new Error('isolated render produced no PDF');
-    await waitForPdf(pdf); // %%EOF flushed before pdftocairo reads it
-    // same page map as the resident RENDER path: galley, floats, feet
-    const targets = chunkTargets(block).filter(
-      (t) => engine.chunks.get(t.key)?.forGalley !== forGalley
-    );
-    await cropRenderTargets({ jobdir, pdf, targets, chunks: engine.chunks, forGalley, prefix: 'iso' });
-    if (block.galleyHash === forGalley) asyncRepaginate();
-    rmSync(jobdir, { recursive: true, force: true });
+    try {
+      mkdirSync(jobdir, { recursive: true });
+      rmSync(path.join(jobdir, 'iso.pdf'), { force: true });
+      writeFileSync(path.join(jobdir, 'iso.tex'), isoTex);
+      // lowest-priority CPU: see #isoCompile. Register the child so
+      // closeEngine can SIGKILL it — an abandoned run otherwise burns a
+      // core for up to its 90s timeout after the server exits.
+      const run = execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
+        cwd: jobdir,
+        timeout: 90_000,
+      });
+      if (run.child) engine.isoChildren.add(run.child);
+      await run.catch(() => {}).finally(() => {
+        if (run.child) engine.isoChildren.delete(run.child);
+      });
+      const pdf = path.join(jobdir, 'iso.pdf');
+      if (!existsSync(pdf)) throw new Error('isolated render produced no PDF');
+      await waitForPdf(pdf); // %%EOF flushed before pdftocairo reads it
+      // same page map as the resident RENDER path: galley, floats, feet
+      const targets = chunkTargets(block).filter(
+        (t) => engine.chunks.get(t.key)?.forGalley !== forGalley
+      );
+      await cropRenderTargets({ jobdir, pdf, targets, chunks: engine.chunks, forGalley, prefix: 'iso' });
+      if (block.galleyHash === forGalley) asyncRepaginate();
+    } finally {
+      // failure paths used to leak the whole job dir (PDF + SVGs) on disk
+      rmSync(jobdir, { recursive: true, force: true });
+    }
   } finally {
     engine.rendering.delete(inflightKey);
   }

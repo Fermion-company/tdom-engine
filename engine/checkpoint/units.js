@@ -55,7 +55,15 @@ export function paginateNow({ blocks, geometry, chunks, fidelityEpoch, pageRun }
 }
 
 export function rebuildUnits(blocks, chunks, fidelityEpoch) {
+  // Cheap skip: when the chunk world (chunks.rev — bumped on every chunk
+  // write), the fidelity epoch and the block's own galley are all unchanged
+  // since this block's last rebuild, its signature inputs are identical —
+  // don't even build the sig string. This sweep runs 2-3× per edit over
+  // every block; steady-state typing now touches only the edited block.
+  const worldRev = (chunks.rev ?? -1) + ':' + fidelityEpoch;
   for (const block of blocks) {
+    const stamp = worldRev + ':' + block.galleyHash;
+    if (block.units && block.unitsStamp === stamp) continue;
     // the sig carries chunk VERSION and FRESHNESS (stale chunks are
     // displayed too — see buildStream — so a stale→fresh flip must
     // rebuild) plus the fidelity epoch (font-tier demotions)
@@ -75,5 +83,6 @@ export function rebuildUnits(blocks, chunks, fidelityEpoch) {
       block.units = buildStream(block, chunks);
       block.unitsSig = sig;
     }
+    block.unitsStamp = stamp;
   }
 }

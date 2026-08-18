@@ -25,12 +25,21 @@ import { fnv1a } from './hash.js';
 
 const FORCED_START = /^\s*\\(chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
 
+// Environments whose content is LITERAL: no comments, no macro calls, no
+// brace/environment structure. Without this awareness an unbalanced `{`
+// (or a `%` hiding the rest of a line) inside a listing poisoned the depth
+// counters and merged the entire remaining document into one block — every
+// keystroke anywhere in the tail then re-typeset the whole remainder.
+const VERBATIM_BEGIN_RE =
+  /\\begin\{(verbatim\*?|lstlisting|minted|alltt|filecontents\*?|[BLV]erbatim\*?)\}/;
+
 export function segmentBody(text, baseOffset) {
   const segs = [];
   const lines = splitLines(text);
   let envDepth = 0;
   let braceDepth = 0;
   let inDisplay = false;
+  let inVerbatim = null; // env name while inside a literal environment
   let cur = null; // { start, end }
 
   const flush = (endOffset) => {
@@ -44,7 +53,16 @@ export function segmentBody(text, baseOffset) {
   };
 
   for (const ln of lines) {
-    const stripped = stripComment(ln.text);
+    if (inVerbatim) {
+      // literal content: no comment stripping, no depth tracking, no
+      // blank-line flush (blank lines inside a listing stay in the block)
+      if (cur === null) cur = { start: ln.start };
+      if (ln.text.includes(`\\end{${inVerbatim}}`)) inVerbatim = null;
+      continue;
+    }
+    let stripped = stripComment(ln.text);
+    // neutralize inline \verb payloads before counting braces/comments
+    stripped = stripped.replace(/\\verb\*?([^A-Za-z\s])(.*?)\1/g, '\\verb$1v$1');
     const blank = stripped.trim().length === 0 && ln.text.trim().length === 0;
     const atTop = envDepth === 0 && braceDepth <= 0 && !inDisplay;
 
@@ -56,6 +74,22 @@ export function segmentBody(text, baseOffset) {
       flush(ln.start);
     }
     if (cur === null && !blank) cur = { start: ln.start };
+
+    const verb = VERBATIM_BEGIN_RE.exec(stripped);
+    if (verb) {
+      // enter literal mode unless the same line also closes it; the
+      // verbatim env itself contributes nothing to envDepth (its \begin
+      // and \end are both skipped, so it stays balanced), but any OTHER
+      // structure on the line before \begin{verbatim} still counts
+      const before = stripped.slice(0, verb.index);
+      envDepth += countMatches(before, /\\begin\{[^}]*\}/g);
+      envDepth -= countMatches(before, /\\end\{[^}]*\}/g);
+      if (envDepth < 0) envDepth = 0;
+      braceDepth += braceDelta(before);
+      if (braceDepth < 0) braceDepth = 0;
+      if (!ln.text.includes(`\\end{${verb[1]}}`)) inVerbatim = verb[1];
+      continue;
+    }
 
     // Track depth transitions on this line.
     envDepth += countMatches(stripped, /\\begin\{[^}]*\}/g);

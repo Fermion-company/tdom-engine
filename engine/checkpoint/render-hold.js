@@ -2,7 +2,7 @@
 // verdict yet (checkpoint render-hold heuristic — a miss only costs the
 // slower isolated render path)
 const MATHY_RE =
-  /\$|\\\[|\\\(|\\begin\{(equation|align|gather|multline|eqnarray|math|displaymath|tikzpicture)/;
+  /\$|\\\[|\\\(|\\begin\{(equation|align|alignat|gather|multline|eqnarray|math|displaymath|cases|array|split|aligned|gathered|alignedat|tikzpicture)/;
 
 // how many off-grid checkpoints may stay alive awaiting their block's chunk
 const RENDER_HOLD_MAX = Number(process.env.TDOM_RENDER_HOLD_MAX || 8);

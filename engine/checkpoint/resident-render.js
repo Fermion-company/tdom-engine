@@ -12,8 +12,8 @@ export async function renderResidentBlock(
   engine.rendering ??= new Set();
   if (engine.rendering.has(inflightKey)) return;
   engine.rendering.add(inflightKey);
+  const jobdir = path.join(engine.workDir, `render-${block.id}-${forGalley}`);
   try {
-    const jobdir = path.join(engine.workDir, `render-${block.id}-${forGalley}`);
     mkdirSync(jobdir, { recursive: true });
     rmSync(path.join(jobdir, 'driver.pdf'), { force: true });
     const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
@@ -55,6 +55,10 @@ export async function renderResidentBlock(
     if (block.galleyHash === forGalley) asyncRepaginate();
   } finally {
     engine.rendering.delete(inflightKey);
+    // the job dir held one PDF + page SVGs whose useful content now lives
+    // in engine.chunks — every edit to a gfx block minted a new dir and
+    // nothing ever removed them (observed: hundreds of dirs, 10s of MB)
+    rmSync(jobdir, { recursive: true, force: true });
     // fresh chunks (or a superseding edit) end the checkpoint's reprieve
     if (
       engine.blocks[idx] !== block ||

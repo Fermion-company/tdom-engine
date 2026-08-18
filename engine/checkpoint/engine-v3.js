@@ -118,7 +118,7 @@ const BASE_COUNTERS = [
   'part', 'chapter', 'section', 'subsection', 'subsubsection', 'paragraph',
   'equation', 'figure', 'table', 'footnote',
 ];
-const HEADING_RE = /^\s*\\(chapter|section|subsection|subsubsection|paragraph)\b/;
+const HEADING_RE = /^\s*\\(chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
 const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 12_000);
 const BOOT_TIMEOUT = 60_000;
 // Definition-bearing body edits: a macro/environment/length defined (or
@@ -884,7 +884,7 @@ export class CheckpointEngine {
             // derives the state from isoFailCache, so a block that was only
             // collateral (a sane text re-rescued at a mid-breakage page
             // offset) un-freezes by itself when its inputs revert.
-            this.diagnostics.push(`async rescue ${bid}: ${err.message}`);
+            this.diagnostics.push(`async rescue ${bid}: ${err?.message ?? err}`);
           }
         }
       } finally {

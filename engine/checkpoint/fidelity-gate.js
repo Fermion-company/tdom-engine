@@ -1,5 +1,6 @@
 import { fnv1a } from '../hash.js';
 import { classifyGalley, demoteFidelity } from './fidelity.js';
+import { stripComments } from './safety.js';
 
 // Margin placement: material lands OUTSIDE the galley box (page margin), so
 // no per-block chunk can represent it — the block is typeset in-chain for
@@ -27,7 +28,8 @@ export function applyFidelity(block, galley, { fonts, fidelityDemoted }) {
   // this band, so the canonical page (margin note included) shows
   // through. This is what keeps \todo-bearing paper drafts structured
   // instead of demoting the whole document.
-  if (MARGIN_RE.test(block.text)) {
+  if (MARGIN_RE.test(stripComments(block.text))) {
+    // comment-stripped: a `% \todo{...}` must not blank the block's band
     fid = demoteFidelity(fid, 'canonical');
   }
   block.fidelity = fid;

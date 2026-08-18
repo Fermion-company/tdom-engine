@@ -21,10 +21,15 @@ export function finalizeUpdate(engine, {
 
   // ---- pages, display lists, patches ---------------------------------
   const pagesRaw = paginateNow();
+  const prevPageCount = engine.pages.length;
   const { pages, reused, rebuilt } = reconcile(pagesRaw, engine.pages);
   const { patches, dirtyPages } = buildPagePatches(pages, engine.pages, engine.hfSig, displayList);
   engine.pages = pages;
-  scheduleHeaders();
+  // header/footer respecification walks every page and hashes the result —
+  // only worth it when the page composition actually moved (folio values,
+  // marks and styles all ride on galley changes, which show up as rebuilt
+  // pages or a page-count change)
+  if (rebuilt > 0 || pages.length !== prevPageCount || !engine.hfSig) scheduleHeaders();
   timer.lap('paginate');
 
   // ---- async work: rebuild remaining checkpoint chain + gfx renders --

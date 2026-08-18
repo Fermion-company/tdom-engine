@@ -35,18 +35,24 @@ export class CanonicalRenderer {
     workDir,
     docDir,
     // Structured mode: canonical is the AUTHORITY, consumed when the user
-    // pauses to look — not per keystroke. A long idle debounce makes it a
-    // "confirm after writing for a while" pass instead of a constant
-    // follower, so active editing spends no canonical CPU/memory (the
-    // real-time provisional layer owns the live display). Opaque mode uses
-    // the short displayDebounceMs below (canonical IS the display there).
+    // is DONE writing for a while or asks for it (export) — never per
+    // keystroke, never per short pause. Real writing does not recompile
+    // the document every few seconds; the provisional layer owns the live
+    // display and is already correct, so canonical is a background
+    // confirmation pass. Cadence:
+    //   - no compile yet: debounceMs (fast first baseline, one compile)
+    //   - after that: idleMs of continuous quiet (a real writing pause,
+    //     not a glance at the preview) AND the cost cooldown below.
+    // Opaque mode uses displayDebounceMs (canonical IS the display there).
     debounceMs = Number(process.env.TDOM_CANON_DEBOUNCE ?? 2500),
+    idleMs = Number(process.env.TDOM_CANON_IDLE ?? 30_000),
     displayDebounceMs = Number(process.env.TDOM_CANON_DISPLAY_DEBOUNCE ?? 350),
   }) {
     this.workDir = path.resolve(workDir);
     this.docDir = docDir ? path.resolve(docDir) : this.workDir;
     mkdirSync(this.workDir, { recursive: true });
     this.debounceMs = debounceMs;
+    this.idleMs = idleMs;
     this.displayDebounceMs = displayDebounceMs;
     this.timer = null;
     this.running = null; // in-flight compile promise
@@ -55,21 +61,41 @@ export class CanonicalRenderer {
     this.last = null; // last GOOD compile: {id, rev, srcHash, pdf, pageCount, paper, passes, ms}
     this.lastError = null; // {rev, message}
     // Demand-paced authority (docs/10 §I3): in structured mode the canonical
-    // output is consumed when the user PAUSES to look or exports — not per
-    // edit. Recompiles are therefore paced by their own cost (a cooldown of
-    // cooldownFactor × last compile time, capped), which bounds canonical's
-    // CPU duty cycle at ~1/(1+factor) no matter how large the document is.
-    // In opaque mode the compile IS the display: pressure 'display' restores
-    // the immediate debounce-only behavior.
+    // output is consumed when the user is DONE writing or exports — not per
+    // edit. Recompiles are paced by their own cost (a cooldown of
+    // cooldownFactor × last compile time), which bounds canonical's CPU duty
+    // cycle at ~1/(1+factor). The cap exists only so a pathological compile
+    // cannot postpone the refresh forever; it must stay far above any real
+    // compile time or it silently breaks the duty bound (the old 30s cap put
+    // a 60s-compile document at ~2/3 canonical CPU while typing).
+    // In opaque mode the compile IS the display: pressure 'display' keeps the
+    // short debounce but still paces by cost at half duty — an unpaced
+    // display mode recompiled long documents nearly back-to-back.
     this.pressure = 'authority'; // 'authority' | 'display'
     this.lastEndAt = 0;
     this.cooldownFactor = Number(process.env.TDOM_CANON_COOLDOWN ?? 2);
-    this.cooldownCapMs = Number(process.env.TDOM_CANON_COOLDOWN_CAP ?? 30_000);
+    this.cooldownCapMs = Number(process.env.TDOM_CANON_COOLDOWN_CAP ?? 600_000);
+    this.displayCooldownFactor = Number(process.env.TDOM_CANON_DISPLAY_COOLDOWN ?? 1);
+    this.displayCooldownCapMs = Number(process.env.TDOM_CANON_DISPLAY_COOLDOWN_CAP ?? 60_000);
     this.svgCache = new Map(); // `${id}:${page}` -> svg string (LRU)
     this.textCache = null; // {id, pages: [string]} pdftotext page texts
     this.onResult = null; // callback({...info}) after every compile attempt
     this.disposed = false;
     this._texts = null;
+    this.children = new Set(); // in-flight lualatex/pdftocairo/pdftotext/pdfinfo
+  }
+
+  /** execFile with child tracking, so dispose() can kill in-flight work —
+   * an orphaned canonical lualatex otherwise burns a core for up to its
+   * 5-minute timeout after the server exits. */
+  #exec(cmd, args, opts) {
+    const p = execFileP(cmd, args, opts);
+    if (p.child) {
+      const cleanup = () => this.children.delete(p.child);
+      this.children.add(p.child);
+      p.then(cleanup, cleanup);
+    }
+    return p;
   }
 
   /** Public snapshot for /doc payloads, reports and SSE events. */
@@ -106,35 +132,60 @@ export class CanonicalRenderer {
   }
 
   /**
-   * Delay before the next compile may start. Base debounce always applies;
-   * under 'authority' pressure a cost-proportional cooldown (measured from
-   * the END of the previous compile) is added on top, so a document whose
-   * compile takes 7s recompiles at most every ~(1+factor)×7s while the user
-   * keeps editing — instead of back-to-back. Public for tests.
+   * Delay before the next compile may start, measured from the LAST edit
+   * (schedule() re-arms the timer on every edit, so this is an idle gate).
+   * Authority (structured) mode: one fast baseline compile per document,
+   * then nothing until the user has been quiet for idleMs AND the
+   * cost-proportional cooldown has passed — active writing never pays a
+   * full compile. Display (opaque) mode: short debounce plus a half-duty
+   * cost cooldown. Public for tests.
    */
   delayFor() {
-    // opaque mode: canonical IS the display — stay responsive (short
-    // debounce, no cost cooldown). structured mode: canonical is the
-    // post-pause confirmation — long idle debounce plus the cost cooldown.
-    if (this.pressure !== 'authority') return this.displayDebounceMs;
-    if (!this.last?.ms) return this.debounceMs;
-    const cooldown = Math.min(this.last.ms * this.cooldownFactor, this.cooldownCapMs);
     const since = Date.now() - this.lastEndAt;
-    return Math.max(this.debounceMs, cooldown - since);
+    if (this.pressure !== 'authority') {
+      // opaque mode: canonical IS the display — stay responsive on small
+      // documents, but never let a long document compile back-to-back
+      if (!this.last?.ms) return this.displayDebounceMs;
+      const cool = Math.min(this.last.ms * this.displayCooldownFactor, this.displayCooldownCapMs);
+      return Math.max(this.displayDebounceMs, cool - since);
+    }
+    if (!this.last?.ms) return this.debounceMs; // fast first baseline
+    const cooldown = Math.min(this.last.ms * this.cooldownFactor, this.cooldownCapMs);
+    return Math.max(this.idleMs, cooldown - since);
   }
 
   /**
    * Compile now (used by PDF export and tests): skips the debounce, reuses
    * the last good compile when the source is unchanged, and returns the
    * result record (throws when this exact source cannot be compiled).
+   * Compiles exactly the snapshot it was handed — it never loop-chases
+   * keystrokes that land during the compile (the old settle()-based path
+   * ran full compiles back-to-back for as long as the user kept typing
+   * during an export). Newer edits stay on the normal cadence timer.
    */
   async ensure(source, rev) {
     const srcHash = fnv1a(source);
     if (this.last && this.last.srcHash === srcHash) return this.last;
-    this.pendingJob = { source, rev };
-    await this.settle();
-    // ours may have been consumed by an already-running drain loop — check
-    // by source identity, not by who awaited
+    while (this.running) await this.running;
+    if (this.disposed) throw new Error('renderer disposed');
+    if (this.last && this.last.srcHash === srcHash) return this.last;
+    // No await between the check above and this assignment: #drain and
+    // ensure both claim `running` synchronously, so two compiles can never
+    // share the workdir.
+    this.running = this.#compile({ source, rev })
+      .catch((err) => {
+        this.lastError = { rev, message: String(err?.message || err) };
+      })
+      .finally(() => {
+        this.running = null;
+      });
+    await this.running;
+    this.lastEndAt = Date.now();
+    try {
+      this.onResult?.(this.info());
+    } catch {
+      /* observer errors must not break the export path */
+    }
     if (this.last && this.last.srcHash === srcHash) return this.last;
     throw new Error(this.lastError?.message || 'canonical compile failed');
   }
@@ -155,6 +206,18 @@ export class CanonicalRenderer {
     if (!this.pendingJob) return;
     const job = this.pendingJob;
     this.pendingJob = null;
+    if (this.last && this.last.srcHash === fnv1a(job.source)) {
+      // the newest source is already compiled (an export ran it, or the
+      // edits round-tripped back) — record the rev, skip the compile
+      this.last.rev = job.rev;
+      this.lastError = null;
+      try {
+        this.onResult?.(this.info());
+      } catch {
+        /* observer errors must not break the drain loop */
+      }
+      return;
+    }
     this.running = this.#compile(job)
       .catch((err) => {
         this.lastError = { rev: job.rev, message: String(err?.message || err) };
@@ -230,7 +293,7 @@ export class CanonicalRenderer {
       srcHash,
       pdf: kept,
       pageCount,
-      paper: await paperSize(kept),
+      paper: await paperSize(kept, (cmd, args, opts) => this.#exec(cmd, args, opts)),
       passes,
       ms: Math.round(performance.now() - t0),
     };
@@ -247,7 +310,7 @@ export class CanonicalRenderer {
   async #runLatex(tex) {
     let out = '';
     try {
-      const r = await execFileP(
+      const r = await this.#exec(
         'lualatex',
         ['-interaction=nonstopmode', '-output-directory', this.workDir, tex],
         {
@@ -289,7 +352,7 @@ export class CanonicalRenderer {
       return svg;
     }
     const out = path.join(this.workDir, `canon-${cur.id}-p${n}.svg`);
-    await execFileP('pdftocairo', ['-svg', '-f', String(n), '-l', String(n), cur.pdf, out], {
+    await this.#exec('pdftocairo', ['-svg', '-f', String(n), '-l', String(n), cur.pdf, out], {
       timeout: 60_000,
     });
     const svg = readFileSync(out, 'utf8');
@@ -311,7 +374,7 @@ export class CanonicalRenderer {
     if (id != null && Number(id) !== cur.id) return null;
     if (this.textCache?.id === cur.id) return this.textCache.pages;
     try {
-      const r = await execFileP('pdftotext', ['-enc', 'UTF-8', cur.pdf, '-'], {
+      const r = await this.#exec('pdftotext', ['-enc', 'UTF-8', cur.pdf, '-'], {
         timeout: 120_000,
         maxBuffer: 256 * 1024 * 1024,
       });
@@ -335,6 +398,14 @@ export class CanonicalRenderer {
     clearTimeout(this.timer);
     this.timer = null;
     this.pendingJob = null;
+    for (const child of this.children) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+    this.children.clear();
   }
 }
 
@@ -346,9 +417,9 @@ function pageCountFrom(log) {
 
 /** Paper size in bp via poppler's pdfinfo (the MediaBox usually lives in a
  * compressed object stream, invisible to a raw byte scan). */
-async function paperSize(pdfPath) {
+async function paperSize(pdfPath, exec = execFileP) {
   try {
-    const r = await execFileP('pdfinfo', [pdfPath], { timeout: 30_000 });
+    const r = await exec('pdfinfo', [pdfPath], { timeout: 30_000 });
     const m = r.stdout.match(/Page size:\s+([\d.]+) x ([\d.]+)/);
     if (!m) return null;
     return { w: Number(m[1]), h: Number(m[2]) };
