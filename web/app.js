@@ -65,16 +65,16 @@ const pageDirtyRev = new Map(); // page -> srcRev of the last provisional patch
 let lastRemoveRev = 0; // srcRev of the last provisional remove-pages patch
 const docStateEl = document.getElementById('doc-state');
 
-// Band-granular convergence: an edit invalidates the canonical render only
-// where the page actually CHANGED. We diff the old and new display lists,
-// keep the canonical pixels everywhere outside the changed y-band (via a
-// clip-path window), and let only the edited lines render provisionally —
-// so a one-character math edit no longer degrades the whole page for the
-// seconds until the next canonical compile lands. A height-changing edit
-// reflows everything below it, which the diff naturally reports as a band
-// reaching the page bottom.
-const pageDls = new Map(); // page -> last rendered display list (diff base)
-const pageBands = new Map(); // page -> {top,bottom} bp | 'full', since last full canonical
+// Page convergence is BINARY: a page shows either the canonical render
+// (a compile of the CURRENT source covers it) or the provisional layer —
+// never a mix. A band-granular splice used to keep canonical pixels outside
+// the edited y-band with a clip-path window, but that composite is only
+// coherent when the provisional and canonical layouts agree outside the
+// band, and nothing verifies that: with any drift (approximated floats,
+// diverging page breaks, half-broken documents mid-typing) the old
+// canonical line and the freshly edited provisional line showed up
+// TOGETHER, a line apart. Self-consistent-but-provisional beats
+// fast-but-wrong, so the splice is gone.
 
 // ---------------------------------------------------------------- layout
 
@@ -389,8 +389,6 @@ function adoptDoc(doc) {
   pagesEl.textContent = '';
   pageDivs.clear();
   pageDirtyRev.clear();
-  pageDls.clear();
-  pageBands.clear();
   lastRemoveRev = 0;
   mode = doc.mode ?? 'structured';
   modeReasons = doc.modeReasons ?? [];
@@ -398,7 +396,6 @@ function adoptDoc(doc) {
   shipPages.clear();
   for (const dl of doc.pages) {
     renderPage(dl, false);
-    pageDls.set(dl.page, dl);
   }
   appliedRev = doc.report.rev;
   appliedSrcRev = doc.report.srcRev ?? doc.report.rev;
@@ -506,8 +503,6 @@ function removePagesFrom(from) {
     if (n >= from) {
       div.remove();
       pageDivs.delete(n);
-      pageDls.delete(n);
-      pageBands.delete(n);
     }
   }
 }
@@ -521,12 +516,9 @@ function applyReport(report) {
   for (const patch of report.patches) {
     if (patch.type === 'replace-page') {
       const dl = patch.displayList;
-      // where did the page actually change? canonical keeps everything else
-      noteBand(dl.page, changedBand(dl, pageDls.get(dl.page)));
       renderPage(dl, true);
-      pageDls.set(dl.page, dl);
       // this page now differs from the last canonical compile — provisional
-      // wins INSIDE the changed band until a compile of srcRev >= this lands
+      // owns it until a compile of srcRev >= this lands
       pageDirtyRev.set(dl.page, appliedSrcRev);
       updateCanonState(dl.page);
     } else if (patch.type === 'remove-pages') {
@@ -538,86 +530,6 @@ function applyReport(report) {
 }
 
 // ------------------------------------------------- canonical (exact) layer
-
-/**
- * The y-extent (bp) of everything that visually changed between two display
- * lists of the same page. Multiset diff over serialized commands: commands
- * present in only one side are "changed"; unchanged content shifted by a
- * reflow differs in its coordinates, so a height-changing edit naturally
- * yields a band reaching the bottom. Returns:
- *   null           — no visual difference
- *   {top, bottom}  — the changed band
- *   'full'         — no diff base (first paint of this page)
- */
-// Sub-visible differences must not count as "changed": glue re-resolution
-// after an async exact-rescue lands can drift every coordinate by a few
-// hundredths of a bp, which would otherwise flip whole pages to
-// provisional for an invisible reason. Quantize to 0.5bp. Chunk version
-// counters DO count — a cv bump is how an edit inside a chunk-rendered
-// block (mhchem, TikZ, rescued envs) becomes visible.
-function bandKey(c) {
-  const q = (v) => (typeof v === 'number' ? Math.round(v * 2) / 2 : v);
-  const rest = { ...c };
-  for (const f of ['x', 'y', 'w', 'h', 'sy', 'ch', 'size']) {
-    if (rest[f] !== undefined) rest[f] = q(rest[f]);
-  }
-  return JSON.stringify(rest);
-}
-
-function changedBand(newDl, prevDl) {
-  if (!prevDl || !newDl) return 'full';
-  const counts = new Map();
-  for (const c of prevDl.commands) {
-    const k = bandKey(c);
-    counts.set(k, (counts.get(k) ?? 0) + 1);
-  }
-  const changed = [];
-  for (const c of newDl.commands) {
-    const k = bandKey(c);
-    const n = counts.get(k) ?? 0;
-    if (n > 0) counts.set(k, n - 1);
-    else changed.push(c);
-  }
-  for (const [k, n] of counts) {
-    if (n > 0) changed.push(JSON.parse(k));
-  }
-  if (!changed.length) return null;
-  let top = Infinity;
-  let bottom = -Infinity;
-  for (const c of changed) {
-    if (c.op === 'glyphs') {
-      // y is the baseline: cover ascenders and descenders of the line
-      top = Math.min(top, c.y - (c.size ?? 10) * 1.2);
-      bottom = Math.max(bottom, c.y + (c.size ?? 10) * 0.5);
-    } else if (c.op === 'rule' || c.op === 'chunk') {
-      top = Math.min(top, c.y);
-      bottom = Math.max(bottom, c.y + (c.h ?? 0));
-    } else {
-      top = Math.min(top, (c.y ?? 0) - 12);
-      bottom = Math.max(bottom, (c.y ?? 0) + 4);
-    }
-  }
-  return {
-    top: Math.max(0, top),
-    bottom: Math.min(geometry.paperheight ?? bottom, bottom),
-  };
-}
-
-/** Accumulate a page's changed band until the next full canonical. */
-function noteBand(page, band) {
-  const prev = pageBands.get(page);
-  if (prev === 'full') return;
-  if (band === 'full') {
-    pageBands.set(page, 'full');
-    return;
-  }
-  // null = the patch changed nothing visible (hash-only churn): an empty
-  // band keeps the full canonical on screen instead of dropping the page
-  // to provisional for an invisible change
-  const b = band ?? { top: 0, bottom: 0 };
-  if (!prev) pageBands.set(page, { ...b });
-  else pageBands.set(page, { top: Math.min(prev.top, b.top), bottom: Math.max(prev.bottom, b.bottom) });
-}
 
 function setMode(newMode, reasons) {
   modeReasons = reasons ?? modeReasons;
@@ -631,8 +543,6 @@ function setMode(newMode, reasons) {
       delete div.dataset.prov;
     }
     pageDirtyRev.clear();
-    pageDls.clear();
-    pageBands.clear();
   }
 }
 
@@ -684,13 +594,11 @@ function syncCanonical() {
 }
 
 /**
- * Decide, for one page, how much of the canonical overlay wins right now:
+ * Decide, for one page, whether the canonical overlay wins right now:
  *   final       — canonical covers the page's current source: full overlay
- *   partial     — the page was edited since the last compile, but only a
- *                 known band changed: canonical keeps everything OUTSIDE
- *                 the band (clip-path window), provisional shows through
- *                 inside it
- *   provisional — no usable canonical (or the whole page changed)
+ *   provisional — the page was edited since the last covering compile (or
+ *                 no usable canonical exists): the provisional layer owns
+ *                 the WHOLE page until a fresh compile lands
  */
 function updateCanonState(n) {
   const div = pageDivs.get(n);
@@ -728,27 +636,14 @@ function updateCanonState(n) {
     }
   }
 
-  let state = 'provisional';
-  let clip = '';
-  const band = pageBands.get(n);
-  if (fresh) {
-    state = 'final';
-    pageBands.delete(n); // the compile covers everything accumulated so far
-  } else if (canonAvail && band && band !== 'full') {
-    const H = geometry.paperheight || 1;
-    const t = Math.max(0, (band.top / H) * 100);
-    const b = Math.min(100, (band.bottom / H) * 100);
-    if (b - t <= 75) {
-      // canonical everywhere except the changed band: one polygon tracing
-      // the top rectangle, bridging down the left edge, then the bottom
-      // rectangle — the band itself is left open for the provisional layer
-      state = 'partial';
-      clip = `polygon(0% 0%, 100% 0%, 100% ${t.toFixed(3)}%, 0% ${t.toFixed(3)}%, 0% ${b.toFixed(3)}%, 100% ${b.toFixed(3)}%, 100% 100%, 0% 100%)`;
-    }
-  }
-  if (img) img.style.clipPath = state === 'partial' ? clip : '';
+  // Binary per page: canonical pixels only when a compile of the CURRENT
+  // source covers this page; otherwise the provisional layer owns the whole
+  // page. No band splice — mixing the two layouts on one page showed stale
+  // and edited lines together whenever they drifted.
+  const state = fresh ? 'final' : 'provisional';
+  if (img) img.style.clipPath = '';
   div.classList.toggle('is-final', state === 'final');
-  div.classList.toggle('is-partial', state === 'partial');
+  div.classList.remove('is-partial');
   // a fully-fresh canonical is the page-count authority: provisional-only
   // pages beyond it are phantoms of the JS pagination and are hidden
   const phantom =
@@ -1291,9 +1186,7 @@ sse.onmessage = (ev) => {
         for (const patch of msg.patches) {
           if (patch.type === 'replace-page') {
             const dl = patch.displayList;
-            noteBand(dl.page, changedBand(dl, pageDls.get(dl.page)));
             renderPage(dl, true);
-            pageDls.set(dl.page, dl);
             updateCanonState(dl.page);
           } else if (patch.type === 'remove-pages') {
             removePagesFrom(patch.from);
