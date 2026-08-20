@@ -40,6 +40,10 @@ export function handlePeerMessage(engine, peer, msg) {
       engine._fulfill('render:' + msg.id, true);
       break;
     case 'FORKED':
+      // pid must be a real child: a bogus non-positive pid stored here would
+      // reach process.kill() on timeout, and kill(-1) signals EVERYTHING
+      // the user owns
+      if (!Number.isFinite(msg.pid) || msg.pid <= 0) break;
       if (engine.currentJob && engine.currentJob.galleyKey === 'galley:' + msg.id) {
         engine.currentJob.pid = msg.pid;
       }
@@ -48,5 +52,16 @@ export function handlePeerMessage(engine, peer, msg) {
       // instead of burning a core forever
       if (engine.renderPids?.has(msg.id)) engine.renderPids.set(msg.id, msg.pid);
       break;
+    case 'FORKFAIL': {
+      // the daemon's fork() failed (EAGAIN/ENOMEM — the system is out of
+      // processes or memory): nothing will ever answer this job. Fail the
+      // waiters NOW instead of letting them burn the full job timeout.
+      const err = new Error(`daemon fork failed for ${msg.id} (process/memory pressure)`);
+      err.tdomInfra = true;
+      engine.diagnostics.push(`daemon fork failed for ${msg.id} (pid ${peer.pid})`);
+      engine._reject('galley:' + msg.id, err);
+      engine._reject('render:' + msg.id, err);
+      break;
+    }
   }
 }

@@ -1035,6 +1035,59 @@ layoutSplitterEl?.addEventListener('keydown', (ev) => {
   }
 });
 window.addEventListener('resize', () => applySplitRatio());
+// Embed mode (?embed=1): a host app (e.g. TeX64) shows only the pages —
+// no topbar, no pane title, no inspector — and owns the editor, pushing
+// edits through POST /edit. The host passes its own look so the preview
+// reads as part of the host viewer, not as this dev UI:
+//   ?bg=%23rrggbb  backdrop behind the pages
+//   ?theme=light   light page shadow + light scrollbars
+{
+  const embedParams = new URLSearchParams(location.search);
+  if (embedParams.get('embed') === '1') {
+    document.body.classList.add('is-embed');
+    if (layoutViewEl) layoutViewEl.value = 'preview';
+    if (embedParams.get('theme') === 'light') document.body.classList.add('is-embed-light');
+    const bg = embedParams.get('bg');
+    if (bg && /^#[0-9a-f]{3,8}$/i.test(bg)) {
+      document.documentElement.style.setProperty('--embed-bg', bg);
+    }
+
+    // The host's viewer toolbar drives this frame over postMessage, so the
+    // host keeps its own chrome and this page stays pages-only.
+    const sortedPages = () => [...pageDivs.entries()].sort((a, b) => a[0] - b[0]);
+    const currentTopPage = () => {
+      const top = pagesEl.getBoundingClientRect().top;
+      for (const [n, div] of sortedPages()) {
+        if (div.getBoundingClientRect().bottom - top > 4) return n;
+      }
+      return 1;
+    };
+    const scrollToPage = (n) => {
+      const entries = sortedPages();
+      if (!entries.length) return;
+      const clamped = Math.max(entries[0][0], Math.min(entries.at(-1)[0], Math.round(n)));
+      pageDivs.get(clamped)?.scrollIntoView({ block: 'start' });
+    };
+    window.addEventListener('message', (ev) => {
+      const d = ev.data;
+      if (!d || d.source !== 'tdom-host') return;
+      if (d.action === 'zoom-in') setZoom(zoom * 1.1);
+      else if (d.action === 'zoom-out') setZoom(zoom / 1.1);
+      else if (d.action === 'zoom-fit') setZoom(1);
+      else if (d.action === 'goto-page') scrollToPage(Number(d.page));
+      else if (d.action === 'page-prev') scrollToPage(currentTopPage() - 1);
+      else if (d.action === 'page-next') scrollToPage(currentTopPage() + 1);
+    });
+    setInterval(() => {
+      try {
+        window.parent.postMessage(
+          { source: 'tdom-embed', pageCount: pageDivs.size, zoom, page: currentTopPage() },
+          '*'
+        );
+      } catch { /* host gone */ }
+    }, 400);
+  }
+}
 applyLayoutView();
 applySplitRatio();
 

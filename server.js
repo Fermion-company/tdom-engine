@@ -316,17 +316,22 @@ async function requireToolchain() {
 await requireToolchain();
 const backend = 'checkpoint';
 // TDOM_WORKDIR isolates parallel instances (benchmarks, tests) — two
-// engines sharing one workdir would clobber each other's driver/canonical
-const workDirName = /^[.a-z0-9_-]+$/i.test(process.env.TDOM_WORKDIR || '')
-  ? process.env.TDOM_WORKDIR
-  : '.tdom-v3';
+// engines sharing one workdir would clobber each other's driver/canonical.
+// An absolute path is accepted verbatim so an embedding app (TeX64) can put
+// the live state outside a read-only install location.
+const rawWorkDir = (process.env.TDOM_WORKDIR || '').trim();
+const workDirName = path.isAbsolute(rawWorkDir)
+  ? rawWorkDir
+  : /^[.a-z0-9_-]+$/i.test(rawWorkDir)
+    ? rawWorkDir
+    : '.tdom-v3';
 // The work directory is a live process's private state (driver.tex, format,
 // render jobs, canonical PDFs). TWO servers sharing one silently corrupt
 // each other — a concurrently rewritten driver.tex reads back as NUL
 // garbage and the boot demotes to opaque. A pid lockfile detects a living
 // owner and moves this instance to a suffixed directory instead.
 function claimWorkDir(base) {
-  const dir = path.join(ROOT, base);
+  const dir = path.isAbsolute(base) ? base : path.join(ROOT, base);
   const lock = path.join(dir, '.tdom-owner');
   try {
     const pid = Number(readFileSync(lock, 'utf8'));
@@ -371,10 +376,12 @@ function sweepStaleArtifacts(dir, base) {
   // Strictly `${base}-<digits>` WITH a dead-owner lockfile: anything else
   // (test workdirs like .tdom-v3-test carry no lock) is not ours to touch.
   try {
-    const fallbackRe = new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-\\d+$`);
-    for (const f of readdirSync(ROOT, { withFileTypes: true })) {
+    const parent = path.isAbsolute(base) ? path.dirname(base) : ROOT;
+    const baseName = path.basename(base);
+    const fallbackRe = new RegExp(`^${baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-\\d+$`);
+    for (const f of readdirSync(parent, { withFileTypes: true })) {
       if (!f.isDirectory() || !fallbackRe.test(f.name)) continue;
-      const sib = path.join(ROOT, f.name);
+      const sib = path.join(parent, f.name);
       let dead = false;
       try {
         const pid = Number(readFileSync(path.join(sib, '.tdom-owner'), 'utf8'));

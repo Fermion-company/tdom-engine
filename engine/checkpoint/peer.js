@@ -71,6 +71,9 @@ export class Peer {
         case 'FORKED':
           this.engine._onMessage(this, { kind: 'FORKED', id: parts[1], pid: Number(parts[2]) });
           break;
+        case 'FORKFAIL':
+          this.engine._onMessage(this, { kind: 'FORKFAIL', id: parts[1] });
+          break;
         case 'PONG':
           break;
         default:

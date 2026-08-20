@@ -227,6 +227,27 @@ body[data-layout-view="preview"] #workspace-preview-splitter,
 body[data-layout-view="preview"] #inspector-pane { display: none; }
 body[data-layout-view="preview"] #layout { grid-template-columns: minmax(0, 1fr); }
 
+/* embed mode (?embed=1): pages only, no chrome — the host app owns the rest.
+   ?bg=%23rrggbb matches the host's backdrop; ?theme=light flips the page
+   shadow and scrollbar scheme for light hosts. */
+body.is-embed #topbar,
+body.is-embed #insp-reopen,
+body.is-embed #preview-pane .pane-title,
+body.is-embed .page .pageno { display: none; }
+body.is-embed #preview-pane { background: var(--embed-bg, var(--canvas)); }
+body.is-embed.is-embed-light { color-scheme: light; }
+body.is-embed.is-embed-light .page {
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.16), 0 8px 24px rgba(15, 23, 42, 0.1);
+}
+body.is-embed.is-embed-light #pages::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.25);
+  background-clip: content-box;
+}
+body.is-embed.is-embed-light #pages::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.4);
+  background-clip: content-box;
+}
+
 #workspace-preview-splitter {
   position: relative;
   min-width: var(--splitter-width);

@@ -316,10 +316,22 @@ export class CheckpointEngine {
     } catch (err) {
       // A stuck fork child (e.g. a TeX infinite loop in this block) never
       // reads DIE from its socket — kill it hard or it spins at full CPU
-      // forever. The pid arrived with the FORKED announcement.
+      // forever. The pid arrived with the FORKED announcement. Guard > 0:
+      // kill(-1) would signal every process the user owns.
       const pid = this.currentJob?.pid;
-      if (pid) {
+      if (pid && pid > 0) {
         try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      if (err?.tdomTimeout || err?.tdomInfra) {
+        // forensics: a wedge here is an infrastructure event, not a content
+        // one — record what was known so field incidents are attributable
+        this.diagnostics.push(
+          `galley ${jobId} ${err.tdomInfra ? 'fork-failed' : 'timed out'} at ckpt ${idx}` +
+            (pid && pid > 0 ? ` (killed child ${pid})` : ' (no child ever announced)')
+        );
+        // a timeout with NO child announcement means the fork never happened
+        // (or was swallowed): infrastructure, not this block's content
+        if (err.tdomTimeout && !(pid && pid > 0)) err.tdomNoChild = true;
       }
       this._reject(galleyKey, err);
       this._reject(ckptKey, err);
@@ -664,7 +676,7 @@ export class CheckpointEngine {
     this.bgAbort = true;
     if (this.bgActive) {
       const pid = this.currentJob?.pid;
-      if (pid) {
+      if (pid && pid > 0) {
         try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
       }
     }
@@ -726,6 +738,7 @@ export class CheckpointEngine {
         },
       });
     } catch (err) {
+      if (this.closed) throw err; // shutting down — no rebuild, no opaque demotion
       if (!retry) {
         this.diagnostics.push('typeset phase failed (' + err.message + ') — full rebuild');
         this.preHash = null; // force a root reboot on the retry pass

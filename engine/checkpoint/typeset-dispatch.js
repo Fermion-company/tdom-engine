@@ -30,12 +30,51 @@ export async function typesetBlock(engine, idx, callbacks) {
   // failed the same way and pinned the document in opaque (reprobe racing a
   // keystroke, or two concurrent edit() calls in an editor embedding).
   const aborted = () => engine.bgAbort && engine.bgActive;
-  const rescueSafely = async (why) => {
+  const isInfra = (e) => e?.tdomInfra === true;
+  const isTimeoutErr = (e) => e?.tdomTimeout === true;
+  // Freeze vs escalate: the freeze ladder exists to contain CONTENT failures
+  // (mid-typing broken TeX) to one block. An explicit fork failure — or a
+  // timeout where no child was ever announced — is INFRASTRUCTURE: nothing
+  // in the resident tree is serving, and freezing would mask it per block
+  // while every later edit of the block pays the same silent double timeout
+  // (observed live: \maketitle-block edits stuck at canonical latency for a
+  // whole session). Those escalate instead: the update-level safety net in
+  // #updateInner tears the tree down, reboots the root, and retries once.
+  // A timeout whose child DID announce stays on the freeze ladder — that
+  // pattern is also what a genuine TeX infinite loop in the user's text
+  // produces, and rebooting cannot fix content.
+  const rescueSafely = async (why, inChainSilent = false) => {
     try {
       return await rescueBlock(idx, why);
     } catch (err) {
       if (aborted()) throw err; // an edit is waiting — no freeze jobs now
+      if (isInfra(err) || (isTimeoutErr(err) && (inChainSilent || err.tdomNoChild === true))) {
+        engine.poisoned.delete(block.id);
+        engine.diagnostics.push(
+          `${block.id}: rescue got no answer (${err.message}) — escalating to a full rebuild`
+        );
+        throw err;
+      }
       engine.diagnostics.push(`${block.id}: rescue failed (${err.message}) — freezing the block`);
+      if (isTimeoutErr(err)) {
+        // A timeout-shaped double failure (in-chain AND rescue unanswered)
+        // marks the PARENT lineage as suspect — a wedged checkpoint would
+        // otherwise eat every future edit of this region the same silent
+        // way (observed live: the block froze and every keystroke re-paid
+        // the double timeout for the rest of the session). Retire it: the
+        // next edit forks the region from an earlier snapshot, or — with
+        // no snapshot left — fails fast into the full-rebuild retry.
+        const ck = engine.checkpoints.get(idx);
+        if (ck) {
+          try { ck.send('DIE\n'); } catch { /* peer gone */ }
+          if (ck.pid) {
+            engine.dyingPids ??= new Set();
+            engine.dyingPids.add(ck.pid);
+          }
+          engine.checkpoints.delete(idx);
+          engine.diagnostics.push(`${block.id}: retired checkpoint ${idx} after unanswered jobs`);
+        }
+      }
       return brokenBlockGalley(idx);
     }
   };
@@ -68,8 +107,14 @@ export async function typesetBlock(engine, idx, callbacks) {
     // and without paying for rescue/state follow-up jobs — the next
     // rebuild retries from scratch
     if (aborted()) throw err;
+    if (isInfra(err)) {
+      // the daemon reported the fork failure outright — the rescue fork
+      // would hit the same exhausted system; escalate to the full rebuild
+      engine.diagnostics.push(`${block.id}: in-chain fork failed — escalating to a full rebuild`);
+      throw err;
+    }
     engine.poisoned.set(block.id, sig);
-    const isTimeout = /timeout/.test(err.message);
+    const isTimeout = isTimeoutErr(err) || /timeout/.test(err.message);
     engine.chainTimeouts = isTimeout ? (engine.chainTimeouts ?? 0) + 1 : 0;
     engine.diagnostics.push(
       `${block.id}: in-chain typeset failed (${err.message}) — isolated exact-render rescue`
@@ -90,6 +135,6 @@ export async function typesetBlock(engine, idx, callbacks) {
       pumpRescues();
       return brokenBlockGalley(idx);
     }
-    return rescueSafely(err.message);
+    return rescueSafely(err.message, err.tdomNoChild === true);
   }
 }

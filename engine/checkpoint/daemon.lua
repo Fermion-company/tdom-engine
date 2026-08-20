@@ -29,6 +29,13 @@ local WORKDIR = ''
 local COUNTERS = {}
 local CKPT = 0
 local JOB = nil -- set in a freshly forked job child
+-- fault injection (tests): 'FAULT FORKFAIL <n>' makes the next n fork()
+-- attempts report failure; 'FAULT WEDGE <n>' makes the next n fork children
+-- hang before ever connecting (a wedged lineage). Counters live per process,
+-- so tests arm the specific peer they are about to exercise.
+local FAULT_FORKFAIL = 0
+local FAULT_WEDGE = 0
+local FAULT_SILENT = 0 -- swallow the job without forking or replying at all
 local seen_fonts = {}
 local blk_labels = {}
 local blk_refs = {}
@@ -1232,6 +1239,37 @@ end
 
 -- --------------------------------------------------------- the loop
 
+-- fork with failure reporting: a failed fork() (EAGAIN/ENOMEM — the system
+-- is out of processes or memory) must reach the orchestrator as an explicit
+-- FORKFAIL line. Silence here used to cost the engine a full job timeout per
+-- attempt — and the old announce path even sent 'FORKED <id> -1', which the
+-- orchestrator could later hand to kill(2). Returns nil on failure.
+local function fork_for(id)
+  if FAULT_FORKFAIL > 0 then
+    FAULT_FORKFAIL = FAULT_FORKFAIL - 1
+    texio.write_nl('term and log', 'TDOMFAULT forkfail job=' .. tostring(id))
+    conn:send('FORKFAIL ' .. id .. '\n')
+    return nil
+  end
+  local pid = fk.fork()
+  if not pid or pid < 0 then
+    texio.write_nl('term and log', 'TDOMFORKFAIL job=' .. tostring(id) .. ' ckpt=' .. tostring(CKPT))
+    conn:send('FORKFAIL ' .. id .. '\n')
+    return nil
+  end
+  return pid
+end
+
+-- fault injection: should this fork's CHILD wedge (hang before connecting)?
+-- decremented in the PARENT so consecutive faults count deterministically
+local function take_wedge_fault()
+  if FAULT_WEDGE > 0 then
+    FAULT_WEDGE = FAULT_WEDGE - 1
+    return true
+  end
+  return false
+end
+
 function tdom_wait()
   while true do
     local line, err = conn:receive('*l')
@@ -1243,17 +1281,33 @@ function tdom_wait()
       fk._exit(0)
     elseif cmd == 'PING' then
       conn:send('PONG ' .. CKPT .. '\n')
+    elseif cmd == 'FAULT' then
+      -- test-only fault injection: FAULT FORKFAIL <n> | FAULT WEDGE <n>
+      if a == 'FORKFAIL' then
+        FAULT_FORKFAIL = tonumber(b) or 0
+      elseif a == 'WEDGE' then
+        FAULT_WEDGE = tonumber(b) or 0
+      elseif a == 'SILENT' then
+        FAULT_SILENT = tonumber(b) or 0
+      end
     elseif cmd == 'JOB' then
       -- JOB <blockId> <newCkptIdx> <bodyLen>
       local id = a
       local newckpt = tonumber(b) or (CKPT + 1)
       local len = tonumber(c) or 0
       local body = len > 0 and conn:receive(len) or ''
-      local pid = fk.fork()
-      if pid and pid < 0 then
-        texio.write_nl('term and log', 'TDOMFORKFAIL job=' .. tostring(id) .. ' ckpt=' .. tostring(CKPT))
-      end
+      if FAULT_SILENT > 0 then
+        -- body already consumed (protocol stays in sync); reply with nothing
+        FAULT_SILENT = FAULT_SILENT - 1
+        texio.write_nl('term and log', 'TDOMFAULT silent job=' .. tostring(id))
+      else
+      local wedge = take_wedge_fault()
+      local pid = fork_for(id)
       if pid == 0 then
+        if wedge then
+          os.execute('/bin/sleep 30')
+          fk._exit(9)
+        end
         JOB = { id = id, ckpt = newckpt, body = body }
         T_JOB = os.gettimeofday and os.gettimeofday() or os.clock()
         blk_labels = {}
@@ -1285,15 +1339,16 @@ function tdom_wait()
         end
         inject_job(body, false)
         return -- resume TeX: typeset, report, then \TDOMloop brings us back
-      else
+      elseif pid then
         conn:send('FORKED ' .. id .. ' ' .. pid .. '\n')
+      end
       end
     elseif cmd == 'RENDER' then
       local id = a
       local jobdir = b
       local len = tonumber(c) or 0
       local body = len > 0 and conn:receive(len) or ''
-      local pid = fk.fork()
+      local pid = fork_for(id)
       if pid == 0 then
         JOB = { id = id, ckpt = -1, body = body }
         blk_floats = {}
@@ -1316,7 +1371,7 @@ function tdom_wait()
         end
         inject_job(body, true)
         return
-      else
+      elseif pid then
         conn:send('FORKED ' .. id .. ' ' .. pid .. '\n')
       end
     elseif cmd == 'ISO' then
@@ -1330,8 +1385,13 @@ function tdom_wait()
       local jobdir = b
       local len = tonumber(c) or 0
       local body = len > 0 and conn:receive(len) or ''
-      local pid = fk.fork()
+      local wedge = take_wedge_fault()
+      local pid = fork_for(id)
       if pid == 0 then
+        if wedge then
+          os.execute('/bin/sleep 30')
+          fk._exit(9)
+        end
         JOB = { id = id, ckpt = -1, body = body }
         RENDER_MODE = false
         reconnect('iso', 0)
@@ -1360,7 +1420,7 @@ function tdom_wait()
         end
         inject_raw(body)
         return
-      else
+      elseif pid then
         conn:send('FORKED ' .. id .. ' ' .. pid .. '\n')
       end
     end

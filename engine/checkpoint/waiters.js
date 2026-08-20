@@ -2,7 +2,11 @@ export function awaitWaiter(waiters, key, timeout) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       waiters.delete(key);
-      reject(new Error(`timeout waiting for ${key}`));
+      const err = new Error(`timeout waiting for ${key}`);
+      // protocol timeout, not a content verdict — lets the typeset ladder
+      // tell "this block's TeX is broken" apart from "nothing answered"
+      err.tdomTimeout = true;
+      reject(err);
     }, timeout);
     waiters.set(key, { resolve, reject, timer });
   });

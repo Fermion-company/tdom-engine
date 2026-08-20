@@ -4,6 +4,8 @@
 // whole pipeline. Boundaries are:
 //   - blank lines at group/environment depth 0 (a real \par)
 //   - lines starting a sectioning command (which performs its own \par)
+//   - lines holding only a standalone generated-content command
+//     (\maketitle, \tableofcontents, ...) — isolated on BOTH sides
 //
 // Blank lines *inside* an environment or display math do not split.
 //
@@ -24,6 +26,16 @@
 import { fnv1a } from './hash.js';
 
 const FORCED_START = /^\s*\\(chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
+
+// Standalone generated-content commands. Each performs its own \par and
+// emits display material nobody types into (the title block, the toc/lof/lot
+// lists), so a line holding only such a command is a complete \par unit.
+// Isolating it keeps that block's fate — title blocks are whole-block exact
+// chunks, and a wedged render can freeze them — from swallowing the paragraph
+// the user is typing directly below (observed: text typed on the line after
+// \maketitle shared its block, and once that block froze every keystroke
+// there degraded to canonical-latency updates).
+const STANDALONE_LINE = /^\s*\\(maketitle|tableofcontents|listoffigures|listoftables)\s*$/;
 
 // Environments whose content is LITERAL: no comments, no macro calls, no
 // brace/environment structure. Without this awareness an unbalanced `{`
@@ -70,10 +82,16 @@ export function segmentBody(text, baseOffset) {
       flush(ln.start);
       continue;
     }
-    if (atTop && cur !== null && FORCED_START.test(stripped)) {
+    if (atTop && cur !== null && (FORCED_START.test(stripped) || STANDALONE_LINE.test(stripped))) {
       flush(ln.start);
     }
     if (cur === null && !blank) cur = { start: ln.start };
+    if (atTop && STANDALONE_LINE.test(stripped)) {
+      // close the standalone command's block right after its line; the next
+      // non-blank line starts a fresh block even without a blank line
+      flush(ln.end);
+      continue;
+    }
 
     const verb = VERBATIM_BEGIN_RE.exec(stripped);
     if (verb) {

@@ -59,6 +59,12 @@ export async function bootRoot(
     ['--shell-escape', '-interaction=nonstopmode', 'driver.tex'],
     {
       cwd: engine.workDir,
+      // own process group: every checkpoint/render/iso fork inherits it, so
+      // closeEngine can SIGKILL the WHOLE resident tree with one group kill
+      // — connected peers already self-exit on socket EOF, but forks that
+      // never connected (fork raced a kill, a wedged child) used to survive
+      // and keep the root's stdout pipe open, pinning the host process alive
+      detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,
