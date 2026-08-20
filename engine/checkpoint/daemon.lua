@@ -1270,6 +1270,36 @@ local function take_wedge_fault()
   return false
 end
 
+
+-- Control-line tokens are split on whitespace, so a jobdir under a path
+-- with spaces (macOS "Application Support"!) used to shear the line: the
+-- length token became part of the path, len parsed as 0, and the body
+-- bytes stayed in the stream to be consumed as garbage commands — every
+-- later job on this peer silently vanished (observed live in the TeX64
+-- embedding, 2026-08-20). Paths now travel percent-encoded.
+local function pctdecode(s)
+  return (s:gsub('%%(%x%x)', function(h) return string.char(tonumber(h, 16)) end))
+end
+
+-- receive exactly n bytes: luasocket may return nil,err,partial mid-stream;
+-- dropping the partial (the old `len > 0 and conn:receive(len) or ''`)
+-- both lost the body AND desynced the framing for every later command.
+local function recv_exact(n)
+  local parts, got = {}, 0
+  while got < n do
+    local chunk, err, partial = conn:receive(n - got)
+    local piece = chunk or partial
+    if piece and #piece > 0 then
+      parts[#parts + 1] = piece
+      got = got + #piece
+    end
+    if not chunk and err == 'closed' then
+      fk._exit(0) -- orchestrator went away mid-body
+    end
+  end
+  return table.concat(parts)
+end
+
 function tdom_wait()
   while true do
     local line, err = conn:receive('*l')
@@ -1295,7 +1325,7 @@ function tdom_wait()
       local id = a
       local newckpt = tonumber(b) or (CKPT + 1)
       local len = tonumber(c) or 0
-      local body = len > 0 and conn:receive(len) or ''
+      local body = len > 0 and recv_exact(len) or ''
       if FAULT_SILENT > 0 then
         -- body already consumed (protocol stays in sync); reply with nothing
         FAULT_SILENT = FAULT_SILENT - 1
@@ -1345,9 +1375,9 @@ function tdom_wait()
       end
     elseif cmd == 'RENDER' then
       local id = a
-      local jobdir = b
+      local jobdir = pctdecode(b)
       local len = tonumber(c) or 0
-      local body = len > 0 and conn:receive(len) or ''
+      local body = len > 0 and recv_exact(len) or ''
       local pid = fork_for(id)
       if pid == 0 then
         JOB = { id = id, ckpt = -1, body = body }
@@ -1382,9 +1412,9 @@ function tdom_wait()
       -- real one), typesets the block, writes state.json, ships its galley
       -- and ends — so it is injected raw, without the JOB/RENDER wrappers.
       local id = a
-      local jobdir = b
+      local jobdir = pctdecode(b)
       local len = tonumber(c) or 0
-      local body = len > 0 and conn:receive(len) or ''
+      local body = len > 0 and recv_exact(len) or ''
       local wedge = take_wedge_fault()
       local pid = fork_for(id)
       if pid == 0 then

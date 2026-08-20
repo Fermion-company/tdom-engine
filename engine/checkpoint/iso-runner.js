@@ -31,7 +31,9 @@ export async function runForkIsoCompile(engine, { ck0, block, jobdir, pdf, isoTe
   }, 200);
   let forked = false;
   try {
-    ck0.send(`ISO ${isoId} ${jobdir} ${body.length}\n`);
+    // jobdir percent-encoded: control-line tokens split on whitespace,
+    // and macOS userData paths contain spaces ("Application Support")
+    ck0.send(`ISO ${isoId} ${encodeURIComponent(jobdir)} ${body.length}\n`);
     ck0.sendRaw(body);
     await done;
     if (!existsSync(pdf)) {

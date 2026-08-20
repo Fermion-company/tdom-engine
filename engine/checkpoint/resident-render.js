@@ -24,7 +24,8 @@ export async function renderResidentBlock(
     engine.renderPids ??= new Map();
     engine.renderPids.set(block.id, 0); // armed: FORKED will fill the pid
     const done = awaitRender('render:' + block.id, Number(process.env.TDOM_RENDER_TIMEOUT || 20_000));
-    ck.send(`RENDER ${block.id} ${jobdir} ${body.length}\n`);
+    // jobdir percent-encoded (spaces in macOS paths shear the line)
+    ck.send(`RENDER ${block.id} ${encodeURIComponent(jobdir)} ${body.length}\n`);
     ck.sendRaw(body);
     try {
       await done;

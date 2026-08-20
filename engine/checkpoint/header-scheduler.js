@@ -34,7 +34,8 @@ function runHeaderJob(engine, helpers, specs, sig) {
     const body = Buffer.from(hfJobBody(specs), 'utf8');
     const done = awaitGalley('galley:__hf', 60_000);
     done.catch(() => {});
-    ck.send(`RENDER __hf ${engine.workDir} ${body.length}\n`);
+    // workDir percent-encoded (spaces in macOS paths shear the line)
+    ck.send(`RENDER __hf ${encodeURIComponent(engine.workDir)} ${body.length}\n`);
     ck.sendRaw(body);
     const payload = await done;
     const map = normalizeHeaderFooterPayload(payload, registerFont);
