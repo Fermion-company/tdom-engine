@@ -21,21 +21,12 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   if (engine.preGate?.preHash !== preHash) {
     engine.preGate = { preHash, gate: classifyPreamble(preamble) };
   }
-  if (!engine.preGate.gate.safe) {
-    return {
-      response: opaqueUpdate(editLabel, timer, engine.preGate.gate.reasons.map((r) => `safety gate: ${r}`)),
-    };
-  }
-  if (engine.opaqueStickyPre === preHash) {
-    // dynamically demoted on this exact preamble — don't pay a doomed
-    // boot per keystroke; a preamble edit (or reopen) retries structured
-    return { response: opaqueUpdate(editLabel, timer, engine.modeReasons) };
-  }
-
   // ---- segmentation + diff ---------------------------------------------
-  // Independent of the resident boot, so it runs BEFORE the mode flip:
-  // the body half of the safety gate needs the fresh block list, and a
-  // body-unsafe document must not boot the structured tree per keystroke.
+  // Independent of the resident boot, so it runs even for opaque documents.
+  // Besides feeding the body safety gate, these blocks carry direct-edit
+  // source spans over the exact canonical pages.  Previously an unsafe
+  // preamble returned above this point, leaving twocolumn and other opaque
+  // papers with zero editable regions despite the UI calling them editable.
   const oldBlocks = engine.blocks;
   let segs = segmentBody(text.slice(bounds.body.start, bounds.body.end), bounds.body.start);
   segs = expandIncludes(segs, 0);
@@ -58,6 +49,17 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
     }
   }
   const dirtySource = new Set(diff.dirty);
+
+  if (!engine.preGate.gate.safe) {
+    return {
+      response: opaqueUpdate(editLabel, timer, engine.preGate.gate.reasons.map((r) => `safety gate: ${r}`)),
+    };
+  }
+  if (engine.opaqueStickyPre === preHash) {
+    // dynamically demoted on this exact preamble — don't pay a doomed
+    // boot per keystroke; a preamble edit (or reopen) retries structured
+    return { response: opaqueUpdate(editLabel, timer, engine.modeReasons) };
+  }
 
   // ---- safety gate, body half (incremental) ----------------------------
   // Only blocks whose text changed are re-scanned; the verdict for clean
@@ -108,7 +110,17 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
     engine.preHash = preHash;
     rebooted = true;
     for (const b of engine.blocks) {
-      b.galley = null;
+      // A preamble edit needs an honest replay from block zero, but it must
+      // not erase the last good provisional display while that replay is in
+      // flight.  In particular, \title/\author/\date edits reboot the root;
+      // \maketitle then takes the asynchronous exact-rescue path.  Clearing
+      // its galley here replaced the whole title block with an empty
+      // placeholder until the isolated compile landed.  Keep every old
+      // galley as the stale-first display and mark every block dirty instead:
+      // the foreground walk still re-typesets the complete document against
+      // the new preamble, while rescue-only blocks can hold their clean old
+      // pixels and swap in the new ones atomically.
+      dirtySource.add(b.id);
       b.units = null;
     }
   }

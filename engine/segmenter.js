@@ -35,7 +35,8 @@ const FORCED_START = /^\s*\\(chapter|section|subsection|subsubsection|paragraph|
 // the user is typing directly below (observed: text typed on the line after
 // \maketitle shared its block, and once that block froze every keystroke
 // there degraded to canonical-latency updates).
-const STANDALONE_LINE = /^\s*\\(maketitle|tableofcontents|listoffigures|listoftables)\s*$/;
+const STANDALONE_LINE =
+  /^\s*\\(?:(?:maketitle|tableofcontents|listoffigures|listoftables)\s*|(?:input|include|bibliography)\s*\{[^}]+\}\s*|printbibliography\s*(?:\[[^\]]*\])?\s*)$/;
 
 // Environments whose content is LITERAL: no comments, no macro calls, no
 // brace/environment structure. Without this awareness an unbalanced `{`
@@ -212,6 +213,13 @@ export function diffBlocks(oldBlocks, segs, nextId) {
         gfx: ob.gfx,
         kind: ob.kind,
         consumesToc: ob.consumesToc,
+        file: sg.file ?? null,
+        sourceStart: sg.sourceStart ?? null,
+        sourceEnd: sg.sourceEnd ?? null,
+        includeStart: !!sg.includeStart,
+        includeEnd: !!sg.includeEnd,
+        externalGraphics: !!sg.externalGraphics,
+        sourceChanged: true,
       };
       blocks.push(nb);
       dirty.add(nb.id);
@@ -230,6 +238,13 @@ export function diffBlocks(oldBlocks, segs, nextId) {
       exp: null,
       layout: null,
       layoutKey: null,
+      file: sg.file ?? null,
+      sourceStart: sg.sourceStart ?? null,
+      sourceEnd: sg.sourceEnd ?? null,
+      includeStart: !!sg.includeStart,
+      includeEnd: !!sg.includeEnd,
+      externalGraphics: !!sg.externalGraphics,
+      sourceChanged: true,
     });
     dirty.add(id);
     added.push(id);
@@ -257,6 +272,12 @@ export function diffBlocks(oldBlocks, segs, nextId) {
 function refresh(block, seg) {
   block.start = seg.start;
   block.end = seg.end;
+  block.file = seg.file ?? null;
+  block.sourceStart = seg.sourceStart ?? null;
+  block.sourceEnd = seg.sourceEnd ?? null;
+  block.includeStart = !!seg.includeStart;
+  block.includeEnd = !!seg.includeEnd;
+  block.externalGraphics = !!seg.externalGraphics;
   return block;
 }
 

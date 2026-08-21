@@ -340,15 +340,34 @@ function comparePage(idx, real, eng) {
     for (let i = a + 1; i < b; i++) s += dimOf(seq[i]);
     return s;
   };
+  const gapFlex = (seq, a, b) => {
+    let stretch = 0;
+    let shrink = 0;
+    for (let i = a + 1; i < b; i++) {
+      const n = seq[i];
+      if (n.k !== 'glue') continue;
+      if ((n.sto ?? 0) === 0) stretch += n.st ?? 0;
+      if ((n.sho ?? 0) === 0) shrink += n.sh ?? 0;
+    }
+    return { stretch, shrink };
+  };
   for (const p of pairs) {
     const gr = gapSum(rs, prevR, p.r.i);
     const ge = gapSum(es, prevE, p.e.i);
-    if (Math.abs(gr - ge) > TOL * 2) {
+    const fr = gapFlex(rs, prevR, p.r.i);
+    const fe = gapFlex(es, prevE, p.e.i);
+    if (
+      Math.abs(gr - ge) > TOL * 2 ||
+      Math.abs(fr.stretch - fe.stretch) > TOL * 2 ||
+      Math.abs(fr.shrink - fe.shrink) > TOL * 2
+    ) {
       faults.push({
         kind: 'gap',
         before: p,
         gr,
         ge,
+        fr,
+        fe,
         rNodes: rs.slice(prevR + 1, p.r.i),
         eNodes: es.slice(prevE + 1, p.e.i),
       });
@@ -361,12 +380,20 @@ function comparePage(idx, real, eng) {
   }
   const tailR = gapSum(rs, prevR, rs.length);
   const tailE = gapSum(es, prevE, es.length);
-  if (Math.abs(tailR - tailE) > TOL * 2) {
+  const tailFr = gapFlex(rs, prevR, rs.length);
+  const tailFe = gapFlex(es, prevE, es.length);
+  if (
+    Math.abs(tailR - tailE) > TOL * 2 ||
+    Math.abs(tailFr.stretch - tailFe.stretch) > TOL * 2 ||
+    Math.abs(tailFr.shrink - tailFe.shrink) > TOL * 2
+  ) {
     faults.push({
       kind: 'gap',
       before: null,
       gr: tailR,
       ge: tailE,
+      fr: tailFr,
+      fe: tailFe,
       rNodes: rs.slice(prevR + 1),
       eNodes: es.slice(prevE + 1),
     });
@@ -394,7 +421,11 @@ function printDetail(idx, r) {
       );
     } else {
       const anchor = f.before ? `before "${(f.before.r.n.t ?? '').slice(0, 32)}"` : 'at page tail';
-      console.log(`  GAP ${anchor}: real=${fmt(f.gr)} engine=${fmt(f.ge)} (Δ=${fmt(f.gr - f.ge)})`);
+      console.log(
+        `  GAP ${anchor}: natural ${fmt(f.gr)}/${fmt(f.ge)} ` +
+          `stretch ${fmt(f.fr.stretch)}/${fmt(f.fe.stretch)} ` +
+          `shrink ${fmt(f.fr.shrink)}/${fmt(f.fe.shrink)}`
+      );
       console.log(`    real : ${f.rNodes.map(nodeDesc).join(' | ') || '(none)'}`);
       console.log(`    eng  : ${f.eNodes.map(nodeDesc).join(' | ') || '(none)'}`);
     }

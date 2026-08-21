@@ -25,6 +25,9 @@ const layoutSplitterEl = document.getElementById('workspace-preview-splitter');
 const layoutEl = document.getElementById('layout');
 const workspacePaneEl = document.getElementById('workspace-pane');
 const previewPaneEl = document.getElementById('preview-pane');
+const initialParams = new URLSearchParams(location.search);
+const embeddedHost = initialParams.get('embed') === '1';
+const embedActivationId = initialParams.get('activationId') ?? '';
 
 let splitRatio = 48;
 
@@ -49,6 +52,43 @@ let debounceTimer = null;
 let inFlight = false;
 const history = [];
 const pageDivs = new Map();
+let lastEngineStatus = null;
+let liveSearch = { query: '', results: [], current: -1 };
+let editDomCache = null;
+let directEditor = null;
+let mathWysiwygModulePromise = null;
+let mathCaretProbe = null;
+let mathCaretProbeSeq = 0;
+const mathCaretOffsetCache = new Map();
+const canonicalTextBoxesCache = new Map();
+const canonicalRegionBoundsCache = new Map();
+let directEditClickEpoch = 0;
+let bootComplete = false;
+let bootRequestEpoch = 0;
+let stateEventEpoch = 0;
+const documentReset = new window.TdomDocumentResetCoordinator({ hostRequired: embeddedHost });
+let resetBootInFlight = false;
+const presentedDomSnapshots = new Map();
+const presentedDomFetches = new Map();
+const opaqueCanonicalBatches = new Map();
+let opaqueBatchCommitDepth = 0;
+
+// Exact SVGs are decoded off-DOM, but a long paper must not decode every
+// page on every keystroke. Pages near the viewport stage immediately;
+// offscreen pages keep only the latest wanted URL and stage on approach.
+const canonicalStageObserver = typeof IntersectionObserver === 'function'
+  ? new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const page = entry.target;
+        const wanted = page.dataset.canonWanted;
+        if (!wanted) continue;
+        page.dataset.canonStage = wanted;
+        canonicalStageObserver.unobserve(page);
+        updateCanonState(Number(page.dataset.page));
+      }
+    }, { root: pagesEl, rootMargin: '200% 0px' })
+  : null;
 
 // canonical (exact LuaLaTeX) layer state — all comparisons use SOURCE
 // revisions (srcRev): async repaints (TikZ chunk swaps …) advance the patch
@@ -372,14 +412,108 @@ function reportFontFailure(family) {
 
 // ---------------------------------------------------------------- boot
 
-async function boot() {
-  const doc = await fetch('/doc').then((r) => r.json());
+function presentedSnapshotKey(id, rev) {
+  return `${Number(id)}:${Number(rev)}`;
+}
+
+async function ensurePresentedDomSnapshot(id, rev) {
+  const numericId = Number(id);
+  const numericRev = Number(rev);
+  if (!Number.isFinite(numericId) || !Number.isFinite(numericRev)) return null;
+  const key = presentedSnapshotKey(numericId, numericRev);
+  if (presentedDomSnapshots.has(key)) return presentedDomSnapshots.get(key);
+  if (presentedDomFetches.has(key)) return presentedDomFetches.get(key);
+  const pending = fetch('/dom', { cache: 'no-store' })
+    .then((response) => response.ok ? response.json() : null)
+    .then((snapshot) => {
+      // /dom always describes the current editor source. It is a valid hit
+      // map for a canonical generation only while both source revisions are
+      // identical. Keeping this immutable snapshot lets an already printed
+      // page resolve a second location while the next compile is pending.
+      if (!snapshot || Number(snapshot.srcRev) !== numericRev) return null;
+      presentedDomSnapshots.set(key, snapshot);
+      while (presentedDomSnapshots.size > 4) {
+        presentedDomSnapshots.delete(presentedDomSnapshots.keys().next().value);
+      }
+      return snapshot;
+    })
+    .catch(() => null)
+    .finally(() => presentedDomFetches.delete(key));
+  presentedDomFetches.set(key, pending);
+  return pending;
+}
+
+async function boot(expectedDocumentEpoch = null) {
+  if (expectedDocumentEpoch !== null && !documentReset.canAdopt(expectedDocumentEpoch)) return;
+  const requestEpoch = ++bootRequestEpoch;
+  const eventEpoch = stateEventEpoch;
+  bootComplete = false;
+  const doc = await fetch('/doc', { cache: 'no-store' }).then((r) => r.json());
+  if (requestEpoch !== bootRequestEpoch) return;
+  if (expectedDocumentEpoch !== null && Number(doc.documentEpoch) !== Number(expectedDocumentEpoch)) {
+    if (documentReset.canAdopt(expectedDocumentEpoch)) {
+      setTimeout(() => boot(expectedDocumentEpoch), 0);
+    }
+    return;
+  }
+  if (eventEpoch !== stateEventEpoch) {
+    queueMicrotask(() => boot(expectedDocumentEpoch));
+    return;
+  }
+  if (documentReset.pending &&
+      (expectedDocumentEpoch === null || !documentReset.canAdopt(expectedDocumentEpoch))) {
+    return;
+  }
   adoptDoc(doc);
+  if (mode === 'opaque' && canonical?.id && canonical.rev === appliedSrcRev) {
+    await ensurePresentedDomSnapshot(canonical.id, canonical.rev);
+  }
+  if (requestEpoch !== bootRequestEpoch || eventEpoch !== stateEventEpoch) {
+    queueMicrotask(() => boot(expectedDocumentEpoch));
+    return;
+  }
+  if (!documentReset.adopt(doc.documentEpoch)) {
+    if (expectedDocumentEpoch !== null) queueMicrotask(() => boot(expectedDocumentEpoch));
+    return;
+  }
+  bootComplete = true;
   statusEl.textContent = '';
   renderInspector(doc.report, null);
 }
 
+function maybeAdoptCompletedReset(epoch) {
+  if (resetBootInFlight || !documentReset.canAdopt(epoch)) return;
+  resetBootInFlight = true;
+  boot(epoch).finally(() => {
+    resetBootInFlight = false;
+    if (documentReset.canAdopt(epoch)) queueMicrotask(() => maybeAdoptCompletedReset(epoch));
+  });
+}
+
+function beginClientDocumentReset(epoch) {
+  if (!documentReset.begin(epoch)) return false;
+  bootComplete = false;
+  directEditClickEpoch++;
+  closeDirectEditor();
+  if (embeddedHost) {
+    window.parent.postMessage({
+      source: 'tdom-embed',
+      activationId: embedActivationId,
+      action: 'reset-pending',
+      documentEpoch: Number(epoch),
+    }, '*');
+  }
+  return true;
+}
+
+function completeClientDocumentReset(epoch) {
+  if (documentReset.complete(epoch)) maybeAdoptCompletedReset(Number(epoch));
+}
+
 function adoptDoc(doc) {
+  directEditClickEpoch++;
+  closeDirectEditor();
+  cancelObsoleteOpaqueBatches();
   geometry = doc.geometry;
   backend = doc.backend ?? 'checkpoint';
   injectFonts(doc.fonts);
@@ -392,6 +526,7 @@ function adoptDoc(doc) {
   lastRemoveRev = 0;
   mode = doc.mode ?? 'structured';
   modeReasons = doc.modeReasons ?? [];
+  document.body.classList.toggle('is-opaque-document', mode === 'opaque');
   canonical = doc.canonical ?? null;
   shipPages.clear();
   for (const dl of doc.pages) {
@@ -418,6 +553,12 @@ function srcOf(target) {
 
 function renderPage(dl, flash) {
   let div = pageDivs.get(dl.page);
+  if (mode === 'opaque') {
+    // Opaque pages are created exclusively from canonical metadata. A late
+    // resident patch must not create an empty phantom shell or stale hit map.
+    if (div) prepareOpaqueShell(div);
+    return;
+  }
   if (!div) {
     div = document.createElement('div');
     div.className = 'page';
@@ -460,6 +601,8 @@ function renderPage(dl, flash) {
     requestAnimationFrame(() => div.classList.add('fading'));
     setTimeout(() => div.classList.remove('patched', 'fading'), 1200);
   }
+  if (liveSearch.query) scheduleLiveSearchRefresh();
+  if (directEditor?.pageNumber === dl.page) requestAnimationFrame(repositionDirectEditor);
 }
 
 /** Unified SVG page: TeX-positioned glyph runs, rules, chunk images, folio. */
@@ -468,6 +611,7 @@ function svgFor(dl) {
     `<svg viewBox="0 0 ${geometry.paperwidth} ${geometry.paperheight}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">`,
   ];
   for (const cmd of dl.commands) {
+    const lineAttr = cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`;
     if (cmd.op === 'glyphs') {
       let fontAttrs;
       if (cmd.fam) {
@@ -480,11 +624,19 @@ function svgFor(dl) {
         fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
       }
       parts.push(
-        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}" xml:space="preserve">${escapeXml(cmd.text)}</text>`
+        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''} xml:space="preserve">${escapeXml(cmd.text)}</text>`
       );
     } else if (cmd.op === 'rule') {
       parts.push(
-        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.1)}" height="${Math.max(cmd.h, 0.1)}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"/>`
+        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.1)}" height="${Math.max(cmd.h, 0.1)}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}/>`
+      );
+    } else if (cmd.op === 'editbox') {
+      parts.push(
+        `<rect class="tdom-edit-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}" data-edit="${escapeXml(cmd.edit)}"/>`
+      );
+    } else if (cmd.op === 'sourcebox') {
+      parts.push(
+        `<rect class="tdom-source-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}"${lineAttr}${cmd.ink ? ' data-ink="1"' : ''}${cmd.complex ? ' data-complex="1"' : ''}/>`
       );
     } else if (cmd.op === 'chunk') {
       // exact-render chunks are drawn as HTML <img> overlays (see renderPage)
@@ -523,7 +675,7 @@ function applyReport(report) {
       updateCanonState(dl.page);
     } else if (patch.type === 'remove-pages') {
       lastRemoveRev = appliedSrcRev;
-      removePagesFrom(patch.from);
+      if (mode !== 'opaque') removePagesFrom(patch.from);
     }
   }
   updateBadge();
@@ -531,19 +683,587 @@ function applyReport(report) {
 
 // ------------------------------------------------- canonical (exact) layer
 
+function activePaperGeometry(page = null) {
+  const displayedWidth = Number(page?.dataset?.canonPaperW);
+  const displayedHeight = Number(page?.dataset?.canonPaperH);
+  const displayedRotation = Number(page?.dataset?.canonPaperRotation) || 0;
+  // The dimensions attached to a committed canonical image belong to the
+  // immutable generation whose pixels are actually on screen. They outrank
+  // both the newest compile metadata and the resident renderer's one global
+  // geometry. Only use them while that image is visible: a dirty structured
+  // page falls back to its provisional SVG until the next exact image lands.
+  const displaysCanonical = page?.classList?.contains('is-final') &&
+    page?.querySelector?.('img.canon');
+  if (displaysCanonical && displayedWidth > 0 && displayedHeight > 0) {
+    return { width: displayedWidth, height: displayedHeight, rotation: displayedRotation };
+  }
+  const pageNumber = Number(page?.dataset?.page);
+  const exactPaper = Number.isInteger(pageNumber)
+    ? canonical?.papers?.[pageNumber - 1] ?? canonical?.paper
+    : canonical?.paper;
+  const exactWidth = Number(exactPaper?.w);
+  const exactHeight = Number(exactPaper?.h);
+  if (mode === 'opaque' && exactWidth > 0 && exactHeight > 0) {
+    return { width: exactWidth, height: exactHeight, rotation: Number(exactPaper?.rotation) || 0 };
+  }
+  return {
+    width: Number(geometry?.paperwidth) || exactWidth || 612,
+    height: Number(geometry?.paperheight) || exactHeight || 792,
+    rotation: Number(exactPaper?.rotation) || 0,
+  };
+}
+
+function prepareOpaqueShell(div) {
+  if (!div || mode !== 'opaque') return;
+  div.querySelector('svg')?.remove();
+  div.querySelectorAll('.chunkwin').forEach((element) => element.remove());
+  div.classList.remove('patched', 'fading');
+  delete div.dataset.prov;
+  const current = div.querySelector('img.canon');
+  div.classList.toggle('awaiting-canonical', !current);
+  // Never stretch old exact pixels to a new compile's paper size. Existing
+  // images carry their committed dimensions; a brand-new shell may use the
+  // current canonical size until its first image arrives.
+  if (!current || (Number(div.dataset.canonPaperW) > 0 && Number(div.dataset.canonPaperH) > 0)) {
+    const paper = activePaperGeometry(div);
+    div.style.aspectRatio = `${paper.width} / ${paper.height}`;
+  }
+}
+
 function setMode(newMode, reasons) {
   modeReasons = reasons ?? modeReasons;
   if (newMode === mode) return;
   mode = newMode;
+  document.body.classList.toggle('is-opaque-document', mode === 'opaque');
+  directEditClickEpoch++;
+  directEditor?.element?.classList.toggle('is-opaque', mode === 'opaque');
+  if (mode !== 'opaque' && directEditor?.control) directEditor.control.style.transform = '';
   if (mode === 'opaque') {
+    // A structured editor is anchored to provisional SVG geometry. Once the
+    // document demotes, that coordinate system no longer exists; retaining
+    // its WYSIWYG/IME surface above an old canonical page would be a visible
+    // mixed-generation UI. Input events are sent eagerly, so only the
+    // transient surface is closed here.
+    closeDirectEditor();
     // the provisional layers are dead weight now — every page is canonical
-    for (const div of pageDivs.values()) {
-      div.querySelector('svg')?.remove();
-      div.querySelectorAll('.chunkwin').forEach((e) => e.remove());
-      delete div.dataset.prov;
-    }
+    shipPages.clear();
+    pagesEl.querySelectorAll('.tdom-search-marker').forEach((marker) => marker.remove());
+    liveSearch = { query: liveSearch.query, results: [], current: -1 };
+    for (const div of pageDivs.values()) prepareOpaqueShell(div);
     pageDirtyRev.clear();
+    for (const pageNumber of pageDivs.keys()) updateCanonState(pageNumber);
+    if (canonical?.id && canonical.rev === appliedSrcRev) {
+      void ensurePresentedDomSnapshot(canonical.id, canonical.rev);
+    }
   }
+}
+
+function createCanonicalImage(src) {
+  const image = document.createElement('img');
+  image.className = 'canon';
+  image.loading = 'eager';
+  image.decoding = 'async';
+  image.draggable = false;
+  image.dataset.src = src;
+  return image;
+}
+
+function canonicalIdFromSrc(src) {
+  if (!src || !String(src).startsWith('/canonical/')) return null;
+  try {
+    const value = Number(new URL(src, location.href).searchParams.get('c'));
+    return Number.isFinite(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function presentedPageState(page) {
+  const image = page?.querySelector?.('img.canon');
+  const id = Number(page?.dataset?.canonPresentedId);
+  const rev = Number(page?.dataset?.canonPresentedRev);
+  if (!image || image.dataset.src !== page?.dataset?.canonPresentedSrc ||
+      !Number.isFinite(id) || !Number.isFinite(rev)) return null;
+  const snapshot = presentedDomSnapshots.get(presentedSnapshotKey(id, rev));
+  return snapshot ? { image, id, rev, snapshot, src: image.dataset.src } : null;
+}
+
+function opaqueCanonicalBatchKey(generation) {
+  const id = Number(generation?.id);
+  const rev = Number(generation?.rev);
+  return Number.isFinite(id) && Number.isFinite(rev) ? `${id}:${rev}` : null;
+}
+
+function cancelObsoleteOpaqueBatches(keepKey = null) {
+  for (const [key, batch] of [...opaqueCanonicalBatches]) {
+    if (key === keepKey) continue;
+    for (const entry of batch.expected.values()) {
+      if (entry.page?.dataset?.canonPending === entry.src) {
+        delete entry.page.dataset.canonPending;
+      }
+    }
+    opaqueCanonicalBatches.delete(key);
+  }
+}
+
+function directEditorRegionInSnapshot(snapshot, session) {
+  if (!snapshot || !session) return null;
+  const regions = (snapshot.blocks ?? []).flatMap((block) =>
+    (block.editRegions ?? []).map((region) => ({ ...region, blockSource: block.source ?? null }))
+  );
+  const visible = String(session.readValue?.() ?? session.region?.value ?? '');
+  const exact = regions.find((region) =>
+    region.id === session.region?.id && String(region.value ?? '') === visible
+  );
+  if (exact) return exact;
+  const sameKindAndFile = regions.filter((region) =>
+    region.kind === session.kind && sameSourceFile(region.source?.file, session.region?.source?.file)
+  );
+  const sameValue = sameKindAndFile.filter((region) => String(region.value ?? '') === visible);
+  const candidates = sameValue.length ? sameValue : sameKindAndFile.filter((region) =>
+    String(region.value ?? '') === String(session.region?.value ?? '')
+  );
+  const oldLine = Number(session.region?.source?.start?.line);
+  return candidates.sort((a, b) =>
+    Math.abs(Number(a.source?.start?.line) - oldLine) -
+    Math.abs(Number(b.source?.start?.line) - oldLine)
+  )[0] ?? null;
+}
+
+async function stageDirectEditorForOpaqueBatch(batch) {
+  const session = directEditor;
+  if (!session || mode !== 'opaque') return { sessionId: null };
+  const snapshot = await batch.snapshotReady;
+  if (!snapshot || directEditor?.sessionId !== session.sessionId) return { sessionId: session.sessionId, mapping: null };
+  const visible = String(session.readValue?.() ?? session.region?.value ?? '');
+  let region = directEditorRegionInSnapshot(snapshot, session);
+  const sentFromSrcRev = Number(session.sentFromSrcRev ?? session.presentedRev);
+  if (!region && batch.rev <= sentFromSrcRev) {
+    // The transparent control is ahead of the engine/host debounce. This
+    // generation is already obsolete from the typist's point of view; keep
+    // the old exact page and focused control until the matching source rev
+    // produces its own canonical generation.
+    return { sessionId: session.sessionId, localAhead: true, mapping: null };
+  }
+  if (!region) {
+    // LaTeX escaping can split one visible text region into several source
+    // regions (for example `a$b` -> `a`, `\$`, `b`). Once the canonical
+    // revision is newer than the revision from which the edit was sent, the
+    // visible value is authoritative for PDF geometry even if no single new
+    // DOM region retains the old id.
+    region = { ...session.region, value: visible };
+  }
+  const near = session.printBounds
+    ? {
+        page: session.pageNumber,
+        x: (session.printBounds.left + session.printBounds.right) / 2,
+        y: (session.printBounds.top + session.printBounds.bottom) / 2,
+      }
+    : { page: session.pageNumber };
+  const value = visible;
+  const bounds = session.kind === 'text'
+    ? await canonicalTextBounds(value, null, near, batch.id)
+    : await canonicalSourceBounds(region, null, batch.id, near);
+  if (!bounds || !Number.isInteger(Number(bounds.page))) {
+    return { sessionId: session.sessionId, mapping: null };
+  }
+  const Coordinator = window.TdomOpaqueEditorCoordinator;
+  const canonicalAnchorPoint = Coordinator?.caretAnchorPoint?.(
+    bounds,
+    session.caretAnchorRatio
+  ) ?? {
+    x: (Number(bounds.left) + Number(bounds.right)) / 2,
+    y: (Number(bounds.top) + Number(bounds.bottom)) / 2,
+  };
+  return {
+    sessionId: session.sessionId,
+    mapping: {
+      region,
+      bounds,
+      canonicalAnchorPoint,
+      pageNumber: Number(bounds.page),
+      id: batch.id,
+      rev: batch.rev,
+    },
+  };
+}
+
+function getOpaqueCanonicalBatch(generation) {
+  const key = opaqueCanonicalBatchKey(generation);
+  if (!key || mode !== 'opaque') return null;
+  cancelObsoleteOpaqueBatches(key);
+  let batch = opaqueCanonicalBatches.get(key);
+  if (!batch) {
+    const id = Number(generation.id);
+    const rev = Number(generation.rev);
+    batch = {
+      key,
+      id,
+      rev,
+      pageCount: Number(generation.pageCount),
+      expected: new Map(),
+      sealed: false,
+      committing: false,
+      snapshot: undefined,
+      editorStage: undefined,
+      editorStageToken: 0,
+    };
+    opaqueCanonicalBatches.set(key, batch);
+    batch.snapshotReady = ensurePresentedDomSnapshot(id, rev).then((snapshot) => {
+      if (opaqueCanonicalBatches.get(key) !== batch) return null;
+      batch.snapshot = snapshot;
+      tryCommitOpaqueCanonicalBatch(batch);
+      return snapshot;
+    });
+    restageOpaqueBatchEditor(batch);
+  } else if (Number.isInteger(Number(generation.pageCount))) {
+    batch.pageCount = Number(generation.pageCount);
+  }
+  batch.sealed = false;
+  queueMicrotask(() => {
+    if (opaqueCanonicalBatches.get(key) !== batch) return;
+    batch.sealed = true;
+    tryCommitOpaqueCanonicalBatch(batch);
+  });
+  return batch;
+}
+
+function restageOpaqueBatchEditor(batch) {
+  if (!batch || opaqueCanonicalBatches.get(batch.key) !== batch) return;
+  const token = ++batch.editorStageToken;
+  batch.editorStage = undefined;
+  batch.editorReady = stageDirectEditorForOpaqueBatch(batch).then((stage) => {
+    if (opaqueCanonicalBatches.get(batch.key) !== batch || batch.editorStageToken !== token) return null;
+    batch.editorStage = stage;
+    tryCommitOpaqueCanonicalBatch(batch);
+    return stage;
+  });
+}
+
+function registerOpaqueCanonicalBatchPage(batch, div, src) {
+  if (!batch) return null;
+  const pageNumber = Number(div.dataset.page);
+  const existing = batch.expected.get(pageNumber);
+  if (!existing || existing.src !== src || existing.page !== div) {
+    batch.expected.set(pageNumber, { page: div, src, apply: null });
+  }
+  return { batch, pageNumber, src };
+}
+
+function readyOpaqueCanonicalBatchPage(registration, apply) {
+  const { batch, pageNumber, src } = registration ?? {};
+  if (!batch || opaqueCanonicalBatches.get(batch.key) !== batch) return;
+  const entry = batch.expected.get(pageNumber);
+  if (!entry || entry.src !== src) return;
+  entry.apply = apply;
+  tryCommitOpaqueCanonicalBatch(batch);
+}
+
+function dropOpaqueCanonicalBatchPage(registration) {
+  const { batch, pageNumber, src } = registration ?? {};
+  if (!batch || opaqueCanonicalBatches.get(batch.key) !== batch) return;
+  const entry = batch.expected.get(pageNumber);
+  if (entry?.src === src) batch.expected.delete(pageNumber);
+  tryCommitOpaqueCanonicalBatch(batch);
+}
+
+function reconcileOpaquePageCount(pageCount) {
+  if (!Number.isInteger(pageCount) || pageCount < 0) return;
+  for (const [pageNumber, page] of [...pageDivs]) {
+    if (pageNumber <= pageCount) continue;
+    page.remove();
+    pageDivs.delete(pageNumber);
+  }
+}
+
+function applyStagedDirectEditor(stage, batch) {
+  const session = directEditor;
+  if (!session || stage?.sessionId !== session.sessionId) return;
+  const mapping = stage.mapping;
+  const targetPage = mapping ? pageDivs.get(mapping.pageNumber) : null;
+  if (!mapping || !targetPage?.isConnected) {
+    // Keeping an input surface anchored to an obsolete generation would make
+    // its IME/candidate UI point at unrelated printed ink. The edit has
+    // already been sent on input, so close only the transient surface.
+    closeDirectEditor();
+    return;
+  }
+  targetPage.appendChild(session.element);
+  session.pageNumber = mapping.pageNumber;
+  session.region = mapping.region;
+  session.printBounds = mapping.bounds;
+  session.presentedId = batch.id;
+  session.presentedRev = batch.rev;
+  session.canonicalAnchorPoint = mapping.canonicalAnchorPoint;
+  session.anchor = null;
+  session.anchorOffset = null;
+  repositionDirectEditor();
+}
+
+function ensureOpaqueBatchEditorTargetPage(batch) {
+  const mapping = batch.editorStage?.mapping;
+  const mappingMatchesBatch = Number(mapping?.id) === batch.id && Number(mapping?.rev) === batch.rev;
+  const pageNumber = mappingMatchesBatch ? Number(mapping?.pageNumber) : NaN;
+  const targetPage = Number.isInteger(pageNumber) ? pageDivs.get(pageNumber) : null;
+  const targetSrc = Number.isInteger(pageNumber)
+    ? `/canonical/${pageNumber}.svg?c=${batch.id}`
+    : '';
+  const expected = batch.expected.get(pageNumber);
+  const expectedActive = expected?.page === targetPage &&
+    targetPage?.dataset?.canonWanted === expected?.src;
+  const presented = targetPage?.isConnected ? presentedPageState(targetPage) : null;
+  const Coordinator = window.TdomOpaqueEditorCoordinator;
+  if (typeof Coordinator?.planGenerationBarrier !== 'function') return false;
+  const plan = Coordinator.planGenerationBarrier({
+    pageNumber,
+    pageConnected: targetPage?.isConnected === true,
+    targetSrc,
+    wantedSrc: targetPage?.dataset?.canonWanted ?? null,
+    expectedSrc: expectedActive ? expected.src : null,
+    expectedReady: expectedActive && typeof expected.apply === 'function',
+    presentedSrc: presented?.src ?? null,
+    presentedId: presented?.id ?? null,
+    presentedRev: presented?.rev ?? null,
+    generationId: batch.id,
+    generationRev: batch.rev,
+  });
+  if (plan.action === 'stage') {
+    // The editor may reflow to an offscreen page that lazy canonical staging
+    // did not include. Release that exact page explicitly and make it a
+    // member of this document-generation batch before moving any input,
+    // caret, selection, or candidate UI to its new bounds.
+    targetPage.dataset.canonStage = plan.targetSrc;
+    updateCanonState(plan.pageNumber);
+    return false;
+  }
+  if (plan.action === 'register') {
+    // The page may already have committed this exact immutable generation
+    // before the editor's asynchronous SyncTeX mapping resolved. Record a
+    // no-op participant so the target is still explicit in this barrier.
+    const registration = registerOpaqueCanonicalBatchPage(batch, targetPage, plan.targetSrc);
+    const entry = batch.expected.get(registration.pageNumber);
+    if (entry?.page === targetPage && entry.src === plan.targetSrc) entry.apply = () => {};
+  }
+  return plan.action !== 'wait';
+}
+
+function tryCommitOpaqueCanonicalBatch(batch) {
+  if (!batch || batch.committing || !batch.sealed || batch.snapshot === undefined ||
+      batch.editorStage === undefined) return;
+  if (opaqueCanonicalBatches.get(batch.key) !== batch || mode !== 'opaque' ||
+      Number(canonical?.id) !== batch.id || Number(canonical?.rev) !== batch.rev ||
+      batch.rev !== Number(appliedSrcRev) || !batch.snapshot) {
+    return;
+  }
+  const currentEditorSessionId = directEditor?.sessionId ?? null;
+  if ((batch.editorStage?.sessionId ?? null) !== currentEditorSessionId) {
+    restageOpaqueBatchEditor(batch);
+    return;
+  }
+  if (batch.editorStage?.localAhead &&
+      directEditor?.sessionId === batch.editorStage.sessionId) return;
+  if (batch.editorStage?.mapping &&
+      directEditor?.sessionId === batch.editorStage.sessionId &&
+      String(directEditor.readValue?.() ?? '') !== String(batch.editorStage.mapping.region?.value ?? '')) return;
+  if (!ensureOpaqueBatchEditorTargetPage(batch)) return;
+  for (const [pageNumber, entry] of [...batch.expected]) {
+    if (!entry.page?.isConnected || entry.page.dataset.canonWanted !== entry.src) {
+      batch.expected.delete(pageNumber);
+      continue;
+    }
+    if (typeof entry.apply !== 'function') return;
+  }
+  batch.committing = true;
+  opaqueCanonicalBatches.delete(batch.key);
+  // All mutations below are synchronous. The browser cannot paint a frame
+  // with page 1 from generation N+1 and page 2 from N, nor with an editor
+  // candidate panel still anchored to the old generation.
+  for (const [, entry] of [...batch.expected].sort((a, b) => a[0] - b[0])) {
+    entry.apply();
+  }
+  applyStagedDirectEditor(batch.editorStage, batch);
+  reconcileOpaquePageCount(batch.pageCount);
+  directEditClickEpoch++;
+  opaqueBatchCommitDepth++;
+  try {
+    for (const pageNumber of pageDivs.keys()) updateCanonState(pageNumber);
+  } finally {
+    opaqueBatchCommitDepth--;
+  }
+  updateBadge();
+}
+
+/**
+ * Decode the next exact page off-DOM and replace the current exact bitmap in
+ * one DOM operation. Assigning a new URL to an in-DOM <img> is not an atomic
+ * presentation contract: a browser may clear or partially paint it while the
+ * SVG is fetched/decoded. The detached candidate makes every painted frame
+ * either the complete previous LuaLaTeX page or the complete next one.
+ */
+function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
+  const current = div.querySelector('img.canon');
+  const batch = mode === 'opaque' && opaqueBatchCommitDepth === 0
+    ? getOpaqueCanonicalBatch(generation)
+    : null;
+  const batchRegistration = batch ? registerOpaqueCanonicalBatchPage(batch, div, src) : null;
+  if (current?.dataset.src === src) {
+    div.dataset.canonWanted = src;
+    delete div.dataset.canonPending;
+    delete div.dataset.canonRetries;
+    const currentId = generation?.id ?? canonicalIdFromSrc(src);
+    const currentRev = generation?.rev;
+    if (mode === 'opaque' && currentId != null && currentRev != null) {
+      void ensurePresentedDomSnapshot(currentId, currentRev).then((snapshot) => {
+        if (!snapshot || !div.isConnected || div.dataset.canonWanted !== src ||
+            div.querySelector('img.canon') !== current) {
+          dropOpaqueCanonicalBatchPage(batchRegistration);
+          return;
+        }
+        if (div.dataset.canonPresentedSrc === src &&
+            Number(div.dataset.canonPresentedId) === Number(currentId) &&
+            Number(div.dataset.canonPresentedRev) === Number(currentRev)) {
+          readyOpaqueCanonicalBatchPage(batchRegistration, () => {});
+          return;
+        }
+        // Hash reuse (A -> B -> A) keeps the exact same PDF/id and advances
+        // only the source revision. Promote every exposed page's immutable
+        // mapping in the same document-generation commit.
+        readyOpaqueCanonicalBatchPage(batchRegistration, () => {
+          div.dataset.canonPresentedSrc = src;
+          div.dataset.canonPresentedId = String(currentId);
+          div.dataset.canonPresentedRev = String(currentRev);
+          current.dataset.canonId = String(currentId);
+          current.dataset.canonRev = String(currentRev);
+          div.classList.remove('awaiting-canonical');
+        });
+      });
+    } else if (batchRegistration) {
+      readyOpaqueCanonicalBatchPage(batchRegistration, () => {});
+    }
+    return current;
+  }
+  div.dataset.canonWanted = src;
+  if (div.dataset.canonPending && div.dataset.canonPending !== src) {
+    delete div.dataset.canonPending;
+  }
+  const rootRect = pagesEl.getBoundingClientRect();
+  const pageRect = div.getBoundingClientRect();
+  const nearViewport = pageRect.bottom >= rootRect.top - rootRect.height * 2 &&
+    pageRect.top <= rootRect.bottom + rootRect.height * 2;
+  const observerReleased = div.dataset.canonStage === src;
+  if (observerReleased) delete div.dataset.canonStage;
+  if (!nearViewport && !observerReleased && canonicalStageObserver) {
+    dropOpaqueCanonicalBatchPage(batchRegistration);
+    canonicalStageObserver.observe(div);
+    return current;
+  }
+  canonicalStageObserver?.unobserve(div);
+  if (div.dataset.canonPending === src) return current;
+  div.dataset.canonPending = src;
+
+  const candidate = createCanonicalImage(src);
+  const rawPresentationId = generation?.id ?? canonicalIdFromSrc(src);
+  const rawPresentationRev = generation?.rev;
+  const presentationId = rawPresentationId == null ? NaN : Number(rawPresentationId);
+  const presentationRev = rawPresentationRev == null ? NaN : Number(rawPresentationRev);
+  const requiresSnapshot = mode === 'opaque' &&
+    Number.isFinite(presentationId) && Number.isFinite(presentationRev);
+  const snapshotReady = requiresSnapshot
+    ? ensurePresentedDomSnapshot(presentationId, presentationRev)
+    : Promise.resolve(true);
+  let settled = false;
+  const fail = () => {
+    if (settled) return;
+    settled = true;
+    if (div.dataset.canonPending === src) delete div.dataset.canonPending;
+    // Opaque mode deliberately retains the previous known-good exact page.
+    // Structured mode can safely reveal its coherent provisional page.
+    if (div.dataset.canonWanted === src && mode !== 'opaque') {
+      div.classList.remove('is-final', 'is-partial');
+    }
+    if (div.dataset.canonWanted === src && div.isConnected) {
+      const attempts = Number(div.dataset.canonRetries ?? 0) + 1;
+      div.dataset.canonRetries = String(attempts);
+      window.setTimeout(() => {
+        if (div.dataset.canonWanted === src && !div.dataset.canonPending) {
+          updateCanonState(Number(div.dataset.page));
+        }
+      }, Math.min(3000, 150 * 2 ** Math.min(attempts - 1, 5)));
+    }
+  };
+  const commit = async () => {
+    if (settled) return;
+    const snapshot = await snapshotReady;
+    if (settled) return;
+    if (requiresSnapshot && !snapshot) {
+      fail();
+      return;
+    }
+    settled = true;
+    if (div.dataset.canonWanted !== src || !div.isConnected) {
+      dropOpaqueCanonicalBatchPage(batchRegistration);
+      return;
+    }
+    const applyCandidate = () => {
+      const previous = div.querySelector('img.canon');
+      if (previous) previous.replaceWith(candidate);
+      else div.appendChild(candidate);
+      div.classList.remove('awaiting-canonical');
+      div.dataset.canonPresentedSrc = src;
+      if (Number.isFinite(presentationId)) {
+        div.dataset.canonPresentedId = String(presentationId);
+        candidate.dataset.canonId = String(presentationId);
+      } else {
+        delete div.dataset.canonPresentedId;
+      }
+      if (Number.isFinite(presentationRev)) {
+        div.dataset.canonPresentedRev = String(presentationRev);
+        candidate.dataset.canonRev = String(presentationRev);
+      } else {
+        delete div.dataset.canonPresentedRev;
+      }
+      const paperWidth = Number(paper?.w ?? paper?.width);
+      const paperHeight = Number(paper?.h ?? paper?.height);
+      if (paperWidth > 0 && paperHeight > 0) {
+        div.dataset.canonPaperW = String(paperWidth);
+        div.dataset.canonPaperH = String(paperHeight);
+        div.dataset.canonPaperRotation = String(Number(paper?.rotation) || 0);
+        div.style.aspectRatio = `${paperWidth} / ${paperHeight}`;
+      }
+      if (div.dataset.canonPending === src) delete div.dataset.canonPending;
+      delete div.dataset.canonRetries;
+    };
+    if (batchRegistration) {
+      readyOpaqueCanonicalBatchPage(batchRegistration, applyCandidate);
+    } else {
+      applyCandidate();
+      directEditClickEpoch++;
+      updateCanonState(Number(div.dataset.page));
+      if (directEditor?.pageNumber === Number(div.dataset.page)) {
+        void refreshDirectEditorExactBounds(Number(div.dataset.page));
+      }
+      updateBadge();
+    }
+  };
+  const decodeAndCommit = () => {
+    if (settled) return;
+    if (typeof candidate.decode === 'function') {
+      candidate.decode().then(commit).catch(() => {
+        if (candidate.complete && candidate.naturalWidth > 0) commit();
+        else fail();
+      });
+    } else {
+      commit();
+    }
+  };
+  candidate.addEventListener('load', decodeAndCommit, { once: true });
+  candidate.addEventListener('error', fail, { once: true });
+  candidate.src = src;
+  if (candidate.complete) queueMicrotask(() => {
+    if (candidate.naturalWidth > 0) decodeAndCommit();
+    else fail();
+  });
+  return current;
 }
 
 /** A page shell with no provisional content (canonical-only pages). */
@@ -552,9 +1272,14 @@ function ensureShell(n) {
   if (div) return div;
   div = document.createElement('div');
   div.className = 'page';
+  if (mode === 'opaque') div.classList.add('awaiting-canonical');
   div.dataset.page = n;
-  if (geometry?.paperwidth && geometry?.paperheight) {
-    div.style.aspectRatio = `${geometry.paperwidth} / ${geometry.paperheight}`;
+  const exactPaper = canonical?.papers?.[n - 1] ?? canonical?.paper;
+  const paper = mode === 'opaque' && exactPaper
+    ? { width: Number(exactPaper.w), height: Number(exactPaper.h) }
+    : activePaperGeometry();
+  if (paper.width && paper.height) {
+    div.style.aspectRatio = `${paper.width} / ${paper.height}`;
   }
   const no = document.createElement('span');
   no.className = 'pageno';
@@ -568,28 +1293,52 @@ function ensureShell(n) {
 
 /** Reconcile shells + per-page overlays after a canonical compile lands. */
 function syncCanonical() {
+  let opaqueBatch = null;
   if (canonical && canonical.id) {
     // dirty marks covered by this compile are settled: those pages are
     // exactly what LuaLaTeX printed for the current source
     for (const [n, rev] of [...pageDirtyRev]) {
       if (rev <= canonical.rev) pageDirtyRev.delete(n);
     }
-    // canonical-only pages (beyond the provisional count) get shells —
-    // unless a newer provisional update legitimately removed pages
-    if (canonical.rev >= lastRemoveRev) {
+    // Canonical-only pages (beyond the provisional count) get shells only
+    // when this compile covers the CURRENT source.  After /open, the cold
+    // renderer can still describe the previous document for the idle
+    // debounce window; letting that stale pageCount create shells briefly
+    // resurrected old pages (for example a 1-page document showed /2).
+    if (canonical.rev >= appliedSrcRev && canonical.rev >= lastRemoveRev) {
       for (let n = 1; n <= canonical.pageCount; n++) {
         if (!pageDivs.has(n)) ensureShell(n);
       }
     }
     // canonical-only shells beyond the new page count disappear
     for (const [n, div] of [...pageDivs]) {
-      if (n > canonical.pageCount && div.dataset.prov !== '1') {
+      if (mode !== 'opaque' && n > canonical.pageCount && div.dataset.prov !== '1') {
         div.remove();
         pageDivs.delete(n);
       }
     }
+    if (mode === 'opaque') {
+      if (canonical.rev >= appliedSrcRev) {
+        opaqueBatch = getOpaqueCanonicalBatch({
+          id: canonical.id,
+          rev: canonical.rev,
+          pageCount: canonical.pageCount,
+        });
+      }
+      for (const div of pageDivs.values()) prepareOpaqueShell(div);
+    }
   }
   for (const n of pageDivs.keys()) updateCanonState(n);
+  if (opaqueBatch && opaqueBatch.expected.size === 0 && canonical.pageCount > 0) {
+    // A page-count shrink can leave only an obsolete last page in view. Its
+    // replacement has no page number to fetch, so force the nearest surviving
+    // page into this generation barrier before removing the obsolete shell.
+    const survivor = pageDivs.get(canonical.pageCount) ?? pageDivs.get(1);
+    if (survivor) {
+      survivor.dataset.canonStage = `/canonical/${Number(survivor.dataset.page)}.svg?c=${canonical.id}`;
+      updateCanonState(Number(survivor.dataset.page));
+    }
+  }
   updateBadge();
 }
 
@@ -608,45 +1357,47 @@ function updateCanonState(n) {
   const ship = shipPages.get(n);
   const shipOk = !!ship && (pageDirtyRev.get(n) ?? 0) <= ship.srcRev;
   // prefer the freshest real-pixels source for THIS page
-  const useShip = shipOk && (!coldFresh || ship.srcRev > canonical.rev);
+  const useShip = mode !== 'opaque' && shipOk && (!coldFresh || ship.srcRev > canonical.rev);
   const fresh = coldFresh || useShip;
   let img = div.querySelector('img.canon');
-  if (canonAvail || useShip) {
-    if (!img) {
-      img = document.createElement('img');
-      img.className = 'canon';
-      img.loading = 'lazy'; // viewport-aware: offscreen pages convert lazily
-      img.decoding = 'async';
-      img.draggable = false;
-      img.addEventListener('error', () => {
-        // superseded compile id (or conversion hiccup): fall back to the
-        // provisional layer; the next canonical event re-points the src
-        delete img.dataset.src;
-        img.removeAttribute('src');
-        div.classList.remove('is-final', 'is-partial');
-      });
-      div.appendChild(img);
-    }
+  const stageCanonical = canonAvail && (mode !== 'opaque' || canonical.rev >= appliedSrcRev);
+  let targetSrc = null;
+  if (stageCanonical || useShip) {
     const src = useShip
       ? `/ship/${n}.svg?g=${ship.gen}&r=${ship.srcRev}`
       : `/canonical/${n}.svg?c=${canonical.id}`;
-    if (img.dataset.src !== src) {
-      img.dataset.src = src;
-      img.src = src; // in-DOM swap keeps old pixels until the new SVG decodes
-    }
+    targetSrc = src;
+    img = queueCanonicalImageSwap(
+      div,
+      src,
+      useShip
+        ? { w: geometry.paperwidth, h: geometry.paperheight }
+        : canonical.papers?.[n - 1] ?? canonical.paper,
+      useShip
+        ? { id: null, rev: ship.srcRev, pageCount: canonical?.pageCount }
+        : { id: canonical.id, rev: canonical.rev, pageCount: canonical.pageCount }
+    );
+  } else {
+    div.dataset.canonWanted = '';
+    delete div.dataset.canonPending;
   }
 
   // Binary per page: canonical pixels only when a compile of the CURRENT
   // source covers this page; otherwise the provisional layer owns the whole
   // page. No band splice — mixing the two layouts on one page showed stale
   // and edited lines together whenever they drifted.
-  const state = fresh ? 'final' : 'provisional';
+  const targetPresented = Boolean(
+    targetSrc && img?.dataset.src === targetSrc && div.dataset.canonPresentedSrc === targetSrc
+  );
+  const state = mode === 'opaque'
+    ? (img ? 'final' : 'provisional')
+    : (fresh && targetPresented ? 'final' : 'provisional');
   if (img) img.style.clipPath = '';
   div.classList.toggle('is-final', state === 'final');
   div.classList.remove('is-partial');
   // a fully-fresh canonical is the page-count authority: provisional-only
   // pages beyond it are phantoms of the JS pagination and are hidden
-  const phantom =
+  const phantom = mode !== 'opaque' &&
     canonical &&
     canonical.id &&
     canonical.rev >= appliedSrcRev &&
@@ -662,7 +1413,17 @@ function updateBadge() {
   let cls = 'state-preview';
   let text;
   if (mode === 'opaque') {
-    if (canonical?.id && !canonical.inFlight && !err && canonical.rev >= appliedSrcRev) {
+    const viewport = pagesEl.getBoundingClientRect();
+    const visible = [...pageDivs.values()].filter((page) => {
+      const rect = page.getBoundingClientRect();
+      return rect.bottom > viewport.top && rect.top < viewport.bottom;
+    });
+    const required = visible.length ? visible : [...pageDivs.values()].slice(0, 1);
+    const exactPresented = required.length > 0 && required.every((page) => {
+      const state = presentedPageState(page);
+      return state?.id === Number(canonical?.id) && state?.rev === Number(appliedSrcRev);
+    });
+    if (canonical?.id && !canonical.inFlight && !err && canonical.rev >= appliedSrcRev && exactPresented) {
       cls = 'state-exact';
       text = 'LuaLaTeX 直描画';
     } else {
@@ -803,6 +1564,15 @@ async function pollStatus() {
     clearTimeout(timer);
     if (!r.ok) throw new Error(String(r.status));
     const s = await r.json();
+    lastEngineStatus = s;
+    const statusDocumentEpoch = Number(s.documentEpoch);
+    if (documentReset.adoptedEpoch > 0 &&
+        Number.isInteger(statusDocumentEpoch) && statusDocumentEpoch > documentReset.adoptedEpoch) {
+      beginClientDocumentReset(statusDocumentEpoch);
+      if (!s.busy) completeClientDocumentReset(statusDocumentEpoch);
+    } else if (documentReset.pending?.epoch === statusDocumentEpoch && !s.busy) {
+      completeClientDocumentReset(statusDocumentEpoch);
+    }
     if (pillEdits > 0 || s.busy) {
       if (!pillBusySince) pillBusySince = Date.now() - (s.busyMs || 0);
       const secs = Math.floor((Date.now() - pillBusySince) / 1000);
@@ -821,6 +1591,7 @@ async function pollStatus() {
       pill('ok', '待機中');
     }
   } catch {
+    lastEngineStatus = { up: false };
     pillBusySince = 0;
     pill('down', 'サーバー応答なし');
   }
@@ -842,15 +1613,46 @@ editor.addEventListener('input', () => {
 // scroll only moves the overlay — it must never re-render the highlight
 editor.addEventListener('scroll', syncHighlightScroll);
 
-// Preview interaction: Alt+click a glyph/rule jumps to the corresponding
-// source in the editor — the data-src mapping is an engine feature (every
-// display-list command carries its source block id).
+// Preview interaction: Cmd/Ctrl+click mirrors the static PDF viewer's
+// SyncTeX gesture.  In embedded mode the real editor owns navigation; the
+// standalone TDOM workbench keeps Alt+click for its internal textarea.
 pagesEl.addEventListener('click', async (ev) => {
-  if (!ev.altKey) return;
+  if (embeddedHost ? !(ev.metaKey || ev.ctrlKey) : !ev.altKey) return;
+  if (ev.target?.closest?.('.tdom-direct-editor')) return;
+  const clickEpoch = ++directEditClickEpoch;
+  const clickedPage = pageAtClientPoint(ev, ev.target);
+  const presented = mode === 'opaque' ? presentedPageState(clickedPage) : null;
+  if (mode === 'opaque' && !presented) return;
+  const stillCurrent = () => {
+    if (clickEpoch !== directEditClickEpoch || !clickedPage?.isConnected) return false;
+    if (mode !== 'opaque') return true;
+    const current = presentedPageState(clickedPage);
+    return current?.id === presented.id && current?.rev === presented.rev && current?.src === presented.src;
+  };
   const src = srcOf(ev.target);
-  if (!src) return;
-  const dom = await fetch('/dom').then((r) => r.json());
-  const block = dom.blocks.find((b) => b.id === src);
+  ev.preventDefault();
+  ev.stopPropagation();
+  let location = null;
+  let block = null;
+  if (src) {
+    const dom = await fetch('/dom').then((r) => r.json());
+    block = dom.blocks.find((b) => b.id === src);
+    if (block) location = block.source;
+  }
+  if (!location && embeddedHost) location = await syncLocationForClick(ev, clickedPage);
+  if (!location || !stillCurrent()) return;
+  if (embeddedHost) {
+    window.parent.postMessage({
+      source: 'tdom-embed',
+      activationId: embedActivationId,
+      documentEpoch: documentReset.adoptedEpoch,
+      action: 'source',
+      file: location.file,
+      line: location.start?.line ?? location.line,
+      column: location.start?.column ?? location.column ?? 1,
+    }, '*');
+    return;
+  }
   if (!block) return;
   const offset = lineColToOffset(editor.value, block.source.start.line, block.source.start.column);
   editor.focus();
@@ -859,6 +1661,1771 @@ pagesEl.addEventListener('click', async (ev) => {
   editor.scrollTop = Math.max(0, lineTop * 19 - editor.clientHeight / 2);
   statusEl.textContent = `ソース対応 ${src} → main.tex:${block.source.start.line} (${block.type})`;
 });
+
+function latexEscapeText(value) {
+  return String(value ?? '').replace(/[\\{}$&#_%^~]/g, (char) => ({
+    '\\': '\\textbackslash{}',
+    '{': '\\{',
+    '}': '\\}',
+    '$': '\\$',
+    '&': '\\&',
+    '#': '\\#',
+    '_': '\\_',
+    '%': '\\%',
+    '^': '\\^{}',
+    '~': '\\~{}',
+  })[char]);
+}
+
+function mathRowAt(value, limit) {
+  let row = 0;
+  for (let i = 0; i + 1 < Math.min(value.length, limit); i++) {
+    if (value[i] !== '\\' || value[i + 1] !== '\\') continue;
+    let preceding = 0;
+    for (let j = i - 1; j >= 0 && value[j] === '\\'; j--) preceding++;
+    if ((preceding & 1) === 0) {
+      row++;
+      i++;
+    }
+  }
+  return row;
+}
+
+function mathRowEnd(value, wantedRow) {
+  let row = 0;
+  for (let i = 0; i + 1 < value.length; i++) {
+    if (value[i] !== '\\' || value[i + 1] !== '\\') continue;
+    let preceding = 0;
+    for (let j = i - 1; j >= 0 && value[j] === '\\'; j--) preceding++;
+    if ((preceding & 1) !== 0) continue;
+    if (row === wantedRow) return i;
+    row++;
+    i++;
+  }
+  return value.length;
+}
+
+function preserveMathAuxCommands(baseValue, nextValue) {
+  const base = String(baseValue ?? '');
+  let next = String(nextValue ?? '');
+  const auxiliaries = [];
+  const pattern = /\\(?:label\{(?:[^{}]|\\.)*\}|(?:notag|nonumber)\b)/g;
+  let match;
+  while ((match = pattern.exec(base))) {
+    if (!next.includes(match[0])) {
+      auxiliaries.push({ command: match[0], row: mathRowAt(base, match.index) });
+    }
+  }
+  // Insert from the final row backwards so earlier offsets stay stable.
+  auxiliaries.sort((a, b) => b.row - a.row);
+  for (const auxiliary of auxiliaries) {
+    const offset = mathRowEnd(next, auxiliary.row);
+    next = next.slice(0, offset) + auxiliary.command + next.slice(offset);
+  }
+  return next;
+}
+
+function shouldWrapAligned(value) {
+  const text = String(value ?? '');
+  if (!text || text.includes('\\begin{') || text.includes('\\end{')) return false;
+  let slashRun = 0;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === '\\') {
+      slashRun++;
+      if (slashRun === 2) return true;
+      continue;
+    }
+    if (char === '&' && (slashRun & 1) === 0) return true;
+    slashRun = 0;
+  }
+  return false;
+}
+
+function wrapAligned(value) {
+  return '\\begin{aligned}\n' + value + '\n\\end{aligned}';
+}
+
+function unwrapAligned(value) {
+  const text = String(value ?? '');
+  const begin = '\\begin{aligned}';
+  const end = '\\end{aligned}';
+  const start = text.indexOf(begin);
+  const finish = text.lastIndexOf(end);
+  if (start < 0 || finish < 0 || text.slice(0, start).trim() || text.slice(finish + end.length).trim()) {
+    return { value: text, unwrapped: false };
+  }
+  let inner = text.slice(start + begin.length, finish);
+  if (inner.startsWith('\n')) inner = inner.slice(1);
+  if (inner.endsWith('\n')) inner = inner.slice(0, -1);
+  return { value: inner, unwrapped: true };
+}
+
+function mathSourceOffsetFromClick(value, clickedWord, bounds, point) {
+  const Coordinator = window.TdomOpaqueEditorCoordinator;
+  if (typeof Coordinator?.mathSourceOffset !== 'function') return null;
+  return Coordinator.mathSourceOffset({
+    value,
+    clickedWord,
+    words: clickedWord?.pageWords ?? [],
+    bounds,
+    point,
+  });
+}
+
+function mathCaretStructure(field, offset, markerId = '') {
+  const clean = (value) => String(value ?? '')
+    .replaceAll(`\\placeholder[${markerId}]{}`, '')
+    .replaceAll(`\\placeholder[${markerId}]`, '');
+  const info = field.getElementInfo?.(offset) ?? {};
+  const context = field.getEnvironmentContext?.(offset) ?? {};
+  return JSON.stringify({
+    depth: info.depth ?? null,
+    mode: info.mode ?? context.mode ?? null,
+    latex: clean(info.latex),
+    branchPath: context.branchPath ?? [],
+    environments: context.environments ?? [],
+    array: context.nearestArray ? {
+      environmentName: context.nearestArray.environmentName,
+      row: context.nearestArray.row,
+      column: context.nearestArray.column,
+    } : null,
+  });
+}
+
+function ensureMathCaretProbe(control) {
+  if (mathCaretProbe?.constructor === control.constructor && mathCaretProbe.isConnected) return mathCaretProbe;
+  mathCaretProbe?.remove?.();
+  mathCaretProbe = new control.constructor();
+  mathCaretProbe.setAttribute('aria-hidden', 'true');
+  Object.assign(mathCaretProbe.style, {
+    position: 'fixed',
+    left: '-10000px',
+    top: '-10000px',
+    width: '1px',
+    height: '1px',
+    overflow: 'hidden',
+    opacity: '0',
+    pointerEvents: 'none',
+  });
+  document.body.appendChild(mathCaretProbe);
+  try {
+    mathCaretProbe.setOptions?.({
+      smartFence: false,
+      smartMode: false,
+      inlineShortcuts: {},
+      popoverPolicy: 'off',
+      mathVirtualKeyboardPolicy: 'manual',
+      removeExtraneousParentheses: false,
+    });
+    mathCaretProbe.menuItems = [];
+  } catch { /* the probe still supports parsing and prompt ranges */ }
+  return mathCaretProbe;
+}
+
+function mathModelOffsetFromSource(control, latex, estimatedOffset, wrapped = false) {
+  const source = String(latex ?? '');
+  const estimate = Math.max(0, Math.min(source.length, Math.round(Number(estimatedOffset) || 0)));
+  const cacheKey = `${wrapped ? 1 : 0}:${source}:${estimate}`;
+  if (mathCaretOffsetCache.has(cacheKey)) return mathCaretOffsetCache.get(cacheKey);
+  const probe = ensureMathCaretProbe(control);
+  const candidates = [];
+  for (let distance = 0; distance <= source.length; distance++) {
+    const left = estimate - distance;
+    const right = estimate + distance;
+    if (left >= 0) candidates.push(left);
+    if (distance && right <= source.length) candidates.push(right);
+  }
+  const safeLexicalBoundary = (offset) => {
+    const before = source.slice(0, offset);
+    const after = source.slice(offset);
+    if (/\\[A-Za-z]*$/.test(before) && /^[A-Za-z]/.test(after)) return false;
+    if (/\\[A-Za-z]+$/.test(before) && /^\s*\{/.test(after)) return false;
+    return true;
+  };
+  for (const sourceOffset of candidates) {
+    if (!safeLexicalBoundary(sourceOffset)) continue;
+    const id = `tdom_caret_${++mathCaretProbeSeq}`;
+    const marker = `\\placeholder[${id}]{}`;
+    const markedSource = source.slice(0, sourceOffset) + marker + source.slice(sourceOffset);
+    const marked = wrapped ? wrapAligned(markedSource) : markedSource;
+    try {
+      probe.setValue(marked, { format: 'latex', silenceNotifications: true });
+      const range = probe.getPromptRange?.(id);
+      const modelOffset = Array.isArray(range) ? Number(range[0]) - 1 : NaN;
+      if (!Number.isInteger(modelOffset) || modelOffset < 0 || modelOffset > Number(control.lastOffset)) continue;
+      if (Number(probe.lastOffset) !== Number(control.lastOffset) + 2) continue;
+      let structureMatches = true;
+      for (let realOffset = 0; realOffset <= Number(control.lastOffset); realOffset++) {
+        const probeOffset = realOffset <= modelOffset ? realOffset : realOffset + 2;
+        if (mathCaretStructure(control, realOffset) !== mathCaretStructure(probe, probeOffset, id)) {
+          structureMatches = false;
+          break;
+        }
+      }
+      if (!structureMatches) continue;
+      mathCaretOffsetCache.set(cacheKey, modelOffset);
+      while (mathCaretOffsetCache.size > 512) {
+        mathCaretOffsetCache.delete(mathCaretOffsetCache.keys().next().value);
+      }
+      return modelOffset;
+    } catch { /* try the next syntax-safe source boundary */ }
+  }
+  return Number(control.lastOffset) || 0;
+}
+
+function loadMathWysiwyg() {
+  if (!mathWysiwygModulePromise) {
+    mathWysiwygModulePromise = import('/host/web/math/wysiwyg/math-wysiwyg.js');
+  }
+  return mathWysiwygModulePromise;
+}
+
+async function editRegionById(id) {
+  if (!editDomCache || editDomCache.rev !== appliedRev) {
+    editDomCache = await fetch('/dom', { cache: 'no-store' }).then((r) => r.json());
+  }
+  for (const block of editDomCache.blocks ?? []) {
+    const region = (block.editRegions ?? []).find((item) => item.id === id);
+    if (region) return { ...region, blockSource: block.source ?? null };
+  }
+  return null;
+}
+
+async function editBlockBySourceId(id) {
+  if (!editDomCache || editDomCache.rev !== appliedRev) {
+    editDomCache = await fetch('/dom', { cache: 'no-store' }).then((r) => r.json());
+  }
+  return (editDomCache.blocks ?? []).find((block) => block.id === id) ?? null;
+}
+
+function sourceContainsPosition(region, location) {
+  const line = Number(location?.line);
+  const column = Number(location?.column);
+  if (!Number.isFinite(line)) return true;
+  const start = region.source?.start;
+  const end = region.source?.end;
+  if (!start || !end || line < start.line || line > end.line) return false;
+  // SyncTeX frequently reports column 1 as a line-only location (not the
+  // literal first source character), especially for caption/section boxes.
+  if (!Number.isFinite(column) || column <= 1) return true;
+  if (line === start.line && column < start.column) return false;
+  if (line === end.line && column > end.column) return false;
+  return true;
+}
+
+function sameSourceFile(a, b) {
+  const left = String(a ?? '').replace(/\\/g, '/').replace(/^\.\//, '');
+  const right = String(b ?? '').replace(/\\/g, '/').replace(/^\.\//, '');
+  return Boolean(left && right) && (
+    left === right || left.endsWith('/' + right) || right.endsWith('/' + left)
+  );
+}
+
+function paperPointForClick(event, page) {
+  const rect = page?.getBoundingClientRect?.();
+  if (!rect?.width || !rect?.height) return null;
+  const paper = activePaperGeometry(page);
+  // `paper.width/height` are the final pdftocairo SVG viewport dimensions.
+  // The canonical API accepts this same displayed coordinate space and owns
+  // the inverse `/Rotate`/PDF-content transform before invoking SyncTeX.
+  return window.TdomOpaqueEditorCoordinator?.paperPoint?.({
+    clientX: event.clientX,
+    clientY: event.clientY,
+    pageRect: rect,
+    paper,
+  }) ?? null;
+}
+
+function clientBoundsForDisplayedPaperBounds(bounds, page) {
+  const rect = page?.getBoundingClientRect?.();
+  const paper = activePaperGeometry(page);
+  return window.TdomOpaqueEditorCoordinator?.clientBounds?.({ bounds, pageRect: rect, paper }) ?? null;
+}
+
+function pageAtClientPoint(event, target = null) {
+  const direct = target?.closest?.('#pages > .page');
+  if (direct) return direct;
+  for (const element of document.elementsFromPoint?.(event.clientX, event.clientY) ?? []) {
+    const page = element?.closest?.('#pages > .page');
+    if (page) return page;
+  }
+  return [...pageDivs.values()].find((page) => {
+    const rect = page.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 &&
+      event.clientX >= rect.left && event.clientX <= rect.right &&
+      event.clientY >= rect.top && event.clientY <= rect.bottom;
+  }) ?? null;
+}
+
+function sourceColumnForOpaqueClick(location, point) {
+  const syncedColumn = Number(location?.column);
+  // SyncTeX's returned column is authoritative when available. Column 1
+  // means “line only”; inventing a character offset from x/line-width mixes
+  // proportional TeX glyph metrics with source character counts. Spatial
+  // text/math boxes below handle that case instead.
+  return syncedColumn >= 1 ? syncedColumn : 1;
+}
+
+function caretOffsetForOpaqueRegion(region, location, clickedWord = null, bounds = null, point = null) {
+  const value = String(region?.value ?? '');
+  if (region?.kind === 'math') {
+    return mathSourceOffsetFromClick(value, clickedWord, bounds, point);
+  }
+  const start = region?.source?.start;
+  const line = Number(location?.line);
+  const column = Number(location?.column);
+  if (start && sourceContainsPosition(region, { line, column }) &&
+      Number.isInteger(line) && Number.isInteger(column) && column > 1) {
+    const lines = value.split('\n');
+    const relativeLine = line - start.line;
+    if (relativeLine >= 0 && relativeLine < lines.length) {
+      let offset = 0;
+      for (let index = 0; index < relativeLine; index++) offset += lines[index].length + 1;
+      const baseColumn = relativeLine === 0 ? start.column : 1;
+      offset += Math.max(0, column - baseColumn);
+      return Math.max(0, Math.min(value.length, offset));
+    }
+  }
+  const printed = String(clickedWord?.text ?? '');
+  const group = Array.isArray(bounds?.words) ? bounds.words : [];
+  const clickedIndex = group.findIndex((word) => word === clickedWord || (
+    word.text === clickedWord?.text && Math.abs(word.left - Number(clickedWord?.left)) < 0.01 &&
+    Math.abs(word.top - Number(clickedWord?.top)) < 0.01
+  ));
+  if (printed && clickedIndex >= 0) {
+    let cursor = 0;
+    let at = -1;
+    for (let index = 0; index <= clickedIndex; index++) {
+      const token = String(group[index]?.text ?? '');
+      at = value.indexOf(token, cursor);
+      if (at < 0) break;
+      cursor = at + token.length;
+    }
+    if (at >= 0) {
+      const wordBox = group[clickedIndex];
+      const midpoint = (wordBox.left + wordBox.right) / 2;
+      // PDF extraction exposes exact word rectangles, not per-glyph
+      // advances. Choose an exact source boundary rather than inventing an
+      // equal-width character metric for proportional fonts and ligatures.
+      return Math.max(0, Math.min(value.length, point?.x < midpoint ? at : at + printed.length));
+    }
+  }
+  return null;
+}
+
+async function canonicalSourceBounds(region, pageNumber = null, requestedId = canonical?.id, near = null) {
+  const id = Number(requestedId);
+  if (!region?.source || !Number.isFinite(id)) return null;
+  const key = `${id}:${region.id ?? ''}:${region.source.file ?? ''}:` +
+    `${region.source.start?.line}:${region.source.start?.column}:` +
+    `${region.source.end?.line}:${region.source.end?.column}`;
+  let candidates = canonicalRegionBoundsCache.get(key);
+  if (!candidates) try {
+    const Coordinator = window.TdomOpaqueEditorCoordinator;
+    const probeLocations = Coordinator?.sourceProbeLocations?.(region) ??
+      [region.source.start, region.source.end].filter(Boolean).map((position) => ({
+        file: region.source.file,
+        line: position?.line,
+        column: position?.column,
+      }));
+    if (!probeLocations.length) return null;
+    const response = await fetch('/synctex/forward', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id,
+        locations: probeLocations,
+      }),
+    });
+    const all = response.ok ? (await response.json()).results?.filter(Boolean) ?? [] : [];
+    // Forward SyncTeX results are normalized by canonical.js into the same
+    // displayed SVG coordinates used by `near`, pdftotext word boxes, and
+    // the direct-editor overlay (including rotated/mixed-size pages).
+    // Never union the region boundaries. In a display environment those
+    // positions are usually the newline after `\\begin` and the `\\end`
+    // line; SyncTeX legitimately maps them to the preceding paragraph and
+    // the whole column. The coordinator selects one compact raw TeX box near
+    // the clicked canonical point from structural + visible-content probes.
+    candidates = all;
+    if (!candidates.length) return null;
+    canonicalRegionBoundsCache.set(key, candidates);
+    while (canonicalRegionBoundsCache.size > 512) {
+      canonicalRegionBoundsCache.delete(canonicalRegionBoundsCache.keys().next().value);
+    }
+  } catch {
+    return null;
+  }
+  return window.TdomOpaqueEditorCoordinator?.selectSourceBounds?.({
+    results: candidates,
+    pageNumber,
+    near,
+  }) ?? null;
+}
+
+async function canonicalTextBoxes(requestedId = canonical?.id) {
+  const id = Number(requestedId);
+  if (!Number.isFinite(id)) return [];
+  if (canonicalTextBoxesCache.has(id)) return canonicalTextBoxesCache.get(id);
+  try {
+    const response = await fetch(`/canonical/boxes?c=${id}`, { cache: 'no-store' });
+    if (!response.ok) return [];
+    // Poppler already returns word rectangles after page `/Rotate`; do not
+    // rotate them again. Their space is the canonical SVG viewport.
+    const pages = (await response.json()).pages ?? [];
+    // Cache under the ID that was actually requested, never whichever
+    // canonical happened to become global while the request was awaiting.
+    canonicalTextBoxesCache.set(id, pages);
+    while (canonicalTextBoxesCache.size > 4) {
+      canonicalTextBoxesCache.delete(canonicalTextBoxesCache.keys().next().value);
+    }
+    return pages;
+  } catch {
+    return [];
+  }
+}
+
+async function canonicalTextBounds(value, pageNumber = null, near = null, requestedId = canonical?.id) {
+  const wanted = printedKey(value);
+  if (!wanted) return null;
+  const pages = await canonicalTextBoxes(requestedId);
+  const matches = [];
+  const pageIndexes = Number.isInteger(pageNumber)
+    ? [pageNumber - 1]
+    : pages.map((_, index) => index);
+  for (const pageIndex of pageIndexes) {
+    const words = pages[pageIndex] ?? [];
+    for (let start = 0; start < words.length; start++) {
+      let joined = '';
+      for (let end = start; end < words.length && joined.length <= wanted.length; end++) {
+        joined += printedKey(words[end].text);
+        if (joined === wanted) {
+          const group = words.slice(start, end + 1);
+          matches.push({
+            page: pageIndex + 1,
+            left: Math.min(...group.map((item) => item.left)),
+            top: Math.min(...group.map((item) => item.top)),
+            right: Math.max(...group.map((item) => item.right)),
+            bottom: Math.max(...group.map((item) => item.bottom)),
+            words: group,
+          });
+          break;
+        }
+        if (!wanted.startsWith(joined)) break;
+      }
+    }
+  }
+  if (!matches.length) return null;
+  if (!near) return matches[0];
+  const pageMatches = Number.isInteger(Number(near.page))
+    ? matches.filter((match) => match.page === Number(near.page))
+    : matches;
+  const available = pageMatches.length ? pageMatches : matches;
+  return available.sort((a, b) => {
+    const acx = (a.left + a.right) / 2;
+    const acy = (a.top + a.bottom) / 2;
+    const bcx = (b.left + b.right) / 2;
+    const bcy = (b.top + b.bottom) / 2;
+    return (acx - near.x) ** 2 + (acy - near.y) ** 2 -
+      ((bcx - near.x) ** 2 + (bcy - near.y) ** 2);
+  })[0];
+}
+
+async function canonicalWordAtPoint(pageNumber, point, requestedId = canonical?.id) {
+  if (!Number.isInteger(pageNumber) || !point) return null;
+  const words = (await canonicalTextBoxes(requestedId))[pageNumber - 1] ?? [];
+  const readingIndex = words.findIndex((word) =>
+    point.x >= word.left - 1 && point.x <= word.right + 1 &&
+    point.y >= word.top - 2 && point.y <= word.bottom + 2
+  );
+  return readingIndex < 0 ? null : { ...words[readingIndex], readingIndex, pageWords: words };
+}
+
+async function opaquePrintBounds(
+  region,
+  location,
+  point,
+  generatedIndex = null,
+  generatedCount = null,
+  requestedId = canonical?.id
+) {
+  if (region.kind === 'text') {
+    const exact = await canonicalTextBounds(region.value, location?.anchor?.page ?? null, point, requestedId);
+    if (exact) return exact;
+  }
+  const exactSource = await canonicalSourceBounds(
+    region,
+    location?.anchor?.page ?? null,
+    requestedId,
+    point
+  );
+  if (exactSource) return exactSource;
+  let box = location?.anchor?.box ?? null;
+  if (box && Number.isInteger(generatedIndex) && generatedCount > 1) {
+    const height = box.bottom - box.top;
+    if (height > generatedCount * 4) {
+      const top = box.top + (height * generatedIndex) / generatedCount;
+      box = { ...box, top, bottom: box.top + (height * (generatedIndex + 1)) / generatedCount };
+    }
+  }
+  return box;
+}
+
+async function refreshDirectEditorExactBounds(pageNumber) {
+  const session = directEditor;
+  if (!session || mode !== 'opaque' || session.pageNumber !== pageNumber) return;
+  const page = pageDivs.get(pageNumber);
+  const presented = presentedPageState(page);
+  if (!presented) return;
+  let bounds = null;
+  if (session.kind === 'text') {
+    const value = session.readValue?.() ?? session.region.value;
+    const near = session.printBounds
+      ? {
+          x: (session.printBounds.left + session.printBounds.right) / 2,
+          y: (session.printBounds.top + session.printBounds.bottom) / 2,
+        }
+      : null;
+    bounds = await canonicalTextBounds(value, pageNumber, near, presented.id);
+  } else {
+    bounds = await canonicalSourceBounds(session.region, pageNumber, presented.id, session.printBounds ? {
+      page: pageNumber,
+      x: (session.printBounds.left + session.printBounds.right) / 2,
+      y: (session.printBounds.top + session.printBounds.bottom) / 2,
+    } : null);
+  }
+  if (directEditor?.sessionId !== session.sessionId) return;
+  if (bounds) {
+    session.printBounds = bounds;
+    session.presentedId = presented.id;
+    session.presentedRev = presented.rev;
+  }
+  requestAnimationFrame(repositionDirectEditor);
+}
+
+async function syncLocationForClick(event, page) {
+  const presented = mode === 'opaque' ? presentedPageState(page) : null;
+  const mappingId = presented?.id ?? canonical?.id;
+  if (!mappingId || (mode !== 'opaque' && canonical.rev !== appliedSrcRev)) return null;
+  const pageNumber = Number(page?.dataset?.page);
+  const point = paperPointForClick(event, page);
+  if (!point || !Number.isFinite(pageNumber)) return null;
+  try {
+    const response = await fetch('/synctex', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        page: pageNumber,
+        x: point.x,
+        y: point.y,
+        id: mappingId,
+      }),
+    });
+    if (!response.ok) return null;
+    const result = await response.json();
+    return { ...result, canonicalId: mappingId, canonicalRev: presented?.rev ?? canonical?.rev };
+  } catch {
+    return null;
+  }
+}
+
+async function resolveOpaqueEditRegion(page, event) {
+  if (mode !== 'opaque') return null;
+  if (!page) page = pageAtClientPoint(event);
+  const pageNumber = Number(page?.dataset?.page);
+  const point = paperPointForClick(event, page);
+  if (!page || !Number.isInteger(pageNumber) || !point) return null;
+  const presented = presentedPageState(page);
+  if (!presented) return null;
+  const stillPresented = () => {
+    const current = presentedPageState(page);
+    return current?.id === presented.id && current?.rev === presented.rev && current?.src === presented.src;
+  };
+  const location = await syncLocationForClick(event, page);
+  if (!stillPresented()) return null;
+  const domSnapshot = presented.snapshot;
+  const clickedWord = await canonicalWordAtPoint(pageNumber, point, presented.id);
+  if (!stillPresented()) return null;
+  const word = printedKey(clickedWord?.text);
+  const printedCandidates = [];
+  for (const block of domSnapshot.blocks ?? []) {
+    for (const item of block.editRegions ?? []) {
+      if (item.kind !== 'text' ||
+          location?.file && !sameSourceFile(item.source?.file, location.file) ||
+          word && !printedKey(item.value).includes(word)) continue;
+      const bounds = await canonicalTextBounds(item.value, pageNumber, point, presented.id);
+      if (!bounds || point.x < bounds.left - 2 || point.x > bounds.right + 2 ||
+          point.y < bounds.top - 2 || point.y > bounds.bottom + 2) continue;
+      printedCandidates.push({
+        region: { ...item, blockSource: block.source ?? null },
+        printBounds: bounds,
+        caretOffset: caretOffsetForOpaqueRegion(item, location, clickedWord, bounds, point),
+      });
+    }
+  }
+  if (!stillPresented()) return null;
+  if (printedCandidates.length) {
+    return printedCandidates.sort((a, b) =>
+      (a.printBounds.right - a.printBounds.left) * (a.printBounds.bottom - a.printBounds.top) -
+      (b.printBounds.right - b.printBounds.left) * (b.printBounds.bottom - b.printBounds.top)
+    )[0];
+  }
+  if (!location?.file || !Number.isFinite(Number(location.line))) return null;
+  const sourceColumn = sourceColumnForOpaqueClick(location, point);
+  const atPoint = { ...location, column: sourceColumn };
+  const blocks = (domSnapshot.blocks ?? []).filter((block) =>
+    sameSourceFile(block.source?.file, location.file) &&
+    Number(location.line) >= Number(block.source?.start?.line) &&
+    Number(location.line) <= Number(block.source?.end?.line)
+  );
+
+  // Prefer the exact forward SyncTeX boxes for math on this source line.
+  // This avoids converting proportional TeX glyph advances into a source
+  // column by a linear character-count ratio.
+  const spatialMath = [];
+  for (const block of blocks) {
+    for (const item of block.editRegions ?? []) {
+      if (item.kind !== 'math' || !sameSourceFile(item.source?.file, location.file) ||
+          Number(location.line) < Number(item.source?.start?.line) ||
+          Number(location.line) > Number(item.source?.end?.line)) continue;
+      const region = { ...item, blockSource: block.source ?? null };
+      const bounds = await canonicalSourceBounds(region, pageNumber, presented.id, point);
+      if (!stillPresented()) return null;
+      if (!bounds || point.x < bounds.left - 3 || point.x > bounds.right + 3 ||
+          point.y < bounds.top - 3 || point.y > bounds.bottom + 3) continue;
+      spatialMath.push({
+        region,
+        printBounds: bounds,
+        caretOffset: caretOffsetForOpaqueRegion(region, location, clickedWord, bounds, point),
+      });
+    }
+  }
+  if (spatialMath.length) {
+    spatialMath.sort((a, b) => {
+      const aContains = sourceContainsPosition(a.region, atPoint) ? 0 : 1;
+      const bContains = sourceContainsPosition(b.region, atPoint) ? 0 : 1;
+      if (aContains !== bContains) return aContains - bContains;
+      const acx = (a.printBounds.left + a.printBounds.right) / 2;
+      const acy = (a.printBounds.top + a.printBounds.bottom) / 2;
+      const bcx = (b.printBounds.left + b.printBounds.right) / 2;
+      const bcy = (b.printBounds.top + b.printBounds.bottom) / 2;
+      return (acx - point.x) ** 2 + (acy - point.y) ** 2 -
+        ((bcx - point.x) ** 2 + (bcy - point.y) ** 2);
+    });
+    return spatialMath[0];
+  }
+  // A blank margin, column gutter or line-end has neither a canonical word
+  // nor an exact math box. Reverse SyncTeX returns the nearest source line,
+  // but proximity is navigation data, not proof that editable ink was hit.
+  if (!clickedWord) return null;
+  for (const block of blocks) {
+    const regions = (block.editRegions ?? [])
+      .filter((region) => sameSourceFile(region.source?.file, location.file))
+      .map((region) => ({ ...region, blockSource: block.source ?? null }));
+    let candidates = regions.filter((region) => sourceContainsPosition(region, atPoint));
+    if (clickedWord && candidates.some((region) => region.kind === 'text')) {
+      const word = printedKey(clickedWord.text);
+      const visible = candidates.filter((region) =>
+        region.kind !== 'text' || printedKey(region.value).includes(word)
+      );
+      // A reference/citation number can reverse-map to the surrounding
+      // source line. If the printed word is not part of any editable value,
+      // it remains navigation/structure rather than opening nearby prose.
+      candidates = visible.some((region) => region.kind === 'text') ||
+        candidates.some((region) => region.kind !== 'text') ? visible : [];
+    }
+    let generatedIndex = null;
+    let generatedAnchor = null;
+    if (!candidates.length) {
+      const generated = regions.filter((region) =>
+        Number(region.source?.end?.line) < Number(block.source?.start?.line)
+      ).sort((a, b) =>
+        Number(a.source.start.line) - Number(b.source.start.line) ||
+        Number(a.source.start.column) - Number(b.source.start.column)
+      );
+      if (generated.length) {
+        const printed = await Promise.all(generated.map((region) =>
+          canonicalTextBounds(region.value, Number(page.dataset.page), point, presented.id)
+        ));
+        if (!stillPresented()) return null;
+        const printedIndex = printed.findIndex((bounds) => bounds && point &&
+          point.x >= bounds.left - 3 && point.x <= bounds.right + 3 &&
+          point.y >= bounds.top - 3 && point.y <= bounds.bottom + 3);
+        if (printedIndex >= 0) {
+          generatedIndex = printedIndex;
+          generatedAnchor = { page: Number(page.dataset.page), ...printed[printedIndex], box: printed[printedIndex] };
+        }
+        const anchors = (location.anchors ?? [])
+          .filter((item) => item.page === Number(page.dataset.page))
+          .sort((a, b) => a.y - b.y ||
+            (b.box.right - b.box.left) - (a.box.right - a.box.left))
+          .filter((item, index, all) => index === 0 ||
+            Math.abs(item.y - all[index - 1].y) > 1);
+        if (generatedIndex == null && anchors.length && point) {
+          let anchorIndex = 0;
+          let best = Infinity;
+          for (let index = 0; index < anchors.length; index++) {
+            const center = (anchors[index].box.top + anchors[index].box.bottom) / 2;
+            const distance = Math.abs(point.y - center);
+            if (distance < best) {
+              best = distance;
+              anchorIndex = index;
+            }
+          }
+          generatedIndex = anchors.length === 1
+            ? 0
+            : Math.round((anchorIndex / (anchors.length - 1)) * (generated.length - 1));
+          generatedAnchor = anchors[anchorIndex];
+        } else if (generatedIndex == null) {
+          const anchor = location.anchor?.box;
+          const ratio = anchor && point && anchor.bottom > anchor.top
+            ? Math.max(0, Math.min(0.999, (point.y - anchor.top) / (anchor.bottom - anchor.top)))
+            : 0;
+          generatedIndex = Math.min(generated.length - 1, Math.floor(ratio * generated.length));
+        }
+        candidates = [generated[generatedIndex]];
+      }
+    }
+    if (!candidates.length) continue;
+    const region = candidates.sort((a, b) => {
+      const ac = (Number(a.source.start.column) + Number(a.source.end.column)) / 2;
+      const bc = (Number(b.source.start.column) + Number(b.source.end.column)) / 2;
+      return Math.abs(ac - sourceColumn) - Math.abs(bc - sourceColumn);
+    })[0];
+    const printBounds = await opaquePrintBounds(
+      region,
+      generatedAnchor ? { ...location, anchor: generatedAnchor } : location,
+      point,
+      generatedIndex,
+      generatedIndex == null ? null : regions.filter((item) =>
+        Number(item.source?.end?.line) < Number(block.source?.start?.line)
+      ).length,
+      presented.id
+    );
+    if (!stillPresented()) return null;
+    if (!printBounds || point.x < printBounds.left - 3 || point.x > printBounds.right + 3 ||
+        point.y < printBounds.top - 3 || point.y > printBounds.bottom + 3) return null;
+    return {
+      region,
+      printBounds,
+      caretOffset: caretOffsetForOpaqueRegion(region, location, clickedWord, printBounds, point),
+    };
+  }
+  return null;
+}
+
+function chooseRegionByGeometry(candidates, target, event, page, src) {
+  if (candidates.length <= 1) return candidates[0] ?? null;
+  const sorted = [...candidates].sort(
+    (a, b) => a.source.start.line - b.source.start.line || a.source.start.column - b.source.start.column
+  );
+  const sourceHits = [...page.querySelectorAll('.tdom-source-hit')]
+    .filter((node) => node.dataset.src === src && node.getBoundingClientRect().height > 1.5)
+    .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+  if (target.classList.contains('tdom-source-hit') && sourceHits.length > 1) {
+    const targetIndex = sourceHits.indexOf(target);
+    const byLine = [];
+    for (const region of sorted) {
+      const line = region.source.start.line;
+      let group = byLine.find((item) => item.line === line);
+      if (!group) {
+        group = { line, regions: [] };
+        byLine.push(group);
+      }
+      group.regions.push(region);
+    }
+    if (byLine.length > 1 && targetIndex >= 0) {
+      const index = Math.round((targetIndex / Math.max(1, sourceHits.length - 1)) * (byLine.length - 1));
+      candidates = byLine[Math.max(0, Math.min(byLine.length - 1, index))].regions;
+      if (candidates.length === 1) return candidates[0];
+    }
+  }
+
+  const rect = target.getBoundingClientRect();
+  if (!rect.width) return candidates[0] ?? null;
+  const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  const start = Math.min(...candidates.map((region) => region.source.start.column));
+  const end = Math.max(...candidates.map((region) => region.source.end.column));
+  const sourceColumn = start + ratio * Math.max(1, end - start);
+  return candidates.find(
+    (region) => sourceColumn >= region.source.start.column - 0.35 &&
+      sourceColumn <= region.source.end.column + 0.35
+  ) ?? null;
+}
+
+async function resolveEditRegion(target, event) {
+  const src = srcOf(target);
+  let page = target.closest('#pages > .page');
+  if (!src || !page) return null;
+  const targetSnapshot = {
+    pageNumber: Number(page.dataset.page),
+    line: target.dataset.line ?? null,
+    math: target.dataset.math === '1',
+    text: String(target.textContent ?? '').trim(),
+    sourceHit: target.classList.contains('tdom-source-hit'),
+  };
+  const block = await editBlockBySourceId(src);
+  let candidates = [...(block?.editRegions ?? [])]
+    .map((region) => ({ ...region, blockSource: block?.source ?? null }));
+  if (!candidates.length) return null;
+
+  // Fetching /dom can overlap a provisional page repaint. The clicked SVG
+  // glyph is then detached even though the same printed glyph is already in
+  // the replacement SVG. Reacquire it by source identity and click point so
+  // rapid edits at a second location do not disappear between those steps.
+  if (!target.isConnected) {
+    page = pageDivs.get(targetSnapshot.pageNumber) ?? page;
+    const nodes = [...page.querySelectorAll(`[data-src="${CSS.escape(src)}"]`)]
+      .filter((node) => targetSnapshot.math === (node.dataset.math === '1'));
+    const atPoint = nodes.find((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 &&
+        event.clientX >= rect.left && event.clientX <= rect.right &&
+        event.clientY >= rect.top && event.clientY <= rect.bottom;
+    });
+    const sameText = targetSnapshot.text
+      ? nodes.find((node) => String(node.textContent ?? '').trim() === targetSnapshot.text)
+      : null;
+    const sameLine = targetSnapshot.line == null
+      ? null
+      : nodes.find((node) => node.dataset.line === targetSnapshot.line);
+    const sameHit = targetSnapshot.sourceHit
+      ? nodes.find((node) => node.classList.contains('tdom-source-hit'))
+      : null;
+    target = atPoint ?? sameText ?? sameLine ?? sameHit ?? nodes[0] ?? null;
+    if (!target) return null;
+  }
+
+  if (target.dataset.math === '1') {
+    const math = candidates.filter((region) => region.kind === 'math');
+    if (math.length) candidates = math;
+  } else if (!target.classList.contains('tdom-source-hit')) {
+    const printed = String(target.textContent ?? '').replace(/\s+/g, '');
+    if (printed) {
+      const text = candidates.filter(
+        (region) => region.kind === 'text' &&
+          String(region.value ?? '').replace(/\s+/g, '').includes(printed)
+      );
+      if (text.length) candidates = text;
+      else return null; // a reference/citation glyph is navigation, not prose
+    } else return null; // images/rules are structural, never caption text
+  }
+
+  if (target.classList.contains('tdom-source-hit') && target.dataset.line != null) {
+    const displayedLine = Number(target.dataset.line);
+    const sourceLine = Number(block?.source?.start?.line);
+    if (Number.isFinite(displayedLine) && Number.isFinite(sourceLine)) {
+      const onDisplayedLine = candidates.filter((region) => {
+        const start = Number(region.source?.start?.line) - sourceLine;
+        const end = Number(region.source?.end?.line) - sourceLine;
+        return Number.isFinite(start) && Number.isFinite(end) &&
+          displayedLine >= start && displayedLine <= end;
+      });
+      if (onDisplayedLine.length) candidates = onDisplayedLine;
+    }
+  }
+
+  const generatedFromPreamble = candidates.length > 0 && candidates.every((region) =>
+    region.source?.file === block.source?.file &&
+    Number(region.source?.end?.line) < Number(block.source?.start?.line)
+  );
+  if (target.classList.contains('tdom-source-hit') || block?.gfx) {
+    const location = await syncLocationForClick(event, page);
+    if (location) {
+      const atPoint = candidates.filter((region) => sourceContainsPosition(region, location));
+      if (atPoint.length) candidates = atPoint;
+      else {
+        // \maketitle pixels reverse-map to the \maketitle invocation, while
+        // their editable values live in earlier \title/\author/\date lines.
+        // Keep those candidates and let the vertically ordered source-hit
+        // geometry below select the matching generated field.
+        if (!generatedFromPreamble) return null;
+      }
+    } else if (
+      block?.gfx &&
+      !generatedFromPreamble &&
+      !(
+        candidates.length === 1 && candidates[0].kind === 'math' ||
+        target.classList.contains('tdom-source-hit') &&
+          target.dataset.ink === '1' &&
+          target.dataset.complex !== '1'
+      )
+    ) {
+      // Generated caption prefixes and references can repeat real source
+      // words.  A complex graphics block needs current SyncTeX to
+      // disambiguate them; during canonical convergence, do not guess. A
+      // displayed math line with exactly one math region is already
+      // unambiguous and remains immediately editable across consecutive
+      // changes while the canonical page catches up.
+      return null;
+    } else if (
+      target.classList.contains('tdom-source-hit') &&
+      !generatedFromPreamble &&
+      (target.dataset.ink !== '1' || target.dataset.complex === '1') &&
+      !candidates.some((region) => Number(String(region.id).split(':').at(-1)) >= 1_000_000)
+    ) {
+      // An image/graphics box may share a rescued block with an editable
+      // caption. Without current SyncTeX or glyph ink, do not guess that an
+      // image click meant the caption.
+      return null;
+    }
+  }
+  return chooseRegionByGeometry(candidates, target, event, page, src);
+}
+
+function editBounds(id, page) {
+  const nodes = [...page.querySelectorAll(`[data-edit="${CSS.escape(id)}"]`)]
+    .filter((node) => !node.classList.contains('tdom-direct-editor'));
+  if (!nodes.length) return null;
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+  for (const node of nodes) {
+    const rect = node.getBoundingClientRect();
+    if (!rect.width && !rect.height) continue;
+    left = Math.min(left, rect.left);
+    top = Math.min(top, rect.top);
+    right = Math.max(right, rect.right);
+    bottom = Math.max(bottom, rect.bottom);
+  }
+  return Number.isFinite(left) ? { left, top, right, bottom } : null;
+}
+
+function unionNodeBounds(nodes) {
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+  for (const node of nodes ?? []) {
+    const rect = node?.getBoundingClientRect?.();
+    if (!rect || (!rect.width && !rect.height)) continue;
+    left = Math.min(left, rect.left);
+    top = Math.min(top, rect.top);
+    right = Math.max(right, rect.right);
+    bottom = Math.max(bottom, rect.bottom);
+  }
+  return Number.isFinite(left) ? { left, top, right, bottom } : null;
+}
+
+function printedKey(value) {
+  return String(value ?? '').normalize('NFKC').replace(/\s+/gu, '');
+}
+
+function textRegionNodes(page, src, value) {
+  const wanted = printedKey(value);
+  if (!wanted) return [];
+  const nodes = [...page.querySelectorAll(`svg text[data-src="${CSS.escape(src)}"]`)]
+    .filter((node) => node.dataset.math !== '1' && node.getBoundingClientRect().width > 0);
+  const pieces = nodes.map((node) => printedKey(node.textContent));
+  for (let start = 0; start < nodes.length; start++) {
+    if (!pieces[start] || !wanted.startsWith(pieces[start])) continue;
+    let joined = '';
+    for (let end = start; end < nodes.length && joined.length <= wanted.length; end++) {
+      joined += pieces[end];
+      if (joined === wanted) return nodes.slice(start, end + 1);
+      if (!wanted.startsWith(joined)) break;
+    }
+  }
+  return [];
+}
+
+function mathRegionNodes(page, meta) {
+  if (!meta?.src) return [];
+  const selector = `[data-src="${CSS.escape(meta.src)}"]`;
+  const mathGlyphs = [...page.querySelectorAll(`svg text${selector}[data-math="1"]`)]
+    .filter((node) => node.getBoundingClientRect().width > 0);
+  const clicked = Number(meta.line);
+  const mathLines = [...new Set(mathGlyphs
+    .map((node) => Number(node.dataset.line))
+    .filter(Number.isFinite))].sort((a, b) => a - b);
+  let lineGroup = Number.isFinite(clicked) ? [clicked] : [];
+  if (Number.isFinite(clicked) && mathLines.includes(clicked)) {
+    const at = mathLines.indexOf(clicked);
+    let first = at;
+    let last = at;
+    while (first > 0 && mathLines[first] - mathLines[first - 1] <= 1) first--;
+    while (last + 1 < mathLines.length && mathLines[last + 1] - mathLines[last] <= 1) last++;
+    lineGroup = mathLines.slice(first, last + 1);
+  }
+  const lineSet = new Set(lineGroup.map(String));
+  const preciseNodes = [...page.querySelectorAll(`svg ${selector}[data-line]`)].filter((node) => {
+    if (!lineSet.has(node.dataset.line)) return false;
+    if (node.matches('text[data-math="1"]')) return true;
+    // Fraction bars and similar TeX rules belong to the formula. Source-hit
+    // rectangles span an entire printed line and must not widen an inline
+    // formula editor into a separate line-sized input surface.
+    return node.matches('rect:not(.tdom-edit-hit):not(.tdom-source-hit)');
+  });
+  if (preciseNodes.some((node) => node.matches('text[data-math="1"]'))) return preciseNodes;
+  // Exact-render image chunks have no individual SVG glyphs. Their source
+  // hit is the only provisional geometry available until inverse SyncTeX
+  // boxes are carried into the display list.
+  const blockLine = Number(directEditor?.region?.blockSource?.start?.line);
+  const regionStart = Number(directEditor?.region?.source?.start?.line);
+  const regionEnd = Number(directEditor?.region?.source?.end?.line);
+  const exactLineSet = Number.isFinite(blockLine) && Number.isFinite(regionStart) && Number.isFinite(regionEnd)
+    ? new Set(Array.from(
+      { length: Math.max(1, regionEnd - regionStart + 1) },
+      (_, index) => String(regionStart - blockLine + index)
+    ))
+    : lineSet;
+  return [...page.querySelectorAll(`svg rect.tdom-source-hit${selector}[data-line]`)]
+    .filter((node) => exactLineSet.has(node.dataset.line));
+}
+
+function directEditorAnchor(page) {
+  if (!directEditor) return null;
+  if (directEditor.anchor?.isConnected) return directEditor.anchor;
+  const meta = directEditor.anchorMeta;
+  if (!meta?.src) return null;
+  const nodes = [...page.querySelectorAll(`[data-src="${CSS.escape(meta.src)}"]`)]
+    .filter((node) => !node.classList.contains('tdom-direct-editor'));
+  const sameLine = meta.line == null
+    ? nodes
+    : nodes.filter((node) => node.dataset.line === meta.line);
+  const sameKind = meta.math
+    ? sameLine.filter((node) => node.dataset.math === '1')
+    : sameLine;
+  const sameText = meta.text
+    ? sameKind.find((node) => String(node.textContent ?? '').trim() === meta.text)
+    : null;
+  directEditor.anchor = sameText ?? sameKind[0] ?? sameLine[0] ?? nodes[0] ?? null;
+  return directEditor.anchor;
+}
+
+function directEditorVisualNodes(page) {
+  if (!directEditor) return [];
+  const meta = directEditor.anchorMeta;
+  if (directEditor.kind === 'text') {
+    const value = directEditor.readValue?.() ?? directEditor.region.value;
+    const matched = textRegionNodes(page, meta?.src, value);
+    if (matched.length) return matched;
+  } else {
+    const matched = mathRegionNodes(page, meta);
+    if (matched.length) return matched;
+  }
+  const anchor = directEditorAnchor(page);
+  return anchor ? [anchor] : [];
+}
+
+function syncDirectEditorTypography(page, nodes) {
+  if (!directEditor) return;
+  const textNode = nodes.find((node) => node.tagName?.toLowerCase() === 'text') ??
+    (directEditor.anchor?.tagName?.toLowerCase() === 'text' ? directEditor.anchor : null);
+  const paper = activePaperGeometry(page);
+  const scale = page.getBoundingClientRect().width / Math.max(1, paper.width);
+  const svgSize = Number(textNode?.getAttribute?.('font-size'));
+  const rect = textNode?.getBoundingClientRect?.();
+  const fontSize = Number.isFinite(svgSize) && svgSize > 0
+    ? svgSize * scale
+    : Math.max(1, rect?.height ?? 10);
+  const family = textNode?.getAttribute?.('font-family');
+  const color = textNode?.getAttribute?.('fill');
+  directEditor.element.style.setProperty('--direct-font-size', `${fontSize}px`);
+  if (family) directEditor.element.style.setProperty('--direct-font-family', family);
+  if (color) directEditor.element.style.setProperty('--direct-color', color);
+  const style = textNode ? getComputedStyle(textNode) : null;
+  if (style?.fontStyle) directEditor.element.style.setProperty('--direct-font-style', style.fontStyle);
+  if (style?.fontWeight) directEditor.element.style.setProperty('--direct-font-weight', style.fontWeight);
+}
+
+function contentEditableCaretRect(control) {
+  const selection = window.getSelection?.();
+  if (!selection?.rangeCount) return null;
+  const selected = selection.getRangeAt(0);
+  if (!control?.contains?.(selected.startContainer) || !control.contains(selected.endContainer)) return null;
+  const probe = selected.cloneRange();
+  probe.collapse(false);
+  const rects = [...probe.getClientRects()];
+  const rect = rects.at(-1) ?? probe.getBoundingClientRect();
+  return rect && [rect.left, rect.top, rect.right, rect.bottom].every(Number.isFinite) &&
+    rect.bottom > rect.top ? rect : null;
+}
+
+function alignOpaqueNativeCaretAnchor(expectedSessionId = directEditor?.sessionId) {
+  const session = directEditor;
+  if (!session || session.sessionId !== expectedSessionId) return;
+  const control = session.control;
+  if (!control?.isContentEditable) return;
+  // Always measure in untransformed browser layout coordinates. The control
+  // is transparent in opaque mode, so translating it cannot alter the
+  // canonical page and leaves the shell-owned candidate panel in place.
+  // Keep the transform composition-only because it also moves the control's
+  // pointer hitbox; ordinary re-clicks must retain the shell's exact bounds.
+  control.style.transform = '';
+  session.nativeCaretAnchor = null;
+  if (mode !== 'opaque' || session.imeComposing !== true ||
+      !session.canonicalAnchorPoint) return;
+  const page = pageDivs.get(session.pageNumber);
+  if (!page?.isConnected) return;
+  const target = clientBoundsForDisplayedPaperBounds({
+    left: session.canonicalAnchorPoint.x,
+    top: session.canonicalAnchorPoint.y,
+    right: session.canonicalAnchorPoint.x,
+    bottom: session.canonicalAnchorPoint.y,
+  }, page);
+  const caret = contentEditableCaretRect(control) ?? control.getBoundingClientRect?.();
+  if (!target || !caret) return;
+  const dx = target.left - caret.left;
+  const dy = target.top - caret.top;
+  const pageRect = page.getBoundingClientRect();
+  if (![dx, dy].every(Number.isFinite) ||
+      Math.abs(dx) > pageRect.width * 2 || Math.abs(dy) > pageRect.height * 2) return;
+  control.style.transform = `translate3d(${dx}px, ${dy}px, 0)`;
+  session.nativeCaretAnchor = {
+    target: { x: target.left, y: target.top },
+    untransformed: { x: caret.left, y: caret.top },
+    delta: { x: dx, y: dy },
+  };
+}
+
+function positionOpaqueSuggestionPanel(page, pageRect) {
+  const session = directEditor;
+  if (!session?.element?.isConnected) return;
+  const panel = session.element.querySelector('.math-wysiwyg-panel');
+  if (!panel) return;
+  if (mode !== 'opaque' || !session.canonicalAnchorPoint) {
+    session.element.style.removeProperty('--tdom-canonical-panel-left');
+    session.element.style.removeProperty('--tdom-canonical-panel-top');
+    panel.style.left = '';
+    panel.style.top = '';
+    return;
+  }
+  const target = clientBoundsForDisplayedPaperBounds({
+    left: session.canonicalAnchorPoint.x,
+    top: session.canonicalAnchorPoint.y,
+    right: session.canonicalAnchorPoint.x,
+    bottom: session.canonicalAnchorPoint.y,
+  }, page);
+  if (!target) return;
+  const shellLeft = Number.parseFloat(session.element.style.left) || 0;
+  const shellTop = Number.parseFloat(session.element.style.top) || 0;
+  const offset = window.TdomOpaqueEditorCoordinator?.overlayOffset?.({
+    pageRect,
+    shellLeft,
+    shellTop,
+    anchor: { x: target.left, y: target.top },
+    gap: 5,
+    panelRect: panel.getBoundingClientRect(),
+    viewportRect: pagesEl.getBoundingClientRect(),
+  });
+  if (!offset) return;
+  // MathLive's candidate renderer deliberately repositions its panel after
+  // every keyboard navigation render. Keep the canonical anchor on the
+  // stable editor shell so CSS can enforce it through those rerenders too.
+  session.element.style.setProperty('--tdom-canonical-panel-left', `${offset.left}px`);
+  session.element.style.setProperty('--tdom-canonical-panel-top', `${offset.top}px`);
+}
+
+function repositionDirectEditor() {
+  if (!directEditor?.element?.isConnected) return;
+  if (directEditor.control?.isContentEditable) {
+    directEditor.control.style.transform = '';
+    directEditor.nativeCaretAnchor = null;
+  }
+  const page = pageDivs.get(directEditor.pageNumber);
+  if (!page) return;
+  const pageRect = page.getBoundingClientRect();
+  let bounds = null;
+  const print = directEditor.printBounds;
+  if (print) bounds = clientBoundsForDisplayedPaperBounds(print, page);
+  if (!bounds) bounds = editBounds(directEditor.id, page);
+  if (!bounds) {
+    const visualNodes = directEditorVisualNodes(page);
+    bounds = unionNodeBounds(visualNodes);
+    if (bounds) {
+      syncDirectEditorTypography(page, visualNodes);
+      directEditor.anchorOffset = {
+        left: bounds.left - pageRect.left,
+        top: bounds.top - pageRect.top,
+        right: bounds.right - pageRect.left,
+        bottom: bounds.bottom - pageRect.top,
+      };
+    } else if (directEditor.anchorOffset) {
+      bounds = {
+        left: pageRect.left + directEditor.anchorOffset.left,
+        top: pageRect.top + directEditor.anchorOffset.top,
+        right: pageRect.left + directEditor.anchorOffset.right,
+        bottom: pageRect.top + directEditor.anchorOffset.bottom,
+      };
+    }
+  }
+  if (!bounds) return;
+  directEditor.element.style.left = `${bounds.left - pageRect.left}px`;
+  directEditor.element.style.top = `${bounds.top - pageRect.top}px`;
+  directEditor.element.style.width = `${Math.max(bounds.right - bounds.left, 1)}px`;
+  const height = Math.max(bounds.bottom - bounds.top, 1);
+  directEditor.element.style.minHeight = `${height}px`;
+  if (directEditor.kind === 'math') directEditor.element.style.height = `${height}px`;
+  positionOpaqueSuggestionPanel(page, pageRect);
+  alignOpaqueNativeCaretAnchor();
+}
+
+function closeDirectEditor() {
+  if (!directEditor) return;
+  directEditor.wysiwyg?.detach?.();
+  directEditor.wysiwyg?.close?.();
+  directEditor.element.remove();
+  directEditor = null;
+  for (const batch of opaqueCanonicalBatches.values()) {
+    restageOpaqueBatchEditor(batch);
+  }
+}
+
+function sendDirectEdit(region, sessionId, visibleValue, { cancel = false, finish = false } = {}) {
+  const sessionState = directEditor?.sessionId === sessionId ? directEditor : null;
+  if ((cancel || finish) && sessionState && !sessionState.sentEdit) return;
+  if (!cancel && !finish && sessionState?.lastVisibleValue === visibleValue) return;
+  const replacement = region.kind === 'math'
+    ? preserveMathAuxCommands(region.value, visibleValue)
+    : latexEscapeText(visibleValue);
+  const payload = {
+    source: 'tdom-embed',
+    activationId: embedActivationId,
+    documentEpoch: documentReset.adoptedEpoch,
+    action: 'edit',
+    sessionId,
+    regionId: region.id,
+    kind: region.kind,
+    file: region.source.file,
+    start: region.source.start,
+    end: region.source.end,
+    baseValue: region.sourceValue ?? region.value,
+    value: visibleValue,
+    replacement,
+    cancel,
+    finish,
+    sourceRev: sessionState?.presentedRev ?? appliedSrcRev,
+  };
+  if (sessionState && !cancel && !finish) {
+    sessionState.sentEdit = true;
+    sessionState.lastVisibleValue = visibleValue;
+    sessionState.sentFromSrcRev = Number(appliedSrcRev);
+    for (const batch of opaqueCanonicalBatches.values()) {
+      restageOpaqueBatchEditor(batch);
+    }
+  }
+  if (embeddedHost) {
+    window.parent.postMessage(payload, '*');
+    return;
+  }
+  // Standalone workbench: apply the same range to its textarea and let the
+  // existing 80 ms source-sync path update the engine.
+  const start = lineColToOffset(editor.value, region.source.start.line, region.source.start.column);
+  const session = directEditor?.standalone;
+  const old = session?.lastReplacement ?? region.value;
+  if (editor.value.slice(start, start + old.length) !== old) return;
+  editor.value = editor.value.slice(0, start) + replacement + editor.value.slice(start + old.length);
+  if (directEditor) directEditor.standalone = { lastReplacement: replacement };
+  scheduleHighlight();
+  scheduleSync();
+}
+
+async function openDirectEditor(
+  id,
+  target,
+  knownRegion = null,
+  clickPoint = null,
+  printBounds = null,
+  caretOffset = null
+) {
+  const page = target.closest('#pages > .page');
+  const pageNumber = Number(page?.dataset?.page);
+  if (!page || !Number.isFinite(pageNumber)) return;
+  const presented = mode === 'opaque' ? presentedPageState(page) : null;
+  if (mode === 'opaque' && !presented) return;
+  const region = knownRegion ?? await editRegionById(id);
+  if (!region) return;
+  if (directEditor) {
+    sendDirectEdit(
+      directEditor.region,
+      directEditor.sessionId,
+      directEditor.readValue?.() ?? String(directEditor.control.value ?? directEditor.region.value),
+      { finish: true }
+    );
+    closeDirectEditor();
+  }
+
+  const shell = document.createElement('div');
+  shell.className = `tdom-direct-editor is-${region.kind}`;
+  shell.classList.toggle('is-opaque', mode === 'opaque');
+  shell.dataset.edit = id;
+  const sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+  let control;
+  let mathWrapped = false;
+  let wysiwyg = null;
+
+  if (region.kind === 'math' && customElements.get('math-field')) {
+    const Mathfield = customElements.get('math-field');
+    const mf = new Mathfield();
+    mf.className = 'tdom-direct-mathfield';
+    mf.setAttribute('aria-label', 'Edit formula');
+    // The printed TeX pixels remain the visual authority while MathLive is
+    // focused above them. MathLive inherits transparent glyph color from the
+    // host, but TeX64 auxiliary-command badges have their own background and
+    // color inside the shadow root; neutralize those paints as well so a
+    // click cannot change even one formula pixel.
+    const transparentPaint = document.createElement('style');
+    transparentPaint.textContent = `
+      .ML__tex64-aux-command,
+      .ML__tex64-aux-command * {
+        color: transparent !important;
+        background: transparent !important;
+        border-color: transparent !important;
+        box-shadow: none !important;
+        -webkit-text-fill-color: transparent !important;
+      }
+    `;
+    mf.shadowRoot?.appendChild(transparentPaint);
+    try {
+      const ctor = mf.constructor;
+      ctor.fontsDirectory = '/host/mathlive/fonts';
+      ctor.soundsDirectory = null;
+      ctor.locale = 'en';
+      mf.setOptions?.({
+        smartFence: false,
+        smartMode: false,
+        inlineShortcuts: {},
+        popoverPolicy: 'off',
+        mathVirtualKeyboardPolicy: 'manual',
+        removeExtraneousParentheses: false,
+      });
+      mf.mathVirtualKeyboardPolicy = 'manual';
+      mathWrapped = shouldWrapAligned(region.value);
+      mf.value = mathWrapped ? wrapAligned(region.value) : region.value;
+    } catch { mf.textContent = region.value; }
+    control = mf;
+    control.addEventListener('contextmenu', (event) => event.preventDefault());
+    control.addEventListener('keydown', (event) => {
+      if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey)) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    }, { capture: true });
+    control.addEventListener('focus', () => {
+      try { window.mathVirtualKeyboard?.hide?.(); } catch { /* no global keyboard */ }
+    });
+  } else {
+    const input = document.createElement('span');
+    input.className = region.kind === 'math' ? 'tdom-direct-math-fallback' : 'tdom-direct-text';
+    input.setAttribute('contenteditable', 'plaintext-only');
+    input.setAttribute('role', 'textbox');
+    input.setAttribute('aria-multiline', 'true');
+    // Monaco/texlab owns document spell checking. Native contenteditable
+    // squiggles would paint over the canonical TeX pixels even though this
+    // direct-input layer is otherwise transparent.
+    input.spellcheck = false;
+    input.setAttribute('aria-label', region.kind === 'math' ? 'Edit formula source' : 'Edit text');
+    input.textContent = region.value;
+    control = input;
+  }
+
+  const readValue = () => {
+    let value;
+    if (typeof control.getValue === 'function') {
+      try { value = String(control.getValue('latex')); } catch { /* fallback below */ }
+    }
+    if (value == null) value = String(control.value ?? control.textContent ?? '');
+    if (region.kind === 'math' && mathWrapped) {
+      const result = unwrapAligned(value);
+      if (result.unwrapped) return result.value;
+      mathWrapped = false;
+    }
+    return value;
+  };
+  const resizeText = () => {
+    if (!control.isContentEditable) return;
+    control.style.minHeight = `${Math.max(1, control.scrollHeight)}px`;
+  };
+  let composing = false;
+  const realignOpaqueCaret = () => alignOpaqueNativeCaretAnchor(sessionId);
+  control.addEventListener('compositionstart', () => {
+    composing = true;
+    if (directEditor?.sessionId === sessionId) directEditor.imeComposing = true;
+    realignOpaqueCaret();
+  });
+  control.addEventListener('compositionupdate', realignOpaqueCaret);
+  control.addEventListener('compositionend', () => {
+    composing = false;
+    resizeText();
+    sendDirectEdit(region, sessionId, readValue());
+    if (directEditor?.sessionId === sessionId) directEditor.imeComposing = false;
+    realignOpaqueCaret();
+  });
+  control.addEventListener('input', () => {
+    resizeText();
+    realignOpaqueCaret();
+    if (mode === 'opaque' && region.kind === 'math') {
+      requestAnimationFrame(repositionDirectEditor);
+    }
+    // Native IME composition can emit several transient input values.
+    // Keep those local to the overlay and submit only the committed text.
+    if (composing) return;
+    sendDirectEdit(region, sessionId, readValue());
+  });
+  control.addEventListener('keydown', (event) => {
+    if (wysiwyg?.handleKeydown?.(event)) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      sendDirectEdit(region, sessionId, region.value, { cancel: true });
+      closeDirectEditor();
+    } else if (region.kind === 'math' && event.key === 'Enter' && !event.shiftKey) {
+      const api = control;
+      if ((event.metaKey || event.ctrlKey) && typeof api.executeCommand === 'function') {
+        const before = typeof api.getValue === 'function' ? String(api.getValue('latex') ?? '') : '';
+        try { api.executeCommand('addColumnAfter'); } catch { /* finish below */ }
+        const after = typeof api.getValue === 'function' ? String(api.getValue('latex') ?? '') : before;
+        if (after !== before) {
+          event.preventDefault();
+          control.dispatchEvent(new Event('input', { bubbles: true }));
+          return;
+        }
+      } else if (typeof api.executeCommand === 'function') {
+        const before = typeof api.getValue === 'function' ? String(api.getValue('latex') ?? '') : '';
+        try { api.executeCommand('addRowAfter'); } catch { /* finish below */ }
+        const after = typeof api.getValue === 'function' ? String(api.getValue('latex') ?? '') : before;
+        if (after !== before) {
+          event.preventDefault();
+          control.dispatchEvent(new Event('input', { bubbles: true }));
+          return;
+        }
+      }
+      event.preventDefault();
+      control.blur();
+    } else if (
+      region.kind === 'math' &&
+      event.key === '/' &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      !event.shiftKey &&
+      typeof control.getValue === 'function'
+    ) {
+      const selection = control.selection;
+      const range = Array.isArray(selection?.ranges?.[0])
+        ? selection.ranges[0]
+        : Array.isArray(selection) && typeof selection[0] === 'number'
+          ? selection
+          : null;
+      if (range && range[0] !== range[1]) {
+        const selected = String(control.getValue(range[0], range[1], 'latex') ?? '');
+        if (selected) {
+          event.preventDefault();
+          try {
+            control.executeCommand?.('insert', '\\frac{' + selected + '}{\\placeholder{}}', {
+              selectionMode: 'placeholder',
+              focus: true,
+              feedback: false,
+              format: 'latex',
+            });
+            control.dispatchEvent(new Event('input', { bubbles: true }));
+          } catch { /* let MathLive keep the selection */ }
+        }
+      }
+    }
+  });
+  control.addEventListener('blur', () => {
+    window.setTimeout(() => {
+      if (directEditor?.sessionId === sessionId && !shell.contains(document.activeElement)) {
+        sendDirectEdit(region, sessionId, readValue(), { finish: true });
+        closeDirectEditor();
+      }
+    }, 0);
+  });
+  shell.appendChild(control);
+  page.appendChild(shell);
+  if (control.tagName === 'MATH-FIELD') {
+    try { control.menuItems = []; } catch { /* field remains keyboard-editable */ }
+  }
+  const Coordinator = window.TdomOpaqueEditorCoordinator;
+  const clickOnPaper = mode === 'opaque' && clickPoint
+    ? paperPointForClick({ clientX: clickPoint.x, clientY: clickPoint.y }, page)
+    : null;
+  const caretAnchorRatio = Coordinator?.caretAnchorRatio?.(printBounds, clickOnPaper) ?? null;
+  directEditor = {
+    id,
+    region,
+    sessionId,
+    element: shell,
+    control,
+    pageNumber,
+    kind: region.kind,
+    standalone: null,
+    wysiwyg: null,
+    anchor: target,
+    anchorMeta: {
+      src: srcOf(target),
+      line: target.dataset.line ?? null,
+      math: target.dataset.math === '1',
+      text: String(target.textContent ?? '').trim(),
+    },
+    anchorOffset: null,
+    printBounds,
+    caretOffset,
+    caretAnchorRatio,
+    // The visible candidate UI and the native IME window share one exact
+    // canonical-paper anchor. Zoom/layout changes only project this point to
+    // client pixels; a new document generation updates it in the same atomic
+    // batch as the page and source mapping.
+    canonicalAnchorPoint: clickOnPaper,
+    nativeCaretAnchor: null,
+    imeComposing: false,
+    presentedId: presented?.id ?? null,
+    presentedRev: presented?.rev ?? appliedSrcRev,
+    readValue,
+    sentEdit: false,
+    lastVisibleValue: region.value,
+    sentFromSrcRev: Number(presented?.rev ?? appliedSrcRev),
+  };
+  // Position synchronously. Math WYSIWYG is loaded lazily and must not
+  // leave a newly opened field flashing at the page origin meanwhile.
+  repositionDirectEditor();
+  if (region.kind === 'math' && control.tagName === 'MATH-FIELD') {
+    try {
+      const { initMathWysiwyg } = await loadMathWysiwyg();
+      if (directEditor?.sessionId === sessionId) {
+        wysiwyg = initMathWysiwyg({
+          container: shell,
+          autoSuggest: true,
+          getMruStorageKey: () => 'tex64.math-wysiwyg.mru',
+          insertKey: (key) => {
+            const latex = String(key?.latex ?? '').replace(/#\?/g, '\\placeholder{}');
+            if (!latex) return;
+            try {
+              control.executeCommand?.('insert', latex, {
+                selectionMode: 'placeholder',
+                focus: true,
+                feedback: false,
+                format: 'latex',
+              });
+              control.dispatchEvent(new Event('input', { bubbles: true }));
+            } catch { /* keep the current formula intact */ }
+          },
+        });
+        wysiwyg.attach(control);
+        directEditor.wysiwyg = wysiwyg;
+      }
+    } catch { /* MathLive itself remains usable without suggestions */ }
+  }
+  repositionDirectEditor();
+  resizeText();
+  requestAnimationFrame(() => {
+    const scrollTop = pagesEl.scrollTop;
+    const scrollLeft = pagesEl.scrollLeft;
+    try { control.focus({ preventScroll: true }); } catch { control.focus(); }
+    if (control.isContentEditable) {
+      const selection = window.getSelection();
+      let range = null;
+      if (mode === 'opaque') {
+        if (Number.isInteger(caretOffset)) {
+          const textNode = control.firstChild;
+          if (textNode?.nodeType === Node.TEXT_NODE) {
+            range = document.createRange();
+            range.setStart(textNode, Math.max(0, Math.min(textNode.textContent?.length ?? 0, caretOffset)));
+            range.collapse(true);
+          }
+        }
+      } else if (clickPoint) {
+        range = document.caretRangeFromPoint?.(clickPoint.x, clickPoint.y) ?? null;
+        if (range && !control.contains(range.startContainer)) range = null;
+      }
+      if (!range) {
+        range = document.createRange();
+        range.selectNodeContents(control);
+        range.collapse(false);
+      }
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    } else if (mode === 'opaque') {
+      if (Number.isInteger(caretOffset) && typeof control.getPromptRange === 'function') {
+        const offset = mathModelOffsetFromSource(control, region.value, caretOffset, mathWrapped);
+        if (Number.isFinite(offset) && offset >= 0) control.position = offset;
+      } else if (Number.isFinite(Number(control.lastOffset))) {
+        // No PDF/source mapping is safer than asking MathLive to interpret a
+        // browser-space point over a LuaLaTeX page. Keep a valid, predictable
+        // model boundary until an exact mapping is available.
+        control.position = Number(control.lastOffset);
+      }
+    } else if (clickPoint && typeof control.getOffsetFromPoint === 'function') {
+      const offset = control.getOffsetFromPoint(clickPoint.x, clickPoint.y);
+      if (Number.isFinite(offset) && offset >= 0) control.position = offset;
+    } else if (control instanceof HTMLTextAreaElement) {
+      control.setSelectionRange(control.value.length, control.value.length);
+    }
+    alignOpaqueNativeCaretAnchor(sessionId);
+    // Adding a DOM/MathLive selection can scroll after focus even when
+    // preventScroll is honored. A preview click must never move the paper.
+    pagesEl.scrollTop = scrollTop;
+    pagesEl.scrollLeft = scrollLeft;
+    requestAnimationFrame(() => {
+      if (directEditor?.sessionId === sessionId) {
+        pagesEl.scrollTop = scrollTop;
+        pagesEl.scrollLeft = scrollLeft;
+      }
+    });
+  });
+}
+
+// A plain click edits; Cmd/Ctrl+click remains source navigation.  Only the
+// printed node under the pointer activates, so scrolling/searching elsewhere
+// on the page never creates editor DOM.
+pagesEl.addEventListener('click', async (event) => {
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  if (event.target?.closest?.('.tdom-direct-editor')) return;
+  const clickEpoch = ++directEditClickEpoch;
+  const target = event.target?.closest?.('[data-edit], .tdom-source-hit, [data-src]') ??
+    (mode === 'opaque' ? pageAtClientPoint(event, event.target) : null);
+  if (!target) return;
+  const targetPage = pageAtClientPoint(event, target);
+  const presented = mode === 'opaque' ? presentedPageState(targetPage) : null;
+  if (mode === 'opaque' && !presented) return;
+  const stillCurrent = () => {
+    if (clickEpoch !== directEditClickEpoch || !targetPage?.isConnected) return false;
+    if (mode !== 'opaque') return true;
+    const current = presentedPageState(targetPage);
+    return current?.id === presented.id && current?.rev === presented.rev && current?.src === presented.src;
+  };
+  event.preventDefault();
+  event.stopPropagation();
+  const clickPoint = { x: event.clientX, y: event.clientY };
+  const id = target.dataset.edit;
+  if (id) {
+    const region = await editRegionById(id);
+    if (region && stillCurrent()) {
+      await openDirectEditor(id, target, region, clickPoint);
+    }
+    return;
+  }
+  if (mode === 'opaque') {
+    const page = targetPage;
+    const resolved = await resolveOpaqueEditRegion(page, event);
+    if (resolved && stillCurrent()) {
+      await openDirectEditor(
+        resolved.region.id,
+        page,
+        resolved.region,
+        clickPoint,
+        resolved.printBounds,
+        resolved.caretOffset
+      );
+    }
+    return;
+  }
+  const region = await resolveEditRegion(target, event);
+  if (region && stillCurrent()) {
+    await openDirectEditor(region.id, target, region, clickPoint);
+  }
+});
+
+let liveSearchRaf = 0;
+let liveSearchEpoch = 0;
+function scheduleLiveSearchRefresh() {
+  if (liveSearchRaf) return;
+  liveSearchRaf = requestAnimationFrame(() => {
+    liveSearchRaf = 0;
+    runLiveSearch(liveSearch.query, false, true);
+  });
+}
+
+async function runLiveSearch(rawQuery, findPrevious = false, preserveIndex = false) {
+  const epoch = ++liveSearchEpoch;
+  const query = String(rawQuery ?? '').trim();
+  const oldIndex = liveSearch.current;
+  for (const marker of pagesEl.querySelectorAll('.tdom-search-marker')) marker.remove();
+  if (!query) {
+    liveSearch = { query: '', results: [], current: -1 };
+    return;
+  }
+  const foldSearchText = (value) => String(value).toLocaleLowerCase().replace(/\s+/gu, '');
+  const needle = foldSearchText(query);
+  const results = [];
+  for (const [pageNumber, page] of [...pageDivs.entries()].sort((a, b) => a[0] - b[0])) {
+    const svg = page.querySelector('svg');
+    if (!svg) continue;
+    const elements = [...svg.querySelectorAll('text')];
+    let haystack = '';
+    const spans = [];
+    for (const element of elements) {
+      const value = foldSearchText(element.textContent ?? '');
+      const start = haystack.length;
+      haystack += value;
+      spans.push({ element, start, end: haystack.length });
+    }
+    const folded = haystack;
+    let from = 0;
+    while (from <= folded.length - needle.length) {
+      const at = folded.indexOf(needle, from);
+      if (at < 0) break;
+      const end = at + needle.length;
+      const hits = spans.filter((span) => span.end > at && span.start < end).map((span) => span.element);
+      if (hits.length) results.push({ pageNumber, page, svg, hits });
+      from = at + Math.max(needle.length, 1);
+    }
+  }
+  // Opaque documents intentionally have no provisional SVG/text layer.
+  // Search their canonical PDF text on demand; pdftotext is cached by the
+  // canonical renderer, so typing remains unaffected and repeat searches
+  // do no extra process work.
+  if (!results.length && canonical?.id) {
+    try {
+      const response = await fetch(`/canonical/text?c=${canonical.id}`, { cache: 'no-store' });
+      if (response.ok) {
+        const payload = await response.json();
+        (payload.pages ?? []).forEach((text, index) => {
+          const folded = foldSearchText(text);
+          let from = 0;
+          while (from <= folded.length - needle.length) {
+            const at = folded.indexOf(needle, from);
+            if (at < 0) break;
+            const pageNumber = index + 1;
+            const page = pageDivs.get(pageNumber);
+            if (page) results.push({ pageNumber, page, svg: null, hits: [] });
+            from = at + Math.max(needle.length, 1);
+          }
+        });
+      }
+    } catch { /* canonical text search is best-effort */ }
+  }
+  if (epoch !== liveSearchEpoch) return;
+  let current = -1;
+  if (results.length) {
+    if (preserveIndex) current = Math.min(Math.max(oldIndex, 0), results.length - 1);
+    else if (liveSearch.query === query && oldIndex >= 0) {
+      current = (oldIndex + (findPrevious ? -1 : 1) + results.length) % results.length;
+    } else current = findPrevious ? results.length - 1 : 0;
+  }
+  liveSearch = { query, results, current };
+  results.forEach((result, index) => {
+    if (!result.svg || !result.hits.length) return;
+    let box = null;
+    for (const element of result.hits) {
+      try {
+        const b = element.getBBox();
+        box = box
+          ? {
+              x: Math.min(box.x, b.x),
+              y: Math.min(box.y, b.y),
+              right: Math.max(box.right, b.x + b.width),
+              bottom: Math.max(box.bottom, b.y + b.height),
+            }
+          : { x: b.x, y: b.y, right: b.x + b.width, bottom: b.y + b.height };
+      } catch { /* SVG not laid out yet */ }
+    }
+    if (!box) return;
+    const vb = result.svg.viewBox?.baseVal;
+    const width = vb?.width || geometry.paperwidth;
+    const height = vb?.height || geometry.paperheight;
+    const marker = document.createElement('span');
+    marker.className = `tdom-search-marker${index === current ? ' current' : ''}`;
+    marker.style.left = `${(box.x / width) * 100}%`;
+    marker.style.top = `${(box.y / height) * 100}%`;
+    marker.style.width = `${((box.right - box.x) / width) * 100}%`;
+    marker.style.height = `${((box.bottom - box.y) / height) * 100}%`;
+    result.page.appendChild(marker);
+  });
+  results[current]?.page.scrollIntoView({ block: 'center' });
+}
 
 function lineColToOffset(text, line, col) {
   let off = 0;
@@ -881,6 +3448,7 @@ function setZoom(z) {
   pagesEl.style.setProperty('--zoom', zoom);
   document.getElementById('zoom-level').textContent = Math.round(zoom * 100) + '%';
   localStorage.setItem('tdom-zoom', String(zoom));
+  if (directEditor) requestAnimationFrame(repositionDirectEditor);
 }
 
 document.getElementById('zoom-in').addEventListener('click', () => setZoom(zoom * 1.1));
@@ -929,7 +3497,13 @@ layoutSplitterEl?.addEventListener('keydown', (ev) => {
     applySplitRatio(70);
   }
 });
-window.addEventListener('resize', () => applySplitRatio());
+window.addEventListener('resize', () => {
+  applySplitRatio();
+  if (directEditor) requestAnimationFrame(repositionDirectEditor);
+});
+pagesEl.addEventListener('scroll', () => {
+  if (directEditor) requestAnimationFrame(repositionDirectEditor);
+}, { passive: true });
 // Embed mode (?embed=1): a host app (e.g. TeX64) shows only the pages —
 // no topbar, no pane title, no inspector — and owns the editor, pushing
 // edits through POST /edit. The host passes its own look so the preview
@@ -938,7 +3512,7 @@ window.addEventListener('resize', () => applySplitRatio());
 //   ?theme=light   light page shadow + light scrollbars
 {
   const embedParams = new URLSearchParams(location.search);
-  if (embedParams.get('embed') === '1') {
+  if (embeddedHost) {
     document.body.classList.add('is-embed');
     if (layoutViewEl) layoutViewEl.value = 'preview';
     if (embedParams.get('theme') === 'light') document.body.classList.add('is-embed-light');
@@ -949,13 +3523,45 @@ window.addEventListener('resize', () => applySplitRatio());
 
     // The host's viewer toolbar drives this frame over postMessage, so the
     // host keeps its own chrome and this page stays pages-only.
-    const sortedPages = () => [...pageDivs.entries()].sort((a, b) => a[0] - b[0]);
+    const sortedPages = () => {
+      const all = [...pageDivs.entries()].sort((a, b) => a[0] - b[0]);
+      const visible = all.filter(([, div]) => !div.classList.contains('phantom'));
+      return visible.length ? visible : all;
+    };
     const currentTopPage = () => {
       const top = pagesEl.getBoundingClientRect().top;
       for (const [n, div] of sortedPages()) {
         if (div.getBoundingClientRect().bottom - top > 4) return n;
       }
       return 1;
+    };
+    const previewReady = () => {
+      if (!bootComplete || !documentReset.acceptsReady(documentReset.adoptedEpoch)) return false;
+      const entries = sortedPages();
+      if (!entries.length) return false;
+      const viewport = pagesEl.getBoundingClientRect();
+      const exposed = entries.filter(([, page]) => {
+        const rect = page.getBoundingClientRect();
+        return rect.bottom > viewport.top && rect.top < viewport.bottom;
+      });
+      const required = exposed.length ? exposed : [entries[0]];
+      if (mode === 'opaque') {
+        if (!canonical?.id || canonical.inFlight || canonical.error || canonical.rev < appliedSrcRev) {
+          return false;
+        }
+        return required.every(([, page]) => {
+          const state = presentedPageState(page);
+          return Boolean(
+            state && state.id === Number(canonical.id) && state.rev === Number(appliedSrcRev) &&
+            state.image.complete && state.image.naturalWidth > 0 &&
+            !page.classList.contains('awaiting-canonical')
+          );
+        });
+      }
+      return required.every(([, page]) =>
+        Boolean(page.querySelector('svg') ||
+          page.classList.contains('is-final') && page.querySelector('img.canon')?.complete)
+      );
     };
     const scrollToPage = (n) => {
       const entries = sortedPages();
@@ -966,17 +3572,37 @@ window.addEventListener('resize', () => applySplitRatio());
     window.addEventListener('message', (ev) => {
       const d = ev.data;
       if (!d || d.source !== 'tdom-host') return;
-      if (d.action === 'zoom-in') setZoom(zoom * 1.1);
+      if (d.activationId && d.activationId !== embedActivationId) return;
+      if (d.action === 'reset-ack') {
+        if (documentReset.acknowledge(d.documentEpoch)) {
+          maybeAdoptCompletedReset(Number(d.documentEpoch));
+        }
+      } else if (d.action === 'zoom-in') setZoom(zoom * 1.1);
       else if (d.action === 'zoom-out') setZoom(zoom / 1.1);
       else if (d.action === 'zoom-fit') setZoom(1);
       else if (d.action === 'goto-page') scrollToPage(Number(d.page));
       else if (d.action === 'page-prev') scrollToPage(currentTopPage() - 1);
       else if (d.action === 'page-next') scrollToPage(currentTopPage() + 1);
+      else if (d.action === 'search') runLiveSearch(d.query, d.findPrevious === true);
     });
     setInterval(() => {
       try {
         window.parent.postMessage(
-          { source: 'tdom-embed', pageCount: pageDivs.size, zoom, page: currentTopPage() },
+          {
+            source: 'tdom-embed',
+            activationId: embedActivationId,
+            documentEpoch: documentReset.adoptedEpoch,
+            ready: previewReady(),
+            pageCount: sortedPages().length,
+            zoom,
+            page: currentTopPage(),
+            status: lastEngineStatus,
+            search: {
+              query: liveSearch.query,
+              current: liveSearch.current >= 0 ? liveSearch.current + 1 : 0,
+              total: liveSearch.results.length,
+            },
+          },
           '*'
         );
       } catch { /* host gone */ }
@@ -1164,10 +3790,31 @@ const sse = new EventSource('/events');
 sse.onmessage = (ev) => {
   try {
     const msg = JSON.parse(ev.data);
+    stateEventEpoch++;
+    if (msg.kind === 'reset-pending') {
+      beginClientDocumentReset(msg.documentEpoch);
+      return;
+    }
+    if (msg.kind === 'reset') {
+      // A reconnect can miss reset-pending. Starting the same gate here is
+      // still safe: the new DOM waits for the host's static-view ack.
+      if (!documentReset.pending) beginClientDocumentReset(msg.documentEpoch);
+      completeClientDocumentReset(msg.documentEpoch);
+      return;
+    }
+    if (documentReset.pending) {
+      // New-engine canonical/update events may arrive before reset completes.
+      // /doc is the single atomic snapshot adopted after both sides agree.
+      return;
+    }
+    if (Number.isInteger(Number(msg.documentEpoch)) &&
+        Number(msg.documentEpoch) !== documentReset.adoptedEpoch) {
+      return;
+    }
     if (msg.kind === 'canonical') {
       // a real-lualatex compile landed: converge every covered page to it
       canonical = msg.canonical;
-      if (msg.mode) setMode(msg.mode, modeReasons);
+      if (msg.mode) setMode(msg.mode, msg.canonical?.modeReasons ?? modeReasons);
       syncCanonical();
       return;
     }
@@ -1183,6 +3830,7 @@ sse.onmessage = (ev) => {
       // dirty marks, but re-evaluate each repainted page's overlay state
       if (msg.rev > appliedRev) {
         appliedRev = msg.rev;
+        if (mode === 'opaque') return;
         for (const patch of msg.patches) {
           if (patch.type === 'replace-page') {
             const dl = patch.displayList;
@@ -1215,8 +3863,6 @@ sse.onmessage = (ev) => {
             }
           });
       }
-    } else if (msg.kind === 'reset') {
-      if (document.activeElement !== editor) boot();
     }
   } catch {
     /* ignore malformed events */

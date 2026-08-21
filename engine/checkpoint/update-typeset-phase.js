@@ -54,6 +54,13 @@ export async function runUpdateTypesetPhase(engine, {
       break;
     }
   }
+  let lastDirty = firstDirty;
+  for (let k = engine.blocks.length - 1; k >= 0; k--) {
+    if (dirtySource.has(engine.blocks[k].id)) {
+      lastDirty = k;
+      break;
+    }
+  }
   let i = nearestCheckpoint(Math.min(firstDirty, engine.blocks.length));
   while (i < engine.blocks.length) {
     // /status liveness marker: which block the foreground pass is on —
@@ -83,7 +90,11 @@ export async function runUpdateTypesetPhase(engine, {
       }
     }
     i++;
-    if (i <= firstDirty) continue; // replay ramp up to the edited region
+    // External project updates can dirty disjoint blocks in one source
+    // snapshot (for example an included chapter plus the generated .bbl at
+    // the end). Never accept an intermediate clean block as convergence
+    // while a later source-dirty block is still waiting.
+    if (i <= lastDirty) continue;
     if (!wasClean) {
       // an EDITED block that reproduced its galley AND exit state exactly
       // (stale-first rescue reuse, comment-only change) moved nothing:

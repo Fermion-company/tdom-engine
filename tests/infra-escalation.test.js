@@ -78,12 +78,24 @@ const editAppend = async (marker) => {
 test('fork failure escalates to a full rebuild and heals', opts, async () => {
   await settle();
   await armFault('FORKFAIL', 99);
+  const resetBoundaries = [];
+  const resetCompletions = [];
+  eng.onDocumentResetPending = (event) => resetBoundaries.push(event);
+  eng.onDocumentResetComplete = (event) => resetCompletions.push(event);
   const t0 = Date.now();
   const report = await editAppend('FORKFAIL RECOVERY MARKER');
+  eng.onDocumentResetPending = null;
+  eng.onDocumentResetComplete = null;
   const took = Date.now() - t0;
   assert.equal(eng.mode, 'structured');
   assert.ok(source.includes('FORKFAIL RECOVERY MARKER'));
   assert.equal(report.stats?.rebooted, true, 'the full-rebuild retry ran');
+  assert.ok(
+    resetBoundaries.some((event) => event.reason === 'engine-retry-reboot'),
+    'the host is warned before the retry destroys the resident tree'
+  );
+  assert.equal(resetCompletions.length, 1, 'the retry reset has one terminal completion');
+  assert.equal(resetCompletions[0].report, report, 'completion carries the adoptable report');
   // FORKFAIL is reported instantly — no job-timeout burn before the rebuild
   assert.ok(took < 30_000, `healed in ${took}ms`);
   assert.ok((report.patches?.length ?? 0) >= 1, 'rebuilt pages were patched');

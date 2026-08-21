@@ -10,6 +10,7 @@ import { buildIsolatedRenderSource } from './isolated-render-source.js';
 const execFileP = promisify(execFile);
 
 export function queueIsolatedRender(engine, block, idx, renderBlock) {
+  if (engine.closed) return Promise.resolve();
   // isolated renders are FULL lualatex runs of the document preamble —
   // dozens in parallel overload the machine, hit the 90s timeout and
   // leave truncated PDFs ('Invalid XRef'). Serialize them; each result
@@ -44,17 +45,18 @@ export function queueIsolatedRender(engine, block, idx, renderBlock) {
  */
 async function renderIdleGate(engine) {
   for (;;) {
+    if (engine.closed) return false;
     const busy =
       engine.rescueQueue.size > 0 ||
       engine.canonical.info().inFlight ||
       Date.now() - (engine.lastEditAt ?? 0) < 3000;
-    if (!busy) return;
+    if (!busy) return true;
     await new Promise((r) => setTimeout(r, 500));
   }
 }
 
 export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, asyncRepaginate }) {
-  await renderIdleGate(engine);
+  if (!(await renderIdleGate(engine)) || engine.closed) return;
   // the idle gate can hold this job for minutes — the index captured at
   // queue time is stale after any insertion/deletion above the block, and
   // blocks[idx-1] would then be a DIFFERENT block's exit state (wrong

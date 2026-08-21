@@ -16,6 +16,8 @@ export async function closeEngine(engine) {
   clearTimeout(engine.shipBootTimer);
   if (engine.shipping) await engine.shipping.close().catch(() => {});
   engine.rescueQueue.clear();
+  engine.renderWant.clear();
+  engine.isoRenderPending?.clear();
   for (const child of engine.isoChildren) {
     try { child.kill('SIGKILL'); } catch { /* gone */ }
   }

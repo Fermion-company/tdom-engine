@@ -24,6 +24,30 @@ function parseVec(json) {
   }
 }
 
+const SP_PER_BP = 65781.76;
+
+/** Full trailing glue spec for a \lastskip primer (dimensions in sp). */
+function trailingGlueSpec(galley, widthSp) {
+  const fallback = {
+    widthSp: Math.round(widthSp ?? 0),
+    stretchSp: 0,
+    shrinkSp: 0,
+    stretchOrder: 0,
+    shrinkOrder: 0,
+  };
+  const tail = galley?.items?.at?.(-1);
+  if (!tail || tail.k !== 'glue') return fallback;
+  const tailWidthSp = Math.round((tail.a ?? 0) * SP_PER_BP);
+  if (Math.abs(tailWidthSp - fallback.widthSp) > 2) return fallback;
+  return {
+    widthSp: fallback.widthSp,
+    stretchSp: Math.round((tail.st ?? 0) * SP_PER_BP),
+    shrinkSp: Math.round((tail.sh ?? 0) * SP_PER_BP),
+    stretchOrder: tail.sto ?? 0,
+    shrinkOrder: tail.sho ?? 0,
+  };
+}
+
 // stateVec layout: [...counters, tdom@pd, tdom@nobreak, tdom@ls]
 function vecCountersEqual(aJson, bJson) {
   const a = parseVec(aJson);
@@ -84,4 +108,5 @@ export {
   push2,
   resolvedInGalley,
   stableFontKey,
+  trailingGlueSpec,
 };

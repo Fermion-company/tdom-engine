@@ -34,11 +34,17 @@ const UNSAFE_PACKAGES = [
   // NOT pdfpages: loading it is harmless (macro definitions only). The
   // ACTION — \includepdf — is a single block, and the isolated exact-render
   // rescue ships its foreign pages as real per-page chunks with forced
-  // breaks (same machinery as landscape/longtable). Gate granularity is
+  // breaks (same machinery as longtable). Gate granularity is
   // block, not document.
   'pagegrid',
   'fancytabs',
   'thumbs',
+  // These packages rotate complete shipped pages. The structured layer has
+  // one document-wide SVG viewport and cannot transform its source hit map
+  // into the per-page displayed coordinate system. Keep the exact page and
+  // SyncTeX/word-box resolver as the sole display/edit authority instead.
+  'pdflscape',
+  'lscape',
 ];
 // NOT here: multicol/paracol/longtable/tcolorbox/mdframed — their
 // environments are single blocks (the segmenter never splits inside an
@@ -55,6 +61,22 @@ const UNSAFE_PREAMBLE = [
   [/\\(?:documentclass|LoadClass)\s*\[[^\]]*\btwocolumn\b[^\]]*\]/, 'twocolumn class option'],
   [/\\twocolumn\b/, '\\twocolumn'],
   [/\\AtBeginDvi\b/, '\\AtBeginDvi'],
+  [/\\(?:documentclass|LoadClass)\s*\[[^\]]*\blandscape\b[^\]]*\]/, 'landscape class option'],
+];
+
+// Per-page MediaBox/page-dictionary changes cannot share the resident
+// renderer's single provisional geometry. In particular, leaving these in
+// structured mode makes the exact PDF pixels use one viewport while the
+// invisible direct-edit SVG still uses another, so a click can miss by an
+// entire line or column. Demote before creating that split coordinate system.
+const UNSAFE_PAGE_GEOMETRY = [
+  [/\\(?:pagewidth|pageheight|pdfpagewidth|pdfpageheight)\b/, 'per-page paper size primitive'],
+  [/\\(?:paperwidth|paperheight)\s*=/, 'paper size assignment'],
+  [/\\setlength\s*\{\s*\\(?:paperwidth|paperheight)\s*\}/, 'paper size assignment'],
+  [/\\pdfvariable\s+(?:pagewidth|pageheight)\b/, 'per-page PDF size assignment'],
+  [/\\(?:pdfvariable\s+pageattr|pdfpageattr\b|pdfextension\s+pageattr\b)/, 'raw PDF page attributes'],
+  [/\\special\s*\{[^}]*@thispage\b/i, 'raw PDF page special'],
+  [/\\begin\s*\{\s*landscape\s*\}/, 'landscape page environment'],
 ];
 
 // Body constructs the JS page assembly cannot represent even per block:
@@ -102,6 +124,9 @@ export function classifyPreamble(preamble) {
   for (const [re, why] of UNSAFE_PREAMBLE) {
     if (re.test(pre)) reasons.push(why);
   }
+  for (const [re, why] of UNSAFE_PAGE_GEOMETRY) {
+    if (re.test(pre)) reasons.push(why);
+  }
   return { safe: reasons.length === 0, reasons: [...new Set(reasons)] };
 }
 
@@ -117,6 +142,9 @@ export function classifyBodyBlock(text) {
   for (const [re, why] of UNSAFE_BODY) {
     if (re.test(bod)) return why;
   }
+  for (const [re, why] of UNSAFE_PAGE_GEOMETRY) {
+    if (re.test(bod)) return why;
+  }
   return null;
 }
 
@@ -129,6 +157,9 @@ export function classifyDocument(preamble, body) {
   const reasons = [...classifyPreamble(preamble).reasons];
   const bod = stripComments(body);
   for (const [re, why] of UNSAFE_BODY) {
+    if (re.test(bod)) reasons.push(why);
+  }
+  for (const [re, why] of UNSAFE_PAGE_GEOMETRY) {
     if (re.test(bod)) reasons.push(why);
   }
   return { safe: reasons.length === 0, reasons: [...new Set(reasons)] };

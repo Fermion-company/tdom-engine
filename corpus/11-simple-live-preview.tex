@@ -1,0 +1,53 @@
+% !TEX program = lualatex
+\documentclass[a4paper,11pt]{article}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\title{Real-time Preview Check}
+\author{TeX64}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Text}
+This is a short paragraph with \textbf{bold}, \textit{italic}, and \textcolor{blue}{blue text}.
+The inline formula is $e^{i\pi}+1=0$, followed by a footnote.\footnote{A short footnote.}
+
+\section{Display mathematics}
+\begin{equation}
+  \int_{-\infty}^{\infty} e^{-x^2}\,dx = \sqrt{\pi}.
+\end{equation}
+\begin{align}
+  (a+b)^2 &= a^2+2ab+b^2, \\
+  (a-b)^2 &= a^2-2ab+b^2.
+\end{align}
+
+\section{Lists and table}
+\begin{itemize}
+  \item First item
+  \item Second item
+\end{itemize}
+\begin{enumerate}
+  \item Step one
+  \item Step two
+\end{enumerate}
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{lr}
+    \toprule
+    Item & Value \\
+    \midrule
+    Alpha & 1 \\
+    Beta & 2 \\
+    \bottomrule
+  \end{tabular}
+  \caption{A compact table}
+\end{table}
+
+\section{Rule}
+\noindent\colorbox{yellow!25}{\parbox{0.9\linewidth}{A boxed note used to verify layout and color updates.}}
+
+\end{document}

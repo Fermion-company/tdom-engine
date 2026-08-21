@@ -44,6 +44,12 @@ mkdirSync(scratch, { recursive: true });
 // ---------------------------------------------------------------- engine
 
 async function enginePages() {
+  let pageDump = null;
+  if (process.env.TDOM_DEBUG_PAGE_DUMP) {
+    globalThis.__TDOM_PAGE_DUMP__ = (records) => {
+      pageDump = records;
+    };
+  }
   const engine = new CheckpointEngine({
     workDir: path.join(scratch, 'engine'),
     docDir: path.dirname(texPath),
@@ -58,9 +64,56 @@ async function enginePages() {
     await (engine.hfTask ?? Promise.resolve()).catch(() => {});
     const dls = engine.getDisplayLists();
     const geo = engine.getGeometry();
-    return { dls, geo };
+    const debug = process.env.TDOM_DEBUG_BLOCKS
+      ? {
+          blocks: engine.blocks.map((block) => ({
+            id: block.id,
+            kind: block.kind,
+            text: block.text.replace(/\s+/g, ' ').slice(0, 100),
+            galleyH: block.galley?.h,
+            galleyD: block.galley?.d,
+            rescued: block.rescued,
+            needsRender: block.needsRender,
+            stream: (block.units ?? []).map((entry) => {
+              if (entry.t === 'box') {
+                return {
+                  t: 'box',
+                  h: entry.u.h,
+                  d: entry.u.d,
+                  text: (entry.u.ln?.runs ?? []).map((run) => run.t ?? '').join('').slice(0, 50),
+                };
+              }
+              if (entry.t === 'glue') {
+                return { t: 'glue', a: entry.a, st: entry.st, sto: entry.sto, sh: entry.sh };
+              }
+              if (entry.t === 'kern') return { t: 'kern', a: entry.a };
+              if (entry.t === 'pen') return { t: 'pen', v: entry.v };
+              if (entry.t === 'ins') return { t: 'ins', h: entry.h, hc: entry.hc };
+              if (entry.t === 'fm') return { t: 'fm', h: entry.f.h, d: entry.f.d, p: entry.f.place };
+              return { t: entry.t, v: entry.v, k: entry.k };
+            }),
+          })),
+          pages: engine.pages.map((page) => ({
+            page: page.number,
+            draw: page.draw.map((entry) => ({
+              y: entry.y,
+              h: entry.u.h,
+              d: entry.u.d,
+              bid: entry.u.blockId,
+              text: (entry.u.ln?.runs ?? [])
+                .map((run) => run.t ?? '')
+                .join('')
+                .replace(/\s+/g, ' ')
+                .slice(0, 80),
+              chunk: entry.u.ln?.gfxChunk?.blockId,
+            })),
+          })),
+        }
+      : null;
+    return { dls, geo, pageDump, debug };
   } finally {
     await engine.close();
+    if (process.env.TDOM_DEBUG_PAGE_DUMP) delete globalThis.__TDOM_PAGE_DUMP__;
   }
 }
 
@@ -240,12 +293,28 @@ function comparePage(pn, engine, truth, geo) {
 const t0 = Date.now();
 let failed = false;
 try {
-  const [{ dls, geo }, truth] = await Promise.all([enginePages(), truthPages()]);
+  const [{ dls, geo, pageDump, debug }, truth] = await Promise.all([enginePages(), truthPages()]);
   console.log(
     `pages: engine=${dls.length} real=${truth.length}` +
       (dls.length !== truth.length ? '  << PAGE COUNT MISMATCH' : '')
   );
   if (dls.length !== truth.length) failed = true;
+  if (pageDump) {
+    const summary = pageDump.map((page, index) => ({
+      page: index + 1,
+      pen: page.pen,
+      goal: page.goal,
+      total: page.total,
+      shrink: page.shrink,
+      shrinkInf: page.shrinkInf,
+      stretch: page.stretch,
+      blank: page.blank,
+      floatpage: page.floatpage,
+      nodes: page.nodes?.length,
+      tail: page.nodes?.slice(-8),
+    }));
+    console.log(`PAGE MISMATCH DUMP ${JSON.stringify(summary)}`);
+  }
   const n = Math.max(dls.length, truth.length);
   let totalMatched = 0;
   let totalLines = 0;
@@ -265,6 +334,7 @@ try {
     for (const i of show) console.log('  ' + i);
     if (!VERBOSE && r.issues.length > 8) console.log(`  ... +${r.issues.length - 8} more`);
   }
+  if (failed && debug) console.log(`LAYOUT DEBUG ${JSON.stringify(debug)}`);
   console.log(
     `total: ${totalMatched}/${totalLines} lines matched in ${((Date.now() - t0) / 1000).toFixed(1)}s — ` +
       (failed ? 'DIVERGED' : 'LAYOUT IDENTICAL (within tolerance)')

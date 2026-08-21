@@ -1,4 +1,6 @@
 import { braceImbalance, labelDefBody, startsAddvspace } from './util/tex.js';
+import { trailingGlueSpec } from './util/galley.js';
+import { instrumentEditRegions } from '../edit-regions.js';
 
 export function buildJobBlockBody({
   block,
@@ -26,12 +28,16 @@ export function buildJobBlockBody({
     // new text itself — otherwise editing any \ref-bearing paragraph froze
     // its references at '??' until some label happened to move (found by
     // the Phase-0 fuzzer, corpus/06 seed 7).
-    const refKeys = new Set(block.galley?.refs ?? []);
+    // A stale-first block carries its previous galley while new source is
+    // being typeset. Literal refs removed by the edit must not survive just
+    // because they existed in that old galley; clean blocks still seed from
+    // the harvested list so macro-generated references remain supported.
+    const refKeys = new Set(block.sourceChanged ? [] : (block.galley?.refs ?? []));
     const REF_USE_RE = /\\(?:ref|eqref|pageref|vref|vpageref|autoref|nameref|cref|Cref)\*?\s*\{([^}]+)\}/g;
     for (const m of block.text.matchAll(REF_USE_RE)) {
       for (const k of m[1].split(',')) refKeys.add(k.trim());
     }
-    const CITE_USE_RE = /\\[cC]ite[a-zA-Z]*\*?\s*(?:\[[^\]]*\]\s*)*\{([^}]+)\}/g;
+    const CITE_USE_RE = /\\[a-zA-Z]*[cC]ite[a-zA-Z]*\*?\s*(?:\[[^\]]*\]\s*)*\{([^}]+)\}/g;
     for (const m of block.text.matchAll(CITE_USE_RE)) {
       for (const k of m[1].split(',')) refKeys.add('cite:' + k.trim());
     }
@@ -66,7 +72,12 @@ export function buildJobBlockBody({
     if (idx > 0 && startsAddvspace(block.text)) {
       const pv = JSON.parse(blocks[idx - 1].stateVec ?? '[]');
       const ls = pv.length ? pv[pv.length - 1] : 0;
-      if (ls) primer = `\\directlua{tdom_prime_lastskip(${Math.round(ls)})}`;
+      if (ls) {
+        const g = trailingGlueSpec(blocks[idx - 1].galley, ls);
+        primer =
+          `\\directlua{tdom_prime_lastskip(${g.widthSp},${g.stretchSp},${g.shrinkSp},` +
+          `${g.stretchOrder},${g.shrinkOrder})}`;
+      }
     }
     const volatilePre = ck.vstale && idx > 0 ? volatilePrelude(idx) : '';
     const prelude =
@@ -76,8 +87,12 @@ export function buildJobBlockBody({
     // (the old \vbox wrapper stopped it structurally). Auto-close the
     // imbalance — the source is transiently invalid anyway, and the exact
     // path resumes on the next balanced keystroke.
+    const edit = instrumentEditRegions(block.text);
+    // Metadata stays on the source block; only the transient resident job
+    // receives the zero-width attribute wrappers.
+    block.editRegions = edit.regions;
     const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
-    body = Buffer.from(prelude + block.text + guard, 'utf8');
+    body = Buffer.from(prelude + edit.text + guard, 'utf8');
     jobId = block.id;
   }
   return { body, jobId, refSnapshot };

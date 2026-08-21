@@ -3,6 +3,7 @@ import { writeFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { documentBounds } from '../segmenter.js';
 import { scanCounterDefs, texErrorFrom } from './util/tex.js';
+import { withProjectInputs } from '../project-inputs.js';
 
 export async function bootRoot(
   engine,
@@ -66,11 +67,7 @@ export async function bootRoot(
       // and keep the root's stdout pipe open, pinning the host process alive
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        TEXINPUTS: `${engine.docDir}:${process.env.TEXINPUTS || ''}`,
-        LUAINPUTS: `${engine.docDir}:${process.env.LUAINPUTS || ''}`,
-      },
+      env: withProjectInputs(process.env, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
     }
   );
   let rootLog = '';

@@ -135,6 +135,9 @@ export function buildStream(block, chunks) {
           descent: it.d ?? 0,
           boxH: it.h ?? 0,
           runs: suppress ? [] : (it.runs ?? []),
+          // Even when fidelity forbids painting a glyph bridge, the real run
+          // extents remain useful as transparent source-line hit geometry.
+          editRuns: it.runs ?? [],
           gfxChunk,
         },
       };
@@ -153,6 +156,16 @@ export function buildStream(block, chunks) {
   if (stream[0]) {
     stream[0].first = true;
     stream[0].bid = block.id;
+  }
+  // \include wraps its input in \clearpage.  Pagebuilder eject markers are
+  // the exact semantic unit here: putting literal \clearpage in a rescued
+  // child block also captures the page preceding the chapter and duplicates
+  // it as an isolated chunk.
+  if (block.includeStart) {
+    stream.unshift({ t: 'eject', v: -10000 }, { t: 'eject', v: -10001 });
+  }
+  if (block.includeEnd) {
+    stream.push({ t: 'eject', v: -10000 }, { t: 'eject', v: -10001 });
   }
   return stream;
 }
@@ -178,6 +191,7 @@ export function miniUnits(items, blockId, chunkRef, suppress = false) {
         descent: it.d ?? 0,
         boxH: it.h ?? 0,
         runs: suppress && !chunkRef ? [] : (it.runs ?? []),
+        editRuns: it.runs ?? [],
         gfxChunk: chunkRef
           ? { blockId: chunkRef.key, yOff: y, w: chunkRef.w, stale: chunkRef.stale }
           : null,

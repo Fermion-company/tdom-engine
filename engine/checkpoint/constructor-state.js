@@ -25,10 +25,11 @@ export function makeChunkMap() {
 
 export function initializeEngineState(
   engine,
-  { workDir, docDir, baseCounters, makeShipping, onCanonicalResult }
+  { workDir, docDir, overlayDir, baseCounters, makeShipping, onCanonicalResult }
 ) {
   engine.workDir = path.resolve(workDir);
   engine.docDir = docDir ? path.resolve(docDir) : engine.workDir;
+  engine.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
   mkdirSync(engine.workDir, { recursive: true });
   engine.store = new SourceStore();
   engine.file = 'main.tex';
@@ -47,6 +48,7 @@ export function initializeEngineState(
   engine.geometry = null;
   engine.counters = [...baseCounters];
   engine.preHash = null;
+  engine.preambleEditRegions = [];
   engine.labelTable = new Map(); // key -> value (for reboot injection)
   engine.hrefTable = new Map(); // key -> hyperref anchor (\@currentHref at \label)
   // incremental label/ref bookkeeping — the hot path must never scan
@@ -94,6 +96,7 @@ export function initializeEngineState(
   engine.canonical = new CanonicalRenderer({
     workDir: path.join(engine.workDir, 'canonical'),
     docDir: engine.docDir,
+    overlayDir: engine.overlayDir,
   });
   engine.canonical.onResult = onCanonicalResult;
   engine.onCanonical = null; // callback(info) for the server's SSE fanout

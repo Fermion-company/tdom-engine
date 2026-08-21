@@ -92,11 +92,15 @@ function tdom_enlarge(sp, star)
   node.write(m)
 end
 
-function tdom_prime_lastskip(sp)
+function tdom_prime_lastskip(sp, stretch, shrink, stretch_order, shrink_order)
   sp = tonumber(sp) or 0
   if sp == 0 then return end
   local g = node.new('glue')
   g.width = sp
+  g.stretch = tonumber(stretch) or 0
+  g.shrink = tonumber(shrink) or 0
+  g.stretch_order = tonumber(stretch_order) or 0
+  g.shrink_order = tonumber(shrink_order) or 0
   node.set_attribute(g, LASTSKIP_ATTR, 1)
   node.write(g)
 end
@@ -167,8 +171,14 @@ function tdom_geo()
     return ok and bp(v or 0) or 0
   end
   local geo = {
-    paperwidth = dim('paperwidth'),
-    paperheight = dim('paperheight'),
+    -- The PDF canvas is LuaTeX's actual output page, not necessarily the
+    -- LaTeX layout registers. With a site-wide A4 pdftexconfig, plain
+    -- article leaves \paperwidth at Letter while LuaTeX ships an A4
+    -- MediaBox. Using the register made the provisional SVG/hit map 612x792
+    -- over canonical 595x842 pixels. Keep text/margin registers below, but
+    -- publish the same canvas dimensions the PDF backend will ship.
+    paperwidth = bp(tex.pagewidth or tex.dimen.paperwidth or 0),
+    paperheight = bp(tex.pageheight or tex.dimen.paperheight or 0),
     textwidth = dim('textwidth'),
     textheight = dim('textheight'),
     oddsidemargin = dim('oddsidemargin'),
@@ -474,7 +484,10 @@ walk_h = function(head, parent, x0, dy0, out)
   local x = x0
   local run = nil
   local function flush()
-    if run and #run.g > 0 then out[#out + 1] = run end
+    if run and #run.g > 0 then
+      run.w = math.max(0, x - run.x)
+      out[#out + 1] = run
+    end
     run = nil
   end
   local n = head

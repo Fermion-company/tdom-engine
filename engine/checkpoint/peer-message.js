@@ -26,6 +26,20 @@ export function handlePeerMessage(engine, peer, msg) {
       // the rescue/retry that replaced it, and future jobs would fork
       // from the wrong state
       if (engine.waiters.has('ckpt:' + msg.idx)) {
+        // A preserved suffix can already occupy this boundary.  The new
+        // child is the checkpoint produced by re-typesetting the edited
+        // block, so it replaces that suffix snapshot.  Retire the old peer
+        // explicitly before overwriting the Map entry; otherwise every
+        // keystroke leaks one resident lualatex process even though the
+        // advertised checkpoint count stays constant.
+        const replaced = engine.checkpoints.get(msg.idx);
+        if (replaced && replaced !== peer) {
+          replaced.send('DIE\n');
+          if (replaced.pid) {
+            engine.dyingPids ??= new Set();
+            engine.dyingPids.add(replaced.pid);
+          }
+        }
         engine.checkpoints.set(msg.idx, peer);
         engine._fulfill('ckpt:' + msg.idx, peer);
       } else {

@@ -1,6 +1,7 @@
 import { fnv1a } from '../hash.js';
 
 export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, applyFidelity }) {
+  const reusedStaleGalley = !!galley.tdomStale;
   block.galley = galley;
   block.galleyHash = fnv1a(
     JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events])
@@ -47,4 +48,5 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
       ? 'graphics'
       : 'paragraph';
   block.units = null;
+  if (!reusedStaleGalley) block.sourceChanged = false;
 }

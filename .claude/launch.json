@@ -36,6 +36,18 @@
         "PORT=4666 TDOM_WORKDIR=.tdom-v3-shipdev TDOM_SHIP=1 exec node server.js"
       ],
       "port": 4666
+    },
+    {
+      "name": "paper-preview",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "4699",
+        "--directory",
+        "paper"
+      ],
+      "port": 4699
     }
   ]
 }

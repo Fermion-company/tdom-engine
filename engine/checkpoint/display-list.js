@@ -11,6 +11,20 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
   const flushGfx = () => {
     if (!gfxOpen) return;
     const meta = chunks.get(gfxOpen.blockId);
+    const visibleHeight = gfxOpen.clip1 - gfxOpen.clip0;
+    if (gfxOpen.units === 1 && visibleHeight > Math.max(12, gfxOpen.covered * 2)) {
+      commands.push({
+        op: 'sourcebox',
+        x: r2(L),
+        y: r2(gfxOpen.top + gfxOpen.clip0),
+        w: r2(gfxOpen.w),
+        h: r2(visibleHeight),
+        ink: gfxOpen.ink ? 1 : undefined,
+        chunk: 1,
+        complex: 1,
+        src: gfxOpen.blockId,
+      });
+    }
     commands.push({
       op: 'chunk',
       chunk: gfxOpen.blockId,
@@ -39,13 +53,32 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       const chunkTop = unitTop - c.yOff;
       const clip0 = c.yOff;
       const clip1 = c.yOff + u.h + (u.d ?? 0);
+      const unitRuns = u.ln.editRuns ?? u.ln.runs ?? [];
+      const unitInk = unitRuns.some((run) => !run.rule && !!run.t);
+      const unitExtent = Math.max(0, (u.h ?? 0) + (u.d ?? 0));
       if (gfxOpen && gfxOpen.blockId === c.blockId && Math.abs(gfxOpen.top - chunkTop) < 0.05) {
         gfxOpen.clip1 = Math.max(gfxOpen.clip1, clip1);
         gfxOpen.stale ||= !!c.stale;
+        gfxOpen.units++;
+        gfxOpen.covered += unitExtent;
+        gfxOpen.ink ||= unitInk;
       } else {
         flushGfx();
-        gfxOpen = { blockId: c.blockId, top: chunkTop, clip0, clip1, w: c.w, stale: !!c.stale };
+        gfxOpen = {
+          blockId: c.blockId,
+          top: chunkTop,
+          clip0,
+          clip1,
+          w: c.w,
+          stale: !!c.stale,
+          units: 1,
+          covered: unitExtent,
+          ink: unitInk,
+        };
       }
+      // Exact pixels cover this line; the unchanged TeX run extents provide
+      // one transparent source-line hit surface underneath the chunk.
+      sourceHitCommand(commands, L, baseline, u, u.blockId);
       continue;
     }
     flushGfx();
@@ -61,9 +94,10 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
         h: r2(u.ln.boxH + (u.d ?? 0)),
         src: u.blockId,
       });
+      sourceHitCommand(commands, L, baseline, u, u.blockId, geo.textwidth);
       continue;
     }
-    runCommands(commands, u.ln.runs, L, baseline, u.blockId, { fonts, twinMetrics });
+    runCommands(commands, u.ln.runs, L, baseline, u.blockId, { fonts, twinMetrics, line: u.li });
   }
   flushGfx();
   // Header / footer: TeX-typeset boxes from the page-style job (the exact
@@ -98,7 +132,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
 
 /** Paint one run list (glyphs + rules) at a baseline — shared by body
  * units and the TeX-typeset header/footer boxes. */
-function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics }) {
+function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, line }) {
   for (const r of runs ?? []) {
     if (r.rule) {
       commands.push({
@@ -109,6 +143,7 @@ function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics }) {
         h: r2(r.h),
         color: r.c && r.c !== '#000000' ? r.c : undefined,
         src,
+        line,
       });
     } else if (r.t) {
       const fmeta = fonts.get(r.f);
@@ -136,11 +171,39 @@ function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics }) {
         x: r2(X + r.x),
         y: r2(baseline + dy),
         text,
+        w: r2(r.w ?? Math.max(1, text.length * r.s * 0.5)),
+        gh: r2(r.gh ?? r.s * 0.8),
+        gd: r2(r.gd ?? r.s * 0.2),
         color: r.c && r.c !== '#000000' ? r.c : undefined,
         src,
+        line,
+        math: fmeta?.mth ? 1 : undefined,
       });
     }
   }
+}
+
+function sourceHitCommand(commands, X, baseline, unit, src, fallbackWidth = 1) {
+  const runs = unit.ln.editRuns ?? unit.ln.runs ?? [];
+  let left = Infinity;
+  let right = -Infinity;
+  for (const run of runs) {
+    if (!run.rule && !run.t) continue;
+    left = Math.min(left, run.x ?? 0);
+    right = Math.max(right, (run.x ?? 0) + Math.max(run.w ?? 0, 0.5));
+  }
+  const hasRunBounds = Number.isFinite(left) && Number.isFinite(right) && right > left;
+  const hasTextInk = runs.some((run) => !run.rule && !!run.t);
+  commands.push({
+    op: 'sourcebox',
+    x: r2(X + (hasRunBounds ? left : 0)),
+    y: r2(baseline - (unit.ln.boxH ?? unit.h ?? 0)),
+    w: r2(Math.max(hasRunBounds ? right - left : (unit.ln.gfxChunk?.w ?? fallbackWidth), 1)),
+    h: r2(Math.max((unit.ln.boxH ?? unit.h ?? 0) + (unit.d ?? 0), 1)),
+    line: unit.li,
+    ink: hasTextInk ? 1 : undefined,
+    src,
+  });
 }
 
 /** Paint a harvested header/footer box (vbox-wrapped hbox items) with its

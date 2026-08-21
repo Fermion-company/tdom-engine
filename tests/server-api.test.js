@@ -67,6 +67,16 @@ async function hasLuaLatex() {
   }
 }
 
+async function waitForCanonical(base, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const status = await fetch(`${base}/status`).then((res) => res.json());
+    if (status.canonical?.id > 0 && !status.canonical.inFlight) return status.canonical;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error('canonical compile did not settle');
+}
+
 // the server itself requires lualatex now (final display = LuaLaTeX output)
 const texReady = await hasLuaLatex();
 
@@ -116,4 +126,16 @@ Style preview $E=mc^2$.
   assert.equal(pdf.status, 200);
   const head = Buffer.from(await pdf.arrayBuffer()).subarray(0, 5).toString('latin1');
   assert.equal(head, '%PDF-');
+});
+
+test('two viewers can fetch the same uncached canonical page concurrently', { skip: !texReady && 'lualatex not installed' }, async (t) => {
+  const base = await startServer(t);
+  const canonical = await waitForCanonical(base);
+  const url = `${base}/canonical/1.svg?c=${canonical.id}`;
+  const [first, second] = await Promise.all([fetch(url), fetch(url)]);
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  const [firstSvg, secondSvg] = await Promise.all([first.text(), second.text()]);
+  assert.match(firstSvg, /<svg\b/);
+  assert.equal(secondSvg, firstSvg, 'both viewers receive the same generation pixels');
 });

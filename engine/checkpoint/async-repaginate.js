@@ -5,6 +5,10 @@ export function asyncRepaginate(
   engine,
   { paginateNow, displayList, computeToc, queueChainWork, scheduleBackground }
 ) {
+  // Demotion to opaque tears down the resident tree. Async render callbacks
+  // that were already resolving must not resurrect provisional pages or hit
+  // geometry after canonical-only mode has taken ownership.
+  if (engine.mode !== 'structured') return;
   // rebuild display lists after async galley/chunk arrivals and push
   // patches through the async channel (SSE)
   const rawPages = paginateNow();

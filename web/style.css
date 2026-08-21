@@ -432,6 +432,7 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
   background: #fff;
   box-shadow: var(--page-shadow);
 }
+.page.awaiting-canonical { visibility: hidden; }
 .page svg { display: block; width: 100%; height: auto; }
 .page svg text { cursor: pointer; }
 
@@ -451,12 +452,155 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
   user-select: none;
 }
 .page.is-final svg,
-.page.is-final .chunkwin { visibility: hidden; }
+.page.is-final .chunkwin { opacity: 0; }
 /* pages the fresh canonical says don't exist */
 .page.phantom { display: none; }
 
 .chunkwin { position: absolute; overflow: hidden; cursor: pointer; }
 .chunkwin img.chunk { display: block; width: 100%; height: auto; user-select: none; }
+
+/* Direct PDF editing: hit geometry is carried by the invisible provisional
+   SVG even when exact LuaLaTeX pixels are on top.  Only one actual input is
+   mounted at a time, so a long paper pays no permanent editor cost. */
+[data-edit] { cursor: text; }
+.tdom-edit-hit { pointer-events: all; }
+.tdom-source-hit { pointer-events: all; cursor: text; }
+.page.is-final svg { pointer-events: auto; }
+.is-opaque-document .page svg,
+.is-opaque-document .page .chunkwin {
+  display: none;
+  pointer-events: none;
+}
+.page.is-final .chunkwin,
+.page .chunkwin:has(+ .tdom-direct-editor) { pointer-events: none; }
+body.is-embed .chunkwin { pointer-events: none; }
+.tdom-direct-editor {
+  position: absolute;
+  z-index: 12;
+  box-sizing: border-box;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: transparent;
+  font-family: var(--direct-font-family, serif);
+  font-size: var(--direct-font-size, 10px);
+  font-style: var(--direct-font-style, normal);
+  font-weight: var(--direct-font-weight, 400);
+  line-height: 1;
+}
+.tdom-direct-editor [contenteditable],
+.tdom-direct-editor math-field {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: inherit;
+  box-sizing: border-box;
+  margin: 0;
+  border: 0;
+  outline: 0;
+  resize: none;
+  overflow: hidden;
+  color: transparent;
+  background: transparent;
+  -webkit-text-fill-color: transparent;
+  caret-color: #2563eb;
+}
+.tdom-direct-text {
+  padding: 0;
+  font: inherit;
+  line-height: 1;
+  white-space: pre-wrap;
+  overflow-wrap: normal;
+}
+.tdom-direct-mathfield,
+.tdom-direct-math-fallback {
+  height: 100%;
+  padding: 0;
+  font-size: inherit;
+  line-height: 1;
+  --caret-color: #2563eb;
+  --selection-background-color: rgba(37, 99, 235, 0.2);
+}
+/* Opaque mode is an exact LuaLaTeX page. Browser text, carets and selection
+   geometry cannot share its font metrics, so the previous exact page stays
+   completely untouched until the next exact page swaps in atomically. */
+.tdom-direct-editor.is-opaque [contenteditable],
+.tdom-direct-editor.is-opaque math-field {
+  caret-color: transparent;
+  opacity: 0;
+}
+/* The transparent browser layout is never opaque-mode hit geometry. Let a
+   re-click reach the exact canonical page so SyncTeX/pdftotext resolves it
+   again; keyboard focus survives pointer-events:none. The visible suggestion
+   panel remains directly interactive. */
+.tdom-direct-editor.is-opaque { pointer-events: none; }
+.tdom-direct-editor.is-opaque .math-wysiwyg-panel {
+  pointer-events: auto;
+  left: var(--tdom-canonical-panel-left, 0px) !important;
+  top: var(--tdom-canonical-panel-top, calc(100% + 5px)) !important;
+}
+.tdom-direct-editor.is-opaque [contenteditable]::selection {
+  background: transparent;
+}
+.tdom-direct-editor.is-opaque .tdom-direct-mathfield,
+.tdom-direct-editor.is-opaque .tdom-direct-math-fallback {
+  --caret-color: transparent;
+  --selection-background-color: transparent;
+}
+.tdom-direct-mathfield::part(virtual-keyboard-toggle),
+.tdom-direct-mathfield::part(menu-toggle) { display: none; }
+.tdom-direct-editor .math-wysiwyg-panel {
+  position: absolute;
+  top: calc(100% + 5px);
+  left: 0;
+  z-index: 14;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: max-content;
+  min-width: min(320px, 70vw);
+  max-width: min(620px, 80vw);
+  padding: 5px;
+  overflow-x: auto;
+  border: 1px solid rgba(47, 111, 221, 0.55);
+  border-radius: 5px;
+  background: #fff;
+  box-shadow: 0 5px 18px rgba(20, 30, 45, 0.2);
+}
+.tdom-direct-editor .math-wysiwyg-panel[aria-hidden="true"] { display: none; }
+.tdom-direct-editor .math-wysiwyg-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: #f4f5f7;
+  color: #1f2937;
+  white-space: nowrap;
+}
+.tdom-direct-editor .math-wysiwyg-item.is-active {
+  border-color: #2563eb;
+  background: #e8f0ff;
+}
+.tdom-direct-editor .math-wysiwyg-symbol { font-size: 16px; }
+.tdom-direct-editor .math-wysiwyg-label { color: #5b6472; font-size: 11px; }
+
+.tdom-search-marker {
+  position: absolute;
+  z-index: 7;
+  border-radius: 2px;
+  background: rgba(250, 204, 21, 0.34);
+  outline: 1px solid rgba(202, 138, 4, 0.5);
+  pointer-events: none;
+}
+.tdom-search-marker.current {
+  background: rgba(251, 146, 60, 0.48);
+  outline-color: rgba(234, 88, 12, 0.8);
+}
 
 /* page label sits above the sheet: number on the left, state on the right */
 .page .pageno {

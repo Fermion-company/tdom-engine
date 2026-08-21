@@ -44,7 +44,9 @@ async function runOpaqueCheck(texPath) {
 
 async function runReferee(texPath) {
   const t0 = Date.now();
-  const r = await execFileP('node', [path.join(ROOT, 'tools', 'verify-layout.mjs'), texPath], {
+  const refereeArgs = [path.join(ROOT, 'tools', 'verify-layout.mjs'), texPath];
+  if (process.env.TDOM_FARM_VERBOSE) refereeArgs.push('--verbose');
+  const r = await execFileP('node', refereeArgs, {
     timeout: 900_000,
     maxBuffer: 32 * 1024 * 1024,
   }).catch((err) => ({ stdout: err.stdout ?? '', stderr: err.stderr ?? '', failed: true }));
@@ -105,12 +107,30 @@ for (const entry of entries) {
       `pages=${r.enginePages}/${r.realPages} lines=${r.matched}/${r.lines} ${r.secs.toFixed(0)}s`
   );
   if (!ok && !tolerated) {
-    console.log(r.out.split('\n').filter((l) => /DIVERGED|MISMATCH|miss /.test(l)).slice(0, 12).join('\n'));
+    if (process.env.TDOM_FARM_VERBOSE) {
+      console.log(r.out.trim());
+    } else {
+      console.log(
+        r.out
+          .split('\n')
+          .filter((l) => /DIVERGED|MISMATCH|miss |has no|not present/.test(l))
+          .slice(0, 12)
+          .join('\n')
+      );
+    }
     if (r.enginePages === null) {
       // the referee died before producing a summary (crash, missing tool,
       // boot failure): surface its actual output instead of null/null
       console.log('  referee tail:');
       console.log(r.out.trim().split('\n').slice(-12).map((l) => '  | ' + l).join('\n'));
+    }
+    if (process.env.TDOM_FARM_COMPARE_BREAKS) {
+      const breaks = await execFileP(
+        'node',
+        [path.join(ROOT, 'tools', 'compare-breaks.mjs'), texPath, '--page=1'],
+        { timeout: 900_000, maxBuffer: 32 * 1024 * 1024 }
+      ).catch((err) => ({ stdout: err.stdout ?? '', stderr: err.stderr ?? '' }));
+      console.log(((breaks.stdout || '') + (breaks.stderr || '')).trim());
     }
   }
 }

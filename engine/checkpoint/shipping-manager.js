@@ -6,6 +6,7 @@ export function makeShippingChain(engine, queueShipBoot) {
   const chain = new ShippingChain({
     workDir: path.join(engine.workDir, 'ship'),
     docDir: engine.docDir,
+    overlayDir: engine.overlayDir,
   });
   chain.onPaged = ({ page, gen }) => {
     if (engine.shipStale || chain !== engine.shipping) return;

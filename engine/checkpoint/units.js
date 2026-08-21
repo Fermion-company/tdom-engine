@@ -78,7 +78,7 @@ export function rebuildUnits(blocks, chunks, fidelityEpoch) {
       .filter((it) => it.k === 'ins')
       .map((_, k) => chunkSig(`${block.id}@fn${k}`))
       .join(',');
-    const sig = `${block.galleyHash}|${chunkSig(block.id)}|${floatVs}|${insVs}|${fidelityEpoch}`;
+    const sig = `${block.galleyHash}|${chunkSig(block.id)}|${floatVs}|${insVs}|${fidelityEpoch}|i${block.includeStart ? 1 : 0}${block.includeEnd ? 1 : 0}`;
     if (!block.units || block.unitsSig !== sig) {
       block.units = buildStream(block, chunks);
       block.unitsSig = sig;

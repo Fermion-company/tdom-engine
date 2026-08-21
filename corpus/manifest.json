@@ -42,6 +42,10 @@
       "expect": "structured"
     },
     {
+      "file": "11-simple-live-preview.tex",
+      "expect": "structured"
+    },
+    {
       "file": "../samples/demo-lua.tex",
       "expect": "structured"
     }

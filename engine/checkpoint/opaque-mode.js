@@ -1,7 +1,21 @@
 import { buildOpaqueUpdateResponse } from './update-response.js';
+import { instrumentEditRegions } from '../edit-regions.js';
+import { documentBounds } from '../segmenter.js';
 
 export function opaqueUpdate(engine, editLabel, t, reasons, { teardownTree, shipUpdate }) {
   const text = engine.store.get(engine.file);
+  // Opaque mode changes how pages are painted, not whether the source is
+  // editable.  Populate the same conservative source regions without
+  // booting the resident TeX tree so canonical-only/twocolumn documents can
+  // still be edited through SyncTeX hit geometry.
+  for (const block of engine.blocks) {
+    block.editRegions = instrumentEditRegions(block.text).regions;
+  }
+  const bounds = documentBounds(text);
+  engine.preambleEditRegions = instrumentEditRegions(
+    text.slice(bounds.preamble.start, bounds.preamble.end),
+    { baseId: 1_000_000 }
+  ).regions;
   if (engine.mode !== 'opaque') {
     engine.mode = 'opaque';
     // the compile IS the display now: recompile promptly on every pause

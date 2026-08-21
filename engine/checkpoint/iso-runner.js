@@ -4,6 +4,7 @@ import { existsSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fnv1a } from '../hash.js';
 import { waitForPdf } from './util/fs.js';
+import { withProjectInputs } from '../project-inputs.js';
 
 const execFileP = promisify(execFile);
 
@@ -78,11 +79,7 @@ export async function runColdIsoCompile(engine, jobdir) {
     timeout: 120_000,
     // doc-relative assets (\includegraphics, \includepdf …) resolve the
     // same way the canonical compile resolves them
-    env: {
-      ...process.env,
-      TEXINPUTS: `${engine.docDir}:${process.env.TEXINPUTS || ''}`,
-      LUAINPUTS: `${engine.docDir}:${process.env.LUAINPUTS || ''}`,
-    },
+    env: withProjectInputs(process.env, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
   });
   engine.isoChildren.add(run.child);
   await run.catch(() => {});

@@ -7,6 +7,12 @@ import { stripComments } from './safety.js';
 // its body text and demoted to CANONICAL_ONLY. \todo is todonotes
 // (paper-draft review marks — marginpar underneath).
 const MARGIN_RE = /\\(?:marginpar|marginnote|todo)\b/;
+// LuaTeX represents included PDF/PNG/JPEG assets as backend image nodes,
+// not necessarily pdf_literal whatsits. Older daemon builds therefore saw
+// correct box dimensions but no `galley.gfx` bit and let the browser glyph
+// layer draw an empty rectangle. Source-level inclusion is definitive: the
+// whole block must come from TeX-derived pixels.
+const EXTERNAL_GRAPHICS_RE = /\\includegraphics\*?\b/;
 
 /**
  * Visual fidelity gate, applied per adopted galley: classify every line
@@ -31,6 +37,17 @@ export function applyFidelity(block, galley, { fonts, fidelityDemoted }) {
   if (MARGIN_RE.test(stripComments(block.text))) {
     // comment-stripped: a `% \todo{...}` must not blank the block's band
     fid = demoteFidelity(fid, 'canonical');
+  }
+  if (block.externalGraphics || EXTERNAL_GRAPHICS_RE.test(stripComments(block.text))) {
+    fid = demoteFidelity(fid, 'exact');
+    // Some LuaTeX builds expose PDF/PNG/JPEG inclusion without a backend
+    // whatsit in the harvested float. Source inclusion is definitive, so
+    // every float owned by this source block gets its own TeX-rendered
+    // chunk as well. Otherwise a figure can leak through as an unscaled
+    // browser rule while the canonical page is converging.
+    for (const fl of galley?.floats ?? []) {
+      fid.floats.set(fl.n, { exact: true, noBridge: true });
+    }
   }
   block.fidelity = fid;
   block.needsRender = !block.rescued && !fid.canonicalOnly && fid.exact;

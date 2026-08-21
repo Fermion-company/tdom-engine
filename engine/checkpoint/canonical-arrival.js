@@ -3,9 +3,63 @@ import { compareCanonicalText } from './canonical-verification.js';
 import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
 import { cropSvgAt } from './util/svg.js';
 
-export function onCanonicalResult(engine, info, { verifyAgainstCanonical, cropCanonicalChunks }) {
+const PAPER_EPSILON_PT = 0.5;
+
+/** A structured display has one document-wide viewport. Once the canonical
+ * PDF proves that any page uses another displayed box or any `/Rotate`, its
+ * pixels and the provisional source-hit SVG no longer share coordinates.
+ * Return explicit reasons so the arrival path can fail closed to the exact
+ * opaque renderer even when static source scanning missed an indirect macro,
+ * class hook, included file, or package implementation. */
+export function canonicalGeometryMismatchReasons(geometry, info) {
+  const count = Math.max(0, Math.floor(Number(info?.pageCount) || 0));
+  if (!count) return [];
+  const width = Number(geometry?.paperwidth);
+  const height = Number(geometry?.paperheight);
+  if (!(width > 0 && height > 0)) return ['canonical geometry gate: resident paper geometry is unavailable'];
+  const papers = Array.isArray(info?.papers) ? info.papers : [];
+  if (papers.length < count || papers.slice(0, count).some((paper) =>
+    !(Number(paper?.w) > 0 && Number(paper?.h) > 0))) {
+    return ['canonical geometry gate: per-page PDF geometry is incomplete'];
+  }
+  const reasons = [];
+  for (let index = 0; index < count; index++) {
+    const paper = papers[index];
+    const rotation = ((Math.round(Number(paper.rotation) || 0) % 360) + 360) % 360;
+    if (rotation !== 0) {
+      reasons.push(`canonical geometry gate: page ${index + 1} has /Rotate ${rotation}`);
+      continue;
+    }
+    if (Math.abs(Number(paper.w) - width) > PAPER_EPSILON_PT ||
+        Math.abs(Number(paper.h) - height) > PAPER_EPSILON_PT) {
+      reasons.push(
+        `canonical geometry gate: page ${index + 1} is ${Number(paper.w).toFixed(3)}x${Number(paper.h).toFixed(3)}pt, ` +
+        `resident viewport is ${width.toFixed(3)}x${height.toFixed(3)}pt`
+      );
+    }
+  }
+  return reasons;
+}
+
+export function onCanonicalResult(
+  engine,
+  info,
+  { verifyAgainstCanonical, cropCanonicalChunks, teardownTree = () => {} }
+) {
+  if (!info.error && engine.mode === 'structured' && info.rev === engine.srcRev) {
+    const reasons = canonicalGeometryMismatchReasons(engine.geometry, info);
+    if (reasons.length) {
+      const stickyPre = engine.preHash;
+      engine.mode = 'opaque';
+      engine.modeReasons = reasons;
+      engine.opaqueStickyPre = stickyPre;
+      engine.canonical.pressure = 'display';
+      engine.diagnostics.push(`structured layer demoted to opaque: ${reasons.join('; ')}`);
+      teardownTree();
+    }
+  }
   try {
-    engine.onCanonical?.(info);
+    engine.onCanonical?.({ ...info, modeReasons: engine.modeReasons });
   } catch { /* observer errors are not ours */ }
   if (info.error || process.env.TDOM_NO_VERIFY) return;
   // verify only at convergence: the compile must be of the CURRENT source

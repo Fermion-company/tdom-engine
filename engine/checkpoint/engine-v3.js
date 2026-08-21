@@ -57,7 +57,7 @@ import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
 import { computeToc, pageSpecs, hfJobBody } from './page-metadata.js';
 import { chunkTargets } from './chunk-targets.js';
 import { paginateNow, rebuildUnits } from './units.js';
-import { expandIncludes, watchInclude } from './include-expander.js';
+import { expandIncludes, includeOnlyFromSource, watchInclude } from './include-expander.js';
 import { needsRescue } from './rescue-classifier.js';
 import { scheduleHeaders as scheduleHeadersHelper } from './header-scheduler.js';
 import {
@@ -74,6 +74,8 @@ import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
 import { queueRender as queueRenderHelper } from './render-pump.js';
 import { queueMovedOffsets as queueMovedOffsetsHelper } from './rescue-offsets.js';
+import { isPathInside } from '../project-inputs.js';
+import { instrumentEditRegions } from '../edit-regions.js';
 import { scheduleBackground as scheduleBackgroundHelper } from './background-scheduler.js';
 import { typesetBlock as typesetBlockHelper } from './typeset-dispatch.js';
 import { rescueBlock as rescueBlockHelper } from './rescue-block.js';
@@ -130,10 +132,11 @@ const DEF_RE =
   /\\(def|edef|gdef|xdef|newcommand|renewcommand|providecommand|DeclareRobustCommand|DeclareMathOperator|let|futurelet|newenvironment|renewenvironment|newcounter|newtheorem|newlength|newsavebox|setlength|addtolength|makeatletter|catcode|pagestyle)\b/;
 
 export class CheckpointEngine {
-  constructor({ workDir, docDir }) {
+  constructor({ workDir, docDir, overlayDir = null }) {
     initializeEngineState(this, {
       workDir,
       docDir,
+      overlayDir,
       baseCounters: BASE_COUNTERS,
       makeShipping: () => this.#makeShipping(),
       onCanonicalResult: (info) => this.#onCanonicalResult(info),
@@ -155,6 +158,46 @@ export class CheckpointEngine {
   async open(text, file = 'main.tex') {
     resetOpenState(this, text, file);
     return this.#update({ editLabel: 'open' });
+  }
+
+  /**
+   * Retarget every TeX path resolver to the active editor document. A fresh
+   * open deliberately forces checkpoint 0 to reboot even when two projects
+   * happen to have byte-identical preambles: their local classes, images,
+   * aux state and child files are different compilation inputs.
+   */
+  async setDocumentContext({ docDir, overlayDir = null, force = false } = {}) {
+    const nextDir = path.resolve(docDir || this.workDir);
+    const nextOverlay = overlayDir ? path.resolve(overlayDir) : null;
+    if (!force && nextDir === this.docDir && nextOverlay === this.overlayDir) return false;
+    this.bgAbort = true;
+    if (this.bgActive) {
+      const pid = this.currentJob?.pid;
+      if (pid && pid > 0) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+    await this.bgTask.catch(() => {});
+    return this.#locked(async () => {
+      await this.canonical.resetDocument(nextDir, nextOverlay);
+      clearTimeout(this.shipBootTimer);
+      this.shipBootTimer = null;
+      if (this.shipping) {
+        await this.shipping.close().catch(() => {});
+        this.shipping = this.#makeShipping();
+      }
+      for (const watcher of this.watchers.values()) {
+        try { watcher.close(); } catch { /* already closed */ }
+      }
+      this.watchers.clear();
+      this.includes.clear();
+      this.docDir = nextDir;
+      this.overlayDir = nextOverlay;
+      this.preHash = null;
+      this.preGate = null;
+      this.opaqueStickyPre = null;
+      return true;
+    });
   }
 
   async edit(start, end, replacement, file = this.file) {
@@ -196,6 +239,7 @@ export class CheckpointEngine {
   getDOM() {
     return buildDomSnapshot({
       rev: this.rev,
+      srcRev: this.srcRev,
       backendName: this.backendName,
       mode: this.mode,
       modeReasons: this.modeReasons,
@@ -207,6 +251,7 @@ export class CheckpointEngine {
       file: this.file,
       position: (file, offset) => this.store.position(file, offset),
       labelTable: this.labelTable,
+      preambleEditRegions: this.preambleEditRegions,
     });
   }
 
@@ -267,8 +312,13 @@ export class CheckpointEngine {
   }
 
   #driverSource(preamble) {
+    // Preamble fields such as \title/\author are printed later by
+    // \maketitle.  Give them a disjoint id range and keep their real root
+    // offsets so the glyphs emitted by that later block remain editable.
+    const edit = instrumentEditRegions(preamble, { baseId: 1_000_000 });
+    this.preambleEditRegions = edit.regions;
     return buildDriverSource({
-      preamble,
+      preamble: edit.text,
       daemonPath: path.join(DIR, 'daemon.lua'),
       port: this.port,
       workDir: this.workDir,
@@ -310,7 +360,16 @@ export class CheckpointEngine {
       ck.send(`JOB ${jobId} ${idx + 1} ${body.length}\n`);
       ck.sendRaw(body);
       const [galley] = await Promise.all([galleyP, ckptP]);
-      if (refSnapshot) galley.tdomRefVals = refSnapshot;
+      if (refSnapshot) {
+        galley.tdomRefVals = refSnapshot;
+        // Source scanning covers the wider citation/reference families
+        // (natbib's \citep/\citet, biblatex's \autocite, cleveref, …)
+        // whose package macros do not necessarily pass through the driver's
+        // narrow \cite/\ref wrappers. Index those dependencies exactly like
+        // daemon-reported ones so a later \bibitem/\label can re-typeset an
+        // earlier consumer in the same incremental pass.
+        galley.refs = [...new Set([...(galley.refs ?? []), ...Object.keys(refSnapshot)])];
+      }
       this.#retireOffGrid(idx);
       return galley;
     } catch (err) {
@@ -662,6 +721,12 @@ export class CheckpointEngine {
   // ------------------------------------------------------------- update
 
   async #update(args) {
+    let documentResetPending = false;
+    const announceDocumentReset = (event) => {
+      if (documentResetPending) return;
+      documentResetPending = true;
+      this.onDocumentResetPending?.(event);
+    };
     this.lastEditAt = Date.now(); // pauses the idle-gated isolated renders
     // Stop the in-flight background chain rebuild BEFORE taking the chain
     // lock (it holds the lock while running; aborting it first avoids a
@@ -681,29 +746,65 @@ export class CheckpointEngine {
       }
     }
     await this.bgTask.catch(() => {});
-    return this.#locked(async () => {
-      // serialize async header-job arrivals against updates: an hf apply
-      // between an update's prevHashes capture and its patch computation
-      // would mark unrelated pages dirty
-      this.updating = true;
-      this.bgAbort = false;
-      try {
-        return await this.#updateInner(args);
-      } finally {
-        this.updating = false;
-        this.progress = null; // /status liveness marker
-      }
-    });
+    try {
+      const report = await this.#locked(async () => {
+        // serialize async header-job arrivals against updates: an hf apply
+        // between an update's prevHashes capture and its patch computation
+        // would mark unrelated pages dirty
+        this.updating = true;
+        this.bgAbort = false;
+        try {
+          return await this.#updateInner({ ...args, announceDocumentReset });
+        } finally {
+          this.updating = false;
+          this.progress = null; // /status liveness marker
+        }
+      });
+      if (documentResetPending) this.onDocumentResetComplete?.({ report });
+      return report;
+    } catch (error) {
+      if (documentResetPending) this.onDocumentResetComplete?.({ error });
+      throw error;
+    }
   }
 
-  async #updateInner({ editLabel, retry = false }) {
+  async #updateInner({ editLabel, retry = false, announceDocumentReset }) {
     const t = new Timer();
     const prepared = await prepareUpdate(this, {
       editLabel,
       timer: t,
       callbacks: {
-        opaqueUpdate: (label, timer, reasons) => this.#opaqueUpdate(label, timer, reasons),
-        bootRoot: () => this.#bootRoot(),
+        opaqueUpdate: (label, timer, reasons) => {
+          if (this.mode !== 'opaque') {
+            announceDocumentReset?.({
+              reason: 'engine-opaque-transition',
+              editLabel: label,
+            });
+          }
+          return this.#opaqueUpdate(label, timer, reasons);
+        },
+        // A root boot tears down the currently visible resident tree before
+        // the replacement can produce its first honest page. Tell the host
+        // synchronously at that exact boundary. This covers both ordinary
+        // preamble edits and the one-shot full-rebuild retry after a
+        // foreground typeset failure; predicting only from the HTTP edit
+        // range misses the latter.
+        bootRoot: () => {
+          // In opaque mode the resident tree is not the presented surface:
+          // the browser keeps the last exact canonical generation (and its
+          // retained source snapshot) interactive while this root reboots.
+          // Hiding that surface would prevent the user from editing a second
+          // location during an ordinary title/preamble compile. Structured
+          // mode still needs the host reset gate because its resident DOM is
+          // the visible surface being destroyed here.
+          if (this.mode !== 'opaque') {
+            announceDocumentReset?.({
+              reason: retry ? 'engine-retry-reboot' : 'engine-preamble-reboot',
+              editLabel,
+            });
+          }
+          return this.#bootRoot();
+        },
         scheduleStructuredReprobe: (preHash) => this.#scheduleStructuredReprobe(preHash),
         expandIncludes: (segs, depth) => this.#expandIncludes(segs, depth),
         unindexBlock: (id) => this.#unindexBlock(id),
@@ -748,7 +849,7 @@ export class CheckpointEngine {
         this.editHold = [];
         // direct inner call: we already hold the chain lock (re-entering
         // #update would deadlock on it)
-        return this.#updateInner({ editLabel, retry: true });
+        return this.#updateInner({ editLabel, retry: true, announceDocumentReset });
       }
       // even the full rebuild failed: demote to opaque instead of erroring —
       // the canonical layer keeps the document visible and editable
@@ -855,6 +956,7 @@ export class CheckpointEngine {
     onCanonicalResultHelper(this, info, {
       verifyAgainstCanonical: (canonicalInfo) => this.#verifyAgainstCanonical(canonicalInfo),
       cropCanonicalChunks: (canonicalInfo) => this.#cropCanonicalChunks(canonicalInfo),
+      teardownTree: () => this.#teardownTree(),
     });
   }
 
@@ -881,11 +983,11 @@ export class CheckpointEngine {
   // queue entry carries the fresh inputs.
 
   #pumpRescues() {
-    if (this.rescuePumping) return;
+    if (this.closed || this.rescuePumping) return;
     this.rescuePumping = true;
     (async () => {
       try {
-        while (this.rescueQueue.size) {
+        while (!this.closed && this.rescueQueue.size) {
           const [bid, key] = this.rescueQueue.entries().next().value;
           this.rescueQueue.delete(bid);
           try {
@@ -907,14 +1009,15 @@ export class CheckpointEngine {
   }
 
   async #asyncRescueOne(bid, key) {
-    if (this.mode !== 'structured') return;
+    if (this.closed || this.mode !== 'structured') return;
     // typing-burst quiescence: a keystroke inside/near a rescue block
     // supersedes the previous compile anyway — wait for a short pause so
     // bursts cost ONE compile instead of one per keystroke, and the
     // resident fork jobs keep the CPU while the user is typing
-    while (Date.now() - (this.lastEditAt ?? 0) < 800) {
+    while (!this.closed && Date.now() - (this.lastEditAt ?? 0) < 800) {
       await new Promise((r) => setTimeout(r, 200));
     }
+    if (this.closed) return;
     let idx = this.blocks.findIndex((b) => b.id === bid);
     if (idx < 0) return;
     let block = this.blocks[idx];
@@ -985,10 +1088,12 @@ export class CheckpointEngine {
     if (outcome === 'aborted') {
       // resume after the edit that pre-empted us (waiting OUTSIDE the lock
       // — the edit needs it); the queue entry revalidates on retry
+      if (this.closed) return;
       this.rescueQueue.set(bid, key);
-      while (this.bgAbort) {
+      while (!this.closed && this.bgAbort) {
         await new Promise((r) => setTimeout(r, 25));
       }
+      if (this.closed) this.rescueQueue.delete(bid);
     }
   }
 
@@ -1164,21 +1269,39 @@ export class CheckpointEngine {
   }
 
   #expandIncludes(segs, depth) {
+    const source = this.store.get(this.file) ?? '';
     return expandIncludes(segs, depth, {
       docDir: this.docDir,
+      overlayDir: this.overlayDir,
       workDir: this.workDir,
       includes: this.includes,
       diagnostics: this.diagnostics,
+      includeOnly: includeOnlyFromSource(source),
       watchInclude: (full) => this.#watchInclude(full),
     });
   }
 
   #watchInclude(full) {
+    // Overlay writes are explicit API mutations. Watching our own temp files
+    // would enqueue a second refresh for every keystroke in a child buffer.
+    if (this.overlayDir && isPathInside(this.overlayDir, full)) return;
+    if (path.resolve(full) === path.join(this.workDir, 'driver.bbl')) return;
     watchInclude(full, this.watchers, (changed) => this.onExternalChange?.(changed));
   }
 
   async refresh() {
+    this.canonical.invalidateInputs();
     return this.#update({ editLabel: 'external-include' });
+  }
+
+  invalidateProjectInputs(paths = []) {
+    const changed = new Set(paths.map((file) => path.resolve(file)));
+    for (const [identity, cached] of this.includes) {
+      if (changed.has(path.resolve(identity)) || (cached?.readPath && changed.has(path.resolve(cached.readPath)))) {
+        this.includes.delete(identity);
+      }
+    }
+    this.canonical.invalidateInputs();
   }
 
   #displayList(page) {

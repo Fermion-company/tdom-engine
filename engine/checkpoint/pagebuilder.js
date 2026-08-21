@@ -435,16 +435,22 @@ class PageBuilder {
     // before the eject. NB LuaTeX glue orders run fi=1,fil=2,fill=3,filll=4
     // (the stream uses that encoding), so \vfil is order TWO here.
     this.finishing = true;
-    if (this.contents.some((c) => c.e.t === 'box' || c.e.t === 'ins') ||
-        this.toplist.length || this.botlist.length) {
+    if (this.#pageHasMaterial()) {
       if (this.hasBox) {
         const pd = this.prevdepth ?? 0;
         if (pd > 0) {
-          this.#contributeGlue({ t: 'glue', a: -Math.min(pd, this.maxdepth), st: 0, sto: 0, sh: 0, sho: 0 });
+          this.#appendGlue({ t: 'glue', a: -Math.min(pd, this.maxdepth), st: 0, sto: 0, sh: 0, sho: 0 });
         }
-        this.#contributeGlue({ t: 'glue', a: 0, st: FIL, sto: 2, sh: 0, sho: 0 });
+        // This glue and the following forced penalty are one \newpage
+        // sequence.  Letting the glue run the ordinary breakpoint scan can
+        // fire at an older best break before the forced penalty is seen,
+        // dropping the document tail from the final page.
+        this.#appendGlue({ t: 'glue', a: 0, st: FIL, sto: 2, sh: 0, sho: 0 });
       }
-      this.#firePage(this.contents.length, null);
+      // Either closing glue can make an already-overfull page fire at its
+      // remembered best break.  In that case #firePage has reset the page;
+      // do not ship that fresh, empty page a second time.
+      if (this.#pageHasMaterial()) this.#firePage(this.contents.length, null);
     }
     while (this.deferlist.length) {
       const made = this.#tryFloatColumn(true);
@@ -459,6 +465,14 @@ class PageBuilder {
 
   #pageEmpty() {
     return !this.hasBox && this.feet.length === 0;
+  }
+
+  #pageHasMaterial() {
+    return (
+      this.contents.some((c) => c.e.t === 'box' || c.e.t === 'ins') ||
+      this.toplist.length > 0 ||
+      this.botlist.length > 0
+    );
   }
 
   #contributeBox(e) {
@@ -498,6 +512,11 @@ class PageBuilder {
       // the page fired; the glue re-enters via the queue in document order
       return;
     }
+    this.#appendGlue(e);
+  }
+
+  #appendGlue(e) {
+    if (!this.hasBox) return;
     this.contents.push({ e });
     this.total += e.a ?? 0;
     this.stretch[e.sto ?? 0] += e.st ?? 0;
@@ -776,7 +795,9 @@ class PageBuilder {
     const placed = this.contents.slice(0, breakIndex);
     const rest = this.contents.slice(breakIndex);
     if (this.dumpRec) {
-      this.dumpRec.push(dumpPageRecord(placed, breakPen, this.goal, this.total));
+      this.dumpRec.push(
+        dumpPageRecord(placed, breakPen, this.goal, this.total, this.shrink, this.shrinkInf, this.stretch)
+      );
     }
     // stored entries after the break re-enter the stream, followed by the
     // item that was in flight when the page fired (document order!); the
@@ -1163,7 +1184,7 @@ function unitText(u, limit = 48) {
 }
 
 /** One fired page's body stream, natural values — compare-breaks format. */
-function dumpPageRecord(placed, pen, goal, total) {
+function dumpPageRecord(placed, pen, goal, total, shrink, shrinkInf, stretch) {
   const nodes = [];
   for (const c of placed) {
     const e = c.e;
@@ -1187,7 +1208,7 @@ function dumpPageRecord(placed, pen, goal, total) {
       nodes.push({ k: 'ins', h: e.h ?? 0 });
     }
   }
-  return { pen, goal, total, nodes };
+  return { pen, goal, total, shrink, shrinkInf, stretch: [...stretch], nodes };
 }
 
 /** A committed inline float participates in the text stream as one big box. */

@@ -2,6 +2,7 @@ import { SAFE_GLYPH } from './fidelity.js';
 
 export function buildDomSnapshot({
   rev,
+  srcRev,
   backendName,
   mode,
   modeReasons,
@@ -13,7 +14,29 @@ export function buildDomSnapshot({
   file,
   position,
   labelTable,
+  preambleEditRegions = [],
 }) {
+  const relativePosition = (base, text, offset) => {
+    const prefix = String(text ?? '').slice(0, Math.max(0, offset));
+    const lines = prefix.split('\n');
+    return lines.length === 1
+      ? { line: base.line, column: base.column + lines[0].length }
+      : { line: base.line + lines.length - 1, column: lines.at(-1).length + 1 };
+  };
+  const editSource = (block, region) => {
+    if (block.file && block.sourceStart) {
+      return {
+        file: block.file,
+        start: relativePosition(block.sourceStart, block.text, region.contentStart),
+        end: relativePosition(block.sourceStart, block.text, region.contentEnd),
+      };
+    }
+    return {
+      file,
+      start: position(file, block.start + region.contentStart),
+      end: position(file, block.start + region.contentEnd),
+    };
+  };
   const blockPages = new Map();
   for (const page of pages) {
     for (const d of page.draw ?? []) {
@@ -26,6 +49,7 @@ export function buildDomSnapshot({
   }
   return {
     rev,
+    srcRev,
     backend: backendName,
     mode,
     modeReasons,
@@ -34,6 +58,28 @@ export function buildDomSnapshot({
     checkpoints: [...checkpoints.keys()].sort((a, b) => a - b),
     blocks: blocks.map((b, i) => {
       const chunkKeys = chunkTargets(b).map((t) => t.key);
+      const blockRegions = [
+        ...(b.editRegions ?? []).map((region) => ({
+          id: `${b.id}:${region.id}`,
+          kind: region.kind,
+          value: region.value,
+          sourceValue: region.sourceValue,
+          source: editSource(b, region),
+        })),
+        ...preambleEditRegions
+          .filter(() => /\\maketitle\b/.test(b.text))
+          .map((region) => ({
+            id: `${b.id}:${region.id}`,
+            kind: region.kind,
+            value: region.value,
+            sourceValue: region.sourceValue,
+            source: {
+              file,
+              start: position(file, region.contentStart),
+              end: position(file, region.contentEnd),
+            },
+          })),
+      ];
       return {
         id: b.id,
         index: i,
@@ -42,11 +88,13 @@ export function buildDomSnapshot({
         gfxChunks: chunkKeys,
         fidelity: b.fidelity?.level ?? null,
         exactLines: b.fidelity?.exactLines ?? 0,
-        source: {
-          file,
-          start: position(file, b.start),
-          end: position(file, b.end),
-        },
+        source: b.file && b.sourceStart && b.sourceEnd
+          ? { file: b.file, start: b.sourceStart, end: b.sourceEnd }
+          : {
+              file,
+              start: position(file, b.start),
+              end: position(file, b.end),
+            },
         labels: (b.galley?.labels ?? []).map((l) => l.k),
         refs: b.galley?.refs ?? [],
         pages: blockPages.get(b.id) ?? [],
@@ -54,6 +102,7 @@ export function buildDomSnapshot({
         // blocks expanded from \input files are not editable in-place
         file: b.file ?? null,
         span: b.file ? null : { start: b.start, end: b.end },
+        editRegions: blockRegions,
       };
     }),
     labels: Object.fromEntries(labelTable),

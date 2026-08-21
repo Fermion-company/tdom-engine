@@ -2,6 +2,7 @@ import path from 'node:path';
 import { fnv1a } from '../hash.js';
 import { documentBounds } from '../segmenter.js';
 import { buildIsoCompileSource } from './tex-templates.js';
+import { trailingGlueSpec } from './util/galley.js';
 
 export function prepareIsoCompileJob({
   block,
@@ -99,6 +100,8 @@ export function prepareIsoCompileJob({
   const maxStrut = Math.max(0, (geometry?.textheight ?? Infinity) - 1);
   const strut = Math.min(Math.max(0, entryOff - topskipW), maxStrut);
   const prevLsSp = idx > 0 ? prevVec[prevVec.length - 1] ?? 0 : 0;
+  const prevLastskip =
+    idx > 0 ? trailingGlueSpec(blocks[idx - 1].galley, prevLsSp) : trailingGlueSpec(null, 0);
   const isoTex = buildIsoCompileSource({
     ck0,
     preamble: text.slice(bounds.preamble.start, bounds.preamble.end),
@@ -110,7 +113,7 @@ export function prepareIsoCompileJob({
     blockText: block.text,
     prevPd,
     prevNobreak,
-    prevLsSp,
+    prevLastskip,
     realOutput,
     strut,
   });

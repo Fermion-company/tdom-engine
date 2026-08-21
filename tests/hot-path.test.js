@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
+import { handlePeerMessage } from '../engine/checkpoint/peer-message.js';
 
 const WORK = fileURLToPath(new URL('../.tdom-hotpath-test', import.meta.url));
 const WORK2 = fileURLToPath(new URL('../.tdom-hotpath-test-scratch', import.meta.url));
@@ -107,6 +108,24 @@ async function drain(eng, timeoutMs = 120_000) {
 
 /** Lineage-independent identity of the whole document state. */
 const signature = (eng) => eng.blocks.map((b) => `${b.galleyHash}|${b.stateVec}`);
+
+test('a replacement checkpoint retires the preserved peer at that boundary', () => {
+  const sent = [];
+  const oldPeer = { pid: 41, send: (message) => sent.push(message) };
+  const newPeer = { pid: 42, send() {} };
+  const engine = {
+    checkpoints: new Map([[3, oldPeer]]),
+    dyingPids: new Set(),
+    waiters: new Map([['ckpt:3', {}]]),
+    _fulfill() {},
+  };
+
+  handlePeerMessage(engine, newPeer, { kind: 'CKPT', idx: 3 });
+
+  assert.deepEqual(sent, ['DIE\n']);
+  assert.equal(engine.checkpoints.get(3), newPeer);
+  assert.deepEqual([...engine.dyingPids], [41]);
+});
 
 let eng;
 before(async () => {

@@ -2,7 +2,7 @@
 // verdict yet (checkpoint render-hold heuristic — a miss only costs the
 // slower isolated render path)
 const MATHY_RE =
-  /\$|\\\[|\\\(|\\begin\{(equation|align|alignat|gather|multline|eqnarray|math|displaymath|cases|array|split|aligned|gathered|alignedat|tikzpicture)/;
+  /\$|\\\[|\\\(|\\includegraphics\b|\\begin\{(equation|align|alignat|gather|multline|eqnarray|math|displaymath|cases|array|split|aligned|gathered|alignedat|tikzpicture)/;
 
 // how many off-grid checkpoints may stay alive awaiting their block's chunk
 const RENDER_HOLD_MAX = Number(process.env.TDOM_RENDER_HOLD_MAX || 8);
@@ -15,6 +15,18 @@ export function mayNeedRender(block) {
 }
 
 export function maybeHoldRenderCheckpoint(idx, block, renderHold) {
+  const externalGraphic = !!block && /\\includegraphics\b/.test(block.text);
+  // Math-heavy papers can fill every render hold before reaching a figure
+  // near the end of the document. Unlike math, an image has no usable glyph
+  // bridge at all, so reserve a warm checkpoint for it by evicting the
+  // oldest latency-only hold. The normal checkpoint cap retires that peer.
+  if (
+    externalGraphic &&
+    !renderHold.has(idx) &&
+    renderHold.size >= RENDER_HOLD_MAX
+  ) {
+    renderHold.delete(renderHold.keys().next().value);
+  }
   if (
     block &&
     !renderHold.has(idx) &&

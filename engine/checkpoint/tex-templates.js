@@ -13,6 +13,15 @@ export function buildDriverSource({
 }) {
   const L = [];
   L.push(preamble.trimEnd());
+  // hyperref writes PDF catalog/anchor objects from its begin-document
+  // hook, opening driver.pdf in checkpoint 0. Every fork then inherits the
+  // same output descriptor and can no longer ship its own tight render — a
+  // basic `hyperref + includegraphics` paper waited for the cold canonical
+  // compile before showing any image. The resident document is a layout and
+  // chunk producer, not the exported PDF: run hyperref in draft mode here so
+  // it keeps identical text/boxes without opening the shared PDF. Canonical
+  // compiles the untouched source and therefore retains the real links.
+  L.push('\\makeatletter\\@ifpackageloaded{hyperref}{\\Hy@drafttrue}{}\\makeatother');
   L.push('\\begin{document}');
   L.push(`\\directlua{dofile('${luaStr(daemonPath)}')}`);
   L.push('\\makeatletter');
@@ -314,7 +323,7 @@ export function buildIsoCompileSource({
   blockText,
   prevPd,
   prevNobreak,
-  prevLsSp,
+  prevLastskip,
   realOutput,
   strut,
 }) {
@@ -484,9 +493,11 @@ export function buildIsoCompileSource({
   // trailing skip, but the isostart whatsit above resets \lastskip to 0.
   // Re-establish it here (after isostart, marked with LASTSKIP_ATTR so the
   // harvest drops the primer — it is already in the previous block's galley).
-  if (prevLsSp > 0 && startsAddvspace(blockText)) {
+  if (prevLastskip?.widthSp > 0 && startsAddvspace(blockText)) {
     L.push(
-      `\\directlua{local g=node.new('glue') g.width=${Math.round(prevLsSp)} ` +
+      `\\directlua{local g=node.new('glue') g.width=${prevLastskip.widthSp} ` +
+        `g.stretch=${prevLastskip.stretchSp} g.shrink=${prevLastskip.shrinkSp} ` +
+        `g.stretch_order=${prevLastskip.stretchOrder} g.shrink_order=${prevLastskip.shrinkOrder} ` +
         `node.set_attribute(g, 8124, 1) node.write(g)}`
     );
   }
@@ -548,8 +559,12 @@ export function buildIsoCompileSource({
       'local m = out ' +
       'while m do ' +
       'if m.id == HL or m.id == VL then table.insert(items, \'{"k":"box","h":\' .. bp(m.height) .. \',"d":\' .. bp(m.depth) .. \'}\') ' +
-      'elseif m.id == GL or m.id == KE then local a = (m.id == GL and m.width or m.kern) or 0 ' +
-      'if a ~= 0 then table.insert(items, \'{"k":"glue","a":\' .. bp(a) .. \'}\') end ' +
+      'elseif m.id == GL then local a = m.width or 0 ' +
+      'local st = m.stretch or 0 local sh = m.shrink or 0 ' +
+      'table.insert(items, \'{"k":"glue","a":\' .. bp(a) .. ' +
+      '\',"st":\' .. bp(st) .. \' ,"sto":\' .. (m.stretch_order or 0) .. ' +
+      '\',"sh":\' .. bp(sh) .. \' ,"sho":\' .. (m.shrink_order or 0) .. \'}\') ' +
+      'elseif m.id == KE then table.insert(items, \'{"k":"kern","a":\' .. bp(m.kern or 0) .. \'}\') ' +
       'elseif m.id == WH and m.subtype == SP and m.data and m.data:sub(1, 8) == "tdom:tl:" then ' +
       'table.insert(items, \'{"k":"tl","n":\' .. (tonumber(m.data:sub(9)) or 0) .. \'}\') ' +
       'elseif m.id == WH and m.subtype == SP and m.data and m.data:sub(1, 11) == "tdom:eject:" then ' +

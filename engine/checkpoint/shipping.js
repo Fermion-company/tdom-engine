@@ -18,6 +18,7 @@ import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
+import { withProjectInputs } from '../project-inputs.js';
 import { fileURLToPath } from 'node:url';
 import { segmentBody } from '../segmenter.js';
 import { ensureShim } from './forkshim.js';
@@ -43,9 +44,10 @@ class Peer {
 }
 
 export class ShippingChain {
-  constructor({ workDir, docDir }) {
+  constructor({ workDir, docDir, overlayDir = null }) {
     this.workDir = path.resolve(workDir);
     this.docDir = docDir ? path.resolve(docDir) : this.workDir;
+    this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
     mkdirSync(this.workDir, { recursive: true });
     this.server = null;
     this.port = 0;
@@ -269,11 +271,7 @@ export class ShippingChain {
     this.root = spawn('lualatex', ['--shell-escape', '-interaction=nonstopmode', 'driver-ship.tex'], {
       cwd: this.workDir,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        TEXINPUTS: `${this.docDir}:${process.env.TEXINPUTS || ''}`,
-        LUAINPUTS: `${this.docDir}:${process.env.LUAINPUTS || ''}`,
-      },
+      env: withProjectInputs(process.env, { docDir: this.docDir, overlayDir: this.overlayDir }),
     });
     let log = '';
     this.root.stdout.on('data', (d) => {
