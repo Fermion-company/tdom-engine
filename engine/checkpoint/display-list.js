@@ -2,6 +2,8 @@ import { fnv1a } from '../hash.js';
 import { remapText } from './mathmap.js';
 import { r2 } from './util/svg.js';
 
+const EXACT_CHUNK_BLEED_BP = 0.5;
+
 export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twinMetrics }) {
   const geo = geometry;
   const L = 72 + (geo.oddsidemargin ?? 0);
@@ -11,14 +13,21 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
   const flushGfx = () => {
     if (!gfxOpen) return;
     const meta = chunks.get(gfxOpen.blockId);
-    const visibleHeight = gfxOpen.clip1 - gfxOpen.clip0;
-    if (gfxOpen.units === 1 && visibleHeight > Math.max(12, gfxOpen.covered * 2)) {
+    // PDF/SVG ink may overhang TeX's logical box by a fraction of a bp
+    // (notably superscripts and large operators). Keep the chunk clipped,
+    // but give its outer band a tiny bounded bleed so those pixels survive.
+    const chunkHeight = Math.max(0, meta?.hBp ?? gfxOpen.clip1);
+    const clip0 = Math.min(chunkHeight, Math.max(0, gfxOpen.clip0 - EXACT_CHUNK_BLEED_BP));
+    const clip1 = Math.min(chunkHeight, gfxOpen.clip1 + EXACT_CHUNK_BLEED_BP);
+    const visibleHeight = Math.max(0, clip1 - clip0);
+    const logicalHeight = gfxOpen.clip1 - gfxOpen.clip0;
+    if (gfxOpen.units === 1 && logicalHeight > Math.max(12, gfxOpen.covered * 2)) {
       commands.push({
         op: 'sourcebox',
         x: r2(L),
         y: r2(gfxOpen.top + gfxOpen.clip0),
         w: r2(gfxOpen.w),
-        h: r2(visibleHeight),
+        h: r2(logicalHeight),
         ink: gfxOpen.ink ? 1 : undefined,
         chunk: 1,
         complex: 1,
@@ -28,12 +37,14 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
     commands.push({
       op: 'chunk',
       chunk: gfxOpen.blockId,
+      // The SVG already contains paragraph indentation. Anchor it at the
+      // text block origin; adding run.x here would indent exact lines twice.
       x: r2(L),
-      y: r2(gfxOpen.top + gfxOpen.clip0),
+      y: r2(gfxOpen.top + clip0),
       w: r2(gfxOpen.w),
-      h: r2(gfxOpen.clip1 - gfxOpen.clip0),
-      sy: r2(gfxOpen.clip0),
-      ch: r2(meta?.hBp ?? gfxOpen.clip1),
+      h: r2(visibleHeight),
+      sy: r2(clip0),
+      ch: r2(chunkHeight),
       cv: meta?.v ?? 0,
       st: gfxOpen.stale ? 1 : undefined, // stale-exact: previous pixels held
       src: gfxOpen.blockId,
@@ -135,6 +146,9 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
 function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, line }) {
   for (const r of runs ?? []) {
     if (r.rule) {
+      // LuaTeX-ja emits zero-width rule nodes as structural markers around
+      // Japanese glyphs. They have no PDF ink and must remain invisible.
+      if (!(r.w > 0) || !(r.h > 0)) continue;
       commands.push({
         op: 'rule',
         x: r2(X + r.x),

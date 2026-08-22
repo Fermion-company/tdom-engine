@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
+import { buildDisplayList } from '../engine/checkpoint/display-list.js';
 import { handlePeerMessage } from '../engine/checkpoint/peer-message.js';
 
 const WORK = fileURLToPath(new URL('../.tdom-hotpath-test', import.meta.url));
@@ -125,6 +126,71 @@ test('a replacement checkpoint retires the preserved peer at that boundary', () 
   assert.deepEqual(sent, ['DIE\n']);
   assert.equal(engine.checkpoints.get(3), newPeer);
   assert.deepEqual([...engine.dyingPids], [41]);
+});
+
+test('preview display list drops zero-area markers and preserves exact chunk ink', () => {
+  const page = {
+    number: 1,
+    draw: [
+      {
+        y: 10,
+        u: {
+          blockId: 'ja',
+          li: 0,
+          h: 8,
+          d: 2,
+          ln: {
+            boxH: 8,
+            runs: [
+              { rule: true, x: 10, dy: -8, w: 0, h: 10 },
+              { rule: true, x: 20, dy: -0.4, w: 5, h: 0.4 },
+            ],
+          },
+        },
+      },
+      {
+        y: 30,
+        u: {
+          blockId: 'math',
+          li: 0,
+          h: 8,
+          d: 2,
+          ln: {
+            boxH: 8,
+            runs: [],
+            editRuns: [{ t: 'x', x: 10, w: 5 }],
+            gfxChunk: { blockId: 'math', yOff: 6, w: 100 },
+          },
+        },
+      },
+    ],
+  };
+  const dl = buildDisplayList(page, {
+    geometry: {
+      oddsidemargin: 0,
+      topmargin: 0,
+      headheight: 0,
+      headsep: 0,
+      textwidth: 100,
+      textheight: 200,
+      footskip: 30,
+    },
+    chunks: new Map([['math', { hBp: 20, v: 1 }]]),
+    hf: new Map(),
+    hfSig: '',
+    fonts: new Map(),
+    twinMetrics: {},
+  });
+
+  const rules = dl.commands.filter((command) => command.op === 'rule');
+  assert.deepEqual(rules.map(({ w, h }) => ({ w, h })), [{ w: 5, h: 0.4 }]);
+
+  const chunk = dl.commands.find((command) => command.op === 'chunk');
+  assert.deepEqual(
+    { x: chunk.x, y: chunk.y, h: chunk.h, sy: chunk.sy, ch: chunk.ch },
+    { x: 72, y: 93.5, h: 11, sy: 5.5, ch: 20 },
+    'the SVG owns paragraph indentation, while a bounded vertical bleed preserves math ink'
+  );
 });
 
 let eng;

@@ -628,7 +628,7 @@ function svgFor(dl) {
       );
     } else if (cmd.op === 'rule') {
       parts.push(
-        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.1)}" height="${Math.max(cmd.h, 0.1)}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}/>`
+        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0)}" height="${Math.max(cmd.h, 0)}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}/>`
       );
     } else if (cmd.op === 'editbox') {
       parts.push(
