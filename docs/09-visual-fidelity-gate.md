@@ -79,12 +79,13 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
   **line chunk** になる。
 - stale な whole-block chunk があるときも、普通の散文行は現在の glyph を
   出す。古い block 画像が編集直後の本文を覆わない。
+- fresh chunk が届いても exact 判定された行だけを chunk window にする。
+  同じ block の安全な散文行は glyph のまま残すため、隣接する `\texttt` や
+  `\textit` が数式レンダー待ちになったり、後から画像へ置換されたりしない。
 - 本文と inline math が同じ行に混在する場合、`itemFlags` の bit 4 が立つ。
-  その行は現在の本文 glyph を出し、数式 run だけを source-level LaTeX から
-  MathLive の静的 `<math-span>` で描く。元の math run は初回 paint から常に
-  透明で、位置・クリック領域だけを保持する。MathLive と一対一に対応できない
-  `align` 等も raw glyph へ戻らず、exact chunk が届くまで空白になるため、
-  PUA の四角や代替フォントを一瞬も表示しない。
+  fresh chunk 待ちの間は現在の本文 glyph だけを出し、math run は透明にする。
+  MathLive 等の別レンダラーでは補わない。前回の exact chunk を安全に使える
+  math-only 行はそれを保持し、それ以外は空白へ fail closed する。
 - float は float ページ（2..1+F）、**脚注は新設の footnote ページ
   （2+F..1+F+N）**に ship され、`b13#1` / `b13@fn0` のキーで独立に
   banding される（数式入り脚注も exact）。
@@ -95,18 +96,13 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
 打鍵直後の各 exact 行は、良い方から:
 
 1. **fresh chunk** — 現 galley の実PDFピクセル
-2. **current mixed-line bridge** — stale な whole-block chunk 内で編集された
-   混在行だけ、現在の本文 glyph＋source-level MathLive 数式を表示
-3. **stale chunk** — 直前レンダーのピクセル（`st:1` でマーク）。
+2. **stale chunk** — 直前レンダーのピクセル（`st:1` でマーク）。
    「一瞬古いが綺麗」は許容、「速いが汚い」は不許容
-4. **glyph bridge** — 非数式の exact-required 行だけ、全グリフが少なくとも
+3. **glyph bridge** — 非数式の exact-required 行だけ、全グリフが少なくとも
    写像可能（twin可・PUA不可）なら chunk 到着までの橋として表示。数式 run
    自体は常に透明
-5. **blank** — `xb` 行・降格ブロック。間違った字形は一瞬でも出さない
-
-mixed-line bridge は `/dom` の `editRegions` と SVG 上の math run group が
-一対一に対応するときだけ使う。対応数が合わない場合は推測せず exact 経路に
-残す。display math は `editRegions[].display=true` で区別する。
+4. **blank** — `xb` 行・降格ブロック・exact chunk 待ちの数式。
+   間違った字形は一瞬でも出さない
 
 chunk の鮮度は `unitsSig` が chunk 版数＋fresh/stale ビットを持つので、
 到着時に帯だけが差し替わります（第8章のバンド収束と同じ経路）。
@@ -155,14 +151,17 @@ canonical 着地時の一致検証（第8章 §8.4）が fidelity にも接続�
 - ブラウザ側も `document.fonts.load()` で各 `@font-face` の実ロードを
   検証し、失敗を `POST /font-fail` で報告 → `demoteFontFamily()` が
   そのファミリを `none` に落として該当行を chunk へ切り替える
-  （Times fallback が画面に残らない）。
+  （Times fallback が画面に残らない）。差分 report / async patch は同じ更新で
+  font manifest を送る。未ロード family の run は `data-font-pending` で透明にし、
+  実フォントの decode が完了してからだけ表示する。
 
 ## 9.8 実装対応表
 
 | 表示対象 | 現在の実装 |
 |---|---|
 | display math がTeX品質 | math 行は exact chunk |
-| inline math 段落の編集中に本文が古い chunk に隠れない | current glyph＋MathLive mixed-line bridge（§9.4） |
+| inline math 段落の編集中に本文が古い chunk に隠れない | current glyph、math は exact chunk 待ちの間 blank（§9.4） |
+| 隣接する `\texttt` / `\textit` が遅れて差し替わらない | safe 行を構造化 glyph のまま維持＋font manifest を同時配送 |
 | CM / LM / unicode-math / CJK が fallback しない | フォントティア＋`xb` 検出＋font-fail 降格 |
 | TikZ / PDF literal は常にTeX由来 | 従来の `blk_gfx`（変更なし） |
 | canonical 到着で大ジャンプしない | chunk ピクセル＝実PDFピクセル |

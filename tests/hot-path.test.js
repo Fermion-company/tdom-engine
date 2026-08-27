@@ -247,10 +247,10 @@ test('preview display list drops zero-area markers and preserves exact chunk ink
   );
   const mathHit = dl.commands.find((command) => command.op === 'sourcebox' && command.src === 'math');
   assert.equal(mathHit?.math, 1, 'stale exact display math exposes its live TeX geometry');
-  assert.equal(mathHit?.stale, 1, 'the client only overlays MathLive while exact pixels are stale');
+  assert.equal(mathHit?.stale, 1, 'the client can retain clean stale pixels while the mini-compile runs');
 });
 
-test('fresh partial-exact pixels cover a complete block without internal crop edges', () => {
+test('fresh partial-exact pixels replace only contiguous math lines', () => {
   const line = (text) => ({
     k: 'box',
     h: 10,
@@ -263,14 +263,14 @@ test('fresh partial-exact pixels cover a complete block without internal crop ed
     galleyHash: 'fresh-galley',
     galley: {
       w: 100,
-      items: [line('before'), line('\uE000S_1=S_2'), line('after')],
+      items: [line('before'), line('\uE000S_1=S_2'), line('\uE000S_2=S_3'), line('after')],
       floats: [],
     },
     fidelity: {
       blockExact: false,
       canonicalOnly: false,
-      exactLines: 1,
-      itemFlags: [0, 3, 0],
+      exactLines: 2,
+      itemFlags: [0, 3, 3, 0],
       floats: new Map(),
       ins: new Map(),
     },
@@ -278,7 +278,7 @@ test('fresh partial-exact pixels cover a complete block without internal crop ed
   const chunks = new Map([['mixed', {
     forGalley: 'fresh-galley',
     wBp: 100,
-    hBp: 36,
+    hBp: 48,
     v: 1,
   }]]);
   const boxes = buildStream(block, chunks)
@@ -305,21 +305,46 @@ test('fresh partial-exact pixels cover a complete block without internal crop ed
   });
   const exact = dl.commands.filter((command) => command.op === 'chunk');
 
-  assert.ok(boxes.every((unit) => unit.ln.gfxChunk?.blockId === 'mixed'));
+  assert.equal(boxes[0].ln.gfxChunk, null, 'safe prose before math stays as live glyphs');
+  assert.equal(boxes[0].ln.runs[0].t, 'before');
+  assert.equal(boxes[1].ln.gfxChunk?.blockId, 'mixed');
+  assert.equal(boxes[2].ln.gfxChunk?.blockId, 'mixed');
+  assert.equal(boxes[3].ln.gfxChunk, null, 'safe prose after math stays as live glyphs');
+  assert.equal(boxes[3].ln.runs[0].t, 'after');
   assert.deepEqual(
     exact.map(({ sy, h, ch }) => ({ sy, h, ch })),
-    [{ sy: 0, h: 36, ch: 36 }]
+    [{ sy: 10, h: 28, ch: 48 }],
+    'adjacent exact lines merge into one mini-compile window with only outer bleed'
   );
 });
 
 let eng;
+let openReport;
 before(async () => {
   if (!available) return;
   rmSync(WORK, { recursive: true, force: true });
   rmSync(WORK2, { recursive: true, force: true });
   eng = new CheckpointEngine({ workDir: WORK });
-  await eng.open(makeDoc());
+  openReport = await eng.open(makeDoc());
   await drain(eng);
+});
+
+test('edit reports atomically carry newly registered texttt and textit faces', opts, async () => {
+  assert.deepEqual(new Set(openReport.fonts), new Set(eng.getFontManifest()));
+  const anchor = 'Opening alpha';
+  const insert = '\\texttt{aaaa}\\textit{BBBB}';
+  const start = eng.getSource().indexOf(anchor) + anchor.length;
+  const before = new Set(eng.getFontManifest());
+  const report = await eng.edit(start, start, insert);
+  const commands = report.patches.flatMap((patch) => patch.displayList?.commands ?? []);
+  const mono = commands.find((command) => command.op === 'glyphs' && command.text.includes('aaaa'));
+  const italic = commands.find((command) => command.op === 'glyphs' && command.text.includes('BBBB'));
+  assert.ok(mono?.fam && italic?.fam, 'both style runs stay in the structured text layer');
+  assert.notEqual(mono.fam, italic.fam, 'typewriter and italic use distinct TeX faces');
+  assert.ok(report.fonts.includes(mono.fam));
+  assert.ok(report.fonts.includes(italic.fam));
+  assert.ok(report.fonts.some((family) => !before.has(family)), 'the same edit reports its new face');
+  await eng.edit(start, start + insert.length, '');
 });
 after(async () => {
   if (eng) await eng.close();

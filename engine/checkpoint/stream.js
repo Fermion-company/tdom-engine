@@ -20,12 +20,6 @@ export function buildStream(block, chunks) {
   const bc = chunks.get(block.id);
   const bcFresh = !!bc && bc.forGalley === block.galleyHash;
   const blockExact = !!(block.gfx || fid?.blockExact);
-  // A block chunk is a complete TeX render even when fidelity only required
-  // exact pixels for a few of its lines. Once that chunk is fresh, use it for
-  // every box in the block: one continuous window has no internal crop edges
-  // that can shave display-math ink. While stale, keep the old policy below so
-  // a previous whole-block image never hides newly edited safe prose.
-  const promoteFreshBlockChunk = bcFresh && (fid?.exactLines ?? 0) > 0;
   const canonicalOnly = !!fid?.canonicalOnly;
 
   const stream = [];
@@ -111,14 +105,13 @@ export function buildStream(block, chunks) {
     } else if (it.k === 'box') {
       // fidelity verdict for THIS line: exact-required lines map into the
       // block chunk (fresh, or stale until the new one lands ~100ms later);
-      // safe lines stay pure glyphs. A graphical block can mix both kinds
-      // (for example prose followed by an align environment). While its
-      // whole-block chunk is stale, do not let those old pixels hide a
-      // newly edited safe line; keep only the exact/math lines on the stale
-      // chunk. Rescued per-item chunks still take precedence.
+      // safe lines stay pure glyphs even after the chunk becomes fresh. This
+      // is the miniature-compile boundary: a nearby display formula must not
+      // delay or later replace prose/font-style runs from the same block.
+      // Rescued per-item chunks still take precedence.
       const flags = fid?.itemFlags?.[ii] ?? 0;
       const wantExact =
-        !canonicalOnly && (blockExact || promoteFreshBlockChunk || (flags & 1) !== 0);
+        !canonicalOnly && (blockExact || (flags & 1) !== 0);
       const hasRuns = (it.runs ?? []).some((run) => run.rule || !!run.t);
       const useCurrentSafeLine =
         !!bc && !bcFresh && (fid?.exactLines ?? 0) > 0 &&

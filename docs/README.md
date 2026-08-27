@@ -31,7 +31,7 @@
 | [09-visual-fidelity-gate.md](./09-visual-fidelity-gate.md) | 視覚忠実度ゲートと exact chunk 降格 |
 | [10-edit-hot-path.md](./10-edit-hot-path.md) | 編集ホットパス、checkpoint 再利用、非同期追従 |
 | [11-shipping-chain.md](./11-shipping-chain.md) | shipping chain: `TDOM_SHIP=1` で有効なページ境界 checkpoint 付き実ラン |
-| [12-live-preview-fidelity-baseline.md](./12-live-preview-fidelity-baseline.md) | 2026-08-27 の表示忠実度基準点、混在行の MathLive bridge、復元手順 |
+| [12-live-preview-fidelity-baseline.md](./12-live-preview-fidelity-baseline.md) | 2026-08-27 の基準点と 2026-08-28 の exact-only 更新、復元手順 |
 
 最短で全体像だけ掴むなら、`00 -> 02 -> 03 -> 08 -> 09 -> 10 -> 11` の順で読む。TeX の内部に慣れていない場合だけ、最初に `01` を挟む。2026-08-27 のリアルタイム表示修正を保守するときは、続けて `12` を読む。
 

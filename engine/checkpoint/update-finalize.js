@@ -74,6 +74,7 @@ export function finalizeUpdate(engine, {
     changedLabels,
     verifyState: engine.verifyState,
     fidelity: fidelitySummary(),
+    fonts: engine.getFontManifest(),
     diagnostics,
     engineDiagnostics: engine.diagnostics,
   });

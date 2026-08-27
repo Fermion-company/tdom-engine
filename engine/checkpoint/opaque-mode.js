@@ -37,6 +37,7 @@ export function opaqueUpdate(engine, editLabel, t, reasons, { teardownTree, ship
     mode: engine.mode,
     modeReasons: engine.modeReasons,
     canonical: engine.canonical.info(),
+    fonts: engine.getFontManifest(),
     timerStats: t.done(),
     diagnostics: engine.diagnostics,
   });

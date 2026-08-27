@@ -668,7 +668,7 @@ engine.onDocumentResetComplete = ({ report } = {}) => {
 
 // async patches (TikZ renders, late chain discoveries) from the checkpoint engine
 engine.onAsyncPatches = (partial) => {
-  broadcast({ kind: 'patches', rev: partial.rev, patches: partial.patches });
+  broadcast({ kind: 'patches', rev: partial.rev, fonts: partial.fonts, patches: partial.patches });
 };
 engine.onExternalChange = () => {
   withEngine(async () => {

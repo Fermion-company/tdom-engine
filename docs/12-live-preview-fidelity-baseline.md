@@ -3,6 +3,9 @@
 この章は、2026-08-27 に実画面で確認した表示忠実度の基準点と、その復元方法を
 記録する。計画ではなく、現在の実装・履歴・検証事実のメモである。
 
+> 2026-08-28 更新: §12.2 の旧項目 4 / 7 / 9 にある MathLive bridge と
+> fresh whole-block 昇格は廃止した。現在の契約は §12.8 および第9章を正とする。
+
 ## 12.1 Git の基準点
 
 今回の統合は、次の二つの兄弟コミットを両方残す merge である。
@@ -64,7 +67,8 @@ TDOM は外部プロセスなので、Electron の仮想 `app.asar` 内を通常
 - `/host/mathlive/mathlive-static.css`
 - `/host/web/math/wysiwyg/math-wysiwyg.js`
 
-この契約が壊れると `<math-span>` が登録されず、mixed-line bridge が起動しない。
+この契約が壊れると `<math-span>` が登録されず、直接数式編集と WYSIWYG 候補が
+起動しない。2026-08-28 以降、印刷プレビューの暫定描画自体には MathLive を使わない。
 
 ## 12.5 再現・確認に使ったケース
 
@@ -120,3 +124,16 @@ git switch codex/backup-live-preview-fidelity-20260827
 git fetch /Users/majinkuu/Desktop/tdom-live-preview-fidelity-20260827.bundle \
   refs/heads/codex/backup-live-preview-fidelity-20260827:refs/heads/codex/backup-live-preview-fidelity-20260827
 ```
+
+## 12.8 2026-08-28 の見た目優先契約
+
+- 数式は resident CAPTURE / RENDER が作る実 LuaLaTeX chunk、または canonical
+  page だけを表示する。raw math font や MathLive の近似表示は使わない。
+- exact pixel がまだ無ければ空白、直前の安全な exact pixel があればそれを保持する。
+  「遅いが綺麗」は許容し、「速いが別書体」は許容しない。
+- partial-exact block の fresh chunk は block 全体へ昇格せず、exact 判定された
+  連続行だけを window として貼る。前後の散文行は構造化 glyph のまま残す。
+- edit report / async patch は font manifest を同梱する。client は新しい TeX face が
+  decode されるまで該当 glyph run を透明にし、browser fallback を表示しない。
+- `\texttt{aaaa}\textit{BBBB}` のような本文装飾は、隣接する数式の mini-compile
+  完了を待たず、同じ差分応答で別々の実 TeX font family として反映する。

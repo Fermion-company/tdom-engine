@@ -25,6 +25,7 @@ export function buildUpdateResponse({
   changedLabels,
   verifyState,
   fidelity,
+  fonts,
   diagnostics,
   engineDiagnostics,
 }) {
@@ -36,6 +37,7 @@ export function buildUpdateResponse({
     mode,
     modeReasons,
     canonical,
+    fonts,
     dirtySourceNodes: [...dirtySource].map((id) => 'src-' + id),
     dirtySemanticNodes: dirtyBlocks.map((id) => 'blk-' + id),
     dirtyDependencies: depDirty,
@@ -77,6 +79,7 @@ export function buildOpaqueUpdateResponse({
   mode,
   modeReasons,
   canonical,
+  fonts,
   timerStats,
   diagnostics,
 }) {
@@ -88,6 +91,7 @@ export function buildOpaqueUpdateResponse({
     mode,
     modeReasons,
     canonical,
+    fonts,
     dirtySourceNodes: [],
     dirtySemanticNodes: [],
     dirtyDependencies: [],
