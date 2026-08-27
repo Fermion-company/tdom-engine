@@ -427,6 +427,7 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 }
 .page {
   position: relative;
+  container-type: inline-size;
   width: min(calc(92% * var(--zoom)), calc(640px * var(--zoom)));
   flex: none;
   background: #fff;
@@ -452,12 +453,36 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
   user-select: none;
 }
 .page.is-final svg,
-.page.is-final .chunkwin { opacity: 0; }
+.page.is-final .chunkwin,
+.page.is-final .tdom-provisional-math { opacity: 0; }
 /* pages the fresh canonical says don't exist */
 .page.phantom { display: none; }
 
 .chunkwin { position: absolute; overflow: hidden; cursor: pointer; }
 .chunkwin img.chunk { display: block; width: 100%; height: auto; user-select: none; }
+
+/* A stale exact chunk cannot cover a newly edited prose line that also has
+   inline math. TeX still supplies its exact run geometry; MathLive paints the
+   source expression into that geometry for the one provisional frame. */
+.tdom-provisional-math {
+  position: absolute;
+  z-index: 2;
+  display: inline-block;
+  width: max-content;
+  max-width: none;
+  white-space: nowrap;
+  color: #1a1a1a;
+  opacity: 0;
+  pointer-events: none;
+  user-select: none;
+  transform: translateY(-50%) scale(var(--tdom-math-scale, 1));
+  transform-origin: left center;
+}
+.tdom-provisional-math.ready { opacity: 1; }
+.page.is-final .tdom-provisional-math.ready { opacity: 0; }
+.tdom-provisional-math math-span { display: inline-flex; }
+.tdom-provisional-math .ML__mathlive,
+.tdom-provisional-math .ML__content { overflow: visible !important; }
 
 /* Direct PDF editing: hit geometry is carried by the invisible provisional
    SVG even when exact LuaLaTeX pixels are on top.  Only one actual input is

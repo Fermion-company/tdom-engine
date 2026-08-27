@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildDisplayList } from '../engine/checkpoint/display-list.js';
+import { buildStream } from '../engine/checkpoint/stream.js';
 import { prepareIsoCompileJob } from '../engine/checkpoint/iso-context.js';
 import { needsRescue } from '../engine/checkpoint/rescue-classifier.js';
 
@@ -14,6 +15,71 @@ const geometry = {
   footskip: 30,
   topskip: { w: 10 },
 };
+
+const lineBox = (text, extra = {}) => ({
+  k: 'box',
+  h: 10,
+  d: 2,
+  w: 300,
+  runs: text ? [{ f: 1, t: text, x: 0, dy: 0, s: 10 }] : [],
+  ...extra,
+});
+
+test('a stale graphical block reveals current prose, including mixed math lines, but keeps math-only pixels', () => {
+  const block = {
+    id: 'b1',
+    galleyHash: 'new-galley',
+    galley: {
+      gfx: true,
+      w: 300,
+      items: [
+        lineBox('検左側の区間'),
+        lineBox('本文\uE000x', { x: 1, xb: 1 }),
+        lineBox('\uE000x', { x: 1, xb: 1 }),
+      ],
+      floats: [],
+    },
+    fidelity: {
+      blockExact: true,
+      canonicalOnly: false,
+      noBridge: true,
+      exactLines: 2,
+      itemFlags: [0, 7, 3],
+      floats: new Map(),
+      ins: new Map(),
+    },
+  };
+  const chunks = new Map([['b1', { forGalley: 'old-galley', wBp: 300, hBp: 24, v: 1 }]]);
+  const boxes = buildStream(block, chunks).filter((entry) => entry.t === 'box');
+
+  assert.equal(boxes[0].u.ln.gfxChunk, null);
+  assert.equal(boxes[0].u.ln.runs[0].t, '検左側の区間');
+  assert.equal(boxes[1].u.ln.gfxChunk, null);
+  assert.equal(boxes[1].u.ln.runs[0].t, '本文\uE000x');
+  assert.equal(boxes[2].u.ln.gfxChunk?.stale, 1);
+  assert.equal(boxes[2].u.ln.runs[0].t, '\uE000x', 'run geometry remains only as chunk hit metadata');
+});
+
+test('a fresh exact chunk still replaces every line of a graphical block', () => {
+  const block = {
+    id: 'b1',
+    galleyHash: 'new-galley',
+    galley: { gfx: true, w: 300, items: [lineBox('左側の区間')], floats: [] },
+    fidelity: {
+      blockExact: true,
+      canonicalOnly: false,
+      noBridge: true,
+      itemFlags: [0],
+      floats: new Map(),
+      ins: new Map(),
+    },
+  };
+  const chunks = new Map([['b1', { forGalley: 'new-galley', wBp: 300, hBp: 12, v: 2 }]]);
+  const box = buildStream(block, chunks).find((entry) => entry.t === 'box');
+
+  assert.equal(box.u.ln.gfxChunk?.stale, undefined);
+  assert.equal(box.u.ln.runs[0].t, '左側の区間', 'fresh chunk keeps source geometry for hit testing');
+});
 
 test('zero-area TeX rules remain invisible in the SVG display list', () => {
   const page = {

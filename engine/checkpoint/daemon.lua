@@ -453,10 +453,11 @@ local function curcolor()
   return colstack[#colstack] or '#000000'
 end
 
--- Emit into `out` flat runs: {f=,s=,dy=,x=,c=,g='utf8 string'}
+-- Emit into `out` flat runs: {f=,s=,dy=,x=,c=,m=,g='utf8 string'}
 -- and rules {rule=true,x=,dy=,w=,h=}. dy is relative to the line baseline
 -- (negative = raised). Runs are split at every kern/glue so the browser does
--- no shaping of its own: positions are TeX's.
+-- no shaping of its own: positions are TeX's. m=1 comes from TeX's inline
+-- math boundary nodes, so \mathrm and other text-font math remain identifiable.
 
 local walk_h, walk_v
 
@@ -480,9 +481,10 @@ local function emit_leader_rule(n, parent, x, dy0, out)
   return true
 end
 
-walk_h = function(head, parent, x0, dy0, out)
+walk_h = function(head, parent, x0, dy0, out, math_mode)
   local x = x0
   local run = nil
+  local in_math = math_mode and true or false
   local function flush()
     if run and #run.g > 0 then
       run.w = math.max(0, x - run.x)
@@ -498,9 +500,20 @@ walk_h = function(head, parent, x0, dy0, out)
       local fi = seen_fonts[n.font]
       local gy = dy0 - bp(n.yoffset or 0)
       local gx = x + bp(n.xoffset or 0)
-      if not run or run.f ~= n.font or run.dy ~= gy or run.c ~= curcolor() then
+      if not run or run.f ~= n.font or run.dy ~= gy or run.c ~= curcolor() or
+          (run.m and true or false) ~= in_math then
         flush()
-        run = { f = n.font, s = fi and fi.size or 10, dy = gy, x = gx, c = curcolor(), g = {}, gh = 0, gd = 0 }
+        run = {
+          f = n.font,
+          s = fi and fi.size or 10,
+          dy = gy,
+          x = gx,
+          c = curcolor(),
+          m = in_math and 1 or nil,
+          g = {},
+          gh = 0,
+          gd = 0,
+        }
       end
       -- slots below 32 (legacy greek etc.) travel as PUA so JSON stays clean
       local c = n.char or 63
@@ -546,11 +559,11 @@ walk_h = function(head, parent, x0, dy0, out)
       x = x + bp(node.effective_glue(n, parent) or 0)
     elseif id == HLIST then
       flush()
-      walk_h(n.list, n, x, dy0 + bp(n.shift or 0), out)
+      walk_h(n.list, n, x, dy0 + bp(n.shift or 0), out, in_math)
       x = x + bp(n.width or 0)
     elseif id == VLIST then
       flush()
-      walk_v(n, x, dy0 + bp(n.shift or 0), out)
+      walk_v(n, x, dy0 + bp(n.shift or 0), out, in_math)
       x = x + bp(n.width or 0)
     elseif id == RULE then
       flush()
@@ -568,6 +581,7 @@ walk_h = function(head, parent, x0, dy0, out)
       -- browser glyph path by default
       flush()
       line_x = true
+      in_math = not in_math
       -- \mathsurround travels on the math node (kern-like, or glue in
       -- LuaTeX's mathsurroundskip form); zero in almost every document
       local mw = 0
@@ -579,7 +593,7 @@ walk_h = function(head, parent, x0, dy0, out)
       flush()
       if n.replace then
         local fake = node.hpack(node.copy_list(n.replace))
-        walk_h(fake.list, fake, x, dy0, out)
+        walk_h(fake.list, fake, x, dy0, out, in_math)
         x = x + bp(fake.width or 0)
         node.free(fake)
       end
@@ -606,7 +620,7 @@ walk_h = function(head, parent, x0, dy0, out)
   flush()
 end
 
-walk_v = function(box, x0, baseline_dy, out)
+walk_v = function(box, x0, baseline_dy, out, math_mode)
   -- box is a vlist whose baseline sits at baseline_dy; contents start at its top
   local y = baseline_dy - bp(box.height or 0)
   local n = box.list
@@ -614,10 +628,10 @@ walk_v = function(box, x0, baseline_dy, out)
     local id = n.id
     if id == HLIST then
       local base = y + bp(n.height or 0)
-      walk_h(n.list, n, x0 + bp(n.shift or 0), base, out)
+      walk_h(n.list, n, x0 + bp(n.shift or 0), base, out, math_mode)
       y = y + bp(n.height or 0) + bp(n.depth or 0)
     elseif id == VLIST then
-      walk_v(n, x0 + bp(n.shift or 0), y + bp(n.height or 0), out)
+      walk_v(n, x0 + bp(n.shift or 0), y + bp(n.height or 0), out, math_mode)
       y = y + bp(n.height or 0) + bp(n.depth or 0)
     elseif id == RULE then
       local h = n.height

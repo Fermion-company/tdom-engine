@@ -64,6 +64,7 @@ export function buildDomSnapshot({
           kind: region.kind,
           value: region.value,
           sourceValue: region.sourceValue,
+          display: region.display,
           source: editSource(b, region),
         })),
         ...preambleEditRegions
@@ -73,6 +74,7 @@ export function buildDomSnapshot({
             kind: region.kind,
             value: region.value,
             sourceValue: region.sourceValue,
+            display: region.display,
             source: {
               file,
               start: position(file, region.contentStart),

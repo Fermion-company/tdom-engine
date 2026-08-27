@@ -132,6 +132,7 @@ function mathDelimited(text, index, end) {
           end: i + token.length,
           contentStart: index + token.length,
           contentEnd: i,
+          display: double,
         };
       }
     }
@@ -141,7 +142,13 @@ function mathDelimited(text, index, end) {
     const close = text[index + 1] === '(' ? '\\)' : '\\]';
     for (let i = index + 2; i < end - 1; i++) {
       if (text.startsWith(close, i) && !escaped(text, i)) {
-        return { start: index, end: i + 2, contentStart: index + 2, contentEnd: i };
+        return {
+          start: index,
+          end: i + 2,
+          contentStart: index + 2,
+          contentEnd: i,
+          display: text[index + 1] === '[',
+        };
       }
     }
   }
@@ -191,7 +198,15 @@ export function discoverEditRegions(source) {
   const text = String(source ?? '');
   const regions = [];
 
-  const add = (kind, start, end, contentStart = start, contentEnd = end, visibleValue = null) => {
+  const add = (
+    kind,
+    start,
+    end,
+    contentStart = start,
+    contentEnd = end,
+    visibleValue = null,
+    metadata = null
+  ) => {
     if (end <= start || contentEnd < contentStart) return;
     const sourceValue = text.slice(contentStart, contentEnd);
     const value = visibleValue ?? sourceValue;
@@ -205,6 +220,7 @@ export function discoverEditRegions(source) {
       contentEnd,
       value,
       sourceValue,
+      ...(metadata ?? {}),
     });
   };
 
@@ -219,7 +235,9 @@ export function discoverEditRegions(source) {
 
       const math = mathDelimited(text, i, to);
       if (math) {
-        add('math', math.start, math.end, math.contentStart, math.contentEnd);
+        add('math', math.start, math.end, math.contentStart, math.contentEnd, null, {
+          display: math.display,
+        });
         i = math.end;
         continue;
       }
@@ -228,7 +246,9 @@ export function discoverEditRegions(source) {
         const env = environmentAt(text, i, to);
         if (env) {
           if (MATH_ENVS.has(env.name)) {
-            add('math', env.start, env.end, env.contentStart, env.contentEnd);
+            add('math', env.start, env.end, env.contentStart, env.contentEnd, null, {
+              display: env.name !== 'math',
+            });
           } else if (!VERBATIM_ENVS.has(env.name)) {
             if (env.optional && VISIBLE_ENVIRONMENT_OPTIONS.has(env.name)) {
               scan(env.optional.start, env.optional.end, true);

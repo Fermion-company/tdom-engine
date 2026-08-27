@@ -55,6 +55,7 @@ const pageDivs = new Map();
 let lastEngineStatus = null;
 let liveSearch = { query: '', results: [], current: -1 };
 let editDomCache = null;
+let editDomFetch = null;
 let directEditor = null;
 let mathWysiwygModulePromise = null;
 let mathCaretProbe = null;
@@ -551,6 +552,162 @@ function srcOf(target) {
   return src;
 }
 
+async function currentEditDomSnapshot(expectedRev) {
+  if (editDomCache?.rev === expectedRev) return editDomCache;
+  if (editDomFetch?.rev !== expectedRev) {
+    const promise = fetch('/dom', { cache: 'no-store' })
+      .then((response) => response.ok ? response.json() : null)
+      .catch(() => null);
+    editDomFetch = { rev: expectedRev, promise };
+  }
+  const pending = editDomFetch;
+  const snapshot = await pending.promise;
+  if (editDomFetch === pending) editDomFetch = null;
+  if (snapshot?.rev !== expectedRev || appliedRev !== expectedRev) return null;
+  editDomCache = snapshot;
+  return snapshot;
+}
+
+function finishMathGroup(groups, active) {
+  if (active?.nodes.some((node) => node.matches('text[data-math="1"]'))) groups.push(active);
+  return null;
+}
+
+function provisionalMathGroups(svg, src) {
+  const groups = [];
+  let active = null;
+  for (const node of svg.children) {
+    const sameSource = node.dataset.src === src;
+    const line = node.dataset.line ?? '';
+    const mathGlyph = sameSource && node.matches('text[data-math="1"]');
+    const mathRule = sameSource && active && line === active.line &&
+      node.matches('rect:not(.tdom-edit-hit):not(.tdom-source-hit)');
+    if (mathGlyph) {
+      if (active && line !== active.line) active = finishMathGroup(groups, active);
+      if (!active) active = { line, nodes: [] };
+      active.nodes.push(node);
+    } else if (mathRule) {
+      active.nodes.push(node);
+    } else if (active) {
+      active = finishMathGroup(groups, active);
+    }
+  }
+  finishMathGroup(groups, active);
+  return groups;
+}
+
+function provisionalNodeBounds(node) {
+  if (node.matches('text')) {
+    const x = Number(node.getAttribute('x'));
+    const y = Number(node.getAttribute('y'));
+    const width = Number(node.dataset.width);
+    const gh = Number(node.dataset.gh);
+    const gd = Number(node.dataset.gd);
+    if ([x, y, width, gh, gd].every(Number.isFinite) && width > 0 && gh + gd > 0) {
+      return { left: x, top: y - gh, right: x + width, bottom: y + gd };
+    }
+  } else if (node.matches('rect')) {
+    const x = Number(node.getAttribute('x'));
+    const y = Number(node.getAttribute('y'));
+    const width = Number(node.getAttribute('width'));
+    const height = Number(node.getAttribute('height'));
+    if ([x, y, width, height].every(Number.isFinite)) {
+      return { left: x, top: y, right: x + width, bottom: y + height };
+    }
+  }
+  try {
+    const box = node.getBBox();
+    return { left: box.x, top: box.y, right: box.x + box.width, bottom: box.y + box.height };
+  } catch {
+    return null;
+  }
+}
+
+function provisionalGroupBounds(group) {
+  let bounds = null;
+  for (const node of group.nodes) {
+    const box = provisionalNodeBounds(node);
+    if (!box) continue;
+    bounds = bounds
+      ? {
+          left: Math.min(bounds.left, box.left),
+          top: Math.min(bounds.top, box.top),
+          right: Math.max(bounds.right, box.right),
+          bottom: Math.max(bounds.bottom, box.bottom),
+        }
+      : box;
+  }
+  return bounds;
+}
+
+function sourceOrder(a, b) {
+  return Number(a.source?.start?.line) - Number(b.source?.start?.line) ||
+    Number(a.source?.start?.column) - Number(b.source?.start?.column);
+}
+
+async function scheduleProvisionalMath(page) {
+  const svg = page.querySelector('svg');
+  if (!svg || !window.customElements?.get('math-span')) return;
+  const sources = [...new Set([...svg.querySelectorAll('text[data-math="1"][data-src]')]
+    .map((node) => node.dataset.src)
+    .filter(Boolean))];
+  if (!sources.length) return;
+
+  const expectedRev = appliedRev;
+  const sequence = String((Number(page.dataset.provisionalMathSeq) || 0) + 1);
+  page.dataset.provisionalMathSeq = sequence;
+  const snapshot = await currentEditDomSnapshot(expectedRev);
+  if (!snapshot || page.dataset.provisionalMathSeq !== sequence || !svg.isConnected) return;
+  const blocks = new Map((snapshot.blocks ?? []).map((block) => [block.id, block]));
+
+  for (const src of sources) {
+    const block = blocks.get(src);
+    const regions = (block?.editRegions ?? [])
+      .filter((region) => region.kind === 'math' && region.display === false)
+      .sort(sourceOrder);
+    const groups = provisionalMathGroups(svg, src);
+    // The source regions are the authority. If a formula cannot be paired
+    // one-to-one with TeX's run groups, leave the exact chunk path alone
+    // instead of guessing and painting the wrong expression.
+    if (!regions.length || groups.length !== regions.length) continue;
+
+    for (let index = 0; index < groups.length; index++) {
+      const group = groups[index];
+      const bounds = provisionalGroupBounds(group);
+      if (!bounds || bounds.right <= bounds.left || bounds.bottom <= bounds.top) continue;
+      if (page.dataset.provisionalMathSeq !== sequence) continue;
+      const shell = document.createElement('span');
+      shell.className = 'tdom-provisional-math';
+      shell.setAttribute('aria-hidden', 'true');
+      shell.style.left = `${(bounds.left / geometry.paperwidth) * 100}%`;
+      shell.style.top = `${(((bounds.top + bounds.bottom) / 2) / geometry.paperheight) * 100}%`;
+      const fontSize = Math.max(...group.nodes
+        .filter((node) => node.matches('text'))
+        .map((node) => Number(node.getAttribute('font-size')) || 0), 1);
+      shell.style.fontSize = `${(fontSize / geometry.paperwidth) * 100}cqw`;
+      shell.style.color = group.nodes.find((node) => node.matches('text'))?.getAttribute('fill') || '#1a1a1a';
+      const mathSpan = document.createElement('math-span');
+      mathSpan.setAttribute('mode', 'textstyle');
+      mathSpan.textContent = String(regions[index].value ?? '');
+      shell.appendChild(mathSpan);
+      page.appendChild(shell);
+      mathSpan.render?.();
+      if (!shell.isConnected || page.dataset.provisionalMathSeq !== sequence) continue;
+      const naturalWidth = shell.getBoundingClientRect().width;
+      const pageWidth = page.getBoundingClientRect().width;
+      const targetWidth = ((bounds.right - bounds.left) / geometry.paperwidth) * pageWidth;
+      if (!(naturalWidth > 0) || !(targetWidth > 0)) {
+        shell.remove();
+        continue;
+      }
+      const scale = Math.min(2.5, Math.max(0.4, targetWidth / naturalWidth));
+      shell.style.setProperty('--tdom-math-scale', String(scale));
+      shell.classList.add('ready');
+      for (const node of group.nodes) node.style.opacity = '0';
+    }
+  }
+}
+
 function renderPage(dl, flash) {
   let div = pageDivs.get(dl.page);
   if (mode === 'opaque') {
@@ -575,6 +732,7 @@ function renderPage(dl, flash) {
   // survives provisional repaints untouched
   div.querySelector('svg')?.remove();
   div.querySelectorAll('.chunkwin').forEach((e) => e.remove());
+  div.querySelectorAll('.tdom-provisional-math').forEach((e) => e.remove());
   div.dataset.prov = '1';
 
   // display lists carry glyph runs -> unified SVG plus absolutely-
@@ -594,6 +752,7 @@ function renderPage(dl, flash) {
         `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
     );
   }
+  scheduleProvisionalMath(div);
 
   if (flash) {
     div.classList.remove('fading');
@@ -624,7 +783,7 @@ function svgFor(dl) {
         fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
       }
       parts.push(
-        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''} xml:space="preserve">${escapeXml(cmd.text)}</text>`
+        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-width="${cmd.w ?? 0}" data-gh="${cmd.gh ?? 0}" data-gd="${cmd.gd ?? 0}" data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''} xml:space="preserve">${escapeXml(cmd.text)}</text>`
       );
     } else if (cmd.op === 'rule' && cmd.w > 0 && cmd.h > 0) {
       parts.push(
