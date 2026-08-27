@@ -53,6 +53,9 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
   - `it.xb` — cmap 外グリフ（非legacyのPUA 0xE000–0xF8FF、plane 15/16 の
     0xF0000+、0x110000以上）を含む → glyph ブリッジすら禁止（空白の方が
     「間違った字形」よりまし）
+  - run の `m=1` — inline math の開始・終了ノード間から採取した数式由来
+    マーカー。フォント名ではなく TeX の数式境界を使うため、`\mathrm`、
+    `\mathit`、`\mathbf` のように本文系フォントを使う数式も識別できる
 - **フォント配信ティア**（`#registerFont` が決定、runごとに参照）
   - `native` — TeXが実際に使った .otf/.ttf がディスクに実在し配信される
   - `twin` — legacy CM の Latin Modern 双子（mathmap.js）。置換なので
@@ -66,14 +69,20 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
 
 ## 9.4 行粒度の chunk banding
 
-ブロック全体を画像化するのではなく、**数式を含む行だけ**が chunk 帯に
-なります。
+ブロック全体を画像化するのではなく、行の内容と chunk の鮮度に応じて
+表示を分けます。
 
 - RENDER プロトコルはブロック galley 全体を 1 ページとして ship する
   （既存機構）。`buildStream` は `it.x` の行にだけ、そのブロック chunk 内
   オフセット（`yOff`）を窓にした `gfxChunk` 参照を張る。
-- 数式行の周りの散文行は glyph のまま — inline math 段落では「数式の行
-  だけがTeXピクセル、他はグリフ」という**line chunk** が実現される。
+- 数式行の周りの散文行は glyph のまま — display math と math-only 行は
+  **line chunk** になる。
+- stale な whole-block chunk があるときも、普通の散文行は現在の glyph を
+  出す。古い block 画像が編集直後の本文を覆わない。
+- 本文と inline math が同じ行に混在する場合、`itemFlags` の bit 4 が立つ。
+  その行は現在の本文 glyph を出し、数式 run だけを source-level LaTeX から
+  MathLive の静的 `<math-span>` で描く。元の math run は位置・クリック領域を
+  保ったまま透明化するため、PUA の四角を表示しない。
 - float は float ページ（2..1+F）、**脚注は新設の footnote ページ
   （2+F..1+F+N）**に ship され、`b13#1` / `b13@fn0` のキーで独立に
   banding される（数式入り脚注も exact）。
@@ -84,11 +93,17 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
 打鍵直後の各 exact 行は、良い方から:
 
 1. **fresh chunk** — 現 galley の実PDFピクセル
-2. **stale chunk** — 直前レンダーのピクセル（`st:1` でマーク）。
+2. **current mixed-line bridge** — stale な whole-block chunk 内で編集された
+   混在行だけ、現在の本文 glyph＋source-level MathLive 数式を表示
+3. **stale chunk** — 直前レンダーのピクセル（`st:1` でマーク）。
    「一瞬古いが綺麗」は許容、「速いが汚い」は不許容
-3. **glyph bridge** — 全グリフが少なくとも写像可能（twin可・PUA不可）な
+4. **glyph bridge** — 全グリフが少なくとも写像可能（twin可・PUA不可）な
    行だけ、chunk 到着までの橋として表示
-4. **blank** — `xb` 行・降格ブロック。間違った字形は一瞬でも出さない
+5. **blank** — `xb` 行・降格ブロック。間違った字形は一瞬でも出さない
+
+mixed-line bridge は `/dom` の `editRegions` と SVG 上の math run group が
+一対一に対応するときだけ使う。対応数が合わない場合は推測せず exact 経路に
+残す。display math は `editRegions[].display=true` で区別する。
 
 chunk の鮮度は `unitsSig` が chunk 版数＋fresh/stale ビットを持つので、
 到着時に帯だけが差し替わります（第8章のバンド収束と同じ経路）。
@@ -144,7 +159,7 @@ canonical 着地時の一致検証（第8章 §8.4）が fidelity にも接続�
 | 表示対象 | 現在の実装 |
 |---|---|
 | display math がTeX品質 | math 行は exact chunk |
-| inline math 段落で数式部分が崩れない | 行粒度 banding（§9.4） |
+| inline math 段落の編集中に本文が古い chunk に隠れない | current glyph＋MathLive mixed-line bridge（§9.4） |
 | CM / LM / unicode-math / CJK が fallback しない | フォントティア＋`xb` 検出＋font-fail 降格 |
 | TikZ / PDF literal は常にTeX由来 | 従来の `blk_gfx`（変更なし） |
 | canonical 到着で大ジャンプしない | chunk ピクセル＝実PDFピクセル |
