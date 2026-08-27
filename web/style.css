@@ -620,6 +620,26 @@ body.is-embed .chunkwin { pointer-events: none; }
 .page.patched { box-shadow: var(--page-shadow), 0 0 0 1px var(--accent); }
 .page { transition: box-shadow 0.8s ease; }
 .page.fading { box-shadow: var(--page-shadow), 0 0 0 1px transparent; }
+.tdom-sync-highlight {
+  position: absolute;
+  z-index: 14;
+  box-sizing: border-box;
+  min-width: 14px;
+  min-height: 8px;
+  pointer-events: none;
+  border: 2px solid #2684ff;
+  border-radius: 4px;
+  background: rgb(38 132 255 / 18%);
+  box-shadow: 0 0 0 2px rgb(255 255 255 / 70%);
+}
+.tdom-sync-highlight.is-point {
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  min-height: 22px;
+  border-radius: 999px;
+  transform: translate(-50%, -50%);
+}
 
 /* ------------------------------------------------------- engine inspector */
 

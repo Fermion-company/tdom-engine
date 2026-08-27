@@ -135,6 +135,11 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
 function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, line }) {
   for (const r of runs ?? []) {
     if (r.rule) {
+      // TeX uses zero-width/zero-height rules as invisible struts and
+      // anchors (luatexja emits many of them around CJK glyphs). They
+      // affect box metrics but paint no ink. Sending them to SVG made the
+      // browser's minimum rect width turn them into stray vertical hairs.
+      if (!(r.w > 0) || !(r.h > 0)) continue;
       commands.push({
         op: 'rule',
         x: r2(X + r.x),

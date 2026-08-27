@@ -626,9 +626,9 @@ function svgFor(dl) {
       parts.push(
         `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''} xml:space="preserve">${escapeXml(cmd.text)}</text>`
       );
-    } else if (cmd.op === 'rule') {
+    } else if (cmd.op === 'rule' && cmd.w > 0 && cmd.h > 0) {
       parts.push(
-        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.1)}" height="${Math.max(cmd.h, 0.1)}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}/>`
+        `<rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}/>`
       );
     } else if (cmd.op === 'editbox') {
       parts.push(
@@ -3533,7 +3533,7 @@ pagesEl.addEventListener('scroll', () => {
       for (const [n, div] of sortedPages()) {
         if (div.getBoundingClientRect().bottom - top > 4) return n;
       }
-      return 1;
+      return sortedPages()[0]?.[0] ?? 1;
     };
     const previewReady = () => {
       if (!bootComplete || !documentReset.acceptsReady(documentReset.adoptedEpoch)) return false;
@@ -3563,29 +3563,8 @@ pagesEl.addEventListener('scroll', () => {
           page.classList.contains('is-final') && page.querySelector('img.canon')?.complete)
       );
     };
-    const scrollToPage = (n) => {
-      const entries = sortedPages();
-      if (!entries.length) return;
-      const clamped = Math.max(entries[0][0], Math.min(entries.at(-1)[0], Math.round(n)));
-      pageDivs.get(clamped)?.scrollIntoView({ block: 'start' });
-    };
-    window.addEventListener('message', (ev) => {
-      const d = ev.data;
-      if (!d || d.source !== 'tdom-host') return;
-      if (d.activationId && d.activationId !== embedActivationId) return;
-      if (d.action === 'reset-ack') {
-        if (documentReset.acknowledge(d.documentEpoch)) {
-          maybeAdoptCompletedReset(Number(d.documentEpoch));
-        }
-      } else if (d.action === 'zoom-in') setZoom(zoom * 1.1);
-      else if (d.action === 'zoom-out') setZoom(zoom / 1.1);
-      else if (d.action === 'zoom-fit') setZoom(1);
-      else if (d.action === 'goto-page') scrollToPage(Number(d.page));
-      else if (d.action === 'page-prev') scrollToPage(currentTopPage() - 1);
-      else if (d.action === 'page-next') scrollToPage(currentTopPage() + 1);
-      else if (d.action === 'search') runLiveSearch(d.query, d.findPrevious === true);
-    });
-    setInterval(() => {
+    let embedSnapshotRaf = null;
+    const postEmbedSnapshot = () => {
       try {
         window.parent.postMessage(
           {
@@ -3606,7 +3585,167 @@ pagesEl.addEventListener('scroll', () => {
           '*'
         );
       } catch { /* host gone */ }
-    }, 400);
+    };
+    const scheduleEmbedSnapshot = () => {
+      if (embedSnapshotRaf !== null) return;
+      embedSnapshotRaf = requestAnimationFrame(() => {
+        embedSnapshotRaf = null;
+        postEmbedSnapshot();
+      });
+    };
+    const pageEntryFor = (n) => {
+      const entries = sortedPages();
+      if (!entries.length) return null;
+      const wanted = Number.isFinite(n) ? Math.round(n) : entries[0][0];
+      return entries.reduce((best, entry) =>
+        Math.abs(entry[0] - wanted) < Math.abs(best[0] - wanted) ? entry : best
+      );
+    };
+    const scrollPageToViewport = (page, paperY = 0, center = false) => {
+      const viewport = pagesEl.getBoundingClientRect();
+      const pageRect = page.getBoundingClientRect();
+      const paper = activePaperGeometry(page);
+      const ratio = Math.max(0, Math.min(1, Number(paperY) / Math.max(1, Number(paper.height))));
+      const withinPage = ratio * pageRect.height;
+      const target = pagesEl.scrollTop + pageRect.top - viewport.top + withinPage -
+        (center ? pagesEl.clientHeight / 2 : 0);
+      pagesEl.scrollTo({ top: Math.max(0, target), behavior: 'auto' });
+      scheduleEmbedSnapshot();
+    };
+    const scrollToPage = (n) => {
+      const entry = pageEntryFor(Number(n));
+      if (!entry) return;
+      scrollPageToViewport(entry[1]);
+    };
+    const showSyncMarker = (page, data) => {
+      page.querySelectorAll('.tdom-sync-highlight').forEach((marker) => marker.remove());
+      const paper = activePaperGeometry(page);
+      const paperWidth = Math.max(1, Number(paper.width));
+      const paperHeight = Math.max(1, Number(paper.height));
+      const hasBlock = Number.isFinite(Number(data.blockWidth)) && Number(data.blockWidth) !== 0 &&
+        Number.isFinite(Number(data.blockHeight)) && Number(data.blockHeight) !== 0;
+      const marker = document.createElement('div');
+      marker.className = `tdom-sync-highlight${hasBlock ? '' : ' is-point'}`;
+      if (hasBlock) {
+        const bx = Number.isFinite(Number(data.blockX)) ? Number(data.blockX) : Number(data.x);
+        const by = Number.isFinite(Number(data.blockY)) ? Number(data.blockY) : Number(data.y);
+        const bw = Number(data.blockWidth);
+        const bh = Number(data.blockHeight);
+        marker.style.left = `${Math.max(0, Math.min(100, Math.min(bx, bx + bw) / paperWidth * 100))}%`;
+        marker.style.top = `${Math.max(0, Math.min(100, Math.min(by, by + bh) / paperHeight * 100))}%`;
+        marker.style.width = `${Math.max(.5, Math.min(100, Math.abs(bw) / paperWidth * 100))}%`;
+        marker.style.height = `${Math.max(.35, Math.min(100, Math.abs(bh) / paperHeight * 100))}%`;
+      } else {
+        marker.style.left = `${Math.max(0, Math.min(100, Number(data.x) / paperWidth * 100))}%`;
+        marker.style.top = `${Math.max(0, Math.min(100, Number(data.y) / paperHeight * 100))}%`;
+      }
+      page.append(marker);
+      setTimeout(() => marker.remove(), 2400);
+    };
+    const refineSyncToSource = async (data) => {
+      const file = String(data.sourceFile ?? '');
+      const line = Number(data.sourceLine);
+      if (!file || !Number.isFinite(line)) return false;
+      let dom;
+      try {
+        const response = await fetch('/dom', { cache: 'no-store' });
+        if (!response.ok) return false;
+        dom = await response.json();
+      } catch {
+        return false;
+      }
+      const blocks = (dom?.blocks ?? []).filter((block) =>
+        block?.id && sameSourceFile(block.source?.file, file) &&
+        Number(block.source?.start?.line) <= line && Number(block.source?.end?.line) >= line
+      ).sort((a, b) =>
+        (Number(a.source.end.line) - Number(a.source.start.line)) -
+        (Number(b.source.end.line) - Number(b.source.start.line))
+      );
+      for (const block of blocks) {
+        const relativeLine = line - Number(block.source.start.line);
+        for (const [, page] of sortedPages()) {
+          const nodes = [...page.querySelectorAll(`[data-src="${CSS.escape(String(block.id))}"][data-line]`)]
+            .filter((node) => {
+              const rect = node.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            });
+          if (!nodes.length) continue;
+          const values = [...new Set(nodes.map((node) => Number(node.dataset.line)).filter(Number.isFinite))];
+          if (!values.length) continue;
+          const targetLine = values.includes(relativeLine)
+            ? relativeLine
+            : values.reduce((best, value) =>
+              Math.abs(value - relativeLine) < Math.abs(best - relativeLine) ? value : best
+            );
+          const exact = nodes.filter((node) => Number(node.dataset.line) === targetLine);
+          const ink = exact.filter((node) =>
+            !node.classList.contains('tdom-source-hit') &&
+            !node.classList.contains('tdom-edit-hit')
+          );
+          // Rescue/source-hit rectangles can cover a whole tcolorbox. They
+          // are useful for click mapping but would make a forward-jump marker
+          // less precise than SyncTeX's immediate fallback.
+          if (!ink.length) continue;
+          const rects = ink.map((node) => node.getBoundingClientRect());
+          const left = Math.min(...rects.map((rect) => rect.left));
+          const top = Math.min(...rects.map((rect) => rect.top));
+          const right = Math.max(...rects.map((rect) => rect.right));
+          const bottom = Math.max(...rects.map((rect) => rect.bottom));
+          const viewport = pagesEl.getBoundingClientRect();
+          pagesEl.scrollTo({
+            top: Math.max(0, pagesEl.scrollTop + (top + bottom) / 2 - viewport.top - pagesEl.clientHeight / 2),
+            behavior: 'auto',
+          });
+          page.querySelectorAll('.tdom-sync-highlight').forEach((marker) => marker.remove());
+          const pageRect = page.getBoundingClientRect();
+          const pad = 3;
+          const marker = document.createElement('div');
+          marker.className = 'tdom-sync-highlight';
+          marker.style.left = `${(left - pageRect.left - pad) / Math.max(1, pageRect.width) * 100}%`;
+          marker.style.top = `${(top - pageRect.top - pad) / Math.max(1, pageRect.height) * 100}%`;
+          marker.style.width = `${(right - left + pad * 2) / Math.max(1, pageRect.width) * 100}%`;
+          marker.style.height = `${(bottom - top + pad * 2) / Math.max(1, pageRect.height) * 100}%`;
+          page.append(marker);
+          setTimeout(() => marker.remove(), 2400);
+          scheduleEmbedSnapshot();
+          return true;
+        }
+      }
+      return false;
+    };
+    const scrollToSync = (data) => {
+      const entry = pageEntryFor(Number(data.page));
+      if (!entry) return;
+      const [, page] = entry;
+      const blockY = Number(data.blockY);
+      const blockHeight = Number(data.blockHeight);
+      const y = Number.isFinite(blockY)
+        ? blockY + (Number.isFinite(blockHeight) ? blockHeight / 2 : 0)
+        : Number(data.y);
+      scrollPageToViewport(page, Number.isFinite(y) ? y : 0, true);
+      showSyncMarker(page, data);
+      void refineSyncToSource(data);
+      requestAnimationFrame(scheduleEmbedSnapshot);
+    };
+    pagesEl.addEventListener('scroll', scheduleEmbedSnapshot, { passive: true });
+    window.addEventListener('message', (ev) => {
+      const d = ev.data;
+      if (!d || d.source !== 'tdom-host') return;
+      if (d.activationId && d.activationId !== embedActivationId) return;
+      if (d.action === 'reset-ack') {
+        if (documentReset.acknowledge(d.documentEpoch)) {
+          maybeAdoptCompletedReset(Number(d.documentEpoch));
+        }
+      } else if (d.action === 'zoom-in') setZoom(zoom * 1.1);
+      else if (d.action === 'zoom-out') setZoom(zoom / 1.1);
+      else if (d.action === 'zoom-fit') setZoom(1);
+      else if (d.action === 'goto-page') scrollToPage(Number(d.page));
+      else if (d.action === 'goto-sync') scrollToSync(d);
+      else if (d.action === 'page-prev') scrollToPage(currentTopPage() - 1);
+      else if (d.action === 'page-next') scrollToPage(currentTopPage() + 1);
+      else if (d.action === 'search') runLiveSearch(d.query, d.findPrevious === true);
+    });
+    setInterval(postEmbedSnapshot, 400);
   }
 }
 applyLayoutView();
