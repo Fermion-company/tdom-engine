@@ -102,7 +102,10 @@ hot path の最後に `#scheduleBackground(fgStop, dirtyBlocks)`、`#shipUpdate(
 `#scheduleBackground()` は二つの仕事を予約する。
 
 - pending chain があれば idle 後に chain pass を走らせる。
-- dirty block 数が `TDOM_RENDER_HOT_MAX` 以下なら、needsRender な hot block を resident RENDER queue に積む。
+- dirty block 数が `TDOM_RENDER_HOT_MAX` 以下なら、needsRender な hot block を resident exact-render queue に積む。display math は foreground JOB の node list を post-block checkpoint に世代付きで保持し、queue 側は CAPTURE を先に試す。これにより block source の二重組版を避ける。保持 list が退役・世代不一致なら、pre-block checkpoint の従来 RENDER へ自動 fallback する。
+- 新しい編集は、前の edit/boot が残した resident exact render と未着手 queue を preempt する。render fork は foreground JOB と衝突しない固有 request id で追跡し、現在編集中の block が全 lane の解放を待たないようにする。
+
+exact chunk が stale の短い区間では、client は現在の resident JOB が返した math run の位置・寸法に MathLive を重ねる。inline だけでなく display math も対象で、MathLive の準備完了と同時に対応する stale 行の chunk window だけを隠すため、旧式と新式が二重に見えない。fresh chunk が届いた時点でこの暫定層を外し、実 LuaLaTeX pixel に戻す。
 
 `canonical.schedule()` は source/rev を保存して timer を張るだけである。実際の full `lualatex` compile は edit response を待たせない。structured モードでは canonical は「権威」であって表示の主役ではない（リアルタイム provisional が主役）。cadence は「執筆中は走らない」設計である: 文書ごとの初回だけ `debounceMs`（既定 2500ms）で速攻の baseline を 1 回取り、以降は `idleMs`（既定 30s = 手が本当に止まった状態）＋コスト比例 cooldown（factor 2、cap は既定 600s — 旧 30s cap は長文書の duty 比バウンドを壊していた）を両方満たすまで再コンパイルしない。opaque モードでは canonical が唯一の表示なので `displayDebounceMs`（既定 350ms）で即応しつつ、half-duty の cost cooldown（factor 1、cap 60s）で長文書の連続再コンパイルを防ぐ（`delayFor()` が pressure で分岐）。`ensure()`（export 経路）は渡された snapshot だけを compile し、compile 中に届いた打鍵を loop で追いかけない。
 
@@ -118,7 +121,7 @@ hot path の最後に `#scheduleBackground(fgStop, dirtyBlocks)`、`#shipUpdate(
 
 - canonical full compile。
 - page SVG 変換。
-- resident RENDER の PDF/SVG 生成。
+- resident CAPTURE/RENDER の PDF/SVG 生成。
 - isolated rescue compile。
 - long suffix rebuild/settle。
 - page-context rescue fixed point。

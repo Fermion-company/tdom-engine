@@ -2,7 +2,10 @@ import { fnv1a } from '../hash.js';
 import { remapText } from './mathmap.js';
 import { r2 } from './util/svg.js';
 
-const EXACT_CHUNK_BLEED_BP = 0.5;
+// Half a bp is smaller than one device pixel at common preview zoom levels,
+// so fractional CSS clipping could still shave antialiased math ink. Two bp
+// remains well inside ordinary TeX line spacing while surviving that rounding.
+const EXACT_CHUNK_BLEED_BP = 2;
 
 export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twinMetrics }) {
   const geo = geometry;
@@ -13,9 +16,9 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
   const flushGfx = () => {
     if (!gfxOpen) return;
     const meta = chunks.get(gfxOpen.blockId);
-    // PDF/SVG ink may overhang TeX's logical box by a fraction of a bp
-    // (notably superscripts and large operators). Keep the chunk clipped,
-    // but give its outer band a tiny bounded bleed so those pixels survive.
+    // PDF/SVG ink may overhang TeX's logical box (notably subscripts,
+    // superscripts and large operators). Keep the chunk clipped, but give its
+    // outer band a bounded bleed that also survives browser pixel rounding.
     const chunkHeight = Math.max(0, meta?.hBp ?? gfxOpen.clip1);
     const clip0 = Math.min(chunkHeight, Math.max(0, gfxOpen.clip0 - EXACT_CHUNK_BLEED_BP));
     const clip1 = Math.min(chunkHeight, gfxOpen.clip1 + EXACT_CHUNK_BLEED_BP);
@@ -47,6 +50,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       ch: r2(chunkHeight),
       cv: meta?.v ?? 0,
       st: gfxOpen.stale ? 1 : undefined, // stale-exact: previous pixels held
+      line: gfxOpen.units === 1 ? gfxOpen.line : undefined,
       src: gfxOpen.blockId,
     });
     gfxOpen = null;
@@ -71,6 +75,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
         gfxOpen.clip1 = Math.max(gfxOpen.clip1, clip1);
         gfxOpen.stale ||= !!c.stale;
         gfxOpen.units++;
+        if (gfxOpen.line !== u.li) gfxOpen.line = null;
         gfxOpen.covered += unitExtent;
         gfxOpen.ink ||= unitInk;
       } else {
@@ -82,6 +87,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
           clip1,
           w: c.w,
           stale: !!c.stale,
+          line: u.li,
           units: 1,
           covered: unitExtent,
           ink: unitInk,
@@ -89,7 +95,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       }
       // Exact pixels cover this line; the unchanged TeX run extents provide
       // one transparent source-line hit surface underneath the chunk.
-      sourceHitCommand(commands, L, baseline, u, u.blockId);
+      sourceHitCommand(commands, L, baseline, u, u.blockId, 1, fonts);
       continue;
     }
     flushGfx();
@@ -105,7 +111,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
         h: r2(u.ln.boxH + (u.d ?? 0)),
         src: u.blockId,
       });
-      sourceHitCommand(commands, L, baseline, u, u.blockId, geo.textwidth);
+      sourceHitCommand(commands, L, baseline, u, u.blockId, geo.textwidth, fonts);
       continue;
     }
     runCommands(commands, u.ln.runs, L, baseline, u.blockId, { fonts, twinMetrics, line: u.li });
@@ -199,7 +205,7 @@ function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, lin
   }
 }
 
-function sourceHitCommand(commands, X, baseline, unit, src, fallbackWidth = 1) {
+function sourceHitCommand(commands, X, baseline, unit, src, fallbackWidth = 1, fonts = new Map()) {
   const runs = unit.ln.editRuns ?? unit.ln.runs ?? [];
   let left = Infinity;
   let right = -Infinity;
@@ -218,6 +224,10 @@ function sourceHitCommand(commands, X, baseline, unit, src, fallbackWidth = 1) {
     h: r2(Math.max((unit.ln.boxH ?? unit.h ?? 0) + (unit.d ?? 0), 1)),
     line: unit.li,
     ink: hasTextInk ? 1 : undefined,
+    math: runs.some((run) =>
+      !run.rule && !!run.t && (!!run.m || !!fonts.get(run.f)?.mth)
+    ) ? 1 : undefined,
+    stale: unit.ln.gfxChunk?.stale ? 1 : undefined,
     src,
   });
 }

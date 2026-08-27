@@ -569,7 +569,7 @@ async function currentEditDomSnapshot(expectedRev) {
 }
 
 function finishMathGroup(groups, active) {
-  if (active?.nodes.some((node) => node.matches('text[data-math="1"]'))) groups.push(active);
+  if (active?.nodes.some((node) => node.matches('[data-math="1"]'))) groups.push(active);
   return null;
 }
 
@@ -579,7 +579,10 @@ function provisionalMathGroups(svg, src) {
   for (const node of svg.children) {
     const sameSource = node.dataset.src === src;
     const line = node.dataset.line ?? '';
-    const mathGlyph = sameSource && node.matches('text[data-math="1"]');
+    const mathGlyph = sameSource && (
+      node.matches('text[data-math="1"]') ||
+      node.matches('rect.tdom-source-hit[data-math="1"][data-stale="1"]')
+    );
     const mathRule = sameSource && active && line === active.line &&
       node.matches('rect:not(.tdom-edit-hit):not(.tdom-source-hit)');
     if (mathGlyph) {
@@ -648,7 +651,9 @@ function sourceOrder(a, b) {
 async function scheduleProvisionalMath(page) {
   const svg = page.querySelector('svg');
   if (!svg || !window.customElements?.get('math-span')) return;
-  const sources = [...new Set([...svg.querySelectorAll('text[data-math="1"][data-src]')]
+  const sources = [...new Set([...svg.querySelectorAll(
+    'text[data-math="1"][data-src], rect.tdom-source-hit[data-math="1"][data-stale="1"][data-src]'
+  )]
     .map((node) => node.dataset.src)
     .filter(Boolean))];
   if (!sources.length) return;
@@ -663,7 +668,7 @@ async function scheduleProvisionalMath(page) {
   for (const src of sources) {
     const block = blocks.get(src);
     const regions = (block?.editRegions ?? [])
-      .filter((region) => region.kind === 'math' && region.display === false)
+      .filter((region) => region.kind === 'math')
       .sort(sourceOrder);
     const groups = provisionalMathGroups(svg, src);
     // The source regions are the authority. If a formula cannot be paired
@@ -683,11 +688,12 @@ async function scheduleProvisionalMath(page) {
       shell.style.top = `${(((bounds.top + bounds.bottom) / 2) / geometry.paperheight) * 100}%`;
       const fontSize = Math.max(...group.nodes
         .filter((node) => node.matches('text'))
-        .map((node) => Number(node.getAttribute('font-size')) || 0), 1);
+        .map((node) => Number(node.getAttribute('font-size')) || 0),
+        Math.min(14, Math.max(1, (bounds.bottom - bounds.top) * 0.85)));
       shell.style.fontSize = `${(fontSize / geometry.paperwidth) * 100}cqw`;
       shell.style.color = group.nodes.find((node) => node.matches('text'))?.getAttribute('fill') || '#1a1a1a';
       const mathSpan = document.createElement('math-span');
-      mathSpan.setAttribute('mode', 'textstyle');
+      mathSpan.setAttribute('mode', regions[index].display ? 'displaystyle' : 'textstyle');
       mathSpan.textContent = String(regions[index].value ?? '');
       shell.appendChild(mathSpan);
       page.appendChild(shell);
@@ -704,6 +710,16 @@ async function scheduleProvisionalMath(page) {
       shell.style.setProperty('--tdom-math-scale', String(scale));
       shell.classList.add('ready');
       for (const node of group.nodes) node.style.opacity = '0';
+      // Display math still has the previous exact SVG underneath this
+      // provisional layer. Hide only the stale chunk window for the matched
+      // TeX line, atomically after MathLive is ready, so old/new formulas do
+      // not appear doubled. Multi-line chunks deliberately have no line id
+      // and therefore retain the fail-closed exact display.
+      for (const chunk of page.querySelectorAll('.chunkwin.stale')) {
+        if (chunk.dataset.src === src && chunk.dataset.line === group.line) {
+          chunk.style.opacity = '0';
+        }
+      }
     }
   }
 }
@@ -748,7 +764,7 @@ function renderPage(dl, flash) {
     // but wrong; the class is a hook for the inspector, not a visual.
     div.insertAdjacentHTML(
       'beforeend',
-      `<div class="chunkwin${cmd.st ? ' stale' : ''}" data-src="${cmd.src}" style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
+      `<div class="chunkwin${cmd.st ? ' stale' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
         `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
     );
   }
@@ -795,7 +811,7 @@ function svgFor(dl) {
       );
     } else if (cmd.op === 'sourcebox') {
       parts.push(
-        `<rect class="tdom-source-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}"${lineAttr}${cmd.ink ? ' data-ink="1"' : ''}${cmd.complex ? ' data-complex="1"' : ''}/>`
+        `<rect class="tdom-source-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}"${lineAttr}${cmd.ink ? ' data-ink="1"' : ''}${cmd.math ? ' data-math="1"' : ''}${cmd.stale ? ' data-stale="1"' : ''}${cmd.complex ? ' data-complex="1"' : ''}/>`
       );
     } else if (cmd.op === 'chunk') {
       // exact-render chunks are drawn as HTML <img> overlays (see renderPage)
@@ -3776,31 +3792,6 @@ pagesEl.addEventListener('scroll', () => {
       if (!entry) return;
       scrollPageToViewport(entry[1]);
     };
-    const showSyncMarker = (page, data) => {
-      page.querySelectorAll('.tdom-sync-highlight').forEach((marker) => marker.remove());
-      const paper = activePaperGeometry(page);
-      const paperWidth = Math.max(1, Number(paper.width));
-      const paperHeight = Math.max(1, Number(paper.height));
-      const hasBlock = Number.isFinite(Number(data.blockWidth)) && Number(data.blockWidth) !== 0 &&
-        Number.isFinite(Number(data.blockHeight)) && Number(data.blockHeight) !== 0;
-      const marker = document.createElement('div');
-      marker.className = `tdom-sync-highlight${hasBlock ? '' : ' is-point'}`;
-      if (hasBlock) {
-        const bx = Number.isFinite(Number(data.blockX)) ? Number(data.blockX) : Number(data.x);
-        const by = Number.isFinite(Number(data.blockY)) ? Number(data.blockY) : Number(data.y);
-        const bw = Number(data.blockWidth);
-        const bh = Number(data.blockHeight);
-        marker.style.left = `${Math.max(0, Math.min(100, Math.min(bx, bx + bw) / paperWidth * 100))}%`;
-        marker.style.top = `${Math.max(0, Math.min(100, Math.min(by, by + bh) / paperHeight * 100))}%`;
-        marker.style.width = `${Math.max(.5, Math.min(100, Math.abs(bw) / paperWidth * 100))}%`;
-        marker.style.height = `${Math.max(.35, Math.min(100, Math.abs(bh) / paperHeight * 100))}%`;
-      } else {
-        marker.style.left = `${Math.max(0, Math.min(100, Number(data.x) / paperWidth * 100))}%`;
-        marker.style.top = `${Math.max(0, Math.min(100, Number(data.y) / paperHeight * 100))}%`;
-      }
-      page.append(marker);
-      setTimeout(() => marker.remove(), 2400);
-    };
     const refineSyncToSource = async (data) => {
       const file = String(data.sourceFile ?? '');
       const line = Number(data.sourceLine);
@@ -3842,30 +3833,16 @@ pagesEl.addEventListener('scroll', () => {
             !node.classList.contains('tdom-edit-hit')
           );
           // Rescue/source-hit rectangles can cover a whole tcolorbox. They
-          // are useful for click mapping but would make a forward-jump marker
-          // less precise than SyncTeX's immediate fallback.
+          // are useful for click mapping but too broad for a precise jump.
           if (!ink.length) continue;
           const rects = ink.map((node) => node.getBoundingClientRect());
-          const left = Math.min(...rects.map((rect) => rect.left));
           const top = Math.min(...rects.map((rect) => rect.top));
-          const right = Math.max(...rects.map((rect) => rect.right));
           const bottom = Math.max(...rects.map((rect) => rect.bottom));
           const viewport = pagesEl.getBoundingClientRect();
           pagesEl.scrollTo({
             top: Math.max(0, pagesEl.scrollTop + (top + bottom) / 2 - viewport.top - pagesEl.clientHeight / 2),
             behavior: 'auto',
           });
-          page.querySelectorAll('.tdom-sync-highlight').forEach((marker) => marker.remove());
-          const pageRect = page.getBoundingClientRect();
-          const pad = 3;
-          const marker = document.createElement('div');
-          marker.className = 'tdom-sync-highlight';
-          marker.style.left = `${(left - pageRect.left - pad) / Math.max(1, pageRect.width) * 100}%`;
-          marker.style.top = `${(top - pageRect.top - pad) / Math.max(1, pageRect.height) * 100}%`;
-          marker.style.width = `${(right - left + pad * 2) / Math.max(1, pageRect.width) * 100}%`;
-          marker.style.height = `${(bottom - top + pad * 2) / Math.max(1, pageRect.height) * 100}%`;
-          page.append(marker);
-          setTimeout(() => marker.remove(), 2400);
           scheduleEmbedSnapshot();
           return true;
         }
@@ -3882,7 +3859,6 @@ pagesEl.addEventListener('scroll', () => {
         ? blockY + (Number.isFinite(blockHeight) ? blockHeight / 2 : 0)
         : Number(data.y);
       scrollPageToViewport(page, Number.isFinite(y) ? y : 0, true);
-      showSyncMarker(page, data);
       void refineSyncToSource(data);
       requestAnimationFrame(scheduleEmbedSnapshot);
     };

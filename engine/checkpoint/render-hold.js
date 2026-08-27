@@ -1,8 +1,20 @@
+import { stripComments } from './safety.js';
+
 // cheap "will want an exact preview chunk" scan for blocks with no fidelity
 // verdict yet (checkpoint render-hold heuristic — a miss only costs the
 // slower isolated render path)
 const MATHY_RE =
   /\$|\\\[|\\\(|\\includegraphics\b|\\begin\{(equation|align|alignat|gather|multline|eqnarray|math|displaymath|cases|array|split|aligned|gathered|alignedat|tikzpicture)/;
+
+// Node-list capture is deliberately narrower than the general render
+// heuristic.  Display math is self-contained galley material and can be
+// shipped from the post-JOB checkpoint without re-running the source.  Keep
+// graphics/floats/tcolorbox on the proven RENDER path until their backend
+// objects and output-routine state have an equally strict ownership proof.
+const DISPLAY_MATH_RE =
+  /\$\$|\\\[|\\begin\{(?:equation|align|alignat|gather|multline|eqnarray|displaymath)\*?\}/;
+const CAPTURE_UNSAFE_RE =
+  /\\includegraphics\b|\\begin\{(?:figure|table|tikzpicture|tcolorbox|mdframed|framed|shaded|longtable|multicols)\*?\}/;
 
 // how many off-grid checkpoints may stay alive awaiting their block's chunk
 const RENDER_HOLD_MAX = Number(process.env.TDOM_RENDER_HOLD_MAX || 8);
@@ -12,6 +24,12 @@ const RENDER_HOLD_MAX = Number(process.env.TDOM_RENDER_HOLD_MAX || 8);
 export function mayNeedRender(block) {
   if (block.fidelity) return !!block.needsRender;
   return MATHY_RE.test(block.text);
+}
+
+/** Safe initial scope for copy-free JOB node-list capture. */
+export function mayCaptureDisplayMath(block) {
+  const text = stripComments(block?.text ?? '');
+  return DISPLAY_MATH_RE.test(text) && !CAPTURE_UNSAFE_RE.test(text);
 }
 
 export function maybeHoldRenderCheckpoint(idx, block, renderHold) {

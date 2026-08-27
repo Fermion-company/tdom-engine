@@ -20,6 +20,12 @@ export function buildStream(block, chunks) {
   const bc = chunks.get(block.id);
   const bcFresh = !!bc && bc.forGalley === block.galleyHash;
   const blockExact = !!(block.gfx || fid?.blockExact);
+  // A block chunk is a complete TeX render even when fidelity only required
+  // exact pixels for a few of its lines. Once that chunk is fresh, use it for
+  // every box in the block: one continuous window has no internal crop edges
+  // that can shave display-math ink. While stale, keep the old policy below so
+  // a previous whole-block image never hides newly edited safe prose.
+  const promoteFreshBlockChunk = bcFresh && (fid?.exactLines ?? 0) > 0;
   const canonicalOnly = !!fid?.canonicalOnly;
 
   const stream = [];
@@ -111,7 +117,8 @@ export function buildStream(block, chunks) {
       // newly edited safe line; keep only the exact/math lines on the stale
       // chunk. Rescued per-item chunks still take precedence.
       const flags = fid?.itemFlags?.[ii] ?? 0;
-      const wantExact = !canonicalOnly && (blockExact || (flags & 1) !== 0);
+      const wantExact =
+        !canonicalOnly && (blockExact || promoteFreshBlockChunk || (flags & 1) !== 0);
       const hasRuns = (it.runs ?? []).some((run) => run.rule || !!run.t);
       const useCurrentSafeLine =
         !!bc && !bcFresh && (fid?.exactLines ?? 0) > 0 &&

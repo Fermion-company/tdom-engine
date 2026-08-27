@@ -4,6 +4,42 @@ import { braceImbalance } from './util/tex.js';
 import { waitForPdf } from './util/fs.js';
 import { cropRenderTargets } from './render-chunks.js';
 
+async function runShipCommand(engine, {
+  block,
+  idx,
+  ck,
+  requestId,
+  command,
+  body,
+  awaitRender,
+  renderIsolated,
+}) {
+  // Renders are latency work, not correctness work (canonical always wins):
+  // give up quickly on a spinning child rather than parking a pump lane.
+  engine.renderPids ??= new Map();
+  engine.renderPids.set(requestId, 0); // armed: FORKED will fill the pid
+  const done = awaitRender('render:' + requestId, Number(process.env.TDOM_RENDER_TIMEOUT || 20_000));
+  ck.send(command);
+  if (body) ck.sendRaw(body);
+  try {
+    await done;
+  } catch (err) {
+    if (/timeout/.test(String(err?.message))) {
+      // Deep-lineage luatexja wall: kill a wedged child and let canonical or
+      // the isolated queue provide the pixels.  Do not retry a timed-out
+      // capture through RENDER: that would occupy the lane twice.
+      const pid = engine.renderPids.get(requestId);
+      if (pid) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      renderIsolated(block, idx);
+    }
+    throw err;
+  } finally {
+    engine.renderPids.delete(requestId);
+  }
+}
+
 export async function renderResidentBlock(
   engine,
   { block, idx, ck, targets, forGalley, awaitRender, renderIsolated, asyncRepaginate, chunkTargets, releaseRenderHold }
@@ -15,40 +51,66 @@ export async function renderResidentBlock(
   const jobdir = path.join(engine.workDir, `render-${block.id}-${forGalley}`);
   try {
     mkdirSync(jobdir, { recursive: true });
-    rmSync(path.join(jobdir, 'driver.pdf'), { force: true });
+    const pdf = path.join(jobdir, 'driver.pdf');
+    rmSync(pdf, { force: true });
     const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
     const body = Buffer.from(block.text + guard, 'utf8');
-    // renders are latency work, not correctness work (canonical always
-    // wins): give up quickly on a spinning child rather than parking a
-    // pump lane on it
-    engine.renderPids ??= new Map();
-    engine.renderPids.set(block.id, 0); // armed: FORKED will fill the pid
-    const done = awaitRender('render:' + block.id, Number(process.env.TDOM_RENDER_TIMEOUT || 20_000));
-    // jobdir percent-encoded (spaces in macOS paths shear the line)
-    ck.send(`RENDER ${block.id} ${encodeURIComponent(jobdir)} ${body.length}\n`);
-    ck.sendRaw(body);
-    try {
-      await done;
-    } catch (err) {
-      if (/timeout/.test(String(err?.message))) {
-        // deep-lineage luatexja wall: the forked render child spins in
-        // luahbtex exactly like in-chain jobs do. Kill it (it never reads
-        // its socket again) and let the canonical-crop pass supply the
-        // exact pixels instead.
-        const pid = engine.renderPids.get(block.id);
-        if (pid) {
-          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
-        }
-        // exact pixels still arrive two ways: the canonical-crop pass, or
-        // (for drifting documents it cannot serve) the idle-gated isolated
-        // queue — a fresh process typesets wall blocks at normal speed
-        renderIsolated(block, idx);
+    engine.renderStats ??= { captureHits: 0, captureMisses: 0, retypesets: 0 };
+
+    let shippedCapture = false;
+    const captureToken = block.galley?.capture;
+    const captureCk = captureToken ? engine.checkpoints.get(idx + 1) : null;
+    if (captureToken && captureCk) {
+      try {
+        const requestId = `rr@${++engine.renderSeq}`;
+        await runShipCommand(engine, {
+          block,
+          idx,
+          ck: captureCk,
+          requestId,
+          command:
+            `CAPTURE ${block.id} ${captureToken} ${encodeURIComponent(jobdir)} ${requestId}\n`,
+          body: null,
+          awaitRender,
+          renderIsolated,
+        });
+        shippedCapture = true;
+        engine.renderStats.captureHits++;
+        if (block.galley?.capture === captureToken) delete block.galley.capture;
+      } catch (err) {
+        if (!err?.tdomCaptureMiss) throw err;
+        engine.renderStats.captureMisses++;
+        if (block.galley?.capture === captureToken) delete block.galley.capture;
       }
-      throw err;
-    } finally {
-      engine.renderPids.delete(block.id);
+    } else if (captureToken) {
+      // The sparse checkpoint grid retired the post-block owner before the
+      // pump reached it. This is expected on cold/long documents.
+      engine.renderStats.captureMisses++;
+      if (block.galley?.capture === captureToken) delete block.galley.capture;
     }
-    const pdf = path.join(jobdir, 'driver.pdf');
+
+    if (!shippedCapture) {
+      if (!ck) {
+        // Capture raced with sparse-checkpoint retirement and there is no
+        // pre-block resident state left for RENDER either.
+        renderIsolated(block, idx);
+        return;
+      }
+      engine.renderStats.retypesets++;
+      const requestId = `rr@${++engine.renderSeq}`;
+      // Universal fallback: use the state BEFORE this block and execute its
+      // source exactly as the original implementation did.
+      await runShipCommand(engine, {
+        block,
+        idx,
+        ck,
+        requestId,
+        command: `RENDER ${block.id} ${encodeURIComponent(jobdir)} ${body.length} ${requestId}\n`,
+        body,
+        awaitRender,
+        renderIsolated,
+      });
+    }
     // DONE fires from finish_pdffile, but the child's stdio buffers reach
     // the disk only on _exit — wait until the file is complete (%%EOF)
     await waitForPdf(pdf);

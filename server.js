@@ -1016,6 +1016,13 @@ const server = http.createServer(async (req, res) => {
         srcRev: engine.srcRev,
         documentEpoch,
         progress: engine.progress ?? null,
+        render: {
+          queued: [...engine.renderWant.keys()],
+          pumping: engine.renderPumping,
+          active: [...(engine.rendering ?? [])],
+          pids: Object.fromEntries(engine.renderPids ?? []),
+          stats: engine.renderStats,
+        },
         canonical: engine.canonical.info(),
       });
     }
