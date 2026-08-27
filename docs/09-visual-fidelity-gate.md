@@ -81,8 +81,10 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
   出す。古い block 画像が編集直後の本文を覆わない。
 - 本文と inline math が同じ行に混在する場合、`itemFlags` の bit 4 が立つ。
   その行は現在の本文 glyph を出し、数式 run だけを source-level LaTeX から
-  MathLive の静的 `<math-span>` で描く。元の math run は位置・クリック領域を
-  保ったまま透明化するため、PUA の四角を表示しない。
+  MathLive の静的 `<math-span>` で描く。元の math run は初回 paint から常に
+  透明で、位置・クリック領域だけを保持する。MathLive と一対一に対応できない
+  `align` 等も raw glyph へ戻らず、exact chunk が届くまで空白になるため、
+  PUA の四角や代替フォントを一瞬も表示しない。
 - float は float ページ（2..1+F）、**脚注は新設の footnote ページ
   （2+F..1+F+N）**に ship され、`b13#1` / `b13@fn0` のキーで独立に
   banding される（数式入り脚注も exact）。
@@ -97,8 +99,9 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
    混在行だけ、現在の本文 glyph＋source-level MathLive 数式を表示
 3. **stale chunk** — 直前レンダーのピクセル（`st:1` でマーク）。
    「一瞬古いが綺麗」は許容、「速いが汚い」は不許容
-4. **glyph bridge** — 全グリフが少なくとも写像可能（twin可・PUA不可）な
-   行だけ、chunk 到着までの橋として表示
+4. **glyph bridge** — 非数式の exact-required 行だけ、全グリフが少なくとも
+   写像可能（twin可・PUA不可）なら chunk 到着までの橋として表示。数式 run
+   自体は常に透明
 5. **blank** — `xb` 行・降格ブロック。間違った字形は一瞬でも出さない
 
 mixed-line bridge は `/dom` の `editRegions` と SVG 上の math run group が

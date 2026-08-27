@@ -275,6 +275,11 @@ test('visible suggestions are anchored to the canonical click, not the source-ra
   assert.match(STYLE, /\.tdom-direct-editor\.is-opaque \.math-wysiwyg-panel \{[\s\S]*?left: var\(--tdom-canonical-panel-left, 0px\) !important;[\s\S]*?top: var\(--tdom-canonical-panel-top,/);
 });
 
+test('raw browser math glyphs are never painted before a clean bridge or exact chunk', () => {
+  assert.match(STYLE, /\.page svg text\[data-math="1"\] \{ opacity: 0; \}/);
+  assert.match(STYLE, /\.tdom-provisional-math\.ready \{ opacity: 1; \}/);
+});
+
 test('the browser entrypoint enforces the planner before the batch commit loop', () => {
   const plannerScript = INDEX.indexOf('<script src="/opaque-editor-coordinator.js"></script>');
   const appScript = INDEX.indexOf('<script src="/app.js"></script>');
