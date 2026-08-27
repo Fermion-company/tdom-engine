@@ -64,6 +64,10 @@ export function handlePeerMessage(engine, peer, msg) {
       // render children announce the same way — remember the pid so a
       // timed-out render (deep-lineage luahbtex spin) can be SIGKILLed
       // instead of burning a core forever
+      if (engine.cancelledRenderIds?.delete(msg.id)) {
+        try { process.kill(msg.pid, 'SIGKILL'); } catch { /* already gone */ }
+        break;
+      }
       if (engine.renderPids?.has(msg.id)) engine.renderPids.set(msg.id, msg.pid);
       break;
     case 'FORKFAIL': {
@@ -74,6 +78,16 @@ export function handlePeerMessage(engine, peer, msg) {
       err.tdomInfra = true;
       engine.diagnostics.push(`daemon fork failed for ${msg.id} (pid ${peer.pid})`);
       engine._reject('galley:' + msg.id, err);
+      engine._reject('render:' + msg.id, err);
+      break;
+    }
+    case 'CAPTUREMISS': {
+      // A post-block checkpoint can survive a source edit while its retained
+      // list belongs to an older generation. This is a normal race, not an
+      // engine failure: reject only this attempt so resident-render can use
+      // the original pre-block RENDER fallback.
+      const err = new Error(`captured node list unavailable for ${msg.id}`);
+      err.tdomCaptureMiss = true;
       engine._reject('render:' + msg.id, err);
       break;
     }

@@ -35,6 +35,60 @@ const OUTPUT_HIJACK_RE =
 // print-identical.
 const FORCED_BREAK_RE = /\\(?:maketitle|newpage|clearpage|cleardoublepage)\b/;
 
+function skipSpace(source, at) {
+  while (at < source.length && /\s/.test(source[at])) at++;
+  return at;
+}
+
+function readBalanced(source, at, open, close) {
+  if (source[at] !== open) return null;
+  let depth = 0;
+  for (let i = at; i < source.length; i++) {
+    if (source[i] === '\\') {
+      i++; // escaped delimiters do not close the TeX argument
+      continue;
+    }
+    if (source[i] === open) depth++;
+    else if (source[i] === close && --depth === 0) {
+      return { value: source.slice(at + 1, i), end: i + 1 };
+    }
+  }
+  return null;
+}
+
+/** Find custom tcolorbox environments whose option argument enables
+ * `breakable`. Definitions are commonly formatted across many lines, so
+ * a line-bounded regex misses the normal form used by TeX documents. */
+export function collectBreakableTcolorboxNames(preamble) {
+  const source = stripComments(preamble);
+  const names = [];
+  for (const match of source.matchAll(/\\(newtcolorbox|newtcbtheorem)\b/g)) {
+    const theorem = match[1] === 'newtcbtheorem';
+    let at = skipSpace(source, match.index + match[0].length);
+    if (source[at] === '[') {
+      const initial = readBalanced(source, at, '[', ']');
+      if (!initial) continue;
+      at = skipSpace(source, initial.end);
+    }
+    const name = readBalanced(source, at, '{', '}');
+    if (!name || !/^[A-Za-z@]+$/.test(name.value)) continue;
+    at = skipSpace(source, name.end);
+    while (source[at] === '[') {
+      const optional = readBalanced(source, at, '[', ']');
+      if (!optional) break;
+      at = skipSpace(source, optional.end);
+    }
+    if (theorem) {
+      const displayName = readBalanced(source, at, '{', '}');
+      if (!displayName) continue;
+      at = skipSpace(source, displayName.end);
+    }
+    const options = readBalanced(source, at, '{', '}');
+    if (options && /\bbreakable\b(?!\s*=\s*false\b)/.test(options.value)) names.push(name.value);
+  }
+  return [...new Set(names)];
+}
+
 /**
  * Rescue triggers: the static hijack list plus breakable tcolorbox
  * environments the PREAMBLE defines (\newtcolorbox/\newtcbtheorem with
@@ -49,9 +103,7 @@ export function needsRescue(text, { preHash, breakableFor, breakableRe, source }
     const src = source() ?? '';
     const b = documentBounds(src);
     const pre = src.slice(b.preamble.start, b.preamble.end);
-    const names = [];
-    for (const m of pre.matchAll(/\\newtcolorbox\{([A-Za-z@]+)\}[^\n]*?breakable/g)) names.push(m[1]);
-    for (const m of pre.matchAll(/\\newtcbtheorem(?:\[[^\]]*\])?\{([A-Za-z@]+)\}[^\n]*?breakable/g)) names.push(m[1]);
+    const names = collectBreakableTcolorboxNames(pre);
     breakableRe = names.length
       ? new RegExp(`\\\\begin\\{(?:${names.join('|')})\\}`)
       : null;

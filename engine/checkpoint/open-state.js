@@ -32,6 +32,7 @@ export function resetOpenState(engine, text, file) {
   engine.isoFailCache = new Map();
   engine.isoForkBroken = new Set();
   engine.renderWant = new Map();
+  engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };
   engine.renderHold = new Map();
   engine.rescueQueue = new Map();
   engine.tocHash = null;

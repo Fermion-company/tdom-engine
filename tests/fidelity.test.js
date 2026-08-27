@@ -71,6 +71,16 @@ test('OpenType MATH font glyphs are math, whatever the file format', () => {
   assert.equal(fid.exact, true);
 });
 
+test('TeX math boundaries identify mixed inline math even when math uses a text font', () => {
+  const mathRoman = { ...textRun(1, 'x'), x: 42, m: 1 };
+  const fid = classifyGalley({
+    items: [box([textRun(1, '本文'), mathRoman], { x: 1 })],
+    floats: [],
+  }, fonts);
+  assert.equal(fid.exactLines, 1);
+  assert.equal(fid.itemFlags[0] & 4, 4);
+});
+
 test('unknown font ids default DOWN: exact, no bridge', () => {
   const fid = lineFidelity(box([textRun(99)]), fonts);
   assert.equal(fid.exact, true);

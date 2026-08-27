@@ -2,6 +2,11 @@ import { fnv1a } from '../hash.js';
 import { remapText } from './mathmap.js';
 import { r2 } from './util/svg.js';
 
+// Half a bp is smaller than one device pixel at common preview zoom levels,
+// so fractional CSS clipping could still shave antialiased math ink. Two bp
+// remains well inside ordinary TeX line spacing while surviving that rounding.
+const EXACT_CHUNK_BLEED_BP = 2;
+
 export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twinMetrics }) {
   const geo = geometry;
   const L = 72 + (geo.oddsidemargin ?? 0);
@@ -11,14 +16,21 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
   const flushGfx = () => {
     if (!gfxOpen) return;
     const meta = chunks.get(gfxOpen.blockId);
-    const visibleHeight = gfxOpen.clip1 - gfxOpen.clip0;
-    if (gfxOpen.units === 1 && visibleHeight > Math.max(12, gfxOpen.covered * 2)) {
+    // PDF/SVG ink may overhang TeX's logical box (notably subscripts,
+    // superscripts and large operators). Keep the chunk clipped, but give its
+    // outer band a bounded bleed that also survives browser pixel rounding.
+    const chunkHeight = Math.max(0, meta?.hBp ?? gfxOpen.clip1);
+    const clip0 = Math.min(chunkHeight, Math.max(0, gfxOpen.clip0 - EXACT_CHUNK_BLEED_BP));
+    const clip1 = Math.min(chunkHeight, gfxOpen.clip1 + EXACT_CHUNK_BLEED_BP);
+    const visibleHeight = Math.max(0, clip1 - clip0);
+    const logicalHeight = gfxOpen.clip1 - gfxOpen.clip0;
+    if (gfxOpen.units === 1 && logicalHeight > Math.max(12, gfxOpen.covered * 2)) {
       commands.push({
         op: 'sourcebox',
         x: r2(L),
         y: r2(gfxOpen.top + gfxOpen.clip0),
         w: r2(gfxOpen.w),
-        h: r2(visibleHeight),
+        h: r2(logicalHeight),
         ink: gfxOpen.ink ? 1 : undefined,
         chunk: 1,
         complex: 1,
@@ -28,14 +40,17 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
     commands.push({
       op: 'chunk',
       chunk: gfxOpen.blockId,
+      // The SVG already contains paragraph indentation. Anchor it at the
+      // text block origin; adding run.x here would indent exact lines twice.
       x: r2(L),
-      y: r2(gfxOpen.top + gfxOpen.clip0),
+      y: r2(gfxOpen.top + clip0),
       w: r2(gfxOpen.w),
-      h: r2(gfxOpen.clip1 - gfxOpen.clip0),
-      sy: r2(gfxOpen.clip0),
-      ch: r2(meta?.hBp ?? gfxOpen.clip1),
+      h: r2(visibleHeight),
+      sy: r2(clip0),
+      ch: r2(chunkHeight),
       cv: meta?.v ?? 0,
       st: gfxOpen.stale ? 1 : undefined, // stale-exact: previous pixels held
+      line: gfxOpen.units === 1 ? gfxOpen.line : undefined,
       src: gfxOpen.blockId,
     });
     gfxOpen = null;
@@ -60,6 +75,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
         gfxOpen.clip1 = Math.max(gfxOpen.clip1, clip1);
         gfxOpen.stale ||= !!c.stale;
         gfxOpen.units++;
+        if (gfxOpen.line !== u.li) gfxOpen.line = null;
         gfxOpen.covered += unitExtent;
         gfxOpen.ink ||= unitInk;
       } else {
@@ -71,6 +87,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
           clip1,
           w: c.w,
           stale: !!c.stale,
+          line: u.li,
           units: 1,
           covered: unitExtent,
           ink: unitInk,
@@ -78,7 +95,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       }
       // Exact pixels cover this line; the unchanged TeX run extents provide
       // one transparent source-line hit surface underneath the chunk.
-      sourceHitCommand(commands, L, baseline, u, u.blockId);
+      sourceHitCommand(commands, L, baseline, u, u.blockId, 1, fonts);
       continue;
     }
     flushGfx();
@@ -94,7 +111,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
         h: r2(u.ln.boxH + (u.d ?? 0)),
         src: u.blockId,
       });
-      sourceHitCommand(commands, L, baseline, u, u.blockId, geo.textwidth);
+      sourceHitCommand(commands, L, baseline, u, u.blockId, geo.textwidth, fonts);
       continue;
     }
     runCommands(commands, u.ln.runs, L, baseline, u.blockId, { fonts, twinMetrics, line: u.li });
@@ -135,6 +152,11 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
 function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, line }) {
   for (const r of runs ?? []) {
     if (r.rule) {
+      // TeX uses zero-width/zero-height rules as invisible struts and
+      // anchors (luatexja emits many of them around CJK glyphs). They
+      // affect box metrics but paint no ink. Sending them to SVG made the
+      // browser's minimum rect width turn them into stray vertical hairs.
+      if (!(r.w > 0) || !(r.h > 0)) continue;
       commands.push({
         op: 'rule',
         x: r2(X + r.x),
@@ -177,13 +199,13 @@ function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, lin
         color: r.c && r.c !== '#000000' ? r.c : undefined,
         src,
         line,
-        math: fmeta?.mth ? 1 : undefined,
+        math: r.m || fmeta?.mth ? 1 : undefined,
       });
     }
   }
 }
 
-function sourceHitCommand(commands, X, baseline, unit, src, fallbackWidth = 1) {
+function sourceHitCommand(commands, X, baseline, unit, src, fallbackWidth = 1, fonts = new Map()) {
   const runs = unit.ln.editRuns ?? unit.ln.runs ?? [];
   let left = Infinity;
   let right = -Infinity;
@@ -202,6 +224,10 @@ function sourceHitCommand(commands, X, baseline, unit, src, fallbackWidth = 1) {
     h: r2(Math.max((unit.ln.boxH ?? unit.h ?? 0) + (unit.d ?? 0), 1)),
     line: unit.li,
     ink: hasTextInk ? 1 : undefined,
+    math: runs.some((run) =>
+      !run.rule && !!run.t && (!!run.m || !!fonts.get(run.f)?.mth)
+    ) ? 1 : undefined,
+    stale: unit.ln.gfxChunk?.stale ? 1 : undefined,
     src,
   });
 }

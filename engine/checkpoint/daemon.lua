@@ -57,6 +57,22 @@ local RENDER_MODE = false
 T_JOB = 0 -- wall clock at JOB child start (phase timing)
 local FLOAT_COPIES = {}
 local FOOT_COPIES = {}
+-- A hot display-math JOB may retain its already-typeset MVL nodes in the
+-- post-block checkpoint.  The orchestrator addresses the list with BOTH the
+-- block id and a monotonic generation token, so a preserved stale checkpoint
+-- can never ship pixels from an earlier edit.
+local CAPTURE_HEAD = nil
+local CAPTURE_ID = nil
+local CAPTURE_TOKEN = nil
+
+local function drop_capture(id, token)
+  if id and (CAPTURE_ID ~= id or CAPTURE_TOKEN ~= token) then return false end
+  if CAPTURE_HEAD then node.flush_list(CAPTURE_HEAD) end
+  CAPTURE_HEAD = nil
+  CAPTURE_ID = nil
+  CAPTURE_TOKEN = nil
+  return true
+end
 -- Visual-fidelity flags for the CURRENT top-level line box being walked
 -- (reset per box item in extract_items, accumulated through nested boxes):
 --   line_x   the line needs an exact preview chunk (math nodes, math-font
@@ -453,10 +469,11 @@ local function curcolor()
   return colstack[#colstack] or '#000000'
 end
 
--- Emit into `out` flat runs: {f=,s=,dy=,x=,c=,g='utf8 string'}
+-- Emit into `out` flat runs: {f=,s=,dy=,x=,c=,m=,g='utf8 string'}
 -- and rules {rule=true,x=,dy=,w=,h=}. dy is relative to the line baseline
 -- (negative = raised). Runs are split at every kern/glue so the browser does
--- no shaping of its own: positions are TeX's.
+-- no shaping of its own: positions are TeX's. m=1 comes from TeX's inline
+-- math boundary nodes, so \mathrm and other text-font math remain identifiable.
 
 local walk_h, walk_v
 
@@ -480,9 +497,10 @@ local function emit_leader_rule(n, parent, x, dy0, out)
   return true
 end
 
-walk_h = function(head, parent, x0, dy0, out)
+walk_h = function(head, parent, x0, dy0, out, math_mode)
   local x = x0
   local run = nil
+  local in_math = math_mode and true or false
   local function flush()
     if run and #run.g > 0 then
       run.w = math.max(0, x - run.x)
@@ -498,9 +516,20 @@ walk_h = function(head, parent, x0, dy0, out)
       local fi = seen_fonts[n.font]
       local gy = dy0 - bp(n.yoffset or 0)
       local gx = x + bp(n.xoffset or 0)
-      if not run or run.f ~= n.font or run.dy ~= gy or run.c ~= curcolor() then
+      if not run or run.f ~= n.font or run.dy ~= gy or run.c ~= curcolor() or
+          (run.m and true or false) ~= in_math then
         flush()
-        run = { f = n.font, s = fi and fi.size or 10, dy = gy, x = gx, c = curcolor(), g = {}, gh = 0, gd = 0 }
+        run = {
+          f = n.font,
+          s = fi and fi.size or 10,
+          dy = gy,
+          x = gx,
+          c = curcolor(),
+          m = in_math and 1 or nil,
+          g = {},
+          gh = 0,
+          gd = 0,
+        }
       end
       -- slots below 32 (legacy greek etc.) travel as PUA so JSON stays clean
       local c = n.char or 63
@@ -546,11 +575,11 @@ walk_h = function(head, parent, x0, dy0, out)
       x = x + bp(node.effective_glue(n, parent) or 0)
     elseif id == HLIST then
       flush()
-      walk_h(n.list, n, x, dy0 + bp(n.shift or 0), out)
+      walk_h(n.list, n, x, dy0 + bp(n.shift or 0), out, in_math)
       x = x + bp(n.width or 0)
     elseif id == VLIST then
       flush()
-      walk_v(n, x, dy0 + bp(n.shift or 0), out)
+      walk_v(n, x, dy0 + bp(n.shift or 0), out, in_math)
       x = x + bp(n.width or 0)
     elseif id == RULE then
       flush()
@@ -568,6 +597,7 @@ walk_h = function(head, parent, x0, dy0, out)
       -- browser glyph path by default
       flush()
       line_x = true
+      in_math = not in_math
       -- \mathsurround travels on the math node (kern-like, or glue in
       -- LuaTeX's mathsurroundskip form); zero in almost every document
       local mw = 0
@@ -579,7 +609,7 @@ walk_h = function(head, parent, x0, dy0, out)
       flush()
       if n.replace then
         local fake = node.hpack(node.copy_list(n.replace))
-        walk_h(fake.list, fake, x, dy0, out)
+        walk_h(fake.list, fake, x, dy0, out, in_math)
         x = x + bp(fake.width or 0)
         node.free(fake)
       end
@@ -606,7 +636,7 @@ walk_h = function(head, parent, x0, dy0, out)
   flush()
 end
 
-walk_v = function(box, x0, baseline_dy, out)
+walk_v = function(box, x0, baseline_dy, out, math_mode)
   -- box is a vlist whose baseline sits at baseline_dy; contents start at its top
   local y = baseline_dy - bp(box.height or 0)
   local n = box.list
@@ -614,10 +644,10 @@ walk_v = function(box, x0, baseline_dy, out)
     local id = n.id
     if id == HLIST then
       local base = y + bp(n.height or 0)
-      walk_h(n.list, n, x0 + bp(n.shift or 0), base, out)
+      walk_h(n.list, n, x0 + bp(n.shift or 0), base, out, math_mode)
       y = y + bp(n.height or 0) + bp(n.depth or 0)
     elseif id == VLIST then
-      walk_v(n, x0 + bp(n.shift or 0), y + bp(n.height or 0), out)
+      walk_v(n, x0 + bp(n.shift or 0), y + bp(n.height or 0), out, math_mode)
       y = y + bp(n.height or 0) + bp(n.depth or 0)
     elseif id == RULE then
       local h = n.height
@@ -1115,9 +1145,22 @@ function tdom_report()
       harvest = math.floor((TR1 - TR0) * 100000 + 0.5) / 100,
     }
   end
+  local capture = nil
+  if JOB.capture and head then
+    -- COPY-FREE hand-off: extraction only walked the list, so the very nodes
+    -- TeX just built can remain owned by this checkpoint and be shipped by a
+    -- later fork.  A descendant JOB drops the inherited list before it
+    -- typesets, preventing captures from accumulating down the lineage.
+    drop_capture()
+    CAPTURE_HEAD = head
+    CAPTURE_ID = JOB.id
+    CAPTURE_TOKEN = JOB.capture
+    capture = JOB.capture
+  end
   local payload = jenc({
     tm = tm,
     block = JOB.id,
+    capture = capture,
     gfx = blk_gfx,
     w = w,
     h = hsum,
@@ -1131,7 +1174,7 @@ function tdom_report()
     toclines = blk_toclines,
     events = blk_events,
   })
-  if head then node.flush_list(head) end
+  if head and not capture then node.flush_list(head) end
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
   conn:send(payload)
   -- Collect BEFORE this process becomes a long-lived checkpoint: the fork
@@ -1156,10 +1199,10 @@ end
 
 -- ------------------------------------------------------------ shipping
 
--- Render child: vpack the harvested MVL nodes (the exact nodes the galley
--- reported) and ship them as one tight PDF page.
-function tdom_ship()
-  local head = harvest_nodes()
+-- Vpack an owned MVL node list and install it as one tight PDF page.
+-- Both paths call this exact routine: legacy RENDER harvests a second
+-- typesetting pass, while CAPTURE consumes the original JOB list.
+local function ship_node_list(head)
   if not head then return end
   -- drop the leading dummy and any held ins nodes: footnote bodies are
   -- placed by the orchestrator's page builder, not inside the block chunk
@@ -1199,6 +1242,22 @@ function tdom_ship()
   tex.box[255] = b
   tex.pagewidth = w
   tex.pageheight = total
+end
+
+-- Legacy render child: retypeset then harvest. Kept as the universal
+-- fallback for graphics/floats and whenever a capture is unavailable.
+function tdom_ship()
+  ship_node_list(harvest_nodes())
+end
+
+-- Fast exact render child: consume the nodes retained by the foreground JOB
+-- and ship them without executing the block source again.
+function tdom_ship_capture()
+  local head = CAPTURE_HEAD
+  CAPTURE_HEAD = nil
+  CAPTURE_ID = nil
+  CAPTURE_TOKEN = nil
+  ship_node_list(head)
 end
 
 -- Render child epilogue: leave the dormant page truly empty so the \end
@@ -1319,7 +1378,7 @@ function tdom_wait()
     if not line then
       fk._exit(0) -- orchestrator went away
     end
-    local cmd, a, b, c = line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)')
+    local cmd, a, b, c, d = line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)')
     if cmd == 'DIE' then
       fk._exit(0)
     elseif cmd == 'PING' then
@@ -1334,10 +1393,11 @@ function tdom_wait()
         FAULT_SILENT = tonumber(b) or 0
       end
     elseif cmd == 'JOB' then
-      -- JOB <blockId> <newCkptIdx> <bodyLen>
+      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|->
       local id = a
       local newckpt = tonumber(b) or (CKPT + 1)
       local len = tonumber(c) or 0
+      local capture = d ~= '' and d ~= '-' and d or nil
       local body = len > 0 and recv_exact(len) or ''
       if FAULT_SILENT > 0 then
         -- body already consumed (protocol stays in sync); reply with nothing
@@ -1351,7 +1411,11 @@ function tdom_wait()
           os.execute('/bin/sleep 30')
           fk._exit(9)
         end
-        JOB = { id = id, ckpt = newckpt, body = body }
+        -- Do not propagate a previous block's retained nodes into the next
+        -- checkpoint generation. The parent keeps its own COW copy until
+        -- CAPTURE or checkpoint retirement.
+        drop_capture()
+        JOB = { id = id, ckpt = newckpt, body = body, capture = capture }
         T_JOB = os.gettimeofday and os.gettimeofday() or os.clock()
         blk_labels = {}
         blk_refs = {}
@@ -1390,10 +1454,12 @@ function tdom_wait()
       local id = a
       local jobdir = pctdecode(b)
       local len = tonumber(c) or 0
+      local request = d ~= '' and d or id
       local body = len > 0 and recv_exact(len) or ''
-      local pid = fork_for(id)
+      local pid = fork_for(request)
       if pid == 0 then
-        JOB = { id = id, ckpt = -1, body = body }
+        drop_capture()
+        JOB = { id = request, ckpt = -1, body = body }
         blk_floats = {}
         pending_fmarks = {}
         RENDER_MODE = true
@@ -1404,7 +1470,7 @@ function tdom_wait()
         -- under LaTeX, raw callback.register is owned by luatexbase
         local notify = function()
           pcall(function()
-            conn:send('DONE ' .. id .. '\n')
+            conn:send('DONE ' .. request .. '\n')
           end)
         end
         if luatexbase and luatexbase.add_to_callback then
@@ -1415,8 +1481,49 @@ function tdom_wait()
         inject_job(body, true)
         return
       elseif pid then
-        conn:send('FORKED ' .. id .. ' ' .. pid .. '\n')
+        conn:send('FORKED ' .. request .. ' ' .. pid .. '\n')
       end
+    elseif cmd == 'CAPTURE' then
+      -- CAPTURE <blockId> <generationToken> <percentEncodedJobDir>
+      -- The post-JOB checkpoint owns the exact nodes.  A token mismatch is
+      -- expected when an edit superseded/retired that checkpoint, so report
+      -- it explicitly and let Node fall back to legacy RENDER.
+      local id = a
+      local token = b
+      local jobdir = pctdecode(c)
+      local request = d ~= '' and d or id
+      if not CAPTURE_HEAD or CAPTURE_ID ~= id or CAPTURE_TOKEN ~= token then
+        conn:send('CAPTUREMISS ' .. request .. '\n')
+      else
+        local pid = fork_for(request)
+        if pid == 0 then
+          JOB = { id = request, ckpt = -1, body = '' }
+          RENDER_MODE = true
+          FLOAT_COPIES = {}
+          FOOT_COPIES = {}
+          reconnect('render', 0)
+          lfs.chdir(jobdir)
+          local notify = function()
+            pcall(function()
+              conn:send('DONE ' .. request .. '\n')
+            end)
+          end
+          if luatexbase and luatexbase.add_to_callback then
+            pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdom')
+          else
+            pcall(callback.register, 'finish_pdffile', notify)
+          end
+          inject_capture()
+          return
+        elseif pid then
+          conn:send('FORKED ' .. request .. ' ' .. pid .. '\n')
+          -- The child owns a COW view of the list. Free the checkpoint's
+          -- copy now so an already-rendered equation costs no retained RAM.
+          drop_capture(id, token)
+        end
+      end
+    elseif cmd == 'DROP_CAPTURE' then
+      drop_capture(a, b)
     elseif cmd == 'ISO' then
       -- isolated rescue in a fork: the child already holds the loaded
       -- preamble (10-15s and 300-500MB saved vs a cold lualatex per
@@ -1435,6 +1542,7 @@ function tdom_wait()
           os.execute('/bin/sleep 30')
           fk._exit(9)
         end
+        drop_capture()
         JOB = { id = id, ckpt = -1, body = body }
         RENDER_MODE = false
         reconnect('iso', 0)
@@ -1468,6 +1576,16 @@ function tdom_wait()
       end
     end
   end
+end
+
+function inject_capture()
+  tex.print({
+    '\\directlua{tdom_ship_capture()}',
+    '\\shipout\\box255',
+    '\\directlua{tdom_ship_floats()}',
+    '\\directlua{tdom_render_end()}',
+    '\\csname @@end\\endcsname',
+  })
 end
 
 function inject_raw(body)

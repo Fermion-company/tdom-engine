@@ -13,6 +13,7 @@ test('discovers printed prose and math without exposing structural arguments', (
     ['math', 'x^2+1'],
     ['text', '.'],
   ]);
+  assert.equal(regions.find((region) => region.kind === 'math')?.display, false);
   assert.equal(regions.some((r) => r.value.includes('sec:hidden')), false);
   assert.equal(regions.some((r) => r.value.includes('secret-name')), false);
 });
@@ -26,6 +27,10 @@ test('supports title fields, display delimiters, and math environments', () => {
     ['text', 'A New Result'],
     ['math', 'a+b=c'],
     ['math', 'x&=1\\\\y&=2'],
+  ]);
+  assert.deepEqual(regions.filter((region) => region.kind === 'math').map((region) => region.display), [
+    true,
+    true,
   ]);
 });
 

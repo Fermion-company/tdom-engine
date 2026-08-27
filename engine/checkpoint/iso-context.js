@@ -24,17 +24,26 @@ export function prepareIsoCompileJob({
   // cold iso on package-heavy documents) is already loaded and COW-shared.
   // Cold mode remains the fallback when no resident root exists (opaque
   // mode, boot failure) or infra fails before the fork happens.
-  // \includepdf keeps the REAL output routine (page-emitting) — that
-  // cannot run in a fork child yet (inherited dormant page state breaks
-  // it under luatexja), so it always compiles cold. Everything else
-  // forks with the iso absorb; a fork run that DISCARDS (a split was
-  // actually needed at this offset) retries cold with the real routine.
+  // Page-emitting/splitting blocks keep the REAL output routine. That
+  // cannot run in a fork child: the inherited dormant page state breaks
+  // it under luatexja, and tcolorbox can wait forever without producing
+  // either an artifact or the DISCARD signal. Compile those blocks cold
+  // immediately instead of first paying the 120s fork timeout. Ordinary
+  // non-splitting rescues still reuse ckpt0 and its loaded preamble.
   const includesPdf = /\\includepdf\b/.test(block.text);
+  needsRescue(block.text); // populate _breakableRe for this preamble
+  const splitMode =
+    !includesPdf &&
+    (/\\begin\{(mdframed|framed|shaded|longtable|multicols\*?)\}|\\begin\{tcolorbox\}\[[^\]]*breakable/.test(
+      block.text
+    ) ||
+      (breakableRe()?.test(block.text) ?? false));
   const ck0 =
     !forceCold &&
     !process.env.TDOM_ISO_COLD &&
     !isoForkBroken.has(block.id) &&
-    !includesPdf
+    !includesPdf &&
+    !splitMode
       ? checkpoints.get(0)
       : null;
   // label values as injected into THIS run — recorded on the result so
@@ -53,13 +62,6 @@ export function prepareIsoCompileJob({
   // absolute path injected into inline Lua (fork mode): single-quoted, so
   // escape the characters that would break the literal
   const jobdirForBody = jobdir.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-  needsRescue(block.text); // populate _breakableRe for this preamble
-  const splitMode =
-    !includesPdf &&
-    (/\\begin\{(mdframed|framed|shaded|longtable|multicols\*?)\}|\\begin\{tcolorbox\}\[[^\]]*breakable/.test(
-      block.text
-    ) ||
-      (breakableRe()?.test(block.text) ?? false));
   // Page-EMITTING blocks (\includepdf: whole foreign pages) keep the REAL
   // output routine so every page ships and becomes a per-page chunk. The
   // dormant absorb would hand their zero-dimension page paintings back to
@@ -75,11 +77,9 @@ export function prepareIsoCompileJob({
   // the final partial page stays on the galley for the normal remainder
   // harvest. A box that FITS never fires the routine, so its galley is
   // byte-identical to the absorb path.
-  // fork children always run the iso absorb: the real routine cannot run
-  // against the inherited dormant page state yet (box255/unbox cascades
-  // under luatexja). A fork run whose absorb DISCARDS (the env truly had
-  // to split at this offset) is retried cold below, where the real
-  // routine splits exactly as in print.
+  // Fork children use the iso absorb only for non-splitting rescues. The
+  // splitting cases above intentionally have no ck0 and therefore run the
+  // real routine cold, where page output and progress are deterministic.
   const realOutput = !ck0 && (includesPdf || splitMode);
   // page-context strut: reproduce the block's true on-page start position
   // so splitting environments (mdframed & co.) measure the same

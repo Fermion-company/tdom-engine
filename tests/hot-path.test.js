@@ -11,7 +11,11 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
+import { buildDisplayList } from '../engine/checkpoint/display-list.js';
+import { buildStream } from '../engine/checkpoint/stream.js';
 import { handlePeerMessage } from '../engine/checkpoint/peer-message.js';
+import { mayCaptureDisplayMath } from '../engine/checkpoint/render-hold.js';
+import { preemptResidentRenders } from '../engine/checkpoint/render-pump.js';
 
 const WORK = fileURLToPath(new URL('../.tdom-hotpath-test', import.meta.url));
 const WORK2 = fileURLToPath(new URL('../.tdom-hotpath-test-scratch', import.meta.url));
@@ -43,6 +47,16 @@ function makeDoc() {
   L.push('\\begin{equation}\\label{eq:one}');
   L.push('  a^2 + b^2 = c^2');
   L.push('\\end{equation}');
+  L.push('');
+  L.push('A displayed odd-function explanation begins here.');
+  L.push('\\[');
+  L.push('  h(x)=x^3-2x');
+  L.push('\\]');
+  L.push('is paired with');
+  L.push('\\[');
+  L.push('  h(-x)=-h(x)');
+  L.push('\\]');
+  L.push('and ends here.');
   L.push('');
   L.push(para('Macro user says \\foo{} inline in a normal'));
   L.push('');
@@ -127,17 +141,275 @@ test('a replacement checkpoint retires the preserved peer at that boundary', () 
   assert.deepEqual([...engine.dyingPids], [41]);
 });
 
+test('capture scope includes display math but excludes inline/commented math', () => {
+  assert.equal(mayCaptureDisplayMath({ text: '\\[x^2\\]' }), true);
+  assert.equal(mayCaptureDisplayMath({ text: '\\begin{align*}x&=1\\end{align*}' }), true);
+  assert.equal(mayCaptureDisplayMath({ text: 'inline $x$ only' }), false);
+  assert.equal(mayCaptureDisplayMath({ text: '% \\[commented display\\]\nplain' }), false);
+  assert.equal(
+    mayCaptureDisplayMath({ text: '\\begin{tcolorbox}\\[x\\]\\end{tcolorbox}' }),
+    false,
+    'page-context boxes stay on the established render/rescue paths'
+  );
+});
+
+test('capture miss rejects only the render attempt with a fallback marker', () => {
+  let rejected = null;
+  const engine = {
+    _reject(key, err) {
+      rejected = { key, err };
+    },
+  };
+  handlePeerMessage(engine, {}, { kind: 'CAPTUREMISS', id: 'b7' });
+  assert.equal(rejected?.key, 'render:b7');
+  assert.equal(rejected?.err?.tdomCaptureMiss, true);
+});
+
+test('a new edit preempts resident exact backlog but preserves isolated cache work', () => {
+  const rejected = [];
+  const engine = {
+    renderWant: new Map([['old-block', true]]),
+    renderPids: new Map([['rr@1', 0], ['iso@cache', 0]]),
+    cancelledRenderIds: new Set(),
+    _reject(key, err) { rejected.push({ key, err }); },
+  };
+  preemptResidentRenders(engine);
+  assert.equal(engine.renderWant.size, 0);
+  assert.equal(engine.renderPids.has('rr@1'), false);
+  assert.equal(engine.renderPids.has('iso@cache'), true);
+  assert.equal(engine.cancelledRenderIds.has('rr@1'), true);
+  assert.equal(rejected[0]?.key, 'render:rr@1');
+  assert.equal(rejected[0]?.err?.tdomSuperseded, true);
+});
+
+test('preview display list drops zero-area markers and preserves exact chunk ink', () => {
+  const page = {
+    number: 1,
+    draw: [
+      {
+        y: 10,
+        u: {
+          blockId: 'ja',
+          li: 0,
+          h: 8,
+          d: 2,
+          ln: {
+            boxH: 8,
+            runs: [
+              { rule: true, x: 10, dy: -8, w: 0, h: 10 },
+              { rule: true, x: 20, dy: -0.4, w: 5, h: 0.4 },
+            ],
+          },
+        },
+      },
+      {
+        y: 30,
+        u: {
+          blockId: 'math',
+          li: 0,
+          h: 8,
+          d: 2,
+          ln: {
+            boxH: 8,
+            runs: [],
+            editRuns: [{ t: 'x', x: 10, w: 5, f: 1 }],
+            gfxChunk: { blockId: 'math', yOff: 6, w: 100, stale: 1 },
+          },
+        },
+      },
+    ],
+  };
+  const dl = buildDisplayList(page, {
+    geometry: {
+      oddsidemargin: 0,
+      topmargin: 0,
+      headheight: 0,
+      headsep: 0,
+      textwidth: 100,
+      textheight: 200,
+      footskip: 30,
+    },
+    chunks: new Map([['math', { hBp: 20, v: 1 }]]),
+    hf: new Map(),
+    hfSig: '',
+    fonts: new Map([[1, { mth: 1 }]]),
+    twinMetrics: {},
+  });
+
+  const rules = dl.commands.filter((command) => command.op === 'rule');
+  assert.deepEqual(rules.map(({ w, h }) => ({ w, h })), [{ w: 5, h: 0.4 }]);
+
+  const chunk = dl.commands.find((command) => command.op === 'chunk');
+  assert.deepEqual(
+    { x: chunk.x, y: chunk.y, h: chunk.h, sy: chunk.sy, ch: chunk.ch, line: chunk.line },
+    { x: 72, y: 92, h: 14, sy: 4, ch: 20, line: 0 },
+    'the SVG owns paragraph indentation, while a bounded vertical bleed preserves math ink'
+  );
+  const mathHit = dl.commands.find((command) => command.op === 'sourcebox' && command.src === 'math');
+  assert.equal(mathHit?.math, 1, 'stale exact display math exposes its live TeX geometry');
+  assert.equal(mathHit?.stale, 1, 'the client can retain clean stale pixels while the mini-compile runs');
+});
+
+test('fresh partial-exact pixels replace only contiguous math lines', () => {
+  const line = (text) => ({
+    k: 'box',
+    h: 10,
+    d: 2,
+    w: 100,
+    runs: [{ f: 1, t: text, x: 0, dy: 0, s: 10 }],
+  });
+  const block = {
+    id: 'mixed',
+    galleyHash: 'fresh-galley',
+    galley: {
+      w: 100,
+      items: [line('before'), line('\uE000S_1=S_2'), line('\uE000S_2=S_3'), line('after')],
+      floats: [],
+    },
+    fidelity: {
+      blockExact: false,
+      canonicalOnly: false,
+      exactLines: 2,
+      itemFlags: [0, 3, 3, 0],
+      floats: new Map(),
+      ins: new Map(),
+    },
+  };
+  const chunks = new Map([['mixed', {
+    forGalley: 'fresh-galley',
+    wBp: 100,
+    hBp: 48,
+    v: 1,
+  }]]);
+  const boxes = buildStream(block, chunks)
+    .filter((entry) => entry.t === 'box')
+    .map((entry) => entry.u);
+  const dl = buildDisplayList({
+    number: 1,
+    draw: boxes.map((u, index) => ({ y: 10 + index * 12, u })),
+  }, {
+    geometry: {
+      oddsidemargin: 0,
+      topmargin: 0,
+      headheight: 0,
+      headsep: 0,
+      textwidth: 100,
+      textheight: 200,
+      footskip: 30,
+    },
+    chunks,
+    hf: new Map(),
+    hfSig: '',
+    fonts: new Map(),
+    twinMetrics: {},
+  });
+  const exact = dl.commands.filter((command) => command.op === 'chunk');
+
+  assert.equal(boxes[0].ln.gfxChunk, null, 'safe prose before math stays as live glyphs');
+  assert.equal(boxes[0].ln.runs[0].t, 'before');
+  assert.equal(boxes[1].ln.gfxChunk?.blockId, 'mixed');
+  assert.equal(boxes[2].ln.gfxChunk?.blockId, 'mixed');
+  assert.equal(boxes[3].ln.gfxChunk, null, 'safe prose after math stays as live glyphs');
+  assert.equal(boxes[3].ln.runs[0].t, 'after');
+  assert.deepEqual(
+    exact.map(({ sy, h, ch }) => ({ sy, h, ch })),
+    [{ sy: 10, h: 28, ch: 48 }],
+    'adjacent exact lines merge into one mini-compile window with only outer bleed'
+  );
+});
+
 let eng;
+let openReport;
 before(async () => {
   if (!available) return;
   rmSync(WORK, { recursive: true, force: true });
   rmSync(WORK2, { recursive: true, force: true });
   eng = new CheckpointEngine({ workDir: WORK });
-  await eng.open(makeDoc());
+  openReport = await eng.open(makeDoc());
   await drain(eng);
+});
+
+test('edit reports atomically carry newly registered texttt and textit faces', opts, async () => {
+  assert.deepEqual(new Set(openReport.fonts), new Set(eng.getFontManifest()));
+  const anchor = 'Opening alpha';
+  const insert = '\\texttt{aaaa}\\textit{BBBB}';
+  const start = eng.getSource().indexOf(anchor) + anchor.length;
+  const before = new Set(eng.getFontManifest());
+  const report = await eng.edit(start, start, insert);
+  const commands = report.patches.flatMap((patch) => patch.displayList?.commands ?? []);
+  const mono = commands.find((command) => command.op === 'glyphs' && command.text.includes('aaaa'));
+  const italic = commands.find((command) => command.op === 'glyphs' && command.text.includes('BBBB'));
+  assert.ok(mono?.fam && italic?.fam, 'both style runs stay in the structured text layer');
+  assert.notEqual(mono.fam, italic.fam, 'typewriter and italic use distinct TeX faces');
+  assert.ok(report.fonts.includes(mono.fam));
+  assert.ok(report.fonts.includes(italic.fam));
+  assert.ok(report.fonts.some((family) => !before.has(family)), 'the same edit reports its new face');
+  await eng.edit(start, start + insert.length, '');
 });
 after(async () => {
   if (eng) await eng.close();
+});
+
+test('display-math exact render reuses the foreground JOB node list', opts, async () => {
+  await eng.renderTask.catch(() => {});
+  const beforeHits = eng.renderStats.captureHits;
+  const at = eng.getSource().indexOf('a^2');
+  assert.ok(at >= 0, 'equation source found');
+  await eng.edit(at + 3, at + 3, '+1');
+  await eng.renderTask;
+
+  const equation = eng.blocks.find((b) => b.text.includes('a^2+1'));
+  assert.ok(equation?.needsRender, 'edited equation requires exact pixels');
+  assert.ok(
+    eng.renderStats.captureHits > beforeHits,
+    `capture path served the edit (${JSON.stringify(eng.renderStats)})`
+  );
+  assert.equal(equation.galley?.capture, undefined, 'retained list released after shipout');
+  assert.equal(
+    eng.chunks.get(equation.id)?.forGalley,
+    equation.galleyHash,
+    'the capture produced the current galley chunk'
+  );
+
+  const undo = eng.getSource().indexOf('a^2+1');
+  await eng.edit(undo + 3, undo + 5, '');
+  await eng.renderTask;
+  await drain(eng);
+});
+
+test('mixed prose and display math reaches fresh exact pixels without canonical compile', opts, async () => {
+  await eng.renderTask.catch(() => {});
+  const beforeHits = eng.renderStats.captureHits;
+  const source = eng.getSource();
+  const at = source.indexOf('h(x)=x^3-2x');
+  assert.ok(at >= 0, 'mixed equation source found');
+  const two = at + 'h(x)=x^3-'.length;
+  const canonicalRev = eng.canonical.last?.rev ?? eng.canonical.current?.rev ?? null;
+  await eng.edit(two, two + 1, '');
+  await Promise.race([
+    eng.renderTask,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('mixed display exact render timeout')), 5_000)
+    ),
+  ]);
+
+  const mixed = eng.blocks.find((b) => b.text.includes('h(x)=x^3-x'));
+  assert.ok(mixed?.needsRender, 'mixed prose/math block requires exact pixels');
+  assert.ok(
+    eng.renderStats.captureHits > beforeHits,
+    `capture path served the mixed edit (${JSON.stringify(eng.renderStats)})`
+  );
+  assert.equal(eng.chunks.get(mixed.id)?.forGalley, mixed.galleyHash);
+  assert.equal(
+    eng.canonical.last?.rev ?? eng.canonical.current?.rev ?? null,
+    canonicalRev,
+    'exact pixels landed without waiting for a new canonical result'
+  );
+
+  const undo = eng.getSource().indexOf('h(x)=x^3-x') + 'h(x)=x^3-'.length;
+  await eng.edit(undo, undo, '2');
+  await eng.renderTask;
+  await drain(eng);
 });
 
 test('steady-state keystrokes stay fork-once (edit-locus pin)', opts, async () => {

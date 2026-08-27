@@ -28,7 +28,8 @@ Node.js engine
       ├─ ckpt1
       ├─ ckpt2 ...
       ├─ JOB child -> 組版後に次 checkpoint へ昇格
-      └─ RENDER child -> tight PDF を shipout して終了
+      ├─ CAPTURE child -> JOB が保持した node list を tight PDF に shipout
+      └─ RENDER child -> block を再実行して tight PDF を shipout（fallback）
 ```
 
 checkpoint は「ある block 境界まで処理済みの TeX プロセス」である。OS の copy-on-write `fork()` が TeX 状態の snapshot になるため、マクロ、catcode、counter、font、box register などを JavaScript 側で保存・復元しない。
@@ -57,8 +58,10 @@ checkpoint は「ある block 境界まで処理済みの TeX プロセス」で
 
 | command | 内容 |
 | --- | --- |
-| `JOB <blockId> <newCkptIdx> <len>` | block を組版し、結果を返して次 checkpoint になる |
-| `RENDER <blockId> <jobDir> <len>` | block を tight PDF として shipout する |
+| `JOB <blockId> <newCkptIdx> <len> <captureToken\|->` | block を組版し、結果を返して次 checkpoint になる。display math の hot job は node list を世代付きで保持する |
+| `CAPTURE <blockId> <token> <jobDir> <requestId>` | post-block checkpoint が保持する JOB node list を再組版せず shipout する |
+| `RENDER <blockId> <jobDir> <len> <requestId>` | block を tight PDF として shipout する |
+| `DROP_CAPTURE <blockId> <token>` | exact pixel が不要だった保持 node list を解放する |
 | `DIE` | checkpoint を終了する |
 | `PING` | 生存確認 |
 
@@ -73,6 +76,7 @@ checkpoint は「ある block 境界まで処理済みの TeX プロセス」で
 | `CKPT` | checkpoint 昇格通知 |
 | `FORKED` | 子 process pid 通知 |
 | `DONE` | RENDER PDF 完了通知 |
+| `CAPTUREMISS` | capture が無い、または編集世代が一致しないため fallback を要求 |
 | `PONG` | 生存応答 |
 
 JOB の子だけが `tdom_wait()` から抜け、`tex.print()` で挿入された block source を TeX に読ませる。親 checkpoint は待機 loop に残る。
@@ -132,15 +136,21 @@ foreground verification の現在の初期 budget は、galley divergence 用が
 
 ## 3.9 exact chunk の経路
 
-exact chunk は主に三つの経路から来る。
+exact chunk は主に四つの経路から来る。
 
 | 経路 | 内容 |
 | --- | --- |
-| resident RENDER | warm checkpoint から block を tight PDF として shipout し、`pdftocairo` で SVG 化する |
+| resident CAPTURE | display math の foreground JOB が既に組んだ node list を post-block checkpoint から copy-free で引き渡し、再組版せず shipout する |
+| resident RENDER | warm pre-block checkpoint から block を再実行して tight PDF として shipout する（capture 非対象・miss 時の fallback） |
 | canonical crop | fresh canonical SVG から block band を切り出して chunk として登録する |
 | isolated render | standalone `lualatex` で該当 block を compile し、rescue chunk を作る |
 
-resident RENDER は hot dirty block と async chain で実際に変化した block に寄せられる。大量の cold block を全文 sweep しない。dirty block 数が `TDOM_RENDER_HOT_MAX` を超える場合は hot render を抑制する。
+resident CAPTURE/RENDER は hot dirty block と async chain で実際に変化した block に寄せられる。大量の cold block を全文 sweep しない。dirty block 数が `TDOM_RENDER_HOT_MAX` を超える場合は hot render を抑制し、cold boot の全 checkpoint に node list を保持しない。
+
+各 resident render は foreground JOB の block id とは別の単調増加 `requestId` を持つ。新しい編集が始まると、未着手の cold render queue と実行中の resident render を破棄し、現在の dirty block を空いた lane の先頭へ入れる。孤立 compile は結果を cache として再利用できるため、この preemption の対象外である。fork 通知が cancellation より遅れて到着した場合も `requestId` で識別して子 process を回収する。
+render lane の終了時にも queue を再確認する。全 lane が終了判定を済ませてから pumping counter を下げるまでの間に新しい item が入っても、次の打鍵を待たず replacement pump を起動する。
+
+CAPTURE の初期対象は `\[...\]`、`$$...$$`、equation/align/gather/multline 等の display math に限定する。token は source edit ごとに単調増加し、block id と token の両方が一致した場合だけ shipout する。capture child を fork した直後に checkpoint 親の list を解放し、次の JOB child は継承した古い list を組版前に破棄する。graphics、float、breakable box は backend/output-routine state の所有境界が異なるため、従来の RENDER/isolated 経路を使う。
 
 isolated render は idle-gated の低優先度経路である。`rescueQueue` が空、canonical が compile 中でない、直近編集から一定時間が経過、などの条件を見て動く。
 

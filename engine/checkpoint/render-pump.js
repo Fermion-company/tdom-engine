@@ -1,5 +1,25 @@
 import { renderResidentBlock } from './resident-render.js';
 
+/** Exact pixels are replaceable latency work. A new edit must not wait behind
+ * boot/backlog renders that already occupy every pump lane. Cancel resident
+ * render children and discard their cold queue while the update lock is held;
+ * isolated `iso@` compiles are cache-producing work and continue separately. */
+export function preemptResidentRenders(engine) {
+  engine.renderWant.clear();
+  for (const [requestId, pid] of [...(engine.renderPids ?? [])]) {
+    if (!requestId.startsWith('rr@')) continue;
+    if (pid > 0) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+    } else {
+      engine.cancelledRenderIds.add(requestId);
+    }
+    const err = new Error(`resident render superseded by edit: ${requestId}`);
+    err.tdomSuperseded = true;
+    engine._reject('render:' + requestId, err);
+    engine.renderPids.delete(requestId);
+  }
+}
+
 /**
  * High-fidelity chunk scheduler. Latest-wins per block (a superseded
  * galley is never rendered — renderBlock reads the block's CURRENT hash),
@@ -35,11 +55,16 @@ function pumpRenders(engine, callbacks) {
         const block = engine.blocks.find((b) => b.id === id);
         if (!block || !block.galley || !block.needsRender) continue;
         await renderBlock(engine, block, callbacks).catch((err) => {
-          engine.diagnostics.push(`render ${id}: ${err?.message ?? err}`);
+          if (!err?.tdomSuperseded) engine.diagnostics.push(`render ${id}: ${err?.message ?? err}`);
         });
       }
     } finally {
       engine.renderPumping--;
+      // A queue item can arrive after this drain observed size=0 but before
+      // the counter drops. queueRender then sees every lane as occupied and
+      // cannot start a replacement. Re-check after releasing the lane so the
+      // newest edit never remains stranded until the next keystroke.
+      if (engine.renderWant.size) pumpRenders(engine, callbacks);
     }
   })();
   // exposed so tools/tests can wait for the exact-render tier to settle
@@ -47,9 +72,8 @@ function pumpRenders(engine, callbacks) {
 }
 
 function renderBlock(engine, block, callbacks) {
-  // per-block serialization: the RENDER protocol's reply key is the block
-  // id, so two in-flight renders of the same block (different galleys, two
-  // pump lanes) would collide in the waiter table
+  // Per-block serialization keeps two generations from sharing the same
+  // job directory. Protocol replies themselves carry unique request ids.
   engine.renderLocks ??= new Map();
   const prev = engine.renderLocks.get(block.id) ?? Promise.resolve();
   const run = prev.then(() => renderBlockInner(engine, block, callbacks));
@@ -86,12 +110,11 @@ async function renderBlockInner(engine, block, callbacks) {
     return;
   }
   const ck = engine.checkpoints.get(idx);
-  if (!ck) {
+  const captureCk = block.galley?.capture ? engine.checkpoints.get(idx + 1) : null;
+  if (!ck && !captureCk) {
     // checkpoint retired off the grid (long documents keep ~64): the
-    // resident RENDER path needs the state AT this block, so fall back to
-    // the isolated render. Fire-and-forget — its queue is idle-gated and
-    // self-serialized, and it must never occupy a pump lane (the lane has
-    // to stay free for the fast resident renders of just-edited blocks).
+    // Neither exact path has a resident owner: RENDER needs the state AT the
+    // block, CAPTURE needs the state just AFTER it. Fall back to isolated.
     renderIsolated(block, idx);
     return;
   }

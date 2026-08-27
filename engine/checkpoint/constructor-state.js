@@ -145,6 +145,10 @@ export function initializeEngineState(
   engine.renderWant = new Map(); // block.id -> queue marker
   engine.renderPumping = 0;
   engine.renderTask = Promise.resolve();
+  engine.renderSeq = 0; // unique protocol ids keep render forks distinct from foreground JOBs
+  engine.cancelledRenderIds = new Set(); // late FORKED replies are killed after edit preemption
+  engine.captureSeq = 0; // monotonic generation token for retained JOB node lists
+  engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };
   engine.renderHold = new Map(); // ckpt idx kept alive for a pending render -> block.id
   // Edit-locus pinning: the checkpoints at (and right after) the block the
   // user is typing in are exempt from grid retirement, so a keystroke burst

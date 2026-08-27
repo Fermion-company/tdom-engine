@@ -427,6 +427,7 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 }
 .page {
   position: relative;
+  container-type: inline-size;
   width: min(calc(92% * var(--zoom)), calc(640px * var(--zoom)));
   flex: none;
   background: #fff;
@@ -435,6 +436,12 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 .page.awaiting-canonical { visibility: hidden; }
 .page svg { display: block; width: 100%; height: auto; }
 .page svg text { cursor: pointer; }
+/* Math glyph runs exist only as TeX geometry for hit-testing. Never paint
+   them directly: legacy math fonts can map operators to ordinary letters or
+   missing-glyph boxes. Until the exact mini-compile chunk is ready, blank is
+   the visually honest fallback. */
+.page svg text[data-math="1"] { opacity: 0; }
+.page svg text[data-font-pending="1"] { opacity: 0; }
 
 /* canonical layer: the exact LuaLaTeX render of this page. When fresh it
    sits on top of (and hides) the provisional layers; pointer events pass
@@ -620,7 +627,6 @@ body.is-embed .chunkwin { pointer-events: none; }
 .page.patched { box-shadow: var(--page-shadow), 0 0 0 1px var(--accent); }
 .page { transition: box-shadow 0.8s ease; }
 .page.fading { box-shadow: var(--page-shadow), 0 0 0 1px transparent; }
-
 /* ------------------------------------------------------- engine inspector */
 
 #inspector-pane { display: none; background: var(--surface); }

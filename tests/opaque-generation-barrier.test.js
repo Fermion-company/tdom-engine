@@ -275,6 +275,20 @@ test('visible suggestions are anchored to the canonical click, not the source-ra
   assert.match(STYLE, /\.tdom-direct-editor\.is-opaque \.math-wysiwyg-panel \{[\s\S]*?left: var\(--tdom-canonical-panel-left, 0px\) !important;[\s\S]*?top: var\(--tdom-canonical-panel-top,/);
 });
 
+test('raw browser math glyphs are never painted before an exact chunk', () => {
+  assert.match(STYLE, /\.page svg text\[data-math="1"\] \{ opacity: 0; \}/);
+  assert.doesNotMatch(APP, /scheduleProvisionalMath|tdom-provisional-math/);
+  assert.doesNotMatch(STYLE, /tdom-provisional-math/);
+});
+
+test('incremental font faces fail closed until the real TeX font is ready', () => {
+  assert.match(APP, /function applyReport\(report\) \{[\s\S]*?injectFonts\(report\.fonts\);[\s\S]*?for \(const patch of report\.patches\)/);
+  assert.match(APP, /const pending = readyFonts\.has\(cmd\.fam\)[\s\S]*?data-font-family=/);
+  assert.match(APP, /readyFonts\.add\(k\);[\s\S]*?removeAttribute\('data-font-pending'\)/);
+  assert.match(STYLE, /\.page svg text\[data-font-pending="1"\] \{ opacity: 0; \}/);
+  assert.match(SERVER, /kind: 'patches', rev: partial\.rev, fonts: partial\.fonts/);
+});
+
 test('the browser entrypoint enforces the planner before the batch commit loop', () => {
   const plannerScript = INDEX.indexOf('<script src="/opaque-editor-coordinator.js"></script>');
   const appScript = INDEX.indexOf('<script src="/app.js"></script>');

@@ -42,6 +42,7 @@ const FONT_FAMILY = {
 let geometry = { paperwidth: 612, paperheight: 792 };
 let backend = 'internal';
 const loadedFonts = new Set();
+const readyFonts = new Set();
 const failedFonts = new Set(); // families reported to /font-fail (once each)
 
 let serverText = '';
@@ -393,7 +394,17 @@ function injectFonts(keys) {
   for (const k of missing) {
     document.fonts.load(`12px "${k}"`).then(
       (faces) => {
-        if (!faces || faces.length === 0) reportFontFailure(k);
+        if (!faces || faces.length === 0) {
+          reportFontFailure(k);
+          return;
+        }
+        readyFonts.add(k);
+        // Pages may have been patched while the local face was decoding.
+        // Reveal only runs that now have their real TeX font; a fallback is
+        // never an intermediate presentation state.
+        for (const node of document.querySelectorAll('text[data-font-pending="1"]')) {
+          if (node.dataset.fontFamily === k) node.removeAttribute('data-font-pending');
+        }
       },
       () => reportFontFailure(k)
     );
@@ -590,11 +601,10 @@ function renderPage(dl, flash) {
     // but wrong; the class is a hook for the inspector, not a visual.
     div.insertAdjacentHTML(
       'beforeend',
-      `<div class="chunkwin${cmd.st ? ' stale' : ''}" data-src="${cmd.src}" style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
+      `<div class="chunkwin${cmd.st ? ' stale' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
         `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
     );
   }
-
   if (flash) {
     div.classList.remove('fading');
     div.classList.add('patched');
@@ -617,18 +627,19 @@ function svgFor(dl) {
       if (cmd.fam) {
         // checkpoint backend: real TeX font, TeX positions; disable browser
         // shaping so run-start x + font advances reproduce TeX exactly
-        fontAttrs = ` font-family="${escapeXml(cmd.fam)}" style="font-kerning:none;font-variant-ligatures:none;letter-spacing:0"`;
+        const pending = readyFonts.has(cmd.fam) ? '' : ' data-font-pending="1"';
+        fontAttrs = ` font-family="${escapeXml(cmd.fam)}" data-font-family="${escapeXml(cmd.fam)}"${pending} style="font-kerning:none;font-variant-ligatures:none;letter-spacing:0"`;
       } else {
         const it = cmd.font === 'italic' || cmd.font === 'bolditalic' ? ` font-style="italic"` : '';
         const b = cmd.font === 'bold' || cmd.font === 'bolditalic' ? ` font-weight="bold"` : '';
         fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
       }
       parts.push(
-        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''} xml:space="preserve">${escapeXml(cmd.text)}</text>`
+        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-width="${cmd.w ?? 0}" data-gh="${cmd.gh ?? 0}" data-gd="${cmd.gd ?? 0}" data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''} xml:space="preserve">${escapeXml(cmd.text)}</text>`
       );
-    } else if (cmd.op === 'rule') {
+    } else if (cmd.op === 'rule' && cmd.w > 0 && cmd.h > 0) {
       parts.push(
-        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.1)}" height="${Math.max(cmd.h, 0.1)}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}/>`
+        `<rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}/>`
       );
     } else if (cmd.op === 'editbox') {
       parts.push(
@@ -636,7 +647,7 @@ function svgFor(dl) {
       );
     } else if (cmd.op === 'sourcebox') {
       parts.push(
-        `<rect class="tdom-source-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}"${lineAttr}${cmd.ink ? ' data-ink="1"' : ''}${cmd.complex ? ' data-complex="1"' : ''}/>`
+        `<rect class="tdom-source-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}"${lineAttr}${cmd.ink ? ' data-ink="1"' : ''}${cmd.math ? ' data-math="1"' : ''}${cmd.stale ? ' data-stale="1"' : ''}${cmd.complex ? ' data-complex="1"' : ''}/>`
       );
     } else if (cmd.op === 'chunk') {
       // exact-render chunks are drawn as HTML <img> overlays (see renderPage)
@@ -661,6 +672,10 @@ function removePagesFrom(from) {
 
 function applyReport(report) {
   if (report.rev <= appliedRev) return;
+  // Font registration and the page patch are one visual transaction. The
+  // SVG may be inserted before the local face finishes decoding, but its
+  // affected runs remain hidden until injectFonts marks that face ready.
+  injectFonts(report.fonts);
   appliedRev = report.rev;
   appliedSrcRev = report.srcRev ?? appliedSrcRev;
   setMode(report.mode ?? 'structured', report.modeReasons ?? []);
@@ -3533,7 +3548,7 @@ pagesEl.addEventListener('scroll', () => {
       for (const [n, div] of sortedPages()) {
         if (div.getBoundingClientRect().bottom - top > 4) return n;
       }
-      return 1;
+      return sortedPages()[0]?.[0] ?? 1;
     };
     const previewReady = () => {
       if (!bootComplete || !documentReset.acceptsReady(documentReset.adoptedEpoch)) return false;
@@ -3563,29 +3578,8 @@ pagesEl.addEventListener('scroll', () => {
           page.classList.contains('is-final') && page.querySelector('img.canon')?.complete)
       );
     };
-    const scrollToPage = (n) => {
-      const entries = sortedPages();
-      if (!entries.length) return;
-      const clamped = Math.max(entries[0][0], Math.min(entries.at(-1)[0], Math.round(n)));
-      pageDivs.get(clamped)?.scrollIntoView({ block: 'start' });
-    };
-    window.addEventListener('message', (ev) => {
-      const d = ev.data;
-      if (!d || d.source !== 'tdom-host') return;
-      if (d.activationId && d.activationId !== embedActivationId) return;
-      if (d.action === 'reset-ack') {
-        if (documentReset.acknowledge(d.documentEpoch)) {
-          maybeAdoptCompletedReset(Number(d.documentEpoch));
-        }
-      } else if (d.action === 'zoom-in') setZoom(zoom * 1.1);
-      else if (d.action === 'zoom-out') setZoom(zoom / 1.1);
-      else if (d.action === 'zoom-fit') setZoom(1);
-      else if (d.action === 'goto-page') scrollToPage(Number(d.page));
-      else if (d.action === 'page-prev') scrollToPage(currentTopPage() - 1);
-      else if (d.action === 'page-next') scrollToPage(currentTopPage() + 1);
-      else if (d.action === 'search') runLiveSearch(d.query, d.findPrevious === true);
-    });
-    setInterval(() => {
+    let embedSnapshotRaf = null;
+    const postEmbedSnapshot = () => {
       try {
         window.parent.postMessage(
           {
@@ -3606,7 +3600,127 @@ pagesEl.addEventListener('scroll', () => {
           '*'
         );
       } catch { /* host gone */ }
-    }, 400);
+    };
+    const scheduleEmbedSnapshot = () => {
+      if (embedSnapshotRaf !== null) return;
+      embedSnapshotRaf = requestAnimationFrame(() => {
+        embedSnapshotRaf = null;
+        postEmbedSnapshot();
+      });
+    };
+    const pageEntryFor = (n) => {
+      const entries = sortedPages();
+      if (!entries.length) return null;
+      const wanted = Number.isFinite(n) ? Math.round(n) : entries[0][0];
+      return entries.reduce((best, entry) =>
+        Math.abs(entry[0] - wanted) < Math.abs(best[0] - wanted) ? entry : best
+      );
+    };
+    const scrollPageToViewport = (page, paperY = 0, center = false) => {
+      const viewport = pagesEl.getBoundingClientRect();
+      const pageRect = page.getBoundingClientRect();
+      const paper = activePaperGeometry(page);
+      const ratio = Math.max(0, Math.min(1, Number(paperY) / Math.max(1, Number(paper.height))));
+      const withinPage = ratio * pageRect.height;
+      const target = pagesEl.scrollTop + pageRect.top - viewport.top + withinPage -
+        (center ? pagesEl.clientHeight / 2 : 0);
+      pagesEl.scrollTo({ top: Math.max(0, target), behavior: 'auto' });
+      scheduleEmbedSnapshot();
+    };
+    const scrollToPage = (n) => {
+      const entry = pageEntryFor(Number(n));
+      if (!entry) return;
+      scrollPageToViewport(entry[1]);
+    };
+    const refineSyncToSource = async (data) => {
+      const file = String(data.sourceFile ?? '');
+      const line = Number(data.sourceLine);
+      if (!file || !Number.isFinite(line)) return false;
+      let dom;
+      try {
+        const response = await fetch('/dom', { cache: 'no-store' });
+        if (!response.ok) return false;
+        dom = await response.json();
+      } catch {
+        return false;
+      }
+      const blocks = (dom?.blocks ?? []).filter((block) =>
+        block?.id && sameSourceFile(block.source?.file, file) &&
+        Number(block.source?.start?.line) <= line && Number(block.source?.end?.line) >= line
+      ).sort((a, b) =>
+        (Number(a.source.end.line) - Number(a.source.start.line)) -
+        (Number(b.source.end.line) - Number(b.source.start.line))
+      );
+      for (const block of blocks) {
+        const relativeLine = line - Number(block.source.start.line);
+        for (const [, page] of sortedPages()) {
+          const nodes = [...page.querySelectorAll(`[data-src="${CSS.escape(String(block.id))}"][data-line]`)]
+            .filter((node) => {
+              const rect = node.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            });
+          if (!nodes.length) continue;
+          const values = [...new Set(nodes.map((node) => Number(node.dataset.line)).filter(Number.isFinite))];
+          if (!values.length) continue;
+          const targetLine = values.includes(relativeLine)
+            ? relativeLine
+            : values.reduce((best, value) =>
+              Math.abs(value - relativeLine) < Math.abs(best - relativeLine) ? value : best
+            );
+          const exact = nodes.filter((node) => Number(node.dataset.line) === targetLine);
+          const ink = exact.filter((node) =>
+            !node.classList.contains('tdom-source-hit') &&
+            !node.classList.contains('tdom-edit-hit')
+          );
+          // Rescue/source-hit rectangles can cover a whole tcolorbox. They
+          // are useful for click mapping but too broad for a precise jump.
+          if (!ink.length) continue;
+          const rects = ink.map((node) => node.getBoundingClientRect());
+          const top = Math.min(...rects.map((rect) => rect.top));
+          const bottom = Math.max(...rects.map((rect) => rect.bottom));
+          const viewport = pagesEl.getBoundingClientRect();
+          pagesEl.scrollTo({
+            top: Math.max(0, pagesEl.scrollTop + (top + bottom) / 2 - viewport.top - pagesEl.clientHeight / 2),
+            behavior: 'auto',
+          });
+          scheduleEmbedSnapshot();
+          return true;
+        }
+      }
+      return false;
+    };
+    const scrollToSync = (data) => {
+      const entry = pageEntryFor(Number(data.page));
+      if (!entry) return;
+      const [, page] = entry;
+      const blockY = Number(data.blockY);
+      const blockHeight = Number(data.blockHeight);
+      const y = Number.isFinite(blockY)
+        ? blockY + (Number.isFinite(blockHeight) ? blockHeight / 2 : 0)
+        : Number(data.y);
+      scrollPageToViewport(page, Number.isFinite(y) ? y : 0, true);
+      void refineSyncToSource(data);
+      requestAnimationFrame(scheduleEmbedSnapshot);
+    };
+    pagesEl.addEventListener('scroll', scheduleEmbedSnapshot, { passive: true });
+    window.addEventListener('message', (ev) => {
+      const d = ev.data;
+      if (!d || d.source !== 'tdom-host') return;
+      if (d.activationId && d.activationId !== embedActivationId) return;
+      if (d.action === 'reset-ack') {
+        if (documentReset.acknowledge(d.documentEpoch)) {
+          maybeAdoptCompletedReset(Number(d.documentEpoch));
+        }
+      } else if (d.action === 'zoom-in') setZoom(zoom * 1.1);
+      else if (d.action === 'zoom-out') setZoom(zoom / 1.1);
+      else if (d.action === 'zoom-fit') setZoom(1);
+      else if (d.action === 'goto-page') scrollToPage(Number(d.page));
+      else if (d.action === 'goto-sync') scrollToSync(d);
+      else if (d.action === 'page-prev') scrollToPage(currentTopPage() - 1);
+      else if (d.action === 'page-next') scrollToPage(currentTopPage() + 1);
+      else if (d.action === 'search') runLiveSearch(d.query, d.findPrevious === true);
+    });
+    setInterval(postEmbedSnapshot, 400);
   }
 }
 applyLayoutView();
@@ -3829,6 +3943,7 @@ sse.onmessage = (ev) => {
       // the SOURCE is unchanged, so canonical stays authoritative — no
       // dirty marks, but re-evaluate each repainted page's overlay state
       if (msg.rev > appliedRev) {
+        injectFonts(msg.fonts);
         appliedRev = msg.rev;
         if (mode === 'opaque') return;
         for (const patch of msg.patches) {

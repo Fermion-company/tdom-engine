@@ -342,6 +342,7 @@ class PageBuilder {
     const suffixStartNew = incr.suffixStartNew ?? Infinity;
     const suffixShift = incr.suffixShift ?? 0;
 
+    let ending = false;
     for (;;) {
       // ---- resync: a boundary in the clean suffix that matches the old
       // run replays identically — splice the remaining old pages
@@ -360,8 +361,35 @@ class PageBuilder {
       }
       this.justFired = false;
 
-      const e = this.#nextItem();
-      if (!e) break;
+      let e = this.#nextItem();
+      if (!e) {
+        if (ending) break;
+        ending = true;
+        this.finishing = true;
+        if (!this.#pageHasMaterial()) break;
+
+        // \enddocument runs \clearpage. Feed its final \newpage sequence
+        // through the ordinary contribution loop: the first closing glue is
+        // a legal breakpoint and may need to fire an already-overfull page
+        // at its remembered best break before the forced penalty arrives.
+        // Keeping the tail in `pending` also ensures everything after that
+        // break is reprocessed on the next page instead of being dropped.
+        const closing = [];
+        if (this.hasBox) {
+          const pd = this.prevdepth ?? 0;
+          if (pd > 0) {
+            closing.push({
+              t: 'glue', a: -Math.min(pd, this.maxdepth),
+              st: 0, sto: 0, sh: 0, sho: 0,
+            });
+          }
+          closing.push({ t: 'glue', a: 0, st: FIL, sto: 2, sh: 0, sho: 0 });
+        }
+        closing.push({ t: 'eject', v: EJECT });
+        this.pending.push(...closing);
+        e = this.#nextItem();
+        if (!e) break;
+      }
       // a block's first stream node: record its effective entry offset
       // (space already unavailable on this page: \pagetotal plus whatever
       // inserts/floats took off \pagegoal). FIRST-seen wins: this is the
@@ -429,28 +457,6 @@ class PageBuilder {
         default:
           break;
       }
-    }
-    // end of document: \enddocument runs \clearpage, whose \newpage puts
-    //   \ifdim\prevdepth>\z@ \vskip-min(\prevdepth,\maxdepth) \fi \vfil
-    // before the eject. NB LuaTeX glue orders run fi=1,fil=2,fill=3,filll=4
-    // (the stream uses that encoding), so \vfil is order TWO here.
-    this.finishing = true;
-    if (this.#pageHasMaterial()) {
-      if (this.hasBox) {
-        const pd = this.prevdepth ?? 0;
-        if (pd > 0) {
-          this.#appendGlue({ t: 'glue', a: -Math.min(pd, this.maxdepth), st: 0, sto: 0, sh: 0, sho: 0 });
-        }
-        // This glue and the following forced penalty are one \newpage
-        // sequence.  Letting the glue run the ordinary breakpoint scan can
-        // fire at an older best break before the forced penalty is seen,
-        // dropping the document tail from the final page.
-        this.#appendGlue({ t: 'glue', a: 0, st: FIL, sto: 2, sh: 0, sho: 0 });
-      }
-      // Either closing glue can make an already-overfull page fire at its
-      // remembered best break.  In that case #firePage has reset the page;
-      // do not ship that fresh, empty page a second time.
-      if (this.#pageHasMaterial()) this.#firePage(this.contents.length, null);
     }
     while (this.deferlist.length) {
       const made = this.#tryFloatColumn(true);

@@ -52,19 +52,26 @@ export function lineFidelity(item, fonts) {
   // daemon-side verdicts (math nodes, math/CM fonts, unencoded glyphs)
   let exact = !!item.x || !!item.xb;
   let noBridge = !!item.xb;
-  scanRuns(item.runs, fonts, (tier, meta) => {
+  let nativeText = false;
+  let math = false;
+  scanRuns(item.runs, fonts, (tier, meta, run) => {
     if (tier !== 'native') exact = true; // twin substitution or unservable
     if (tier === 'none') noBridge = true; // nothing presentable to bridge with
-    if (meta?.mth) exact = true; // math-font glyphs are math, whatever the file
+    if (run?.m || meta?.mth) {
+      exact = true; // math-font glyphs are math, whatever the file
+      math = true;
+    } else if (tier === 'native') {
+      nativeText = true;
+    }
   });
-  return { exact, noBridge };
+  return { exact, noBridge, mixedTextMath: nativeText && math };
 }
 
 function scanRuns(runs, fonts, visit) {
   for (const r of runs ?? []) {
     if (r.rule || !r.t) continue; // rules are exact by construction
     const meta = fonts.get(r.f);
-    visit(fontTier(meta), meta);
+    visit(fontTier(meta), meta, r);
   }
 }
 
@@ -74,7 +81,7 @@ function scanRuns(runs, fonts, visit) {
  *   level        gate verdict for the block as a whole
  *   exact        any part of the block needs an exact preview chunk
  *   itemFlags    per top-level item (index-aligned): bit1 = exact line,
- *                bit2 = no glyph bridge
+ *                bit2 = no glyph bridge, bit4 = native text mixed with math
  *   floats       float n -> {exact, noBridge}
  *   ins          ins ordinal (k-th footnote item) -> {exact, noBridge}
  *   lines/exactLines  counts for the inspector
@@ -104,6 +111,7 @@ export function classifyGalley(galley, fonts) {
         noBridge = true;
         itemFlags[i] |= 2;
       }
+      if (f.mixedTextMath) itemFlags[i] |= 4;
     } else if (it.k === 'ins') {
       const f = subFidelity(it.items, fonts);
       if (f.exact || f.noBridge) ins.set(insOrdinal, f);

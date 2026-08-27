@@ -105,22 +105,30 @@ export function buildStream(block, chunks) {
     } else if (it.k === 'box') {
       // fidelity verdict for THIS line: exact-required lines map into the
       // block chunk (fresh, or stale until the new one lands ~100ms later);
-      // safe lines stay pure glyphs. Rescued blocks carry per-item chunk
-      // refs (multi-page isolated renders) which take precedence.
+      // safe lines stay pure glyphs even after the chunk becomes fresh. This
+      // is the miniature-compile boundary: a nearby display formula must not
+      // delay or later replace prose/font-style runs from the same block.
+      // Rescued per-item chunks still take precedence.
       const flags = fid?.itemFlags?.[ii] ?? 0;
-      const wantExact = !canonicalOnly && (blockExact || (flags & 1) !== 0);
+      const wantExact =
+        !canonicalOnly && (blockExact || (flags & 1) !== 0);
+      const hasRuns = (it.runs ?? []).some((run) => run.rule || !!run.t);
+      const useCurrentSafeLine =
+        !!bc && !bcFresh && (fid?.exactLines ?? 0) > 0 &&
+        ((flags & 3) === 0 || (flags & 4) !== 0) && hasRuns;
       let gfxChunk = null;
       if (it.chunk) {
         gfxChunk = { blockId: it.chunk, yOff: it.coff ?? 0, w: chunks.get(it.chunk)?.wBp ?? galley.w };
         if (it.full) gfxChunk.full = 1; // real shipped page: owns folio/hf
-      } else if (wantExact && bc) {
+      } else if (wantExact && bc && !useCurrentSafeLine) {
         gfxChunk = { blockId: block.id, yOff, w: galley.w, stale: bcFresh ? undefined : 1 };
       }
       // no exact pixels yet: mappable glyphs may bridge the render latency;
       // unmappable ones (and verification-demoted blocks) show nothing
       // rather than something wrong
       const lineNoBridge =
-        canonicalOnly || (flags & 2) !== 0 || (blockExact && !!fid?.noBridge);
+        canonicalOnly || ((flags & 2) !== 0 && !useCurrentSafeLine) ||
+        (blockExact && !!fid?.noBridge && !useCurrentSafeLine);
       const suppress = !gfxChunk && (canonicalOnly || (wantExact && lineNoBridge));
       const unit = {
         blockId: block.id,

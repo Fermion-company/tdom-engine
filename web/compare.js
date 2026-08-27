@@ -93,9 +93,9 @@ function svgFor(dl) {
       parts.push(
         `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" xml:space="preserve">${escapeXml(cmd.text)}</text>`
       );
-    } else if (cmd.op === 'rule') {
+    } else if (cmd.op === 'rule' && cmd.w > 0 && cmd.h > 0) {
       parts.push(
-        `<rect x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.1)}" height="${Math.max(cmd.h, 0.1)}" fill="${cmd.color || '#1a1a1a'}"/>`
+        `<rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}" fill="${cmd.color || '#1a1a1a'}"/>`
       );
     } else if (cmd.op === 'folio') {
       parts.push(

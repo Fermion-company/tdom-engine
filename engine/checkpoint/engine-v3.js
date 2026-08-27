@@ -69,10 +69,10 @@ import { applyFidelity } from './fidelity-gate.js';
 import { indexBlock, unindexBlock } from './block-index.js';
 import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
 import { brokenBlockGalley as brokenBlockGalleyHelper } from './broken-galley.js';
-import { mayNeedRender, releaseRenderHold } from './render-hold.js';
+import { mayCaptureDisplayMath, mayNeedRender, releaseRenderHold } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
-import { queueRender as queueRenderHelper } from './render-pump.js';
+import { preemptResidentRenders, queueRender as queueRenderHelper } from './render-pump.js';
 import { queueMovedOffsets as queueMovedOffsetsHelper } from './rescue-offsets.js';
 import { isPathInside } from '../project-inputs.js';
 import { instrumentEditRegions } from '../edit-regions.js';
@@ -357,7 +357,20 @@ export class CheckpointEngine {
     ckptP.catch(() => {});
     this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1 };
     try {
-      ck.send(`JOB ${jobId} ${idx + 1} ${body.length}\n`);
+      // A display-math JOB already owns the exact TeX node list that the
+      // asynchronous preview needs.  Retain it in the post-block checkpoint
+      // instead of asking a later RENDER child to typeset the same source a
+      // second time.  Capture only hot/small-document work; a long cold boot
+      // is served by canonical pixels and must not retain a node list in
+      // every checkpoint.
+      const capture =
+        !override &&
+        !this.pdfOpenedAtRoot &&
+        mayCaptureDisplayMath(block) &&
+        (!!block.galley || this.blocks.length <= Number(process.env.TDOM_RENDER_HOT_MAX || 64))
+          ? `c${++this.captureSeq}`
+          : '-';
+      ck.send(`JOB ${jobId} ${idx + 1} ${body.length} ${capture}\n`);
       ck.sendRaw(body);
       const [galley] = await Promise.all([galleyP, ckptP]);
       if (refSnapshot) {
@@ -679,6 +692,14 @@ export class CheckpointEngine {
       headingRe: HEADING_RE,
       applyFidelity: (b, g) => this.#applyFidelity(b, g),
     });
+    // A conservative source scan can request capture for a construct whose
+    // harvested nodes ultimately need no exact pixels.  Release that retained
+    // list immediately instead of keeping it until checkpoint retirement.
+    if (galley.capture && !block.needsRender) {
+      const idx = this.blocks.indexOf(block);
+      this.checkpoints.get(idx + 1)?.send(`DROP_CAPTURE ${block.id} ${galley.capture}\n`);
+      delete galley.capture;
+    }
   }
 
   #applyFidelity(block, galley) {
@@ -754,6 +775,7 @@ export class CheckpointEngine {
         this.updating = true;
         this.bgAbort = false;
         try {
+          preemptResidentRenders(this);
           return await this.#updateInner({ ...args, announceDocumentReset });
         } finally {
           this.updating = false;

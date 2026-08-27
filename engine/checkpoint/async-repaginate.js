@@ -17,7 +17,10 @@ export function asyncRepaginate(
   engine.pages = pages;
   if (patches.length && engine.onAsyncPatches) {
     engine.rev++;
-    engine.onAsyncPatches({ rev: engine.rev, patches });
+    // A late exact render or chain pass can be the first update that uses a
+    // newly registered TeX face. Ship the manifest in the same event so the
+    // client never paints the patch through a browser fallback font.
+    engine.onAsyncPatches({ rev: engine.rev, fonts: engine.getFontManifest(), patches });
   }
   // toc drift: an async landing (header job, rescue offsets, chunk
   // adoption) moved provisional page numbers AFTER the last toc pass —

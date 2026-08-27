@@ -53,6 +53,9 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
   - `it.xb` — cmap 外グリフ（非legacyのPUA 0xE000–0xF8FF、plane 15/16 の
     0xF0000+、0x110000以上）を含む → glyph ブリッジすら禁止（空白の方が
     「間違った字形」よりまし）
+  - run の `m=1` — inline math の開始・終了ノード間から採取した数式由来
+    マーカー。フォント名ではなく TeX の数式境界を使うため、`\mathrm`、
+    `\mathit`、`\mathbf` のように本文系フォントを使う数式も識別できる
 - **フォント配信ティア**（`#registerFont` が決定、runごとに参照）
   - `native` — TeXが実際に使った .otf/.ttf がディスクに実在し配信される
   - `twin` — legacy CM の Latin Modern 双子（mathmap.js）。置換なので
@@ -66,14 +69,23 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
 
 ## 9.4 行粒度の chunk banding
 
-ブロック全体を画像化するのではなく、**数式を含む行だけ**が chunk 帯に
-なります。
+ブロック全体を画像化するのではなく、行の内容と chunk の鮮度に応じて
+表示を分けます。
 
 - RENDER プロトコルはブロック galley 全体を 1 ページとして ship する
   （既存機構）。`buildStream` は `it.x` の行にだけ、そのブロック chunk 内
   オフセット（`yOff`）を窓にした `gfxChunk` 参照を張る。
-- 数式行の周りの散文行は glyph のまま — inline math 段落では「数式の行
-  だけがTeXピクセル、他はグリフ」という**line chunk** が実現される。
+- 数式行の周りの散文行は glyph のまま — display math と math-only 行は
+  **line chunk** になる。
+- stale な whole-block chunk があるときも、普通の散文行は現在の glyph を
+  出す。古い block 画像が編集直後の本文を覆わない。
+- fresh chunk が届いても exact 判定された行だけを chunk window にする。
+  同じ block の安全な散文行は glyph のまま残すため、隣接する `\texttt` や
+  `\textit` が数式レンダー待ちになったり、後から画像へ置換されたりしない。
+- 本文と inline math が同じ行に混在する場合、`itemFlags` の bit 4 が立つ。
+  fresh chunk 待ちの間は現在の本文 glyph だけを出し、math run は透明にする。
+  MathLive 等の別レンダラーでは補わない。前回の exact chunk を安全に使える
+  math-only 行はそれを保持し、それ以外は空白へ fail closed する。
 - float は float ページ（2..1+F）、**脚注は新設の footnote ページ
   （2+F..1+F+N）**に ship され、`b13#1` / `b13@fn0` のキーで独立に
   banding される（数式入り脚注も exact）。
@@ -86,9 +98,11 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
 1. **fresh chunk** — 現 galley の実PDFピクセル
 2. **stale chunk** — 直前レンダーのピクセル（`st:1` でマーク）。
    「一瞬古いが綺麗」は許容、「速いが汚い」は不許容
-3. **glyph bridge** — 全グリフが少なくとも写像可能（twin可・PUA不可）な
-   行だけ、chunk 到着までの橋として表示
-4. **blank** — `xb` 行・降格ブロック。間違った字形は一瞬でも出さない
+3. **glyph bridge** — 非数式の exact-required 行だけ、全グリフが少なくとも
+   写像可能（twin可・PUA不可）なら chunk 到着までの橋として表示。数式 run
+   自体は常に透明
+4. **blank** — `xb` 行・降格ブロック・exact chunk 待ちの数式。
+   間違った字形は一瞬でも出さない
 
 chunk の鮮度は `unitsSig` が chunk 版数＋fresh/stale ビットを持つので、
 到着時に帯だけが差し替わります（第8章のバンド収束と同じ経路）。
@@ -137,14 +151,17 @@ canonical 着地時の一致検証（第8章 §8.4）が fidelity にも接続�
 - ブラウザ側も `document.fonts.load()` で各 `@font-face` の実ロードを
   検証し、失敗を `POST /font-fail` で報告 → `demoteFontFamily()` が
   そのファミリを `none` に落として該当行を chunk へ切り替える
-  （Times fallback が画面に残らない）。
+  （Times fallback が画面に残らない）。差分 report / async patch は同じ更新で
+  font manifest を送る。未ロード family の run は `data-font-pending` で透明にし、
+  実フォントの decode が完了してからだけ表示する。
 
 ## 9.8 実装対応表
 
 | 表示対象 | 現在の実装 |
 |---|---|
 | display math がTeX品質 | math 行は exact chunk |
-| inline math 段落で数式部分が崩れない | 行粒度 banding（§9.4） |
+| inline math 段落の編集中に本文が古い chunk に隠れない | current glyph、math は exact chunk 待ちの間 blank（§9.4） |
+| 隣接する `\texttt` / `\textit` が遅れて差し替わらない | safe 行を構造化 glyph のまま維持＋font manifest を同時配送 |
 | CM / LM / unicode-math / CJK が fallback しない | フォントティア＋`xb` 検出＋font-fail 降格 |
 | TikZ / PDF literal は常にTeX由来 | 従来の `blk_gfx`（変更なし） |
 | canonical 到着で大ジャンプしない | chunk ピクセル＝実PDFピクセル |

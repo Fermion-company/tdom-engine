@@ -74,6 +74,9 @@ export class Peer {
         case 'FORKFAIL':
           this.engine._onMessage(this, { kind: 'FORKFAIL', id: parts[1] });
           break;
+        case 'CAPTUREMISS':
+          this.engine._onMessage(this, { kind: 'CAPTUREMISS', id: parts[1] });
+          break;
         case 'PONG':
           break;
         default:
