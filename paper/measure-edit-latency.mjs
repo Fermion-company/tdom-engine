@@ -156,7 +156,7 @@ async function benchDoc(label, sections) {
 
     res.typing = {};
     for (const [name, tok] of [['prose25', 'LOCUSAAA'], ['mid60', 'LOCUSBBB'], ['tail92', 'LOCUSCCC']]) {
-      res.typing[name] = await typeAt(eng, tok);
+      res.typing[name] = await typeAt(eng, tok, 30);
       console.log(`typing ${name}: first=${res.typing[name].firstMs}ms steady p50=${res.typing[name].p50}ms p95=${res.typing[name].p95}ms max=${res.typing[name].max}ms (typeset p95=${res.typing[name].typesetP95}ms)`);
     }
 

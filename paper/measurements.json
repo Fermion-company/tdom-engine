@@ -1,5 +1,5 @@
 {
-  "date": "2026-08-17T17:23:31.105Z",
+  "date": "2026-08-29T05:16:27.573Z",
   "host": "Apple M5",
   "memGB": 16,
   "docs": [
@@ -7,160 +7,160 @@
       "label": "S",
       "sections": 8,
       "cold": {
-        "ms": 674,
+        "ms": 1118,
         "pages": 4
       },
-      "bootMs": 1378,
+      "bootMs": 1963,
       "blocks": 49,
       "pages": 4,
       "checkpoints": 15,
-      "rssMB": 389,
+      "rssMB": 262,
       "typing": {
         "prose25": {
-          "firstMs": 10.4,
-          "p50": 11.8,
-          "p95": 14.9,
-          "max": 14.9,
-          "typesetP50": 10.3,
-          "typesetP95": 13,
+          "firstMs": 10.3,
+          "p50": 15.7,
+          "p95": 17.3,
+          "max": 20.9,
+          "typesetP50": 12.7,
+          "typesetP95": 13.9,
           "worstBlocks": 3
         },
         "mid60": {
-          "firstMs": 20.3,
-          "p50": 11.6,
-          "p95": 21.8,
-          "max": 21.8,
-          "typesetP50": 10.1,
-          "typesetP95": 19.4,
+          "firstMs": 19.9,
+          "p50": 13.1,
+          "p95": 19.1,
+          "max": 21.7,
+          "typesetP50": 10.4,
+          "typesetP95": 17.3,
           "worstBlocks": 4
         },
         "tail92": {
-          "firstMs": 30.8,
-          "p50": 15.4,
-          "p95": 24.6,
-          "max": 24.6,
-          "typesetP50": 13.4,
-          "typesetP95": 23,
+          "firstMs": 20.2,
+          "p50": 16.6,
+          "p95": 19.5,
+          "max": 19.6,
+          "typesetP50": 13.7,
+          "typesetP95": 17.1,
           "worstBlocks": 5
         }
       },
       "sectionInsert": {
-        "wallMs": 23.5,
+        "wallMs": 43.1,
         "verdict": "counters",
         "blocksTypeset": 4
       },
       "defEdit": {
-        "wallMs": 34.7,
+        "wallMs": 20.6,
         "verdict": "leak",
         "blocksTypeset": 1
       },
-      "rssAfterMB": 1633
+      "rssAfterMB": 364
     },
     {
       "label": "M",
       "sections": 40,
       "cold": {
-        "ms": 779,
+        "ms": 1088,
         "pages": 20
       },
-      "bootMs": 1755,
+      "bootMs": 3127,
       "blocks": 241,
       "pages": 20,
       "checkpoints": 17,
-      "rssMB": 417,
+      "rssMB": 748,
       "typing": {
         "prose25": {
-          "firstMs": 11.1,
-          "p50": 11.6,
-          "p95": 14.1,
-          "max": 14.1,
-          "typesetP50": 9,
-          "typesetP95": 11.2,
+          "firstMs": 13.1,
+          "p50": 10.9,
+          "p95": 15.7,
+          "max": 19,
+          "typesetP50": 8.1,
+          "typesetP95": 12.1,
           "worstBlocks": 3
         },
         "mid60": {
-          "firstMs": 93.8,
-          "p50": 10.4,
-          "p95": 66.7,
-          "max": 66.7,
-          "typesetP50": 8.1,
-          "typesetP95": 64,
+          "firstMs": 92.6,
+          "p50": 13.5,
+          "p95": 21.4,
+          "max": 72.7,
+          "typesetP50": 9.5,
+          "typesetP95": 18.1,
           "worstBlocks": 24
         },
         "tail92": {
-          "firstMs": 29.1,
-          "p50": 12.5,
-          "p95": 23.6,
-          "max": 23.6,
-          "typesetP50": 9.7,
-          "typesetP95": 21.4,
+          "firstMs": 23.9,
+          "p50": 13.9,
+          "p95": 73.6,
+          "max": 173.6,
+          "typesetP50": 9.9,
+          "typesetP95": 69.3,
           "worstBlocks": 7
         }
       },
       "sectionInsert": {
-        "wallMs": 89,
+        "wallMs": 90.1,
         "verdict": "counters",
         "blocksTypeset": 19
       },
       "defEdit": {
-        "wallMs": 42,
+        "wallMs": 41.9,
         "verdict": "leak",
         "blocksTypeset": 1
       },
-      "rssAfterMB": 1468
+      "rssAfterMB": 296
     },
     {
       "label": "L",
       "sections": 60,
       "cold": {
-        "ms": 849,
+        "ms": 962,
         "pages": 30
       },
-      "bootMs": 1992,
+      "bootMs": 3057,
       "blocks": 361,
       "pages": 30,
       "checkpoints": 17,
-      "rssMB": 408,
+      "rssMB": 230,
       "typing": {
         "prose25": {
-          "firstMs": 6.5,
-          "p50": 12.1,
-          "p95": 15.1,
-          "max": 15.1,
-          "typesetP50": 9.1,
-          "typesetP95": 11.6,
+          "firstMs": 17.6,
+          "p50": 18.2,
+          "p95": 27.9,
+          "max": 42.6,
+          "typesetP50": 11.9,
+          "typesetP95": 21.4,
           "worstBlocks": 3
         },
         "mid60": {
-          "firstMs": 122.1,
-          "p50": 11.2,
-          "p95": 85.6,
-          "max": 85.6,
-          "typesetP50": 8.3,
-          "typesetP95": 81.9,
+          "firstMs": 140.8,
+          "p50": 15.2,
+          "p95": 21.5,
+          "max": 108.7,
+          "typesetP50": 10.7,
+          "typesetP95": 15.4,
           "worstBlocks": 36
         },
         "tail92": {
-          "firstMs": 62.6,
-          "p50": 25.2,
-          "p95": 45.3,
-          "max": 45.3,
-          "typesetP50": 23.2,
-          "typesetP95": 42.9,
+          "firstMs": 50.4,
+          "p50": 16.2,
+          "p95": 41.5,
+          "max": 41.9,
+          "typesetP50": 11.3,
+          "typesetP95": 34.8,
           "worstBlocks": 13
         }
       },
       "sectionInsert": {
-        "wallMs": 102,
+        "wallMs": 98.5,
         "verdict": "counters",
         "blocksTypeset": 25
       },
       "defEdit": {
-        "wallMs": 43.6,
+        "wallMs": 35.5,
         "verdict": "leak",
         "blocksTypeset": 1
       },
-      "rssAfterMB": 2159
+      "rssAfterMB": 298
     }
   ]
 }

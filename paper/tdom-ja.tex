@@ -55,7 +55,7 @@ Verified Incremental Typesetting over a Live Document Tree}}
 新規構築状態と一致することの検査を含む4系統の手続きで機械的に確認され、
 一致を保証できない構文は行・ブロック・文書の各粒度で実出力による表示へ退避する。
 評価では、4ページから\nLpages ページの文書に対して定常の打鍵応答が
-p50で12〜\nWorstP\,ms、p95で100\,msを下回り、文書規模にほとんど
+p50で高々\nWorstP\,ms、p95で100\,msを下回り、文書規模にほとんど
 依存しないことを確認した。
 \end{abstract}
 
@@ -83,7 +83,7 @@ content streams and an equivalence test between incrementally maintained and
 freshly built engine states under randomized edits; constructs whose agreement
 cannot be established fall back to display taken from the real output, at line,
 block or document granularity. In our evaluation, steady-state keystroke
-response remains at 12--\nWorstP\,ms (p50) and below 100\,ms (p95) on documents
+response stays at or below \nWorstP\,ms (p50) and below 100\,ms (p95) on documents
 of 4 to \nLpages{} pages, largely independent of document size.
 \end{minipage}
 \end{center}
@@ -492,7 +492,7 @@ PDFのそれと一致する。
     \toprule
     検証 & 内容 & 精度 & 実行\\
     \midrule
-    レイアウトの照合\newline(\code{verify-layout}) & 全行の基線の座標を、本物のPDFの内部命令から直接読み出して突き合わせる & 0.1\,bp & コーパス11文書・CIで必須\\
+    レイアウトの照合\newline(\code{verify-layout}) & 全行の基線の座標を、本物のPDFの内部命令から直接読み出して突き合わせる & 0.1\,bp & コーパス12文書・CIで必須\\
     ページ分割の照合\newline(\code{compare-breaks}) & 本物の出力ルーチンが呼ばれるたびに素材と寸法を書き出し、こちらの組み立てと突き合わせる & 0.02\,bp & 診断時\\
     増分と新規の一致\newline(\code{fuzz}) & ランダムな編集のあと、増分で保った状態と新しく開いた状態を全ブロックで比較する & 完全一致 & CI(種を固定)\\
     増分正本の照合\newline(\code{shipping}) & 出荷し直した各ページの文字が、全文コンパイルの結果と一致する & ページ単位 & CI\\
@@ -525,20 +525,17 @@ PDFのそれと一致する。
 メモリを節約する設定であり、後述のとおり編集位置を移した直後の1打を
 遅くする方向、すなわち本手法にとって不利な側の設定である。正本層と、
 画像を作る処理は、設計上どちらも編集応答に含まれないため(\S\ref{sec:arch})、
-本計測では止めてある。打鍵は文書の25\%、60\%、92\%の3箇所で各12打
+本計測では止めてある。打鍵は文書の25\%、60\%、92\%の3箇所で各30打
 (1文字の挿入)を行い、同期の応答時間の分布を取った。比較の基準としては、
 同じ文書を普通に全文コンパイルした時間(\code{lualatex}を2回)を、
 同じ機械で計測した。計測スクリプトと生データは実装とともに公開している
 \cite{tdomrepo}。以下、p50は中央値、p95は遅い側5\%を除いた値である。
-なお、本節の計測と後述の照合はいずれも、監査スイート(全試験・全文書の
-レイアウト照合・無作為編集の同一性検査)が全通過した時点のリビジョン
-(\code{db3a22c})に対して行った。
 
 \subsection{結果}
 
 \begin{table}[tb]
   \centering\small
-  \caption{文書規模と編集応答(打鍵は1文字の挿入、3箇所$\times$12打の
+  \caption{文書規模と編集応答(打鍵は1文字の挿入、3箇所$\times$30打の
   最悪箇所の値)。「定常」は編集位置が定まったあと(2打目以降)、「初回」は
   編集位置を移した直後の1打目である。全文コンパイルは\code{lualatex}を
   2回実行した実測値。}
@@ -563,9 +560,9 @@ PDFのそれと一致する。
 依存しなかった。規模がSからLへ7倍になっても、p50で\nStypP〜\nLtypP\,ms、
 p95でも最悪\nWorstPP\,msにとどまり、すべての規模と編集位置で、対話的な
 応答の目安とされる100\,ms\cite{card1983}を下回った。これに対して全文
-コンパイルの時間は、この軽い文書群でも規模とともに増えている
-(\nScoldSec 秒から\nLcoldSec 秒)。両者の比は、この下限に近い条件でも
-約\nSpeedup 倍である。実際の文書では全文コンパイルが10〜30秒に達する
+コンパイルは、この最軽量の文書群でも約1秒を要する
+(\nScoldSec〜\nLcoldSec 秒)。両者の比はこの下限に近い条件でも
+約\nSpeedup 倍であり、実際の文書では全文コンパイルが10〜30秒に達する
 \cite{lode2026}ことを思えば、差はさらに大きい。編集のたびに要していた
 時間は、起動時に一度だけ要する時間(Lで\nLbootSec 秒)に置き換えられた。
 
@@ -584,10 +581,11 @@ p95でも最悪\nWorstPP\,msにとどまり、すべての規模と編集位置�
 とどまり、組み直しは背後で収束した。編集の体感を決めるのは平均だけではない
 から、最悪の編集で応答が有界であることには、平均と同等以上の意味がある。
 
-最後に、以上の数値は検証に合格している実装から得られたものである。
-本計測と同じ設定で、数式・フロート・脚注・参照・和文混植・別プロセスで
-組む環境を含む11文書のレイアウト照合は\nFarmLines 行の基線照合で
-\nFarmResult となり、編集経路の不変量を固定した試験は\nHotpath を通過した。
+最後に、本計測と同じ設定で検証系統を実行した。編集経路の不変量を固定した
+試験は\nHotpath を通過した。数式・フロート・脚注・参照・和文混植・
+別プロセスで組む環境を含む12文書のレイアウト照合では、基線\nFarmLines 行が
+一致し、11文書では全行が一致した。残る1文書は本稿の執筆と並行して追加された
+検証用文書であり、乖離が残っている。
 
 \subsection{先行システムとの関係}
 
