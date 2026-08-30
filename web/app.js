@@ -3458,11 +3458,47 @@ function lineColToOffset(text, line, col) {
 
 let zoom = Number(localStorage.getItem('tdom-zoom')) || 1;
 
-function setZoom(z) {
+function findZoomAnchorPage(clientX, clientY) {
+  const direct = pageAtClientPoint({ clientX, clientY });
+  if (direct) return direct;
+  const pages = [...pageDivs.values()].filter((page) => {
+    const rect = page.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  });
+  return pages.reduce((best, page) => {
+    const rect = page.getBoundingClientRect();
+    const dx = clientX < rect.left ? rect.left - clientX : clientX > rect.right ? clientX - rect.right : 0;
+    const dy = clientY < rect.top ? rect.top - clientY : clientY > rect.bottom ? clientY - rect.bottom : 0;
+    const distance = dx * dx + dy * dy;
+    return !best || distance < best.distance ? { page, distance } : best;
+  }, null)?.page ?? null;
+}
+
+function setZoom(z, origin = null) {
+  const anchorPage = origin && Number.isFinite(origin.x) && Number.isFinite(origin.y)
+    ? findZoomAnchorPage(origin.x, origin.y)
+    : null;
+  const anchor = anchorPage && globalThis.TdomViewportMath?.capturePageAnchor({
+    clientX: origin.x,
+    clientY: origin.y,
+    pageRect: anchorPage.getBoundingClientRect(),
+  });
   zoom = Math.min(3, Math.max(0.4, Math.round(z * 100) / 100));
   pagesEl.style.setProperty('--zoom', zoom);
   document.getElementById('zoom-level').textContent = Math.round(zoom * 100) + '%';
   localStorage.setItem('tdom-zoom', String(zoom));
+  if (anchor && anchorPage?.isConnected) {
+    const scroll = globalThis.TdomViewportMath?.calculateAnchoredScroll({
+      scrollLeft: pagesEl.scrollLeft,
+      scrollTop: pagesEl.scrollTop,
+      pageRect: anchorPage.getBoundingClientRect(),
+      anchor,
+    });
+    if (scroll) {
+      pagesEl.scrollLeft = scroll.left;
+      pagesEl.scrollTop = scroll.top;
+    }
+  }
   if (directEditor) requestAnimationFrame(repositionDirectEditor);
 }
 
@@ -3482,7 +3518,7 @@ pagesEl.addEventListener(
     let dy = ev.deltaY;
     if (ev.deltaMode === 1) dy *= 16; // line mode -> approx pixels
     const factor = Math.min(1.25, Math.max(1 / 1.25, Math.exp(-dy * 0.0035)));
-    setZoom(zoom * factor);
+    setZoom(zoom * factor, { x: ev.clientX, y: ev.clientY });
   },
   { passive: false }
 );
