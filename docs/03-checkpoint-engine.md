@@ -132,7 +132,7 @@ foreground verification の現在の初期 budget は、galley divergence 用が
 - raggedbottom / flushbottom の glue distribution。
 - page boundary snapshot による incremental rebuild と page reuse。
 
-二段組、margin note、mid-document geometry change などは `safety.js` 側で structured path から外れる。footnote は扱うが、TeX と同じ page-spanning split を完全再現する実装ではない。
+標準 class option の二段組と本文中の `\onecolumn` / `\twocolumn` は、page builder の結果を表示せず、resident LuaLaTeX の実定義・実列幅による行組みだけを canonical-addressed overlay に使う。列切替時の `\box255` はTeXプリミティブで通常boxへ移してから dormant pageへ戻し、active column mode / width を exit state vector に含める。overlay は編集位置が可視本文 region 内であることと、内部段落なら行数が変わらないことを確認し、TeXのline boxが変化したsuffixだけを物理列上で差し替える。mid-document geometry change と `\balance` は `safety.js` 側で structured path から外れる。margin note は canonical-only block である。footnote は扱うが、TeX と同じ page-spanning split を完全再現する実装ではない。
 
 ## 3.9 exact chunk の経路
 

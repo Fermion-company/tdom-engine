@@ -53,3 +53,17 @@ test('\\maketitle with an argument-like tail stays a normal paragraph start', ()
     '\\maketitle text on the same line\nmore',
   ]);
 });
+
+test('align row spacing does not swallow the following prose', () => {
+  assert.deepEqual(texts('\\begin{align}\na&=b\\\\[2mm]\nc&=d\n\\end{align}\n\nplain tail'), [
+    '\\begin{align}\na&=b\\\\[2mm]\nc&=d\n\\end{align}\n',
+    'plain tail',
+  ]);
+});
+
+test('a real display delimiter still owns internal blank lines', () => {
+  assert.deepEqual(texts('before\\[\nx=1\n\ny=2\n\\]\nafter\n\ntail'), [
+    'before\\[\nx=1\n\ny=2\n\\]\nafter\n',
+    'tail',
+  ]);
+});

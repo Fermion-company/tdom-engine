@@ -1,4 +1,4 @@
-import { braceImbalance, labelDefBody, startsAddvspace } from './util/tex.js';
+import { labelDefBody, startsAddvspace } from './util/tex.js';
 import { trailingGlueSpec } from './util/galley.js';
 import { instrumentEditRegions } from '../edit-regions.js';
 
@@ -82,17 +82,13 @@ export function buildJobBlockBody({
     const volatilePre = ck.vstale && idx > 0 ? volatilePrelude(idx) : '';
     const prelude =
       volatilePre + (defs.length ? `\\makeatletter ${defs.join(' ')}\\makeatother\n` : '') + primer;
-    // Mid-typing safety: an unclosed brace makes a \long macro argument
-    // scan past the injected \par/report tokens to EOF and kills the child
-    // (the old \vbox wrapper stopped it structurally). Auto-close the
-    // imbalance — the source is transiently invalid anyway, and the exact
-    // path resumes on the next balanced keystroke.
     const edit = instrumentEditRegions(block.text);
     // Metadata stays on the source block; only the transient resident job
     // receives the zero-width attribute wrappers.
     block.editRegions = edit.regions;
-    const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
-    body = Buffer.from(prelude + edit.text + guard, 'utf8');
+    // Never invent source tokens here. The lexical closure gate runs before
+    // this function and LuaLaTeX itself certifies the resulting JOB.
+    body = Buffer.from(prelude + edit.text, 'utf8');
     jobId = block.id;
   }
   return { body, jobId, refSnapshot };

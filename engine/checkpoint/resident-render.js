@@ -1,6 +1,5 @@
 import { mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { braceImbalance } from './util/tex.js';
 import { waitForPdf } from './util/fs.js';
 import { cropRenderTargets } from './render-chunks.js';
 
@@ -53,8 +52,7 @@ export async function renderResidentBlock(
     mkdirSync(jobdir, { recursive: true });
     const pdf = path.join(jobdir, 'driver.pdf');
     rmSync(pdf, { force: true });
-    const guard = '}'.repeat(Math.max(0, braceImbalance(block.text)));
-    const body = Buffer.from(block.text + guard, 'utf8');
+    const body = Buffer.from(block.text, 'utf8');
     engine.renderStats ??= { captureHits: 0, captureMisses: 0, retypesets: 0 };
 
     let shippedCapture = false;

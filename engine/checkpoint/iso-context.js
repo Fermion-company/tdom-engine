@@ -54,7 +54,12 @@ export function prepareIsoCompileJob({
   counters.forEach((c, i) => {
     entry[c] = prevVec[i] ?? 0;
   });
-  // tail layout: [...counters, tdom@pd, tdom@nobreak, tdom@ls]
+  const hasColumnState = prevVec.length >= counters.length + 5;
+  if (hasColumnState) {
+    entry['tdom@twocolumn'] = prevVec[counters.length];
+    entry['tdom@columnwidth'] = prevVec[counters.length + 1];
+  }
+  // vector tail: [...counters, twocolumn, columnwidth, pd, nobreak, lastskip]
   const prevPd = idx > 0 && prevVec.length >= 3 ? prevVec[prevVec.length - 3] : -65536000;
   const prevNobreak = idx > 0 && prevVec.length >= 2 ? prevVec[prevVec.length - 2] === 1 : false;
   const bounds = documentBounds(text);

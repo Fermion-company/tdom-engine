@@ -179,6 +179,21 @@ function tdom_boot(port, workdir, counters)
   conn:setoption('tcp-nodelay', true)
   conn:send('HELLO ckpt 0 ' .. fk.getpid() .. '\n')
   texio.write_nl('tdom: daemon resident, checkpoint 0, pid ' .. fk.getpid())
+  -- A recovered TeX error may still reach the injected tdom_report().  That
+  -- output is not a successful preview generation: mark the JOB so the host
+  -- can discard its child checkpoint and keep the previous good galley.
+  if luatexbase and luatexbase.add_to_callback then
+    pcall(luatexbase.add_to_callback, 'show_error_hook', function()
+      if JOB then
+        JOB.had_error = true
+        JOB.error = tostring(status.lasterrorstring or 'unknown')
+      end
+      if os.getenv('TDOM_TRACE_ERRORS') then
+        texio.write_nl('term and log', 'tdom: native error: ' .. tostring(status.lasterrorstring or 'unknown'))
+        texio.write_nl('term and log', tostring(status.lasterrorcontext or ''))
+      end
+    end, 'tdom-closure-certificate')
+  end
 end
 
 function tdom_geo()
@@ -196,6 +211,8 @@ function tdom_geo()
     paperwidth = bp(tex.pagewidth or tex.dimen.paperwidth or 0),
     paperheight = bp(tex.pageheight or tex.dimen.paperheight or 0),
     textwidth = dim('textwidth'),
+    columnwidth = dim('columnwidth'),
+    columnsep = dim('columnsep'),
     textheight = dim('textheight'),
     oddsidemargin = dim('oddsidemargin'),
     topmargin = dim('topmargin'),
@@ -409,6 +426,17 @@ local WHATSIT = node.id('whatsit')
 local INS = node.id('ins')
 local MARK = node.id('mark')
 local MATH = node.id('math')
+local ATTRIBUTE = node.id('attribute')
+
+local EMPTY_RULE_SUBTYPE = nil
+do
+  local ok, subtypes = pcall(node.subtypes, 'rule')
+  if ok and subtypes then
+    for subtype, name in pairs(subtypes) do
+      if name == 'empty' then EMPTY_RULE_SUBTYPE = tonumber(subtype) end
+    end
+  end
+end
 
 local LIT_SUB = node.subtype and node.subtype('pdf_literal')
 local COL_SUB = node.subtype and node.subtype('pdf_colorstack')
@@ -469,6 +497,54 @@ local function curcolor()
   return colstack[#colstack] or '#000000'
 end
 
+-- RuleRunV2 retains the raw LuaTeX evidence that `rule=true` used to erase.
+-- In particular subtype=3 is empty_rule in certified LuaTeX PDF profiles:
+-- it participates in layout but the production backend emits no paint.
+local function rule_attr_signature(n)
+  local parts = {}
+  local a = n and n.attr
+  if a and a.id ~= ATTRIBUTE then a = a.next end -- skip attribute_list head
+  while a and a.id == ATTRIBUTE do
+    parts[#parts + 1] = tostring(a.number or 0) .. ':' .. tostring(a.value or 0)
+    a = a.next
+  end
+  return table.concat(parts, ',')
+end
+
+local function rule_run(n, x, dy, effective_w, effective_h, effective_d, color)
+  return {
+    rule = true,
+    rv = 2,
+    rs = n and (n.subtype or -1) or -1,
+    rw = n and (n.width or 0) or 0,
+    rh = n and (n.height or 0) or 0,
+    rd = n and (n.depth or 0) or 0,
+    ri = n and (n.index or 0) or 0,
+    rl = n and (n.left or 0) or 0,
+    rr = n and (n.right or 0) or 0,
+    rdir = n and (n.dir or '') or '',
+    ra = rule_attr_signature(n),
+    x = x,
+    dy = dy,
+    w = bp(effective_w),
+    h = bp(effective_h) + bp(effective_d),
+    c = color or curcolor(),
+  }
+end
+
+local function resident_backend_profile()
+  return {
+    schema = 2,
+    engine = status.luatex_engine or 'luatex',
+    version = status.luatex_version or 0,
+    revision = tonumber(status.luatex_revision) or 0,
+    outputMode = tex.outputmode or 0,
+    capture = 'resident-post-linebreak',
+    emptyRuleSubtype = EMPTY_RULE_SUBTYPE or -1,
+    format = status.format_id or '',
+  }
+end
+
 -- Emit into `out` flat runs: {f=,s=,dy=,x=,c=,m=,g='utf8 string'}
 -- and rules {rule=true,x=,dy=,w=,h=}. dy is relative to the line baseline
 -- (negative = raised). Runs are split at every kern/glue so the browser does
@@ -493,7 +569,7 @@ local function emit_leader_rule(n, parent, x, dy0, out)
   local d = lead.depth or 0
   if h < -1073741823 then h = 26214 end
   if d < -1073741823 then d = 0 end
-  out[#out + 1] = { rule = true, x = x, dy = dy0 - bp(h), w = bp(w), h = bp(h) + bp(d), c = curcolor() }
+  out[#out + 1] = rule_run(lead, x, dy0 - bp(h), w, h, d, curcolor())
   return true
 end
 
@@ -589,7 +665,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       if w and w < -1073741823 then w = parent and parent.width or 0 end
       if h and h < -1073741823 then h = parent and parent.height or 0 end
       if d and d < -1073741823 then d = parent and parent.depth or 0 end
-      out[#out + 1] = { rule = true, x = x, dy = dy0 - bp(h), w = bp(w), h = bp(h) + bp(d), c = curcolor() }
+      out[#out + 1] = rule_run(n, x, dy0 - bp(h), w, h, d, curcolor())
       x = x + bp(w or 0)
     elseif id == MATH then
       -- inline math on/off marker: the surrounding line must be shown as
@@ -656,7 +732,7 @@ walk_v = function(box, x0, baseline_dy, out, math_mode)
       if h and h < -1073741823 then h = 26214 end
       if d and d < -1073741823 then d = 0 end
       if w and w < -1073741823 then w = box.width end
-      out[#out + 1] = { rule = true, x = x0, dy = y, w = bp(w), h = bp(h) + bp(d), c = curcolor() }
+      out[#out + 1] = rule_run(n, x0, y, w, h, d, curcolor())
       y = y + bp(h) + bp(d)
     elseif id == GLUE then
       y = y + bp(node.effective_glue(n, box) or 0)
@@ -722,7 +798,7 @@ local function extract_items(head, parentBox)
       elseif id == VLIST then
         walk_v(n, bp(n.shift or 0), bp(h), runs)
       else
-        runs[1] = { rule = true, x = 0, dy = -bp(h), w = bp(w), h = bp(h) + bp(d), c = '#000000' }
+        runs[1] = rule_run(n, 0, -bp(h), w, h, d, '#000000')
       end
       local item = { k = 'box', h = bp(h), d = bp(d), w = bp(w), runs = runs }
       if line_x then item.x = 1 end
@@ -919,7 +995,7 @@ function tdom_absorb_reset()
   absorb_fires = 0
 end
 
-function tdom_absorb_output()
+function tdom_absorb_output(boxnum)
   absorb_fires = absorb_fires + 1
   if absorb_fires > 50 then
     texio.write_nl('term and log', 'tdom: output routine fired ' .. absorb_fires ..
@@ -932,7 +1008,7 @@ function tdom_absorb_output()
     local jid = JOB and JOB.id or '?'
     local desc = {}
     local dlen = 0
-    local n = tex.box[255] and tex.box[255].list or nil
+    local n = tex.box[boxnum] and tex.box[boxnum].list or nil
     while n and dlen < 10 do
       dlen = dlen + 1
       local t = node.type(n.id)
@@ -943,12 +1019,12 @@ function tdom_absorb_output()
     texio.write_nl('term and log', 'TDOMTRACE absorb job=' .. jid .. ' pen=' .. pen ..
       ' box255=[' .. table.concat(desc, ' ') .. (n and ' ...' or '') .. ']')
   end
-  local b = tex.box[255]
+  local b = tex.box[boxnum]
   local list = nil
   if b then
     list = b.list
     b.list = nil
-    tex.box[255] = nil -- frees the (now empty) box node
+    tex.box[boxnum] = nil -- frees the (now empty) ordinary box register
   end
   local marker = nil
   if pen > -10002 then
@@ -1064,7 +1140,7 @@ function tdom_hf_flush()
       fonts[tostring(fid)] = { file = f.file, name = f.name, size = f.size, fmt = f.fmt, mth = f.mth }
     end
   end
-  local payload = jenc({ block = '__hf', hf = hf_pages, fonts = fonts })
+  local payload = jenc({ block = '__hf', hf = hf_pages, fonts = fonts, backend = resident_backend_profile() })
   conn:send('GALLEY __hf ' .. #payload .. '\n')
   conn:send(payload)
   fk._exit(0)
@@ -1173,6 +1249,9 @@ function tdom_report()
     state = blk_counters,
     toclines = blk_toclines,
     events = blk_events,
+    closure = JOB.had_error and 'error' or 'native',
+    closure_error = JOB.error,
+    backend = resident_backend_profile(),
   })
   if head and not capture then node.flush_list(head) end
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
@@ -1415,7 +1494,7 @@ function tdom_wait()
         -- checkpoint generation. The parent keeps its own COW copy until
         -- CAPTURE or checkpoint retirement.
         drop_capture()
-        JOB = { id = id, ckpt = newckpt, body = body, capture = capture }
+        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil }
         T_JOB = os.gettimeofday and os.gettimeofday() or os.clock()
         blk_labels = {}
         blk_refs = {}
@@ -1621,6 +1700,14 @@ function inject_job(body, ship)
     -- \if@nobreak (post-heading state) is part of the exit state vector
     lines[#lines + 1] = '\\csname if@nobreak\\endcsname\\directlua{tdom_counter(\'tdom@nobreak\',1)}' ..
       '\\else\\directlua{tdom_counter(\'tdom@nobreak\',0)}\\fi'
+    -- Column mode is ordinary TeX state, not a browser approximation. Keep
+    -- it in the exit vector so a body-level \onecolumn/\twocolumn switch
+    -- invalidates downstream checkpoints and exact-render continuations.
+    lines[#lines + 1] = '\\csname if@twocolumn\\endcsname' ..
+      '\\directlua{tdom_counter(\'tdom@twocolumn\',1)}' ..
+      '\\else\\directlua{tdom_counter(\'tdom@twocolumn\',0)}\\fi'
+    lines[#lines + 1] =
+      '\\directlua{tdom_counter(\'tdom@columnwidth\',\\number\\dimexpr\\columnwidth\\relax)}'
     lines[#lines + 1] = '\\directlua{tdom_report()}'
   end
   tex.print(lines)

@@ -42,12 +42,13 @@ structured mode では `pressure = 'authority'` で、基本 debounce に加え�
 
 - `flowfram`、`eso-pic`、`everypage`、`background`、`xwatermark`、`draftwatermark`、`atbegshi` などの shipout/page paint 系 package。
 - custom `\output`、raw `\shipout`、shipout hook、`\AtBeginDvi`。
-- class option または本文中の `twocolumn`。
-- `\marginpar`、`\marginnote`。
+- 列状態だけでは表現できない独自の出力ルーチン変更。
 - `\newgeometry`、`\enlargethispage`。
 - `\balance`。
 
 `pdfpages` package の読み込み自体は unsafe ではない。実際の `\includepdf` は block-level rescue 対象である。
+
+標準 class option の `twocolumn` と本文中の `\onecolumn` / `\twocolumn` は document-level unsafe ではない。resident LuaLaTeX はこれらの実定義を実行し、TeXプリミティブで出力箱を吸収して、active column mode と実 `\columnwidth` を各 checkpoint に保存する。表示面は canonical PDF のまま、TeXの edit-region scanner が可視本文と証明した変更だけを SyncTeX で物理ページ・物理列へ重ねる。同じ段落に装飾コマンドやコメントがあっても、内部段落は行数不変かつ先行行同一なら変更行以降を差し替え、terminal block は同じ証明の下で1行だけ増える場合も扱う。それ以外の再改行、未確定構文、数式、graphics、副作用を伴う block は last-good PDF を保持して real output shipping または次の canonical に任せる。`\marginpar` / `\marginnote` は本文 galley を保持する canonical-only block である。
 
 ## 8.5 block-level rescue
 

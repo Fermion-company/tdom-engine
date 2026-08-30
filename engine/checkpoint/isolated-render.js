@@ -81,8 +81,13 @@ export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, as
     engine.counters.forEach((c, i) => {
       entry[c] = prevVec[i] ?? 0;
     });
+    const hasColumnState = prevVec.length >= engine.counters.length + 5;
+    if (hasColumnState) {
+      entry['tdom@twocolumn'] = prevVec[engine.counters.length];
+      entry['tdom@columnwidth'] = prevVec[engine.counters.length + 1];
+    }
     // cross-block layout state from the previous block's REAL exit vector:
-    // [..counters.., tdom@pd, tdom@nobreak, tdom@ls] — prevdepth reproduces
+    // [..counters.., twocolumn, columnwidth, pd, nobreak, lastskip] — prevdepth reproduces
     // the exact leading interline glue, @nobreak the post-heading \everypar
     const prevPd = idx > 0 && prevVec.length >= 3 ? prevVec[prevVec.length - 3] : -65536000;
     const prevNobreak = idx > 0 && prevVec.length >= 2 ? prevVec[prevVec.length - 2] === 1 : false;

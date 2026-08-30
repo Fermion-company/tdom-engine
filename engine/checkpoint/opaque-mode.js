@@ -6,7 +6,7 @@ export function opaqueUpdate(engine, editLabel, t, reasons, { teardownTree, ship
   const text = engine.store.get(engine.file);
   // Opaque mode changes how pages are painted, not whether the source is
   // editable.  Populate the same conservative source regions without
-  // booting the resident TeX tree so canonical-only/twocolumn documents can
+  // booting the resident TeX tree so canonical-only documents can
   // still be edited through SyncTeX hit geometry.
   for (const block of engine.blocks) {
     block.editRegions = instrumentEditRegions(block.text).regions;
@@ -36,6 +36,8 @@ export function opaqueUpdate(engine, editLabel, t, reasons, { teardownTree, ship
     backendName: engine.backendName,
     mode: engine.mode,
     modeReasons: engine.modeReasons,
+    previewPolicy: engine.previewPolicy,
+    previewReasons: engine.previewReasons,
     canonical: engine.canonical.info(),
     fonts: engine.getFontManifest(),
     timerStats: t.done(),

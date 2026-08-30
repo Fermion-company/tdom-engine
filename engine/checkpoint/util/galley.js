@@ -48,7 +48,8 @@ function trailingGlueSpec(galley, widthSp) {
   };
 }
 
-// stateVec layout: [...counters, tdom@pd, tdom@nobreak, tdom@ls]
+// stateVec layout:
+// [...counters, tdom@twocolumn, tdom@columnwidth, tdom@pd, tdom@nobreak, tdom@ls]
 function vecCountersEqual(aJson, bJson) {
   const a = parseVec(aJson);
   const b = parseVec(bJson);

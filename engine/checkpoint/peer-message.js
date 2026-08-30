@@ -58,6 +58,10 @@ export function handlePeerMessage(engine, peer, msg) {
       // reach process.kill() on timeout, and kill(-1) signals EVERYTHING
       // the user owns
       if (!Number.isFinite(msg.pid) || msg.pid <= 0) break;
+      if (engine.cancelledJobIds?.delete(msg.id)) {
+        try { process.kill(msg.pid, 'SIGKILL'); } catch { /* already gone */ }
+        break;
+      }
       if (engine.currentJob && engine.currentJob.galleyKey === 'galley:' + msg.id) {
         engine.currentJob.pid = msg.pid;
       }

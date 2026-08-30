@@ -14,6 +14,10 @@ const MARGIN_RE = /\\(?:marginpar|marginnote|todo)\b/;
 // whole block must come from TeX-derived pixels.
 const EXTERNAL_GRAPHICS_RE = /\\includegraphics\*?\b/;
 
+export function sourceRequiresCanonicalOnly(text) {
+  return MARGIN_RE.test(stripComments(text));
+}
+
 /**
  * Visual fidelity gate, applied per adopted galley: classify every line
  * (safe-glyph vs exact-preview-required), merge any sticky verification
@@ -34,7 +38,7 @@ export function applyFidelity(block, galley, { fonts, fidelityDemoted }) {
   // this band, so the canonical page (margin note included) shows
   // through. This is what keeps \todo-bearing paper drafts structured
   // instead of demoting the whole document.
-  if (MARGIN_RE.test(stripComments(block.text))) {
+  if (sourceRequiresCanonicalOnly(block.text)) {
     // comment-stripped: a `% \todo{...}` must not blank the block's band
     fid = demoteFidelity(fid, 'canonical');
   }

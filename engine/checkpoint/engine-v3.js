@@ -13,11 +13,15 @@
 //
 // A safety gate (safety.js) decides whether a document may use the
 // structured layer at all; anything page-mechanism-hostile (shipout hooks,
-// twocolumn, marginpar …), any boot/typeset failure, and any verification
+// custom output/geometry changes …), any boot/typeset failure, and any verification
 // mismatch demotes to the opaque path: the display becomes the canonical
 // LuaLaTeX pages themselves, still editable, still incremental at the
 // source level. Unknown constructs are not failures — they are opaque
 // nodes rendered from LuaLaTeX's own output.
+// Standard class-option and body-switched twocolumn are the deliberate
+// middle policy: the resident tree executes the real LaTeX column macros
+// and measures with their active width, while physical pages remain
+// canonical and only SyncTeX-proven plain-text tail lines overlay them.
 //
 // The provisional machinery: a single resident lualatex process tree holds
 // the document. Every block
@@ -51,6 +55,7 @@ import { closeEngine } from './lifecycle.js';
 import { resetOpenState } from './open-state.js';
 import { initializeEngineState } from './constructor-state.js';
 import { awaitWaiter, fulfillWaiter, rejectWaiter } from './waiters.js';
+import { abortBackgroundJob } from './abort-background-job.js';
 import { Timer } from './timer.js';
 import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
@@ -65,14 +70,16 @@ import {
   registerFont,
   demoteFontFamily as demoteRegisteredFontFamily,
 } from './font-registry.js';
-import { applyFidelity } from './fidelity-gate.js';
+import { applyFidelity, sourceRequiresCanonicalOnly } from './fidelity-gate.js';
 import { indexBlock, unindexBlock } from './block-index.js';
 import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
 import { brokenBlockGalley as brokenBlockGalleyHelper } from './broken-galley.js';
+import { sourceClosure } from './closure.js';
 import { mayCaptureDisplayMath, mayNeedRender, releaseRenderHold } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
 import { preemptResidentRenders, queueRender as queueRenderHelper } from './render-pump.js';
+import { shippingPriorityQuietMs } from './interactive-priority.js';
 import { queueMovedOffsets as queueMovedOffsetsHelper } from './rescue-offsets.js';
 import { isPathInside } from '../project-inputs.js';
 import { instrumentEditRegions } from '../edit-regions.js';
@@ -84,6 +91,7 @@ import { runUpdateTypesetPhase } from './update-typeset-phase.js';
 import { prepareUpdate } from './update-prepare.js';
 import { finalizeUpdate } from './update-finalize.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
+import { buildClosureDeferredResponse } from './update-response.js';
 import {
   onCanonicalResult as onCanonicalResultHelper,
   cropCanonicalChunks as cropCanonicalChunksHelper,
@@ -91,7 +99,7 @@ import {
 } from './canonical-arrival.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
 import { adoptGalleyBlock } from './galley-adoption.js';
-import { checkpointGrid, nearestCheckpoint } from './checkpoint-selection.js';
+import { checkpointKeepSet, nearestCheckpoint } from './checkpoint-selection.js';
 import { reapDyingPids } from './dying-pids.js';
 import {
   enforceCheckpointCap as enforceCheckpointCapHelper,
@@ -129,7 +137,7 @@ const BOOT_TIMEOUT = 60_000;
 // preservation and take the conservative path: serial re-typeset of the
 // suffix, off the hot path.
 const DEF_RE =
-  /\\(def|edef|gdef|xdef|newcommand|renewcommand|providecommand|DeclareRobustCommand|DeclareMathOperator|let|futurelet|newenvironment|renewenvironment|newcounter|newtheorem|newlength|newsavebox|setlength|addtolength|makeatletter|catcode|pagestyle)\b/;
+  /\\(def|edef|gdef|xdef|newcommand|renewcommand|providecommand|DeclareRobustCommand|DeclareMathOperator|let|futurelet|newenvironment|renewenvironment|newcounter|newtheorem|newlength|newsavebox|setlength|addtolength|makeatletter|catcode|pagestyle|onecolumn|twocolumn)\b/;
 
 export class CheckpointEngine {
   constructor({ workDir, docDir, overlayDir = null }) {
@@ -172,10 +180,7 @@ export class CheckpointEngine {
     if (!force && nextDir === this.docDir && nextOverlay === this.overlayDir) return false;
     this.bgAbort = true;
     if (this.bgActive) {
-      const pid = this.currentJob?.pid;
-      if (pid && pid > 0) {
-        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
-      }
+      abortBackgroundJob(this, 'background pass pre-empted by a document switch');
     }
     await this.bgTask.catch(() => {});
     return this.#locked(async () => {
@@ -206,6 +211,101 @@ export class CheckpointEngine {
     const editLabel = `${file}:${p1.line}:${p1.column}-${p2.line}:${p2.column}`;
     this.store.applyEdit(file, start, end, replacement);
     return this.#update({ editLabel });
+  }
+
+  /**
+   * Materialize and pin the checkpoint immediately before/after the source
+   * block under the editor caret. This runs on the same preemptible background
+   * chain as other resident maintenance: a real edit kills it immediately,
+   * and stale source revisions can never publish state. The endpoint returns
+   * its promise to tests, while the app deliberately schedules it fire-and-
+   * forget during cursor idle time.
+   */
+  async warmEditOffset(offset) {
+    const numericOffset = Math.max(0, Math.min(this.getSource().length, Math.floor(Number(offset))));
+    if (!Number.isFinite(numericOffset) || !this.blocks.length || this.closed) {
+      return { status: 'rejected', reason: 'invalid-offset' };
+    }
+    const request = ++this.warmSeq;
+    const sourceRev = this.srcRev;
+    const target = this.blocks.findIndex((block, index) => {
+      const start = Number(block.start);
+      const end = Number(block.end);
+      if (Number.isFinite(start) && Number.isFinite(end) && numericOffset >= start && numericOffset <= end) {
+        return true;
+      }
+      return index === this.blocks.length - 1 && numericOffset >= end;
+    });
+    if (target < 0) return { status: 'rejected', reason: 'outside-body' };
+
+    this.warmInfo = { status: 'scheduled', sourceRev, target, offset: numericOffset };
+    // Cursor movement outranks background rescue/settle work, but never an
+    // edit. Reuse the established abort path so a deep LuaTeX-ja job cannot
+    // hold the foreground lock until its timeout.
+    this.bgAbort = true;
+    abortBackgroundJob(this, 'background pass pre-empted by edit-locus warming');
+    await this.bgTask.catch(() => {});
+    if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev) {
+      return { status: 'superseded', sourceRev, target };
+    }
+    this.bgAbort = false;
+    const startedAt = performance.now();
+    const run = this.#locked(async () => {
+      if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev) {
+        return { status: 'superseded', sourceRev, target };
+      }
+      this.warmInfo = { status: 'running', sourceRev, target, offset: numericOffset };
+      // Pin before walking: #jobBlock retires off-grid parents as soon as a
+      // successor exists, so a late pin would lose the exact boundary we are
+      // warming for the first keystroke.
+      this.editHold = [...new Set([target, target + 1, ...this.editHold])]
+        .filter((idx) => idx >= 0 && idx <= this.blocks.length)
+        .slice(0, 8);
+      if (this.checkpoints.has(target) && this.checkpoints.has(target + 1)) {
+        this.#enforceCheckpointCap();
+        const ready = {
+          status: 'ready',
+          sourceRev,
+          target,
+          from: target,
+          replayed: 0,
+          ms: performance.now() - startedAt,
+        };
+        this.warmInfo = ready;
+        return ready;
+      }
+      const from = this.#nearestCheckpoint(target);
+      let changed = false;
+      this.bgActive = true;
+      let replayed;
+      try {
+        replayed = await this.#retypesetChain(
+          from,
+          target,
+          (_idx, blockChanged) => { changed ||= blockChanged; },
+          () => this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev
+        );
+      } finally {
+        this.bgActive = false;
+      }
+      if (replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev) {
+        return { status: 'superseded', sourceRev, target };
+      }
+      this.#enforceCheckpointCap();
+      if (changed) this.#asyncRepaginate();
+      const result = {
+        status: this.checkpoints.has(target) && this.checkpoints.has(target + 1) ? 'ready' : 'incomplete',
+        sourceRev,
+        target,
+        from,
+        replayed,
+        ms: performance.now() - startedAt,
+      };
+      this.warmInfo = result;
+      return result;
+    });
+    this.bgTask = run.then(() => {}, () => {});
+    return run;
   }
 
   async close() {
@@ -243,6 +343,8 @@ export class CheckpointEngine {
       backendName: this.backendName,
       mode: this.mode,
       modeReasons: this.modeReasons,
+      previewPolicy: this.previewPolicy,
+      previewReasons: this.previewReasons,
       canonicalInfo: this.canonical.info(),
       pages: this.pages,
       checkpoints: this.checkpoints,
@@ -333,6 +435,7 @@ export class CheckpointEngine {
 
   async #jobBlock(idx, override = null) {
     const block = this.blocks[idx];
+    const jobStarted = performance.now();
     const ck = this.checkpoints.get(idx);
     if (!ck) throw new Error(`no checkpoint at ${idx} for block ${block.id}`);
     await this.#reapDying(); // bound the live-fork set before minting ckpt idx+1
@@ -373,6 +476,21 @@ export class CheckpointEngine {
       ck.send(`JOB ${jobId} ${idx + 1} ${body.length} ${capture}\n`);
       ck.sendRaw(body);
       const [galley] = await Promise.all([galleyP, ckptP]);
+      if (!override && block.nativeClosureRequired !== false && galley.closure === 'error') {
+        const bad = this.checkpoints.get(idx + 1);
+        if (bad) {
+          try { bad.send('DIE\n'); } catch { /* peer gone */ }
+          if (bad.pid) this.dyingPids.add(bad.pid);
+          this.checkpoints.delete(idx + 1);
+        }
+        const err = new Error(
+          `LuaLaTeX reported an error while typesetting ${block.id}` +
+            (galley.closure_error ? `: ${galley.closure_error}` : '')
+        );
+        if (process.env.TDOM_TRACE_ERRORS) console.error(`[tdom-error] ${err.message}`);
+        err.tdomClosure = true;
+        throw err;
+      }
       if (refSnapshot) {
         galley.tdomRefVals = refSnapshot;
         // Source scanning covers the wider citation/reference families
@@ -383,6 +501,7 @@ export class CheckpointEngine {
         // earlier consumer in the same incremental pass.
         galley.refs = [...new Set([...(galley.refs ?? []), ...Object.keys(refSnapshot)])];
       }
+      this.#recordTypesetCost(block, performance.now() - jobStarted);
       this.#retireOffGrid(idx);
       return galley;
     } catch (err) {
@@ -414,14 +533,26 @@ export class CheckpointEngine {
   }
 
   async #typesetBlock(idx) {
-    return typesetBlockHelper(this, idx, {
-      needsRescue: (text) => this.#needsRescue(text),
-      rescueBlock: (blockIdx, why) => this.#rescueBlock(blockIdx, why),
-      brokenBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx),
-      jobBlock: (blockIdx) => this.#jobBlock(blockIdx),
-      rescueCacheKey: (block, blockIdx) => this.#rescueCacheKey(block, blockIdx),
-      pumpRescues: () => this.#pumpRescues(),
-    });
+    const block = this.blocks[idx];
+    const started = performance.now();
+    try {
+      return await typesetBlockHelper(this, idx, {
+        needsRescue: (text) => this.#needsRescue(text),
+        rescueBlock: (blockIdx, why) => this.#rescueBlock(blockIdx, why),
+        brokenBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx),
+        deferredBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx, false, true),
+        jobBlock: (blockIdx) => this.#jobBlock(blockIdx),
+        rescueCacheKey: (targetBlock, blockIdx) => this.#rescueCacheKey(targetBlock, blockIdx),
+        pumpRescues: () => this.#pumpRescues(),
+        sourceClosure,
+        sourceRequiresCanonicalOnly,
+      });
+    } finally {
+      // Session-high-water cost is intentional: a later rescue-cache hit
+      // must not make the scheduler forget the expensive cold replay that a
+      // distant edit would pay again after checkpoint retirement.
+      this.#recordTypesetCost(block, performance.now() - started);
+    }
   }
 
   /** Freeze a doubly-failed block: last good galley when one exists, an
@@ -435,8 +566,8 @@ export class CheckpointEngine {
    * source (emergency stop), so there is no ground truth to converge on;
    * the incremental==scratch equation only applies to compilable sources.
    * tdomFrozen marks both shapes so referees (fuzz) can scope the equation. */
-  async #brokenBlockGalley(idx, frozen = true) {
-    return brokenBlockGalleyHelper(this, idx, frozen, {
+  async #brokenBlockGalley(idx, frozen = true, deferred = false) {
+    return brokenBlockGalleyHelper(this, idx, frozen, deferred, {
       jobBlock: (i, override) => this.#jobBlock(i, override),
       stateJobBody: (iso) => this.#stateJobBody(iso),
     });
@@ -552,11 +683,34 @@ export class CheckpointEngine {
     });
   }
 
-  // Sparse checkpoints: for large documents only every grid-th boundary
-  // stays resident. Edits resume from the nearest kept snapshot and simply
-  // retypeset a few extra clean blocks (~3ms each).
-  #ckptGrid() {
-    return checkpointGrid(this.blocks.length, this.maxCheckpoints);
+  // Sparse checkpoints: retain both sides of measured expensive blocks,
+  // then fill the remaining budget at weighted document quantiles. Edits
+  // resume from the nearest kept snapshot without replaying an unrelated
+  // giant TikZ/user-macro block merely because it fell between grid points.
+  #recordTypesetCost(block, elapsedMs) {
+    if (!block || !Number.isFinite(elapsedMs)) return;
+    const previous = Number(block.typesetCostMs) || 0;
+    if (elapsedMs <= previous) return;
+    block.typesetCostMs = elapsedMs;
+    // Avoid an O(blocks log blocks) sort after every cheap JOB in a long
+    // boot. Refresh only when this measurement can materially enter the hot
+    // set; the first few samples establish its floor, then a 1.5x hysteresis
+    // prevents near-equal costs from churning the plan.
+    if (!this.checkpointKeepCache || elapsedMs > this.checkpointHotFloorMs * 1.5) {
+      this.#checkpointKeepSet(true);
+    }
+  }
+
+  #checkpointKeepSet(refresh = false) {
+    if (!refresh && this.checkpointKeepCache) return this.checkpointKeepCache;
+    this.checkpointKeepCache = checkpointKeepSet(this.blocks, this.maxCheckpoints);
+    const hotCount = Math.max(1, Math.ceil(Math.max(0, this.maxCheckpoints - 2) / 2));
+    const topCosts = this.blocks
+      .map((block) => Math.max(0.1, Number(block.typesetCostMs) || 1))
+      .sort((a, b) => b - a)
+      .slice(0, hotCount);
+    this.checkpointHotFloorMs = Math.max(0.1, topCosts.at(-1) ?? 1);
+    return this.checkpointKeepCache;
   }
 
   /**
@@ -568,14 +722,14 @@ export class CheckpointEngine {
    * the boot rescue pump churns 55 blocks). Each checkpoint is a resident
    * lualatex holding its accumulated dormant page, so this is real memory.
    *
-   * Collapse to the grid: keep checkpoint 0, every grid-aligned boundary,
-   * and the edit-locus / render pins; DIE the rest. Idempotent — safe to
-   * call after any checkpoint-creating pass.
+   * Collapse to the measured-cost skeleton: keep checkpoint 0, the selected
+   * hot/coverage boundaries and the edit-locus / render pins; DIE the rest.
+   * Idempotent — safe to call after any checkpoint-creating pass.
    */
   #enforceCheckpointCap() {
     enforceCheckpointCapHelper({
       checkpoints: this.checkpoints,
-      grid: this.#ckptGrid(),
+      keep: this.#checkpointKeepSet(),
       editHold: this.editHold,
       renderHold: this.renderHold,
       dyingPids: this.dyingPids,
@@ -585,7 +739,7 @@ export class CheckpointEngine {
   #retireOffGrid(idx) {
     retireOffGridHelper({
       idx,
-      grid: this.#ckptGrid(),
+      keep: this.#checkpointKeepSet(),
       checkpoints: this.checkpoints,
       editHold: this.editHold,
       renderHold: this.renderHold,
@@ -614,7 +768,7 @@ export class CheckpointEngine {
   }
 
   /** A held checkpoint has served its render (or the hold went stale):
-   * resume normal grid retirement. */
+   * resume normal measured-skeleton retirement. */
   #releaseRenderHold(idx) {
     if (!releaseRenderHold(this.renderHold, idx)) return;
     this.#retireOffGrid(idx);
@@ -749,6 +903,11 @@ export class CheckpointEngine {
       this.onDocumentResetPending?.(event);
     };
     this.lastEditAt = Date.now(); // pauses the idle-gated isolated renders
+    const foregroundLeaseMs = shippingPriorityQuietMs(this, 0);
+    this.foregroundLeaseMs = foregroundLeaseMs;
+    this.authorityDeferred = foregroundLeaseMs > 0
+      ? this.canonical.deferAuthority(foregroundLeaseMs)
+      : false;
     // Stop the in-flight background chain rebuild BEFORE taking the chain
     // lock (it holds the lock while running; aborting it first avoids a
     // lock-order deadlock). With stale-first rescues the background task
@@ -759,13 +918,7 @@ export class CheckpointEngine {
     // is not an abort there: kill the in-flight background job outright
     // (#typesetBlock sees bgAbort and neither poisons the block nor runs
     // its follow-up jobs — the next rebuild simply retries it).
-    this.bgAbort = true;
-    if (this.bgActive) {
-      const pid = this.currentJob?.pid;
-      if (pid && pid > 0) {
-        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
-      }
-    }
+    abortBackgroundJob(this);
     await this.bgTask.catch(() => {});
     try {
       const report = await this.#locked(async () => {
@@ -796,8 +949,30 @@ export class CheckpointEngine {
       editLabel,
       timer: t,
       callbacks: {
+        deferClosureUpdate: (label, timer, closure) => {
+          this.rev++;
+          this.srcRev++;
+          return buildClosureDeferredResponse({
+            rev: this.rev,
+            srcRev: this.srcRev,
+            editLabel: label,
+            backendName: this.backendName,
+            mode: this.mode,
+            modeReasons: this.modeReasons,
+            previewPolicy: this.previewPolicy,
+            previewReasons: this.previewReasons,
+            canonical: this.canonical.info(),
+            fonts: this.getFontManifest(),
+            blocks: this.blocks,
+            pages: this.pages,
+            checkpoints: this.checkpoints,
+            timerStats: timer.done(),
+            closure,
+            diagnostics: this.diagnostics,
+          });
+        },
         opaqueUpdate: (label, timer, reasons) => {
-          if (this.mode !== 'opaque') {
+          if (this.mode !== 'opaque' && this.previewPolicy === 'structured') {
             announceDocumentReset?.({
               reason: 'engine-opaque-transition',
               editLabel: label,
@@ -819,7 +994,7 @@ export class CheckpointEngine {
           // location during an ordinary title/preamble compile. Structured
           // mode still needs the host reset gate because its resident DOM is
           // the visible surface being destroyed here.
-          if (this.mode !== 'opaque') {
+          if (this.mode !== 'opaque' && this.previewPolicy === 'structured') {
             announceDocumentReset?.({
               reason: retry ? 'engine-retry-reboot' : 'engine-preamble-reboot',
               editLabel,
@@ -980,6 +1155,27 @@ export class CheckpointEngine {
       cropCanonicalChunks: (canonicalInfo) => this.#cropCanonicalChunks(canonicalInfo),
       teardownTree: () => this.#teardownTree(),
     });
+    // Canonical convergence supplies the exact checkpoint authority whenever
+    // the current lineage cannot represent the source (initial boot,
+    // structural edit, divergence, or failed chain). A healthy plain-edit
+    // lineage already started from a production aux fixpoint and has replayed
+    // the same TeX route; replacing it after every canonical arrival creates
+    // a needless availability gap during continuous typing.
+    if (!info?.error && info.rev === this.srcRev) {
+      const source = this.store.get(this.file);
+      const generation = this.canonical.sourceMatches(source) ? this.canonical.last : null;
+      const needsBaseline = this.shipBootedFor === null ||
+        !this.shipping?.info?.().baselineReady ||
+        this.shipStale || !!this.shipping?.err ||
+        this.shipping?.source !== source;
+      if (needsBaseline && generation?.id === info.id && generation.seedFiles &&
+          this.shipDesiredCanonicalId !== generation.id) {
+        this.shipDesiredCanonicalId = generation.id;
+        this.shipDesiredCanonicalHash = generation.pdfHash ?? null;
+        this.shipBootedFor = null;
+        this.#queueShipBoot();
+      }
+    }
   }
 
   async #cropCanonicalChunks(info) {
@@ -1036,7 +1232,10 @@ export class CheckpointEngine {
     // supersedes the previous compile anyway — wait for a short pause so
     // bursts cost ONE compile instead of one per keystroke, and the
     // resident fork jobs keep the CPU while the user is typing
-    while (!this.closed && Date.now() - (this.lastEditAt ?? 0) < 800) {
+    while (
+      !this.closed &&
+      Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800)
+    ) {
       await new Promise((r) => setTimeout(r, 200));
     }
     if (this.closed) return;

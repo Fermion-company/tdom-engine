@@ -1,9 +1,33 @@
 import { makeChunkMap } from './constructor-state.js';
 
 export function resetOpenState(engine, text, file) {
+  engine.shipDocumentEpoch = (engine.shipDocumentEpoch ?? 0) + 1;
+  if (engine.shipRetry) {
+    Object.assign(engine.shipRetry, {
+      state: 'idle',
+      activeAttemptId: null,
+      activeChainId: null,
+      consecutiveFailures: 0,
+      lastOutcome: 'document-reset',
+      lastFailureClass: null,
+      lastFailureFingerprint: null,
+      cooldownUntil: 0,
+      lastCertifiedSnapshot: null,
+      desiredSnapshot: null,
+      recoveryReason: 'document-reset',
+    });
+  }
+  engine.shipBootTries = 0;
+  engine.shipBootedFor = null;
+  engine.shipDesiredCanonicalId = null;
+  engine.shipDesiredCanonicalHash = null;
+  engine.shipStale = false;
+  engine.shipDisabledFor = null;
   engine.file = file;
   engine.store.open(file, text);
   engine.blocks = [];
+  engine.checkpointKeepCache = null;
+  engine.checkpointHotFloorMs = 1;
   engine.labelTable = new Map();
   engine.hrefTable = new Map();
   engine.blockLabelIdx = new Map();
@@ -16,6 +40,8 @@ export function resetOpenState(engine, text, file) {
   // a fresh document gets a fresh chance at the structured layer
   engine.mode = 'structured';
   engine.modeReasons = [];
+  engine.previewPolicy = 'structured';
+  engine.previewReasons = [];
   engine.opaqueStickyPre = null;
   engine.verifyState = null;
   engine.pendingChain = null;

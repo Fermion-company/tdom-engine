@@ -1,5 +1,6 @@
 import { fnv1a } from '../hash.js';
 import { remapText } from './mathmap.js';
+import { classifyResidentRun } from './run-semantics.js';
 import { r2 } from './util/svg.js';
 
 // Half a bp is smaller than one device pixel at common preview zoom levels,
@@ -69,7 +70,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       const clip0 = c.yOff;
       const clip1 = c.yOff + u.h + (u.d ?? 0);
       const unitRuns = u.ln.editRuns ?? u.ln.runs ?? [];
-      const unitInk = unitRuns.some((run) => !run.rule && !!run.t);
+      const unitInk = unitRuns.some((run) => runPaintsInk(run, u.ln.backend));
       const unitExtent = Math.max(0, (u.h ?? 0) + (u.d ?? 0));
       if (gfxOpen && gfxOpen.blockId === c.blockId && Math.abs(gfxOpen.top - chunkTop) < 0.05) {
         gfxOpen.clip1 = Math.max(gfxOpen.clip1, clip1);
@@ -114,7 +115,12 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       sourceHitCommand(commands, L, baseline, u, u.blockId, geo.textwidth, fonts);
       continue;
     }
-    runCommands(commands, u.ln.runs, L, baseline, u.blockId, { fonts, twinMetrics, line: u.li });
+    runCommands(commands, u.ln.runs, L, baseline, u.blockId, {
+      fonts,
+      twinMetrics,
+      line: u.li,
+      backend: u.ln.backend,
+    });
   }
   flushGfx();
   // Header / footer: TeX-typeset boxes from the page-style job (the exact
@@ -149,13 +155,14 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
 
 /** Paint one run list (glyphs + rules) at a baseline — shared by body
  * units and the TeX-typeset header/footer boxes. */
-function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, line }) {
+function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, line, backend = null }) {
   for (const r of runs ?? []) {
     if (r.rule) {
-      // TeX uses zero-width/zero-height rules as invisible struts and
-      // anchors (luatexja emits many of them around CJK glyphs). They
-      // affect box metrics but paint no ink. Sending them to SVG made the
-      // browser's minimum rect width turn them into stray vertical hairs.
+      // Geometry is not a paint oracle: a normal zero-area PDF rule may be a
+      // visible device hairline. Only a backend-certified empty_rule is
+      // omitted. Fidelity has already routed unknown or zero-area normal
+      // rules to an exact TeX chunk, so this renderer remains fail-closed.
+      if (classifyResidentRun(r, backend).tag === 'LayoutOnly') continue;
       if (!(r.w > 0) || !(r.h > 0)) continue;
       commands.push({
         op: 'rule',
@@ -203,6 +210,12 @@ function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, lin
       });
     }
   }
+}
+
+function runPaintsInk(run, backend) {
+  if (!run?.rule) return !!run?.t;
+  const semantics = classifyResidentRun(run, backend);
+  return semantics.tag !== 'LayoutOnly' && Number(run.w) > 0 && Number(run.h) > 0;
 }
 
 function sourceHitCommand(commands, X, baseline, unit, src, fallbackWidth = 1, fonts = new Map()) {

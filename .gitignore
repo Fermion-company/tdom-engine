@@ -12,3 +12,4 @@ samples/bench-long.tex
 samples/uploads/
 .tdom-hotpath-test*/
 .tdom-ship-test*/
+.tdom-infra-test/

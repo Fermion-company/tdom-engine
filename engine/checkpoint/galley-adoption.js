@@ -29,10 +29,13 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
   } else {
     block.rescued = false;
   }
-  // exit state = tracked counters + cross-block layout state (prevdepth,
-  // \if@nobreak) — any change forces the convergence chain onward
+  // exit state = tracked counters + active column layout + cross-block
+  // paragraph state. Column fields deliberately sit BEFORE the final three
+  // locals so existing tail readers keep their stable offsets.
   block.stateVec = JSON.stringify([
     ...counters.map((c) => galley.state?.[c] ?? 0),
+    galley.state?.['tdom@twocolumn'] ?? 0,
+    galley.state?.['tdom@columnwidth'] ?? 0,
     galley.state?.['tdom@pd'] ?? 0,
     galley.state?.['tdom@nobreak'] ?? 0,
     galley.state?.['tdom@ls'] ?? 0,

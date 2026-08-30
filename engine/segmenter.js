@@ -114,8 +114,13 @@ export function segmentBody(text, baseOffset) {
     envDepth += countMatches(stripped, /\\begin\{[^}]*\}/g);
     envDepth -= countMatches(stripped, /\\end\{[^}]*\}/g);
     if (envDepth < 0) envDepth = 0;
-    if (/\\\[/.test(stripped)) inDisplay = true;
-    if (/\\\]/.test(stripped)) inDisplay = false;
+    // `\\[2mm]` in align/tabular is a row break with optional spacing, not
+    // the display opener `\[`.  A substring regex sees the second slash of
+    // `\\[` and poisons inDisplay for the whole remaining document, merging
+    // every later paragraph into the exact-render block.  TeX reads a bracket
+    // as the control symbol only after an odd run of backslashes.
+    if (hasControlSymbol(stripped, '[')) inDisplay = true;
+    if (hasControlSymbol(stripped, ']')) inDisplay = false;
     braceDepth += braceDelta(stripped);
     if (braceDepth < 0) braceDepth = 0;
     // NOTE: an environment/display CLOSING no longer ends the block — text
@@ -203,6 +208,10 @@ export function diffBlocks(oldBlocks, segs, nextId) {
         layout: ob.layout,
         layoutKey: ob.layoutKey,
         galley: ob.galley,
+        // One-generation proof input for canonical-addressed wrapped prose:
+        // the planner may overlay only the final visual line when every
+        // earlier LuaLaTeX line is byte-identical across the edit.
+        previousGalley: ob.galley,
         galleyHash: ob.galleyHash,
         stateVec: ob.stateVec,
         units: ob.units,
@@ -220,6 +229,7 @@ export function diffBlocks(oldBlocks, segs, nextId) {
         includeEnd: !!sg.includeEnd,
         externalGraphics: !!sg.externalGraphics,
         sourceChanged: true,
+        typesetCostMs: ob.typesetCostMs,
       };
       blocks.push(nb);
       dirty.add(nb.id);
@@ -305,6 +315,16 @@ function stripComment(line) {
 function countMatches(s, re) {
   const m = s.match(re);
   return m ? m.length : 0;
+}
+
+function hasControlSymbol(s, symbol) {
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== symbol) continue;
+    let slashes = 0;
+    for (let j = i - 1; j >= 0 && s[j] === '\\'; j--) slashes++;
+    if (slashes % 2 === 1) return true;
+  }
+  return false;
 }
 
 function braceDelta(s) {

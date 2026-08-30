@@ -1,17 +1,32 @@
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
-import { classifyPreamble, classifyBodyBlock } from './safety.js';
+import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch } from './safety.js';
 import { firstDirtyIndex } from './update-helpers.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
+import { sourceClosure } from './closure.js';
 
 export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
-  const { opaqueUpdate, bootRoot, scheduleStructuredReprobe, expandIncludes, unindexBlock } = callbacks;
+  const { opaqueUpdate, deferClosureUpdate, bootRoot, scheduleStructuredReprobe, expandIncludes, unindexBlock } = callbacks;
   const text = engine.store.get(engine.file);
   const diagnostics = [];
 
   const bounds = documentBounds(text);
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
   const preHash = fnv1a(preamble);
+
+  // Keep both the old page tree and its block boundaries while the user is
+  // in an unambiguously unfinished construct. In particular, an unclosed
+  // environment makes the segmenter absorb every following paragraph; if
+  // that temporary segmentation were committed, "hold last good" would
+  // still make the document tail disappear. The source store advances, but
+  // no TeX path or layout identity advances until the closing syntax lands.
+  if (engine.blocks.length) {
+    const preClosure = sourceClosure(preamble);
+    if (!preClosure.closed) {
+      timer.lap('closure');
+      return { response: deferClosureUpdate(editLabel, timer, { ...preClosure, scope: 'preamble' }) };
+    }
+  }
 
   // ---- safety gate, preamble half --------------------------------------
   // Structured is a privilege, not a default: page-mechanism-hostile
@@ -21,17 +36,42 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   if (engine.preGate?.preHash !== preHash) {
     engine.preGate = { preHash, gate: classifyPreamble(preamble) };
   }
+  engine.previewPolicy = engine.preGate.gate.previewPolicy ?? 'structured';
+  engine.previewReasons = engine.preGate.gate.previewReasons ?? [];
   // ---- segmentation + diff ---------------------------------------------
   // Independent of the resident boot, so it runs even for opaque documents.
   // Besides feeding the body safety gate, these blocks carry direct-edit
   // source spans over the exact canonical pages.  Previously an unsafe
-  // preamble returned above this point, leaving twocolumn and other opaque
+  // preamble returned above this point, leaving opaque
   // papers with zero editable regions despite the UI calling them editable.
   const oldBlocks = engine.blocks;
   let segs = segmentBody(text.slice(bounds.body.start, bounds.body.end), bounds.body.start);
   segs = expandIncludes(segs, 0);
+  if (engine.blocks.length) {
+    for (const seg of segs) {
+      const closure = sourceClosure(seg.text);
+      if (!closure.closed) {
+        timer.lap('closure');
+        return {
+          response: deferClosureUpdate(editLabel, timer, {
+            ...closure,
+            scope: seg.file ?? engine.file,
+            sourceAt: (seg.sourceStart ?? seg.start) + closure.at,
+          }),
+        };
+      }
+    }
+  }
   const diff = diffBlocks(engine.blocks, segs, () => engine.idSeq++);
   engine.blocks = diff.blocks;
+  // Block indices and carried cost profiles may have moved. Rebuild the
+  // sparse resident skeleton once for this source generation; subsequent
+  // JOBs reuse it unless a genuinely hotter block changes the top set.
+  engine.checkpointKeepCache = null;
+  if (engine.blocks.some((block) => bodyUsesColumnSwitch(block.text))) {
+    engine.previewPolicy = 'canonical-anchor';
+    engine.previewReasons = [...new Set([...engine.previewReasons, 'body column switch'])];
+  }
   for (const id of diff.removed) {
     unindexBlock(id);
     engine.unsafeBodyBlocks.delete(id);

@@ -33,6 +33,8 @@
 //                (mathmap.js) — close, but a substitution: not exact
 //      'none'    no browser-drawable representation exists
 
+import { classifyResidentRun } from './run-semantics.js';
+
 export const SAFE_GLYPH = 'safe-glyph';
 export const EXACT_PREVIEW = 'exact-preview-required';
 export const CANONICAL_ONLY = 'canonical-only';
@@ -48,12 +50,25 @@ export function fontTier(meta) {
 }
 
 /** Fidelity of one galley line (a harvested box item). */
-export function lineFidelity(item, fonts) {
+export function lineFidelity(item, fonts, backend = null) {
   // daemon-side verdicts (math nodes, math/CM fonts, unencoded glyphs)
   let exact = !!item.x || !!item.xb;
   let noBridge = !!item.xb;
   let nativeText = false;
   let math = false;
+  for (const run of item?.runs ?? []) {
+    if (!run?.rule) continue;
+    const semantics = classifyResidentRun(run, backend);
+    if (semantics.tag === 'LayoutOnly') continue;
+    // Positive-area ordinary rules are reproduced directly as SVG rects.
+    // A zero-area normal rule is different: PDF backends may promote it to
+    // a device hairline, so the browser layer must not infer "no paint" from
+    // geometry. Unknown run/profile schemas fail closed for the same reason.
+    if (semantics.tag === 'Reject' || !(Number(run.w) > 0 && Number(run.h) > 0)) {
+      exact = true;
+      noBridge = true;
+    }
+  }
   scanRuns(item.runs, fonts, (tier, meta, run) => {
     if (tier !== 'native') exact = true; // twin substitution or unservable
     if (tier === 'none') noBridge = true; // nothing presentable to bridge with
@@ -102,7 +117,7 @@ export function classifyGalley(galley, fonts) {
     const it = items[i];
     if (it.k === 'box') {
       lines++;
-      const f = lineFidelity(it, fonts);
+      const f = lineFidelity(it, fonts, galley?.backend);
       if (f.exact) {
         exactLines++;
         itemFlags[i] |= 1;
@@ -113,14 +128,14 @@ export function classifyGalley(galley, fonts) {
       }
       if (f.mixedTextMath) itemFlags[i] |= 4;
     } else if (it.k === 'ins') {
-      const f = subFidelity(it.items, fonts);
+      const f = subFidelity(it.items, fonts, galley?.backend);
       if (f.exact || f.noBridge) ins.set(insOrdinal, f);
       insOrdinal++;
     }
   }
   const floats = new Map();
   for (const fl of galley?.floats ?? []) {
-    const f = subFidelity(fl.items, fonts);
+    const f = subFidelity(fl.items, fonts, galley?.backend);
     if (fl.gfx) f.exact = true;
     if (f.exact || f.noBridge) floats.set(fl.n, f);
   }
@@ -141,12 +156,12 @@ export function classifyGalley(galley, fonts) {
 }
 
 /** Aggregate fidelity of a mini-galley (float body, footnote text). */
-function subFidelity(items, fonts) {
+function subFidelity(items, fonts, backend = null) {
   let exact = false;
   let noBridge = false;
   for (const it of items ?? []) {
     if (it.k !== 'box') continue;
-    const f = lineFidelity(it, fonts);
+    const f = lineFidelity(it, fonts, backend);
     exact ||= f.exact;
     noBridge ||= f.noBridge;
   }

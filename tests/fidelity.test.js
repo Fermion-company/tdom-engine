@@ -26,10 +26,37 @@ const fonts = new Map([
 
 const box = (runs, flags = {}) => ({ k: 'box', h: 10, d: 2, w: 300, runs, ...flags });
 const textRun = (f, t = 'hello') => ({ f, t, x: 0, dy: 0, s: 10 });
-const rule = () => ({ rule: true, x: 0, dy: 0, w: 100, h: 0.4 });
+const backend = {
+  schema: 2,
+  engine: 'luahbtex',
+  version: 124,
+  revision: 0,
+  outputMode: 1,
+  capture: 'resident-post-linebreak',
+  emptyRuleSubtype: 3,
+  format: 'lualatex',
+};
+const rule = (overrides = {}) => ({
+  rule: true,
+  rv: 2,
+  rs: 0,
+  rw: 6578176,
+  rh: 26315,
+  rd: 0,
+  ri: 0,
+  rl: 0,
+  rr: 0,
+  rdir: 'TLT',
+  ra: '',
+  x: 0,
+  dy: 0,
+  w: 100,
+  h: 0.4,
+  ...overrides,
+});
 
-test('plain text on a served font is safe-glyph', () => {
-  const g = { items: [box([textRun(1)]), box([textRun(1), rule()])], floats: [] };
+test('plain text and a certified ordinary positive-area rule stay safe-glyph', () => {
+  const g = { backend, items: [box([textRun(1)]), box([textRun(1), rule()])], floats: [] };
   const fid = classifyGalley(g, fonts);
   assert.equal(fid.level, SAFE_GLYPH);
   assert.equal(fid.exact, false);
@@ -88,9 +115,23 @@ test('unknown font ids default DOWN: exact, no bridge', () => {
   assert.equal(fontTier(undefined), 'none');
 });
 
-test('rules alone never demote a line (they are exact by construction)', () => {
-  const fid = lineFidelity(box([rule()]), fonts);
+test('certified positive-area rules alone never demote a line', () => {
+  const fid = lineFidelity(box([rule()]), fonts, backend);
   assert.equal(fid.exact, false);
+});
+
+test('certified empty_rule is layout-only, even with positive logical height', () => {
+  const fid = lineFidelity(box([rule({ rs: 3, rw: 0, w: 0, h: 9.2 })]), fonts, backend);
+  assert.deepEqual(fid, { exact: false, noBridge: false, mixedTextMath: false });
+});
+
+test('normal zero-area rule and unknown rule schema fail closed', () => {
+  const normalZero = lineFidelity(box([rule({ rw: 0, w: 0, h: 9.2 })]), fonts, backend);
+  assert.equal(normalZero.exact, true);
+  assert.equal(normalZero.noBridge, true);
+  const unknown = lineFidelity(box([{ rule: true, x: 0, dy: 0, w: 100, h: 0.4 }]), fonts, backend);
+  assert.equal(unknown.exact, true);
+  assert.equal(unknown.noBridge, true);
 });
 
 test('pdf-literal galleys (gfx) are block-exact', () => {
