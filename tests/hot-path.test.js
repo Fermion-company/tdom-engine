@@ -16,6 +16,10 @@ import { buildStream } from '../engine/checkpoint/stream.js';
 import { handlePeerMessage } from '../engine/checkpoint/peer-message.js';
 import { mayCaptureDisplayMath } from '../engine/checkpoint/render-hold.js';
 import { preemptResidentRenders } from '../engine/checkpoint/render-pump.js';
+import {
+  dirtyWithoutPatchFallback,
+  planTerminalCanonicalAnchor,
+} from '../engine/checkpoint/canonical-anchor.js';
 
 const WORK = fileURLToPath(new URL('../.tdom-hotpath-test', import.meta.url));
 const WORK2 = fileURLToPath(new URL('../.tdom-hotpath-test-scratch', import.meta.url));
@@ -80,6 +84,11 @@ function makeDoc() {
     L.push(para(`Delta filler ${k}`));
     L.push('');
   }
+  L.push('\\begin{align*}');
+  L.push('u &= v \\\\[2mm]');
+  L.push('w &= z');
+  L.push('\\end{align*}');
+  L.push('');
   L.push('\\section{Epsilon}\\label{sec:eps}');
   L.push('');
   L.push(para('Epsilon one'));
@@ -123,6 +132,156 @@ async function drain(eng, timeoutMs = 120_000) {
 /** Lineage-independent identity of the whole document state. */
 const signature = (eng) => eng.blocks.map((b) => `${b.galleyHash}|${b.stateVec}`);
 
+test('terminal prose without a frozen canonical line proof fails closed', () => {
+  const block = {
+    id: 'b-tail',
+    text: 'plain terminal prose\n',
+    fidelity: { level: 'safe-glyph' },
+    needsRender: false,
+  };
+  const report = {
+    mode: 'structured',
+    srcRev: 8,
+    canonical: { id: 4, rev: 7, pageCount: 43 },
+    stats: { pageCount: 6 },
+    dirtySourceNodes: ['src-b-tail'],
+    patches: [{
+      type: 'replace-page',
+      page: 6,
+      displayList: {
+        page: 6,
+        commands: [{
+          op: 'glyphs', src: 'b-tail', x: 72, y: 700, w: 90,
+          gh: 8, gd: 2, size: 10, text: 'plain terminal prose',
+        }],
+      },
+    }],
+  };
+  const geometry = {
+    oddsidemargin: 0,
+    textwidth: 450,
+    topmargin: 0,
+    headheight: 12,
+    headsep: 18,
+    textheight: 680,
+  };
+  const plan = planTerminalCanonicalAnchor({
+    blocks: [block],
+    domBlocks: [{
+      id: block.id,
+      source: {
+        file: 'main.tex',
+        start: { line: 622, column: 1 },
+        end: { line: 623, column: 1 },
+      },
+    }],
+    report,
+    geometry,
+  });
+  assert.equal(plan, null, 'page-number guesses cannot replace a frozen paint/line certificate');
+});
+
+test('canonical anchoring fails closed for wrapped or command-bearing prose', () => {
+  const base = {
+    mode: 'structured',
+    srcRev: 3,
+    canonical: { id: 2, rev: 2, pageCount: 20 },
+    stats: { pageCount: 4 },
+    dirtySourceNodes: ['src-b1'],
+    patches: [{
+      type: 'replace-page',
+      page: 4,
+      displayList: { commands: [
+        { op: 'glyphs', src: 'b1', x: 72, y: 600, w: 20, gh: 8, gd: 2, text: 'a' },
+        { op: 'glyphs', src: 'b1', x: 72, y: 612, w: 20, gh: 8, gd: 2, text: 'b' },
+      ] },
+    }],
+  };
+  const domBlocks = [{ id: 'b1', source: { file: 'main.tex', start: { line: 10, column: 1 } } }];
+  const geometry = { textheight: 700 };
+  assert.equal(planTerminalCanonicalAnchor({
+    blocks: [{ id: 'b1', text: 'plain', fidelity: { level: 'safe-glyph' } }],
+    domBlocks,
+    report: base,
+    geometry,
+  }), null);
+  assert.equal(planTerminalCanonicalAnchor({
+    blocks: [{ id: 'b1', text: 'unsafe \\command', fidelity: { level: 'safe-glyph' } }],
+    domBlocks,
+    report: {
+      ...base,
+      patches: [{
+        ...base.patches[0],
+        displayList: { commands: [
+          { op: 'glyphs', src: 'b1', x: 72, y: 600, w: 40, gh: 8, gd: 2, text: 'unsafe' },
+        ] },
+      }],
+    },
+    geometry,
+  }), null);
+  assert.deepEqual(dirtyWithoutPatchFallback({
+    dirtySourceNodes: ['src-b1'],
+    patches: [],
+  }), {
+    kind: 'canonical-fallback',
+    reason: 'dirty-source-without-structured-patch',
+  });
+});
+
+test('canonical-anchor policy still requires a frozen pre-edit line certificate', () => {
+  const block = {
+    id: 'b-middle',
+    text: 'ordinary internal prose',
+    fidelity: { level: 'safe-glyph' },
+    needsRender: false,
+    galley: { items: [], floats: [], events: [], labels: [], refs: [], toclines: [] },
+  };
+  const report = {
+    mode: 'structured',
+    previewPolicy: 'canonical-anchor',
+    srcRev: 12,
+    canonical: { id: 9, rev: 11, pageCount: 5 },
+    stats: { pageCount: 5 },
+    dirtySourceNodes: ['src-b-middle'],
+    patches: [{
+      type: 'replace-page',
+      page: 1,
+      displayList: {
+        page: 1,
+        commands: [{
+          op: 'glyphs', src: 'b-middle', x: 72, y: 120, w: 92,
+          gh: 8, gd: 2, size: 10, text: 'ordinary internal prose',
+        }],
+      },
+    }],
+  };
+  const geometry = {
+    oddsidemargin: 0,
+    textwidth: 450,
+    columnwidth: 215,
+    columnsep: 20,
+    twocolumn: 1,
+    topmargin: 0,
+    headheight: 12,
+    headsep: 18,
+    textheight: 680,
+  };
+  const plan = planTerminalCanonicalAnchor({
+    blocks: [{ id: 'before' }, block, { id: 'after' }],
+    domBlocks: [{
+      id: block.id,
+      source: {
+        file: 'main.tex',
+        start: { line: 40, column: 1 },
+        end: { line: 40, column: 24 },
+      },
+    }],
+    report,
+    geometry,
+  });
+  assert.equal(plan, null, 'column geometry alone is not a physical-address proof');
+});
+
 test('a replacement checkpoint retires the preserved peer at that boundary', () => {
   const sent = [];
   const oldPeer = { pid: 41, send: (message) => sent.push(message) };
@@ -165,7 +324,7 @@ test('capture miss rejects only the render attempt with a fallback marker', () =
   assert.equal(rejected?.err?.tdomCaptureMiss, true);
 });
 
-test('a new edit preempts resident exact backlog but preserves isolated cache work', () => {
+test('a new edit preempts active resident renders but retains latest-wins backlog', () => {
   const rejected = [];
   const engine = {
     renderWant: new Map([['old-block', true]]),
@@ -174,7 +333,7 @@ test('a new edit preempts resident exact backlog but preserves isolated cache wo
     _reject(key, err) { rejected.push({ key, err }); },
   };
   preemptResidentRenders(engine);
-  assert.equal(engine.renderWant.size, 0);
+  assert.deepEqual([...engine.renderWant.keys()], ['old-block']);
   assert.equal(engine.renderPids.has('rr@1'), false);
   assert.equal(engine.renderPids.has('iso@cache'), true);
   assert.equal(engine.cancelledRenderIds.has('rr@1'), true);
@@ -440,6 +599,12 @@ test('a tail edit right after a mid edit is NOT charged the distance', opts, asy
   // immediately — the old design would replay every block from mid to tail
   const tail = eng.getSource().indexOf('TAILWORD');
   assert.ok(tail >= 0);
+  const tailBlock = eng.blocks.find((block) => block.text.includes('TAILWORD'));
+  assert.equal(
+    tailBlock?.fidelity?.level,
+    'safe-glyph',
+    'row spacing must not absorb tail prose into the align chunk'
+  );
   const r = await eng.edit(tail, tail + 'TAILWORD'.length, 'TAILWORQ');
   assert.ok(
     r.stats.blocksTypeset <= 6,

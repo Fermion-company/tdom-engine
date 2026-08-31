@@ -50,6 +50,7 @@ let appliedRev = 0;
 let composing = false;
 let sending = Promise.resolve();
 let debounceTimer = null;
+let pendingEditorInputAtEpochMs = null;
 let inFlight = false;
 const history = [];
 const pageDivs = new Map();
@@ -73,6 +74,7 @@ const presentedDomSnapshots = new Map();
 const presentedDomFetches = new Map();
 const opaqueCanonicalBatches = new Map();
 let opaqueBatchCommitDepth = 0;
+let shipWaveBatch = null;
 
 // Exact SVGs are decoded off-DOM, but a long paper must not decode every
 // page on every keystroke. Pages near the viewport stage immediately;
@@ -96,6 +98,8 @@ const canonicalStageObserver = typeof IntersectionObserver === 'function'
 // rev without changing the source, and must not un-freshen the canonical
 let mode = 'structured'; // 'structured' | 'opaque'
 let modeReasons = [];
+let previewPolicy = 'structured'; // structured | canonical-anchor
+let previewReasons = [];
 let canonical = null; // {id, rev(srcRev), pageCount, paper, inFlight, error}
 // incremental authority (shipping chain): page -> {gen, srcRev}. A shipped
 // page is the SAME fidelity class as a canonical page (a real LuaLaTeX
@@ -104,6 +108,10 @@ const shipPages = new Map();
 let appliedSrcRev = 0;
 const pageDirtyRev = new Map(); // page -> srcRev of the last provisional patch
 let lastRemoveRev = 0; // srcRev of the last provisional remove-pages patch
+let canonicalAnchorPreview = null;
+let canonicalAnchorPendingPatch = null;
+const canonicalAnchorEditStartedAt = new Map(); // srcRev -> inferred server-accept time on renderer clock
+const canonicalAnchorCanvasCache = new WeakMap();
 const docStateEl = document.getElementById('doc-state');
 
 // Page convergence is BINARY: a page shows either the canonical render
@@ -476,7 +484,7 @@ async function boot(expectedDocumentEpoch = null) {
     return;
   }
   adoptDoc(doc);
-  if (mode === 'opaque' && canonical?.id && canonical.rev === appliedSrcRev) {
+  if (usesCanonicalSurface() && canonical?.id && canonical.rev === appliedSrcRev) {
     await ensurePresentedDomSnapshot(canonical.id, canonical.rev);
   }
   if (requestEpoch !== bootRequestEpoch || eventEpoch !== stateEventEpoch) {
@@ -534,14 +542,18 @@ function adoptDoc(doc) {
   pagesEl.textContent = '';
   pageDivs.clear();
   pageDirtyRev.clear();
+  clearCanonicalAnchorPreview();
   lastRemoveRev = 0;
   mode = doc.mode ?? 'structured';
   modeReasons = doc.modeReasons ?? [];
-  document.body.classList.toggle('is-opaque-document', mode === 'opaque');
+  previewPolicy = doc.previewPolicy ?? 'structured';
+  previewReasons = doc.previewReasons ?? [];
+  document.body.classList.toggle('is-opaque-document', usesCanonicalSurface());
   canonical = doc.canonical ?? null;
+  if (shipWaveBatch) cancelShipWaveBatch(shipWaveBatch);
   shipPages.clear();
-  for (const dl of doc.pages) {
-    renderPage(dl, false);
+  if (previewPolicy === 'structured') {
+    for (const dl of doc.pages) renderPage(dl, false);
   }
   appliedRev = doc.report.rev;
   appliedSrcRev = doc.report.srcRev ?? doc.report.rev;
@@ -564,7 +576,7 @@ function srcOf(target) {
 
 function renderPage(dl, flash) {
   let div = pageDivs.get(dl.page);
-  if (mode === 'opaque') {
+  if (usesCanonicalSurface()) {
     // Opaque pages are created exclusively from canonical metadata. A late
     // resident patch must not create an empty phantom shell or stale hit map.
     if (div) prepareOpaqueShell(div);
@@ -616,9 +628,9 @@ function renderPage(dl, flash) {
 }
 
 /** Unified SVG page: TeX-positioned glyph runs, rules, chunk images, folio. */
-function svgFor(dl) {
+function svgFor(dl, className = '') {
   const parts = [
-    `<svg viewBox="0 0 ${geometry.paperwidth} ${geometry.paperheight}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">`,
+    `<svg${className ? ` class="${escapeXml(className)}"` : ''} viewBox="0 0 ${geometry.paperwidth} ${geometry.paperheight}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">`,
   ];
   for (const cmd of dl.commands) {
     const lineAttr = cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`;
@@ -678,11 +690,71 @@ function applyReport(report) {
   injectFonts(report.fonts);
   appliedRev = report.rev;
   appliedSrcRev = report.srcRev ?? appliedSrcRev;
+  const wasCanonicalSurface = usesCanonicalSurface();
+  previewPolicy = report.previewPolicy ?? previewPolicy;
+  previewReasons = report.previewReasons ?? previewReasons;
   setMode(report.mode ?? 'structured', report.modeReasons ?? []);
+  document.body.classList.toggle('is-opaque-document', usesCanonicalSurface());
+  if (!wasCanonicalSurface && usesCanonicalSurface()) {
+    closeDirectEditor();
+    pageDirtyRev.clear();
+    for (const div of pageDivs.values()) prepareOpaqueShell(div);
+    if (canonical?.id) void ensurePresentedDomSnapshot(canonical.id, canonical.rev);
+    for (const pageNumber of pageDivs.keys()) updateCanonState(pageNumber);
+  }
   if (report.canonical) canonical = report.canonical;
+  const anchorIntent = report.canonicalAnchor?.status === 'pending'
+    ? report.canonicalAnchor
+    : null;
+  if (anchorIntent) {
+    // Embedded TeX64 edits arrive over SSE, not through this iframe's own
+    // fetch('/edit'). Reconstruct the server-accept instant from the elapsed
+    // duration carried by the report so the same 850ms publication contract
+    // works in both clients. The value is diagnostic/deadline state only;
+    // authority still comes from source/canonical generation checks.
+    const elapsed = Number(anchorIntent.acceptedElapsedMs);
+    const inferredStart = performance.now() - (Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0);
+    const rev = Number(anchorIntent.srcRev);
+    const previous = canonicalAnchorEditStartedAt.get(rev);
+    if (!Number.isFinite(previous) || inferredStart < previous) {
+      canonicalAnchorEditStartedAt.set(rev, inferredStart);
+    }
+    for (const knownRev of canonicalAnchorEditStartedAt.keys()) {
+      if (knownRev < rev - 4) canonicalAnchorEditStartedAt.delete(knownRev);
+    }
+  }
+  // An unresolved patch belongs to one exact source revision. Keep the
+  // already-painted previous keystroke while the newest one resolves, but
+  // never let an offscreen load commit a patch from an older revision.
+  canonicalAnchorPendingPatch = null;
+  const closureDeferred = !!report.stats?.closureDeferred;
+  if (closureDeferred && canonicalAnchorPreview) {
+    // The source revision advances while an unfinished TeX construct holds
+    // the last successful pixels. Keep that exact previous overlay eligible
+    // for the new revision; it will be replaced when native closure succeeds.
+    canonicalAnchorPreview.targetSrcRev = appliedSrcRev;
+  } else if (!anchorIntent || canonicalAnchorPreview && (
+    canonicalAnchorPreview.blockId !== anchorIntent.blockId ||
+    canonicalAnchorPreview.baseGeneration !== anchorIntent.baseGeneration
+  )) {
+    clearCanonicalAnchorPreview();
+  } else if (anchorIntent && canonicalAnchorPreview) {
+    // Keep the previous keystroke visible while the next cumulative patch is
+    // resolving, but make its convergence target the newest source revision.
+    canonicalAnchorPreview.targetSrcRev = anchorIntent.srcRev;
+  }
   for (const patch of report.patches) {
+    if (previewPolicy !== 'structured') continue;
     if (patch.type === 'replace-page') {
       const dl = patch.displayList;
+      if (anchorIntent && (anchorIntent.provisionalPages ?? [anchorIntent.provisionalPage]).includes(dl.page) &&
+          dl.commands?.some((command) => command.src === anchorIntent.blockId)) {
+        // The provisional page number belongs to the resident renderer's
+        // local address space. While canonical anchoring resolves, retain
+        // the unchanged physical page instead of repainting the unrelated
+        // canonical page with the same number.
+        continue;
+      }
       renderPage(dl, true);
       // this page now differs from the last canonical compile — provisional
       // owns it until a compile of srcRev >= this lands
@@ -694,6 +766,226 @@ function applyReport(report) {
     }
   }
   updateBadge();
+}
+
+function clearCanonicalAnchorPreview() {
+  pagesEl.querySelectorAll('svg.tdom-canonical-delta').forEach((node) => node.remove());
+  canonicalAnchorPreview = null;
+  canonicalAnchorPendingPatch = null;
+}
+
+function canonicalAnchorForPage(pageNumber) {
+  const candidate = canonicalAnchorPendingPatch ?? canonicalAnchorPreview;
+  const pagePatch = canonicalAnchorPages(candidate).find((page) => Number(page.page) === Number(pageNumber));
+  if (!candidate || !pagePatch) return null;
+  if (Number(candidate.targetSrcRev ?? candidate.srcRev) !== Number(appliedSrcRev)) return null;
+  return { ...candidate, ...pagePatch };
+}
+
+function tryApplyPendingCanonicalAnchor() {
+  const patch = canonicalAnchorPendingPatch;
+  if (!patch || patch.srcRev !== appliedSrcRev || !canonicalAnchorWithinDeadline(patch)) return false;
+  const pagePatches = canonicalAnchorPages(patch);
+  const transactions = [];
+  for (const pagePatch of pagePatches) {
+    const pageNumber = Number(pagePatch.page);
+    const page = pageDivs.get(pageNumber);
+    const presented = page?.isConnected ? presentedPageState(page) : null;
+    if (!page?.classList.contains('is-final') ||
+        presented?.id !== Number(patch.baseGeneration) ||
+        presented?.rev !== Number(patch.baseRev)) return false;
+    const rules = [];
+    for (const mask of pagePatch.masks ?? []) {
+      if (!mask || ![mask.left, mask.top, mask.right, mask.bottom].every(Number.isFinite)) return false;
+      const background = canonicalAnchorBackground(page, mask);
+      if (!background) {
+        // A solid mask is exact only when the canonical ink sits on a locally
+        // uniform background. Gradients, artwork, and frames fail closed.
+        clearCanonicalAnchorPreview();
+        return false;
+      }
+      rules.push({
+        op: 'rule',
+        x: mask.left,
+        y: mask.top,
+        w: mask.right - mask.left,
+        h: mask.bottom - mask.top,
+        color: background,
+        src: patch.blockId,
+      });
+    }
+    transactions.push({ pageNumber, page, commands: [...rules, ...(pagePatch.commands ?? [])] });
+  }
+  // The deadline is checked again immediately before the atomic DOM commit;
+  // image decode or background probing is not allowed to publish a stale win.
+  if (!canonicalAnchorWithinDeadline(patch)) {
+    clearCanonicalAnchorPreview();
+    return false;
+  }
+  pagesEl.querySelectorAll('svg.tdom-canonical-delta').forEach((node) => node.remove());
+  for (const transaction of transactions) {
+    transaction.page.insertAdjacentHTML(
+      'beforeend',
+      svgFor({ page: transaction.pageNumber, commands: transaction.commands }, 'tdom-canonical-delta')
+    );
+  }
+  const committedAt = performance.now();
+  canonicalAnchorPreview = {
+    blockId: patch.blockId,
+    srcRev: patch.srcRev,
+    targetSrcRev: patch.srcRev,
+    baseGeneration: patch.baseGeneration,
+    baseRev: patch.baseRev,
+    pages: pagePatches.map((page) => ({ page: page.page })),
+  };
+  canonicalAnchorPendingPatch = null;
+  for (const { page } of transactions) {
+    page.classList.remove('fading');
+    page.classList.add('patched');
+    requestAnimationFrame(() => page.classList.add('fading'));
+    setTimeout(() => page.classList.remove('patched', 'fading'), 1200);
+  }
+  updateBadge();
+  reportCanonicalAnchorPresented(patch, pagePatches, committedAt);
+  return true;
+}
+
+function reportCanonicalAnchorPresented(patch, pagePatches, committedAt) {
+  const startedAt = canonicalAnchorEditStartedAt.get(Number(patch?.srcRev));
+  if (!Number.isFinite(startedAt)) return;
+  window.requestAnimationFrame(() => {
+    const firstFrameAt = performance.now();
+    window.requestAnimationFrame(() => {
+      const active = canonicalAnchorPreview;
+      if (!active || Number(active.srcRev) !== Number(patch.srcRev) ||
+          Number(active.baseGeneration) !== Number(patch.baseGeneration)) return;
+      const secondFrameAt = performance.now();
+      const clientEditAt = patch.clientEditAtEpochMs == null
+        ? Number.NaN
+        : Number(patch.clientEditAtEpochMs);
+      void fetch('/anchor-presented', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          srcRev: patch.srcRev,
+          baseGeneration: patch.baseGeneration,
+          baseRev: patch.baseRev,
+          proofMs: patch.proofMs,
+          commitMs: committedAt - startedAt,
+          firstFrameMs: firstFrameAt - startedAt,
+          secondFrameMs: secondFrameAt - startedAt,
+          inputToSecondFrameMs: Number.isFinite(clientEditAt) ? Date.now() - clientEditAt : null,
+          pages: pagePatches.map((page) => Number(page.page)),
+        }),
+        keepalive: true,
+      }).catch(() => {});
+    });
+  });
+}
+
+function canonicalAnchorPages(patch) {
+  if (!patch) return [];
+  if (Array.isArray(patch.pages)) return patch.pages;
+  return Number.isInteger(Number(patch.page))
+    ? [{ page: Number(patch.page), masks: patch.mask ? [patch.mask] : [], commands: patch.commands ?? [] }]
+    : [];
+}
+
+function canonicalAnchorWithinDeadline(patch) {
+  const startedAt = canonicalAnchorEditStartedAt.get(Number(patch?.srcRev));
+  const limit = Number(patch?.publishWithinMs ?? 850);
+  return Number.isFinite(startedAt) && Number.isFinite(limit) &&
+    performance.now() - startedAt < limit;
+}
+
+function canonicalAnchorBackground(page, mask) {
+  const image = page?.querySelector('img.canon');
+  if (!image?.naturalWidth || !image?.naturalHeight) return null;
+  let cached = canonicalAnchorCanvasCache.get(image);
+  if (!cached) {
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context) return null;
+    try {
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    } catch {
+      return null;
+    }
+    cached = { canvas, context };
+    canonicalAnchorCanvasCache.set(image, cached);
+  }
+  const paper = activePaperGeometry(page);
+  if (!(paper.width > 0 && paper.height > 0)) return null;
+  const sx = cached.canvas.width / paper.width;
+  const sy = cached.canvas.height / paper.height;
+  const xs = [0, 0.25, 0.5, 0.75, 1].map((ratio) =>
+    mask.left + (mask.right - mask.left) * ratio
+  );
+  const ys = [0, 0.5, 1].map((ratio) =>
+    mask.top + (mask.bottom - mask.top) * ratio
+  );
+  const points = [
+    ...xs.flatMap((x) => [[x, mask.top - 1], [x, mask.bottom + 1]]),
+    ...ys.flatMap((y) => [[mask.left - 1, y], [mask.right + 1, y]]),
+  ];
+  const pageBackground = cssColor(getComputedStyle(page).backgroundColor) ?? [255, 255, 255];
+  const samples = [];
+  try {
+    for (const [x, y] of points) {
+      const px = Math.max(0, Math.min(cached.canvas.width - 1, Math.round(x * sx)));
+      const py = Math.max(0, Math.min(cached.canvas.height - 1, Math.round(y * sy)));
+      const data = cached.context.getImageData(px, py, 1, 1).data;
+      const alpha = data[3] / 255;
+      samples.push([
+        Math.round(data[0] * alpha + pageBackground[0] * (1 - alpha)),
+        Math.round(data[1] * alpha + pageBackground[1] * (1 - alpha)),
+        Math.round(data[2] * alpha + pageBackground[2] * (1 - alpha)),
+      ]);
+    }
+  } catch {
+    return null;
+  }
+  const channelRange = (channel) => {
+    const values = samples.map((sample) => sample[channel]);
+    return Math.max(...values) - Math.min(...values);
+  };
+  if (!samples.length || [0, 1, 2].some((channel) => channelRange(channel) > 8)) return null;
+  const rgb = [0, 1, 2].map((channel) =>
+    Math.round(samples.reduce((sum, sample) => sum + sample[channel], 0) / samples.length)
+  );
+  return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+}
+
+function cssColor(value) {
+  const match = String(value ?? '').match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+  return match ? match.slice(1, 4).map(Number) : null;
+}
+
+function applyCanonicalAnchorPatch(patch) {
+  if (!patch || patch.srcRev !== appliedSrcRev) return;
+  if (patch.baseGeneration !== canonical?.id || patch.baseRev !== canonical?.rev) return;
+  if (patch.status !== 'ready') {
+    clearCanonicalAnchorPreview();
+    return;
+  }
+  if (!canonicalAnchorWithinDeadline(patch)) return;
+  const pagePatches = canonicalAnchorPages(patch);
+  if (!pagePatches.length || pagePatches.some((page) =>
+    !Number.isInteger(Number(page.page)) || Number(page.page) < 1 ||
+    !Array.isArray(page.masks) || !page.masks.length ||
+    page.masks.some((mask) => !mask || ![mask.left, mask.top, mask.right, mask.bottom].every(Number.isFinite))
+  )) return;
+  canonicalAnchorPendingPatch = patch;
+  for (const pagePatch of pagePatches) {
+    const pageNumber = Number(pagePatch.page);
+    const page = ensureShell(pageNumber);
+    const targetSrc = `/canonical/${pageNumber}.svg?c=${patch.baseGeneration}`;
+    if (page.dataset.canonPresentedSrc !== targetSrc) page.dataset.canonStage = targetSrc;
+    updateCanonState(pageNumber);
+  }
+  tryApplyPendingCanonicalAnchor();
 }
 
 // ------------------------------------------------- canonical (exact) layer
@@ -718,7 +1010,7 @@ function activePaperGeometry(page = null) {
     : canonical?.paper;
   const exactWidth = Number(exactPaper?.w);
   const exactHeight = Number(exactPaper?.h);
-  if (mode === 'opaque' && exactWidth > 0 && exactHeight > 0) {
+  if (usesCanonicalSurface() && exactWidth > 0 && exactHeight > 0) {
     return { width: exactWidth, height: exactHeight, rotation: Number(exactPaper?.rotation) || 0 };
   }
   return {
@@ -729,7 +1021,7 @@ function activePaperGeometry(page = null) {
 }
 
 function prepareOpaqueShell(div) {
-  if (!div || mode !== 'opaque') return;
+  if (!div || !usesCanonicalSurface()) return;
   div.querySelector('svg')?.remove();
   div.querySelectorAll('.chunkwin').forEach((element) => element.remove());
   div.classList.remove('patched', 'fading');
@@ -749,11 +1041,11 @@ function setMode(newMode, reasons) {
   modeReasons = reasons ?? modeReasons;
   if (newMode === mode) return;
   mode = newMode;
-  document.body.classList.toggle('is-opaque-document', mode === 'opaque');
+  document.body.classList.toggle('is-opaque-document', usesCanonicalSurface());
   directEditClickEpoch++;
-  directEditor?.element?.classList.toggle('is-opaque', mode === 'opaque');
-  if (mode !== 'opaque' && directEditor?.control) directEditor.control.style.transform = '';
-  if (mode === 'opaque') {
+  directEditor?.element?.classList.toggle('is-opaque', usesCanonicalSurface());
+  if (!usesCanonicalSurface() && directEditor?.control) directEditor.control.style.transform = '';
+  if (usesCanonicalSurface()) {
     // A structured editor is anchored to provisional SVG geometry. Once the
     // document demotes, that coordinate system no longer exists; retaining
     // its WYSIWYG/IME surface above an old canonical page would be a visible
@@ -761,6 +1053,7 @@ function setMode(newMode, reasons) {
     // transient surface is closed here.
     closeDirectEditor();
     // the provisional layers are dead weight now — every page is canonical
+    if (shipWaveBatch) cancelShipWaveBatch(shipWaveBatch);
     shipPages.clear();
     pagesEl.querySelectorAll('.tdom-search-marker').forEach((marker) => marker.remove());
     liveSearch = { query: liveSearch.query, results: [], current: -1 };
@@ -771,6 +1064,10 @@ function setMode(newMode, reasons) {
       void ensurePresentedDomSnapshot(canonical.id, canonical.rev);
     }
   }
+}
+
+function usesCanonicalSurface() {
+  return mode === 'opaque' || previewPolicy === 'canonical-anchor';
 }
 
 function createCanonicalImage(src) {
@@ -847,7 +1144,7 @@ function directEditorRegionInSnapshot(snapshot, session) {
 
 async function stageDirectEditorForOpaqueBatch(batch) {
   const session = directEditor;
-  if (!session || mode !== 'opaque') return { sessionId: null };
+  if (!session || !usesCanonicalSurface()) return { sessionId: null };
   const snapshot = await batch.snapshotReady;
   if (!snapshot || directEditor?.sessionId !== session.sessionId) return { sessionId: session.sessionId, mapping: null };
   const visible = String(session.readValue?.() ?? session.region?.value ?? '');
@@ -905,7 +1202,7 @@ async function stageDirectEditorForOpaqueBatch(batch) {
 
 function getOpaqueCanonicalBatch(generation) {
   const key = opaqueCanonicalBatchKey(generation);
-  if (!key || mode !== 'opaque') return null;
+  if (!key || !usesCanonicalSurface()) return null;
   cancelObsoleteOpaqueBatches(key);
   let batch = opaqueCanonicalBatches.get(key);
   if (!batch) {
@@ -1065,7 +1362,7 @@ function ensureOpaqueBatchEditorTargetPage(batch) {
 function tryCommitOpaqueCanonicalBatch(batch) {
   if (!batch || batch.committing || !batch.sealed || batch.snapshot === undefined ||
       batch.editorStage === undefined) return;
-  if (opaqueCanonicalBatches.get(batch.key) !== batch || mode !== 'opaque' ||
+  if (opaqueCanonicalBatches.get(batch.key) !== batch || !usesCanonicalSurface() ||
       Number(canonical?.id) !== batch.id || Number(canonical?.rev) !== batch.rev ||
       batch.rev !== Number(appliedSrcRev) || !batch.snapshot) {
     return;
@@ -1108,6 +1405,83 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   updateBadge();
 }
 
+function cancelShipWaveBatch(batch) {
+  if (!batch || shipWaveBatch !== batch) return;
+  shipWaveBatch = null;
+  window.clearTimeout(batch.cutoffTimer);
+  for (const page of batch.allPages ?? batch.pages) {
+    if (shipPages.get(page)?.batchKey === batch.key) shipPages.delete(page);
+  }
+  for (const page of batch.pages) {
+    const div = pageDivs.get(page);
+    if (!div) continue;
+    if (div.dataset.canonWanted?.includes(`/ship/${page}.svg?g=${batch.gen}`)) {
+      div.dataset.canonWanted = '';
+      delete div.dataset.canonPending;
+    }
+    updateCanonState(page);
+  }
+}
+
+function registerShipWavePage(batch, div, src) {
+  if (!batch || shipWaveBatch !== batch) return null;
+  const pageNumber = Number(div.dataset.page);
+  if (!batch.pages.has(pageNumber)) return null;
+  batch.expected.set(pageNumber, { page: div, src, apply: null });
+  return { batch, pageNumber, src };
+}
+
+function readyShipWavePage(registration, apply) {
+  const { batch, pageNumber, src } = registration ?? {};
+  if (!batch || shipWaveBatch !== batch) return;
+  const entry = batch.expected.get(pageNumber);
+  if (!entry || entry.src !== src) return;
+  entry.apply = apply;
+  tryCommitShipWaveBatch(batch);
+}
+
+function failShipWavePage(registration) {
+  if (registration?.batch) cancelShipWaveBatch(registration.batch);
+}
+
+function tryCommitShipWaveBatch(batch) {
+  if (!batch || shipWaveBatch !== batch || Date.now() >= batch.deadlineAt ||
+      Number(appliedSrcRev) !== batch.srcRev || batch.expected.size !== batch.pages.size) {
+    if (batch && Date.now() >= batch.deadlineAt) cancelShipWaveBatch(batch);
+    return;
+  }
+  for (const [page, entry] of batch.expected) {
+    if (!entry.page?.isConnected || entry.page.dataset.canonWanted !== entry.src ||
+        typeof entry.apply !== 'function' || !batch.pages.has(page)) return;
+  }
+  // All pages were fetched and decoded off-DOM. One synchronous loop makes
+  // the affected set visible as a single renderer transaction.
+  shipWaveBatch = null;
+  window.clearTimeout(batch.cutoffTimer);
+  for (const [, entry] of [...batch.expected].sort((a, b) => a[0] - b[0])) entry.apply();
+  directEditClickEpoch++;
+  updateBadge();
+  // A DOM mutation is not yet a painted frame.  Report the certificate only
+  // after two animation frames so the measurement is a conservative upper
+  // bound for what the user actually saw, not merely JavaScript completion.
+  const certificate = {
+    gen: batch.gen,
+    srcRev: batch.srcRev,
+    acceptedAt: batch.acceptedAt,
+    receivedAt: batch.receivedAt,
+    engineElapsedMs: batch.engineElapsedMs,
+    pages: [...batch.pages].sort((a, b) => a - b),
+  };
+  window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+    void fetch('/ship-presented', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...certificate, presentedAt: Date.now() }),
+      keepalive: true,
+    }).catch(() => {});
+  }));
+}
+
 /**
  * Decode the next exact page off-DOM and replace the current exact bitmap in
  * one DOM operation. Assigning a new URL to an in-DOM <img> is not an atomic
@@ -1117,7 +1491,13 @@ function tryCommitOpaqueCanonicalBatch(batch) {
  */
 function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
   const current = div.querySelector('img.canon');
-  const batch = mode === 'opaque' && opaqueBatchCommitDepth === 0
+  const activeShipBatch = generation?.shipWaveKey && shipWaveBatch?.key === generation.shipWaveKey
+    ? shipWaveBatch
+    : null;
+  const shipRegistration = activeShipBatch
+    ? registerShipWavePage(activeShipBatch, div, src)
+    : null;
+  const batch = usesCanonicalSurface() && opaqueBatchCommitDepth === 0
     ? getOpaqueCanonicalBatch(generation)
     : null;
   const batchRegistration = batch ? registerOpaqueCanonicalBatchPage(batch, div, src) : null;
@@ -1127,7 +1507,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
     delete div.dataset.canonRetries;
     const currentId = generation?.id ?? canonicalIdFromSrc(src);
     const currentRev = generation?.rev;
-    if (mode === 'opaque' && currentId != null && currentRev != null) {
+    if (usesCanonicalSurface() && currentId != null && currentRev != null) {
       void ensurePresentedDomSnapshot(currentId, currentRev).then((snapshot) => {
         if (!snapshot || !div.isConnected || div.dataset.canonWanted !== src ||
             div.querySelector('img.canon') !== current) {
@@ -1152,6 +1532,8 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
           div.classList.remove('awaiting-canonical');
         });
       });
+    } else if (shipRegistration) {
+      readyShipWavePage(shipRegistration, () => {});
     } else if (batchRegistration) {
       readyOpaqueCanonicalBatchPage(batchRegistration, () => {});
     }
@@ -1167,7 +1549,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
     pageRect.top <= rootRect.bottom + rootRect.height * 2;
   const observerReleased = div.dataset.canonStage === src;
   if (observerReleased) delete div.dataset.canonStage;
-  if (!nearViewport && !observerReleased && canonicalStageObserver) {
+  if (!activeShipBatch && !nearViewport && !observerReleased && canonicalStageObserver) {
     dropOpaqueCanonicalBatchPage(batchRegistration);
     canonicalStageObserver.observe(div);
     return current;
@@ -1181,7 +1563,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
   const rawPresentationRev = generation?.rev;
   const presentationId = rawPresentationId == null ? NaN : Number(rawPresentationId);
   const presentationRev = rawPresentationRev == null ? NaN : Number(rawPresentationRev);
-  const requiresSnapshot = mode === 'opaque' &&
+  const requiresSnapshot = usesCanonicalSurface() &&
     Number.isFinite(presentationId) && Number.isFinite(presentationRev);
   const snapshotReady = requiresSnapshot
     ? ensurePresentedDomSnapshot(presentationId, presentationRev)
@@ -1191,9 +1573,13 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
     if (settled) return;
     settled = true;
     if (div.dataset.canonPending === src) delete div.dataset.canonPending;
+    if (shipRegistration) {
+      failShipWavePage(shipRegistration);
+      return;
+    }
     // Opaque mode deliberately retains the previous known-good exact page.
     // Structured mode can safely reveal its coherent provisional page.
-    if (div.dataset.canonWanted === src && mode !== 'opaque') {
+    if (div.dataset.canonWanted === src && !usesCanonicalSurface()) {
       div.classList.remove('is-final', 'is-partial');
     }
     if (div.dataset.canonWanted === src && div.isConnected) {
@@ -1248,7 +1634,9 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
       if (div.dataset.canonPending === src) delete div.dataset.canonPending;
       delete div.dataset.canonRetries;
     };
-    if (batchRegistration) {
+    if (shipRegistration) {
+      readyShipWavePage(shipRegistration, applyCandidate);
+    } else if (batchRegistration) {
       readyOpaqueCanonicalBatchPage(batchRegistration, applyCandidate);
     } else {
       applyCandidate();
@@ -1287,10 +1675,10 @@ function ensureShell(n) {
   if (div) return div;
   div = document.createElement('div');
   div.className = 'page';
-  if (mode === 'opaque') div.classList.add('awaiting-canonical');
+  if (usesCanonicalSurface()) div.classList.add('awaiting-canonical');
   div.dataset.page = n;
   const exactPaper = canonical?.papers?.[n - 1] ?? canonical?.paper;
-  const paper = mode === 'opaque' && exactPaper
+  const paper = usesCanonicalSurface() && exactPaper
     ? { width: Number(exactPaper.w), height: Number(exactPaper.h) }
     : activePaperGeometry();
   if (paper.width && paper.height) {
@@ -1327,12 +1715,12 @@ function syncCanonical() {
     }
     // canonical-only shells beyond the new page count disappear
     for (const [n, div] of [...pageDivs]) {
-      if (mode !== 'opaque' && n > canonical.pageCount && div.dataset.prov !== '1') {
+      if (!usesCanonicalSurface() && n > canonical.pageCount && div.dataset.prov !== '1') {
         div.remove();
         pageDivs.delete(n);
       }
     }
-    if (mode === 'opaque') {
+    if (usesCanonicalSurface()) {
       if (canonical.rev >= appliedSrcRev) {
         opaqueBatch = getOpaqueCanonicalBatch({
           id: canonical.id,
@@ -1367,6 +1755,29 @@ function syncCanonical() {
 function updateCanonState(n) {
   const div = pageDivs.get(n);
   if (!div) return;
+  const anchorCanonical = canonicalAnchorForPage(n);
+  if (anchorCanonical) {
+    // A canonical compile for an intermediate keystroke may arrive while a
+    // newer terminal overlay is already visible. Do not regress to that
+    // one-revision-old PDF: retain the immutable base page used to address
+    // the cumulative overlay until a canonical covers targetSrcRev.
+    const src = `/canonical/${n}.svg?c=${anchorCanonical.baseGeneration}`;
+    const paperWidth = Number(div.dataset.canonPaperW) || Number(geometry.paperwidth);
+    const paperHeight = Number(div.dataset.canonPaperH) || Number(geometry.paperheight);
+    const img = queueCanonicalImageSwap(
+      div,
+      src,
+      { w: paperWidth, h: paperHeight },
+      { id: anchorCanonical.baseGeneration, rev: anchorCanonical.baseRev, pageCount: canonical?.pageCount }
+    );
+    const targetPresented = Boolean(
+      img?.dataset.src === src && div.dataset.canonPresentedSrc === src
+    );
+    div.classList.toggle('is-final', targetPresented);
+    div.classList.remove('is-partial', 'phantom');
+    if (targetPresented) tryApplyPendingCanonicalAnchor();
+    return;
+  }
   const canonAvail = canonical && canonical.id && n <= canonical.pageCount;
   const coldFresh = canonAvail && (pageDirtyRev.get(n) ?? 0) <= canonical.rev;
   const ship = shipPages.get(n);
@@ -1375,7 +1786,9 @@ function updateCanonState(n) {
   const useShip = mode !== 'opaque' && shipOk && (!coldFresh || ship.srcRev > canonical.rev);
   const fresh = coldFresh || useShip;
   let img = div.querySelector('img.canon');
-  const stageCanonical = canonAvail && (mode !== 'opaque' || canonical.rev >= appliedSrcRev);
+  const stageCanonical = canonAvail && (
+    previewPolicy === 'canonical-anchor' || mode !== 'opaque' || canonical.rev >= appliedSrcRev
+  );
   let targetSrc = null;
   if (stageCanonical || useShip) {
     const src = useShip
@@ -1389,7 +1802,12 @@ function updateCanonState(n) {
         ? { w: geometry.paperwidth, h: geometry.paperheight }
         : canonical.papers?.[n - 1] ?? canonical.paper,
       useShip
-        ? { id: null, rev: ship.srcRev, pageCount: canonical?.pageCount }
+        ? {
+            id: null,
+            rev: ship.srcRev,
+            pageCount: canonical?.pageCount,
+            shipWaveKey: ship.batchKey,
+          }
         : { id: canonical.id, rev: canonical.rev, pageCount: canonical.pageCount }
     );
   } else {
@@ -1404,7 +1822,7 @@ function updateCanonState(n) {
   const targetPresented = Boolean(
     targetSrc && img?.dataset.src === targetSrc && div.dataset.canonPresentedSrc === targetSrc
   );
-  const state = mode === 'opaque'
+  const state = usesCanonicalSurface()
     ? (img ? 'final' : 'provisional')
     : (fresh && targetPresented ? 'final' : 'provisional');
   if (img) img.style.clipPath = '';
@@ -1412,7 +1830,7 @@ function updateCanonState(n) {
   div.classList.remove('is-partial');
   // a fully-fresh canonical is the page-count authority: provisional-only
   // pages beyond it are phantoms of the JS pagination and are hidden
-  const phantom = mode !== 'opaque' &&
+  const phantom = !usesCanonicalSurface() &&
     canonical &&
     canonical.id &&
     canonical.rev >= appliedSrcRev &&
@@ -1427,7 +1845,7 @@ function updateBadge() {
   const parts = [];
   let cls = 'state-preview';
   let text;
-  if (mode === 'opaque') {
+  if (usesCanonicalSurface()) {
     const viewport = pagesEl.getBoundingClientRect();
     const visible = [...pageDivs.values()].filter((page) => {
       const rect = page.getBoundingClientRect();
@@ -1479,6 +1897,7 @@ function diffText(oldStr, newStr) {
 
 function scheduleSync() {
   scheduleHighlight();
+  pendingEditorInputAtEpochMs = Date.now();
   // Short debounce: the resident engine absorbs keystrokes in
   // milliseconds, but one POST per keystroke is still one full engine
   // update per keystroke — 80ms coalesces a fast burst into a single
@@ -1493,6 +1912,7 @@ function flushSync() {
     const current = editor.value;
     const d = diffText(serverText, current);
     if (!d) return;
+    const clientEditAtEpochMs = pendingEditorInputAtEpochMs;
     const t0 = performance.now();
     inFlight = true;
     noteEditStart(); // status pill: computing, instantly
@@ -1502,7 +1922,7 @@ function flushSync() {
         headers: { 'Content-Type': 'application/json' },
         // rev: optimistic-concurrency token — the server 409s instead of
         // silently applying our offsets to a source that moved under us
-        body: JSON.stringify({ ...d, rev: appliedSrcRev }),
+        body: JSON.stringify({ ...d, rev: appliedSrcRev, clientEditAtEpochMs }),
       });
       if (res.status === 409) {
         // the source moved (another client/tab): resync our base text and
@@ -1519,7 +1939,14 @@ function flushSync() {
       const report = await res.json();
       if (report.error) throw new Error(report.error);
       serverText = current;
+      if (pendingEditorInputAtEpochMs === clientEditAtEpochMs) pendingEditorInputAtEpochMs = null;
       const rtt = performance.now() - t0;
+      if (Number.isInteger(Number(report.srcRev))) {
+        canonicalAnchorEditStartedAt.set(Number(report.srcRev), t0);
+        for (const rev of canonicalAnchorEditStartedAt.keys()) {
+          if (rev < Number(report.srcRev) - 4) canonicalAnchorEditStartedAt.delete(rev);
+        }
+      }
       applyReport(report);
       renderInspector(report, rtt);
       const engineMs =
@@ -1636,11 +2063,11 @@ pagesEl.addEventListener('click', async (ev) => {
   if (ev.target?.closest?.('.tdom-direct-editor')) return;
   const clickEpoch = ++directEditClickEpoch;
   const clickedPage = pageAtClientPoint(ev, ev.target);
-  const presented = mode === 'opaque' ? presentedPageState(clickedPage) : null;
-  if (mode === 'opaque' && !presented) return;
+  const presented = usesCanonicalSurface() ? presentedPageState(clickedPage) : null;
+  if (usesCanonicalSurface() && !presented) return;
   const stillCurrent = () => {
     if (clickEpoch !== directEditClickEpoch || !clickedPage?.isConnected) return false;
-    if (mode !== 'opaque') return true;
+    if (!usesCanonicalSurface()) return true;
     const current = presentedPageState(clickedPage);
     return current?.id === presented.id && current?.rev === presented.rev && current?.src === presented.src;
   };
@@ -2188,7 +2615,7 @@ async function opaquePrintBounds(
 
 async function refreshDirectEditorExactBounds(pageNumber) {
   const session = directEditor;
-  if (!session || mode !== 'opaque' || session.pageNumber !== pageNumber) return;
+  if (!session || !usesCanonicalSurface() || session.pageNumber !== pageNumber) return;
   const page = pageDivs.get(pageNumber);
   const presented = presentedPageState(page);
   if (!presented) return;
@@ -2219,9 +2646,9 @@ async function refreshDirectEditorExactBounds(pageNumber) {
 }
 
 async function syncLocationForClick(event, page) {
-  const presented = mode === 'opaque' ? presentedPageState(page) : null;
+  const presented = usesCanonicalSurface() ? presentedPageState(page) : null;
   const mappingId = presented?.id ?? canonical?.id;
-  if (!mappingId || (mode !== 'opaque' && canonical.rev !== appliedSrcRev)) return null;
+  if (!mappingId || (!usesCanonicalSurface() && canonical.rev !== appliedSrcRev)) return null;
   const pageNumber = Number(page?.dataset?.page);
   const point = paperPointForClick(event, page);
   if (!point || !Number.isFinite(pageNumber)) return null;
@@ -2245,7 +2672,7 @@ async function syncLocationForClick(event, page) {
 }
 
 async function resolveOpaqueEditRegion(page, event) {
-  if (mode !== 'opaque') return null;
+  if (!usesCanonicalSurface()) return null;
   if (!page) page = pageAtClientPoint(event);
   const pageNumber = Number(page?.dataset?.page);
   const point = paperPointForClick(event, page);
@@ -2770,7 +3197,7 @@ function alignOpaqueNativeCaretAnchor(expectedSessionId = directEditor?.sessionI
   // pointer hitbox; ordinary re-clicks must retain the shell's exact bounds.
   control.style.transform = '';
   session.nativeCaretAnchor = null;
-  if (mode !== 'opaque' || session.imeComposing !== true ||
+  if (!usesCanonicalSurface() || session.imeComposing !== true ||
       !session.canonicalAnchorPoint) return;
   const page = pageDivs.get(session.pageNumber);
   if (!page?.isConnected) return;
@@ -2800,7 +3227,7 @@ function positionOpaqueSuggestionPanel(page, pageRect) {
   if (!session?.element?.isConnected) return;
   const panel = session.element.querySelector('.math-wysiwyg-panel');
   if (!panel) return;
-  if (mode !== 'opaque' || !session.canonicalAnchorPoint) {
+  if (!usesCanonicalSurface() || !session.canonicalAnchorPoint) {
     session.element.style.removeProperty('--tdom-canonical-panel-left');
     session.element.style.removeProperty('--tdom-canonical-panel-top');
     panel.style.left = '';
@@ -2948,8 +3375,8 @@ async function openDirectEditor(
   const page = target.closest('#pages > .page');
   const pageNumber = Number(page?.dataset?.page);
   if (!page || !Number.isFinite(pageNumber)) return;
-  const presented = mode === 'opaque' ? presentedPageState(page) : null;
-  if (mode === 'opaque' && !presented) return;
+  const presented = usesCanonicalSurface() ? presentedPageState(page) : null;
+  if (usesCanonicalSurface() && !presented) return;
   const region = knownRegion ?? await editRegionById(id);
   if (!region) return;
   if (directEditor) {
@@ -2964,7 +3391,7 @@ async function openDirectEditor(
 
   const shell = document.createElement('div');
   shell.className = `tdom-direct-editor is-${region.kind}`;
-  shell.classList.toggle('is-opaque', mode === 'opaque');
+  shell.classList.toggle('is-opaque', usesCanonicalSurface());
   shell.dataset.edit = id;
   const sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
   let control;
@@ -3071,7 +3498,7 @@ async function openDirectEditor(
   control.addEventListener('input', () => {
     resizeText();
     realignOpaqueCaret();
-    if (mode === 'opaque' && region.kind === 'math') {
+    if (usesCanonicalSurface() && region.kind === 'math') {
       requestAnimationFrame(repositionDirectEditor);
     }
     // Native IME composition can emit several transient input values.
@@ -3154,7 +3581,7 @@ async function openDirectEditor(
     try { control.menuItems = []; } catch { /* field remains keyboard-editable */ }
   }
   const Coordinator = window.TdomOpaqueEditorCoordinator;
-  const clickOnPaper = mode === 'opaque' && clickPoint
+  const clickOnPaper = usesCanonicalSurface() && clickPoint
     ? paperPointForClick({ clientX: clickPoint.x, clientY: clickPoint.y }, page)
     : null;
   const caretAnchorRatio = Coordinator?.caretAnchorRatio?.(printBounds, clickOnPaper) ?? null;
@@ -3232,7 +3659,7 @@ async function openDirectEditor(
     if (control.isContentEditable) {
       const selection = window.getSelection();
       let range = null;
-      if (mode === 'opaque') {
+      if (usesCanonicalSurface()) {
         if (Number.isInteger(caretOffset)) {
           const textNode = control.firstChild;
           if (textNode?.nodeType === Node.TEXT_NODE) {
@@ -3252,7 +3679,7 @@ async function openDirectEditor(
       }
       selection?.removeAllRanges();
       selection?.addRange(range);
-    } else if (mode === 'opaque') {
+    } else if (usesCanonicalSurface()) {
       if (Number.isInteger(caretOffset) && typeof control.getPromptRange === 'function') {
         const offset = mathModelOffsetFromSource(control, region.value, caretOffset, mathWrapped);
         if (Number.isFinite(offset) && offset >= 0) control.position = offset;
@@ -3290,14 +3717,14 @@ pagesEl.addEventListener('click', async (event) => {
   if (event.target?.closest?.('.tdom-direct-editor')) return;
   const clickEpoch = ++directEditClickEpoch;
   const target = event.target?.closest?.('[data-edit], .tdom-source-hit, [data-src]') ??
-    (mode === 'opaque' ? pageAtClientPoint(event, event.target) : null);
+    (usesCanonicalSurface() ? pageAtClientPoint(event, event.target) : null);
   if (!target) return;
   const targetPage = pageAtClientPoint(event, target);
-  const presented = mode === 'opaque' ? presentedPageState(targetPage) : null;
-  if (mode === 'opaque' && !presented) return;
+  const presented = usesCanonicalSurface() ? presentedPageState(targetPage) : null;
+  if (usesCanonicalSurface() && !presented) return;
   const stillCurrent = () => {
     if (clickEpoch !== directEditClickEpoch || !targetPage?.isConnected) return false;
-    if (mode !== 'opaque') return true;
+    if (!usesCanonicalSurface()) return true;
     const current = presentedPageState(targetPage);
     return current?.id === presented.id && current?.rev === presented.rev && current?.src === presented.src;
   };
@@ -3312,7 +3739,7 @@ pagesEl.addEventListener('click', async (event) => {
     }
     return;
   }
-  if (mode === 'opaque') {
+  if (usesCanonicalSurface()) {
     const page = targetPage;
     const resolved = await resolveOpaqueEditRegion(page, event);
     if (resolved && stillCurrent()) {
@@ -3596,7 +4023,7 @@ pagesEl.addEventListener('scroll', () => {
         return rect.bottom > viewport.top && rect.top < viewport.bottom;
       });
       const required = exposed.length ? exposed : [entries[0]];
-      if (mode === 'opaque') {
+      if (usesCanonicalSurface()) {
         if (!canonical?.id || canonical.inFlight || canonical.error || canonical.rev < appliedSrcRev) {
           return false;
         }
@@ -3963,15 +4390,69 @@ sse.onmessage = (ev) => {
     }
     if (msg.kind === 'canonical') {
       // a real-lualatex compile landed: converge every covered page to it
+      const activeAnchor = canonicalAnchorPendingPatch ?? canonicalAnchorPreview;
+      if (activeAnchor && (
+        msg.canonical?.rev >= Number(activeAnchor.targetSrcRev ?? activeAnchor.srcRev)
+      )) clearCanonicalAnchorPreview();
       canonical = msg.canonical;
       if (msg.mode) setMode(msg.mode, msg.canonical?.modeReasons ?? modeReasons);
       syncCanonical();
       return;
     }
-    if (msg.kind === 'ship') {
-      // one page's real pixels landed from the incremental authority
-      shipPages.set(msg.page, { gen: msg.gen, srcRev: msg.srcRev });
-      if (pageDivs.has(msg.page)) updateCanonState(msg.page);
+    if (msg.kind === 'canonical-anchor') {
+      applyCanonicalAnchorPatch(msg.patch);
+      return;
+    }
+    if (msg.kind === 'ship-wave') {
+      // The authority is one complete replay PDF after document end, not a
+      // bag of tail-page pager artifacts. Atomically decode every page that
+      // is visible now; offscreen pages only adopt this same immutable PDF
+      // generation when they later enter the viewport.
+      if (Date.now() >= Number(msg.deadlineAt) || Number(msg.srcRev) !== Number(appliedSrcRev)) return;
+      if (shipWaveBatch) cancelShipWaveBatch(shipWaveBatch);
+      const allPages = new Set((msg.pages ?? []).map(Number).filter(Number.isInteger));
+      if (!allPages.size) return;
+      const viewport = pagesEl.getBoundingClientRect();
+      const pages = new Set([...allPages].filter((page) => {
+        const div = pageDivs.get(page);
+        if (!div?.isConnected) return false;
+        const rect = div.getBoundingClientRect();
+        return rect.bottom > viewport.top && rect.top < viewport.bottom;
+      }));
+      const key = `${msg.gen}:${msg.srcRev}:${msg.deadlineAt}`;
+      const batch = {
+        key,
+        gen: Number(msg.gen),
+        srcRev: Number(msg.srcRev),
+        acceptedAt: Number(msg.acceptedAt),
+        receivedAt: Date.now(),
+        engineElapsedMs: Number(msg.elapsedMs),
+        deadlineAt: Number(msg.deadlineAt),
+        allPages,
+        pages,
+        expected: new Map(),
+        cutoffTimer: null,
+      };
+      for (const page of allPages) {
+        shipPages.set(page, {
+          gen: batch.gen,
+          srcRev: batch.srcRev,
+          batchKey: key,
+          deadlineAt: batch.deadlineAt,
+        });
+      }
+      // There may be no visible page during a reset/resize. The backing
+      // generation is already committed; its first future page is rendered
+      // lazily from the complete PDF rather than a stale pager fragment.
+      if (!pages.size) return;
+      shipWaveBatch = batch;
+      batch.cutoffTimer = window.setTimeout(
+        () => cancelShipWaveBatch(batch),
+        Math.max(0, batch.deadlineAt - Date.now())
+      );
+      for (const page of pages) {
+        if (pageDivs.has(page)) updateCanonState(page);
+      }
       return;
     }
     if (msg.kind === 'patches') {
@@ -3981,7 +4462,7 @@ sse.onmessage = (ev) => {
       if (msg.rev > appliedRev) {
         injectFonts(msg.fonts);
         appliedRev = msg.rev;
-        if (mode === 'opaque') return;
+        if (mode === 'opaque' || previewPolicy !== 'structured') return;
         for (const patch of msg.patches) {
           if (patch.type === 'replace-page') {
             const dl = patch.displayList;

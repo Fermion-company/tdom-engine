@@ -5,7 +5,7 @@ await import('../web/viewport-math.js');
 
 const { capturePageAnchor, calculateAnchoredScroll } = globalThis.TdomViewportMath;
 
-test('zoom keeps the paper point beneath the trackpad gesture', () => {
+test('TDOM zoom keeps the paper point beneath the trackpad gesture', () => {
   const anchor = capturePageAnchor({
     clientX: 300,
     clientY: 350,
@@ -28,7 +28,7 @@ test('zoom keeps the paper point beneath the trackpad gesture', () => {
   });
 });
 
-test('zoom clamps a gesture in the page margin to the paper edge', () => {
+test('TDOM zoom clamps a gesture in the page margin to the paper edge', () => {
   assert.deepEqual(capturePageAnchor({
     clientX: 20,
     clientY: 900,

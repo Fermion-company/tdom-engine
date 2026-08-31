@@ -37,7 +37,7 @@ TDOM Engine は、LaTeX を書いている最中の「少し直すたびに全�
 
 ## 安全判定と退避経路
 
-`engine/checkpoint/safety.js` は、document-level に structured path を壊す構造を検出する。shipout hook、`twocolumn`、`\marginpar`、mid-document geometry change などは文書全体を opaque mode に送る。
+`engine/checkpoint/safety.js` は、document-level に structured path を壊す構造を検出する。shipout hook、`\balance`、mid-document geometry change などは文書全体を opaque mode に送る。標準 class option の `twocolumn` と本文中の `\onecolumn` / `\twocolumn` は resident LuaLaTeX の実定義・実列幅をチェックポイントへ保存し、物理ページは canonical PDF、TeXが可視本文として抽出した編集領域だけを SyncTeX で実ページ・実列へ重ねる。同じ段落に `\textbf` などがあっても、編集が通常テキスト内で行数不変なら変更行以降だけを差し替える。末尾で1行だけ増える打鍵も、先行行がTeX出力として同一なら2行をまとめて差し替える。`\marginpar` は block の本文を組み、表示は canonical-only にする。
 
 一方、`\includepdf`、`longtable`、`multicols`、`landscape`、breakable `tcolorbox` などは block-level rescue の対象であり、文書全体を opaque にしない。
 

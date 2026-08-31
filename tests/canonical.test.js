@@ -4,7 +4,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import {
+  rmSync,
+  mkdirSync,
+  writeFileSync,
+  existsSync,
+  realpathSync,
+  symlinkSync,
+} from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -186,6 +193,24 @@ test('upright words diagnose a missing pdflscape transform without rejecting bar
 
 // -------------------------------------------- demand-paced authority cadence
 
+test('canonical work paths use the filesystem-native spelling for SyncTeX', () => {
+  const actual = WORK + '-realpath';
+  const alias = WORK + '-realpath-alias';
+  rmSync(actual, { recursive: true, force: true });
+  rmSync(alias, { recursive: true, force: true });
+  mkdirSync(actual, { recursive: true });
+  symlinkSync(actual, alias, 'dir');
+  const c = new CanonicalRenderer({ workDir: alias });
+  try {
+    assert.equal(c.workDir, realpathSync.native(actual),
+      'the path queried through SyncTeX exactly matches the spelling recorded by lualatex');
+  } finally {
+    c.dispose();
+    rmSync(alias, { force: true });
+    rmSync(actual, { recursive: true, force: true });
+  }
+});
+
 test('authority pressure: fast baseline, then deep idle + cost cooldown', () => {
   const c = new CanonicalRenderer({ workDir: WORK + '-pace' });
   try {
@@ -237,7 +262,16 @@ test('safety gate: clean documents pass, page-mechanism hazards demote', () => {
   );
   assert.equal(clean.safe, true);
   assert.equal(classifyDocument('\\documentclass{article}\\usepackage{eso-pic}', '').safe, false);
-  assert.equal(classifyDocument('\\documentclass[a4paper,twocolumn]{article}', '').safe, false);
+  const twoColumn = classifyDocument('\\documentclass[a4paper,twocolumn]{article}', 'body');
+  assert.equal(twoColumn.safe, true);
+  assert.equal(twoColumn.previewPolicy, 'canonical-anchor');
+  const switchedColumns = classifyDocument(
+    '\\documentclass{article}',
+    '\\onecolumn Title copy.\\twocolumn Body copy.'
+  );
+  assert.equal(switchedColumns.safe, true);
+  assert.equal(switchedColumns.previewPolicy, 'canonical-anchor');
+  assert.deepEqual(switchedColumns.previewReasons, ['body column switch']);
   assert.equal(classifyDocument('\\documentclass[landscape]{article}', '').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}\\AtBeginShipout{x}', '').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}\\usepackage{pdflscape}', 'body').safe, false);

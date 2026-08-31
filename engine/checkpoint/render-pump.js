@@ -1,11 +1,14 @@
 import { renderResidentBlock } from './resident-render.js';
+import { shippingPriorityQuietMs } from './interactive-priority.js';
 
 /** Exact pixels are replaceable latency work. A new edit must not wait behind
  * boot/backlog renders that already occupy every pump lane. Cancel resident
- * render children and discard their cold queue while the update lock is held;
- * isolated `iso@` compiles are cache-producing work and continue separately. */
+ * render children while the update lock is held. Queued block ids stay in
+ * the latest-wins map: the edit will reinsert its own block at the newest
+ * position, then unchanged boot/backlog work can resume after the quiet gate
+ * instead of being lost forever. Isolated `iso@` compiles are cache-producing
+ * work and continue separately. */
 export function preemptResidentRenders(engine) {
-  engine.renderWant.clear();
   for (const [requestId, pid] of [...(engine.renderPids ?? [])]) {
     if (!requestId.startsWith('rr@')) continue;
     if (pid > 0) {
@@ -48,6 +51,20 @@ function pumpRenders(engine, callbacks) {
       while (engine.renderWant.size) {
         if (engine.updating) {
           await new Promise((r) => setTimeout(r, 25));
+          continue;
+        }
+        // Exact chunks (math/TikZ/tcolorbox) are valuable only after the
+        // command burst settles. Plain glyph output has already reached the
+        // browser through the foreground JOB; a short latest-wins quiet gate
+        // prevents valid intermediate command states from spawning a PDF
+        // render per keystroke without adding latency to prose.
+        const quietMs = shippingPriorityQuietMs(
+          engine,
+          Math.max(0, Number(process.env.TDOM_RENDER_QUIET_MS ?? 120))
+        );
+        const remaining = quietMs - (Date.now() - (engine.lastEditAt ?? 0));
+        if (remaining > 0) {
+          await new Promise((r) => setTimeout(r, Math.min(25, remaining)));
           continue;
         }
         const id = [...engine.renderWant.keys()].pop(); // newest first

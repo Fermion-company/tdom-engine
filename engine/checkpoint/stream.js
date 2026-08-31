@@ -49,7 +49,7 @@ export function buildStream(block, chunks) {
       d: f.d ?? 0,
       gfx: f.gfx,
       blockId: block.id,
-      units: miniUnits(f.items, block.id, chunkRef, suppress),
+      units: miniUnits(f.items, block.id, chunkRef, suppress, galley?.backend),
     };
   };
 
@@ -81,7 +81,7 @@ export function buildStream(block, chunks) {
         h: it.h ?? it.hc ?? 0,
         d: it.d ?? 0,
         hc: it.hc ?? it.h ?? 0,
-        units: miniUnits(it.items, block.id, chunkRef, suppress),
+        units: miniUnits(it.items, block.id, chunkRef, suppress, galley?.backend),
       });
     } else if (it.k === 'fm') {
       const f = makeFloat(it.n);
@@ -147,6 +147,7 @@ export function buildStream(block, chunks) {
           // extents remain useful as transparent source-line hit geometry.
           editRuns: it.runs ?? [],
           gfxChunk,
+          backend: galley?.backend ?? null,
         },
       };
       stream.push({ t: 'box', u: unit });
@@ -181,7 +182,7 @@ export function buildStream(block, chunks) {
 /** Convert a captured mini-galley (float body, footnote text) to draw
  * units. `suppress` blanks the glyph runs when the fidelity gate forbids a
  * glyph bridge and no exact chunk has landed yet. */
-export function miniUnits(items, blockId, chunkRef, suppress = false) {
+export function miniUnits(items, blockId, chunkRef, suppress = false, backend = null) {
   const units = [];
   let y = 0;
   for (const it of items ?? []) {
@@ -200,6 +201,7 @@ export function miniUnits(items, blockId, chunkRef, suppress = false) {
         boxH: it.h ?? 0,
         runs: suppress && !chunkRef ? [] : (it.runs ?? []),
         editRuns: it.runs ?? [],
+        backend,
         gfxChunk: chunkRef
           ? { blockId: chunkRef.key, yOff: y, w: chunkRef.w, stale: chunkRef.stale }
           : null,

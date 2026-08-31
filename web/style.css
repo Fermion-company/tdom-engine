@@ -460,6 +460,16 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 }
 .page.is-final svg,
 .page.is-final .chunkwin { opacity: 0; }
+.page.is-final svg.tdom-canonical-delta {
+  display: block;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 6;
+  opacity: 1;
+  pointer-events: none;
+}
 /* pages the fresh canonical says don't exist */
 .page.phantom { display: none; }
 

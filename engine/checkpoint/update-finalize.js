@@ -37,16 +37,20 @@ export function finalizeUpdate(engine, {
   // collapse to the grid before scheduling background work (a full boot
   // walk of a large document is the worst offender)
   enforceCheckpointCap();
-  scheduleBackground(fgStop, dirtyBlocks);
-  timer.lap('schedule');
 
   engine.rev++;
   engine.srcRev++;
+  // Start the only sub-second, complete-PDF path before arming any
+  // replaceable background work. The schedulers below observe the shared
+  // post-edit priority window and stay idle until the shipping deadline has
+  // passed; this ordering also binds the shipping generation to srcRev.
+  shipUpdate(text);
   // converge to exact: the canonical compile of THIS source is scheduled
   // off the hot path; when it lands the client swaps every clean page to
   // LuaLaTeX's own pixels
   engine.canonical.schedule(text, engine.srcRev);
-  shipUpdate(text);
+  scheduleBackground(fgStop, dirtyBlocks);
+  timer.lap('schedule');
   return buildUpdateResponse({
     rev: engine.rev,
     srcRev: engine.srcRev,
@@ -54,6 +58,8 @@ export function finalizeUpdate(engine, {
     backendName: engine.backendName,
     mode: engine.mode,
     modeReasons: engine.modeReasons,
+    previewPolicy: engine.previewPolicy,
+    previewReasons: engine.previewReasons,
     canonical: engine.canonical.info(),
     dirtySource,
     dirtyBlocks,

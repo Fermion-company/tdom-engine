@@ -23,6 +23,22 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from './engine/checkpoint/engine-v3.js';
 import {
+  buildTerminalCanonicalPatch,
+  captureCanonicalAnchorBase,
+  dirtyWithoutPatchFallback,
+  planTerminalCanonicalAnchor,
+} from './engine/checkpoint/canonical-anchor.js';
+import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
+
+// Certified canonical anchoring is deliberately narrow: only plain-text
+// edits whose unchanged line structure, backend run semantics, SyncTeX
+// location and canonical PDF paint all agree may publish. Arbitrary TeX
+// callbacks/output-routine effects still fall through to ShippingChain or a
+// full canonical build. Keep the old variable as a compatibility alias for
+// existing development scripts.
+const ENABLE_CANONICAL_ANCHOR = process.env.TDOM_CANONICAL_ANCHOR === '1' ||
+  process.env.TDOM_UNSAFE_CANONICAL_ANCHOR === '1';
+import {
   describeExternalBibliography,
   prepareExternalBibliography,
 } from './engine/project-bibliography.js';
@@ -423,10 +439,18 @@ const sampleFile = /^[a-z0-9-]+\.tex$/i.test(process.env.TDOM_SAMPLE || '')
   : 'stress-test-ja.tex';
 const sample = readFileSync(path.join(ROOT, 'samples', sampleFile), 'utf8');
 let lastReport = await engine.open(sample);
+// Last browser-side atomic presentation certificate.  This is diagnostics,
+// not authority: the renderer reports it only after every visible page in a
+// shipping wave has decoded and the DOM swap has survived two animation
+// frames.  Keeping it on /status lets the real Electron UI prove the
+// input-generation-to-pixels latency without relying on an external stopwatch.
+let lastShipPresentation = null;
+let lastAnchorPresentation = null;
 // Monotonic identity of the document loaded into this resident process.
 // Ordinary source edits stay within an epoch. A new root or a preamble
 // reboot advances it before any client is allowed to discard old pixels.
 let documentEpoch = 1;
+let terminalAnchorLineage = null;
 let activeProject = {
   docDir: path.join(ROOT, 'samples'),
   file: sampleFile,
@@ -632,6 +656,7 @@ let pendingDocumentReset = null;
 
 function beginDocumentReset(reason) {
   documentEpoch += 1;
+  terminalAnchorLineage = null;
   pendingDocumentReset = { epoch: documentEpoch, reason };
   broadcast({ kind: 'reset-pending', reason });
   return documentEpoch;
@@ -709,12 +734,16 @@ engine.onExternalChange = () => {
 // canonical compiles land asynchronously: tell every client so it can
 // converge its pages to the exact LuaLaTeX render
 engine.onCanonical = (info) => {
+  if (terminalAnchorLineage && info.id !== terminalAnchorLineage.baseGeneration) {
+    terminalAnchorLineage = null;
+  }
   broadcast({ kind: 'canonical', canonical: info, mode: engine.mode });
 };
-// incremental authority (TDOM_SHIP=1): a page's real pixels landed — the
-// client swaps just that page, without waiting for the cold compile
-engine.onShipPage = (info) => {
-  broadcast({ kind: 'ship', ...info });
+// Incremental authority (TDOM_SHIP=1): one complete replay PDF reached
+// normal document end. The client atomically swaps its visible pages and
+// lazily renders every offscreen page from that same immutable generation.
+engine.onShipWave = (info) => {
+  broadcast({ kind: 'ship-wave', ...info });
 };
 
 const MIME = {
@@ -856,6 +885,8 @@ function docPayload() {
     backend,
     mode: engine.mode,
     modeReasons: engine.modeReasons,
+    previewPolicy: engine.previewPolicy,
+    previewReasons: engine.previewReasons,
     canonical: engine.canonical.info(),
     source: engine.getSource(),
     pages: engine.getDisplayLists(),
@@ -975,6 +1006,83 @@ async function validatedForwardSyncAll(location, id) {
   return validated.length ? validated : plausible.length ? plausible : candidates;
 }
 
+async function rawForwardCandidatesForRange(source, id, deadline) {
+  const file = canonicalInputForProjectFile(source?.file);
+  const first = Math.floor(Number(source?.start?.line));
+  const last = Math.floor(Number(source?.end?.line));
+  if (!file || !Number.isInteger(first) || !Number.isInteger(last) || first < 1 || last < first) return null;
+  const lines = Array.from({ length: last - first + 1 }, (_, index) => first + index);
+  const groups = Array(lines.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(8, lines.length) }, async () => {
+    while (cursor < lines.length) {
+      if (performance.now() >= deadline) return;
+      const index = cursor++;
+      groups[index] = await engine.canonical.forwardSyncAll({ file, line: lines[index], column: 1, id });
+    }
+  });
+  await Promise.all(workers);
+  return groups.every(Array.isArray) ? groups.flat() : null;
+}
+
+async function beforeDeadline(promise, deadline) {
+  const remaining = Math.floor(deadline - performance.now());
+  if (remaining <= 0) return null;
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((resolve) => { timer = setTimeout(() => resolve(null), remaining); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function resolveTerminalCanonicalAnchor(plan, epoch) {
+  const candidates = await beforeDeadline(
+    rawForwardCandidatesForRange(plan.source, plan.baseGeneration, plan.proofDeadline),
+    plan.proofDeadline
+  ).catch(() => null);
+  const pages = [...new Set((candidates ?? []).map((candidate) => Number(candidate.page)))];
+  const paintPages = candidates?.length
+    ? await beforeDeadline(engine.canonical.pdfPaintPages(plan.baseGeneration, pages), plan.proofDeadline)
+      .catch(() => null)
+    : null;
+  if (documentEpoch !== epoch || engine.srcRev !== plan.srcRev) return;
+  const currentCanonical = engine.canonical.info();
+  const currentCertificate = engine.canonical.generationCertificate(plan.baseGeneration);
+  if (currentCanonical.id !== plan.baseGeneration || currentCanonical.rev !== plan.baseRev ||
+      currentCertificate?.pdfHash !== plan.baseSnapshot.certificate.pdfHash ||
+      currentCertificate?.synctexHash !== plan.baseSnapshot.certificate.synctexHash) return;
+  let rejectReason = null;
+  if (!candidates?.length) rejectReason = 'NO_SYNC_CANDIDATES';
+  else if (!paintPages) rejectReason = 'PDF_PAINT_INDEX_UNAVAILABLE';
+  else if (performance.now() >= plan.proofDeadline) rejectReason = 'PROOF_DEADLINE_EXCEEDED';
+  const matching = !rejectReason
+    ? certifyCanonicalBlock({
+        witnesses: plan.baseLineWitnesses,
+        candidates,
+        paintPages,
+      })
+    : null;
+  if (!rejectReason && !matching) rejectReason = 'AMBIGUOUS_OR_MISMATCHED_ANCHOR';
+  if (!rejectReason && performance.now() >= plan.publishDeadline) rejectReason = 'PUBLISH_DEADLINE_EXCEEDED';
+  const patch = matching && !rejectReason
+    ? buildTerminalCanonicalPatch(plan, matching)
+    : null;
+  if (!rejectReason && !patch) rejectReason = 'PAINT_NOT_ISOLATED';
+  if (patch) patch.proofMs = performance.now() - plan.acceptedAt;
+  broadcast({
+    kind: 'canonical-anchor',
+    patch: patch ?? {
+      status: 'fallback',
+      blockId: plan.blockId,
+      srcRev: plan.srcRev,
+      baseGeneration: plan.baseGeneration,
+      baseRev: plan.baseRev,
+      reason: rejectReason ?? 'CANONICAL_ANCHOR_UNAVAILABLE',
+      proofMs: performance.now() - plan.acceptedAt,
+    },
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
@@ -1012,6 +1120,7 @@ const server = http.createServer(async (req, res) => {
         queued: engineBusy,
         busyMs: engineBusy > 0 ? Date.now() - engineBusySince : 0,
         mode: engine.mode,
+        previewPolicy: engine.previewPolicy,
         rev: engine.rev,
         srcRev: engine.srcRev,
         documentEpoch,
@@ -1023,8 +1132,86 @@ const server = http.createServer(async (req, res) => {
           pids: Object.fromEntries(engine.renderPids ?? []),
           stats: engine.renderStats,
         },
+        shipping: engine.shipping?.info?.() ?? null,
+        shippingPresentation: lastShipPresentation,
+        canonicalAnchorPresentation: lastAnchorPresentation,
+        warm: engine.warmInfo ?? null,
+        foregroundLeaseMs: engine.foregroundLeaseMs ?? 0,
+        authorityDeferred: engine.authorityDeferred ?? false,
         canonical: engine.canonical.info(),
       });
+    }
+    if (req.method === 'POST' && url.pathname === '/ship-presented') {
+      const body = JSON.parse(await readBody(req));
+      const gen = Number(body.gen);
+      const srcRev = Number(body.srcRev);
+      const acceptedAt = Number(body.acceptedAt);
+      const receivedAt = Number(body.receivedAt);
+      const presentedAt = Number(body.presentedAt);
+      if (![gen, srcRev, acceptedAt, receivedAt, presentedAt].every(Number.isFinite)) {
+        return json(res, { error: 'invalid presentation certificate' }, 400);
+      }
+      // A late iframe must not overwrite the current generation's proof.
+      if (srcRev !== Number(engine.srcRev) || gen !== Number(engine.shipping?.gen)) {
+        return json(res, { ok: false, stale: true });
+      }
+      lastShipPresentation = {
+        gen,
+        srcRev,
+        acceptedAt,
+        receivedAt,
+        presentedAt,
+        engineElapsedMs: Number.isFinite(Number(body.engineElapsedMs))
+          ? Number(body.engineElapsedMs)
+          : null,
+        acceptedToPresentedMs: presentedAt - acceptedAt,
+        eventToPresentedMs: presentedAt - receivedAt,
+        pages: Array.isArray(body.pages) ? body.pages.map(Number).filter(Number.isInteger) : [],
+      };
+      return json(res, { ok: true });
+    }
+    if (req.method === 'POST' && url.pathname === '/anchor-presented') {
+      const body = JSON.parse(await readBody(req));
+      const srcRev = Number(body.srcRev);
+      const baseGeneration = Number(body.baseGeneration);
+      const baseRev = Number(body.baseRev);
+      const commitMs = Number(body.commitMs);
+      const firstFrameMs = Number(body.firstFrameMs);
+      const secondFrameMs = Number(body.secondFrameMs);
+      if (![srcRev, baseGeneration, baseRev, commitMs, firstFrameMs, secondFrameMs]
+        .every(Number.isFinite) || commitMs < 0 || firstFrameMs < commitMs ||
+        secondFrameMs < firstFrameMs || secondFrameMs > 10_000) {
+        return json(res, { error: 'invalid canonical anchor presentation certificate' }, 400);
+      }
+      const currentCanonical = engine.canonical.info();
+      if (srcRev !== Number(engine.srcRev) || baseGeneration !== Number(currentCanonical.id) ||
+          baseRev !== Number(currentCanonical.rev)) {
+        return json(res, { ok: false, stale: true });
+      }
+      lastAnchorPresentation = {
+        srcRev,
+        baseGeneration,
+        baseRev,
+        commitMs,
+        firstFrameMs,
+        secondFrameMs,
+        proofMs: Number.isFinite(Number(body.proofMs)) ? Number(body.proofMs) : null,
+        inputToSecondFrameMs: Number.isFinite(Number(body.inputToSecondFrameMs))
+          ? Number(body.inputToSecondFrameMs)
+          : null,
+        pages: Array.isArray(body.pages) ? body.pages.map(Number).filter(Number.isInteger) : [],
+        receivedAt: Date.now(),
+      };
+      return json(res, { ok: true });
+    }
+    if (req.method === 'POST' && url.pathname === '/warm') {
+      const body = JSON.parse(await readBody(req));
+      const offset = Number(body.offset);
+      if (!Number.isFinite(offset)) return json(res, { error: 'warm requires a finite offset' }, 400);
+      void engine.warmEditOffset(offset).catch((error) => {
+        engine.warmInfo = { status: 'error', message: error?.message ?? String(error) };
+      });
+      return json(res, { scheduled: true, srcRev: engine.srcRev });
     }
     if (req.method === 'GET' && url.pathname === '/doc') return json(res, docPayload());
     if (req.method === 'GET' && url.pathname === '/templates') return json(res, listTemplates());
@@ -1254,6 +1441,15 @@ const server = http.createServer(async (req, res) => {
         return json(res, { error: 'edit requires {start, end, text}' }, 400);
       }
       let resetEpoch = null;
+      let anchorInputSafe = false;
+      let anchorBaseSnapshot = null;
+      const anchorAcceptedAt = performance.now();
+      const rawClientEditAt = Number(body.clientEditAtEpochMs);
+      const nowEpoch = Date.now();
+      const anchorClientEditAt = Number.isFinite(rawClientEditAt) &&
+        rawClientEditAt >= nowEpoch - 60_000 && rawClientEditAt <= nowEpoch + 1_000
+        ? rawClientEditAt
+        : null;
       try {
         lastReport = await withEngine(async () => {
           // optional optimistic-concurrency guard: a client that states the
@@ -1271,6 +1467,18 @@ const server = http.createServer(async (req, res) => {
           const overlayDelta = applyProjectOverlays(activeProject, body);
           const changedInputs = [...overlayDelta.changed, ...overlayDelta.removed];
           const rootChanged = next !== current;
+          anchorInputSafe = rootChanged && changedInputs.length === 0;
+          if (ENABLE_CANONICAL_ANCHOR && anchorInputSafe) {
+            const certificate = engine.canonical.generationCertificate();
+            if (certificate && engine.canonical.sourceMatches(current, certificate.id)) {
+              anchorBaseSnapshot = captureCanonicalAnchorBase({
+                blocks: engine.blocks,
+                domBlocks: engine.getDOM().blocks,
+                edit: { start, end, text },
+                certificate,
+              });
+            }
+          }
           ensureProjectOutputDirectories(next);
           const nextBibliography = describeExternalBibliography(
             next,
@@ -1347,13 +1555,45 @@ const server = http.createServer(async (req, res) => {
         }
         throw err;
       }
+      if (Number(lastAnchorPresentation?.srcRev) !== Number(lastReport.srcRev)) {
+        lastAnchorPresentation = null;
+      }
+      lastReport.previewFallback = dirtyWithoutPatchFallback(lastReport);
+      const anchorPlan = ENABLE_CANONICAL_ANCHOR && anchorInputSafe
+        ? planTerminalCanonicalAnchor({
+            blocks: engine.blocks,
+            domBlocks: engine.getDOM().blocks,
+            report: lastReport,
+            geometry: engine.getGeometry(),
+            lineage: terminalAnchorLineage,
+            edit: { start, end, text },
+            baseSnapshot: anchorBaseSnapshot,
+            acceptedAt: anchorAcceptedAt,
+            clientEditAtEpochMs: anchorClientEditAt,
+          })
+        : null;
+      if (anchorPlan) {
+        anchorPlan.public.acceptedElapsedMs = performance.now() - anchorAcceptedAt;
+        lastReport.canonicalAnchor = anchorPlan.public;
+        terminalAnchorLineage = {
+          blockId: anchorPlan.blockId,
+          baseGeneration: anchorPlan.baseGeneration,
+          baseRev: anchorPlan.baseRev,
+          lastSrcRev: anchorPlan.srcRev,
+          baseSnapshot: anchorPlan.baseSnapshot,
+        };
+      } else if (lastReport.dirtySourceNodes?.length) {
+        terminalAnchorLineage = null;
+      }
       // one serialization for both consumers: the SSE fanout and the HTTP
       // response used to stringify the full report (all patches) twice
       const reportJson = JSON.stringify(lastReport);
       completeDocumentReset(resetEpoch);
       broadcastRaw(`{"kind":"update","documentEpoch":${documentEpoch},"report":${reportJson}}`);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      return res.end(reportJson);
+      res.end(reportJson);
+      if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch);
+      return;
     }
     if (req.method === 'POST' && url.pathname === '/open') {
       const raw = await readBody(req);

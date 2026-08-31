@@ -35,7 +35,7 @@ PDF export は canonical layer から出る。checkpoint 表示 state は編集�
 
 ## 6.3 safety gate の現在地
 
-`engine/checkpoint/safety.js` は、document-level に structured path を壊す package/body token を検出する。現在の unsafe には、custom output routine、shipout hook、`twocolumn`、`marginpar`/`marginnote`、`newgeometry`、`enlargethispage`、`balance` などが含まれる。
+`engine/checkpoint/safety.js` は、document-level に structured path を壊す package/body token を検出する。現在の unsafe には、custom output routine、shipout hook、`newgeometry`、`balance` などが含まれる。標準 class option の `twocolumn` と本文中の `\onecolumn` / `\twocolumn` は canonical-addressed policy、`marginpar` / `marginnote` は canonical-only block で扱う。
 
 `pdfpages` の読み込み自体は unsafe package ではない。`\includepdf` は block-level rescue の対象である。
 
@@ -56,7 +56,10 @@ page count mismatch は report されるが、それだけで即座に文書全�
 | 領域 | 現在の扱い |
 | --- | --- |
 | custom output routine | document-level unsafe として structured path から外れる |
-| two-column / margin notes / geometry change | safety gate の対象 |
+| class option / body-switch two-column | canonical PDF 面 + resident LuaLaTeX 行計測 + 可視本文領域の SyncTeX 実列 overlay |
+| margin notes | 本文 galleyを保持する canonical-only block |
+| `onecolumn` / `twocolumn` switch | TeXの実出力箱を吸収し、active column stateをcheckpointへ保存 |
+| mid-document geometry change / `balance` | safety gate の対象 |
 | block-local output hijack | block-level rescue で exact chunk 化 |
 | footnote splitting | page builder は footnote を扱うが、TeX と同じ分割を完全再現する実装ではない |
 | float placement | 代表的な placement は扱うが、package が output routine を置き換える場合は rescue/opaque 側 |

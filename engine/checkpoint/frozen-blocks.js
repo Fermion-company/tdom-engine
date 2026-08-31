@@ -7,8 +7,13 @@ export function collectFrozenBlocks(blocks, isoFailCache, rescueCacheKey) {
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i];
     const failMsg = isoFailCache.get(rescueCacheKey(b, i));
-    if (b.galley?.tdomFrozen || failMsg) {
-      out.push({ id: b.id, text: b.text, reason: failMsg ?? 'hard-frozen galley' });
+    const nativeHold = b.galley?.tdomDeferred && b.closure?.reason === 'native-error';
+    if (b.galley?.tdomFrozen || nativeHold || failMsg) {
+      out.push({
+        id: b.id,
+        text: b.text,
+        reason: failMsg ?? (nativeHold ? 'native-error last-good hold' : 'hard-frozen galley'),
+      });
     }
   }
   return out;

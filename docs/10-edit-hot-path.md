@@ -113,7 +113,9 @@ exact chunk が stale の短い区間では、math-only 行は直前の正しい
 
 ## 10.10b checkpoint 予算の硬い上限
 
-`maxCheckpoints`（既定は env、主サーバは 8）は `#ckptGrid()` の粗さを決めるが、それだけでは生存 checkpoint 数の上限にならない。`#retireOffGrid(idx)` は「その JOB が処理した 1 index」しか退役させないので、mid-document から resume する pass（rescue pump・settle・chain・backward-ref）は各停止点に orphan checkpoint を残し、誰も retire しないまま生存集合が creep する（実測: budget 8 指定でも 25 個生存、boot 時 55 個超で 16GB 機が窒息）。`#enforceCheckpointCap()` が「ckpt0 ＋グリッド点 ＋ editHold ＋ renderHold だけ残し、他は DIE」で grid に畳み直す。`#updateInner()` 末（boot/edit walk 後）・`#asyncRescueOne` 後・`#runChainPass` の finally で呼ぶ。各 checkpoint は累積 dormant page を保持する常駐 lualatex なので、これは実メモリの上限である。
+`maxCheckpoints`（既定は env、主サーバは 8）は通常の常駐 checkpoint 骨格の予算である。骨格を block 数の等間隔にすると、編集点との間に巨大な TikZ / user macro block が一つあるだけで、無関係な地の文の毎打鍵がその block を再実行する（実測: 160 回の複合 macro 展開を跨いだ日本語 1 文字が 4.4 秒）。そこで各 block の cold typeset 高水位時間を記録し、最も高価な block の入力・出力境界を優先して残し、余りを重み付き分位へ配る。これは `tikzpicture` や `tcolorbox` の名前を判定する局所対応ではなく、未知 package / macro にも同じ実測原理で働く。上記 fixture では同じ編集が fresh-open 直後でも 15ms になった。
+
+ただし骨格選択だけでは生存 checkpoint 数の上限にならない。`#retireOffGrid(idx)` は「その JOB が処理した 1 index」しか退役させないので、mid-document から resume する pass（rescue pump・settle・chain・backward-ref）は各停止点に orphan checkpoint を残し、誰も retire しないまま生存集合が creep する（実測: budget 8 指定でも 25 個生存、boot 時 55 個超で 16GB 機が窒息）。`#enforceCheckpointCap()` が「ckpt0 ＋実測コスト骨格 ＋ editHold ＋ renderHold だけ残し、他は DIE」で畳み直す。`#updateInner()` 末（boot/edit walk 後）・`#asyncRescueOne` 後・`#runChainPass` の finally で呼ぶ。各 checkpoint は累積 dormant page を保持する常駐 lualatex なので、これは実メモリの上限である。
 
 `#shipUpdate()` は `TDOM_SHIP=1` のときだけ意味を持つ。現在の source を shipping chain に渡し、unit diff から resume できるかを判定する。実際の page ship と SVG 化は非同期で、`onShipPage` と SSE `ship` として着地する。
 
