@@ -1,5 +1,18 @@
-import { luaStr, labelDefBody, braceImbalance, startsAddvspace, startsVertical } from './util/tex.js';
+import { luaStr, labelDefBody, startsAddvspace, startsVertical } from './util/tex.js';
 import { parseVec } from './util/galley.js';
+
+function appendColumnState(L, state) {
+  const twoColumn = Number(state?.['tdom@twocolumn']);
+  const columnWidth = Number(state?.['tdom@columnwidth']);
+  if (!Number.isFinite(twoColumn) || !(columnWidth > 0)) return;
+  L.push(twoColumn ? '\\global\\@twocolumntrue\\global\\@firstcolumntrue\\global\\col@number=2\\relax'
+    : '\\global\\@twocolumnfalse\\global\\@firstcolumnfalse\\global\\col@number=1\\relax');
+  L.push(
+    `\\global\\columnwidth=${Math.round(columnWidth)}sp` +
+      `\\global\\hsize=${Math.round(columnWidth)}sp` +
+      `\\global\\linewidth=${Math.round(columnWidth)}sp\\@floatplacement`
+  );
+}
 
 export function buildDriverSource({
   preamble,
@@ -221,6 +234,7 @@ export function buildDriverSource({
   L.push('\\ifx\\@textbottom\\relax\\directlua{tdom_num(\'raggedbottom\',0)}' +
     '\\else\\directlua{tdom_num(\'raggedbottom\',1)}\\fi');
   L.push("\\if@twoside\\directlua{tdom_num('twoside',1)}\\else\\directlua{tdom_num('twoside',0)}\\fi");
+  L.push("\\if@twocolumn\\directlua{tdom_num('twocolumn',1)}\\else\\directlua{tdom_num('twocolumn',0)}\\fi");
   // hyperref changes the \r@… label format to five groups — the injection
   // sites must know which world they write for
   L.push("\\ifcsname Hy@Warning\\endcsname\\directlua{tdom_num('hyperref',1)}\\else\\directlua{tdom_num('hyperref',0)}\\fi");
@@ -265,7 +279,13 @@ export function buildDriverSource({
   // pages inside \output — see #isoCompile splitMode)
   L.push('\\newtoks\\TDOMrealoutput');
   L.push('\\TDOMrealoutput=\\output');
-  L.push('\\output={\\directlua{tdom_absorb_output()}}');
+  // Lua assignment to tex.box[255] does not satisfy TeX's output-routine
+  // invariant ("Output routine didn't use all of \\box255"). Move the
+  // page through the real TeX \\box primitive first; the Lua side can then
+  // detach and re-seed that ordinary box register without recovery errors.
+  L.push('\\newbox\\TDOMabsorbbox');
+  L.push('\\directlua{TDOM_ABSORBBOX=\\number\\TDOMabsorbbox}');
+  L.push('\\output={\\global\\setbox\\TDOMabsorbbox=\\box255\\directlua{tdom_absorb_output(TDOM_ABSORBBOX)}}');
   // a real box first: flips the page builder's internal page_contents
   // flag to box_there (unreachable from Lua); tdom_seed then swaps the
   // list for the marker dummy
@@ -295,6 +315,7 @@ export function buildStateJobBody({ iso, counters, hyperref }) {
     }
   }
   L.push(iso.state['tdom@nobreak'] === 1 ? '\\global\\@nobreaktrue' : '\\global\\@nobreakfalse');
+  appendColumnState(L, iso.state);
   L.push('\\makeatother');
   L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(iso.state['tdom@pd'] ?? -65536000)}}`);
   return L.join('\n');
@@ -307,6 +328,10 @@ export function buildVolatilePrelude({ stateVecJson, counters, hyperref }) {
   counters.forEach((c, i) => {
     state[c] = prevVec[i] ?? 0;
   });
+  if (prevVec.length >= counters.length + 5) {
+    state['tdom@twocolumn'] = prevVec[counters.length] ?? 0;
+    state['tdom@columnwidth'] = prevVec[counters.length + 1] ?? 0;
+  }
   state['tdom@pd'] = prevVec[prevVec.length - 3] ?? -65536000;
   state['tdom@nobreak'] = prevVec[prevVec.length - 2] ?? 0;
   return buildStateJobBody({ iso: { state, labels: [] }, counters, hyperref }) + '\n';
@@ -361,6 +386,7 @@ export function buildIsoCompileSource({
   for (const [name, val] of Object.entries(entry)) {
     L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${val}}\\fi`);
   }
+  appendColumnState(L, entry);
   // capture labels the block defines (value = \@currentlabel at \label);
   // cleveref's r@<key>@cref companion is captured alongside, like the
   // resident driver does
@@ -507,7 +533,7 @@ export function buildIsoCompileSource({
   // \vskip before-skip (tcolorbox breakable) and drops leading glue. Carry
   // the real \if@nobreak flag instead so the env clears it exactly as print.
   if (prevNobreak) L.push(startsVertical(blockText) ? '\\makeatletter\\@nobreaktrue\\makeatother' : '\\noindent');
-  L.push(blockText.trimEnd() + '}'.repeat(Math.max(0, braceImbalance(blockText))));
+  L.push(blockText.trimEnd());
   L.push('\\par');
   for (const name of counters) {
     L.push(
@@ -519,6 +545,12 @@ export function buildIsoCompileSource({
       "\\directlua{tdom_iso_counter('tdom@nobreak',1)}\\else" +
       "\\directlua{tdom_iso_counter('tdom@nobreak',0)}\\fi\\makeatother"
   );
+  L.push(
+    '\\makeatletter\\csname if@twocolumn\\endcsname' +
+      "\\directlua{tdom_iso_counter('tdom@twocolumn',1)}\\else" +
+      "\\directlua{tdom_iso_counter('tdom@twocolumn',0)}\\fi\\makeatother"
+  );
+  L.push("\\directlua{tdom_iso_counter('tdom@columnwidth',\\number\\dimexpr\\columnwidth\\relax)}");
   // harvest: strip pre-body machinery + inserts, record per-item dims
   // (real break opportunities for the page builder), vpack and ship.
   // Same inline-Lua constraint: no '%'/'#' characters (LaTeX catcodes).

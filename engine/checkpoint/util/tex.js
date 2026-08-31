@@ -89,25 +89,8 @@ function luaStr(s) {
   return s.replace(/\\/g, '/').replace(/'/g, "\\'");
 }
 
-/** Net {…} depth of a block (comments stripped, \{ \} ignored). */
-function braceImbalance(text) {
-  let d = 0;
-  for (const line of text.split('\n')) {
-    let s = line;
-    const ci = s.search(/(?<!\\)%/);
-    if (ci >= 0) s = s.slice(0, ci);
-    for (let i = 0; i < s.length; i++) {
-      if (s[i] === '\\') { i++; continue; }
-      if (s[i] === '{') d++;
-      else if (s[i] === '}') d--;
-    }
-  }
-  return d;
-}
-
 export {
   luaStr,
-  braceImbalance,
   labelDefBody,
   extractBraced,
   startsVertical,

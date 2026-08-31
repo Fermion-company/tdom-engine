@@ -9,7 +9,17 @@ import { fnv1a } from '../hash.js';
  * lualatex run whose pixels ARE the print output.
  */
 export async function typesetBlock(engine, idx, callbacks) {
-  const { needsRescue, rescueBlock, brokenBlockGalley, jobBlock, rescueCacheKey, pumpRescues } = callbacks;
+  const {
+    needsRescue,
+    rescueBlock,
+    brokenBlockGalley,
+    deferredBlockGalley,
+    jobBlock,
+    rescueCacheKey,
+    pumpRescues,
+    sourceClosure,
+    sourceRequiresCanonicalOnly,
+  } = callbacks;
   const block = engine.blocks[idx];
   const sig = fnv1a(block.text);
   const TRACE = process.env.TDOM_TRACE_JOB
@@ -32,6 +42,13 @@ export async function typesetBlock(engine, idx, callbacks) {
   const aborted = () => engine.bgAbort && engine.bgActive;
   const isInfra = (e) => e?.tdomInfra === true;
   const isTimeoutErr = (e) => e?.tdomTimeout === true;
+  const lexical = sourceClosure(block.text);
+  block.nativeClosureRequired = !sourceRequiresCanonicalOnly(block.text);
+  block.closure = { ...lexical, native: false };
+  if (!lexical.closed) {
+    engine.diagnostics.push(`${block.id}: source incomplete (${lexical.reason}) — holding last good output`);
+    return deferredBlockGalley(idx);
+  }
   // Freeze vs escalate: the freeze ladder exists to contain CONTENT failures
   // (mid-typing broken TeX) to one block. An explicit fork failure — or a
   // timeout where no child was ever announced — is INFRASTRUCTURE: nothing
@@ -98,6 +115,7 @@ export async function typesetBlock(engine, idx, callbacks) {
   }
   try {
     const galley = await jobBlock(idx);
+    block.closure = { closed: true, reason: null, at: block.text.length, native: true };
     engine.chainTimeouts = 0;
     TRACE?.('in-chain', T0);
     return galley;
@@ -107,6 +125,12 @@ export async function typesetBlock(engine, idx, callbacks) {
     // and without paying for rescue/state follow-up jobs — the next
     // rebuild retries from scratch
     if (aborted()) throw err;
+    if (err?.tdomClosure === true) {
+      block.closure = { closed: false, reason: 'native-error', at: block.text.length, native: true };
+      engine.poisoned.delete(block.id);
+      engine.diagnostics.push(`${block.id}: LuaLaTeX rejected the transient source — holding last good output`);
+      return deferredBlockGalley(idx);
+    }
     if (isInfra(err)) {
       // the daemon reported the fork failure outright — the rescue fork
       // would hit the same exhausted system; escalate to the full rebuild

@@ -1,3 +1,5 @@
+import { shippingPriorityQuietMs } from './interactive-priority.js';
+
 export function scheduleBackground(engine, dirtyBlocks, callbacks) {
   const { locked, runChainPass, chunkTargets, queueRender, retireOffGrid } = callbacks;
   // Deferred chain work is the ONLY background chain activity (docs/10
@@ -9,7 +11,10 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks) {
   // waits on pdftocairo.
   engine.bgTask = (async () => {
     if (!engine.pendingChain) return;
-    while (!engine.bgAbort && Date.now() - (engine.lastEditAt ?? 0) < 300) {
+    while (
+      !engine.bgAbort &&
+      Date.now() - (engine.lastEditAt ?? 0) < shippingPriorityQuietMs(engine, 300)
+    ) {
       await new Promise((r) => setTimeout(r, 25));
     }
     if (engine.bgAbort || !engine.pendingChain) return;

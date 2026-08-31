@@ -1,4 +1,5 @@
 import { mkdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { SourceStore } from '../source-store.js';
 import { CanonicalRenderer } from './canonical.js';
@@ -66,6 +67,7 @@ export function initializeEngineState(
   engine.isoFailCache = new Map(); // rescue key -> error message (doomed compiles: same inputs fail the same way — don't pay the preamble again on every chain pass over a frozen block)
   engine.isoForkBroken = new Set(); // block ids whose iso fork children die (tcolorbox-class fork/dormant incompatibility) — go straight to cold
   engine.dyingPids = new Set(); // DIE'd checkpoint pids not yet exited — #reapDying backpressure
+  engine.cancelledJobIds = new Set(); // jobs aborted before their FORKED pid announcement
   engine.poisoned = new Map(); // block.id -> fnv1a(text) that failed in-chain
   engine.hf = new Map(); // page number -> {h: items, f: items} TeX-typeset header/footer
   engine.hfSig = null; // page-spec signature the current hf map was built for
@@ -88,9 +90,11 @@ export function initializeEngineState(
   // big document multiply into real RAM: 64 forks × 2 audit engines ×
   // stress preamble ≈ machine death by OOM kill wave (observed: macOS
   // took down the server AND the editor session). Audit tools run with a
-  // reduced budget via this env; sparse grids only cost ~3ms replay per
-  // skipped block on resume.
+  // reduced budget via this env; the measured-cost skeleton avoids
+  // replaying the most expensive skipped blocks.
   engine.maxCheckpoints = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
+  engine.checkpointKeepCache = null;
+  engine.checkpointHotFloorMs = 1;
 
   // canonical layer: the exact-output authority (see file header)
   engine.canonical = new CanonicalRenderer({
@@ -104,17 +108,45 @@ export function initializeEngineState(
   // shipping chain: the INCREMENTAL authority (goal "invisible canonical",
   // phase 1). Feature-flagged while the ja long-document numbers are
   // gathered; the cold canonical stays as the demand-paced final audit.
-  engine.onShipPage = null; // callback({page, gen, srcRev}) for SSE fanout
+  engine.onShipPage = null; // legacy callback retained for embedders
+  engine.onShipWave = null; // callback({pages, gen, srcRev}) after end/closure
   engine.shipGenRev = new Map(); // wave generation -> srcRev it converges to
   engine.shipBootedFor = null; // preamble hash the chain booted with
+  // A replay lineage is authoritative only when it starts from the aux
+  // family of a converged production compile.  Provisional TOC/label seeds
+  // can make untouched prefix pages wrong even when the resumed tail is
+  // perfectly valid (the 21-page stress document exposed exactly this).
+  engine.shipDesiredCanonicalId = null;
+  engine.shipDesiredCanonicalHash = null;
   engine.shipStale = false; // a label diverged from its seed: cold owns truth
   engine.shipBooting = false;
   engine.shipBootTimer = null;
   engine.shipLabelOverrides = new Map(); // ship-observed truth for reseeding
-  engine.shipBootTries = 0; // bounded per preamble: a reboot loop burns CPU
+  // Boot attempts are not failures.  The retry state is settled only by a
+  // terminal baseline outcome so normal rebaselines never exhaust a global
+  // budget and superseded work stays neutral.
+  engine.shipSessionId = randomUUID();
+  engine.shipDocumentEpoch = 0;
+  engine.shipRetry = {
+    state: 'idle',
+    nextAttemptId: 1,
+    activeAttemptId: null,
+    activeChainId: null,
+    consecutiveFailures: 0,
+    lastOutcome: 'none',
+    lastFailureClass: null,
+    lastFailureFingerprint: null,
+    cooldownUntil: 0,
+    lastCertifiedSnapshot: null,
+    desiredSnapshot: null,
+    recoveryReason: null,
+  };
+  engine.shipBootTries = 0; // compatibility alias: attributable failures only
   engine.shipping = process.env.TDOM_SHIP === '1' ? makeShipping() : null;
   engine.mode = 'structured'; // 'structured' | 'opaque'
   engine.modeReasons = [];
+  engine.previewPolicy = 'structured'; // 'structured' | 'canonical-anchor'
+  engine.previewReasons = [];
   engine.opaqueStickyPre = null; // preamble hash a dynamic demotion sticks to
   engine.verifyState = null; // last exactness-verification outcome
   // safety-gate memos: the preamble verdict is keyed by preamble hash, the
@@ -154,6 +186,12 @@ export function initializeEngineState(
   // user is typing in are exempt from grid retirement, so a keystroke burst
   // is always "fork once + typeset one block", never a grid replay.
   engine.editHold = []; // boundary indices (most recent loci, capped)
+  // Cursor-locus warming materializes the two checkpoints surrounding the
+  // block the user is about to edit. A small measured skeleton stays within
+  // the memory budget, while navigation idle time pays any sparse replay
+  // before the first keystroke instead of after it.
+  engine.warmSeq = 0;
+  engine.warmInfo = null;
   // Deferred chain work (the ONLY background chain activity): 'rebuild'
   // re-typesets the suffix serially (definition edits, untracked-state
   // leaks). Idle-gated, preemptible, resumable — see #runChainPass.

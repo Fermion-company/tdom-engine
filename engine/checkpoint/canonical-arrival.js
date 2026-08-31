@@ -64,6 +64,12 @@ export function onCanonicalResult(
   if (info.error || process.env.TDOM_NO_VERIFY) return;
   // verify only at convergence: the compile must be of the CURRENT source
   if (engine.mode !== 'structured' || info.rev !== engine.srcRev) return;
+  // canonical-anchor deliberately does not claim that JS pagination maps
+  // onto physical pages (two-column output is the motivating case). Its
+  // resident tree is a TeX-native line-layout probe only; page text
+  // comparison and coordinate cropping would therefore manufacture false
+  // mismatches and wrong-page chunks.
+  if (engine.previewPolicy !== 'structured') return;
   verifyAgainstCanonical(info)
     .catch((err) => {
       engine.diagnostics.push('verification failed to run: ' + err.message);
@@ -88,6 +94,7 @@ export function onCanonicalResult(
  */
 export async function cropCanonicalChunks(engine, info, { asyncRepaginate }) {
   if (engine.mode !== 'structured' || engine.srcRev !== info.rev) return;
+  if (engine.previewPolicy !== 'structured') return;
   // pagination drift means provisional coordinates cannot address the
   // canonical pages — never crop pixels from the wrong page
   if (engine.pages.length !== info.pageCount) return;
@@ -139,7 +146,7 @@ export async function cropCanonicalChunks(engine, info, { asyncRepaginate }) {
 export async function verifyAgainstCanonical(engine, info, { applyFidelity, asyncRepaginate }) {
   const texts = await engine.canonical.pageTexts(info.id);
   if (!texts) return; // pdftotext unavailable — canonical overlay still wins visually
-  if (engine.srcRev !== info.rev || engine.mode !== 'structured') return; // superseded meanwhile
+  if (engine.srcRev !== info.rev || engine.mode !== 'structured' || engine.previewPolicy !== 'structured') return; // superseded meanwhile
   const { mismatches, demote } = compareCanonicalText(engine.pages, texts, info.pageCount);
   engine.verifyState = {
     rev: info.rev,

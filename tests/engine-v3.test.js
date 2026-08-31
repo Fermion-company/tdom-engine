@@ -147,10 +147,17 @@ test('preamble edits take the honest full-rebuild path', opts, async () => {
 test('the engine survives malformed input mid-typing', opts, async () => {
   const src = eng.getSource();
   const idx = src.indexOf('Edit any word');
+  const blocksBefore = eng.blocks.map((block) => block.id);
+  const pagesBefore = eng.getDisplayLists();
   const r1 = await eng.edit(idx, idx, '\\emph{');
   assert.ok(r1.rev > 0, 'unclosed group tolerated');
+  assert.equal(r1.stats.chainVerdict, 'closure-deferred', 'unfinished syntax never enters TeX');
+  assert.equal(r1.stats.blocksTypeset, 0, 'no speculative typeset runs');
+  assert.deepEqual(eng.blocks.map((block) => block.id), blocksBefore, 'last-good block tree is retained');
+  assert.deepEqual(eng.getDisplayLists(), pagesBefore, 'last-good pages are retained byte-for-byte');
   const r2 = await eng.edit(idx, idx + 6, '');
   assert.ok(r2.rev > r1.rev, 'recovered after fix');
+  assert.notEqual(r2.stats.chainVerdict, 'closure-deferred', 'normal path resumes after closure');
 });
 
 test('footnotes are captured live and placed at the page bottom', opts, () => {
@@ -196,13 +203,15 @@ test('citations resolve from the live bibliography', opts, async () => {
 
 test('label renames propagate backwards to earlier referencing blocks', opts, async () => {
   const src = eng.getSource();
-  const li = src.indexOf('\\label{fig:plot}');
-  await eng.edit(li, li + 17, '\\label{fig:plotX}');
+  const originalLabel = '\\label{fig:plot}';
+  const renamedLabel = '\\label{fig:plotX}';
+  const li = src.indexOf(originalLabel);
+  await eng.edit(li, li + originalLabel.length, renamedLabel);
   const rb = eng.blocks.find((b) => b.text.includes('is a genuine float'));
   assert.ok(JSON.stringify(rb.galley.items).includes('??'), 'earlier ref turned into ??');
   const src2 = eng.getSource();
-  const l2 = src2.indexOf('\\label{fig:plotX}');
-  await eng.edit(l2, l2 + 18, '\\label{fig:plot}');
+  const l2 = src2.indexOf(renamedLabel);
+  await eng.edit(l2, l2 + renamedLabel.length, originalLabel);
   const rb2 = eng.blocks.find((b) => b.text.includes('is a genuine float'));
   assert.ok(!JSON.stringify(rb2.galley.items).includes('??'), 'restored and resolved');
 });

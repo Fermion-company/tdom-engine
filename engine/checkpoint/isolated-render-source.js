@@ -1,4 +1,4 @@
-import { braceImbalance, labelDefBody, startsVertical } from './util/tex.js';
+import { labelDefBody, startsVertical } from './util/tex.js';
 
 export function buildIsolatedRenderSource({
   preamble,
@@ -20,6 +20,17 @@ export function buildIsolatedRenderSource({
   }
   for (const [name, val] of Object.entries(entry)) {
     L.push(`\\ifcsname c@${name}\\endcsname\\setcounter{${name}}{${val}}\\fi`);
+  }
+  const twoColumn = Number(entry?.['tdom@twocolumn']);
+  const columnWidth = Number(entry?.['tdom@columnwidth']);
+  if (Number.isFinite(twoColumn) && columnWidth > 0) {
+    L.push(twoColumn ? '\\global\\@twocolumntrue\\global\\@firstcolumntrue\\global\\col@number=2\\relax'
+      : '\\global\\@twocolumnfalse\\global\\@firstcolumnfalse\\global\\col@number=1\\relax');
+    L.push(
+      `\\global\\columnwidth=${Math.round(columnWidth)}sp` +
+        `\\global\\hsize=${Math.round(columnWidth)}sp` +
+        `\\global\\linewidth=${Math.round(columnWidth)}sp\\@floatplacement`
+    );
   }
   // float capture, exactly like the resident driver: the environment
   // body is typeset into a box with \@xfloat's setup, and a Lua-side
@@ -80,7 +91,7 @@ export function buildIsolatedRenderSource({
   // see #isoCompile: vertical-env blocks keep the @nobreak flag instead
   // of \noindent, so their own before-skip glue survives
   if (prevNobreak) L.push(startsVertical(blockText) ? '\\makeatletter\\@nobreaktrue\\makeatother' : '\\noindent');
-  L.push(blockText.trimEnd() + '}'.repeat(Math.max(0, braceImbalance(blockText))));
+  L.push(blockText.trimEnd());
   L.push('\\par');
   L.push(
     '\\directlua{' +

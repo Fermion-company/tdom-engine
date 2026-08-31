@@ -20,12 +20,24 @@
 //     canonical result on screen and reports the TeX error.
 
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, copyFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  readdirSync,
+  existsSync,
+  rmSync,
+  copyFileSync,
+  realpathSync,
+} from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { fnv1a } from '../hash.js';
 import { withProjectInputs } from '../project-inputs.js';
+import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-index.js';
 
 const execFileP = promisify(execFile);
 const MAX_PASSES = 3;
@@ -56,10 +68,16 @@ export class CanonicalRenderer {
     idleMs = Number(process.env.TDOM_CANON_IDLE ?? 30_000),
     displayDebounceMs = Number(process.env.TDOM_CANON_DISPLAY_DEBOUNCE ?? 350),
   }) {
-    this.workDir = path.resolve(workDir);
-    this.docDir = docDir ? path.resolve(docDir) : this.workDir;
-    this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
-    mkdirSync(this.workDir, { recursive: true });
+    const resolvedWorkDir = path.resolve(workDir);
+    mkdirSync(resolvedWorkDir, { recursive: true });
+    // SyncTeX matches its Input records as strings even on a case-insensitive
+    // filesystem.  macOS can expose the same directory as `TeX64` and
+    // `tex64`; letting lualatex record one spelling while the server queries
+    // the other yields zero anchors. Bind every canonical path to the native
+    // realpath before the first compile.
+    this.workDir = existingRealpath(resolvedWorkDir);
+    this.docDir = docDir ? existingRealpath(docDir) : this.workDir;
+    this.overlayDir = overlayDir ? existingRealpath(overlayDir) : null;
     this.debounceMs = debounceMs;
     this.idleMs = idleMs;
     this.displayDebounceMs = displayDebounceMs;
@@ -93,6 +111,15 @@ export class CanonicalRenderer {
     this.textInFlight = new Map(); // id -> shared pdftotext promise
     this.textBoxCache = new Map(); // id -> [[{text,left,top,right,bottom}]]
     this.textBoxInFlight = new Map(); // id -> shared pdftotext -bbox promise
+    // pdf.js is opened once per immutable generation and paint-safe pages are
+    // extracted lazily. Canonical arrival prewarms the document parser; an
+    // edit then pays only the candidate pages, not every page of a 500-page
+    // paper. A requested page set is returned atomically or not at all.
+    this.pdfJsPromise = null;
+    this.pdfDocumentCache = new Map(); // id -> PDFDocumentProxy
+    this.pdfDocumentInFlight = new Map(); // id -> shared open promise
+    this.paintPageCache = new Map(); // `${id}:${page}` -> paint page
+    this.paintPageInFlight = new Map(); // `${id}:${page}` -> shared extraction promise
     // SyncTeX records TeX's pre-PDF coordinates.  `/Rotate` and a page-wide
     // PDF content matrix (notably pdflscape's counter-rotation) are absent
     // from that file, while pdftocairo/pdftotext expose the final displayed
@@ -105,6 +132,14 @@ export class CanonicalRenderer {
     this.resetting = false;
     this._texts = null;
     this.children = new Set(); // in-flight lualatex/pdftocairo/pdftotext/pdfinfo
+    // Authority-only lualatex children run in private process groups. A live
+    // edit can stop those independent groups for the shipping foreground
+    // lease without killing a half-written aux workdir. Export and opaque
+    // display compiles are never placed in this background set.
+    this.authorityChildren = new Set();
+    this.authorityPausedPids = new Map(); // pid -> true when signalled as a process group
+    this.authorityPausedUntil = 0;
+    this.authorityResumeTimer = null;
     // Source text is not the whole compilation input: images, \input files
     // and bibliographies can change without a byte changing in the main
     // buffer.  Capture this epoch in every queued job so those changes
@@ -153,6 +188,12 @@ export class CanonicalRenderer {
     }
     this.textCache.delete(generation.id);
     this.textBoxCache.delete(generation.id);
+    const pdfDocument = this.pdfDocumentCache.get(generation.id);
+    this.pdfDocumentCache.delete(generation.id);
+    Promise.resolve(pdfDocument?.destroy?.()).catch(() => {});
+    for (const key of this.paintPageCache.keys()) {
+      if (key.startsWith(prefix)) this.paintPageCache.delete(key);
+    }
     for (const key of this.syncTransformCache.keys()) {
       if (key.startsWith(prefix)) this.syncTransformCache.delete(key);
     }
@@ -180,6 +221,13 @@ export class CanonicalRenderer {
     this.textInFlight.clear();
     this.textBoxCache.clear();
     this.textBoxInFlight.clear();
+    for (const document of this.pdfDocumentCache.values()) {
+      Promise.resolve(document?.destroy?.()).catch(() => {});
+    }
+    this.pdfDocumentCache.clear();
+    this.pdfDocumentInFlight.clear();
+    this.paintPageCache.clear();
+    this.paintPageInFlight.clear();
     this.syncTransformCache.clear();
     this.syncTransformInFlight.clear();
   }
@@ -198,6 +246,8 @@ export class CanonicalRenderer {
       ...this.svgInFlight.values(),
       ...this.textInFlight.values(),
       ...this.textBoxInFlight.values(),
+      ...this.pdfDocumentInFlight.values(),
+      ...this.paintPageInFlight.values(),
       ...this.syncTransformInFlight.values(),
     ]);
     if (jobs.size) await Promise.allSettled([...jobs]);
@@ -206,14 +256,79 @@ export class CanonicalRenderer {
   /** execFile with child tracking, so dispose() can kill in-flight work —
    * an orphaned canonical lualatex otherwise burns a core for up to its
    * 5-minute timeout after the server exits. */
-  #exec(cmd, args, opts) {
-    const p = execFileP(cmd, args, opts);
+  #exec(cmd, args, opts, { authority = false } = {}) {
+    const p = execFileP(cmd, args, authority ? { ...opts, detached: true } : opts);
     if (p.child) {
-      const cleanup = () => this.children.delete(p.child);
+      if (authority) {
+        this.authorityChildren.add(p.child);
+        if (Date.now() < this.authorityPausedUntil) this.#pauseAuthorityChild(p.child);
+      }
+      const cleanup = () => {
+        this.children.delete(p.child);
+        this.authorityChildren.delete(p.child);
+        this.authorityPausedPids.delete(p.child.pid);
+      };
       this.children.add(p.child);
       p.then(cleanup, cleanup);
     }
     return p;
+  }
+
+  #pauseAuthorityChild(child) {
+    const pid = Number(child?.pid);
+    if (!(pid > 0) || this.authorityPausedPids.has(pid)) return;
+    try {
+      process.kill(-pid, 'SIGSTOP');
+      this.authorityPausedPids.set(pid, true);
+    } catch {
+      // Electron can keep a detached child in the app's inherited process
+      // group on macOS. Never signal that shared group: stop the directly
+      // tracked lualatex child instead. Canonical does not invoke latexmk,
+      // biber or makeindex, and shell escape is disabled on this path.
+      try {
+        child.kill('SIGSTOP');
+        this.authorityPausedPids.set(pid, false);
+      } catch {
+        /* the compile may have finished between spawn/tracking and the lease */
+      }
+    }
+  }
+
+  #resumeAuthority() {
+    clearTimeout(this.authorityResumeTimer);
+    this.authorityResumeTimer = null;
+    this.authorityPausedUntil = 0;
+    for (const [pid, asGroup] of [...this.authorityPausedPids]) {
+      try { process.kill(asGroup ? -pid : pid, 'SIGCONT'); } catch { /* already gone */ }
+      this.authorityPausedPids.delete(pid);
+    }
+  }
+
+  /**
+   * Give a live complete-PDF replay exclusive heavy-TeX time. Canonical
+   * authority is independent and generation-checked, so stopping its process
+   * group is safe; we resume the same compile instead of discarding partial
+   * aux state or spawning a restart storm.
+   */
+  deferAuthority(delayMs) {
+    if (this.disposed || this.pressure !== 'authority') return false;
+    const delay = Math.max(0, Number(delayMs) || 0);
+    if (!delay) return false;
+    this.authorityPausedUntil = Math.max(this.authorityPausedUntil, Date.now() + delay);
+    for (const child of this.authorityChildren) this.#pauseAuthorityChild(child);
+    clearTimeout(this.authorityResumeTimer);
+    const resumeWhenDue = () => {
+      const remaining = this.authorityPausedUntil - Date.now();
+      if (remaining > 0) {
+        this.authorityResumeTimer = setTimeout(resumeWhenDue, remaining);
+        this.authorityResumeTimer.unref?.();
+        return;
+      }
+      this.#resumeAuthority();
+    };
+    this.authorityResumeTimer = setTimeout(resumeWhenDue, delay);
+    this.authorityResumeTimer.unref?.();
+    return true;
   }
 
   /** Public snapshot for /doc payloads, reports and SSE events. */
@@ -230,6 +345,9 @@ export class CanonicalRenderer {
       error: this.lastError?.message ?? null,
       errorRev: this.lastError?.rev ?? 0,
       syncWarnings: this.last?.syncWarnings ?? [],
+      authorityPaused: this.authorityPausedPids.size > 0,
+      authorityChildren: this.authorityChildren.size,
+      authorityPauseRemainingMs: Math.max(0, this.authorityPausedUntil - Date.now()),
     };
   }
 
@@ -341,7 +459,13 @@ export class CanonicalRenderer {
       }
       return;
     }
-    this.running = this.#compile(job)
+    this.running = this.#compile({
+      ...job,
+      // Scheduled authority confirmation is intentionally below the live
+      // complete-PDF path. Export (`ensure`) and opaque display compiles stay
+      // at normal priority because the user is directly waiting for them.
+      background: this.pressure === 'authority',
+    })
       .catch((err) => {
         this.lastError = { rev: job.rev, message: String(err?.message || err) };
       })
@@ -369,7 +493,7 @@ export class CanonicalRenderer {
     }
   }
 
-  async #compile({ source, rev, inputEpoch = this.inputEpoch }) {
+  async #compile({ source, rev, inputEpoch = this.inputEpoch, background = false }) {
     const t0 = performance.now();
     const srcHash = this.#sourceHash(source, inputEpoch);
     const tex = path.join(this.workDir, 'canon.tex');
@@ -392,7 +516,7 @@ export class CanonicalRenderer {
     // family keeps changing (toc page numbers, forward refs), capped
     while (passes < MAX_PASSES) {
       passes++;
-      log = await this.#runLatex(tex);
+      log = await this.#runLatex(tex, background);
       if (this.disposed) throw new Error('renderer disposed');
       const after = auxState();
       const changed = after !== before;
@@ -419,12 +543,20 @@ export class CanonicalRenderer {
       (cmd, args, opts) => this.#exec(cmd, args, opts)
     );
     const firstPaper = papers[0] ?? null;
+    const seedFiles = {};
+    for (const name of auxFiles) {
+      const file = path.join(this.workDir, name);
+      if (existsSync(file)) seedFiles[path.extname(name).slice(1)] = readFileSync(file, 'utf8');
+    }
     const generation = {
       id,
       rev,
       srcHash,
+      inputEpoch,
       pdf: kept,
       synctex: hasSynctex ? keptSynctex : null,
+      pdfHash: sha256File(kept),
+      synctexHash: hasSynctex ? sha256File(keptSynctex) : null,
       pageCount,
       // `paper` remains the legacy first-page shape. `papers` is the exact
       // displayed geometry for every page, including /Rotate orientation.
@@ -436,22 +568,43 @@ export class CanonicalRenderer {
       retired: false,
       filesDeleted: false,
       syncWarnings: [],
+      // Converged production inputs for a ShippingChain boot. Hyperref's
+      // full five-field \newlabel records (including destination anchors)
+      // cannot be reconstructed from the renderer's scalar label table.
+      seedFiles,
     };
     if (this.disposed) {
       this.#deleteGenerationFiles(generation);
       throw new Error('renderer disposed');
     }
     this.#registerGeneration(generation);
+    // Keep PDF import/open off the typing path. This intentionally does not
+    // await: canonical pixels are already committed and the index is merely
+    // an optional fast-proof accelerator.
+    void this.prewarmPaintIndex(id);
     this.lastError = null;
     return generation;
   }
 
-  async #runLatex(tex) {
+  async #runLatex(tex, background = false) {
     let out = '';
     try {
+      const latexArgs = [
+        '-synctex=1',
+        '-interaction=nonstopmode',
+        '-output-directory',
+        this.workDir,
+        tex,
+      ];
+      const command = background ? 'nice' : 'lualatex';
+      const requestedNice = Number(process.env.TDOM_CANON_NICE ?? 10);
+      const niceLevel = Number.isFinite(requestedNice) ? requestedNice : 10;
+      const args = background
+        ? ['-n', String(niceLevel), 'lualatex', ...latexArgs]
+        : latexArgs;
       const r = await this.#exec(
-        'lualatex',
-        ['-synctex=1', '-interaction=nonstopmode', '-output-directory', this.workDir, tex],
+        command,
+        args,
         {
           cwd: this.docDir,
           timeout: Number(process.env.TDOM_CANON_TIMEOUT || 300_000),
@@ -461,7 +614,8 @@ export class CanonicalRenderer {
             overlayDir: this.overlayDir,
             recursive: true,
           }),
-        }
+        },
+        { authority: background }
       );
       out = (r.stdout || '') + (r.stderr || '');
     } catch (err) {
@@ -617,6 +771,139 @@ export class CanonicalRenderer {
     }
   }
 
+  /** True only when the supplied resident source is byte-identical to the
+   * source/input epoch that produced one retained canonical generation. */
+  sourceMatches(source, id = null) {
+    const generation = this.#resolveGeneration(id);
+    return Boolean(generation && generation.srcHash === this.#sourceHash(source, generation.inputEpoch));
+  }
+
+  /** Immutable identity used by anchor tickets and tests. */
+  generationCertificate(id = null) {
+    const generation = this.#resolveGeneration(id);
+    if (!generation) return null;
+    return {
+      id: generation.id,
+      rev: generation.rev,
+      srcHash: generation.srcHash,
+      inputEpoch: generation.inputEpoch,
+      pdfHash: generation.pdfHash,
+      synctexHash: generation.synctexHash,
+      paintIndexVersion: PDF_PAINT_INDEX_VERSION,
+    };
+  }
+
+  /** Start the expensive pdf.js import/document parse as soon as canonical
+   * lands. Failure is an ordinary fail-closed condition for fast preview. */
+  prewarmPaintIndex(id = null) {
+    const generation = this.#resolveGeneration(id);
+    if (!generation) return Promise.resolve(null);
+    return this.#pdfDocument(generation.id).catch(() => null);
+  }
+
+  /** Paint-safe pdf.js pages for one immutable generation. The caller gets
+   * the whole requested set or null; a partially extracted set is never used
+   * as a proof for this request. */
+  async pdfPaintPages(id, pageNumbers) {
+    const generation = this.#resolveGeneration(id);
+    const pages = [...new Set((pageNumbers ?? []).map(Number))];
+    if (!generation || !pages.length || pages.some((page) =>
+      !Number.isInteger(page) || page < 1 || page > generation.pageCount
+    )) return null;
+    const results = await Promise.all(pages.map((page) => this.#pdfPaintPage(generation.id, page)));
+    if (results.some((page) => !page)) return null;
+    if (!this.#resolveGeneration(generation.id)) return null;
+    return results;
+  }
+
+  async #loadPdfJs() {
+    if (this.pdfJsPromise) return this.pdfJsPromise;
+    this.pdfJsPromise = (async () => {
+      const configured = String(process.env.TDOM_PDFJS_PATH ?? '').trim();
+      let module;
+      if (configured) {
+        const specifier = path.isAbsolute(configured) ? pathToFileURL(configured).href : configured;
+        module = await import(specifier);
+      } else {
+        module = await import('pdfjs-dist/legacy/build/pdf.mjs');
+      }
+      if (typeof module?.getDocument !== 'function' || !module?.OPS || !module?.Util) {
+        throw new Error('pdf.js paint index API unavailable');
+      }
+      return module;
+    })();
+    return this.pdfJsPromise;
+  }
+
+  #pdfDocument(id) {
+    const generation = this.#resolveGeneration(id);
+    if (!generation) return Promise.resolve(null);
+    if (this.pdfDocumentCache.has(generation.id)) {
+      return Promise.resolve(this.pdfDocumentCache.get(generation.id));
+    }
+    const pending = this.pdfDocumentInFlight.get(generation.id);
+    if (pending) return pending;
+    let job;
+    job = (async () => {
+      const pdfjs = await this.#loadPdfJs();
+      if (!this.#resolveGeneration(generation.id)) return null;
+      const bytes = new Uint8Array(readFileSync(generation.pdf));
+      const task = pdfjs.getDocument({
+        data: bytes,
+        disableWorker: true,
+        stopAtErrors: true,
+        isEvalSupported: false,
+      });
+      const document = await task.promise;
+      if (!this.#resolveGeneration(generation.id)) {
+        await document.destroy().catch(() => {});
+        return null;
+      }
+      this.pdfDocumentCache.set(generation.id, document);
+      return document;
+    })().catch(() => null).finally(() => {
+      if (this.pdfDocumentInFlight.get(generation.id) === job) {
+        this.pdfDocumentInFlight.delete(generation.id);
+      }
+    });
+    this.pdfDocumentInFlight.set(generation.id, job);
+    return job;
+  }
+
+  #pdfPaintPage(id, pageNumber) {
+    const generation = this.#resolveGeneration(id);
+    if (!generation) return Promise.resolve(null);
+    const key = `${generation.id}:${pageNumber}`;
+    if (this.paintPageCache.has(key)) return Promise.resolve(this.paintPageCache.get(key));
+    const pending = this.paintPageInFlight.get(key);
+    if (pending) return pending;
+    let job;
+    job = (async () => {
+      const [pdfjs, document] = await Promise.all([this.#loadPdfJs(), this.#pdfDocument(generation.id)]);
+      if (!document || !this.#resolveGeneration(generation.id)) return null;
+      const page = await document.getPage(pageNumber);
+      const [textContent, operatorList] = await Promise.all([
+        page.getTextContent({ disableNormalization: true }),
+        page.getOperatorList(),
+      ]);
+      const result = buildPdfPaintPage({
+        pageNumber,
+        textContent,
+        operatorList,
+        viewport: page.getViewport({ scale: 1 }),
+        OPS: pdfjs.OPS,
+        Util: pdfjs.Util,
+      });
+      if (result && this.#resolveGeneration(generation.id)) this.paintPageCache.set(key, result);
+      page.cleanup?.();
+      return result;
+    })().catch(() => null).finally(() => {
+      if (this.paintPageInFlight.get(key) === job) this.paintPageInFlight.delete(key);
+    });
+    this.paintPageInFlight.set(key, job);
+    return job;
+  }
+
   /**
    * Lazy per-page exact pixels: convert one PDF page to SVG on first
    * request. `id` (optional) pins the compile the client saw. Retained old
@@ -751,16 +1038,26 @@ export class CanonicalRenderer {
    */
   async resetDocument(docDir = this.docDir, overlayDir = this.overlayDir) {
     this.resetting = true;
+    clearTimeout(this.authorityResumeTimer);
+    this.authorityResumeTimer = null;
+    this.authorityPausedUntil = 0;
     clearTimeout(this.timer);
     this.timer = null;
     this.pendingJob = null;
     for (const child of this.children) {
-      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      try {
+        if (this.authorityChildren.has(child) && child.pid) {
+          try { process.kill(-child.pid, 'SIGKILL'); }
+          catch { child.kill('SIGKILL'); }
+        } else child.kill('SIGKILL');
+      } catch { /* already gone */ }
     }
     try {
       if (this.running) await this.running.catch(() => {});
       await this.#settleReadJobs();
       this.children.clear();
+      this.authorityChildren.clear();
+      this.authorityPausedPids.clear();
       this.docDir = path.resolve(docDir);
       this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
       this.#clearGenerations();
@@ -775,19 +1072,36 @@ export class CanonicalRenderer {
 
   dispose() {
     this.disposed = true;
+    clearTimeout(this.authorityResumeTimer);
+    this.authorityResumeTimer = null;
+    this.authorityPausedUntil = 0;
     clearTimeout(this.timer);
     this.timer = null;
     this.pendingJob = null;
     for (const child of this.children) {
       try {
-        child.kill('SIGKILL');
+        if (this.authorityChildren.has(child) && child.pid) {
+          try { process.kill(-child.pid, 'SIGKILL'); }
+          catch { child.kill('SIGKILL'); }
+        } else child.kill('SIGKILL');
       } catch {
         /* already gone */
       }
     }
     this.children.clear();
+    this.authorityChildren.clear();
+    this.authorityPausedPids.clear();
     this.#clearGenerations();
     this.#removeWorkArtifacts();
+  }
+}
+
+function existingRealpath(value) {
+  const resolved = path.resolve(value);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    return resolved;
   }
 }
 
@@ -1203,6 +1517,10 @@ async function pageGeometries(pdfPath, pageCount, exec = execFileP) {
   } catch {
     return [];
   }
+}
+
+function sha256File(file) {
+  return createHash('sha256').update(readFileSync(file)).digest('hex');
 }
 
 function texErrorFrom(log) {

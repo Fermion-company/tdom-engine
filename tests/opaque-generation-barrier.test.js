@@ -301,7 +301,7 @@ test('the browser entrypoint enforces the planner before the batch commit loop',
   assert.match(APP, /targetPage\.dataset\.canonStage = plan\.targetSrc;\s+updateCanonState\(plan\.pageNumber\);/);
 });
 
-test('opaque caret placement never falls through to browser hit geometry', () => {
-  assert.match(APP, /if \(mode === 'opaque'\) \{[\s\S]*?\} else if \(clickPoint\) \{\s+range = document\.caretRangeFromPoint/);
-  assert.match(APP, /\} else if \(mode === 'opaque'\) \{[\s\S]*?control\.position = Number\(control\.lastOffset\);[\s\S]*?\} else if \(clickPoint && typeof control\.getOffsetFromPoint/);
+test('canonical-surface caret placement never falls through to browser hit geometry', () => {
+  assert.match(APP, /if \(usesCanonicalSurface\(\)\) \{[\s\S]*?\} else if \(clickPoint\) \{\s+range = document\.caretRangeFromPoint/);
+  assert.match(APP, /\} else if \(usesCanonicalSurface\(\)\) \{[\s\S]*?control\.position = Number\(control\.lastOffset\);[\s\S]*?\} else if \(clickPoint && typeof control\.getOffsetFromPoint/);
 });

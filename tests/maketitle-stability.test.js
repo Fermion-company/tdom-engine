@@ -82,12 +82,13 @@ test('maketitle stays visible while title metadata reboots and refreshes', opts,
   }
 });
 
-test('opaque maketitle reboot keeps the presented exact generation interactive', opts, async () => {
+test('two-column maketitle keeps a resident probe behind the exact page surface', opts, async () => {
   const workDir = mkdtempSync(path.join(tmpdir(), 'tdom-maketitle-opaque-'));
   const engine = new CheckpointEngine({ workDir });
   try {
     await engine.open(SOURCE.replace('{article}', '[twocolumn]{article}'));
-    assert.equal(engine.mode, 'opaque', 'two-column paper uses the exact canonical surface');
+    assert.equal(engine.mode, 'structured', 'two-column paper retains the resident LuaLaTeX probe');
+    assert.equal(engine.previewPolicy, 'canonical-anchor', 'physical pages remain canonical-addressed');
     const pending = [];
     const completed = [];
     engine.onDocumentResetPending = (event) => pending.push(event);

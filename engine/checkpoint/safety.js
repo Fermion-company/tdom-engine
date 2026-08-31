@@ -58,7 +58,6 @@ const UNSAFE_PREAMBLE = [
   [/\\shipout\b/, 'raw \\shipout'],
   [/\\AddToHook\s*\{\s*shipout/, 'shipout hook'],
   [/\\At(?:Begin|Next|End)Shipout/, 'shipout hook (atbegshi API)'],
-  [/\\(?:documentclass|LoadClass)\s*\[[^\]]*\btwocolumn\b[^\]]*\]/, 'twocolumn class option'],
   [/\\twocolumn\b/, '\\twocolumn'],
   [/\\AtBeginDvi\b/, '\\AtBeginDvi'],
   [/\\(?:documentclass|LoadClass)\s*\[[^\]]*\blandscape\b[^\]]*\]/, 'landscape class option'],
@@ -91,9 +90,10 @@ const UNSAFE_BODY = [
   [/\\newgeometry\b/, '\\newgeometry (mid-document page geometry)'],
   // NOT \includepdf: block-level rescue ships its foreign pages exactly
   // (see OUTPUT_HIJACK_RE in engine-v3.js).
-  [/\\twocolumn\b/, 'mid-document \\twocolumn'],
   [/\\balance\b/, 'column balancing'],
 ];
+
+const BODY_COLUMN_SWITCH_RE = /\\(?:one|two)column\b/;
 
 /** Strip TeX comments (unescaped % to end of line) so commented-out
  * dangers don't demote the document. Shared with the other gates
@@ -127,7 +127,18 @@ export function classifyPreamble(preamble) {
   for (const [re, why] of UNSAFE_PAGE_GEOMETRY) {
     if (re.test(pre)) reasons.push(why);
   }
-  return { safe: reasons.length === 0, reasons: [...new Set(reasons)] };
+  // A standard class-level twocolumn layout still has a trustworthy hot
+  // path: the resident process uses the class's real \columnwidth and line
+  // breaker. What it does NOT have is a trustworthy JS page/column builder.
+  // Keep the exact canonical PDF as the page surface and permit only
+  // canonical-addressed, fail-closed text overlays on top of it.
+  const canonicalAnchor = /\\(?:documentclass|LoadClass)\s*\[[^\]]*\btwocolumn\b[^\]]*\]/.test(pre);
+  return {
+    safe: reasons.length === 0,
+    reasons: [...new Set(reasons)],
+    previewPolicy: canonicalAnchor ? 'canonical-anchor' : 'structured',
+    previewReasons: canonicalAnchor ? ['twocolumn class option'] : [],
+  };
 }
 
 /**
@@ -149,12 +160,24 @@ export function classifyBodyBlock(text) {
 }
 
 /**
+ * Page-column switches keep the physical page surface canonical, but they
+ * no longer make the resident line breaker unsafe. The dormant output
+ * routine executes LaTeX's real \onecolumn/\twocolumn definitions and
+ * captures the resulting column state; SyncTeX then provides the physical
+ * page/column address for the narrow text overlay.
+ */
+export function bodyUsesColumnSwitch(text) {
+  return BODY_COLUMN_SWITCH_RE.test(stripComments(text));
+}
+
+/**
  * Classify a whole document for the structured layer (composition of the
  * two halves; kept for tests and one-shot callers).
  * @returns {{safe: boolean, reasons: string[]}}
  */
 export function classifyDocument(preamble, body) {
-  const reasons = [...classifyPreamble(preamble).reasons];
+  const pre = classifyPreamble(preamble);
+  const reasons = [...pre.reasons];
   const bod = stripComments(body);
   for (const [re, why] of UNSAFE_BODY) {
     if (re.test(bod)) reasons.push(why);
@@ -162,7 +185,15 @@ export function classifyDocument(preamble, body) {
   for (const [re, why] of UNSAFE_PAGE_GEOMETRY) {
     if (re.test(bod)) reasons.push(why);
   }
-  return { safe: reasons.length === 0, reasons: [...new Set(reasons)] };
+  const bodyColumnSwitch = BODY_COLUMN_SWITCH_RE.test(bod);
+  return {
+    safe: reasons.length === 0,
+    reasons: [...new Set(reasons)],
+    previewPolicy: bodyColumnSwitch ? 'canonical-anchor' : pre.previewPolicy,
+    previewReasons: bodyColumnSwitch
+      ? [...new Set([...pre.previewReasons, 'body column switch'])]
+      : pre.previewReasons,
+  };
 }
 
 const LIGATURES = { '\uFB00': 'ff', '\uFB01': 'fi', '\uFB02': 'fl', '\uFB03': 'ffi', '\uFB04': 'ffl', '\uFB05': 'ft', '\uFB06': 'st' };
