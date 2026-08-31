@@ -6,7 +6,8 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync, readFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -19,6 +20,7 @@ import { preemptResidentRenders } from '../engine/checkpoint/render-pump.js';
 import { classifyDocument } from '../engine/checkpoint/safety.js';
 import { sourceClosure } from '../engine/checkpoint/closure.js';
 import { classifyStructuralAliases } from '../engine/checkpoint/structural-aliases.js';
+import { ShippingChain } from '../engine/checkpoint/shipping.js';
 import { segmentBody } from '../engine/segmenter.js';
 import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finalize.js';
 import {
@@ -28,6 +30,7 @@ import {
 
 const WORK = fileURLToPath(new URL('../.tdom-hotpath-test', import.meta.url));
 const WORK2 = fileURLToPath(new URL('../.tdom-hotpath-test-scratch', import.meta.url));
+const WORK3 = fileURLToPath(new URL('../.tdom-hotpath-test-mixed-shipping', import.meta.url));
 
 const available = await promisify(execFile)('lualatex', ['--version'], { timeout: 15_000 }).then(
   () => true,
@@ -167,6 +170,150 @@ test('shipping-exact edits publish source immediately without resident page patc
     ['canonical', 'snapshot-12', 12],
     ['background', 1, 12],
   ]);
+});
+
+test('mixed heavy document resumes exact waves from visible edits in rich TeX contexts', opts, async () => {
+  const sourcePath = fileURLToPath(
+    new URL('../corpus/14-mixed-heavy-columns.tex', import.meta.url)
+  );
+  rmSync(WORK3, { recursive: true, force: true });
+  const chain = new ShippingChain({ workDir: WORK3, docDir: fileURLToPath(new URL('../corpus', import.meta.url)) });
+  const waves = [];
+  chain.onWave = (wave) => waves.push(wave);
+  try {
+    let source = readFileSync(sourcePath, 'utf8');
+    let publishedSource = source;
+    await chain.open(source);
+    const baselineStarted = Date.now();
+    while ((!chain.info().baselineReady || !chain.info().done) && Date.now() - baselineStarted < 120_000) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(chain.info().error, null, `shipping baseline failed: ${chain.info().error}`);
+    assert.equal(chain.info().baselineReady, true, 'mixed exact baseline certified');
+    assert.ok(chain.info().pages >= 6, `stress source spans real pages (${chain.info().pages})`);
+    assert.ok(chain.checkpoints.get(0)?.alive, 'body-root checkpoint is ready before first user unit');
+
+    const scenarios = [
+      ['first-page prose', 'PROSEMARKA', 'PROSEMARKB', true],
+      ['tcolorbox body', 'BOXMARKA', 'BOXMARKB', true],
+      ['table cell', 'TABLEMARKA', 'TABLEMARKB', true],
+      ['macro-wrapped multicols', 'COLMARKA', 'COLMARKB', true],
+      ['TikZ node argument', 'NODEMARKA', 'NODEMARKB', true],
+      ['ordinary prose', 'TAILPROSEA', 'TAILPROSEB', true],
+      ['tail tcolorbox', 'TAILBOXA', 'TAILBOXB', true],
+      ['tail footnote argument', 'TAILNOTEA', 'TAILNOTEB', true],
+      ['captured multi-page argument', 'CAPTUREMARKA', 'CAPTUREMARKB', true],
+      // Caption text is a moving argument and changes the .lof output.  The
+      // tail may execute, but it must not replace the visible authority while
+      // the retained prefix was built from the old auxiliary-file universe.
+      ['float caption argument', 'CAPTIONMARKA', 'CAPTIONMARKB', false],
+    ];
+    for (const [label, before, after, expectWave] of scenarios) {
+      assert.ok(source.includes(before), `${label}: source marker exists`);
+      const next = source.replace(before, after);
+      const capturedUnitPage = label === 'captured multi-page argument'
+        ? Math.min(
+            ...chain.ships
+              .filter((ship) => chain.lines[ship.nline - 1]?.includes(before))
+              .map((ship) => ship.page)
+          )
+        : null;
+      const started = Date.now();
+      const outcome = chain.resume(next);
+      assert.equal(outcome.mode, 'resumed', `${label}: ${JSON.stringify(outcome)}`);
+      if (label === 'captured multi-page argument') {
+        assert.ok(Number.isFinite(capturedUnitPage), 'captured unit spans a shipped page');
+        assert.ok(
+          outcome.fromPage <= capturedUnitPage,
+          `resume cut ${outcome.fromPage} precedes captured-token checkpoint ${capturedUnitPage}`
+        );
+      }
+      const generation = chain.info().gen;
+      while (
+        !waves.some((wave) => wave.gen === generation) &&
+        !chain.info().rejectReason &&
+        Date.now() - started < 5_000
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const wave = waves.find((candidate) => candidate.gen === generation);
+      if (!expectWave) {
+        assert.equal(wave, undefined, `${label}: changed auxiliary output must not be promoted`);
+        assert.equal(chain.info().rejectReason, 'output-manifest-changed');
+        console.log(`    mixed shipping ${label}: fail-closed on changed output manifest`);
+        source = next;
+        continue;
+      }
+      assert.ok(wave, `${label}: exact wave missed the production cutoff (${JSON.stringify(chain.info())})`);
+      assert.ok(wave.elapsedMs < 700, `${label}: exact wave took ${wave.elapsedMs}ms`);
+      const pdf = chain.info().completePdf;
+      assert.ok(pdf, `${label}: complete PDF published`);
+      const { stdout } = await promisify(execFile)('pdftotext', [pdf, '-'], { timeout: 30_000 });
+      assert.match(stdout, new RegExp(after), `${label}: certified PDF contains the edit`);
+      console.log(`    mixed shipping ${label}: page ${outcome.fromPage}, ${wave.elapsedMs}ms`);
+      source = next;
+      publishedSource = next;
+    }
+
+    const truthWork = `${WORK3}-truth`;
+    const shipRaster = `${WORK3}-ship-raster`;
+    const truthRaster = `${WORK3}-truth-raster`;
+    for (const dir of [truthWork, shipRaster, truthRaster]) {
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+    }
+    writeFileSync(`${truthWork}/main.tex`, publishedSource);
+    await promisify(execFile)(
+      'lualatex',
+      ['--shell-escape', '-interaction=nonstopmode', '-halt-on-error', 'main.tex'],
+      { cwd: truthWork, timeout: 120_000 }
+    );
+    await Promise.all([
+      promisify(execFile)(
+        'pdftocairo',
+        ['-png', '-r', '96', chain.info().completePdf, `${shipRaster}/page`],
+        { timeout: 120_000 }
+      ),
+      promisify(execFile)(
+        'pdftocairo',
+        ['-png', '-r', '96', `${truthWork}/main.pdf`, `${truthRaster}/page`],
+        { timeout: 120_000 }
+      ),
+    ]);
+    const rasterHashes = (dir) => readdirSync(dir)
+      .filter((name) => name.endsWith('.png'))
+      .sort()
+      .map((name) => createHash('sha256').update(readFileSync(`${dir}/${name}`)).digest('hex'));
+    assert.deepEqual(
+      rasterHashes(shipRaster),
+      rasterHashes(truthRaster),
+      'resumed complete PDF raster-matches a fresh LuaLaTeX process on every page'
+    );
+
+    const rejectedGeneration = chain.info().gen;
+    const unsafe = [
+      ['math token', source.replace('n(n+1)', 'm(n+1)')],
+      ['comment text', source.replace('COMMENTMARKA', 'COMMENTMARKB')],
+      ['control-word splice', source.replace('\\section{Combined tail}', '\\sectiom{Combined tail}')],
+      ['TeX special character', source.replace('TAILPROSEB', 'TAILPROS{B')],
+      ['verbatim payload', source.replace('VERBATIMMARKA', 'VERBATIMMARKB')],
+    ];
+    for (const [label, next] of unsafe) {
+      assert.notEqual(next, source, `${label}: fixture mutation exists`);
+      assert.deepEqual(
+        chain.resume(next),
+        { mode: 'reboot-needed', reason: 'non-plain-edit' },
+        `${label}: replay admission fails closed`
+      );
+      assert.equal(chain.info().gen, rejectedGeneration, `${label}: no generation forked`);
+      assert.equal(chain.source, source, `${label}: certified source remains untouched`);
+    }
+  } finally {
+    await chain.close();
+    for (const dir of [WORK3, `${WORK3}-truth`, `${WORK3}-ship-raster`, `${WORK3}-truth-raster`]) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 });
 
 test('newif-created conditionals close without weakening package-macro conservatism', () => {

@@ -53,6 +53,13 @@ last-known-good と pending 表示に限り、同じ page/tree を途中で spli
 source/checkpoint の incremental 処理は維持するが、JS paginator の page patch は表示せず、直前の
 exact page を保持して complete ShippingChain wave だけを原子的に昇格する。通常本文の編集応答では
 表示不可能な resident state/rescue walk も行わず、source generation を先に ShippingChain へ渡す。
+Shipping replay の plain edit admission は brace depth 0 を要求しない。代わりに旧新の source partition が
+同じで差分が一つの balanced unit に閉じること、選択した checkpoint の consumed-unit cursor がその unit
+より前であることを要求する。したがって `\footnote{...}` や TikZ node の braced visible text も、その
+argument 全体を再入力できる cut からだけ replay する。複数ページを生成する巨大 macro argument は一つの
+unit のままなので、その unit を既に token list 化した内部 page checkpoint は選ばれない。math、comment、
+control word、inline verb / verbatim、TeX 特殊文字は fail closed のままである。moving argument が `.lof`
+などの出力 manifest を変えた generation は実行できても `TreeCommitCut` を通さず、旧 exact page を保つ。
 通常の小文書は
 `structured` のままなので、この保守策のために canonical 全文 compile を foreground で待たない。
 Phase B では lexical paragraph children と `AtomicLayoutRegion` を分離し、領域内でも証明できる
@@ -62,6 +69,11 @@ plain-text edit だけを `VisualCut` overlay として先行表示する。
 250ms以内（p99 400ms以内）を目標にする。100ページの `shipping-exact` 文書では source acceptance
 p95 150ms以内、edited-page exact p95 850ms以内を目標にし、期限を外した generation は表示せず
 last-known-good を保持する。
+
+現行 ShippingChain は `\begin{document}` hook 完了後、最初の user source unit を読む直前に page 0 の
+body-root checkpoint を作る。first page の plain edit は preamble を再実行せず、この root から全 body を
+exact replay する。700ms の replay deadline を越えた edit は exact tree を昇格せず、Phase B の
+`VisualCut` が入るまでは旧 exact pixels を保持する。source acceptance と新しい文字の即時描画は同義ではない。
 
 ## 10.3 diff と checkpoint rekey
 
