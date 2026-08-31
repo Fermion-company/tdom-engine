@@ -1,6 +1,7 @@
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch } from './safety.js';
+import { classifyStructuralAliases } from './structural-aliases.js';
 import { firstDirtyIndex } from './update-helpers.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { sourceClosure } from './closure.js';
@@ -47,6 +48,14 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   const oldBlocks = engine.blocks;
   let segs = segmentBody(text.slice(bounds.body.start, bounds.body.end), bounds.body.start);
   segs = expandIncludes(segs, 0);
+  // Macro wrappers can hide output-routine environments from both the raw
+  // segmenter and block rescue classifier. Analyse the expanded project body
+  // before granting structured display; an exact canonical page is the only
+  // honest surface when a locally-defined structural alias is actually used.
+  const structuralGate = classifyStructuralAliases(
+    preamble,
+    segs.map((seg) => seg.text).join('\n\n')
+  );
   if (engine.blocks.length) {
     for (const seg of segs) {
       const closure = sourceClosure(seg.text);
@@ -93,6 +102,11 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   if (!engine.preGate.gate.safe) {
     return {
       response: opaqueUpdate(editLabel, timer, engine.preGate.gate.reasons.map((r) => `safety gate: ${r}`)),
+    };
+  }
+  if (!structuralGate.safe) {
+    return {
+      response: opaqueUpdate(editLabel, timer, structuralGate.reasons.map((r) => `safety gate: ${r}`)),
     };
   }
   if (engine.opaqueStickyPre === preHash) {

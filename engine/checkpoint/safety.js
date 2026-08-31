@@ -1,4 +1,5 @@
 // Safety gate — decides what the STRUCTURED layer may touch.
+import { classifyStructuralAliases } from './structural-aliases.js';
 //
 // The structured/provisional layer runs the document's real preamble inside
 // a real lualatex, so unknown macros per se are not dangerous. What IS
@@ -178,6 +179,8 @@ export function bodyUsesColumnSwitch(text) {
 export function classifyDocument(preamble, body) {
   const pre = classifyPreamble(preamble);
   const reasons = [...pre.reasons];
+  const aliases = classifyStructuralAliases(preamble, body);
+  reasons.push(...aliases.reasons);
   const bod = stripComments(body);
   for (const [re, why] of UNSAFE_BODY) {
     if (re.test(bod)) reasons.push(why);

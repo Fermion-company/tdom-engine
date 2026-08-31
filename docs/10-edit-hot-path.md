@@ -21,6 +21,13 @@
 - preamble hash が変わったら `#bootRoot()` で resident root を起動し直す。
 - boot 失敗時は opaque に demote し、同じ preamble で毎打鍵 boot しない。
 
+raw source に危険環境が見えなくても、ローカル macro / custom environment の定義依存が
+page-building sink（環境、native column switch、強制列/改ページ、output routine primitive）へ到達し、
+その alias が展開済み本文で使われていれば opaque に demote する。
+この structural-alias firewall は segmenter より先に structured 表示の権利を取り消すため、
+マクロで隠した `multicols` を誤分割した provisional generation が一瞬だけ公開されることもない。
+解析は source generation ごとに作り直し、未使用の危険定義は structured のままにする。
+
 structured に復帰できる状態になったときは、opaque sticky を外して root を boot し直す。
 
 ## 10.3 diff と checkpoint rekey

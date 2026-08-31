@@ -46,6 +46,14 @@
       "expect": "structured"
     },
     {
+      "file": "12-macro-wrapped-columns.tex",
+      "expect": "opaque"
+    },
+    {
+      "file": "13-macro-wrapped-native-columns.tex",
+      "expect": "opaque"
+    },
+    {
       "file": "../samples/demo-lua.tex",
       "expect": "structured"
     }

@@ -16,6 +16,8 @@ import { buildStream } from '../engine/checkpoint/stream.js';
 import { handlePeerMessage } from '../engine/checkpoint/peer-message.js';
 import { mayCaptureDisplayMath } from '../engine/checkpoint/render-hold.js';
 import { preemptResidentRenders } from '../engine/checkpoint/render-pump.js';
+import { classifyDocument } from '../engine/checkpoint/safety.js';
+import { sourceClosure } from '../engine/checkpoint/closure.js';
 import {
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
@@ -29,6 +31,58 @@ const available = await promisify(execFile)('lualatex', ['--version'], { timeout
   () => false
 );
 const opts = available ? {} : { skip: 'lualatex not installed' };
+
+test('locally-defined page-building aliases fail closed only when used', () => {
+  const direct = String.raw`\newcommand\OpenLedgerColumns{\begin{multicols}{2}}
+\newcommand\CloseLedgerColumns{\end{multicols}}`;
+  assert.equal(classifyDocument(direct, 'plain prose').safe, true, 'unused wrappers stay structured');
+  assert.equal(
+    classifyDocument(direct, String.raw`\OpenLedgerColumns body \CloseLedgerColumns`).safe,
+    false,
+    'direct command wrappers demote'
+  );
+
+  const transitive = String.raw`\newcommand\C{\begin{longtable}{c}}
+\newcommand\B{\C}
+\let\A\B`;
+  assert.equal(classifyDocument(transitive, String.raw`\A`).safe, false, 'transitive and let aliases demote');
+
+  const xparse = String.raw`\NewDocumentCommand{\OpenParallel}{m}{\begin{paracol}{#1}}`;
+  assert.equal(classifyDocument(xparse, String.raw`\OpenParallel{2}`).safe, false, 'xparse aliases demote');
+
+  const customEnvironment = String.raw`\newenvironment{ledgerSpread}
+    {\begin{multicols}{2}}{\end{multicols}}`;
+  assert.equal(
+    classifyDocument(customEnvironment, String.raw`\begin{ledgerSpread}x\end{ledgerSpread}`).safe,
+    false,
+    'custom environment aliases demote'
+  );
+
+  assert.equal(
+    classifyDocument(direct, "% \\OpenLedgerColumns\n\\verb|\\OpenLedgerColumns|").safe,
+    true,
+    'comments and literal payloads do not count as uses'
+  );
+  assert.equal(
+    classifyDocument('', String.raw`\newcommand\LateOpen{\begin{multicols}{2}} text \LateOpen`).safe,
+    false,
+    'body-local definitions are tracked before use'
+  );
+
+  const nativeColumns = String.raw`\newcommand\SwitchLedgerLayout{\twocolumn}`;
+  assert.equal(
+    classifyDocument(nativeColumns, String.raw`\SwitchLedgerLayout`).safe,
+    false,
+    'native column-layout commands hidden by wrappers demote'
+  );
+});
+
+test('newif-created conditionals close without weakening package-macro conservatism', () => {
+  assert.equal(sourceClosure(String.raw`\newif\ifLedgerWide
+\ifLedgerWide wide\else narrow\fi`).closed, true);
+  assert.equal(sourceClosure(String.raw`\ifthenelse{a}{b}{c}`).closed, true);
+  assert.equal(sourceClosure(String.raw`\ifnum 1=1 unfinished`).closed, false);
+});
 
 const para = (s) =>
   `${s} paragraph with enough plain words to make a couple of real lines ` +

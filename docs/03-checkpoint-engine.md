@@ -108,6 +108,14 @@ large math glyph、OpenType math、PUA/unencoded glyph、PDF literal などは d
 13. dirty block の high-fidelity render と deferred chain を schedule する。
 14. `canonical.schedule(source, srcRev)` で正本 compile を予約する。
 
+structured safety は raw 本文だけでは判定しない。preamble と展開済み project body にある
+ローカル定義（`newcommand` / primitive `def` / `let` / `newenvironment` / xparse 系）を軽量 lexer で読み、
+`multicols`・`paracol`・`longtable`・`twocolumn` / `onecolumn`・強制列/改ページ・output routine
+primitive などの page-building sink への依存を worklist で
+固定点伝播する。危険な定義が存在するだけでは demote せず、本文の定義外で実際に呼ばれた generation
+だけ opaque にする。これにより、begin/end を別マクロに隠した環境が空行ごとの普通 block に分断され、
+誤った structured page tree を公開することを防ぐ。コメント・inline verb・verbatim 系環境は解析対象外である。
+
 foreground verification の現在の初期 budget は、galley divergence 用が 8 block、local state ripple 用が 4 block である。ここを超えた伝播は、編集応答の中で文書末尾まで歩かず async chain に送られる。
 
 ## 3.7 checkpoint suffix の扱い
