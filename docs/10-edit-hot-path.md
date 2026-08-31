@@ -22,13 +22,46 @@
 - boot 失敗時は opaque に demote し、同じ preamble で毎打鍵 boot しない。
 
 raw source に危険環境が見えなくても、ローカル macro / custom environment の定義依存が
-page-building sink（環境、native column switch、強制列/改ページ、output routine primitive）へ到達し、
-その alias が展開済み本文で使われていれば opaque に demote する。
-この structural-alias firewall は segmenter より先に structured 表示の権利を取り消すため、
-マクロで隠した `multicols` を誤分割した provisional generation が一瞬だけ公開されることもない。
+page-building sink（環境、native column switch、強制列/改ページ、output routine primitive）へ到達する
+alias は ordered effect certificate を作る。開始・終了効果を一意に証明できる call site は source offset
+上の virtual event として segmenter に渡し、マクロで隠した `multicols` の内側を一つの atomic layout
+block にする。ブロックは stale-first を保ったまま exact rescue / ShippingChain へ送り、full canonical は
+background audit に限定する。証明不能な新 generation は page tree を公開せず last-known-good を保持する。
 解析は source generation ごとに作り直し、未使用の危険定義は structured のままにする。
 
 structured に復帰できる状態になったときは、opaque sticky を外して root を boot し直す。
+
+### 10.2a 表示境界と権威境界
+
+重い多段組文書では「すぐ見せられる範囲」と「正確だと宣言できる範囲」は一致しない。
+一つの source offset や page number に両方の責務を持たせず、次の四境界を区別する。
+
+| 境界 | 許されること | 必要な証明 |
+| --- | --- | --- |
+| `VisualCut` | 旧 exact page 上に編集近傍だけを provisional overlay として見せる | 旧 presentation slot 内に収まり、source region と line witness が一意 |
+| `ResumeCut` | 新 generation の TeX replay を開始する | entry state、definition epoch、checkpoint lineage が一致 |
+| `PageSealCut` | 一枚の新 exact page を表示候補にする | 完全 replay PDF 内で page ship が閉じ、世代と source snapshot が一致 |
+| `TreeCommitCut` | page count と suffix page tree を新世代へ切り替える | 影響 suffix の complete bundle が揃い、generation CAS を通過 |
+
+TeX の実行は編集 offset からではなく、その編集に因果的に先行する最寄りの certified `ResumeCut`
+から始める。`multicols` の内部に checkpoint/resume 能力がない場合、開始 alias より前へ戻る。
+一方 `VisualCut` は paragraph 内に置いてよいが、常に非権威であり、ページ数・後続ページ位置・
+現在 generation の完成を主張しない。複数 generation の共存は presentation slot ごとの
+last-known-good と pending 表示に限り、同じ page/tree を途中で splice しない。
+
+現行 Phase A は、ordered effect を証明できた page-building alias を `shipping-exact` policy にする。
+source/checkpoint の incremental 処理は維持するが、JS paginator の page patch は表示せず、直前の
+exact page を保持して complete ShippingChain wave だけを原子的に昇格する。通常本文の編集応答では
+表示不可能な resident state/rescue walk も行わず、source generation を先に ShippingChain へ渡す。
+通常の小文書は
+`structured` のままなので、この保守策のために canonical 全文 compile を foreground で待たない。
+Phase B では lexical paragraph children と `AtomicLayoutRegion` を分離し、領域内でも証明できる
+plain-text edit だけを `VisualCut` overlay として先行表示する。
+
+性能契約は、200行級の通常 `structured` 文書で provisional p95 120ms以内、exact/current p95
+250ms以内（p99 400ms以内）を目標にする。100ページの `shipping-exact` 文書では source acceptance
+p95 150ms以内、edited-page exact p95 850ms以内を目標にし、期限を外した generation は表示せず
+last-known-good を保持する。
 
 ## 10.3 diff と checkpoint rekey
 

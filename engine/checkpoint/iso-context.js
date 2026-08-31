@@ -31,10 +31,13 @@ export function prepareIsoCompileJob({
   // immediately instead of first paying the 120s fork timeout. Ordinary
   // non-splitting rescues still reuse ckpt0 and its loaded preamble.
   const includesPdf = /\\includepdf\b/.test(block.text);
-  needsRescue(block.text); // populate _breakableRe for this preamble
+  needsRescue(block.text, block.structuralSinks); // populate _breakableRe for this preamble
+  const aliasSplitMode = (block.structuralSinks ?? []).some((sink) =>
+    ['multicols', 'multicols*', 'paracol', 'longtable', 'landscape', 'mdframed', 'framed', 'shaded', 'tcolorbox'].includes(sink)
+  );
   const splitMode =
     !includesPdf &&
-    (/\\begin\{(mdframed|framed|shaded|longtable|multicols\*?)\}|\\begin\{tcolorbox\}\[[^\]]*breakable/.test(
+    (aliasSplitMode || /\\begin\{(mdframed|framed|shaded|longtable|multicols\*?)\}|\\begin\{tcolorbox\}\[[^\]]*breakable/.test(
       block.text
     ) ||
       (breakableRe()?.test(block.text) ?? false));

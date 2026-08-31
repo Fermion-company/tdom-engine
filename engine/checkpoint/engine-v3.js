@@ -89,7 +89,7 @@ import { rescueBlock as rescueBlockHelper } from './rescue-block.js';
 import { runChainPass as runChainPassHelper, chainAfterPass as chainAfterPassHelper } from './chain-pass.js';
 import { runUpdateTypesetPhase } from './update-typeset-phase.js';
 import { prepareUpdate } from './update-prepare.js';
-import { finalizeUpdate } from './update-finalize.js';
+import { finalizeShippingExactUpdate, finalizeUpdate } from './update-finalize.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { buildClosureDeferredResponse } from './update-response.js';
 import {
@@ -537,7 +537,7 @@ export class CheckpointEngine {
     const started = performance.now();
     try {
       return await typesetBlockHelper(this, idx, {
-        needsRescue: (text) => this.#needsRescue(text),
+        needsRescue: (text, structuralSinks) => this.#needsRescue(text, structuralSinks),
         rescueBlock: (blockIdx, why) => this.#rescueBlock(blockIdx, why),
         brokenBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx),
         deferredBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx, false, true),
@@ -573,12 +573,13 @@ export class CheckpointEngine {
     });
   }
 
-  #needsRescue(text) {
+  #needsRescue(text, structuralSinks = []) {
     const result = needsRescue(text, {
       preHash: this.preHash,
       breakableFor: this._breakableFor,
       breakableRe: this._breakableRe,
       source: () => this.store.get(this.file) ?? '',
+      structuralSinks,
     });
     if (result.breakableFor !== this._breakableFor) this._breakableFor = result.breakableFor;
     if (result.breakableRe !== this._breakableRe) this._breakableRe = result.breakableRe;
@@ -677,7 +678,7 @@ export class CheckpointEngine {
       why,
       forceCold,
       rescueCacheKey: (targetBlock, blockIdx) => this.#rescueCacheKey(targetBlock, blockIdx),
-      needsRescue: (blockText) => this.#needsRescue(blockText),
+      needsRescue: (blockText, structuralSinks) => this.#needsRescue(blockText, structuralSinks),
       awaitRender: (key, timeout) => this.#await(key, timeout),
       isoCompileCold: () => this.#isoCompile(block, idx, why, true),
     });
@@ -1009,6 +1010,30 @@ export class CheckpointEngine {
     });
     if (prepared.response) return prepared.response;
     const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
+
+    // Hidden output-routine regions keep their incremental source identity,
+    // but only a complete native replay may promote physical pages.  On an
+    // established document, do not synchronously walk/rescue an atomic
+    // region merely to produce JS pages the renderer is forbidden to show.
+    // Initial open still builds the resident witnesses, and deployments
+    // without ShippingChain retain the ordinary structured fallback.
+    if (this.previewPolicy === 'shipping-exact' && this.shipping && editLabel !== 'open' && !rebooted) {
+      return finalizeShippingExactUpdate(this, {
+        text,
+        editLabel,
+        dirtySource,
+        firstDirty,
+        rebooted,
+        diagnostics,
+        timer: t,
+        callbacks: {
+          queueChainWork: (kind, from, labels) => this.#queueChainWork(kind, from, labels),
+          shipUpdate: (sourceText) => this.#shipUpdate(sourceText),
+          scheduleBackground: (from, dirtyBlocks) => this.#scheduleBackground(from, dirtyBlocks),
+          fidelitySummary: () => this.#fidelitySummary(),
+        },
+      });
+    }
 
     // ---- foreground typeset: resume from the nearest kept snapshot -----
     // Any failure in the typeset phase (dead checkpoint, TeX emergency

@@ -18,6 +18,9 @@ import { mayCaptureDisplayMath } from '../engine/checkpoint/render-hold.js';
 import { preemptResidentRenders } from '../engine/checkpoint/render-pump.js';
 import { classifyDocument } from '../engine/checkpoint/safety.js';
 import { sourceClosure } from '../engine/checkpoint/closure.js';
+import { classifyStructuralAliases } from '../engine/checkpoint/structural-aliases.js';
+import { segmentBody } from '../engine/segmenter.js';
+import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finalize.js';
 import {
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
@@ -32,20 +35,44 @@ const available = await promisify(execFile)('lualatex', ['--version'], { timeout
 );
 const opts = available ? {} : { skip: 'lualatex not installed' };
 
-test('locally-defined page-building aliases fail closed only when used', () => {
+test('exact page-building aliases segment as one block and ambiguous aliases fail closed', () => {
   const direct = String.raw`\newcommand\OpenLedgerColumns{\begin{multicols}{2}}
 \newcommand\CloseLedgerColumns{\end{multicols}}`;
   assert.equal(classifyDocument(direct, 'plain prose').safe, true, 'unused wrappers stay structured');
+  const directBody = String.raw`\OpenLedgerColumns
+
+first paragraph
+
+second paragraph
+
+\CloseLedgerColumns`;
+  const directGate = classifyStructuralAliases(direct, directBody);
+  assert.equal(directGate.safe, true, 'exact paired wrappers stay incremental');
   assert.equal(
-    classifyDocument(direct, String.raw`\OpenLedgerColumns body \CloseLedgerColumns`).safe,
-    false,
-    'direct command wrappers demote'
+    directGate.requiresShippingExact,
+    true,
+    'segmentable output-routine aliases still require TeX-exact page promotion'
+  );
+  assert.equal(
+    classifyDocument(direct, directBody).previewPolicy,
+    'shipping-exact',
+    'JS pagination stays presentation-ineligible for the certified region'
+  );
+  assert.equal(
+    segmentBody(directBody, 0, { structuralEvents: directGate.segmentEvents }).length,
+    1,
+    'hidden environment boundaries keep every inner paragraph in one block'
   );
 
   const transitive = String.raw`\newcommand\C{\begin{longtable}{c}}
 \newcommand\B{\C}
 \let\A\B`;
-  assert.equal(classifyDocument(transitive, String.raw`\A`).safe, false, 'transitive and let aliases demote');
+  const transitiveBody = String.raw`\A body \end{longtable}`;
+  assert.equal(
+    classifyStructuralAliases(transitive, transitiveBody).safe,
+    false,
+    'mixed alias/literal boundaries remain conservative'
+  );
 
   const xparse = String.raw`\NewDocumentCommand{\OpenParallel}{m}{\begin{paracol}{#1}}`;
   assert.equal(classifyDocument(xparse, String.raw`\OpenParallel{2}`).safe, false, 'xparse aliases demote');
@@ -54,8 +81,8 @@ test('locally-defined page-building aliases fail closed only when used', () => {
     {\begin{multicols}{2}}{\end{multicols}}`;
   assert.equal(
     classifyDocument(customEnvironment, String.raw`\begin{ledgerSpread}x\end{ledgerSpread}`).safe,
-    false,
-    'custom environment aliases demote'
+    true,
+    'literal custom-environment boundaries stay incremental'
   );
 
   assert.equal(
@@ -66,7 +93,7 @@ test('locally-defined page-building aliases fail closed only when used', () => {
   assert.equal(
     classifyDocument('', String.raw`\newcommand\LateOpen{\begin{multicols}{2}} text \LateOpen`).safe,
     false,
-    'body-local definitions are tracked before use'
+    'unpaired body-local definitions fail closed'
   );
 
   const nativeColumns = String.raw`\newcommand\SwitchLedgerLayout{\twocolumn}`;
@@ -75,6 +102,71 @@ test('locally-defined page-building aliases fail closed only when used', () => {
     false,
     'native column-layout commands hidden by wrappers demote'
   );
+
+  const ambiguous = String.raw`\newcommand\SpreadMode{\begin{multicols}{2}}
+\renewcommand\SpreadMode{\begin{paracol}{2}}`;
+  assert.equal(
+    classifyStructuralAliases(ambiguous, String.raw`\SpreadMode`).safe,
+    false,
+    'multiply-defined structural effects fail closed'
+  );
+});
+
+test('shipping-exact edits publish source immediately without resident page patches', () => {
+  const order = [];
+  const engine = {
+    rev: 7,
+    srcRev: 11,
+    backendName: 'checkpoint',
+    mode: 'structured',
+    modeReasons: [],
+    previewPolicy: 'shipping-exact',
+    previewReasons: ['certified structural alias: \\Open -> multicols'],
+    blocks: [{ id: 'b1' }, { id: 'b2' }],
+    pages: [{ number: 1 }],
+    checkpoints: new Map([[0, {}]]),
+    pendingChain: null,
+    verifyState: null,
+    diagnostics: [],
+    canonical: {
+      schedule(source, rev) { order.push(['canonical', source, rev]); },
+      info() { return { id: 3, rev: 11, pageCount: 42 }; },
+    },
+    getFontManifest() { return []; },
+  };
+  const timer = {
+    laps: [],
+    lap(name) { this.laps.push(name); },
+    done() { return { totalUs: 120 }; },
+  };
+  const report = finalizeShippingExactUpdate(engine, {
+    text: 'snapshot-12',
+    editLabel: 'main.tex:8517:1-8517:1',
+    dirtySource: new Set(['b2']),
+    firstDirty: 1,
+    rebooted: false,
+    diagnostics: [],
+    timer,
+    callbacks: {
+      queueChainWork(kind, from, labels) {
+        engine.pendingChain = { kind, from, labels: new Set(labels) };
+      },
+      shipUpdate(source) { order.push(['ship', source, engine.srcRev]); },
+      scheduleBackground(from) { order.push(['background', from, engine.srcRev]); },
+      fidelitySummary() { return {}; },
+    },
+  });
+  assert.equal(report.srcRev, 12);
+  assert.equal(report.stats.blocksTypeset, 0);
+  assert.equal(report.stats.chainVerdict, 'shipping-deferred');
+  assert.deepEqual(report.patches, []);
+  assert.deepEqual(report.dirtyPages, []);
+  assert.equal(report.stats.pageCount, 42, 'last exact page tree remains the presentation authority');
+  assert.deepEqual(order, [
+    ['ship', 'snapshot-12', 12],
+    ['canonical', 'snapshot-12', 12],
+    ['background', 1, 12],
+  ]);
 });
 
 test('newif-created conditionals close without weakening package-macro conservatism', () => {

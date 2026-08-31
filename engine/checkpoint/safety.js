@@ -189,11 +189,20 @@ export function classifyDocument(preamble, body) {
     if (re.test(bod)) reasons.push(why);
   }
   const bodyColumnSwitch = BODY_COLUMN_SWITCH_RE.test(bod);
+  const shippingExact = aliases.requiresShippingExact;
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
-    previewPolicy: bodyColumnSwitch ? 'canonical-anchor' : pre.previewPolicy,
-    previewReasons: bodyColumnSwitch
+    previewPolicy: shippingExact
+      ? 'shipping-exact'
+      : bodyColumnSwitch
+        ? 'canonical-anchor'
+        : pre.previewPolicy,
+    previewReasons: shippingExact
+      ? [...new Set(aliases.shippingExactUses.flatMap((use) =>
+          use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)
+        ))]
+      : bodyColumnSwitch
       ? [...new Set([...pre.previewReasons, 'body column switch'])]
       : pre.previewReasons,
   };

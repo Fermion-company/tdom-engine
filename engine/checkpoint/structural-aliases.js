@@ -186,9 +186,17 @@ function skipOptionalGroups(source, at, limit = 2) {
   return at;
 }
 
-function addDefinition(defs, key, bodies, start, end) {
+function addDefinition(defs, key, bodies, start, end, definitionKind = 'command') {
   if (!key || !bodies.length || !Number.isFinite(end)) return;
-  const record = defs.get(key) ?? { key, bodies: [], direct: new Set(), deps: new Set(), may: new Set() };
+  const record = defs.get(key) ?? {
+    key,
+    bodies: [],
+    direct: new Set(),
+    deps: new Set(),
+    may: new Set(),
+    definitionKind,
+  };
+  if (record.definitionKind !== definitionKind) record.definitionKind = 'ambiguous';
   record.bodies.push(...bodies);
   record.start = Math.min(record.start ?? start, start);
   record.end = Math.max(record.end ?? end, end);
@@ -303,7 +311,7 @@ function collectDefinitions(source) {
         continue;
       }
       const key = `env:${envName.value.trim()}`;
-      addDefinition(defs, key, [beginBody.value, endBody.value], i, endBody.end);
+      addDefinition(defs, key, [beginBody.value, endBody.value], i, endBody.end, 'environment');
       spans.push([i, endBody.end]);
       i = endBody.end;
       continue;
@@ -391,6 +399,104 @@ function propagate(defs) {
   }
 }
 
+/**
+ * Exact structural effect for the deliberately small Phase-2 trust envelope.
+ * A command definition is segmentable only when every known structural sink
+ * is represented by one unambiguous ordered token sequence. Unknown external
+ * commands are left to the ordinary safety gate; ambiguous local definitions
+ * remain fail-closed.
+ */
+function exactCommandEffect(key, defs, memo = new Map(), active = new Set()) {
+  if (memo.has(key)) return memo.get(key);
+  const record = defs.get(key);
+  if (!record || record.definitionKind !== 'command' || record.bodies.length !== 1 || active.has(key)) {
+    memo.set(key, null);
+    return null;
+  }
+  active.add(key);
+  const effects = [];
+  const covered = new Set();
+  const body = record.bodies[0];
+  for (let i = 0; i < body.length; ) {
+    if (body[i] !== '\\') {
+      i++;
+      continue;
+    }
+    const control = readControl(body, i);
+    if (!control) {
+      i++;
+      continue;
+    }
+    const commandSink = STRUCTURAL_COMMANDS.get(control.name);
+    if (commandSink) {
+      effects.push({ kind: 'command', sink: commandSink });
+      covered.add(commandSink);
+      i = control.end;
+      continue;
+    }
+    if (control.name === 'begin' || control.name === 'end') {
+      const env = readBalanced(body, control.end);
+      if (env) {
+        const envName = env.value.trim();
+        if (STRUCTURAL_ENVIRONMENTS.has(envName)) {
+          effects.push({ kind: control.name, sink: envName });
+          covered.add(envName);
+        } else {
+          const dependency = defs.get(`env:${envName}`);
+          if (dependency?.may.size) {
+            active.delete(key);
+            memo.set(key, null);
+            return null;
+          }
+        }
+        i = env.end;
+        continue;
+      }
+    }
+    if (control.name === 'setlength') {
+      const target = readBalanced(body, control.end);
+      const value = target ? readBalanced(body, target.end) : null;
+      if (!target || !value) {
+        active.delete(key);
+        memo.set(key, null);
+        return null;
+      }
+      effects.push({ kind: 'state-write', target: target.value.trim() });
+      i = value.end;
+      continue;
+    }
+    const depKey = `\\${control.name}`;
+    const dependency = defs.get(depKey);
+    if (dependency) {
+      if (!dependency.may.size) {
+        active.delete(key);
+        memo.set(key, null);
+        return null;
+      }
+      const nested = exactCommandEffect(depKey, defs, memo, active);
+      if (!nested) {
+        active.delete(key);
+        memo.set(key, null);
+        return null;
+      }
+      effects.push(...nested);
+      for (const effect of nested) covered.add(effect.sink);
+    } else if (control.name !== 'relax' && /^[A-Za-z@]/.test(control.name)) {
+      // Certification is intentionally much narrower than hazard
+      // discovery. Unknown commands may have an output-routine meaning at
+      // runtime, so they cannot occur in an exact structural wrapper.
+      active.delete(key);
+      memo.set(key, null);
+      return null;
+    }
+    i = control.end;
+  }
+  active.delete(key);
+  const exact = record.may.size > 0 && [...record.may].every((sink) => covered.has(sink)) ? effects : null;
+  memo.set(key, exact);
+  return exact;
+}
+
 function maskSpans(source, spans) {
   const chars = source.split('');
   for (const [start, end] of spans) blankRange(chars, start, end);
@@ -400,6 +506,7 @@ function maskSpans(source, spans) {
 function usedStructuralAliases(bodyInfo, defs) {
   const source = maskSpans(bodyInfo.masked, bodyInfo.spans);
   const found = [];
+  const exactMemo = new Map();
   for (let i = 0; i < source.length; ) {
     if (source[i] !== '\\') {
       i++;
@@ -415,14 +522,30 @@ function usedStructuralAliases(bodyInfo, defs) {
       if (env) {
         const key = `env:${env.value.trim()}`;
         const record = defs.get(key);
-        if (record?.may.size) found.push({ key, sinks: [...record.may] });
+        if (record?.may.size) {
+          // The custom environment's own literal begin/end already gives the
+          // raw segmenter an exact nesting boundary. It only needs to carry
+          // the hidden sink to the rescue classifier.
+          found.push({
+            key,
+            at: i,
+            sinks: [...record.may],
+            effects: control.name === 'begin'
+              ? [{ kind: 'rescue', sinks: [...record.may] }]
+              : [],
+            exact: record.definitionKind === 'environment',
+          });
+        }
         i = env.end;
         continue;
       }
     }
     const key = `\\${control.name}`;
     const record = defs.get(key);
-    if (record?.may.size) found.push({ key, sinks: [...record.may] });
+    if (record?.may.size) {
+      const exact = exactCommandEffect(key, defs, exactMemo);
+      found.push({ key, at: i, sinks: [...record.may], effects: exact ?? [], exact: !!exact });
+    }
     i = control.end;
   }
   return found;
@@ -441,13 +564,41 @@ export function classifyStructuralAliases(preamble, body) {
   mergeDefinitions(defs, bodyInfo.defs);
   propagate(defs);
   const uses = usedStructuralAliases(bodyInfo, defs);
-  const reasons = uses.map(({ key, sinks }) => {
+  const unsafeUses = uses.filter((use) => !use.exact);
+  const reasons = unsafeUses.map(({ key, sinks }) => {
     const display = key.startsWith('env:') ? `environment ${key.slice(4)}` : `macro ${key}`;
-    return `${display} reaches page-building ${sinks.join(', ')}`;
+    return `${display} has an unprovable page-building effect: ${sinks.join(', ')}`;
   });
+  const segmentEvents = uses
+    .filter((use) => use.exact && use.effects.length)
+    .map((use) => ({ at: use.at, key: use.key, sinks: use.sinks, effects: use.effects }));
+  const open = [];
+  for (const event of segmentEvents) {
+    for (const effect of event.effects) {
+      if (effect.kind === 'begin') open.push(effect.sink);
+      else if (effect.kind === 'end') {
+        if (open.at(-1) !== effect.sink) {
+          reasons.push(`${event.key} does not close the active structural environment`);
+        } else {
+          open.pop();
+        }
+      }
+    }
+  }
+  if (open.length) reasons.push(`structural aliases leave ${open.join(', ')} open`);
+  const shippingExactUses = uses.filter((use) => use.exact && use.sinks.length);
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
+    segmentEvents,
+    uses,
+    // Proving where a hidden environment opens/closes is enough to retain
+    // incremental source identity, but it does NOT prove that the JS page
+    // builder can reproduce TeX's output routine.  Keep those two
+    // qualifications separate: exact aliases are segmentable, while their
+    // physical pages must be promoted only by ShippingChain/canonical TeX.
+    requiresShippingExact: shippingExactUses.length > 0,
+    shippingExactUses,
     aliases: new Map([...defs].map(([key, value]) => [key, [...value.may]])),
   };
 }

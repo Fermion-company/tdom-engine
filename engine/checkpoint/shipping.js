@@ -22,6 +22,7 @@ import path from 'node:path';
 import { withProjectInputs } from '../project-inputs.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { segmentBody } from '../segmenter.js';
+import { classifyStructuralAliases } from './structural-aliases.js';
 import { ensureShim } from './forkshim.js';
 
 const execFileP = promisify(execFile);
@@ -507,7 +508,8 @@ export class ShippingChain {
     const e = source.indexOf('\\end{document}', b);
     const bodyStart = b + '\\begin{document}'.length;
     const body = source.slice(bodyStart, e < 0 ? source.length : e);
-    const segments = segmentBody(body, 0);
+    const structural = classifyStructuralAliases(source.slice(0, b), body);
+    const segments = segmentBody(body, 0, { structuralEvents: structural.segmentEvents });
     // Preserve every source byte, including the blank lines that terminate
     // paragraphs. The segmenter's `text` intentionally excludes separators;
     // rebuilding from those strings and adding an artificial `\\par` is not

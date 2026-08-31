@@ -46,16 +46,28 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   // preamble returned above this point, leaving opaque
   // papers with zero editable regions despite the UI calling them editable.
   const oldBlocks = engine.blocks;
-  let segs = segmentBody(text.slice(bounds.body.start, bounds.body.end), bounds.body.start);
+  const bodyText = text.slice(bounds.body.start, bounds.body.end);
+  const rawStructuralGate = classifyStructuralAliases(preamble, bodyText);
+  let segs = segmentBody(bodyText, bounds.body.start, {
+    structuralEvents: rawStructuralGate.segmentEvents,
+  });
   segs = expandIncludes(segs, 0);
   // Macro wrappers can hide output-routine environments from both the raw
   // segmenter and block rescue classifier. Analyse the expanded project body
   // before granting structured display; an exact canonical page is the only
   // honest surface when a locally-defined structural alias is actually used.
-  const structuralGate = classifyStructuralAliases(
+  const expandedStructuralGate = classifyStructuralAliases(
     preamble,
     segs.map((seg) => seg.text).join('\n\n')
   );
+  const structuralReasons = [
+    ...rawStructuralGate.reasons,
+    ...expandedStructuralGate.reasons,
+  ];
+  const shippingExactUses = [
+    ...rawStructuralGate.shippingExactUses,
+    ...expandedStructuralGate.shippingExactUses,
+  ];
   if (engine.blocks.length) {
     for (const seg of segs) {
       const closure = sourceClosure(seg.text);
@@ -77,7 +89,12 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   // sparse resident skeleton once for this source generation; subsequent
   // JOBs reuse it unless a genuinely hotter block changes the top set.
   engine.checkpointKeepCache = null;
-  if (engine.blocks.some((block) => bodyUsesColumnSwitch(block.text))) {
+  if (shippingExactUses.length) {
+    engine.previewPolicy = 'shipping-exact';
+    engine.previewReasons = [...new Set(shippingExactUses.flatMap((use) =>
+      use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)
+    ))];
+  } else if (engine.blocks.some((block) => bodyUsesColumnSwitch(block.text))) {
     engine.previewPolicy = 'canonical-anchor';
     engine.previewReasons = [...new Set([...engine.previewReasons, 'body column switch'])];
   }
@@ -104,9 +121,13 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
       response: opaqueUpdate(editLabel, timer, engine.preGate.gate.reasons.map((r) => `safety gate: ${r}`)),
     };
   }
-  if (!structuralGate.safe) {
+  if (structuralReasons.length) {
     return {
-      response: opaqueUpdate(editLabel, timer, structuralGate.reasons.map((r) => `safety gate: ${r}`)),
+      response: opaqueUpdate(
+        editLabel,
+        timer,
+        [...new Set(structuralReasons)].map((r) => `safety gate: ${r}`)
+      ),
     };
   }
   if (engine.opaqueStickyPre === preHash) {

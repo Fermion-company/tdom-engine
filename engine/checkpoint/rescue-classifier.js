@@ -94,9 +94,9 @@ export function collectBreakableTcolorboxNames(preamble) {
  * environments the PREAMBLE defines (\newtcolorbox/\newtcbtheorem with
  * a `breakable` option create page-splitting envs under custom names).
  */
-export function needsRescue(text, { preHash, breakableFor, breakableRe, source }) {
+export function needsRescue(text, { preHash, breakableFor, breakableRe, source, structuralSinks = [] }) {
   const live = stripComments(text); // `% \begin{longtable}` must not cost a rescue
-  if (OUTPUT_HIJACK_RE.test(live) || FORCED_BREAK_RE.test(live)) {
+  if (structuralSinks.length || OUTPUT_HIJACK_RE.test(live) || FORCED_BREAK_RE.test(live)) {
     return { needs: true, breakableFor, breakableRe };
   }
   if (breakableFor !== preHash) {
