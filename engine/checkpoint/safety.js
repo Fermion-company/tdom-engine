@@ -1,4 +1,5 @@
 // Safety gate — decides what the STRUCTURED layer may touch.
+import { classifyStructuralAliases } from './structural-aliases.js';
 //
 // The structured/provisional layer runs the document's real preamble inside
 // a real lualatex, so unknown macros per se are not dangerous. What IS
@@ -178,6 +179,8 @@ export function bodyUsesColumnSwitch(text) {
 export function classifyDocument(preamble, body) {
   const pre = classifyPreamble(preamble);
   const reasons = [...pre.reasons];
+  const aliases = classifyStructuralAliases(preamble, body);
+  reasons.push(...aliases.reasons);
   const bod = stripComments(body);
   for (const [re, why] of UNSAFE_BODY) {
     if (re.test(bod)) reasons.push(why);
@@ -186,11 +189,20 @@ export function classifyDocument(preamble, body) {
     if (re.test(bod)) reasons.push(why);
   }
   const bodyColumnSwitch = BODY_COLUMN_SWITCH_RE.test(bod);
+  const shippingExact = aliases.requiresShippingExact;
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
-    previewPolicy: bodyColumnSwitch ? 'canonical-anchor' : pre.previewPolicy,
-    previewReasons: bodyColumnSwitch
+    previewPolicy: shippingExact
+      ? 'shipping-exact'
+      : bodyColumnSwitch
+        ? 'canonical-anchor'
+        : pre.previewPolicy,
+    previewReasons: shippingExact
+      ? [...new Set(aliases.shippingExactUses.flatMap((use) =>
+          use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)
+        ))]
+      : bodyColumnSwitch
       ? [...new Set([...pre.previewReasons, 'body column switch'])]
       : pre.previewReasons,
   };

@@ -96,7 +96,7 @@ export async function typesetBlock(engine, idx, callbacks) {
     }
   };
   if (aborted()) throw new Error('background pass aborted (edit waiting)');
-  if (needsRescue(block.text)) {
+  if (needsRescue(block.text, block.structuralSinks)) {
     const g = await rescueSafely('output-routine environment needs a real page');
     TRACE?.('rescue(env)', T0);
     return g;

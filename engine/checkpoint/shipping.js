@@ -22,6 +22,7 @@ import path from 'node:path';
 import { withProjectInputs } from '../project-inputs.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { segmentBody } from '../segmenter.js';
+import { classifyStructuralAliases } from './structural-aliases.js';
 import { ensureShim } from './forkshim.js';
 
 const execFileP = promisify(execFile);
@@ -35,6 +36,30 @@ const INPUT_IDENTITY_UNSAFE = /\\(?:jobname|inputlineno|everyeof|endinput|Curren
 // reevaluates a shipped prefix. Direct clock/register observation remains
 // outside the certified profile.
 const NONDETERMINISM_UNSAFE = /\\(?:time|day|month|year|pdfelapsedtime|pdfrandomseed|uniformdeviate|openin|read|ifeof|filemoddate|filesize|mdfivesum|ShellEscape)\b|\\input\s*\|/;
+const VERBATIM_ENV = /\\(begin|end)\{(verbatim\*?|lstlisting|minted|alltt|filecontents\*?|[BLV]erbatim\*?)\}/g;
+
+function literalAt(source, offset) {
+  let depth = 0;
+  VERBATIM_ENV.lastIndex = 0;
+  for (let match; (match = VERBATIM_ENV.exec(source)) && match.index < offset;) {
+    depth += match[1] === 'begin' ? 1 : -1;
+    if (depth < 0) depth = 0;
+  }
+  if (depth > 0) return true;
+
+  // Inline \verb changes catcode/scanning rules up to its delimiter.  Only
+  // the current physical line can contain the payload.
+  const lineStart = source.lastIndexOf('\n', Math.max(0, offset - 1)) + 1;
+  const prefix = source.slice(lineStart, offset);
+  const opener = /\\verb\*?([^A-Za-z\s])/g;
+  let match;
+  let last = null;
+  while ((match = opener.exec(prefix))) last = match;
+  if (!last) return false;
+  const delimiter = last[1];
+  const payloadStart = last.index + last[0].length;
+  return !prefix.slice(payloadStart).includes(delimiter);
+}
 
 function plainReplayEdit(before, after) {
   let start = 0;
@@ -48,12 +73,16 @@ function plainReplayEdit(before, after) {
   const removed = before.slice(start, oldEnd);
   const inserted = after.slice(start, newEnd);
   if (PLAIN_EDIT_UNSAFE.test(removed) || PLAIN_EDIT_UNSAFE.test(inserted) ||
+      literalAt(before, start) ||
       DOCUMENT_EFFECT_UNSAFE.test(before) || INPUT_IDENTITY_UNSAFE.test(before) ||
       NONDETERMINISM_UNSAFE.test(before)) return false;
 
-  // Conservative lexical state at the changed byte. A visible prose edit is
-  // outside TeX groups/math/comments and is not part of a control word.
-  let groups = 0;
+  // Conservative lexical state at the changed byte.  Group depth alone is
+  // NOT an admission boundary: a checkpoint preceding the complete source
+  // unit re-reads the opening brace, scans the argument again, and closes it
+  // before the next unit.  resume() proves that whole-unit replay below.
+  // Math/comments and a control-word splice remain unsafe because the changed
+  // bytes are not ordinary visible character tokens.
   let math = null;
   let comment = false;
   for (let index = 0; index < start; index++) {
@@ -70,12 +99,28 @@ function plainReplayEdit(before, after) {
       index++;
       continue;
     }
-    if (char === '{') groups++;
-    else if (char === '}') groups = Math.max(0, groups - 1);
-    else if (char === '$') math = math ? null : '$';
+    if (char === '$') math = math ? null : '$';
   }
-  return !comment && groups === 0 && math === null &&
+  return !comment && math === null &&
     !/\\[A-Za-z@]*$/.test(before.slice(0, start));
+}
+
+/**
+ * A braced edit is replayable only when the unit partition itself proves an
+ * input cut: exactly one already-balanced source unit changes and every byte
+ * around it retains the same unit identity.  The selected page checkpoint is
+ * checked separately to be strictly before this unit.  This is command-name
+ * agnostic — caption, footnote and TikZ node text get no special privilege.
+ */
+function singleReplayUnit(oldUnits, newUnits) {
+  if (oldUnits.length !== newUnits.length) return null;
+  let changed = -1;
+  for (let index = 0; index < oldUnits.length; index++) {
+    if (oldUnits[index] === newUnits[index]) continue;
+    if (changed !== -1) return null;
+    changed = index;
+  }
+  return changed;
 }
 
 class Peer {
@@ -507,7 +552,8 @@ export class ShippingChain {
     const e = source.indexOf('\\end{document}', b);
     const bodyStart = b + '\\begin{document}'.length;
     const body = source.slice(bodyStart, e < 0 ? source.length : e);
-    const segments = segmentBody(body, 0);
+    const structural = classifyStructuralAliases(source.slice(0, b), body);
+    const segments = segmentBody(body, 0, { structuralEvents: structural.segmentEvents });
     // Preserve every source byte, including the blank lines that terminate
     // paragraphs. The segmenter's `text` intentionally excludes separators;
     // rebuilding from those strings and adding an artificial `\\par` is not
@@ -691,6 +737,11 @@ export class ShippingChain {
       return { mode: 'reboot-needed', reason: 'non-plain-edit' };
     }
     const newLines = this.#unitsOf(newSource);
+    const certifiedUnit = singleReplayUnit(this.lines, newLines);
+    if (certifiedUnit === null) {
+      this.lastRejectReason = 'unit-boundary-changed';
+      return { mode: 'reboot-needed', reason: 'unit-boundary-changed' };
+    }
     let first = 0;
     while (
       first < this.lines.length &&
@@ -703,9 +754,16 @@ export class ShippingChain {
       return { mode: 'unchanged' };
     }
     const firstChanged = first + 1; // 1-based
+    if (certifiedUnit + 1 !== firstChanged) {
+      this.lastRejectReason = 'unit-certificate-mismatch';
+      return { mode: 'reboot-needed', reason: 'unit-certificate-mismatch' };
+    }
     // the newest checkpoint whose consumed-line cursor is strictly before
     // the first changed line can replay the tail exactly
-    let best = null;
+    const rootCheckpoint = this.checkpoints.get(0);
+    let best = rootCheckpoint?.alive
+      ? { page: 0, nline: 0, gen: rootCheckpoint.gen }
+      : null;
     for (const s of this.ships) {
       if (s.gen !== undefined && s.nline < firstChanged && this.checkpoints.get(s.page)?.alive) {
         if (!best || s.page > best.page) best = s;

@@ -98,7 +98,7 @@ const canonicalStageObserver = typeof IntersectionObserver === 'function'
 // rev without changing the source, and must not un-freshen the canonical
 let mode = 'structured'; // 'structured' | 'opaque'
 let modeReasons = [];
-let previewPolicy = 'structured'; // structured | canonical-anchor
+let previewPolicy = 'structured'; // structured | canonical-anchor | shipping-exact
 let previewReasons = [];
 let canonical = null; // {id, rev(srcRev), pageCount, paper, inFlight, error}
 // incremental authority (shipping chain): page -> {gen, srcRev}. A shipped
@@ -1067,7 +1067,11 @@ function setMode(newMode, reasons) {
 }
 
 function usesCanonicalSurface() {
-  return mode === 'opaque' || previewPolicy === 'canonical-anchor';
+  // shipping-exact retains the incremental source/checkpoint machinery, but
+  // its physical pages have to come from a complete TeX replay.  Keep the
+  // last exact generation visible until a certified ship wave atomically
+  // replaces it; resident JS pages remain internal witnesses only.
+  return mode === 'opaque' || previewPolicy === 'canonical-anchor' || previewPolicy === 'shipping-exact';
 }
 
 function createCanonicalImage(src) {

@@ -6,7 +6,8 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync, readFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -16,6 +17,12 @@ import { buildStream } from '../engine/checkpoint/stream.js';
 import { handlePeerMessage } from '../engine/checkpoint/peer-message.js';
 import { mayCaptureDisplayMath } from '../engine/checkpoint/render-hold.js';
 import { preemptResidentRenders } from '../engine/checkpoint/render-pump.js';
+import { classifyDocument } from '../engine/checkpoint/safety.js';
+import { sourceClosure } from '../engine/checkpoint/closure.js';
+import { classifyStructuralAliases } from '../engine/checkpoint/structural-aliases.js';
+import { ShippingChain } from '../engine/checkpoint/shipping.js';
+import { segmentBody } from '../engine/segmenter.js';
+import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finalize.js';
 import {
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
@@ -23,12 +30,298 @@ import {
 
 const WORK = fileURLToPath(new URL('../.tdom-hotpath-test', import.meta.url));
 const WORK2 = fileURLToPath(new URL('../.tdom-hotpath-test-scratch', import.meta.url));
+const WORK3 = fileURLToPath(new URL('../.tdom-hotpath-test-mixed-shipping', import.meta.url));
 
 const available = await promisify(execFile)('lualatex', ['--version'], { timeout: 15_000 }).then(
   () => true,
   () => false
 );
 const opts = available ? {} : { skip: 'lualatex not installed' };
+
+test('exact page-building aliases segment as one block and ambiguous aliases fail closed', () => {
+  const direct = String.raw`\newcommand\OpenLedgerColumns{\begin{multicols}{2}}
+\newcommand\CloseLedgerColumns{\end{multicols}}`;
+  assert.equal(classifyDocument(direct, 'plain prose').safe, true, 'unused wrappers stay structured');
+  const directBody = String.raw`\OpenLedgerColumns
+
+first paragraph
+
+second paragraph
+
+\CloseLedgerColumns`;
+  const directGate = classifyStructuralAliases(direct, directBody);
+  assert.equal(directGate.safe, true, 'exact paired wrappers stay incremental');
+  assert.equal(
+    directGate.requiresShippingExact,
+    true,
+    'segmentable output-routine aliases still require TeX-exact page promotion'
+  );
+  assert.equal(
+    classifyDocument(direct, directBody).previewPolicy,
+    'shipping-exact',
+    'JS pagination stays presentation-ineligible for the certified region'
+  );
+  assert.equal(
+    segmentBody(directBody, 0, { structuralEvents: directGate.segmentEvents }).length,
+    1,
+    'hidden environment boundaries keep every inner paragraph in one block'
+  );
+
+  const transitive = String.raw`\newcommand\C{\begin{longtable}{c}}
+\newcommand\B{\C}
+\let\A\B`;
+  const transitiveBody = String.raw`\A body \end{longtable}`;
+  assert.equal(
+    classifyStructuralAliases(transitive, transitiveBody).safe,
+    false,
+    'mixed alias/literal boundaries remain conservative'
+  );
+
+  const xparse = String.raw`\NewDocumentCommand{\OpenParallel}{m}{\begin{paracol}{#1}}`;
+  assert.equal(classifyDocument(xparse, String.raw`\OpenParallel{2}`).safe, false, 'xparse aliases demote');
+
+  const customEnvironment = String.raw`\newenvironment{ledgerSpread}
+    {\begin{multicols}{2}}{\end{multicols}}`;
+  assert.equal(
+    classifyDocument(customEnvironment, String.raw`\begin{ledgerSpread}x\end{ledgerSpread}`).safe,
+    true,
+    'literal custom-environment boundaries stay incremental'
+  );
+
+  assert.equal(
+    classifyDocument(direct, "% \\OpenLedgerColumns\n\\verb|\\OpenLedgerColumns|").safe,
+    true,
+    'comments and literal payloads do not count as uses'
+  );
+  assert.equal(
+    classifyDocument('', String.raw`\newcommand\LateOpen{\begin{multicols}{2}} text \LateOpen`).safe,
+    false,
+    'unpaired body-local definitions fail closed'
+  );
+
+  const nativeColumns = String.raw`\newcommand\SwitchLedgerLayout{\twocolumn}`;
+  assert.equal(
+    classifyDocument(nativeColumns, String.raw`\SwitchLedgerLayout`).safe,
+    false,
+    'native column-layout commands hidden by wrappers demote'
+  );
+
+  const ambiguous = String.raw`\newcommand\SpreadMode{\begin{multicols}{2}}
+\renewcommand\SpreadMode{\begin{paracol}{2}}`;
+  assert.equal(
+    classifyStructuralAliases(ambiguous, String.raw`\SpreadMode`).safe,
+    false,
+    'multiply-defined structural effects fail closed'
+  );
+});
+
+test('shipping-exact edits publish source immediately without resident page patches', () => {
+  const order = [];
+  const engine = {
+    rev: 7,
+    srcRev: 11,
+    backendName: 'checkpoint',
+    mode: 'structured',
+    modeReasons: [],
+    previewPolicy: 'shipping-exact',
+    previewReasons: ['certified structural alias: \\Open -> multicols'],
+    blocks: [{ id: 'b1' }, { id: 'b2' }],
+    pages: [{ number: 1 }],
+    checkpoints: new Map([[0, {}]]),
+    pendingChain: null,
+    verifyState: null,
+    diagnostics: [],
+    canonical: {
+      schedule(source, rev) { order.push(['canonical', source, rev]); },
+      info() { return { id: 3, rev: 11, pageCount: 42 }; },
+    },
+    getFontManifest() { return []; },
+  };
+  const timer = {
+    laps: [],
+    lap(name) { this.laps.push(name); },
+    done() { return { totalUs: 120 }; },
+  };
+  const report = finalizeShippingExactUpdate(engine, {
+    text: 'snapshot-12',
+    editLabel: 'main.tex:8517:1-8517:1',
+    dirtySource: new Set(['b2']),
+    firstDirty: 1,
+    rebooted: false,
+    diagnostics: [],
+    timer,
+    callbacks: {
+      queueChainWork(kind, from, labels) {
+        engine.pendingChain = { kind, from, labels: new Set(labels) };
+      },
+      shipUpdate(source) { order.push(['ship', source, engine.srcRev]); },
+      scheduleBackground(from) { order.push(['background', from, engine.srcRev]); },
+      fidelitySummary() { return {}; },
+    },
+  });
+  assert.equal(report.srcRev, 12);
+  assert.equal(report.stats.blocksTypeset, 0);
+  assert.equal(report.stats.chainVerdict, 'shipping-deferred');
+  assert.deepEqual(report.patches, []);
+  assert.deepEqual(report.dirtyPages, []);
+  assert.equal(report.stats.pageCount, 42, 'last exact page tree remains the presentation authority');
+  assert.deepEqual(order, [
+    ['ship', 'snapshot-12', 12],
+    ['canonical', 'snapshot-12', 12],
+    ['background', 1, 12],
+  ]);
+});
+
+test('mixed heavy document resumes exact waves from visible edits in rich TeX contexts', opts, async () => {
+  const sourcePath = fileURLToPath(
+    new URL('../corpus/14-mixed-heavy-columns.tex', import.meta.url)
+  );
+  rmSync(WORK3, { recursive: true, force: true });
+  const chain = new ShippingChain({ workDir: WORK3, docDir: fileURLToPath(new URL('../corpus', import.meta.url)) });
+  const waves = [];
+  chain.onWave = (wave) => waves.push(wave);
+  try {
+    let source = readFileSync(sourcePath, 'utf8');
+    let publishedSource = source;
+    await chain.open(source);
+    const baselineStarted = Date.now();
+    while ((!chain.info().baselineReady || !chain.info().done) && Date.now() - baselineStarted < 120_000) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(chain.info().error, null, `shipping baseline failed: ${chain.info().error}`);
+    assert.equal(chain.info().baselineReady, true, 'mixed exact baseline certified');
+    assert.ok(chain.info().pages >= 6, `stress source spans real pages (${chain.info().pages})`);
+    assert.ok(chain.checkpoints.get(0)?.alive, 'body-root checkpoint is ready before first user unit');
+
+    const scenarios = [
+      ['first-page prose', 'PROSEMARKA', 'PROSEMARKB', true],
+      ['tcolorbox body', 'BOXMARKA', 'BOXMARKB', true],
+      ['table cell', 'TABLEMARKA', 'TABLEMARKB', true],
+      ['macro-wrapped multicols', 'COLMARKA', 'COLMARKB', true],
+      ['TikZ node argument', 'NODEMARKA', 'NODEMARKB', true],
+      ['ordinary prose', 'TAILPROSEA', 'TAILPROSEB', true],
+      ['tail tcolorbox', 'TAILBOXA', 'TAILBOXB', true],
+      ['tail footnote argument', 'TAILNOTEA', 'TAILNOTEB', true],
+      ['captured multi-page argument', 'CAPTUREMARKA', 'CAPTUREMARKB', true],
+      // Caption text is a moving argument and changes the .lof output.  The
+      // tail may execute, but it must not replace the visible authority while
+      // the retained prefix was built from the old auxiliary-file universe.
+      ['float caption argument', 'CAPTIONMARKA', 'CAPTIONMARKB', false],
+    ];
+    for (const [label, before, after, expectWave] of scenarios) {
+      assert.ok(source.includes(before), `${label}: source marker exists`);
+      const next = source.replace(before, after);
+      const capturedUnitPage = label === 'captured multi-page argument'
+        ? Math.min(
+            ...chain.ships
+              .filter((ship) => chain.lines[ship.nline - 1]?.includes(before))
+              .map((ship) => ship.page)
+          )
+        : null;
+      const started = Date.now();
+      const outcome = chain.resume(next);
+      assert.equal(outcome.mode, 'resumed', `${label}: ${JSON.stringify(outcome)}`);
+      if (label === 'captured multi-page argument') {
+        assert.ok(Number.isFinite(capturedUnitPage), 'captured unit spans a shipped page');
+        assert.ok(
+          outcome.fromPage <= capturedUnitPage,
+          `resume cut ${outcome.fromPage} precedes captured-token checkpoint ${capturedUnitPage}`
+        );
+      }
+      const generation = chain.info().gen;
+      while (
+        !waves.some((wave) => wave.gen === generation) &&
+        !chain.info().rejectReason &&
+        Date.now() - started < 5_000
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      const wave = waves.find((candidate) => candidate.gen === generation);
+      if (!expectWave) {
+        assert.equal(wave, undefined, `${label}: changed auxiliary output must not be promoted`);
+        assert.equal(chain.info().rejectReason, 'output-manifest-changed');
+        console.log(`    mixed shipping ${label}: fail-closed on changed output manifest`);
+        source = next;
+        continue;
+      }
+      assert.ok(wave, `${label}: exact wave missed the production cutoff (${JSON.stringify(chain.info())})`);
+      assert.ok(wave.elapsedMs < 700, `${label}: exact wave took ${wave.elapsedMs}ms`);
+      const pdf = chain.info().completePdf;
+      assert.ok(pdf, `${label}: complete PDF published`);
+      const { stdout } = await promisify(execFile)('pdftotext', [pdf, '-'], { timeout: 30_000 });
+      assert.match(stdout, new RegExp(after), `${label}: certified PDF contains the edit`);
+      console.log(`    mixed shipping ${label}: page ${outcome.fromPage}, ${wave.elapsedMs}ms`);
+      source = next;
+      publishedSource = next;
+    }
+
+    const truthWork = `${WORK3}-truth`;
+    const shipRaster = `${WORK3}-ship-raster`;
+    const truthRaster = `${WORK3}-truth-raster`;
+    for (const dir of [truthWork, shipRaster, truthRaster]) {
+      rmSync(dir, { recursive: true, force: true });
+      mkdirSync(dir, { recursive: true });
+    }
+    writeFileSync(`${truthWork}/main.tex`, publishedSource);
+    await promisify(execFile)(
+      'lualatex',
+      ['--shell-escape', '-interaction=nonstopmode', '-halt-on-error', 'main.tex'],
+      { cwd: truthWork, timeout: 120_000 }
+    );
+    await Promise.all([
+      promisify(execFile)(
+        'pdftocairo',
+        ['-png', '-r', '96', chain.info().completePdf, `${shipRaster}/page`],
+        { timeout: 120_000 }
+      ),
+      promisify(execFile)(
+        'pdftocairo',
+        ['-png', '-r', '96', `${truthWork}/main.pdf`, `${truthRaster}/page`],
+        { timeout: 120_000 }
+      ),
+    ]);
+    const rasterHashes = (dir) => readdirSync(dir)
+      .filter((name) => name.endsWith('.png'))
+      .sort()
+      .map((name) => createHash('sha256').update(readFileSync(`${dir}/${name}`)).digest('hex'));
+    assert.deepEqual(
+      rasterHashes(shipRaster),
+      rasterHashes(truthRaster),
+      'resumed complete PDF raster-matches a fresh LuaLaTeX process on every page'
+    );
+
+    const rejectedGeneration = chain.info().gen;
+    const unsafe = [
+      ['math token', source.replace('n(n+1)', 'm(n+1)')],
+      ['comment text', source.replace('COMMENTMARKA', 'COMMENTMARKB')],
+      ['control-word splice', source.replace('\\section{Combined tail}', '\\sectiom{Combined tail}')],
+      ['TeX special character', source.replace('TAILPROSEB', 'TAILPROS{B')],
+      ['verbatim payload', source.replace('VERBATIMMARKA', 'VERBATIMMARKB')],
+    ];
+    for (const [label, next] of unsafe) {
+      assert.notEqual(next, source, `${label}: fixture mutation exists`);
+      assert.deepEqual(
+        chain.resume(next),
+        { mode: 'reboot-needed', reason: 'non-plain-edit' },
+        `${label}: replay admission fails closed`
+      );
+      assert.equal(chain.info().gen, rejectedGeneration, `${label}: no generation forked`);
+      assert.equal(chain.source, source, `${label}: certified source remains untouched`);
+    }
+  } finally {
+    await chain.close();
+    for (const dir of [WORK3, `${WORK3}-truth`, `${WORK3}-ship-raster`, `${WORK3}-truth-raster`]) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('newif-created conditionals close without weakening package-macro conservatism', () => {
+  assert.equal(sourceClosure(String.raw`\newif\ifLedgerWide
+\ifLedgerWide wide\else narrow\fi`).closed, true);
+  assert.equal(sourceClosure(String.raw`\ifthenelse{a}{b}{c}`).closed, true);
+  assert.equal(sourceClosure(String.raw`\ifnum 1=1 unfinished`).closed, false);
+});
 
 const para = (s) =>
   `${s} paragraph with enough plain words to make a couple of real lines ` +

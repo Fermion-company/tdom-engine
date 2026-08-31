@@ -1,0 +1,28 @@
+\documentclass{article}
+\usepackage{multicol}
+
+% Deliberately arbitrary names: the safety proof follows definition edges,
+% never a product- or fixture-specific command name.
+\newcommand\OpenLedgerColumns{\setlength{\columnsep}{18pt}\begin{multicols}{2}}
+\newcommand\CloseLedgerColumns{\end{multicols}}
+
+\begin{document}
+
+\section{Macro-wrapped output routine}
+
+\OpenLedgerColumns
+
+The wrapper hides the real multicols environment from a raw source scanner.
+This paragraph and every blank-line-separated paragraph below must therefore
+never enter the ordinary structured page builder as independent blocks.
+
+The correctness firewall keeps the last canonical LuaLaTeX page visible.
+
+\columnbreak
+
+Editing this tail used to publish a collapsed provisional document even
+though the canonical document remained unchanged in page topology.
+
+\CloseLedgerColumns
+
+\end{document}
