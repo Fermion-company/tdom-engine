@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test tests/fidelity.test.js tests/canonical.test.js tests/engine-v3.test.js tests/server-api.test.js tests/hot-path.test.js tests/shipping.test.js tests/opaque-generation-barrier.test.js",
+    "test:host": "node --test tests/host-engine-dir.test.js tests/host-engine-host.test.js tests/host-document-session.test.js tests/host-live-driver.test.js tests/host-embed-client.test.js",
     "farm": "node tools/farm.mjs",
     "fuzz": "node tools/fuzz.mjs",
     "bench": "node tools/bench-typing.mjs"

@@ -80,6 +80,24 @@ npm start
 | `GET /events` | SSE |
 | `GET /status` | queue/canonical/mode の軽量 status |
 
+## 別のアプリに組み込む
+
+`host/` は、別のエディタアプリがこのエンジンを自分のリアルタイムプレビューとして動かすための層である。エンジン本体には触れず、プロセスの生死・編集ストリーム・埋め込み表示だけを扱う。
+
+```js
+import { createLivePreviewHost } from './host/index.js';
+
+const host = createLivePreviewHost({ workDir: '/abs/scratch' });
+await host.start();                               // spawn して /status が返るまで待つ
+await host.push({ source, path: '/abs/main.tex' }); // 打鍵のたびに全文を渡す
+host.getStatus().url;                             // この URL の /?embed=1 を iframe に出す
+host.stop();
+```
+
+`push` には常に現在のバッファ全文を渡す。共通 prefix/suffix を削った最小レンジ編集への変換、未保存の子ファイルの overlay 化、ずれたときの再同期は host 層が持つ。ブラウザ側には打鍵デバウンスと単発キューを持つ `host/live-driver.js`、`?embed=1` の iframe を操作する `host/embed-client.js` がある。
+
+詳細は [docs/13-host-integration.md](docs/13-host-integration.md)、Electron の実例は [integrations/electron/](integrations/electron/)。
+
 ## 主要ファイル
 
 | ファイル | 役割 |
@@ -114,6 +132,12 @@ npm test
 - `tests/shipping.test.js`
 
 TeX toolchain が無い環境では、該当する integration test は skip される。
+
+ホスト統合層は別立てで、エンジンを起動しない（fake engine を相手にする）。
+
+```bash
+npm run test:host
+```
 
 ## 詳細 docs
 

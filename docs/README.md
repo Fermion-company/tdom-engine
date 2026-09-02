@@ -32,8 +32,9 @@
 | [10-edit-hot-path.md](./10-edit-hot-path.md) | 編集ホットパス、checkpoint 再利用、非同期追従 |
 | [11-shipping-chain.md](./11-shipping-chain.md) | shipping chain: `TDOM_SHIP=1` で有効なページ境界 checkpoint 付き実ラン |
 | [12-live-preview-fidelity-baseline.md](./12-live-preview-fidelity-baseline.md) | 2026-08-27 の基準点と 2026-08-28 の exact-only 更新、復元手順 |
+| [13-host-integration.md](./13-host-integration.md) | `host/`: 別アプリがエンジンを埋め込んで動かすための統合層 |
 
-最短で全体像だけ掴むなら、`00 -> 02 -> 03 -> 08 -> 09 -> 10 -> 11` の順で読む。TeX の内部に慣れていない場合だけ、最初に `01` を挟む。2026-08-27 のリアルタイム表示修正を保守するときは、続けて `12` を読む。
+最短で全体像だけ掴むなら、`00 -> 02 -> 03 -> 08 -> 09 -> 10 -> 11` の順で読む。TeX の内部に慣れていない場合だけ、最初に `01` を挟む。2026-08-27 のリアルタイム表示修正を保守するときは、続けて `12` を読む。エンジンを自分のアプリに組み込む側の話だけが必要なら `13` を単独で読めばよい。
 
 ## 現行実装の短い要約
 
