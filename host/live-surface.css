@@ -1,0 +1,55 @@
+/* Reference stacking rules for the live surface.
+ *
+ * Copy these into the host viewer's stylesheet (the class name is the host's
+ * to choose; only the `data-live-phase` values are part of the contract —
+ * host/live-surface.js writes them onto the iframe).
+ *
+ * The one rule that must not be "simplified": while a document is staging,
+ * the iframe stays `display: block; visibility: visible` BELOW an opaque
+ * static cover. It is never hidden. Chromium may skip rasterizing a hidden
+ * cross-origin iframe and then expose its blank backing store for a frame
+ * when it becomes visible again — which is exactly the flash the two-frame
+ * reveal barrier in live-surface.js is there to prevent. Activation changes
+ * stacking order only.
+ *
+ * The host is responsible for the other half: its own static page area must
+ * be opaque and must sit ABOVE the iframe during every pending phase. The
+ * `.static-surface` rules below show the shape; use the host's own selector.
+ */
+
+.live-frame {
+  display: none;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--bg, #fff);
+  z-index: 5;
+}
+
+/* Navigating, resetting, or waiting out the reveal barrier: painting, but
+   covered. pointer-events off so clicks keep reaching the static layer. */
+.live-frame[data-live-phase='activation-pending'],
+.live-frame[data-live-phase='reset-pending'],
+.live-frame[data-live-phase='staging'] {
+  display: block;
+  visibility: visible;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Revealed: the same frame, one stacking-order change later. */
+.live-frame[data-live-phase='active'] {
+  display: block;
+  visibility: visible;
+  z-index: 5;
+}
+
+/* The host's static page area, raised above the staging frame. Anything else
+   that must stay clickable while covered (a sidebar, an overlay) needs the
+   same treatment. */
+.static-surface {
+  position: relative;
+  z-index: 2;
+}

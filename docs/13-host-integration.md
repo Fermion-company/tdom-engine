@@ -11,8 +11,9 @@
 1. **別プロセスである。** 常駐 lualatex を fork するため、ホストのプロセス内では動かせない。誰かが起動・監視・終了を持たなければならない。
 2. **編集は差分で渡す。** ホストのエディタはバッファ全体を持っているが、エンジンが速いのは「変更範囲が小さいとき」である。打鍵ごとに全文を投げるとチェックポイント再利用が効かない。
 3. **表示はエンジン側のクライアントが持っている。** ページの描画・canonical 差し替え・exact chunk の合成は `web/app.js` の仕事で、ホストがそれを再実装する理由はない。`?embed=1` はそのためにある。
+4. **差し替えの瞬間が難しい。** ナビゲート直後・文書リセット直後の iframe は表示するものを持たない。1 フレーム早く見せれば空白か前の文書が見える。静的表示から live への切り替えは、そのまま実装すると必ず閃く。
 
-`host/` はこの三つにそれぞれ一つのモジュールを当てる。
+`host/` はこの四つにモジュールを当てる。
 
 | ファイル | 実行場所 | 役割 |
 | --- | --- | --- |
@@ -23,8 +24,12 @@
 | [`host/index.js`](../host/index.js) | Node | 上記を束ねた `createLivePreviewHost()` |
 | [`host/live-driver.js`](../host/live-driver.js) | ブラウザ / Node | 打鍵 → push のデバウンス、単発キュー、世代管理、健全性監視 |
 | [`host/embed-client.js`](../host/embed-client.js) | ブラウザ | `?embed=1` iframe との postMessage 往復 |
+| [`host/live-surface.js`](../host/live-surface.js) | ブラウザ | ページ領域を live に差し替える状態機械。二フレーム reveal バリアと文書リセット握手 |
+| [`host/live-toolbar-state.js`](../host/live-toolbar-state.js) | 純関数 | ライブ中のツールバー数値 |
+| [`host/live-status.js`](../host/live-status.js) | 純関数 | エンジン status → 一意なビューア状態 |
+| [`host/live-surface.css`](../host/live-surface.css) | 参照 CSS | 重なり順の規約 |
 
-`host/live-driver.js` はタイマーを注入できるので DOM なしで実行でき、テストは Node で走る。`host/embed-client.js` だけが `postMessage` / `addEventListener` を必要とする。
+`host/live-driver.js` はタイマーを注入でき、`host/live-surface.js` は iframe・ホストウィンドウ・`requestAnimationFrame` をすべて注入できる。したがって DOM なしで実行でき、テストは Node で走る。
 
 ## 13.2 最小の使い方
 
@@ -107,20 +112,54 @@ IME 変換中は snapshot に `deferred: true` を立てる。ドライバは pu
 - ホスト → frame: `{ source: 'tdom-host', activationId, action, ... }` — `zoom-in` / `zoom-out` / `zoom-fit` / `goto-page` / `page-prev` / `page-next` / `goto-sync` / `search` / `reset-ack`
 - frame → ホスト: `{ source: 'tdom-embed', activationId, ... }` — 400ms 間隔のスナップショット（`ready` / `pageCount` / `zoom` / `page` / `status` / `search`）に加え、`reset-pending`（文書リセット開始）・`source`（クリック位置のソース逆引き）・`edit`（プレビュー直接編集）
 
-`activationId` は URL でホストが渡す。前の活性化から残った iframe が、すでに別の文書やエンジンへ移ったビューアを操作できないようにするためである。`reset-pending` を受けたホストは、新しい重なり順を確定させてから `reset-ack` を返す。先に返すと、子が古い文書 DOM を捨てた瞬間に何も描かれていない面が見える。
+`activationId` は URL でホストが渡す。前の活性化から残った iframe が、すでに別の文書やエンジンへ移ったビューアを操作できないようにするためである。
 
-## 13.7 テスト
+## 13.7 ライブ面の差し替え（live-surface.js）
+
+`createLiveSurface()` は、ホストのビューアが**静的 PDF を表示したまま**ページ領域だけを live に差し替えるための状態機械である。ここが一番壊しやすい。ナビゲート直後の iframe も、リセットのために文書 DOM を捨てた直後の iframe も、**表示するものを持っていない**。1 フレーム早く見せれば、空白か前の文書が見える。
+
+### 二フレーム reveal バリア
+
+1. **iframe は常に描画し続ける。** 不透明な静的カバーの下に置くだけで、`visibility: hidden` にはしない。Chromium は隠れた cross-origin iframe のラスタライズを省くことがあり、可視化した瞬間に空の backing store を 1 フレーム露出させる。活性化で変えるのは**重なり順だけ**である。
+2. 子が特定の `documentEpoch` について `ready: true` を宣言する。これは**子自身の paint についての主張**であって、コンポジタについての主張ではない。
+3. ホストはそこから**アニメーションフレームを 2 回**待つ。1 回目は ready な子がカバーの下で描くため。2 回目は重なり順の変更だけを含むため、どの commit にも古い／空の backing store が入り得ない。
+4. 文書リセットは同じバリアを逆向きに走らせる。ホストが静的カバーを戻し、**新しい重なり順を確定させてから**（`getComputedStyle` によるスタイル解決の強制）`reset-ack` を返す。先に返すと、子が古い DOM を捨てた瞬間に何も無い面が見える。
+
+フェーズは iframe の `data-live-phase` に書かれ、`onPhase` でも通知される。`off` → `activation-pending` → `staging` → `active`、リセット時は `active` → `reset-pending` → `staging` → `active`。重なり順の規約は [`host/live-surface.css`](../host/live-surface.css) にある。ホスト側の静的面を pending 中に iframe より上へ置くのはホストの責任である。
+
+### 間違いうるものすべてに版を振る
+
+| 版 | 何を守るか |
+| --- | --- |
+| `activationId` | 前の活性化から残った frame が現在のビューアを操作できない |
+| `generation` | 同じエンジン URL でも「別の面」として採り直させる |
+| `documentEpoch` | リセット待ちの epoch 以外の `ready` は無視。古い epoch へ戻らない |
+| reveal token | 予約済みバリアを無効化する。同じ epoch の再スナップショットは**バリアを引き延ばさず**最新ペイロードだけ差し替える |
+
+`source`（クリック逆引き）と `edit`（プレビュー直接編集）は、採用済み epoch と一致するときだけホストへ渡る。
+
+### 静的文書のフリーズ
+
+live が面を持っている間、ホストは静的文書を読み込み直してはならない。iframe の下からカバーを引き抜くことになり、このモジュール全体が防いでいる閃きが起きる。`deferStatic(request)` に預けると、live が降りて 1 フレーム経ってから最新の 1 件だけが `onStaticRestore` で返る。
+
+> 元実装（TeX64 の pdf-viewer）では、live off → on が同一フレーム内で起きると保留中の静的文書が捨てられていた（復帰分岐が到達不能だった）。ここでは保留リクエストをフィールドに残し、次に live が降りたときに渡すよう直してある。
+
+### ステータス
+
+`resolveLiveStatus()` はエンジンの status スナップショット（`up` / `busy` / `mode` / `canonical.inFlight` / `canonical.error` + `errorRev`）から、ビューアの 1 行に出せる状態をひとつだけ決める。順序が意味そのものである。`canonical.inFlight`（実 LuaLaTeX 経路）は汎用 busy より優先し、現ソースより古い revision のエラーは既に打ち消されたものとして扱う。`key` はホストが自前の文言へ写すメッセージ ID で、`message` があるときはエンジンの生テキストをそのまま出す。
+
+ツールバーの数値は `normalizeLiveToolbarSnapshot()` が持つ。子は部分スナップショット（zoom だけ、page だけ）を送るので単純代入にはできず、ページ送りは子の次の 400ms スナップショットを待たずに**クリックした瞬間**に動く必要がある。
+
+## 13.8 テスト
 
 エンジンを起動しない。`tests/fixtures/fake-engine/server.js` が `/status` `/open` `/edit` `/warm` `/doc` だけを持つスタンドインで、ホストが実際に送ったレンジと overlay をそのまま検査できる。
 
 ```
-node --test tests/host-engine-dir.test.js tests/host-engine-host.test.js \
-  tests/host-document-session.test.js tests/host-live-driver.test.js \
-  tests/host-embed-client.test.js
+npm run test:host
 ```
 
-`npm run test:host` が同じものを走らせる。TeX も lualatex も要らないので、`AGENTS.md` のマシン安全ルール（エンジンを起動するテストはローカルで走らせない）に触れない。
+`live-surface.js` のテストは iframe・ホストウィンドウ・`requestAnimationFrame` をすべて差し替え、**アニメーションフレームを 1 回ずつ手で進める**。バリアの両側（ready だけでは何も変わらない / 1 フレーム目でもまだ変わらない / 2 フレーム目で初めて切り替わる）が決定的に観測できる。実ピクセルの検証はブラウザが要るのでここにはない。TeX も lualatex も要らないので、`AGENTS.md` のマシン安全ルール（エンジンを起動するテストはローカルで走らせない）に触れない。
 
-## 13.8 Electron の例
+## 13.9 Electron の例
 
 [`integrations/electron/`](../integrations/electron/) に main プロセスの IPC 配線と preload ブリッジがある。エンジンの依存ではなく、参照用の実例である。Electron main は CommonJS、このパッケージは ESM なので、host 層は動的 import で読み込む（IPC ハンドラはもともと非同期なので実害はない）。

@@ -50,4 +50,32 @@ editor.onDidChangeCursorPosition(() => driver.notifyCursor());
 driver.setActive(true);
 ```
 
-ビューア側は、ライブ URL を受け取ったらページ描画部分だけを `embedUrl(url, { activationId, theme, bg })` の iframe に差し替え、ツールバーは `createEmbedClient()` 越しに操作する。ライブを降ろせば元の静的 PDF 表示に戻る。`activationId` は活性化ごとに新しくし、`generation` が上がったら iframe を採り直す。
+## ビューア
+
+ページ描画部分の差し替えは `createLiveSurface()` に任せる。activationId の発行、`?embed=1` の URL 組み立て、二フレーム reveal バリア、文書リセット握手、ツールバー数値、ステータス解決までを持つので、ホストは自分の chrome を更新するだけでよい。
+
+```js
+import { createLiveSurface } from 'tdom-engine/host/live-surface.js';
+
+const surface = createLiveSurface({
+  frame: document.getElementById('live-frame'),
+  getTheme: () => (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'),
+  getBackground: () => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim(),
+  onPhase: (phase) => document.body.classList.toggle('is-live', phase === 'active'),
+  onToolbar: ({ page, pageCount, zoom }) => renderToolbar(page, pageCount, zoom),
+  onStatus: (view) => setStatus(view.message ?? translate(view.key), view.tone),
+  onSource: (location) => bridge.postMessage({ type: 'live-source', payload: location }),
+  onStaticRestore: ({ url, path }) => loadStaticPdf(url, path),
+});
+
+// driver からの onLive をそのまま渡す
+onLive: (url, generation) => surface.setLive(url ? { url, generation } : null),
+
+// 静的 PDF の読み込みは live に預ける（下からカバーを引き抜かない）
+const requestStaticDocument = (url, path) => {
+  if (surface.deferStatic({ url, path })) return;
+  loadStaticPdf(url, path);
+};
+```
+
+CSS は [`host/live-surface.css`](../../host/live-surface.css) をコピーする。ホスト側の静的ページ領域を pending 中に iframe より上へ置くのはホストの責任である。ツールバーのボタンは capture フェーズで `surface.isLive()` を見て `surface.zoomIn()` / `surface.stepPage(±1)` / `surface.gotoPage(n)` / `surface.search(q)` に振り分ければ、ライブ中は自前のレンダラにイベントが届かない。
