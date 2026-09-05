@@ -2055,6 +2055,88 @@ editor.addEventListener('input', () => {
 // scroll only moves the overlay — it must never re-render the highlight
 editor.addEventListener('scroll', syncHighlightScroll);
 
+// Embedded: a place the reader marks on the page — a text selection in the
+// structured view, or a right-click anywhere — goes to the host with its
+// source position and its rectangle on screen, so the host can put that spot
+// in front of its assistant.  Nothing here changes the document.
+let placeOffered = false;
+const postPlaceToHost = async (kind, ev, page, text, rect) => {
+  if (!embeddedHost || !page) return;
+  const pageNumber = Number(page.dataset.page);
+  let location = null;
+  const src = srcOf(ev.target);
+  if (src) {
+    try {
+      const dom = await fetch('/dom').then((r) => r.json());
+      const block = dom.blocks.find((b) => b.id === src);
+      if (block) location = block.source;
+    } catch {
+      location = null;
+    }
+  }
+  if (!location) location = await syncLocationForClick(ev, page);
+  placeOffered = true;
+  window.parent.postMessage({
+    source: 'tdom-embed',
+    activationId: embedActivationId,
+    documentEpoch: documentReset.adoptedEpoch,
+    action: 'place',
+    kind,
+    pageNumber: Number.isFinite(pageNumber) ? pageNumber : null,
+    text,
+    rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom },
+    file: location?.file ?? null,
+    line: location?.start?.line ?? location?.line ?? null,
+    column: location?.start?.column ?? location?.column ?? null,
+  }, '*');
+};
+const clearPlaceForHost = () => {
+  if (!embeddedHost || !placeOffered) return;
+  placeOffered = false;
+  window.parent.postMessage({
+    source: 'tdom-embed',
+    activationId: embedActivationId,
+    documentEpoch: documentReset.adoptedEpoch,
+    action: 'place',
+    kind: 'clear',
+  }, '*');
+};
+pagesEl.addEventListener('mouseup', (ev) => {
+  if (!embeddedHost || ev.button !== 0 || ev.metaKey || ev.ctrlKey) return;
+  if (ev.target?.closest?.('.tdom-direct-editor')) return;
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return;
+  const text = selection.toString().replace(/\s+/g, ' ').trim();
+  if (!text) return;
+  const range = selection.getRangeAt(0);
+  const rects = [...range.getClientRects()].filter((r) => r.width > 0 || r.height > 0);
+  if (rects.length === 0) return;
+  const startNode = range.startContainer instanceof Element
+    ? range.startContainer
+    : range.startContainer?.parentElement;
+  const first = rects[0];
+  const last = rects[rects.length - 1];
+  const at = { target: startNode, clientX: first.left + 1, clientY: first.top + first.height / 2 };
+  const page = pageAtClientPoint(at, startNode);
+  void postPlaceToHost('selection', at, page, text,
+    { left: first.left, top: first.top, right: last.right, bottom: last.bottom });
+});
+document.addEventListener('selectionchange', () => {
+  if (!embeddedHost) return;
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) clearPlaceForHost();
+});
+pagesEl.addEventListener('contextmenu', (ev) => {
+  if (!embeddedHost) return;
+  if (ev.target?.closest?.('.tdom-direct-editor')) return;
+  const page = pageAtClientPoint(ev, ev.target);
+  if (!page) return;
+  ev.preventDefault();
+  void postPlaceToHost('point', ev, page, '',
+    { left: ev.clientX, top: ev.clientY, right: ev.clientX, bottom: ev.clientY });
+});
+document.addEventListener('scroll', () => clearPlaceForHost(), true);
+
 // Preview interaction: Cmd/Ctrl+click mirrors the static PDF viewer's
 // SyncTeX gesture.  In embedded mode the real editor owns navigation; the
 // standalone TDOM workbench keeps Alt+click for its internal textarea.
