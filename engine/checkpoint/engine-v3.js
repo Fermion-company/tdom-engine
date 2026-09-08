@@ -90,6 +90,7 @@ import { runChainPass as runChainPassHelper, chainAfterPass as chainAfterPassHel
 import { runUpdateTypesetPhase } from './update-typeset-phase.js';
 import { prepareUpdate } from './update-prepare.js';
 import { finalizeShippingExactUpdate, finalizeUpdate } from './update-finalize.js';
+import { classifyResidentEdit } from './resident-edit-admission.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { buildClosureDeferredResponse } from './update-response.js';
 import {
@@ -209,8 +210,19 @@ export class CheckpointEngine {
     const p1 = this.store.position(file, start);
     const p2 = this.store.position(file, end);
     const editLabel = `${file}:${p1.line}:${p1.column}-${p2.line}:${p2.column}`;
+    const before = this.store.get(file);
+    const baseSrcRev = this.srcRev;
     this.store.applyEdit(file, start, end, replacement);
-    return this.#update({ editLabel });
+    const editContext = Object.freeze({
+      file,
+      start,
+      end,
+      replacement,
+      before,
+      after: this.store.get(file),
+      baseSrcRev,
+    });
+    return this.#update({ editLabel, editContext });
   }
 
   /**
@@ -947,10 +959,11 @@ export class CheckpointEngine {
     }
   }
 
-  async #updateInner({ editLabel, retry = false, announceDocumentReset }) {
+  async #updateInner({ editLabel, editContext = null, retry = false, announceDocumentReset }) {
     const t = new Timer();
     const prepared = await prepareUpdate(this, {
       editLabel,
+      editContext,
       timer: t,
       callbacks: {
         deferClosureUpdate: (label, timer, closure) => {
@@ -1013,6 +1026,15 @@ export class CheckpointEngine {
     });
     if (prepared.response) return prepared.response;
     const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
+    const residentAdmission = this.previewPolicy === 'shipping-exact'
+      ? classifyResidentEdit(this, {
+          text,
+          editContext,
+          oldBlocks,
+          dirtySource,
+          rebooted,
+        })
+      : Object.freeze({ kind: 'exact-only', reason: 'existing-policy-path' });
 
     // Hidden output-routine regions keep their incremental source identity,
     // but only a complete native replay may promote physical pages.  On an
@@ -1020,7 +1042,8 @@ export class CheckpointEngine {
     // region merely to produce JS pages the renderer is forbidden to show.
     // Initial open still builds the resident witnesses, and deployments
     // without ShippingChain retain the ordinary structured fallback.
-    if (this.previewPolicy === 'shipping-exact' && this.shipping && editLabel !== 'open' && !rebooted) {
+    if (this.previewPolicy === 'shipping-exact' && this.shipping && editLabel !== 'open' && !rebooted &&
+        residentAdmission.kind !== 'probe') {
       return finalizeShippingExactUpdate(this, {
         text,
         editLabel,
@@ -1074,7 +1097,7 @@ export class CheckpointEngine {
         this.editHold = [];
         // direct inner call: we already hold the chain lock (re-entering
         // #update would deadlock on it)
-        return this.#updateInner({ editLabel, retry: true, announceDocumentReset });
+        return this.#updateInner({ editLabel, editContext, retry: true, announceDocumentReset });
       }
       // even the full rebuild failed: demote to opaque instead of erroring —
       // the canonical layer keeps the document visible and editable
@@ -1088,6 +1111,7 @@ export class CheckpointEngine {
       typesetResult: this._typesetResult,
       rebooted,
       diagnostics,
+      residentEditCandidate: residentAdmission.kind === 'probe',
       timer: t,
       callbacks: {
         paginateNow: () => this.#paginateNow(),

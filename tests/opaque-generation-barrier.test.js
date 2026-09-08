@@ -65,6 +65,15 @@ test('a missing target page closes the transient editor instead of reparenting i
   assert.deepEqual(Coordinator.planGenerationBarrier({ ...base, pageNumber: NaN }), { action: 'close' });
 });
 
+test('embedded Shipping pixels are read-only and rechecked after decode', () => {
+  assert.match(APP, /function shippingPresentationBlocked\(\)[\s\S]*?Boolean\(directEditor\)[\s\S]*?queuedDirectOpenings\.length > 0/);
+  assert.match(APP, /function tryCommitShipWaveBatch\(batch\) \{[\s\S]*?if \(shippingPresentationBlocked\(\)\)[\s\S]*?cancelShipWaveBatch\(batch\)/);
+  assert.match(APP, /if \(readOnlyShipping && shippingPresentationBlocked\(\)\)[\s\S]*?residentImpossible: true/);
+  assert.match(APP, /if \(embeddedHost && shippingPresentationBlocked\(\)\)/);
+  assert.match(APP, /function presentedShippingPageState\(page\)[\s\S]*?startsWith\('\/ship\/'\)/);
+  assert.match(APP, /shipping\?\.rev === Number\(appliedSrcRev\)/);
+});
+
 test('two-dimensional duplicate math tokens map by canonical reading order', () => {
   const numerator = { text: 'x', left: 10, top: 10, right: 14, bottom: 16 };
   const denominator = { text: 'x', left: 10, top: 28, right: 14, bottom: 34 };

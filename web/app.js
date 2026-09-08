@@ -680,6 +680,11 @@ function directPresentationBlocked() {
   return Boolean(openingDirectInput?.sink) || flushingDirectPresentation;
 }
 
+function shippingPresentationBlocked() {
+  return documentReset.pending || Boolean(directEditor) || Boolean(openingDirectInput) ||
+    queuedDirectOpenings.length > 0 || flushingDirectPresentation || opaqueBatchCommitDepth > 0;
+}
+
 function flushDirectPresentationUpdates() {
   if (openingDirectInput?.sink || flushingDirectPresentation || documentReset.pending) return;
   // Replay source events in order, while keeping their intermediate surfaces
@@ -1415,6 +1420,15 @@ function presentedPageState(page) {
   return snapshot ? { image, id, rev, snapshot, src: image.dataset.src } : null;
 }
 
+function presentedShippingPageState(page) {
+  const image = page?.querySelector?.('img.canon');
+  const src = page?.dataset?.canonPresentedSrc;
+  const rev = Number(page?.dataset?.canonPresentedRev);
+  if (!image || image.dataset.src !== src || !String(src).startsWith('/ship/') ||
+      !Number.isFinite(rev) || !image.complete || image.naturalWidth <= 0) return null;
+  return { image, rev, src };
+}
+
 function opaqueCanonicalBatchKey(generation) {
   const id = Number(generation?.id);
   const rev = Number(generation?.rev);
@@ -2094,8 +2108,13 @@ function failShipWavePage(registration) {
 }
 
 function tryCommitShipWaveBatch(batch) {
-  if (directPresentationBlocked()) return;
-  if (!batch || shipWaveBatch !== batch || Date.now() >= batch.deadlineAt ||
+  if (shippingPresentationBlocked()) {
+    cancelShipWaveBatch(batch);
+    if (usesCanonicalSurface()) requestCanonicalDisplay({ residentImpossible: true });
+    return;
+  }
+  if (!batch || shipWaveBatch !== batch || batch.documentEpoch !== documentReset.adoptedEpoch ||
+      Date.now() >= batch.deadlineAt ||
       Number(appliedSrcRev) !== batch.srcRev || batch.expected.size !== batch.pages.size) {
     if (batch && Date.now() >= batch.deadlineAt) cancelShipWaveBatch(batch);
     return;
@@ -2110,6 +2129,7 @@ function tryCommitShipWaveBatch(batch) {
   window.clearTimeout(batch.cutoffTimer);
   for (const [, entry] of [...batch.expected].sort((a, b) => a[0] - b[0])) entry.apply();
   directEditClickEpoch++;
+  fulfillCanonicalDisplay();
   updateBadge();
   // A DOM mutation is not yet a painted frame.  Report the certificate only
   // after two animation frames so the measurement is a conservative upper
@@ -2147,6 +2167,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
   const shipRegistration = activeShipBatch
     ? registerShipWavePage(activeShipBatch, div, src)
     : null;
+  const readOnlyShipping = Boolean(generation?.shipWaveKey);
   const batch = !activeShipBatch && opaqueBatchCommitDepth === 0
     ? getOpaqueCanonicalBatch(generation)
     : null;
@@ -2294,6 +2315,11 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
       const publish = () => {
         if (documentReset.pending || documentReset.adoptedEpoch !== documentEpoch ||
             !div.isConnected || div.dataset.canonWanted !== src) return;
+        if (readOnlyShipping && shippingPresentationBlocked()) {
+          if (div.dataset.canonPending === src) delete div.dataset.canonPending;
+          requestCanonicalDisplay({ residentImpossible: true });
+          return;
+        }
         if (directPresentationBlocked()) {
           deferredDirectPresentationCommits.set(div, publish);
           return;
@@ -2436,7 +2462,8 @@ function updateCanonState(n) {
   const ship = shipPages.get(n);
   const shipOk = !!ship && (pageDirtyRev.get(n) ?? 0) <= ship.srcRev;
   // prefer the freshest real-pixels source for THIS page
-  const useShip = !embeddedHost && mode !== 'opaque' && shipOk && (!coldFresh || ship.srcRev > canonical.rev);
+  const useShip = mode !== 'opaque' && shipOk && (!embeddedHost || !shippingPresentationBlocked()) &&
+    (!coldFresh || ship.srcRev > Number(canonical?.rev ?? -1));
   const fresh = coldFresh || useShip;
   let img = div.querySelector('img.canon');
   const stageCanonical = canonAvail && (
@@ -6240,13 +6267,13 @@ pagesEl.addEventListener('scroll', () => {
     const previewReady = (required) => {
       if (!bootComplete || !documentReset.acceptsReady(documentReset.adoptedEpoch) || !required.length) return false;
       if (usesCanonicalSurface()) {
-        if (!canonical?.id || canonical.inFlight || canonical.error || canonical.rev < appliedSrcRev) {
-          return false;
-        }
         return required.every(([, page]) => {
+          const shipping = presentedShippingPageState(page);
+          if (shipping?.rev === Number(appliedSrcRev) &&
+              !page.classList.contains('awaiting-canonical')) return true;
           const state = presentedPageState(page);
           return Boolean(
-            state && state.id === Number(canonical.id) && state.rev === Number(appliedSrcRev) &&
+            state && state.id === Number(canonical?.id) && state.rev === Number(appliedSrcRev) &&
             state.image.complete && state.image.naturalWidth > 0 &&
             !page.classList.contains('awaiting-canonical')
           );
@@ -6291,7 +6318,11 @@ pagesEl.addEventListener('scroll', () => {
         const pending = presentationPending(visible.required);
         // Canonical-only policies do not enter the provisional staging path.
         // Demand the old source still on paper, not ordinary image decode.
-        if (pending && usesCanonicalSurface() && canonical?.rev < appliedSrcRev) requestCanonicalDisplay({ residentImpossible: true });
+        if (pending && usesCanonicalSurface() && Number(canonical?.rev ?? 0) < appliedSrcRev) {
+          requestCanonicalDisplay({
+            residentImpossible: previewPolicy !== 'shipping-exact' || shippingPresentationBlocked(),
+          });
+        }
         window.parent.postMessage(
           {
             source: 'tdom-embed',
@@ -6670,10 +6701,10 @@ function receivePreviewEvent(msg) {
       // is visible now; offscreen pages only adopt this same immutable PDF
       // generation when they later enter the viewport.
       if (Date.now() >= Number(msg.deadlineAt) || Number(msg.srcRev) !== Number(appliedSrcRev)) return;
-      if (embeddedHost) {
-        // A complete replay PDF proves ink, but has no immutable source /
-        // SyncTeX generation or active-editor transfer barrier here. Keep
-        // the editable surface until the canonical batch can prove both.
+      if (embeddedHost && shippingPresentationBlocked()) {
+        // Shipping pages are read-only exact pixels. They may replace a
+        // code-edit preview, but never an opening/active PDF editor surface.
+        // The same lease is checked again after asynchronous image decode.
         if (usesCanonicalSurface()) requestCanonicalDisplay({ residentImpossible: true });
         return;
       }
@@ -6690,6 +6721,7 @@ function receivePreviewEvent(msg) {
       const key = `${msg.gen}:${msg.srcRev}:${msg.deadlineAt}`;
       const batch = {
         key,
+        documentEpoch: Number(msg.documentEpoch),
         gen: Number(msg.gen),
         srcRev: Number(msg.srcRev),
         acceptedAt: Number(msg.acceptedAt),
