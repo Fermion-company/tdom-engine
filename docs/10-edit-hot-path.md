@@ -53,6 +53,8 @@ last-known-good と pending 表示に限り、同じ page/tree を途中で spli
 source/checkpoint の incremental 処理は維持するが、JS paginator の page patch は表示せず、直前の
 exact page を保持して complete ShippingChain wave だけを原子的に昇格する。通常本文の編集応答では
 表示不可能な resident state/rescue walk も行わず、source generation を先に ShippingChain へ渡す。
+ただし埋め込み直接編集では、Shipping の原文・SyncTeX の世代対応と editor 転送の証明がないため
+wave を表示せず直前の編集可能な面を保持し、既存の版・需要IDを使って canonical 表示を要求する。
 Shipping replay の plain edit admission は brace depth 0 を要求しない。代わりに旧新の source partition が
 同じで差分が一つの balanced unit に閉じること、選択した checkpoint の consumed-unit cursor がその unit
 より前であることを要求する。したがって `\footnote{...}` や TikZ node の braced visible text も、その

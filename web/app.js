@@ -2436,7 +2436,7 @@ function updateCanonState(n) {
   const ship = shipPages.get(n);
   const shipOk = !!ship && (pageDirtyRev.get(n) ?? 0) <= ship.srcRev;
   // prefer the freshest real-pixels source for THIS page
-  const useShip = mode !== 'opaque' && shipOk && (!coldFresh || ship.srcRev > canonical.rev);
+  const useShip = !embeddedHost && mode !== 'opaque' && shipOk && (!coldFresh || ship.srcRev > canonical.rev);
   const fresh = coldFresh || useShip;
   let img = div.querySelector('img.canon');
   const stageCanonical = canonAvail && (
@@ -6670,6 +6670,13 @@ function receivePreviewEvent(msg) {
       // is visible now; offscreen pages only adopt this same immutable PDF
       // generation when they later enter the viewport.
       if (Date.now() >= Number(msg.deadlineAt) || Number(msg.srcRev) !== Number(appliedSrcRev)) return;
+      if (embeddedHost) {
+        // A complete replay PDF proves ink, but has no immutable source /
+        // SyncTeX generation or active-editor transfer barrier here. Keep
+        // the editable surface until the canonical batch can prove both.
+        if (usesCanonicalSurface()) requestCanonicalDisplay({ residentImpossible: true });
+        return;
+      }
       if (shipWaveBatch) cancelShipWaveBatch(shipWaveBatch);
       const allPages = new Set((msg.pages ?? []).map(Number).filter(Number.isInteger));
       if (!allPages.size) return;
