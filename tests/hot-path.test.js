@@ -23,6 +23,7 @@ import { classifyStructuralAliases } from '../engine/checkpoint/structural-alias
 import { ShippingChain } from '../engine/checkpoint/shipping.js';
 import { segmentBody } from '../engine/segmenter.js';
 import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finalize.js';
+import { classifyResidentEdit } from '../engine/checkpoint/resident-edit-admission.js';
 import {
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
@@ -170,6 +171,53 @@ test('shipping-exact edits publish source immediately without resident page patc
     ['canonical', 'snapshot-12', 12],
     ['background', 1, 12],
   ]);
+});
+
+test('shipping-exact foreground admission is limited to independent plain paragraphs', () => {
+  const oldBlock = {
+    id: 'b1', start: 20, end: 55, text: 'ordinary prose here\ncontinued prose',
+    galley: { items: [] }, fidelity: { level: 'safe-glyph' },
+    structuralSinks: [],
+  };
+  const block = { ...oldBlock, end: 56, text: 'ordinary prose! here\ncontinued prose' };
+  const before = `${'x'.repeat(20)}${oldBlock.text}`;
+  const after = `${'x'.repeat(20)}${block.text}`;
+  const context = {
+    file: 'main.tex', start: 34, end: 34, replacement: '!',
+    before, after, baseSrcRev: 7,
+  };
+  const engine = {
+    file: 'main.tex', srcRev: 7, blocks: [block], pendingChain: null,
+  };
+  assert.deepEqual(classifyResidentEdit(engine, {
+    text: after,
+    editContext: context,
+    oldBlocks: [oldBlock],
+    dirtySource: new Set(['b1']),
+    rebooted: false,
+  }), { kind: 'probe', blockId: 'b1' });
+
+  const atomicOld = {
+    ...oldBlock,
+    text: '\\begin{multicols}{2}\nordinary prose here\n\\end{multicols}',
+    end: 20 + '\\begin{multicols}{2}\nordinary prose here\n\\end{multicols}'.length,
+  };
+  const atomicBlock = { ...atomicOld, text: atomicOld.text.replace('prose', 'prose!'), end: atomicOld.end + 1 };
+  const atomicBefore = `${'x'.repeat(20)}${atomicOld.text}`;
+  const atomicAfter = `${'x'.repeat(20)}${atomicBlock.text}`;
+  assert.deepEqual(classifyResidentEdit({ ...engine, blocks: [atomicBlock] }, {
+    text: atomicAfter,
+    editContext: {
+      ...context,
+      start: atomicBefore.indexOf('prose') + 5,
+      end: atomicBefore.indexOf('prose') + 5,
+      before: atomicBefore,
+      after: atomicAfter,
+    },
+    oldBlocks: [atomicOld],
+    dirtySource: new Set(['b1']),
+    rebooted: false,
+  }), { kind: 'exact-only', reason: 'atomic-layout-region' });
 });
 
 test('mixed heavy document resumes exact waves from visible edits in rich TeX contexts', opts, async () => {

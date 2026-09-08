@@ -31,6 +31,7 @@ export function buildUpdateResponse({
   fonts,
   diagnostics,
   engineDiagnostics,
+  residentEditCandidate = false,
 }) {
   return {
     rev,
@@ -41,6 +42,7 @@ export function buildUpdateResponse({
     modeReasons,
     previewPolicy,
     previewReasons,
+    residentEditCandidate,
     canonical,
     fonts,
     dirtySourceNodes: [...dirtySource].map((id) => 'src-' + id),

@@ -52,8 +52,10 @@ export function planTerminalCanonicalAnchor({
 }) {
   const canonical = report?.canonical;
   const canonicalAnchorPolicy = report?.previewPolicy === 'canonical-anchor';
+  const residentEditCandidate = report?.residentEditCandidate === true;
   if (report?.mode !== 'structured' || !canonical?.id) return null;
-  if (!canonicalAnchorPolicy && canonical.pageCount === report.stats?.pageCount) return null;
+  if (!canonicalAnchorPolicy && !residentEditCandidate &&
+      canonical.pageCount === report.stats?.pageCount) return null;
   if (report.dirtySourceNodes?.length !== 1) return null;
 
   const blockId = String(report.dirtySourceNodes[0]).replace(/^src-/, '');
