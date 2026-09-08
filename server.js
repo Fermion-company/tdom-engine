@@ -927,6 +927,19 @@ function bibliographySourceLocation(generatedText, generatedLine = null) {
 function domPayload() {
   const dom = engine.getDOM();
   dom.documentEpoch = documentEpoch;
+  // An unfinished construct advances sourceRev while deliberately keeping
+  // the previous block spans. It cannot supply a new editable ink snapshot.
+  dom.sourceCurrent = !lastReport.stats?.closureDeferred;
+  const sourceFiles = new Set((dom.blocks ?? []).flatMap(block =>
+    (block.editRegions ?? []).map(region => region.source?.file).filter(Boolean)));
+  dom.sources = dom.sourceCurrent ? [...sourceFiles].flatMap(file => {
+    // Root text is never expanded. Included files retain the exact original
+    // text read during segmentation, including unsaved overlay contents.
+    const text = file === engine.file
+      ? engine.store.get(file)
+      : engine.includes?.get(file)?.text;
+    return typeof text === 'string' ? [{ file, text }] : [];
+  }) : [];
   const byId = new Map(engine.blocks.map((block) => [block.id, block]));
   for (const item of dom.blocks ?? []) {
     if (path.resolve(item.source?.file || '') !== path.join(engine.workDir, 'driver.bbl')) continue;
@@ -1248,7 +1261,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname.startsWith('/assets/')) {
       return serveAsset(res, decodeURIComponent(url.pathname.slice('/assets/'.length)));
     }
-    if (req.method === 'GET' && url.pathname === '/dom') return json(res, domPayload());
+    if (req.method === 'GET' && url.pathname === '/dom') {
+      // Source and block ranges mutate at different points of an async
+      // edit. Snapshot them together after the queued mutation completes.
+      return json(res, await withEngine(() => domPayload()));
+    }
     if (req.method === 'POST' && url.pathname === '/synctex') {
       const body = JSON.parse(await readBody(req));
       const hit = await engine.canonical.reverseSync({

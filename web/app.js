@@ -469,7 +469,7 @@ async function ensurePresentedDomSnapshot(id, rev, epoch = documentReset.adopted
       // map for a canonical generation only while both source revisions are
       // identical. Keeping this immutable snapshot lets an already printed
       // page resolve a second location while the next compile is pending.
-      if (!snapshot || Number(snapshot.srcRev) !== numericRev ||
+      if (!snapshot || snapshot.sourceCurrent === false || Number(snapshot.srcRev) !== numericRev ||
           Number(snapshot.documentEpoch) !== epoch || documentReset.adoptedEpoch > epoch) return null;
       presentedDomSnapshots.set(key, snapshot);
       while (presentedDomSnapshots.size > 4) {
@@ -1227,6 +1227,31 @@ function cancelObsoleteOpaqueBatches(keepKey = null) {
   }
 }
 
+function directEditorSourceRange(snapshot, session) {
+  const region = session?.sourceRegion;
+  const initial = session?.sourceText;
+  const current = snapshot?.sources?.find(item => item.file === region?.source?.file)?.text;
+  if (!region || typeof initial !== 'string' || typeof current !== 'string') return null;
+  const start = lineColToOffset(initial, region.source.start.line, region.source.start.column);
+  const end = lineColToOffset(initial, region.source.end.line, region.source.end.column);
+  const prefix = initial.slice(0, start), suffix = initial.slice(end);
+  if (current.length < prefix.length + suffix.length ||
+      !current.startsWith(prefix) || !current.endsWith(suffix)) return null;
+  const visible = String(session.readValue?.() ?? region.value ?? '');
+  const replacement = session.kind === 'math'
+    ? String(session.formattedSource ?? region.sourceValue ?? region.value)
+    : latexEscapeText(visible);
+  const contentEnd = current.length - suffix.length;
+  const lines = current.slice(0, contentEnd).split('\n');
+  return {
+    source: { file: region.source.file, start: region.source.start,
+      end: { line: lines.length, column: lines.at(-1).length + 1 } },
+    replacement,
+    matches: current.slice(start, contentEnd) === replacement &&
+      directEditValuesEqual(session.kind, session.lastVisibleValue ?? region.value, visible),
+  };
+}
+
 function directEditorRegionInSnapshot(snapshot, session) {
   if (!snapshot || !session) return null;
   const regions = (snapshot.blocks ?? []).flatMap((block) =>
@@ -1234,22 +1259,34 @@ function directEditorRegionInSnapshot(snapshot, session) {
   );
   const visible = String(session.readValue?.() ?? session.region?.value ?? '');
   const sameValueAs = value => directEditValuesEqual(session.kind, value, visible);
-  const exact = regions.find((region) =>
-    region.id === session.region?.id && sameValueAs(region.value)
-  );
-  if (exact) return exact;
+  const sourceRange = directEditorSourceRange(snapshot, session);
+  if (sourceRange) {
+    // An intermediate compile must not borrow another occurrence of the
+    // newly typed value elsewhere in this same block.
+    if (!sourceRange.matches) return null;
+    const atSource = regions.filter(region => region.kind === session.kind &&
+      region.source?.file === sourceRange.source.file &&
+      region.source.start.line === sourceRange.source.start.line &&
+      region.source.start.column === sourceRange.source.start.column &&
+      region.source.end.line === sourceRange.source.end.line &&
+      region.source.end.column === sourceRange.source.end.column && sameValueAs(region.value));
+    if (atSource.length === 1) return atSource[0];
+    if (atSource.length > 1) return null;
+    // Escaped text can split into several lexical regions. Only the proven
+    // replacement span may supply their combined geometry.
+    return { ...session.sourceRegion, value: visible, sourceValue: sourceRange.replacement,
+      source: sourceRange.source };
+  }
+  // With an immutable source anchor, a unique surviving value still cannot
+  // prove identity: the edited occurrence may have been changed or deleted.
+  if (typeof session.sourceText === 'string') return null;
   const sameKindAndFile = regions.filter((region) =>
     region.kind === session.kind && sameSourceFile(region.source?.file, session.region?.source?.file)
   );
   const sameValue = sameKindAndFile.filter((region) => sameValueAs(region.value));
-  const candidates = sameValue.length ? sameValue : sameKindAndFile.filter((region) =>
-    String(region.value ?? '') === String(session.region?.value ?? '')
-  );
-  const oldLine = Number(session.region?.source?.start?.line);
-  return candidates.sort((a, b) =>
-    Math.abs(Number(a.source?.start?.line) - oldLine) -
-    Math.abs(Number(b.source?.start?.line) - oldLine)
-  )[0] ?? null;
+  // Region ids can be reassigned during resegmentation. Neither an id nor
+  // a nearest-line tie proves which identical occurrence owns this session.
+  return sameValue.length === 1 ? sameValue[0] : null;
 }
 
 async function stageDirectEditorForOpaqueBatch(batch) {
@@ -1260,7 +1297,7 @@ async function stageDirectEditorForOpaqueBatch(batch) {
   const visible = String(session.readValue?.() ?? session.region?.value ?? '');
   let region = directEditorRegionInSnapshot(snapshot, session);
   const sentFromSrcRev = Number(session.sentFromSrcRev ?? session.presentedRev);
-  if (!region && batch.rev <= sentFromSrcRev) {
+  if (!region && (batch.rev <= sentFromSrcRev || directEditorSourceRange(snapshot, session)?.matches === false)) {
     // The transparent control is ahead of the engine/host debounce. This
     // generation is already obsolete from the typist's point of view; keep
     // the old exact page and focused control until the matching source rev
@@ -1268,12 +1305,7 @@ async function stageDirectEditorForOpaqueBatch(batch) {
     return { sessionId: session.sessionId, localAhead: true, mapping: null };
   }
   if (!region) {
-    // LaTeX escaping can split one visible text region into several source
-    // regions (for example `a$b` -> `a`, `\$`, `b`). Once the canonical
-    // revision is newer than the revision from which the edit was sent, the
-    // visible value is authoritative for PDF geometry even if no single new
-    // DOM region retains the old id.
-    region = { ...session.region, value: visible };
+    return { sessionId: session.sessionId, mapping: null };
   }
   const near = session.printBounds
     ? {
@@ -2584,7 +2616,7 @@ async function loadProvisionalSnapshot(sourceRev) {
     const pending = fetch('/dom', { cache: 'no-store' }).then(async response => {
       if (!response.ok) throw new Error('Unready source mapping');
       const snapshot = await response.json();
-      if (Number(snapshot.srcRev) !== Number(sourceRev) ||
+      if (snapshot.sourceCurrent === false || Number(snapshot.srcRev) !== Number(sourceRev) ||
           Number(snapshot.documentEpoch) !== epoch || documentReset.adoptedEpoch !== epoch) {
         throw new Error('Superseded source mapping');
       }
@@ -2607,6 +2639,15 @@ async function editSnapshotForPage(page) {
     editDomCache = await fetch('/dom', { cache: 'no-store' }).then((r) => r.json());
   }
   return editDomCache;
+}
+
+function sourceTextForRegion(snapshot, region) {
+  const source = snapshot?.sources?.find(item => item.file === region.source?.file);
+  if (typeof source?.text !== 'string') return undefined;
+  const start = lineColToOffset(source.text, region.source.start.line, region.source.start.column);
+  const end = lineColToOffset(source.text, region.source.end.line, region.source.end.column);
+  return source.text.slice(start, end) === String(region.sourceValue ?? region.value)
+    ? source.text : undefined;
 }
 
 async function editRegionById(id, page = null) {
@@ -4105,6 +4146,10 @@ function closeDirectEditor() {
 
 function sendDirectEdit(region, sessionId, visibleValue, { cancel = false, finish = false } = {}) {
   const sessionState = directEditor?.sessionId === sessionId ? directEditor : null;
+  // Presentation can advance while a session is open. Its edit anchor stays
+  // in the immutable source snapshot from which that session began; the
+  // host tracks subsequent changes against this same anchor.
+  region = sessionState?.sourceRegion ?? region;
   if ((cancel || finish) && sessionState && !sessionState.sentEdit) return;
   if (!cancel && !finish && sessionState?.lastVisibleValue === visibleValue) return;
   const serialized = region.kind === 'math'
@@ -4129,7 +4174,8 @@ function sendDirectEdit(region, sessionId, visibleValue, { cancel = false, finis
     replacement,
     cancel,
     finish,
-    sourceRev: sessionState?.presentedRev ?? appliedSrcRev,
+    sourceRev: sessionState?.sourceRev ?? appliedSrcRev,
+    sourceText: sessionState?.sourceText,
   };
   if (sessionState && !cancel && !finish) {
     sessionState.sentEdit = true;
@@ -4172,6 +4218,10 @@ async function openDirectEditor(
   if (!page || !Number.isFinite(pageNumber)) return;
   const presented = usesDirectEditSurface(page) ? presentedPageState(page) : null;
   if (usesDirectEditSurface(page) && !presented) return;
+  const sourceSnapshot = presented?.snapshot ?? page.provisionalSnapshot;
+  if (!sourceSnapshot || Number(sourceSnapshot.documentEpoch) !== documentReset.adoptedEpoch) return;
+  const presentedRev = Number(presented?.rev ?? sourceSnapshot.srcRev);
+  if (!Number.isFinite(presentedRev)) return;
   const canonicalInput = Boolean(presented);
   const region = knownRegion ?? await editRegionById(id, page);
   if (!region) return;
@@ -4453,6 +4503,10 @@ async function openDirectEditor(
     kind: region.kind,
     standalone: null,
     canonicalInput,
+    sourceRegion: region,
+    sourceSnapshot,
+    sourceRev: presentedRev,
+    sourceText: sourceTextForRegion(sourceSnapshot, region),
     visualLine: visualHit?.dataset.line ?? target.dataset.line ?? null,
     wysiwyg: null,
     anchor: target,
@@ -4474,13 +4528,13 @@ async function openDirectEditor(
     nativeCaretAnchor: null,
     imeComposing: false,
     presentedId: presented?.id ?? null,
-    presentedRev: presented?.rev ?? appliedSrcRev,
+    presentedRev,
     readValue,
     sentEdit: false,
     lastVisibleValue: readValue(),
     serializedValue: region.kind === 'math' ? preserveMathAuxCommands(region.value, readValue()) : null,
     formattedSource: region.sourceValue ?? region.value,
-    sentFromSrcRev: Number(presented?.rev ?? appliedSrcRev),
+    sentFromSrcRev: presentedRev,
   };
   // Position synchronously. Math WYSIWYG is loaded lazily and must not
   // leave a newly opened field flashing at the page origin meanwhile.
@@ -4707,10 +4761,12 @@ async function activateDirectEditorAtPoint(event) {
   const canonicalClick = usesDirectEditSurface(targetPage);
   const presented = canonicalClick ? presentedPageState(targetPage) : null;
   const provisionalSnapshot = targetPage?.provisionalSnapshot;
+  const provisionalEpoch = targetPage?.provisionalEpoch;
   if (canonicalClick && !presented) return;
   const stillCurrent = () => {
     if (clickEpoch !== directEditClickEpoch || !targetPage?.isConnected) return false;
-    if (!canonicalClick) return targetPage.provisionalSnapshot === provisionalSnapshot;
+    if (!canonicalClick) return !usesDirectEditSurface(targetPage) &&
+      targetPage.provisionalSnapshot === provisionalSnapshot && targetPage.provisionalEpoch === provisionalEpoch;
     const current = presentedPageState(targetPage);
     return current?.id === presented.id && current?.rev === presented.rev && current?.src === presented.src;
   };
