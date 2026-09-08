@@ -7,6 +7,7 @@ import { cropSvg } from './util/svg.js';
 const execFileP = promisify(execFile);
 
 export async function cropRenderTargets({ jobdir, pdf, targets, chunks, forGalley, prefix }) {
+  let editPdf;
   for (const tgt of targets) {
     const svgPath = path.join(jobdir, `${prefix}-${tgt.page}.svg`);
     await execFileP(
@@ -22,6 +23,8 @@ export async function cropRenderTargets({ jobdir, pdf, targets, chunks, forGalle
       hBp: tgt.h,
       v: (prev?.v ?? 0) + 1,
       forGalley,
+      editPdf: editPdf ??= readFileSync(pdf),
+      editPage: tgt.page,
     });
   }
 }

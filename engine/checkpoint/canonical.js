@@ -38,6 +38,7 @@ import { performance } from 'node:perf_hooks';
 import { fnv1a } from '../hash.js';
 import { withProjectInputs } from '../project-inputs.js';
 import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-index.js';
+import { pdfEditGlyphs } from './pdf-edit-geometry.js';
 
 const execFileP = promisify(execFile);
 const MAX_PASSES = 3;
@@ -982,6 +983,37 @@ export class CanonicalRenderer {
     });
     this.textBoxInFlight.set(cur.id, job);
     return job;
+  }
+
+  async pageEditGlyphs(id, pageNumber) {
+    const generation = this.#resolveGeneration(id);
+    if (!generation || !Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > generation.pageCount) return null;
+    // Store with the generation itself: retirement releases geometry as
+    // well as its PDF, and concurrent clicks share the same parse.
+    generation.editGlyphs ??= new Map();
+    if (!generation.editGlyphs.has(pageNumber)) {
+      generation.editGlyphs.set(pageNumber, (async () => {
+        const [pdfjs, document] = await Promise.all([this.#loadPdfJs(), this.#pdfDocument(generation.id)]);
+        if (!document || !this.#resolveGeneration(generation.id)) return null;
+        const page = await document.getPage(pageNumber);
+        const operatorList = await page.getOperatorList();
+        const glyphs = pdfEditGlyphs({ operatorList, viewport: page.getViewport({ scale: 1 }),
+          commonObjs: page.commonObjs, OPS: pdfjs.OPS, Util: pdfjs.Util });
+        return this.#resolveGeneration(generation.id) ? glyphs : null;
+      })().catch(() => null));
+    }
+    return generation.editGlyphs.get(pageNumber);
+  }
+
+  async pdfEditGlyphs(bytes, pageNumber) {
+    const pdfjs = await this.#loadPdfJs();
+    const document = await pdfjs.getDocument({ data: new Uint8Array(bytes),
+      isEvalSupported: false, stopAtErrors: true }).promise;
+    try {
+      const page = await document.getPage(pageNumber);
+      return pdfEditGlyphs({ operatorList: await page.getOperatorList(), viewport: page.getViewport({ scale: 1 }),
+        commonObjs: page.commonObjs, OPS: pdfjs.OPS, Util: pdfjs.Util });
+    } finally { await document.destroy(); }
   }
 
   /**

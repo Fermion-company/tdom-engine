@@ -276,6 +276,7 @@ export class CheckpointEngine {
       }
       const from = this.#nearestCheckpoint(target);
       let changed = false;
+      const beforeChunksRev = this.chunks.rev;
       this.bgActive = true;
       let replayed;
       try {
@@ -292,7 +293,9 @@ export class CheckpointEngine {
         return { status: 'superseded', sourceRev, target };
       }
       this.#enforceCheckpointCap();
-      if (changed) this.#asyncRepaginate();
+      // A cached rescue can replace its PDF chunk without changing any
+      // measured boxes or exit state. Its new version must reach page DLs.
+      if (changed || this.chunks.rev !== beforeChunksRev) this.#asyncRepaginate();
       const result = {
         status: this.checkpoints.has(target) && this.checkpoints.has(target + 1) ? 'ready' : 'incomplete',
         sourceRev,
@@ -1270,6 +1273,7 @@ export class CheckpointEngine {
         return 'done';
       }
       const before = block.galleyHash + '|' + block.stateVec;
+      const beforeChunksRev = this.chunks.rev;
       // cache hit inside → the exact galley adopts in milliseconds; the
       // chain continues to convergence exactly like a foreground edit,
       // but YIELDS to an incoming edit and re-queues so the propagation
@@ -1299,7 +1303,12 @@ export class CheckpointEngine {
           if (l.h != null) this.hrefTable.set(l.k, l.h);
         }
       }
-      if (before !== block.galleyHash + '|' + block.stateVec) this.#asyncRepaginate();
+      // Re-adopting identical geometry still registers a new chunk version.
+      // Publishing only layout changes leaves the page requesting a retired
+      // SVG/glyph version, so an atomic viewer waits for it indefinitely.
+      if (before !== block.galleyHash + '|' + block.stateVec || this.chunks.rev !== beforeChunksRev) {
+        this.#asyncRepaginate();
+      }
       this.#queueMovedOffsets();
       // the resume walk left checkpoints at the blocks it re-typeset — collapse
       // back to the grid so the boot rescue storm can't creep the live set

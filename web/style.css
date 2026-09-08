@@ -438,8 +438,8 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 .page svg text { cursor: pointer; }
 /* Math glyph runs exist only as TeX geometry for hit-testing. Never paint
    them directly: legacy math fonts can map operators to ordinary letters or
-   missing-glyph boxes. Until the exact mini-compile chunk is ready, blank is
-   the visually honest fallback. */
+   missing-glyph boxes. The viewer retains the previous complete page until
+   every required exact chunk is ready. */
 .page svg text[data-math="1"] { opacity: 0; }
 .page svg text[data-font-pending="1"] { opacity: 0; }
 
@@ -540,9 +540,8 @@ body.is-embed .chunkwin { pointer-events: none; }
   --caret-color: #2563eb;
   --selection-background-color: rgba(37, 99, 235, 0.2);
 }
-/* Opaque mode is an exact LuaLaTeX page. Browser text, carets and selection
-   geometry cannot share its font metrics, so the previous exact page stays
-   completely untouched until the next exact page swaps in atomically. */
+/* Native input geometry does not share the PDF font metrics. Its paint is
+   hidden; the ink layer below draws the caret and selection from PDF glyphs. */
 .tdom-direct-editor.is-opaque [contenteditable],
 .tdom-direct-editor.is-opaque math-field {
   caret-color: transparent;
@@ -553,6 +552,19 @@ body.is-embed .chunkwin { pointer-events: none; }
    again; keyboard focus survives pointer-events:none. The visible suggestion
    panel remains directly interactive. */
 .tdom-direct-editor.is-opaque { pointer-events: none; }
+.tdom-ink-layer { position: absolute; inset: 0; z-index: 13; pointer-events: none; }
+.tdom-ink-layer > span { position: absolute; pointer-events: none; }
+.tdom-ink-caret { background: #2563eb; }
+.tdom-ink-selection { background: rgba(37, 99, 235, 0.22); }
+.tdom-ink-composition {
+  color: #111;
+  background: #fff;
+  line-height: 1;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .tdom-direct-editor.is-opaque .math-wysiwyg-panel {
   pointer-events: auto;
   left: var(--tdom-canonical-panel-left, 0px) !important;

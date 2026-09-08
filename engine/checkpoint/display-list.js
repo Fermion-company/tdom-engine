@@ -13,6 +13,11 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
   const L = 72 + (geo.oddsidemargin ?? 0);
   const T = 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
   const commands = [];
+  for (const src of page.pendingExact ?? []) {
+    // The absent block has no geometry yet; the signal is deliberately
+    // page-wide and contributes no fabricated coordinates or dimensions.
+    commands.push({ op: 'pending-exact', src, wholePage: 1 });
+  }
   let gfxOpen = null;
   const flushGfx = () => {
     if (!gfxOpen) return;
@@ -100,12 +105,15 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       continue;
     }
     flushGfx();
-    if (u.cn) {
+    if (u.cn || u.ln.pendingExact) {
       // canonical-only band (margin-bearing blocks): blank in the
       // provisional layer, the canonical page supplies the pixels —
       // advertised so the referee counts real lines here as covered
       commands.push({
-        op: 'canon',
+        // Suppressed glyphs must retain a paint requirement. Without this
+        // marker an atomic viewer could publish the otherwise complete page
+        // while a formula, graphic, float or footnote was entirely absent.
+        op: u.cn ? 'canon' : 'pending-exact',
         x: r2(L),
         y: r2(baseline - u.ln.boxH),
         w: r2(geo.textwidth),

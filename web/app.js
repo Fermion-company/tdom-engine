@@ -43,6 +43,7 @@ let geometry = { paperwidth: 612, paperheight: 792 };
 let backend = 'internal';
 const loadedFonts = new Set();
 const readyFonts = new Set();
+const fontLoads = new Map();
 const failedFonts = new Set(); // families reported to /font-fail (once each)
 
 let serverText = '';
@@ -54,6 +55,9 @@ let pendingEditorInputAtEpochMs = null;
 let inFlight = false;
 const history = [];
 const pageDivs = new Map();
+const provisionalStages = new Map(); // latest unpublished display list per page
+const provisionalRemovedPages = new Set();
+let committedCanonicalGeneration = null;
 let lastEngineStatus = null;
 let liveSearch = { query: '', results: [], current: -1 };
 let editDomCache = null;
@@ -63,6 +67,22 @@ let mathCaretProbe = null;
 let mathCaretProbeSeq = 0;
 const mathCaretOffsetCache = new Map();
 const canonicalTextBoxesCache = new Map();
+const canonicalGlyphCache = new Map();
+const chunkGlyphCache = new Map();
+const chunkInputGeometry = new WeakMap();
+const provisionalSnapshotCache = new Map();
+const shipGlyphCache = new Map();
+
+async function canonicalGlyphs(pageNumber, id) {
+  const key = `${id}:${pageNumber}`;
+  if (!canonicalGlyphCache.has(key)) {
+    const pending = fetch(`/canonical/glyphs?c=${Number(id)}&page=${Number(pageNumber)}`, { cache: 'no-store' })
+      .then(r => r.ok ? r.json() : null).then(data => data?.glyphs ?? []).catch(() => []);
+    canonicalGlyphCache.set(key, pending);
+    while (canonicalGlyphCache.size > 16) canonicalGlyphCache.delete(canonicalGlyphCache.keys().next().value);
+  }
+  return canonicalGlyphCache.get(key);
+}
 const canonicalRegionBoundsCache = new Map();
 let directEditClickEpoch = 0;
 let bootComplete = false;
@@ -400,7 +420,7 @@ function injectFonts(keys) {
   // default font — report it so the engine demotes those lines to exact
   // preview chunks instead of showing wrong glyphs.
   for (const k of missing) {
-    document.fonts.load(`12px "${k}"`).then(
+    fontLoads.set(k, document.fonts.load(`12px "${k}"`).then(
       (faces) => {
         if (!faces || faces.length === 0) {
           reportFontFailure(k);
@@ -415,7 +435,7 @@ function injectFonts(keys) {
         }
       },
       () => reportFontFailure(k)
-    );
+    ));
   }
 }
 
@@ -431,15 +451,15 @@ function reportFontFailure(family) {
 
 // ---------------------------------------------------------------- boot
 
-function presentedSnapshotKey(id, rev) {
-  return `${Number(id)}:${Number(rev)}`;
+function presentedSnapshotKey(id, rev, epoch = documentReset.adoptedEpoch) {
+  return `${Number(epoch)}:${Number(id)}:${Number(rev)}`;
 }
 
-async function ensurePresentedDomSnapshot(id, rev) {
+async function ensurePresentedDomSnapshot(id, rev, epoch = documentReset.adoptedEpoch) {
   const numericId = Number(id);
   const numericRev = Number(rev);
   if (!Number.isFinite(numericId) || !Number.isFinite(numericRev)) return null;
-  const key = presentedSnapshotKey(numericId, numericRev);
+  const key = presentedSnapshotKey(numericId, numericRev, epoch);
   if (presentedDomSnapshots.has(key)) return presentedDomSnapshots.get(key);
   if (presentedDomFetches.has(key)) return presentedDomFetches.get(key);
   const pending = fetch('/dom', { cache: 'no-store' })
@@ -449,7 +469,8 @@ async function ensurePresentedDomSnapshot(id, rev) {
       // map for a canonical generation only while both source revisions are
       // identical. Keeping this immutable snapshot lets an already printed
       // page resolve a second location while the next compile is pending.
-      if (!snapshot || Number(snapshot.srcRev) !== numericRev) return null;
+      if (!snapshot || Number(snapshot.srcRev) !== numericRev ||
+          Number(snapshot.documentEpoch) !== epoch || documentReset.adoptedEpoch > epoch) return null;
       presentedDomSnapshots.set(key, snapshot);
       while (presentedDomSnapshots.size > 4) {
         presentedDomSnapshots.delete(presentedDomSnapshots.keys().next().value);
@@ -483,9 +504,9 @@ async function boot(expectedDocumentEpoch = null) {
       (expectedDocumentEpoch === null || !documentReset.canAdopt(expectedDocumentEpoch))) {
     return;
   }
-  adoptDoc(doc);
-  if (usesCanonicalSurface() && canonical?.id && canonical.rev === appliedSrcRev) {
-    await ensurePresentedDomSnapshot(canonical.id, canonical.rev);
+  if ((doc.mode === 'opaque' || doc.previewPolicy === 'canonical-anchor') &&
+      doc.canonical?.id && doc.canonical.rev === (doc.report.srcRev ?? doc.report.rev)) {
+    await ensurePresentedDomSnapshot(doc.canonical.id, doc.canonical.rev, Number(doc.documentEpoch));
   }
   if (requestEpoch !== bootRequestEpoch || eventEpoch !== stateEventEpoch) {
     queueMicrotask(() => boot(expectedDocumentEpoch));
@@ -495,6 +516,8 @@ async function boot(expectedDocumentEpoch = null) {
     if (expectedDocumentEpoch !== null) queueMicrotask(() => boot(expectedDocumentEpoch));
     return;
   }
+  // Source/chunk mapping requests must capture the adopted document epoch.
+  adoptDoc(doc);
   bootComplete = true;
   statusEl.textContent = '';
   renderInspector(doc.report, null);
@@ -511,6 +534,8 @@ function maybeAdoptCompletedReset(epoch) {
 
 function beginClientDocumentReset(epoch) {
   if (!documentReset.begin(epoch)) return false;
+  provisionalStages.clear();
+  provisionalRemovedPages.clear();
   bootComplete = false;
   directEditClickEpoch++;
   closeDirectEditor();
@@ -541,6 +566,9 @@ function adoptDoc(doc) {
   syncEditorHighlight();
   pagesEl.textContent = '';
   pageDivs.clear();
+  provisionalStages.clear();
+  provisionalRemovedPages.clear();
+  committedCanonicalGeneration = null;
   pageDirtyRev.clear();
   clearCanonicalAnchorPreview();
   lastRemoveRev = 0;
@@ -552,16 +580,16 @@ function adoptDoc(doc) {
   canonical = doc.canonical ?? null;
   if (shipWaveBatch) cancelShipWaveBatch(shipWaveBatch);
   shipPages.clear();
-  if (previewPolicy === 'structured') {
-    for (const dl of doc.pages) renderPage(dl, false);
-  }
   appliedRev = doc.report.rev;
   appliedSrcRev = doc.report.srcRev ?? doc.report.rev;
+  if (previewPolicy === 'structured') {
+    stageProvisionalPatches(doc.pages.map(displayList => ({ type: 'replace-page', displayList })), false);
+  }
   // a canonical compile older than the document state cannot vouch for any
   // page — show provisional until the fresh one lands (reload after
   // convergence has canonical.rev === srcRev: exact from frame one)
   if (mode === 'structured' && canonical && canonical.rev < appliedSrcRev) {
-    for (const n of pageDivs.keys()) pageDirtyRev.set(n, appliedSrcRev);
+    for (const dl of doc.pages) pageDirtyRev.set(dl.page, appliedSrcRev);
   }
   syncCanonical();
 }
@@ -574,57 +602,127 @@ function srcOf(target) {
   return src;
 }
 
-function renderPage(dl, flash) {
-  let div = pageDivs.get(dl.page);
+function stageProvisionalPatches(patches, flash) {
   if (usesCanonicalSurface()) {
-    // Opaque pages are created exclusively from canonical metadata. A late
-    // resident patch must not create an empty phantom shell or stale hit map.
-    if (div) prepareOpaqueShell(div);
+    provisionalStages.clear();
+    provisionalRemovedPages.clear();
     return;
   }
-  if (!div) {
-    div = document.createElement('div');
-    div.className = 'page';
-    div.dataset.page = dl.page;
-    const no = document.createElement('span');
-    no.className = 'pageno';
-    no.textContent = `page ${dl.page}`;
-    div.appendChild(no);
-    const after = [...pageDivs.entries()].filter(([n]) => n > dl.page).sort((a, b) => a[0] - b[0])[0];
-    pagesEl.insertBefore(div, after ? after[1] : null);
-    pageDivs.set(dl.page, div);
+  if (committedCanonicalGeneration?.rev === appliedSrcRev &&
+      committedCanonicalGeneration.epoch === documentReset.adoptedEpoch) return;
+  // An async chunk patch may replace only one page of an unfinished reflow.
+  // Carry every other unpublished DL, including across a new source edit;
+  // otherwise the first ready page can erase ink still waiting on another.
+  const displayLists = new Map([...provisionalStages].map(([n, stage]) => [n, stage.dl]));
+  const replaced = new Set();
+  for (const patch of patches) {
+    if (patch.type === 'replace-page') {
+      displayLists.set(patch.displayList.page, patch.displayList);
+      replaced.add(patch.displayList.page);
+      provisionalRemovedPages.delete(patch.displayList.page);
+    } else if (patch.type === 'remove-pages') {
+      removePagesFrom(patch.from);
+      for (const n of displayLists.keys()) if (n >= patch.from) displayLists.delete(n);
+    }
   }
-  // rebuild only the PROVISIONAL layers; the canonical overlay (img.canon)
-  // survives provisional repaints untouched
-  div.querySelector('svg')?.remove();
-  div.querySelectorAll('.chunkwin').forEach((e) => e.remove());
-  div.dataset.prov = '1';
+  for (const [n, dl] of displayLists) {
+    const previous = provisionalStages.get(n);
+    if (replaced.has(n) || !previous || previous.sourceRev !== appliedSrcRev ||
+        previous.documentEpoch !== documentReset.adoptedEpoch) renderPage(dl, flash);
+  }
+  queueMicrotask(tryCommitProvisionalStages);
+}
 
-  // display lists carry glyph runs -> unified SVG plus absolutely-
-  // positioned <img> overlays for exact-render block chunks
-  div.insertAdjacentHTML('beforeend', svgFor(dl));
+function tryCommitProvisionalStages() {
+  // A provisional shrink cannot decide which printed page disappears. Hold
+  // its replacements too, so moved ink does not appear on both old and new
+  // pages while the definitive PDF establishes the page count.
+  if (!provisionalStages.size || provisionalRemovedPages.size ||
+      usesCanonicalSurface() || documentReset.pending) return;
+  const stages = [...provisionalStages.values()].sort((a, b) => a.dl.page - b.dl.page);
+  if (stages.some(stage => !stage.ready || stage.sourceRev !== appliedSrcRev ||
+      stage.documentEpoch !== documentReset.adoptedEpoch ||
+      Number(stage.snapshot?.srcRev) !== appliedSrcRev ||
+      Number(stage.snapshot?.documentEpoch) !== stage.documentEpoch)) return;
+  // All affected pages change within this synchronous transaction. A new
+  // provisional page is also kept detached until its complete ink is ready.
+  provisionalStages.clear();
+  for (const stage of stages) {
+    const { dl, staging, sourceRev, snapshot } = stage;
+    let div = pageDivs.get(dl.page);
+    if (!div) div = ensureShell(dl.page);
+    div.querySelector(':scope > svg:not(.tdom-canonical-delta)')?.remove();
+    div.querySelectorAll('.chunkwin').forEach(e => e.remove());
+    div.append(...staging.childNodes);
+    div.provisionalEpoch = (div.provisionalEpoch ?? 0) + 1;
+    div.provisionalSnapshot = snapshot;
+    div.dataset.prov = '1';
+    div.dataset.provRev = String(sourceRev);
+    delete div.dataset.provPending;
+    div.classList.remove('awaiting-canonical');
+  }
+  for (const stage of stages) updateCanonState(stage.dl.page);
+  if (liveSearch.query) scheduleLiveSearchRefresh();
+  if (stages.some(stage => stage.dl.page === directEditor?.pageNumber)) {
+    repositionDirectEditor();
+    void refreshDirectEditGeometry();
+  }
+  updateBadge();
+}
+
+function renderPage(dl, flash) {
+  if (usesCanonicalSurface()) return;
+  const div = pageDivs.get(dl.page);
+  // Stage the entire next surface off-DOM. A dirty mixed text/math line
+  // deliberately has no browser math ink; publishing it would erase other
+  // expressions on the page while its exact chunk is still being compiled.
+  const sourceRev = appliedSrcRev;
+  const stage = { dl, sourceRev, documentEpoch: documentReset.adoptedEpoch, ready: false };
+  provisionalStages.set(dl.page, stage);
+  // Carried pages are part of this source generation too. An intermediate
+  // canonical metadata event must not let one retain older exact pixels
+  // while its neighboring page reveals this provisional transaction.
+  pageDirtyRev.set(dl.page, sourceRev);
+  if (div) div.dataset.provPending = '1';
+  if (dl.commands.some(cmd => cmd.op === 'canon' || cmd.op === 'pending-exact' ||
+      cmd.op === 'glyphs' && cmd.math || cmd.op === 'chunk' && cmd.st)) return;
+  const families = [...new Set(dl.commands.filter(cmd => cmd.op === 'glyphs' && cmd.fam).map(cmd => cmd.fam))];
+  injectFonts(families);
+  const staging = document.createElement('div');
+  staging.innerHTML = svgFor(dl);
   for (const cmd of dl.commands) {
     if (cmd.op !== 'chunk') continue;
     const W = geometry.paperwidth;
     const H = geometry.paperheight;
-    const shiftPct = (cmd.sy / cmd.w) * 100; // margin-top % is width-relative
-    // st=1: a stale-exact chunk — the previous edit's TeX pixels, held
-    // until the fresh render lands (~100–200ms). Old but clean beats fast
-    // but wrong; the class is a hook for the inspector, not a visual.
-    div.insertAdjacentHTML(
+    const shiftPct = (cmd.sy / cmd.w) * 100;
+    staging.insertAdjacentHTML(
       'beforeend',
       `<div class="chunkwin${cmd.st ? ' stale' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
         `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
     );
   }
-  if (flash) {
-    div.classList.remove('fading');
-    div.classList.add('patched');
-    requestAnimationFrame(() => div.classList.add('fading'));
-    setTimeout(() => div.classList.remove('patched', 'fading'), 1200);
-  }
-  if (liveSearch.query) scheduleLiveSearchRefresh();
-  if (directEditor?.pageNumber === dl.page) requestAnimationFrame(repositionDirectEditor);
+  const ready = () => {
+    if (provisionalStages.get(dl.page) !== stage || usesCanonicalSurface() ||
+        sourceRev !== appliedSrcRev || stage.documentEpoch !== documentReset.adoptedEpoch) return;
+    if (families.some(family => !readyFonts.has(family))) return;
+    // Font promises can resolve while the SVG is still detached. Its
+    // pending markers must be cleared here as well as in injectFonts().
+    staging.querySelectorAll('text[data-font-pending]').forEach(node => node.removeAttribute('data-font-pending'));
+    stage.staging = staging;
+    stage.ready = true;
+    tryCommitProvisionalStages();
+  };
+  const images = [...staging.querySelectorAll('img')];
+  const pending = [
+    loadProvisionalSnapshot(sourceRev).then(snapshot => { stage.snapshot = snapshot; }),
+    ...images.map(img => img.decode()),
+    ...images.map(loadChunkInputGeometry),
+    ...families.map(family => fontLoads.get(family)),
+  ];
+  void Promise.all(pending).then(ready).catch(() => {
+    // A superseded chunk URL is intentionally rejected by the server. The
+    // newest display list will retry with matching pixels and geometry.
+  });
 }
 
 /** Unified SVG page: TeX-positioned glyph runs, rules, chunk images, folio. */
@@ -674,11 +772,13 @@ function svgFor(dl, className = '') {
 }
 
 function removePagesFrom(from) {
-  for (const [n, div] of [...pageDivs.entries()]) {
-    if (n >= from) {
-      div.remove();
-      pageDivs.delete(n);
-    }
+  // Resident pagination is provisional. A shrink must not erase the last
+  // printed page before the definitive PDF (including any moved ink) lands.
+  lastRemoveRev = appliedSrcRev;
+  for (const n of provisionalStages.keys()) if (n >= from) provisionalStages.delete(n);
+  for (const [n, div] of pageDivs) if (n >= from) {
+    provisionalRemovedPages.add(n);
+    div.dataset.provPending = '1';
   }
 }
 
@@ -743,6 +843,7 @@ function applyReport(report) {
     // resolving, but make its convergence target the newest source revision.
     canonicalAnchorPreview.targetSrcRev = anchorIntent.srcRev;
   }
+  const provisionalPatches = [];
   for (const patch of report.patches) {
     if (previewPolicy !== 'structured') continue;
     if (patch.type === 'replace-page') {
@@ -755,15 +856,17 @@ function applyReport(report) {
         // canonical page with the same number.
         continue;
       }
-      renderPage(dl, true);
+      provisionalPatches.push(patch);
       // this page now differs from the last canonical compile — provisional
       // owns it until a compile of srcRev >= this lands
       pageDirtyRev.set(dl.page, appliedSrcRev);
-      updateCanonState(dl.page);
     } else if (patch.type === 'remove-pages') {
-      lastRemoveRev = appliedSrcRev;
-      if (mode !== 'opaque') removePagesFrom(patch.from);
+      provisionalPatches.push(patch);
     }
+  }
+  stageProvisionalPatches(provisionalPatches, true);
+  for (const patch of provisionalPatches) {
+    if (patch.type === 'replace-page') updateCanonState(patch.displayList.page);
   }
   updateBadge();
 }
@@ -1022,7 +1125,7 @@ function activePaperGeometry(page = null) {
 
 function prepareOpaqueShell(div) {
   if (!div || !usesCanonicalSurface()) return;
-  div.querySelector('svg')?.remove();
+  div.querySelector(':scope > svg')?.remove();
   div.querySelectorAll('.chunkwin').forEach((element) => element.remove());
   div.classList.remove('patched', 'fading');
   delete div.dataset.prov;
@@ -1043,7 +1146,7 @@ function setMode(newMode, reasons) {
   mode = newMode;
   document.body.classList.toggle('is-opaque-document', usesCanonicalSurface());
   directEditClickEpoch++;
-  directEditor?.element?.classList.toggle('is-opaque', usesCanonicalSurface());
+  directEditor?.element?.classList.add('is-opaque');
   if (!usesCanonicalSurface() && directEditor?.control) directEditor.control.style.transform = '';
   if (usesCanonicalSurface()) {
     // A structured editor is anchored to provisional SVG geometry. Once the
@@ -1064,6 +1167,12 @@ function setMode(newMode, reasons) {
       void ensurePresentedDomSnapshot(canonical.id, canonical.rev);
     }
   }
+}
+
+function usesDirectEditSurface(page = null) {
+  return usesCanonicalSurface() || (page
+    ? Boolean(page.classList.contains('is-final') && canonicalIdFromSrc(page.querySelector('img.canon')?.dataset.src) != null)
+    : directEditor?.canonicalInput === true);
 }
 
 function usesCanonicalSurface() {
@@ -1124,14 +1233,15 @@ function directEditorRegionInSnapshot(snapshot, session) {
     (block.editRegions ?? []).map((region) => ({ ...region, blockSource: block.source ?? null }))
   );
   const visible = String(session.readValue?.() ?? session.region?.value ?? '');
+  const sameValueAs = value => directEditValuesEqual(session.kind, value, visible);
   const exact = regions.find((region) =>
-    region.id === session.region?.id && String(region.value ?? '') === visible
+    region.id === session.region?.id && sameValueAs(region.value)
   );
   if (exact) return exact;
   const sameKindAndFile = regions.filter((region) =>
     region.kind === session.kind && sameSourceFile(region.source?.file, session.region?.source?.file)
   );
-  const sameValue = sameKindAndFile.filter((region) => String(region.value ?? '') === visible);
+  const sameValue = sameKindAndFile.filter((region) => sameValueAs(region.value));
   const candidates = sameValue.length ? sameValue : sameKindAndFile.filter((region) =>
     String(region.value ?? '') === String(session.region?.value ?? '')
   );
@@ -1144,7 +1254,7 @@ function directEditorRegionInSnapshot(snapshot, session) {
 
 async function stageDirectEditorForOpaqueBatch(batch) {
   const session = directEditor;
-  if (!session || !usesCanonicalSurface()) return { sessionId: null };
+  if (!session) return { sessionId: null };
   const snapshot = await batch.snapshotReady;
   if (!snapshot || directEditor?.sessionId !== session.sessionId) return { sessionId: session.sessionId, mapping: null };
   const visible = String(session.readValue?.() ?? session.region?.value ?? '');
@@ -1202,7 +1312,12 @@ async function stageDirectEditorForOpaqueBatch(batch) {
 
 function getOpaqueCanonicalBatch(generation) {
   const key = opaqueCanonicalBatchKey(generation);
-  if (!key || !usesCanonicalSurface()) return null;
+  // The same generation barrier serves structured pages as well: canonical
+  // pagination can move ink between two visible pages in either mode.
+  if (!key || generation?.id == null || documentReset.pending ||
+      Number(generation.id) !== Number(canonical?.id) ||
+      Number(generation.rev) !== Number(canonical?.rev) ||
+      Number(generation.rev) !== Number(appliedSrcRev)) return null;
   cancelObsoleteOpaqueBatches(key);
   let batch = opaqueCanonicalBatches.get(key);
   if (!batch) {
@@ -1212,6 +1327,7 @@ function getOpaqueCanonicalBatch(generation) {
       key,
       id,
       rev,
+      documentEpoch: documentReset.adoptedEpoch,
       pageCount: Number(generation.pageCount),
       expected: new Map(),
       sealed: false,
@@ -1283,8 +1399,12 @@ function reconcileOpaquePageCount(pageCount) {
   if (!Number.isInteger(pageCount) || pageCount < 0) return;
   for (const [pageNumber, page] of [...pageDivs]) {
     if (pageNumber <= pageCount) continue;
+    canonicalStageObserver?.unobserve(page);
     page.remove();
     pageDivs.delete(pageNumber);
+    pageDirtyRev.delete(pageNumber);
+    shipPages.delete(pageNumber);
+    provisionalStages.delete(pageNumber);
   }
 }
 
@@ -1303,6 +1423,7 @@ function applyStagedDirectEditor(stage, batch) {
   targetPage.appendChild(session.element);
   session.pageNumber = mapping.pageNumber;
   session.region = mapping.region;
+  session.canonicalInput = true;
   session.printBounds = mapping.bounds;
   session.presentedId = batch.id;
   session.presentedRev = batch.rev;
@@ -1310,6 +1431,8 @@ function applyStagedDirectEditor(stage, batch) {
   session.anchor = null;
   session.anchorOffset = null;
   repositionDirectEditor();
+  targetPage.appendChild(session.inkLayer);
+  void refreshDirectEditGeometry(session);
 }
 
 function ensureOpaqueBatchEditorTargetPage(batch) {
@@ -1362,7 +1485,8 @@ function ensureOpaqueBatchEditorTargetPage(batch) {
 function tryCommitOpaqueCanonicalBatch(batch) {
   if (!batch || batch.committing || !batch.sealed || batch.snapshot === undefined ||
       batch.editorStage === undefined) return;
-  if (opaqueCanonicalBatches.get(batch.key) !== batch || !usesCanonicalSurface() ||
+  if (opaqueCanonicalBatches.get(batch.key) !== batch || documentReset.pending ||
+      batch.documentEpoch !== documentReset.adoptedEpoch ||
       Number(canonical?.id) !== batch.id || Number(canonical?.rev) !== batch.rev ||
       batch.rev !== Number(appliedSrcRev) || !batch.snapshot) {
     return;
@@ -1376,7 +1500,7 @@ function tryCommitOpaqueCanonicalBatch(batch) {
       directEditor?.sessionId === batch.editorStage.sessionId) return;
   if (batch.editorStage?.mapping &&
       directEditor?.sessionId === batch.editorStage.sessionId &&
-      String(directEditor.readValue?.() ?? '') !== String(batch.editorStage.mapping.region?.value ?? '')) return;
+      !directEditValuesEqual(directEditor.kind, directEditor.readValue?.(), batch.editorStage.mapping.region?.value)) return;
   if (!ensureOpaqueBatchEditorTargetPage(batch)) return;
   for (const [pageNumber, entry] of [...batch.expected]) {
     if (!entry.page?.isConnected || entry.page.dataset.canonWanted !== entry.src) {
@@ -1393,7 +1517,10 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   for (const [, entry] of [...batch.expected].sort((a, b) => a[0] - b[0])) {
     entry.apply();
   }
-  applyStagedDirectEditor(batch.editorStage, batch);
+  committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch };
+  provisionalStages.clear();
+  provisionalRemovedPages.clear();
+  for (const [n, rev] of pageDirtyRev) if (rev <= batch.rev) pageDirtyRev.delete(n);
   reconcileOpaquePageCount(batch.pageCount);
   directEditClickEpoch++;
   opaqueBatchCommitDepth++;
@@ -1402,6 +1529,9 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   } finally {
     opaqueBatchCommitDepth--;
   }
+  // The editor's geometry refresh must see the newly selected exact layer,
+  // including when a structured page was provisional before this commit.
+  applyStagedDirectEditor(batch.editorStage, batch);
   updateBadge();
 }
 
@@ -1497,7 +1627,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
   const shipRegistration = activeShipBatch
     ? registerShipWavePage(activeShipBatch, div, src)
     : null;
-  const batch = usesCanonicalSurface() && opaqueBatchCommitDepth === 0
+  const batch = !activeShipBatch && opaqueBatchCommitDepth === 0
     ? getOpaqueCanonicalBatch(generation)
     : null;
   const batchRegistration = batch ? registerOpaqueCanonicalBatchPage(batch, div, src) : null;
@@ -1507,7 +1637,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
     delete div.dataset.canonRetries;
     const currentId = generation?.id ?? canonicalIdFromSrc(src);
     const currentRev = generation?.rev;
-    if (usesCanonicalSurface() && currentId != null && currentRev != null) {
+    if (currentId != null && currentRev != null) {
       void ensurePresentedDomSnapshot(currentId, currentRev).then((snapshot) => {
         if (!snapshot || !div.isConnected || div.dataset.canonWanted !== src ||
             div.querySelector('img.canon') !== current) {
@@ -1563,7 +1693,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
   const rawPresentationRev = generation?.rev;
   const presentationId = rawPresentationId == null ? NaN : Number(rawPresentationId);
   const presentationRev = rawPresentationRev == null ? NaN : Number(rawPresentationRev);
-  const requiresSnapshot = usesCanonicalSurface() &&
+  const requiresSnapshot =
     Number.isFinite(presentationId) && Number.isFinite(presentationRev);
   const snapshotReady = requiresSnapshot
     ? ensurePresentedDomSnapshot(presentationId, presentationRev)
@@ -1579,7 +1709,8 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
     }
     // Opaque mode deliberately retains the previous known-good exact page.
     // Structured mode can safely reveal its coherent provisional page.
-    if (div.dataset.canonWanted === src && !usesCanonicalSurface()) {
+    if (div.dataset.canonWanted === src && !usesCanonicalSurface() &&
+        div.dataset.provPending !== '1' && !div.querySelector('img.canon')) {
       div.classList.remove('is-final', 'is-partial');
     }
     if (div.dataset.canonWanted === src && div.isConnected) {
@@ -1675,7 +1806,7 @@ function ensureShell(n) {
   if (div) return div;
   div = document.createElement('div');
   div.className = 'page';
-  if (usesCanonicalSurface()) div.classList.add('awaiting-canonical');
+  div.classList.add('awaiting-canonical');
   div.dataset.page = n;
   const exactPaper = canonical?.papers?.[n - 1] ?? canonical?.paper;
   const paper = usesCanonicalSurface() && exactPaper
@@ -1698,11 +1829,8 @@ function ensureShell(n) {
 function syncCanonical() {
   let opaqueBatch = null;
   if (canonical && canonical.id) {
-    // dirty marks covered by this compile are settled: those pages are
-    // exactly what LuaLaTeX printed for the current source
-    for (const [n, rev] of [...pageDirtyRev]) {
-      if (rev <= canonical.rev) pageDirtyRev.delete(n);
-    }
+    // Dirty marks are retired with the actual generation commit. Metadata
+    // can precede image decode and a newer edit by several event turns.
     // Canonical-only pages (beyond the provisional count) get shells only
     // when this compile covers the CURRENT source.  After /open, the cold
     // renderer can still describe the previous document for the idle
@@ -1713,26 +1841,20 @@ function syncCanonical() {
         if (!pageDivs.has(n)) ensureShell(n);
       }
     }
-    // canonical-only shells beyond the new page count disappear
-    for (const [n, div] of [...pageDivs]) {
-      if (!usesCanonicalSurface() && n > canonical.pageCount && div.dataset.prov !== '1') {
-        div.remove();
-        pageDivs.delete(n);
-      }
+    if (canonical.rev === appliedSrcRev) {
+      opaqueBatch = getOpaqueCanonicalBatch({
+        id: canonical.id,
+        rev: canonical.rev,
+        pageCount: canonical.pageCount,
+      });
     }
     if (usesCanonicalSurface()) {
-      if (canonical.rev >= appliedSrcRev) {
-        opaqueBatch = getOpaqueCanonicalBatch({
-          id: canonical.id,
-          rev: canonical.rev,
-          pageCount: canonical.pageCount,
-        });
-      }
       for (const div of pageDivs.values()) prepareOpaqueShell(div);
     }
   }
   for (const n of pageDivs.keys()) updateCanonState(n);
-  if (opaqueBatch && opaqueBatch.expected.size === 0 && canonical.pageCount > 0) {
+  if (opaqueBatch && canonical.pageCount > 0 && (opaqueBatch.expected.size === 0 ||
+      [...pageDivs.keys()].some(n => n > canonical.pageCount))) {
     // A page-count shrink can leave only an obsolete last page in view. Its
     // replacement has no page number to fetch, so force the nearest surviving
     // page into this generation barrier before removing the obsolete shell.
@@ -1787,7 +1909,7 @@ function updateCanonState(n) {
   const fresh = coldFresh || useShip;
   let img = div.querySelector('img.canon');
   const stageCanonical = canonAvail && (
-    previewPolicy === 'canonical-anchor' || mode !== 'opaque' || canonical.rev >= appliedSrcRev
+    usesCanonicalSurface() || coldFresh || !img
   );
   let targetSrc = null;
   if (stageCanonical || useShip) {
@@ -1822,21 +1944,22 @@ function updateCanonState(n) {
   const targetPresented = Boolean(
     targetSrc && img?.dataset.src === targetSrc && div.dataset.canonPresentedSrc === targetSrc
   );
+  const retainingCanonical = img && div.classList.contains('is-final') && (
+    div.dataset.provPending === '1' || targetSrc || canonical?.id && n > canonical.pageCount
+  );
   const state = usesCanonicalSurface()
     ? (img ? 'final' : 'provisional')
-    : (fresh && targetPresented ? 'final' : 'provisional');
+    : ((fresh && targetPresented || retainingCanonical) ? 'final' : 'provisional');
   if (img) img.style.clipPath = '';
+  const previousFinal = div.classList.contains('is-final');
   div.classList.toggle('is-final', state === 'final');
+  if (directEditor?.pageNumber === n && previousFinal !== (state === 'final')) {
+    requestAnimationFrame(() => { void refreshDirectEditGeometry(); });
+  }
   div.classList.remove('is-partial');
-  // a fully-fresh canonical is the page-count authority: provisional-only
-  // pages beyond it are phantoms of the JS pagination and are hidden
-  const phantom = !usesCanonicalSurface() &&
-    canonical &&
-    canonical.id &&
-    canonical.rev >= appliedSrcRev &&
-    pageDirtyRev.size === 0 &&
-    n > canonical.pageCount;
-  div.classList.toggle('phantom', !!phantom);
+  // Page-count metadata alone cannot retire ink. The canonical generation
+  // barrier removes surplus pages only after its surviving pages commit.
+  div.classList.remove('phantom');
 }
 
 function updateBadge() {
@@ -2062,6 +2185,7 @@ editor.addEventListener('scroll', syncHighlightScroll);
 let placeOffered = false;
 const postPlaceToHost = async (kind, ev, page, text, rect) => {
   if (!embeddedHost || !page) return;
+  const clickEpoch = directEditClickEpoch;
   const pageNumber = Number(page.dataset.page);
   let location = null;
   const src = srcOf(ev.target);
@@ -2075,6 +2199,7 @@ const postPlaceToHost = async (kind, ev, page, text, rect) => {
     }
   }
   if (!location) location = await syncLocationForClick(ev, page);
+  if (kind === 'selection' && (directEditor || clickEpoch !== directEditClickEpoch)) return;
   placeOffered = true;
   window.parent.postMessage({
     source: 'tdom-embed',
@@ -2249,6 +2374,53 @@ function preserveMathAuxCommands(baseValue, nextValue) {
   return next;
 }
 
+function mathSourceTokens(value) {
+  const text = String(value ?? ''), tokens = [], textModes = [false];
+  for (const match of text.matchAll(/\\(?:[A-Za-z@]+|[\s\S])|[\s\S]/gu)) {
+    const token = match[0], at = match.index;
+    if (token === '{') textModes.push(textModes.at(-1) || /\\(?:text(?:normal|rm|sf|tt|bf|it|sl|sc|up)?|operatorname)\*?\s*$/.test(text.slice(0, at)));
+    if (!/\s/u.test(token) || token.startsWith('\\') || textModes.at(-1)) tokens.push(match);
+    if (token === '}' && textModes.length > 1) textModes.pop();
+  }
+  return tokens;
+}
+
+function directEditValuesEqual(kind, a, b) {
+  if (kind !== 'math') return String(a ?? '') === String(b ?? '');
+  return JSON.stringify(mathSourceTokens(a).map(token => token[0])) ===
+    JSON.stringify(mathSourceTokens(b).map(token => token[0]));
+}
+
+// Keep source line breaks/spacing when MathLive only changes a local span.
+// Its initial serialization often removes all display-environment newlines;
+// sending that normalization as an edit invalidates unrelated source lines.
+function preserveMathSourceLayout(raw, previous, next) {
+  raw = String(raw ?? ''); previous = String(previous ?? ''); next = String(next ?? '');
+  if (previous === next) return raw;
+  const before = mathSourceTokens(previous), after = mathSourceTokens(next), original = mathSourceTokens(raw);
+  if (!directEditValuesEqual('math', previous, raw)) return next;
+  let start = 0, end = before.length, newEnd = after.length;
+  while (start < end && start < newEnd && before[start][0] === after[start][0]) start++;
+  while (end > start && newEnd > start && before[end - 1][0] === after[newEnd - 1][0]) { end--; newEnd--; }
+  // MathLive's first mutation also normalizes cached verbatim whitespace.
+  // Compare painted tokens so that normalization is not a source edit.
+  if (start === end && start === newEnd) return raw;
+  const rawStart = end === start && start > 0
+    ? original[start - 1].index + original[start - 1][0].length
+    : original[start]?.index ?? (original.at(-1)?.index ?? -1) + (original.at(-1)?.[0].length ?? 1);
+  const rawEnd = end > start ? original[end - 1].index + original[end - 1][0].length : rawStart;
+  let inserted = newEnd > start
+    ? next.slice(after[start].index, after[newEnd - 1].index + after[newEnd - 1][0].length) : '';
+  const prefix = raw.slice(0, rawStart), suffix = raw.slice(rawEnd);
+  if (inserted && start > 0 && /\\[A-Za-z]+$/.test(prefix) && /^[A-Za-z]/.test(inserted) &&
+      /\s/u.test(next.slice(after[start - 1].index + after[start - 1][0].length, after[start].index))) inserted = ' ' + inserted;
+  if (inserted && newEnd < after.length && /\\[A-Za-z]+$/.test(inserted) && /^[A-Za-z]/.test(suffix) &&
+      /\s/u.test(next.slice(after[newEnd - 1].index + after[newEnd - 1][0].length, after[newEnd].index))) inserted += ' ';
+  if (!inserted && start > 0 && start < after.length && /\\[A-Za-z]+$/.test(prefix) && /^[A-Za-z]/.test(suffix) &&
+      /\s/u.test(next.slice(after[start - 1].index + after[start - 1][0].length, after[start].index))) inserted = ' ';
+  return prefix + inserted + suffix;
+}
+
 function shouldWrapAligned(value) {
   const text = String(value ?? '');
   if (!text || text.includes('\\begin{') || text.includes('\\end{')) return false;
@@ -2405,22 +2577,50 @@ function loadMathWysiwyg() {
   return mathWysiwygModulePromise;
 }
 
-async function editRegionById(id) {
+async function loadProvisionalSnapshot(sourceRev) {
+  const epoch = documentReset.adoptedEpoch;
+  const key = `${epoch}:${sourceRev}`;
+  if (!provisionalSnapshotCache.has(key)) {
+    const pending = fetch('/dom', { cache: 'no-store' }).then(async response => {
+      if (!response.ok) throw new Error('Unready source mapping');
+      const snapshot = await response.json();
+      if (Number(snapshot.srcRev) !== Number(sourceRev) ||
+          Number(snapshot.documentEpoch) !== epoch || documentReset.adoptedEpoch !== epoch) {
+        throw new Error('Superseded source mapping');
+      }
+      return snapshot;
+    });
+    provisionalSnapshotCache.set(key, pending);
+    pending.catch(() => {
+      if (provisionalSnapshotCache.get(key) === pending) provisionalSnapshotCache.delete(key);
+    });
+    while (provisionalSnapshotCache.size > 4) provisionalSnapshotCache.delete(provisionalSnapshotCache.keys().next().value);
+  }
+  return provisionalSnapshotCache.get(key);
+}
+
+async function editSnapshotForPage(page) {
+  // A last-good provisional page may outlive the source that produced it.
+  // Its click targets must retain that same source mapping, like canonical.
+  if (page?.provisionalSnapshot && !usesDirectEditSurface(page)) return page.provisionalSnapshot;
   if (!editDomCache || editDomCache.rev !== appliedRev) {
     editDomCache = await fetch('/dom', { cache: 'no-store' }).then((r) => r.json());
   }
-  for (const block of editDomCache.blocks ?? []) {
+  return editDomCache;
+}
+
+async function editRegionById(id, page = null) {
+  const snapshot = await editSnapshotForPage(page);
+  for (const block of snapshot.blocks ?? []) {
     const region = (block.editRegions ?? []).find((item) => item.id === id);
     if (region) return { ...region, blockSource: block.source ?? null };
   }
   return null;
 }
 
-async function editBlockBySourceId(id) {
-  if (!editDomCache || editDomCache.rev !== appliedRev) {
-    editDomCache = await fetch('/dom', { cache: 'no-store' }).then((r) => r.json());
-  }
-  return (editDomCache.blocks ?? []).find((block) => block.id === id) ?? null;
+async function editBlockBySourceId(id, page = null) {
+  const snapshot = await editSnapshotForPage(page);
+  return (snapshot.blocks ?? []).find((block) => block.id === id) ?? null;
 }
 
 function sourceContainsPosition(region, location) {
@@ -2571,7 +2771,23 @@ async function canonicalSourceBounds(region, pageNumber = null, requestedId = ca
     // line; SyncTeX legitimately maps them to the preceding paragraph and
     // the whole column. The coordinator selects one compact raw TeX box near
     // the clicked canonical point from structural + visible-content probes.
-    candidates = all;
+    if (region.kind === 'math' && region.display) {
+      // The first/last region offsets can be the empty lines bordering a
+      // display. SyncTeX maps those to a nearby fraction or paragraph. Only
+      // actual formula source lines define the editable expression's extent.
+      const contentLines = new Set(String(region.sourceValue ?? region.value).split(/\r?\n/)
+        .flatMap((text, index) => text.trim() ? [Number(region.source.start.line) + index] : []));
+      const content = all.filter(box => contentLines.has(Number(probeLocations[box.locationIndex]?.line)));
+      const byPage = new Map();
+      for (const box of content) {
+        if (!byPage.has(box.page)) byPage.set(box.page, []);
+        byPage.get(box.page).push(box);
+      }
+      candidates = [...byPage].map(([page, entries]) => ({ page, box: {
+        left: Math.min(...entries.map(b => b.box.left)), right: Math.max(...entries.map(b => b.box.right)),
+        top: Math.min(...entries.map(b => b.box.top)), bottom: Math.max(...entries.map(b => b.box.bottom)),
+      } }));
+    } else candidates = all;
     if (!candidates.length) return null;
     canonicalRegionBoundsCache.set(key, candidates);
     while (canonicalRegionBoundsCache.size > 512) {
@@ -2697,10 +2913,14 @@ async function opaquePrintBounds(
 
 async function refreshDirectEditorExactBounds(pageNumber) {
   const session = directEditor;
-  if (!session || !usesCanonicalSurface() || session.pageNumber !== pageNumber) return;
+  if (!session || session.pageNumber !== pageNumber) return;
   const page = pageDivs.get(pageNumber);
-  const presented = presentedPageState(page);
+  const presented = page?.classList.contains('is-final') ? presentedPageState(page) : null;
   if (!presented) return;
+  const currentRegion = directEditorRegionInSnapshot(presented.snapshot, session);
+  const value = String(session.readValue());
+  const printedValue = String(currentRegion?.value ?? '');
+  if (!currentRegion || !directEditValuesEqual(session.kind, printedValue, value)) return;
   let bounds = null;
   if (session.kind === 'text') {
     const value = session.readValue?.() ?? session.region.value;
@@ -2712,25 +2932,29 @@ async function refreshDirectEditorExactBounds(pageNumber) {
       : null;
     bounds = await canonicalTextBounds(value, pageNumber, near, presented.id);
   } else {
-    bounds = await canonicalSourceBounds(session.region, pageNumber, presented.id, session.printBounds ? {
+    bounds = await canonicalSourceBounds(currentRegion, pageNumber, presented.id, session.printBounds ? {
       page: pageNumber,
       x: (session.printBounds.left + session.printBounds.right) / 2,
       y: (session.printBounds.top + session.printBounds.bottom) / 2,
     } : null);
   }
-  if (directEditor?.sessionId !== session.sessionId) return;
+  if (directEditor !== session || session.readValue() !== value ||
+      presentedPageState(page)?.src !== presented.src) return;
   if (bounds) {
+    session.region = currentRegion;
+    session.canonicalInput = true;
     session.printBounds = bounds;
     session.presentedId = presented.id;
     session.presentedRev = presented.rev;
+    await refreshDirectEditGeometry(session);
   }
   requestAnimationFrame(repositionDirectEditor);
 }
 
 async function syncLocationForClick(event, page) {
-  const presented = usesCanonicalSurface() ? presentedPageState(page) : null;
+  const presented = usesDirectEditSurface(page) ? presentedPageState(page) : null;
   const mappingId = presented?.id ?? canonical?.id;
-  if (!mappingId || (!usesCanonicalSurface() && canonical.rev !== appliedSrcRev)) return null;
+  if (!mappingId || (!usesDirectEditSurface() && canonical.rev !== appliedSrcRev)) return null;
   const pageNumber = Number(page?.dataset?.page);
   const point = paperPointForClick(event, page);
   if (!point || !Number.isFinite(pageNumber)) return null;
@@ -2753,9 +2977,22 @@ async function syncLocationForClick(event, page) {
   }
 }
 
+function sourceDistanceToRegion(region, location) {
+  if (!location || !sameSourceFile(region.source?.file, location.file)) return Infinity;
+  const start = region.source.start, end = region.source.end;
+  const line = Number(location.line), column = Number(location.column);
+  if (line < start.line) return (start.line - line) * 100000;
+  if (line > end.line) return (line - end.line) * 100000;
+  if (column > 1) {
+    if (line === start.line && column < start.column) return start.column - column;
+    if (line === end.line && column > end.column) return column - end.column;
+  }
+  return 0;
+}
+
 async function resolveOpaqueEditRegion(page, event) {
-  if (!usesCanonicalSurface()) return null;
   if (!page) page = pageAtClientPoint(event);
+  if (!usesDirectEditSurface(page)) return null;
   const pageNumber = Number(page?.dataset?.page);
   const point = paperPointForClick(event, page);
   if (!page || !Number.isInteger(pageNumber) || !point) return null;
@@ -2771,6 +3008,104 @@ async function resolveOpaqueEditRegion(page, event) {
   const clickedWord = await canonicalWordAtPoint(pageNumber, point, presented.id);
   if (!stillPresented()) return null;
   const word = printedKey(clickedWord?.text);
+  const resolveRepeatedInk = async candidate => {
+    const valueKey = region => region.kind === 'math'
+      ? JSON.stringify(mathSourceTokens(region.value).map(token => token[0])) : printedKey(region.value);
+    const sourceKey = region => JSON.stringify([region.source?.file, region.source?.start, region.source?.end]);
+    const selected = candidate.region;
+    const identical = new Map();
+    for (const block of domSnapshot.blocks ?? []) {
+      for (const region of block.editRegions ?? []) {
+        if (region.kind === selected.kind && valueKey(region) === valueKey(selected) &&
+            sameSourceFile(region.source?.file, selected.source?.file)) {
+          identical.set(sourceKey(region), { ...region, blockSource: block.source ?? null });
+        }
+      }
+    }
+    if (identical.size < 2) return candidate;
+    if (!location?.file || !sameSourceFile(selected.source?.file, location.file)) return null;
+    const sameLine = [...identical.values()].filter(region => sourceContainsPosition(region, { ...location, column: 1 }));
+    const precise = Number(location.column) > 1
+      ? sameLine.filter(region => sourceContainsPosition(region, location)) : [];
+    if (precise.length === 1 || sameLine.length === 1) {
+      return { ...candidate, region: precise[0] ?? sameLine[0] };
+    }
+    if (!sameLine.length) return null;
+
+    // Forward SyncTeX often assigns every column of a source line the same
+    // enclosing hbox. In that case each repeated value's nearest lookup
+    // would resolve to this same clicked copy. Enumerate the line's copies,
+    // including other pages, before assigning their source boundaries.
+    const probes = sameLine.flatMap(region =>
+      window.TdomOpaqueEditorCoordinator?.sourceProbeLocations?.(region) ??
+      [region.source.start, region.source.end].map(position => ({ file: region.source.file, ...position })));
+    const response = await fetch('/synctex/forward', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: presented.id, locations: probes }),
+    }).catch(() => null);
+    const forward = response?.ok ? (await response.json()).results?.filter(Boolean) ?? [] : [];
+    if (!stillPresented() || !forward.length) return null;
+    const pageNumbers = [...new Set([pageNumber, ...forward.map(item => Number(item.page))])]
+      .filter(number => Number.isInteger(number) && number > 0).sort((a, b) => a - b);
+    const geometry = window.TdomDirectEditGeometry;
+    let probe = null;
+    const occurrences = [];
+    try {
+      if (selected.kind === 'math') {
+        const Mathfield = customElements.get('math-field');
+        if (!Mathfield) return null;
+        probe = new Mathfield();
+        probe.mathVirtualKeyboardPolicy = 'manual';
+        probe.setAttribute('aria-hidden', 'true');
+        Object.assign(probe.style, { position: 'fixed', left: '-10000px', top: '0', opacity: '0', pointerEvents: 'none' });
+        document.body.appendChild(probe);
+        probe.value = shouldWrapAligned(selected.value) ? wrapAligned(selected.value) : selected.value;
+        await new Promise(resolve => requestAnimationFrame(resolve));
+      }
+      for (const number of pageNumbers) {
+        const glyphs = await canonicalGlyphs(number, presented.id);
+        if (!stillPresented()) return null;
+        if (!glyphs.length) continue;
+        const bounds = { left: Math.min(...glyphs.map(g => g.left)), right: Math.max(...glyphs.map(g => g.right)),
+          top: Math.min(...glyphs.map(g => g.top)), bottom: Math.max(...glyphs.map(g => g.bottom)) };
+        const maps = selected.kind === 'text'
+          ? geometry.textMaps(selected.value, glyphs) : geometry.mathMaps(probe, glyphs, bounds);
+        for (const { map } of maps) {
+          const glyph = map[0];
+          const inverse = await fetch('/synctex', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id: presented.id, page: number, x: (glyph.left + glyph.right) / 2, y: (glyph.top + glyph.bottom) / 2 }),
+          }).then(result => result.ok ? result.json() : null).catch(() => null);
+          if (!stillPresented()) return null;
+          if (sameSourceFile(inverse?.file, location.file) && Number(inverse?.line) === Number(location.line)) {
+            occurrences.push({ page: number, map, location: inverse });
+          }
+        }
+      }
+    } finally { probe?.remove(); }
+    if (occurrences.length !== sameLine.length) return null;
+    const ordered = sameLine.sort((a, b) => a.source.start.line - b.source.start.line || a.source.start.column - b.source.start.column);
+    // Preserve PDF content-stream order within a source line. If a precise
+    // inverse column contradicts that order, the layout is not a simple
+    // line continuation and must not be assigned by proximity.
+    if (occurrences.some((occurrence, index) => Number(occurrence.location.column) > 1 &&
+        !sourceContainsPosition(ordered[index], occurrence.location))) return null;
+    const hits = occurrences.map((occurrence, index) => {
+      if (occurrence.page !== pageNumber) return null;
+      const hit = geometry.nearest(occurrence.map, point);
+      return hit && point.x >= hit.left - 2 && point.x <= hit.right + 2 &&
+        point.y >= hit.top - 1 && point.y <= hit.bottom + 1 ? { ...occurrence, region: ordered[index] } : null;
+    }).filter(Boolean);
+    if (hits.length !== 1) return null;
+    const hit = hits[0];
+    const printBounds = hit.region.kind === 'text'
+      ? await canonicalTextBounds(hit.region.value, pageNumber, point, presented.id)
+      : { page: pageNumber, left: Math.min(...hit.map.map(g => g.left)), right: Math.max(...hit.map.map(g => g.right)),
+        top: Math.min(...hit.map.map(g => g.top)), bottom: Math.max(...hit.map.map(g => g.bottom)) };
+    if (!printBounds || !stillPresented()) return null;
+    return { region: hit.region, printBounds,
+      caretOffset: caretOffsetForOpaqueRegion(hit.region, location, clickedWord, printBounds, point) };
+  };
   const printedCandidates = [];
   for (const block of domSnapshot.blocks ?? []) {
     for (const item of block.editRegions ?? []) {
@@ -2789,10 +3124,11 @@ async function resolveOpaqueEditRegion(page, event) {
   }
   if (!stillPresented()) return null;
   if (printedCandidates.length) {
-    return printedCandidates.sort((a, b) =>
+    return resolveRepeatedInk(printedCandidates.sort((a, b) =>
+      (sourceDistanceToRegion(a.region, location) - sourceDistanceToRegion(b.region, location)) ||
       (a.printBounds.right - a.printBounds.left) * (a.printBounds.bottom - a.printBounds.top) -
       (b.printBounds.right - b.printBounds.left) * (b.printBounds.bottom - b.printBounds.top)
-    )[0];
+    )[0]);
   }
   if (!location?.file || !Number.isFinite(Number(location.line))) return null;
   const sourceColumn = sourceColumnForOpaqueClick(location, point);
@@ -2836,7 +3172,7 @@ async function resolveOpaqueEditRegion(page, event) {
       return (acx - point.x) ** 2 + (acy - point.y) ** 2 -
         ((bcx - point.x) ** 2 + (bcy - point.y) ** 2);
     });
-    return spatialMath[0];
+    return resolveRepeatedInk(spatialMath[0]);
   }
   // A blank margin, column gutter or line-end has neither a canonical word
   // nor an exact math box. Reverse SyncTeX returns the nearest source line,
@@ -2929,11 +3265,11 @@ async function resolveOpaqueEditRegion(page, event) {
     if (!stillPresented()) return null;
     if (!printBounds || point.x < printBounds.left - 3 || point.x > printBounds.right + 3 ||
         point.y < printBounds.top - 3 || point.y > printBounds.bottom + 3) return null;
-    return {
+    return resolveRepeatedInk({
       region,
       printBounds,
       caretOffset: caretOffsetForOpaqueRegion(region, location, clickedWord, printBounds, point),
-    };
+    });
   }
   return null;
 }
@@ -2977,6 +3313,77 @@ function chooseRegionByGeometry(candidates, target, event, page, src) {
   ) ?? null;
 }
 
+async function provisionalRegionAtPoint(page, sourceId, candidates, event) {
+  const point = paperPointForClick(event, page);
+  const surfaces = [...pageDivs.values()].filter(surface =>
+    surface.querySelector(`.chunkwin[data-src="${CSS.escape(sourceId)}"]`));
+  const pages = await Promise.all(surfaces.map(async surface => ({
+    surface, epoch: surface.provisionalEpoch, pageNumber: Number(surface.dataset.page),
+    glyphs: await chunkGlyphsOnPage(surface, sourceId),
+  })));
+  const current = () => pages.every(p => p.surface.isConnected && p.surface.provisionalEpoch === p.epoch);
+  if (!current()) return null;
+  const clickedGlyphs = pages.find(p => p.surface === page)?.glyphs ?? [];
+  if (!clickedGlyphs.some(g => point.x >= g.left - 2 && point.x <= g.right + 2 && point.y >= g.top - 1 && point.y <= g.bottom + 1)) return undefined;
+  const geometry = window.TdomDirectEditGeometry;
+  const groups = new Map();
+  for (const region of candidates) {
+    const key = region.kind === 'math'
+      ? 'math:' + JSON.stringify(mathSourceTokens(region.value).map(token => token[0]))
+      : 'text:' + region.value;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(region);
+  }
+  let probe = null;
+  const matches = [];
+  try {
+    for (const group of groups.values()) {
+      const region = group[0];
+      if (region.kind === 'math') {
+        const Mathfield = customElements.get('math-field');
+        if (!Mathfield) continue;
+        if (!probe) {
+          probe = new Mathfield();
+          probe.mathVirtualKeyboardPolicy = 'manual';
+          probe.setAttribute('aria-hidden', 'true');
+          Object.assign(probe.style, { position: 'fixed', left: '-10000px', top: '0', opacity: '0', pointerEvents: 'none' });
+          document.body.appendChild(probe);
+        }
+        probe.value = shouldWrapAligned(region.value) ? wrapAligned(region.value) : region.value;
+        await new Promise(resolve => requestAnimationFrame(resolve));
+      }
+      const occurrences = pages.flatMap(p => {
+        if (!p.glyphs.length) return [];
+        const bounds = { left: Math.min(...p.glyphs.map(g => g.left)), right: Math.max(...p.glyphs.map(g => g.right)),
+          top: Math.min(...p.glyphs.map(g => g.top)), bottom: Math.max(...p.glyphs.map(g => g.bottom)) };
+        const maps = region.kind === 'text'
+          ? geometry.textMaps(region.value, p.glyphs) : geometry.mathMaps(probe, p.glyphs, bounds);
+        return maps.map(({ map }) => ({ map, pageNumber: p.pageNumber,
+          top: Math.min(...map.map(g => g.top)), left: Math.min(...map.map(g => g.left)) }));
+      }).sort((a, b) => a.pageNumber - b.pageNumber || a.top - b.top || a.left - b.left);
+      // Identical source formulas must form a complete source-to-ink
+      // bijection, including copies on other pages of this same block.
+      // Choosing each candidate's nearest ink would edit the first source
+      // occurrence even when the second printed copy was clicked.
+      if (occurrences.length !== group.length) continue;
+      const ordered = [...group].sort((a, b) => a.source.start.line - b.source.start.line || a.source.start.column - b.source.start.column);
+      for (let index = 0; index < occurrences.length; index++) {
+        const occurrence = occurrences[index];
+        if (occurrence.pageNumber !== Number(page.dataset.page)) continue;
+        const hit = geometry.nearest(occurrence.map, point);
+        if (hit && point.x >= hit.left - 2 && point.x <= hit.right + 2 &&
+            point.y >= hit.top - 1 && point.y <= hit.bottom + 1) {
+          matches.push({ region: ordered[index], distance: Math.abs((hit.top + hit.bottom) / 2 - point.y) });
+        }
+      }
+    }
+  } finally { probe?.remove(); }
+  if (!current()) return null;
+  matches.sort((a, b) => a.distance - b.distance);
+  if (matches.length > 1 && Math.abs(matches[0].distance - matches[1].distance) < 0.01) return null;
+  return matches[0]?.region ?? null;
+}
+
 async function resolveEditRegion(target, event) {
   const src = srcOf(target);
   let page = target.closest('#pages > .page');
@@ -2988,7 +3395,7 @@ async function resolveEditRegion(target, event) {
     text: String(target.textContent ?? '').trim(),
     sourceHit: target.classList.contains('tdom-source-hit'),
   };
-  const block = await editBlockBySourceId(src);
+  const block = await editBlockBySourceId(src, page);
   let candidates = [...(block?.editRegions ?? [])]
     .map((region) => ({ ...region, blockSource: block?.source ?? null }));
   if (!candidates.length) return null;
@@ -3018,6 +3425,11 @@ async function resolveEditRegion(target, event) {
       : null;
     target = atPoint ?? sameText ?? sameLine ?? sameHit ?? nodes[0] ?? null;
     if (!target) return null;
+  }
+
+  if (block?.gfx || target.classList.contains('tdom-source-hit')) {
+    const matched = await provisionalRegionAtPoint(page, src, candidates, event);
+    if (matched !== undefined) return matched;
   }
 
   if (target.dataset.math === '1') {
@@ -3267,11 +3679,303 @@ function contentEditableCaretRect(control) {
     rect.bottom > rect.top ? rect : null;
 }
 
+function isDirectTextControl(control) {
+  return control?.tagName !== 'MATH-FIELD' && control?.isContentEditable === true;
+}
+
+function directSelection(session) {
+  if (!isDirectTextControl(session.control)) {
+    const range = session.control.selection?.ranges?.[0];
+    return Array.isArray(range) ? range : [session.control.position, session.control.position];
+  }
+  const selection = window.getSelection();
+  if (!selection?.rangeCount || !session.control.contains(selection.anchorNode) ||
+      !session.control.contains(selection.focusNode)) return null;
+  const offset = (node, at) => {
+    const range = document.createRange();
+    range.selectNodeContents(session.control); range.setEnd(node, at);
+    return range.toString().length;
+  };
+  return [offset(selection.anchorNode, selection.anchorOffset), offset(selection.focusNode, selection.focusOffset)];
+}
+
+function setDirectSelection(session, start, end = start) {
+  if (!isDirectTextControl(session.control)) {
+    session.control.selection = { ranges: [[start, end]], direction: start <= end ? 'forward' : 'backward' };
+  } else {
+    const locate = (offset) => {
+      const walker = document.createTreeWalker(session.control, NodeFilter.SHOW_TEXT);
+      let node, last = session.control;
+      while ((node = walker.nextNode())) {
+        last = node;
+        if (offset <= node.length) return [node, Math.max(0, offset)];
+        offset -= node.length;
+      }
+      return [last, last.nodeType === Node.TEXT_NODE ? last.length : 0];
+    };
+    const a = locate(start), b = locate(end);
+    window.getSelection()?.setBaseAndExtent(a[0], a[1], b[0], b[1]);
+  }
+  paintDirectSelection();
+}
+
+function paintDirectSelection() {
+  const session = directEditor;
+  if (!session?.inkLayer) return;
+  session.inkLayer.replaceChildren();
+  const page = pageDivs.get(session.pageNumber);
+  if (!page) return;
+  const pageRect = page.getBoundingClientRect();
+  if (session.imeComposing && session.compositionInk?.text) {
+    const { anchor, text } = session.compositionInk;
+    const client = clientBoundsForDisplayedPaperBounds(anchor, page);
+    if (!client) return;
+    // Only uncommitted IME text uses browser paint. Its immutable paper
+    // anchor is the selected PDF glyph boundary; the surrounding PDF and
+    // every other formula remain mounted through candidate conversion.
+    const marker = document.createElement('span');
+    marker.className = 'tdom-ink-composition';
+    marker.textContent = text;
+    Object.assign(marker.style, {
+      left: `${client.left - pageRect.left}px`, top: `${client.top - pageRect.top}px`,
+      maxWidth: `${Math.max(1, pageRect.right - client.left)}px`,
+      fontSize: `${Math.max(1, client.bottom - client.top)}px`,
+      fontFamily: getComputedStyle(session.control).fontFamily,
+    });
+    session.inkLayer.appendChild(marker);
+    const end = document.createRange();
+    end.selectNodeContents(marker); end.collapse(false);
+    const caret = [...end.getClientRects()].at(-1) ?? marker.getBoundingClientRect();
+    const point = paperPointForClick({ clientX: caret.right, clientY: caret.bottom }, page);
+    if (point) session.canonicalAnchorPoint = point;
+    return;
+  }
+  const selection = directSelection(session);
+  if (!selection || !session.glyphMap?.length) return;
+  const exact = String(session.readValue()) === session.geometryValue;
+  const [start, end] = selection;
+  const box = window.TdomDirectEditGeometry.caret(session.glyphMap, end);
+  const add = (bounds, className) => {
+    const client = clientBoundsForDisplayedPaperBounds(bounds, page);
+    if (!client) return;
+    const marker = document.createElement('span');
+    marker.className = className;
+    Object.assign(marker.style, { left: `${client.left - pageRect.left}px`, top: `${client.top - pageRect.top}px`,
+      width: `${Math.max(1.5, client.right - client.left)}px`, height: `${Math.max(2, client.bottom - client.top)}px` });
+    session.inkLayer.appendChild(marker);
+  };
+  if (exact && start !== end) {
+    for (const glyph of session.glyphMap) {
+      if (glyph.end > Math.min(start, end) && glyph.start < Math.max(start, end)) add(glyph, 'tdom-ink-selection');
+    }
+  } else {
+    const stable = exact ? box : session.lastPaintedCaret;
+    if (!stable) return;
+    session.lastPaintedCaret = stable;
+    const bounds = { ...stable, left: stable.x, right: stable.x };
+    add(bounds, 'tdom-ink-caret');
+    session.canonicalAnchorPoint = { x: stable.x, y: stable.bottom };
+  }
+}
+
+async function refreshDirectEditGeometry(session = directEditor, clickPoint = null) {
+  if (!session) return;
+  const page = pageDivs.get(session.pageNumber);
+  if (!page) return;
+  const value = String(session.readValue());
+  const epoch = session.geometryEpoch = (session.geometryEpoch ?? 0) + 1;
+  const imageSrc = page.classList.contains('is-final') ? page.querySelector('img.canon')?.dataset.src : null;
+  const id = canonicalIdFromSrc(imageSrc);
+  const canonicalVisible = id != null;
+  if (canonicalVisible) {
+    const printed = directEditorRegionInSnapshot(presentedPageState(page)?.snapshot, session);
+    if (!printed || !directEditValuesEqual(session.kind, printed.value, value)) return;
+  }
+  if (canonicalVisible && (id !== session.presentedId || !session.printBounds)) {
+    await refreshDirectEditorExactBounds(session.pageNumber);
+    if (clickPoint && directEditor === session && session.geometryValue === value) {
+      const offset = window.TdomDirectEditGeometry.hit(session.glyphMap ?? [], clickPoint);
+      if (Number.isInteger(offset)) setDirectSelection(session, offset);
+    }
+    return;
+  }
+  const shipped = imageSrc?.startsWith('/ship/');
+  const displayedRev = shipped ? Number(new URL(imageSrc, location.href).searchParams.get('r'))
+    : Number(page.dataset.provRev);
+  if (!canonicalVisible && session.sentEdit && value !== session.geometryValue &&
+      displayedRev <= session.sentFromSrcRev) return;
+  const surface = imageSrc ?? page.provisionalEpoch;
+  const provisional = canonicalVisible || shipped ? null : await directProvisionalGeometry(session, page);
+  const glyphs = canonicalVisible ? await canonicalGlyphs(session.pageNumber, id)
+    : shipped ? await displayedShipGlyphs(session.pageNumber, imageSrc) : provisional.glyphs;
+  const currentSurface = page.classList.contains('is-final') ? page.querySelector('img.canon')?.dataset.src : page.provisionalEpoch;
+  if (directEditor !== session || session.geometryEpoch !== epoch || surface !== currentSurface ||
+      value !== String(session.readValue())) return;
+  const geometry = window.TdomDirectEditGeometry;
+  const map = session.kind === 'text'
+    ? (shipped || !provisional?.words?.length && !canonicalVisible ? geometry.textMapFromGlyphs(value, glyphs, provisional?.bounds ?? session.printBounds)
+      : geometry.textMap(value, provisional?.words ?? session.printBounds?.words, glyphs))
+    : geometry.mathMap(session.control, glyphs, provisional?.bounds ?? session.printBounds ?? {}, clickPoint ?? session.canonicalAnchorPoint);
+  if (!map.length) return;
+  session.glyphMap = map;
+  session.geometryValue = value;
+  if (clickPoint && map.length) {
+    const offset = geometry.hit(map, clickPoint);
+    if (Number.isInteger(offset)) setDirectSelection(session, offset);
+  }
+  paintDirectSelection();
+}
+
+async function displayedShipGlyphs(pageNumber, src) {
+  if (!shipGlyphCache.has(src)) {
+    const url = new URL(src, location.href);
+    shipGlyphCache.set(src, fetch(`/ship-glyphs?page=${pageNumber}&g=${url.searchParams.get('g')}&r=${url.searchParams.get('r')}`)
+      .then(r => r.ok ? r.json() : null).then(d => d?.glyphs ?? []).catch(() => []));
+    while (shipGlyphCache.size > 16) shipGlyphCache.delete(shipGlyphCache.keys().next().value);
+  }
+  return shipGlyphCache.get(src);
+}
+
+pagesEl.addEventListener('load', event => {
+  if (event.target?.matches?.('img.chunk, img.canon') && directEditor) {
+    requestAnimationFrame(() => { void refreshDirectEditGeometry(); });
+  }
+}, true);
+
+async function directProvisionalGeometry(session, page) {
+  const result = directSvgGeometry(session, page);
+  if (session.kind !== 'math' && result.glyphs.length) return result;
+  const paperRect = (rect) => {
+    const a = paperPointForClick({ clientX: rect.left, clientY: rect.top }, page);
+    const b = paperPointForClick({ clientX: rect.right, clientY: rect.bottom }, page);
+    return { left: a.x, top: a.y, right: b.x, bottom: b.y };
+  };
+  const src = CSS.escape(session.anchorMeta.src);
+  const hits = [...page.querySelectorAll(`svg .tdom-source-hit[data-src="${src}"]${session.kind === 'math' ? '[data-math="1"]' : ''}`)];
+  // A single expression can span several display rows. The exact symbol
+  // multiset narrows this block envelope to the expression being edited.
+  const blockBounds = unionNodeBounds(hits);
+  const bounds = blockBounds ? paperRect(blockBounds) : session.printBounds;
+  const glyphs = await chunkGlyphsOnPage(page, session.anchorMeta.src);
+  return { ...result, bounds, glyphs: glyphs.length ? glyphs : result.glyphs };
+}
+
+async function loadChunkInputGeometry(img) {
+  const imageSrc = img.getAttribute('src');
+  const retained = chunkInputGeometry.get(img);
+  if (retained?.src === imageSrc) return retained.pending;
+  const epoch = documentReset.adoptedEpoch;
+  const url = new URL(imageSrc, location.href);
+  const key = decodeURIComponent(url.pathname.slice('/chunk/'.length).replace(/\.svg$/, ''));
+  const version = url.searchParams.get('v');
+  const cacheKey = `${epoch}:${key}:${version}`;
+  if (!chunkGlyphCache.has(cacheKey)) {
+    const pending = fetch(`/chunk-glyphs?key=${encodeURIComponent(key)}&v=${version}&e=${epoch}`)
+      .then(async response => {
+        if (!response.ok) throw new Error('Unready chunk mapping');
+        const data = await response.json();
+        if (!(data.width > 0) || !Array.isArray(data.glyphs) ||
+            Number(data.documentEpoch) !== epoch || documentReset.adoptedEpoch !== epoch) {
+          throw new Error('Superseded chunk mapping');
+        }
+        return data;
+      });
+    chunkGlyphCache.set(cacheKey, pending);
+    pending.catch(() => {
+      if (chunkGlyphCache.get(cacheKey) === pending) chunkGlyphCache.delete(cacheKey);
+    });
+    while (chunkGlyphCache.size > 24) chunkGlyphCache.delete(chunkGlyphCache.keys().next().value);
+  }
+  const pending = chunkGlyphCache.get(cacheKey);
+  // The node owns this immutable geometry for as long as its ink is on
+  // screen, even after the engine has retired that chunk version.
+  chunkInputGeometry.set(img, { src: imageSrc, pending });
+  return pending;
+}
+
+async function chunkGlyphsOnPage(page, sourceId) {
+  const paperRect = rect => {
+    const a = paperPointForClick({ clientX: rect.left, clientY: rect.top }, page);
+    const b = paperPointForClick({ clientX: rect.right, clientY: rect.bottom }, page);
+    return { left: a.x, top: a.y, right: b.x, bottom: b.y };
+  };
+  const src = CSS.escape(sourceId);
+  const glyphs = [];
+  for (const chunk of page.querySelectorAll(`.chunkwin[data-src="${src}"]:not(.stale)`)) {
+    const img = chunk.querySelector('img');
+    if (!img?.complete || !img.naturalWidth) continue;
+    const imageSrc = img.getAttribute('src');
+    const data = await loadChunkInputGeometry(img).catch(() => null);
+    if (!data?.width || img.getAttribute('src') !== imageSrc || !img.isConnected) continue;
+    const imageBounds = paperRect(img.getBoundingClientRect()), clip = paperRect(chunk.getBoundingClientRect());
+    const scale = (imageBounds.right - imageBounds.left) / data.width;
+    for (const g of data.glyphs) {
+      const box = { ...g, left: imageBounds.left + g.left * scale, right: imageBounds.left + g.right * scale,
+        top: imageBounds.top + g.top * scale, bottom: imageBounds.top + g.bottom * scale,
+        baseline: imageBounds.top + g.baseline * scale };
+      const y = (box.top + box.bottom) / 2;
+      if (y >= clip.top - 0.1 && y <= clip.bottom + 0.1) glyphs.push(box);
+    }
+  }
+  return glyphs;
+}
+
+function directSvgGeometry(session, page) {
+  const nodes = directEditorVisualNodes(page).filter(node => node.tagName?.toLowerCase() === 'text');
+  const glyphs = [], words = [];
+  const paperPoint = (x, y) => paperPointForClick({ clientX: x, clientY: y }, page);
+  for (const node of nodes) {
+    const matrix = node.getScreenCTM();
+    if (!matrix) continue;
+    const project = (x, y) => {
+      const p = new DOMPoint(x, y).matrixTransform(matrix);
+      return paperPoint(p.x, p.y);
+    };
+    const group = [];
+    const text = String(node.textContent ?? '');
+    const chars = [...text];
+    const count = node.getNumberOfChars();
+    const utf16 = count === text.length;
+    if (!utf16 && count !== chars.length) continue;
+    let index = 0;
+    for (const char of chars) {
+      let extent = node.getExtentOfChar(index);
+      const origin = node.getStartPositionOfChar(index);
+      // SVG implementations can address both UTF-16 units of a surrogate
+      // pair. Keep one Unicode symbol and unite its actual ink rectangles.
+      if (utf16 && char.length > 1) {
+        const tail = node.getExtentOfChar(index + 1);
+        const x = Math.min(extent.x, tail.x), y = Math.min(extent.y, tail.y);
+        extent = { x, y, width: Math.max(extent.x + extent.width, tail.x + tail.width) - x,
+          height: Math.max(extent.y + extent.height, tail.y + tail.height) - y };
+      }
+      index += utf16 ? char.length : 1;
+      const a = project(extent.x, extent.y), b = project(extent.x + extent.width, extent.y + extent.height);
+      const baseline = project(origin.x, origin.y);
+      if (!a || !b || !baseline) continue;
+      group.push({ text: char, left: a.x, top: a.y, right: b.x, bottom: b.y, baseline: baseline.y });
+    }
+    glyphs.push(...group);
+    if (group.length) words.push({ text: node.textContent,
+      left: Math.min(...group.map(g => g.left)), right: Math.max(...group.map(g => g.right)),
+      top: Math.min(...group.map(g => g.top)), bottom: Math.max(...group.map(g => g.bottom)) });
+  }
+  return { glyphs, words, bounds: glyphs.length ? {
+    left: Math.min(...glyphs.map(g => g.left)), right: Math.max(...glyphs.map(g => g.right)),
+    top: Math.min(...glyphs.map(g => g.top)), bottom: Math.max(...glyphs.map(g => g.bottom)),
+  } : null };
+}
+
+document.addEventListener('selectionchange', () => {
+  paintDirectSelection();
+  alignOpaqueNativeCaretAnchor();
+});
+
 function alignOpaqueNativeCaretAnchor(expectedSessionId = directEditor?.sessionId) {
   const session = directEditor;
   if (!session || session.sessionId !== expectedSessionId) return;
   const control = session.control;
-  if (!control?.isContentEditable) return;
+  if (!isDirectTextControl(control)) return;
   // Always measure in untransformed browser layout coordinates. The control
   // is transparent in opaque mode, so translating it cannot alter the
   // canonical page and leaves the shell-owned candidate panel in place.
@@ -3279,7 +3983,7 @@ function alignOpaqueNativeCaretAnchor(expectedSessionId = directEditor?.sessionI
   // pointer hitbox; ordinary re-clicks must retain the shell's exact bounds.
   control.style.transform = '';
   session.nativeCaretAnchor = null;
-  if (!usesCanonicalSurface() || session.imeComposing !== true ||
+  if (!usesDirectEditSurface() || session.imeComposing !== true ||
       !session.canonicalAnchorPoint) return;
   const page = pageDivs.get(session.pageNumber);
   if (!page?.isConnected) return;
@@ -3309,7 +4013,7 @@ function positionOpaqueSuggestionPanel(page, pageRect) {
   if (!session?.element?.isConnected) return;
   const panel = session.element.querySelector('.math-wysiwyg-panel');
   if (!panel) return;
-  if (!usesCanonicalSurface() || !session.canonicalAnchorPoint) {
+  if (!usesDirectEditSurface() || !session.canonicalAnchorPoint) {
     session.element.style.removeProperty('--tdom-canonical-panel-left');
     session.element.style.removeProperty('--tdom-canonical-panel-top');
     panel.style.left = '';
@@ -3344,7 +4048,7 @@ function positionOpaqueSuggestionPanel(page, pageRect) {
 
 function repositionDirectEditor() {
   if (!directEditor?.element?.isConnected) return;
-  if (directEditor.control?.isContentEditable) {
+  if (isDirectTextControl(directEditor.control)) {
     directEditor.control.style.transform = '';
     directEditor.nativeCaretAnchor = null;
   }
@@ -3384,6 +4088,7 @@ function repositionDirectEditor() {
   if (directEditor.kind === 'math') directEditor.element.style.height = `${height}px`;
   positionOpaqueSuggestionPanel(page, pageRect);
   alignOpaqueNativeCaretAnchor();
+  paintDirectSelection();
 }
 
 function closeDirectEditor() {
@@ -3391,6 +4096,7 @@ function closeDirectEditor() {
   directEditor.wysiwyg?.detach?.();
   directEditor.wysiwyg?.close?.();
   directEditor.element.remove();
+  directEditor.inkLayer?.remove();
   directEditor = null;
   for (const batch of opaqueCanonicalBatches.values()) {
     restageOpaqueBatchEditor(batch);
@@ -3401,8 +4107,11 @@ function sendDirectEdit(region, sessionId, visibleValue, { cancel = false, finis
   const sessionState = directEditor?.sessionId === sessionId ? directEditor : null;
   if ((cancel || finish) && sessionState && !sessionState.sentEdit) return;
   if (!cancel && !finish && sessionState?.lastVisibleValue === visibleValue) return;
+  const serialized = region.kind === 'math'
+    ? preserveMathAuxCommands(region.value, visibleValue) : null;
   const replacement = region.kind === 'math'
-    ? preserveMathAuxCommands(region.value, visibleValue)
+    ? preserveMathSourceLayout(sessionState?.formattedSource ?? region.sourceValue ?? region.value,
+      sessionState?.serializedValue ?? region.value, serialized)
     : latexEscapeText(visibleValue);
   const payload = {
     source: 'tdom-embed',
@@ -3424,6 +4133,10 @@ function sendDirectEdit(region, sessionId, visibleValue, { cancel = false, finis
   };
   if (sessionState && !cancel && !finish) {
     sessionState.sentEdit = true;
+    if (region.kind === 'math') {
+      sessionState.formattedSource = replacement;
+      sessionState.serializedValue = serialized;
+    }
     sessionState.lastVisibleValue = visibleValue;
     sessionState.sentFromSrcRev = Number(appliedSrcRev);
     for (const batch of opaqueCanonicalBatches.values()) {
@@ -3457,9 +4170,10 @@ async function openDirectEditor(
   const page = target.closest('#pages > .page');
   const pageNumber = Number(page?.dataset?.page);
   if (!page || !Number.isFinite(pageNumber)) return;
-  const presented = usesCanonicalSurface() ? presentedPageState(page) : null;
-  if (usesCanonicalSurface() && !presented) return;
-  const region = knownRegion ?? await editRegionById(id);
+  const presented = usesDirectEditSurface(page) ? presentedPageState(page) : null;
+  if (usesDirectEditSurface(page) && !presented) return;
+  const canonicalInput = Boolean(presented);
+  const region = knownRegion ?? await editRegionById(id, page);
   if (!region) return;
   if (directEditor) {
     sendDirectEdit(
@@ -3473,7 +4187,7 @@ async function openDirectEditor(
 
   const shell = document.createElement('div');
   shell.className = `tdom-direct-editor is-${region.kind}`;
-  shell.classList.toggle('is-opaque', usesCanonicalSurface());
+  shell.classList.add('is-opaque');
   shell.dataset.edit = id;
   const sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
   let control;
@@ -3559,36 +4273,87 @@ async function openDirectEditor(
     return value;
   };
   const resizeText = () => {
-    if (!control.isContentEditable) return;
+    if (!isDirectTextControl(control)) return;
+    control.style.minHeight = '0';
     control.style.minHeight = `${Math.max(1, control.scrollHeight)}px`;
   };
+  // The transparent input has browser line metrics; scrolling it into view
+  // would move the real paper to a different line. Preserve the viewport
+  // through native key/selection handling, while ordinary user scrolling
+  // remains unrestricted outside those input frames.
+  const keepPaperStill = () => {
+    const session = directEditor;
+    if (session?.sessionId !== sessionId || session.scrollLock) return;
+    const lock = { top: pagesEl.scrollTop, left: pagesEl.scrollLeft };
+    session.scrollLock = lock;
+    const restore = () => {
+      if (directEditor !== session || session.scrollLock !== lock) return;
+      pagesEl.scrollTop = lock.top;
+      pagesEl.scrollLeft = lock.left;
+    };
+    requestAnimationFrame(() => {
+      restore();
+      requestAnimationFrame(() => { restore(); session.scrollLock = null; });
+    });
+  };
+  control.addEventListener('beforeinput', keepPaperStill, { capture: true });
+  control.addEventListener('keydown', keepPaperStill, { capture: true });
   let composing = false;
   const realignOpaqueCaret = () => alignOpaqueNativeCaretAnchor(sessionId);
   control.addEventListener('compositionstart', () => {
     composing = true;
-    if (directEditor?.sessionId === sessionId) directEditor.imeComposing = true;
+    wysiwyg?.setComposing?.(true);
+    if (directEditor?.sessionId === sessionId) {
+      const session = directEditor;
+      const selection = directSelection(session);
+      const caret = window.TdomDirectEditGeometry.caret(session.glyphMap ?? [],
+        selection ? Math.min(...selection) : 0) ?? session.lastPaintedCaret;
+      session.imeComposing = true;
+      session.compositionInk = caret
+        ? { text: '', anchor: { ...caret, left: caret.x, right: caret.x } }
+        : null;
+    }
     realignOpaqueCaret();
   });
-  control.addEventListener('compositionupdate', realignOpaqueCaret);
+  control.addEventListener('compositionupdate', event => {
+    if (directEditor?.sessionId === sessionId && directEditor.compositionInk) {
+      directEditor.compositionInk.text = event.data ?? '';
+      paintDirectSelection();
+    }
+    realignOpaqueCaret();
+  });
   control.addEventListener('compositionend', () => {
     composing = false;
+    wysiwyg?.setComposing?.(false);
     resizeText();
     sendDirectEdit(region, sessionId, readValue());
-    if (directEditor?.sessionId === sessionId) directEditor.imeComposing = false;
+    if (directEditor?.sessionId === sessionId) {
+      directEditor.imeComposing = false;
+      directEditor.compositionInk = null;
+    }
+    paintDirectSelection();
     realignOpaqueCaret();
   });
   control.addEventListener('input', () => {
     resizeText();
     realignOpaqueCaret();
-    if (usesCanonicalSurface() && region.kind === 'math') {
+    if (usesDirectEditSurface() && region.kind === 'math') {
       requestAnimationFrame(repositionDirectEditor);
     }
     // Native IME composition can emit several transient input values.
     // Keep those local to the overlay and submit only the committed text.
     if (composing) return;
     sendDirectEdit(region, sessionId, readValue());
+    paintDirectSelection();
+  });
+  control.addEventListener('selection-change', () => {
+    paintDirectSelection();
+    requestAnimationFrame(paintDirectSelection);
   });
   control.addEventListener('keydown', (event) => {
+    // Candidate navigation/confirmation/cancellation belongs to the IME.
+    // In particular Escape must not cancel previously committed edits.
+    if (composing || event.isComposing || event.keyCode === 229) return;
     if (wysiwyg?.handleKeydown?.(event)) return;
     if (event.key === 'Escape') {
       event.preventDefault();
@@ -3657,29 +4422,42 @@ async function openDirectEditor(
       }
     }, 0);
   });
+  clearPlaceForHost();
   shell.appendChild(control);
   page.appendChild(shell);
+  const inkLayer = document.createElement('div');
+  inkLayer.className = 'tdom-ink-layer';
+  inkLayer.setAttribute('aria-hidden', 'true');
+  page.appendChild(inkLayer);
   if (control.tagName === 'MATH-FIELD') {
     try { control.menuItems = []; } catch { /* field remains keyboard-editable */ }
   }
   const Coordinator = window.TdomOpaqueEditorCoordinator;
-  const clickOnPaper = usesCanonicalSurface() && clickPoint
+  const clickOnPaper = clickPoint
     ? paperPointForClick({ clientX: clickPoint.x, clientY: clickPoint.y }, page)
     : null;
   const caretAnchorRatio = Coordinator?.caretAnchorRatio?.(printBounds, clickOnPaper) ?? null;
+  const visualHits = [...page.querySelectorAll('svg .tdom-source-hit[data-math="1"]')];
+  const visualHit = clickPoint ? visualHits.filter(node => {
+    const box = node.getBoundingClientRect();
+    return clickPoint.x >= box.left && clickPoint.x <= box.right && clickPoint.y >= box.top && clickPoint.y <= box.bottom;
+  }).sort((a, b) => a.getBoundingClientRect().width - b.getBoundingClientRect().width)[0] : null;
   directEditor = {
     id,
     region,
     sessionId,
     element: shell,
+    inkLayer,
     control,
     pageNumber,
     kind: region.kind,
     standalone: null,
+    canonicalInput,
+    visualLine: visualHit?.dataset.line ?? target.dataset.line ?? null,
     wysiwyg: null,
     anchor: target,
     anchorMeta: {
-      src: srcOf(target),
+      src: srcOf(target) || String(id).split(':')[0],
       line: target.dataset.line ?? null,
       math: target.dataset.math === '1',
       text: String(target.textContent ?? '').trim(),
@@ -3699,7 +4477,9 @@ async function openDirectEditor(
     presentedRev: presented?.rev ?? appliedSrcRev,
     readValue,
     sentEdit: false,
-    lastVisibleValue: region.value,
+    lastVisibleValue: readValue(),
+    serializedValue: region.kind === 'math' ? preserveMathAuxCommands(region.value, readValue()) : null,
+    formattedSource: region.sourceValue ?? region.value,
     sentFromSrcRev: Number(presented?.rev ?? appliedSrcRev),
   };
   // Position synchronously. Math WYSIWYG is loaded lazily and must not
@@ -3734,14 +4514,16 @@ async function openDirectEditor(
   }
   repositionDirectEditor();
   resizeText();
-  requestAnimationFrame(() => {
+  await new Promise(resolve => requestAnimationFrame(async () => {
+    try {
+    if (directEditor?.sessionId !== sessionId) return;
     const scrollTop = pagesEl.scrollTop;
     const scrollLeft = pagesEl.scrollLeft;
     try { control.focus({ preventScroll: true }); } catch { control.focus(); }
-    if (control.isContentEditable) {
+    if (isDirectTextControl(control)) {
       const selection = window.getSelection();
       let range = null;
-      if (usesCanonicalSurface()) {
+      if (usesDirectEditSurface()) {
         if (Number.isInteger(caretOffset)) {
           const textNode = control.firstChild;
           if (textNode?.nodeType === Node.TEXT_NODE) {
@@ -3761,7 +4543,7 @@ async function openDirectEditor(
       }
       selection?.removeAllRanges();
       selection?.addRange(range);
-    } else if (usesCanonicalSurface()) {
+    } else if (usesDirectEditSurface()) {
       if (Number.isInteger(caretOffset) && typeof control.getPromptRange === 'function') {
         const offset = mathModelOffsetFromSource(control, region.value, caretOffset, mathWrapped);
         if (Number.isFinite(offset) && offset >= 0) control.position = offset;
@@ -3777,6 +4559,8 @@ async function openDirectEditor(
     } else if (control instanceof HTMLTextAreaElement) {
       control.setSelectionRange(control.value.length, control.value.length);
     }
+    await refreshDirectEditGeometry(directEditor, clickOnPaper);
+    if (directEditor?.sessionId !== sessionId) return;
     alignOpaqueNativeCaretAnchor(sessionId);
     // Adding a DOM/MathLive selection can scroll after focus even when
     // preventScroll is honored. A preview click must never move the paper.
@@ -3788,25 +4572,145 @@ async function openDirectEditor(
         pagesEl.scrollLeft = scrollLeft;
       }
     });
-  });
+    } finally { resolve(); }
+  }));
+}
+
+// A first click resolves immutable PDF metadata asynchronously. Retain
+// keystrokes arriving in that short interval until its real caret is ready.
+let openingDirectInput = null;
+const directInputReplayEvents = new WeakSet();
+document.addEventListener('keydown', event => {
+  const opening = openingDirectInput;
+  if (!opening || directInputReplayEvents.has(event) || event.isComposing || event.keyCode === 229) return;
+  if (event.key === 'Escape') { openingDirectInput = null; directEditClickEpoch++; return; }
+  const navigation = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Enter', 'Tab'].includes(event.key) &&
+    !(event.key === 'Tab' && (event.metaKey || event.ctrlKey || event.altKey));
+  const ordinary = !event.metaKey && !event.ctrlKey && !event.altKey &&
+    (event.key.length === 1 || ['Backspace', 'Delete'].includes(event.key));
+  if (!navigation && !ordinary) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  opening.operations.push({ type: 'key', key: event.key, code: event.code,
+    shiftKey: event.shiftKey, ctrlKey: event.ctrlKey, altKey: event.altKey, metaKey: event.metaKey, repeat: event.repeat });
+}, { capture: true });
+
+document.addEventListener('paste', event => {
+  const opening = openingDirectInput;
+  if (!opening || directInputReplayEvents.has(event) || !event.clipboardData) return;
+  // Retain only the strings delivered by this paste gesture. Replaying must
+  // never read a newer system clipboard or request clipboard permission.
+  const formats = {};
+  for (const type of ['text/plain', 'application/x-latex', 'application/json+mathlive', 'application/json']) {
+    if (event.clipboardData.types.includes(type)) formats[type] = event.clipboardData.getData(type);
+  }
+  if (!Object.keys(formats).length) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  opening.operations.push({ type: 'paste', formats });
+}, { capture: true });
+
+function replayDirectOpeningOperation(session, operation) {
+  const control = session.control;
+  if (operation.type === 'paste') {
+    if (isDirectTextControl(control)) {
+      document.execCommand('insertText', false, operation.formats['text/plain'] ?? '');
+    } else {
+      const sink = control.shadowRoot?.querySelector('.ML__keyboard-sink');
+      if (!sink) return;
+      const data = new DataTransfer();
+      for (const [type, value] of Object.entries(operation.formats)) data.setData(type, value);
+      const event = new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true, composed: true });
+      directInputReplayEvents.add(event);
+      sink.dispatchEvent(event);
+    }
+    return;
+  }
+  const { key, shiftKey, ctrlKey, altKey, metaKey } = operation;
+  const event = new KeyboardEvent('keydown', { ...operation, bubbles: true, cancelable: true, composed: true });
+  directInputReplayEvents.add(event);
+  // The host's capture/bubble handlers establish the WYS trigger anchor,
+  // handle candidates, slash selection and matrix Enter before insertion.
+  if (!control.dispatchEvent(event) || directEditor !== session) return;
+  if (isDirectTextControl(control)) {
+    if (key.length === 1 || key === 'Enter') document.execCommand('insertText', false, key === 'Enter' ? '\n' : key);
+    else if (key === 'Backspace' || key === 'Delete') document.execCommand(key === 'Backspace' ? 'delete' : 'forwardDelete');
+    else if (key === 'Tab') control.blur();
+    else {
+      const backward = ['ArrowLeft', 'ArrowUp', 'Home'].includes(key);
+      const granularity = key === 'Home' || key === 'End' || metaKey && (key === 'ArrowUp' || key === 'ArrowDown') ? 'documentboundary'
+        : metaKey ? 'lineboundary' : ctrlKey || altKey ? 'word'
+        : key === 'ArrowUp' || key === 'ArrowDown' ? 'line' : 'character';
+      window.getSelection()?.modify(shiftKey ? 'extend' : 'move', backward ? 'backward' : 'forward', granularity);
+    }
+  } else if (key.length === 1) {
+    control.executeCommand('typedText', key, { focus: true, feedback: false, simulateKeystroke: true });
+  } else {
+    let command;
+    if (key === 'Backspace' || key === 'Delete') command = key === 'Backspace' && !shiftKey ? 'deleteBackward' : 'deleteForward';
+    else if (key === 'Tab') command = shiftKey ? 'moveToPreviousGroup' : 'moveToNextGroup';
+    else if (key === 'ArrowUp' || key === 'ArrowDown') command = shiftKey
+      ? key === 'ArrowUp' ? 'extendSelectionUpward' : 'extendSelectionDownward'
+      : key === 'ArrowUp' ? 'moveUp' : 'moveDown';
+    else if (key !== 'Enter') {
+      const backward = key === 'ArrowLeft' || key === 'Home';
+      if (key === 'Home' || key === 'End' || metaKey) command = shiftKey
+        ? backward ? 'extendToMathFieldStart' : 'extendToMathFieldEnd'
+        : backward ? 'moveToMathfieldStart' : 'moveToMathfieldEnd';
+      else if (ctrlKey) command = shiftKey
+        ? backward ? 'extendToGroupStart' : 'extendToGroupEnd'
+        : backward ? 'moveToGroupStart' : 'moveToGroupEnd';
+      else if (altKey) command = shiftKey
+        ? backward ? 'extendToPreviousWord' : 'extendToNextWord'
+        : backward ? 'moveToPreviousWord' : 'moveToNextWord';
+      else command = shiftKey
+        ? backward ? 'extendSelectionBackward' : 'extendSelectionForward'
+        : backward ? 'moveToPreviousChar' : 'moveToNextChar';
+    }
+    if (command) control.executeCommand(command);
+  }
+  paintDirectSelection();
+}
+
+async function activateDirectEditor(event) {
+  if (event.metaKey || event.ctrlKey || event.altKey || event.target?.closest?.('.tdom-direct-editor')) return;
+  const previous = directEditor;
+  const opening = { operations: [] };
+  openingDirectInput = opening;
+  try {
+    await activateDirectEditorAtPoint(event);
+    if (openingDirectInput !== opening || !directEditor || directEditor === previous) return;
+    openingDirectInput = null;
+    const session = directEditor;
+    for (const operation of opening.operations) {
+      if (directEditor !== session || !session.element.contains(document.activeElement)) break;
+      replayDirectOpeningOperation(session, operation);
+    }
+    if (opening.operations.length && directEditor === session) session.control.dispatchEvent(new Event('input', { bubbles: true }));
+  } finally {
+    if (openingDirectInput === opening) openingDirectInput = null;
+  }
 }
 
 // A plain click edits; Cmd/Ctrl+click remains source navigation.  Only the
 // printed node under the pointer activates, so scrolling/searching elsewhere
 // on the page never creates editor DOM.
-pagesEl.addEventListener('click', async (event) => {
+async function activateDirectEditorAtPoint(event) {
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   if (event.target?.closest?.('.tdom-direct-editor')) return;
   const clickEpoch = ++directEditClickEpoch;
-  const target = event.target?.closest?.('[data-edit], .tdom-source-hit, [data-src]') ??
-    (usesCanonicalSurface() ? pageAtClientPoint(event, event.target) : null);
+  const clickedPage = pageAtClientPoint(event, event.target);
+  const target = usesDirectEditSurface(clickedPage) ? clickedPage :
+    event.target?.closest?.('[data-edit], .tdom-source-hit, [data-src]');
   if (!target) return;
   const targetPage = pageAtClientPoint(event, target);
-  const presented = usesCanonicalSurface() ? presentedPageState(targetPage) : null;
-  if (usesCanonicalSurface() && !presented) return;
+  const canonicalClick = usesDirectEditSurface(targetPage);
+  const presented = canonicalClick ? presentedPageState(targetPage) : null;
+  const provisionalSnapshot = targetPage?.provisionalSnapshot;
+  if (canonicalClick && !presented) return;
   const stillCurrent = () => {
     if (clickEpoch !== directEditClickEpoch || !targetPage?.isConnected) return false;
-    if (!usesCanonicalSurface()) return true;
+    if (!canonicalClick) return targetPage.provisionalSnapshot === provisionalSnapshot;
     const current = presentedPageState(targetPage);
     return current?.id === presented.id && current?.rev === presented.rev && current?.src === presented.src;
   };
@@ -3815,13 +4719,13 @@ pagesEl.addEventListener('click', async (event) => {
   const clickPoint = { x: event.clientX, y: event.clientY };
   const id = target.dataset.edit;
   if (id) {
-    const region = await editRegionById(id);
+    const region = await editRegionById(id, targetPage);
     if (region && stillCurrent()) {
       await openDirectEditor(id, target, region, clickPoint);
     }
     return;
   }
-  if (usesCanonicalSurface()) {
+  if (canonicalClick) {
     const page = targetPage;
     const resolved = await resolveOpaqueEditRegion(page, event);
     if (resolved && stillCurrent()) {
@@ -3838,8 +4742,68 @@ pagesEl.addEventListener('click', async (event) => {
   }
   const region = await resolveEditRegion(target, event);
   if (region && stillCurrent()) {
-    await openDirectEditor(region.id, target, region, clickPoint);
+    // The awaited metadata may have replaced the clicked SVG. The page
+    // remains stable and the exact glyph map reacquires this source's ink.
+    await openDirectEditor(region.id, target.isConnected ? target : targetPage, region, clickPoint);
   }
+}
+
+let directPointer = null;
+let suppressDirectClick = false;
+pagesEl.addEventListener('pointerdown', event => {
+  if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey ||
+      event.target.closest?.('.math-wysiwyg-panel')) return;
+  const page = pageAtClientPoint(event, event.target);
+  if (!page) return;
+  const point = paperPointForClick(event, page);
+  const session = directEditor;
+  const glyph = session?.pageNumber === Number(page.dataset.page) &&
+    session.geometryValue === String(session.readValue())
+    ? window.TdomDirectEditGeometry.nearest(session.glyphMap ?? [], point) : null;
+  const inside = glyph && point.x >= glyph.left - 2 && point.x <= glyph.right + 2 &&
+    point.y >= glyph.top - 2 && point.y <= glyph.bottom + 2;
+  directPointer = { page, event, point, session: inside ? session : null, moved: false };
+  if (inside) {
+    event.preventDefault();
+    session.control.focus({ preventScroll: true });
+    const hit = window.TdomDirectEditGeometry.hit(session.glyphMap, point);
+    directPointer.start = event.shiftKey ? directSelection(session)?.[0] ?? hit : hit;
+    setDirectSelection(session, directPointer.start, hit);
+    pagesEl.setPointerCapture(event.pointerId);
+    suppressDirectClick = true;
+  }
+}, { capture: true });
+pagesEl.addEventListener('pointermove', event => {
+  const drag = directPointer;
+  if (!drag) return;
+  const point = paperPointForClick(event, drag.page);
+  drag.moved ||= Math.hypot(event.clientX - drag.event.clientX, event.clientY - drag.event.clientY) > 3;
+  drag.end = point;
+  if (drag.session && directEditor === drag.session && drag.moved) {
+    event.preventDefault();
+    const offset = window.TdomDirectEditGeometry.hit(drag.session.glyphMap, point);
+    if (Number.isInteger(offset)) setDirectSelection(drag.session, drag.start, offset);
+  }
+});
+pagesEl.addEventListener('pointerup', async event => {
+  const drag = directPointer;
+  directPointer = null;
+  if (pagesEl.hasPointerCapture(event.pointerId)) pagesEl.releasePointerCapture(event.pointerId);
+  if (!drag?.moved || drag.session) return;
+  suppressDirectClick = true;
+  await activateDirectEditor(drag.event);
+  const session = directEditor;
+  if (!session || session.pageNumber !== Number(drag.page.dataset.page)) return;
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  await refreshDirectEditGeometry(session);
+  if (directEditor !== session || !session.glyphMap?.length) return;
+  const geometry = window.TdomDirectEditGeometry;
+  setDirectSelection(session, geometry.hit(session.glyphMap, drag.point), geometry.hit(session.glyphMap, drag.end));
+});
+pagesEl.addEventListener('pointercancel', () => { directPointer = null; suppressDirectClick = false; });
+pagesEl.addEventListener('click', event => {
+  if (suppressDirectClick) { suppressDirectClick = false; return; }
+  void activateDirectEditor(event);
 });
 
 let liveSearchRaf = 0;
@@ -4545,14 +5509,9 @@ sse.onmessage = (ev) => {
         injectFonts(msg.fonts);
         appliedRev = msg.rev;
         if (mode === 'opaque' || previewPolicy !== 'structured') return;
+        stageProvisionalPatches(msg.patches, true);
         for (const patch of msg.patches) {
-          if (patch.type === 'replace-page') {
-            const dl = patch.displayList;
-            renderPage(dl, true);
-            updateCanonState(dl.page);
-          } else if (patch.type === 'remove-pages') {
-            removePagesFrom(patch.from);
-          }
+          if (patch.type === 'replace-page') updateCanonState(patch.displayList.page);
         }
       }
       return;

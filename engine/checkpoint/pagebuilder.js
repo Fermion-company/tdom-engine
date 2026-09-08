@@ -82,6 +82,18 @@ export function buildPages(stream, geo, incr = null) {
   const builder = new PageBuilder(stream, geo);
   const prevRun = incr && incr.prevRun && incr.prevRun.geo === geo ? incr.prevRun : null;
   const pages = builder.run(prevRun, incr ?? {});
+  // A zero-layout placeholder can eventually occupy or move any later
+  // page, including a block at a page boundary. Until its measured galley
+  // arrives, no assembled page can prove a complete paper surface. Hold
+  // every provisional page without changing the pagination or box heights.
+  const pendingExact = stream.filter((entry) => entry.t === 'pending-exact').map((entry) => entry.bid);
+  for (let index = 0; index < pages.length; index++) {
+    const page = pages[index];
+    const previous = page.pendingExact ?? [];
+    if (previous.length === pendingExact.length && previous.every((bid, i) => bid === pendingExact[i])) continue;
+    pages[index] = { ...page, pendingExact };
+    delete pages[index].dl;
+  }
   // \pagetotal at each block's entry — page-context-sensitive rescues
   // (mdframed & co.) need their true on-page start position. Blocks the
   // incremental run never re-processed keep their previous entry offsets.
@@ -150,6 +162,8 @@ class PageBuilder {
     const g = this.geo;
     this.colht = this.textheight; // \@colht
     this.colroom = this.colht; // \@colroom
+    this.enlargeAmount = 0; // -\ht\@kludgeins on this page
+    this.enlargeStar = false; // nonzero \wd\@kludgeins
     this.topnum = g.topnumber ?? 2;
     this.botnum = g.bottomnumber ?? 1;
     this.colnum = g.totalnumber ?? 3;
@@ -246,6 +260,8 @@ class PageBuilder {
       pageCount: this.pages.length,
       col: {
         colroom: this.colroom,
+        enlargeAmount: this.enlargeAmount,
+        enlargeStar: this.enlargeStar,
         topnum: this.topnum,
         botnum: this.botnum,
         colnum: this.colnum,
@@ -269,6 +285,8 @@ class PageBuilder {
     this.pages = pages.slice(0, s.pageCount);
     this.colht = this.textheight;
     this.colroom = s.col.colroom;
+    this.enlargeAmount = s.col.enlargeAmount ?? 0;
+    this.enlargeStar = s.col.enlargeStar ?? false;
     this.topnum = s.col.topnum;
     this.botnum = s.col.botnum;
     this.colnum = s.col.colnum;
@@ -300,6 +318,8 @@ class PageBuilder {
     const cb = b.col;
     if (
       ca.colroom !== cb.colroom || ca.topnum !== cb.topnum || ca.botnum !== cb.botnum ||
+      (ca.enlargeAmount ?? 0) !== (cb.enlargeAmount ?? 0) ||
+      !!ca.enlargeStar !== !!cb.enlargeStar ||
       ca.colnum !== cb.colnum || ca.toproom !== cb.toproom || ca.botroom !== cb.botroom ||
       ca.textfloatsheight !== cb.textfloatsheight ||
       ca.toplist.length !== cb.toplist.length || ca.botlist.length !== cb.botlist.length ||
@@ -430,6 +450,8 @@ class PageBuilder {
           // \enlargethispage at this stream position: the CURRENT page's
           // goal grows; #startColumnState resets it for the next page
           this.colroom += e.a;
+          this.enlargeAmount += e.a;
+          this.enlargeStar ||= !!e.star;
           break;
         case 'ev':
           // page-style event marker: rides the stream so its PAGE is exact,
@@ -558,7 +580,16 @@ class PageBuilder {
 
   #contributeIns(e) {
     // inserts are non-discardable; accepted even before the first box
-    if (!this.footSeen) this.footSeen = true;
+    if (!this.footSeen) {
+      this.footSeen = true;
+      // TeX accounts for the insertion class's skip once per page: its
+      // width reduces pagegoal, while its stretch/shrink participates in
+      // break badness. Omitting the latter can reject a page that fits by
+      // shrinking the footnote separator (article's skip\footins has 2pt).
+      this.stretch[this.footskip.sto] += this.footskip.st;
+      if (this.footskip.sho === 0) this.shrink += this.footskip.sh;
+      else if (this.footskip.sh) this.shrinkInf = true;
+    }
     const entry = { e };
     this.feet.push(entry);
     this.contents.push(entry);
@@ -1023,12 +1054,30 @@ class PageBuilder {
       }
     }
     if (dpLast) g.push({ kind: 'glue', spec: { w: -dpLast, st: 0, sh: 0, sto: 0, sho: 0 } });
+    // \@makespecialcolbox uses an enlarged INNER box for the nonstar form;
+    // the outer \@colht only keeps the normal paper/footer geometry. Packing
+    // the body back to \@colht would shrink the very lines the larger break
+    // goal admitted. The star form instead adds a fixed trailing skip that
+    // makes the body consume \pageshrink, regardless of unused page space.
+    let packingHeight = this.colht + this.enlargeAmount;
+    if (this.enlargeStar) {
+      let natural = 0;
+      for (const el of g) {
+        if (el.kind === 'glue') natural += el.spec.w;
+        else if (el.kind === 'unit') natural += el.u.h + el.u.d;
+        else if (el.kind === 'float') natural += el.f.h + el.f.d;
+        else if (el.kind === 'mini') natural += el.height;
+      }
+      // Equivalent glyph placement to appending LaTeX's fixed
+      // \@colht - \ht\@outputbox + \pageshrink skip and packing to \@colht.
+      packingHeight = natural - this.shrink;
+    }
     // -- \@textbottom (raggedbottom: \vskip 0pt plus .0001fil — LuaTeX
     //    order 2, sharing an order with any \newpage/\vfil on the page)
     if (this.raggedbottom) {
       g.push({ kind: 'glue', spec: { w: 0, st: 0.0001 * FIL, sto: 2, sh: 0, sho: 0 } });
     }
-    this.#layoutAndPush(g, this.colht);
+    this.#layoutAndPush(g, packingHeight);
   }
 
   /** \@vtryfc float page: \@fptop [\@fpsep box]… \@fpbot in a vbox to colht. */
@@ -1281,6 +1330,9 @@ export function reconcile(newPages, oldPages) {
 }
 
 function sameIdentity(a, b) {
+  const pa = a.pendingExact ?? [];
+  const pb = b.pendingExact ?? [];
+  if (pa.length !== pb.length || pa.some((bid, i) => bid !== pb[i])) return false;
   const ia = a.identity ?? [];
   const ib = b.identity ?? [];
   if (ia.length !== ib.length) return false;

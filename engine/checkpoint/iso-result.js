@@ -70,13 +70,15 @@ export async function readIsoCompileResult(
       // the preview stamps its normal page furniture.
       const cut = k === 1 ? strut : 0;
       const h = (geo.textheight ?? st.h) - cut;
-      chunks.push({ key, svg: cropSvgAt(svg, x0, y0 + cut, w, h), wBp: w, hBp: h });
+      chunks.push({ key, svg: cropSvgAt(svg, x0, y0 + cut, w, h), wBp: w, hBp: h,
+        editPage: k, editX: x0, editY: y0 + cut });
       items.push({ k: 'box', h, d: 0, chunk: key, coff: 0 });
       items.push({ k: 'eject', v: -10000 });
       continue;
     }
     const h = geo.textheight ?? st.h;
-    chunks.push({ key, svg: cropSvgAt(svg, x0, y0, w, h), wBp: w, hBp: h });
+    chunks.push({ key, svg: cropSvgAt(svg, x0, y0, w, h), wBp: w, hBp: h,
+      editPage: k, editX: x0, editY: y0 });
     // full: a REAL shipped page — it owns its page style (pdfpages sets
     // \thispagestyle{empty}), so the preview must not stamp a folio on it
     items.push({ k: 'box', h, d: 0, chunk: key, coff: 0, full: 1 });
@@ -98,6 +100,7 @@ export async function readIsoCompileResult(
       svg: cropSvg(readFileSync(svgPath, 'utf8'), st.w, st.h + st.d),
       wBp: st.w,
       hBp: st.h + st.d,
+      editPage: ships + 1,
     });
     let coff = 0;
     for (const it of st.items ?? []) {
@@ -109,6 +112,12 @@ export async function readIsoCompileResult(
         if (it.k === 'glue' || it.k === 'kern') coff += it.a ?? 0;
       }
     }
+  }
+  // Read once after every page has been rendered, before the job directory
+  // is retired. All chunk records share the immutable PDF buffer.
+  if (chunks.length) {
+    const editPdf = readFileSync(pdf);
+    for (const chunk of chunks) chunk.editPdf = editPdf;
   }
   if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
   else console.error('ISO_KEEP', block.id, jobdir);

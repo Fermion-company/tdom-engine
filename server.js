@@ -926,6 +926,7 @@ function bibliographySourceLocation(generatedText, generatedLine = null) {
 
 function domPayload() {
   const dom = engine.getDOM();
+  dom.documentEpoch = documentEpoch;
   const byId = new Map(engine.blocks.map((block) => [block.id, block]));
   for (const item of dom.blocks ?? []) {
     if (path.resolve(item.source?.file || '') !== path.join(engine.workDir, 'driver.bbl')) continue;
@@ -1096,6 +1097,8 @@ const server = http.createServer(async (req, res) => {
       (url.pathname === '/app.js' ||
         url.pathname === '/reset-coordinator.js' ||
         url.pathname === '/opaque-editor-coordinator.js' ||
+        url.pathname === '/direct-edit-geometry.js' ||
+        url.pathname === '/viewport-math.js' ||
         url.pathname === '/style.css' ||
         url.pathname === '/compare.js')
     ) {
@@ -1310,6 +1313,12 @@ const server = http.createServer(async (req, res) => {
       if (!pages) return json(res, { pages: [] }, 404);
       return json(res, { pages });
     }
+    if (req.method === 'GET' && url.pathname === '/canonical/glyphs') {
+      const id = Number(url.searchParams.get('c'));
+      const page = Number(url.searchParams.get('page'));
+      const glyphs = await engine.canonical.pageEditGlyphs(id, page);
+      return json(res, { id, page, glyphs: glyphs ?? [] }, glyphs ? 200 : 404);
+    }
     if (req.method === 'GET' && url.pathname === '/canonical/boxes') {
       const id = url.searchParams.get('c');
       const pages = await engine.canonical.pageTextBoxes(id ? Number(id) : null);
@@ -1337,6 +1346,24 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end(svg);
     }
+    if (req.method === 'GET' && url.pathname === '/ship-glyphs') {
+      const chain = engine.shipping;
+      const gen = Number(url.searchParams.get('g')), rev = Number(url.searchParams.get('r'));
+      const page = Number(url.searchParams.get('page'));
+      if (!chain || chain.gen !== gen || engine.shipGenRev.get(gen) !== rev || !Number.isInteger(page) || page < 1)
+        return json(res, { glyphs: [] }, 404);
+      const pdf = chain.publishedPdf ?? chain.pagePdf.get(page);
+      if (!pdf || !existsSync(pdf)) return json(res, { glyphs: [] }, 404);
+      chain.editGlyphCache ??= new Map();
+      const key = `${gen}:${page}`;
+      if (!chain.editGlyphCache.has(key)) {
+        chain.editGlyphCache.set(key, engine.canonical.pdfEditGlyphs(readFileSync(pdf), page).catch(() => null));
+        while (chain.editGlyphCache.size > 16) chain.editGlyphCache.delete(chain.editGlyphCache.keys().next().value);
+      }
+      const glyphs = await chain.editGlyphCache.get(key);
+      if (engine.shipping !== chain || chain.gen !== gen || engine.shipGenRev.get(gen) !== rev || !glyphs) return json(res, { glyphs: [] }, 404);
+      return json(res, { glyphs });
+    }
     if (req.method === 'GET' && url.pathname.startsWith('/ship/')) {
       const n = Number(url.pathname.slice('/ship/'.length).replace(/\.svg$/, ''));
       const requestedGen = Number(url.searchParams.get('g'));
@@ -1358,8 +1385,29 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end(svg);
     }
+    if (req.method === 'GET' && url.pathname === '/chunk-glyphs') {
+      const key = url.searchParams.get('key');
+      const version = Number(url.searchParams.get('v'));
+      const requestedEpoch = url.searchParams.get('e');
+      if (requestedEpoch != null && Number(requestedEpoch) !== documentEpoch) return json(res, { glyphs: [] }, 404);
+      const chunk = engine.chunks.get(key);
+      if (!chunk || chunk.v !== version) return json(res, { glyphs: [] }, 404);
+      chunk.editGlyphs ??= (chunk.editCanonicalId != null
+        ? engine.canonical.pageEditGlyphs(chunk.editCanonicalId, chunk.editPage)
+        : chunk.editPdf ? engine.canonical.pdfEditGlyphs(chunk.editPdf, chunk.editPage) : Promise.resolve(null))
+        .catch(() => null);
+      const raw = await chunk.editGlyphs;
+      if (!raw || engine.chunks.get(key) !== chunk) return json(res, { glyphs: [] }, 404);
+      const dx = chunk.editX ?? 0, dy = chunk.editY ?? 0;
+      return json(res, { documentEpoch, width: chunk.wBp, height: chunk.hBp, glyphs: raw.map(g => ({ ...g, left: g.left - dx, right: g.right - dx,
+        top: g.top - dy, bottom: g.bottom - dy, baseline: g.baseline - dy })) });
+    }
     if (req.method === 'GET' && url.pathname.startsWith('/chunk/')) {
       const id = decodeURIComponent(url.pathname.slice('/chunk/'.length)).replace(/\.svg$/, '');
+      const requestedVersion = url.searchParams.get('v');
+      if (requestedVersion != null && Number(requestedVersion) !== engine.chunks.get(id)?.v) {
+        return json(res, { error: 'superseded chunk' }, 404);
+      }
       const svg = engine.getChunkSVG ? engine.getChunkSVG(id) : null;
       if (!svg) {
         res.writeHead(404);

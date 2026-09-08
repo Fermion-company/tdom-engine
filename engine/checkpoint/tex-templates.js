@@ -51,18 +51,21 @@ export function buildDriverSource({
     '\\ifcsname cref@currentlabel\\endcsname' +
     "\\directlua{tdom_label_cref('\\luaescapestring{#1}'," +
     "'\\luaescapestring{\\detokenize\\expandafter{\\cref@currentlabel}}')}\\fi";
-  // \enlargethispage: record a stream marker for the JS page builder
-  // (the dormant page ignores the real effect); the original still runs.
+  // The measurement driver's \vsize=\maxdimen is intentionally dormant.
+  // Calling LaTeX's real enlargement there raises "Page height already too
+  // large" and loses the entire block. Record the requested amount only;
+  // forked isolated output restores the saved original below.
   L.push('\\let\\TDOMenlarge\\enlargethispage');
   L.push('\\renewcommand\\enlargethispage{\\@ifstar\\TDOMenlargeS\\TDOMenlargeN}');
-  L.push(
-    '\\newcommand\\TDOMenlargeS[1]{\\TDOMenlarge*{#1}' +
-      '\\begingroup\\dimen@=\\dimexpr#1\\relax\\directlua{tdom_enlarge(\\number\\dimen@,1)}\\endgroup}'
-  );
-  L.push(
-    '\\newcommand\\TDOMenlargeN[1]{\\TDOMenlarge{#1}' +
-      '\\begingroup\\dimen@=\\dimexpr#1\\relax\\directlua{tdom_enlarge(\\number\\dimen@,0)}\\endgroup}'
-  );
+  for (const [suffix, star] of [['S', 1], ['N', 0]]) {
+    L.push(
+      `\\newcommand\\TDOMenlarge${suffix}[1]{\\@bsphack\\begingroup\\@tempskipa#1\\relax` +
+        '\\ifdim\\@tempskipa>.5\\maxdimen' +
+        '\\@latex@error{Suggested extra height (\\the\\@tempskipa) dangerously large}\\@eha' +
+        `\\else\\dimen@=\\@tempskipa\\directlua{tdom_enlarge(\\number\\dimen@,${star})}\\fi` +
+        '\\endgroup\\@esphack}'
+    );
+  }
   L.push('\\let\\TDOMlabel\\label');
   L.push(
     "\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}" +
@@ -369,6 +372,9 @@ export function buildIsoCompileSource({
   }
   L.push('\\makeatletter\\pagestyle{empty}\\hoffset=-1in\\voffset=-1in');
   if (ck0) {
+    // A real-height isolated child must use LaTeX's real output semantics,
+    // not the marker-only enlargement inherited from the dormant driver.
+    L.push('\\let\\enlargethispage\\TDOMenlarge');
     L.push('\\output={\\global\\setbox\\voidb@x\\box255}');
     L.push('\\hbox to0pt{}\\penalty-10000');
     // re-assert the job cwd right before the ship: package code in the

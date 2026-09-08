@@ -1,4 +1,5 @@
 import { fnv1a } from '../hash.js';
+import { instrumentEditRegions } from '../edit-regions.js';
 
 export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, applyFidelity }) {
   const reusedStaleGalley = !!galley.tdomStale;
@@ -7,6 +8,10 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
     JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events])
   );
   if (galley.tdomIsoChunks) {
+    // Isolated rescue bypasses buildJobBlockBody, which normally records
+    // editable source spans. Its real PDF still contains editable prose
+    // and math (for example the paragraph immediately before a new page).
+    block.editRegions = instrumentEditRegions(block.text).regions;
     // rescued block: the isolated run's print-identical pixels are the
     // chunks — registered here so forGalley matches the adopted hash
     for (const c of galley.tdomIsoChunks) {
@@ -17,6 +22,10 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
         hBp: c.hBp,
         v: (prev?.v ?? 0) + 1,
         forGalley: block.galleyHash,
+        editPdf: c.editPdf,
+        editPage: c.editPage,
+        editX: c.editX,
+        editY: c.editY,
       });
     }
     delete galley.tdomIsoChunks;

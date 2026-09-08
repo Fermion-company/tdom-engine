@@ -51,8 +51,7 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
     OpenType MATH、または legacy CM 名）のグリフが含まれる
     → その行は exact chunk 必須
   - `it.xb` — cmap 外グリフ（非legacyのPUA 0xE000–0xF8FF、plane 15/16 の
-    0xF0000+、0x110000以上）を含む → glyph ブリッジすら禁止（空白の方が
-    「間違った字形」よりまし）
+    0xF0000+、0x110000以上）を含む → glyph ブリッジも禁止。ビューアは次の完成した紙面を待つ
   - run の `m=1` — inline math の開始・終了ノード間から採取した数式由来
     マーカー。フォント名ではなく TeX の数式境界を使うため、`\mathrm`、
     `\mathit`、`\mathbf` のように本文系フォントを使う数式も識別できる
@@ -83,9 +82,10 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
   同じ block の安全な散文行は glyph のまま残すため、隣接する `\texttt` や
   `\textit` が数式レンダー待ちになったり、後から画像へ置換されたりしない。
 - 本文と inline math が同じ行に混在する場合、`itemFlags` の bit 4 が立つ。
-  fresh chunk 待ちの間は現在の本文 glyph だけを出し、math run は透明にする。
-  MathLive 等の別レンダラーでは補わない。前回の exact chunk を安全に使える
-  math-only 行はそれを保持し、それ以外は空白へ fail closed する。
+  fresh chunk 待ちの display list は本文 glyph と透明な math run を持つ。
+  ビューアはその未完成ページを公開せず、直前の完成した紙面を保持する。
+  全数式の exact chunk・フォント・文字座標・ソース範囲が揃ってから、
+  影響するページ群を同時に切り替える。ページ減少は確定PDFの提示まで保留する。
 - float は float ページ（2..1+F）、**脚注は新設の footnote ページ
   （2+F..1+F+N）**に ship され、`b13#1` / `b13@fn0` のキーで独立に
   banding される（数式入り脚注も exact）。
@@ -101,8 +101,9 @@ glyph layer は「速いから使う」のではなく「**速くて壊れない
 3. **glyph bridge** — 非数式の exact-required 行だけ、全グリフが少なくとも
    写像可能（twin可・PUA不可）なら chunk 到着までの橋として表示。数式 run
    自体は常に透明
-4. **blank** — `xb` 行・降格ブロック・exact chunk 待ちの数式。
-   間違った字形は一瞬でも出さない
+4. **前の完成ページを保持** — `xb` 行・降格ブロック・exact chunk 待ちの数式。
+   未完成の display list は画面に出さず、次の exact ページまたは完成した
+   provisional ページを待つ。chunk URL の版が変わった応答も採用しない
 
 chunk の鮮度は `unitsSig` が chunk 版数＋fresh/stale ビットを持つので、
 到着時に帯だけが差し替わります（第8章のバンド収束と同じ経路）。
@@ -127,12 +128,12 @@ chunk のソースは3つで、**役割分担が固定**されています。
    隔離経路へ引き継ぐ。
 2. **canonical crop = コールドブロックの一括ソース**
    （`#cropCanonicalChunks`）: canonical が現行 `srcRev` に追いつき
-   **ページ数が一致**したとき、stale な chunk を持つ全ブロック（1パス
-   上限 `TDOM_CANON_CROP_MAX`=40）へ **canonical ページSVGからの
-   切り出し**を登録する。コンパイルゼロ — オーバーレイが既に持つ
-   ピクセルを chunk 座標系に写すだけで、次の編集の stale-exact 帯が
-   グリフ近似ではなく実LuaLaTeXピクセルになる。ページ数がドリフトした
-   文書では絶対に切り出さない（誤ったピクセルを登録しない）。
+   ページ数が一致し、段落の全行を source・SyncTeX・PDF の文字配置で
+   照合できた場合だけ、canonical ページSVGから chunk を切り出す。
+   1パスの照合上限は `TDOM_CANON_CROP_MAX`=40。ページ数や本文の一致
+   だけでは切り出さない。数式・画像・副作用・未検証の描画がある場合は
+   常駐または隔離レンダーを使う。切り出した文字座標はSVGと一緒に保持し、
+   canonical の旧世代が破棄された後も同じ chunk を編集できるようにする。
 3. **隔離レンダー**（フルプリアンブル、アイドルゲート付き最低優先度）:
    ドリフトで crop が届かないブロックの最後の受け皿。ポンプのレーンは
    占有しない（fire-and-forget）— ゲートが何分も閉じたままでも、編集
@@ -146,7 +147,7 @@ canonical 着地時の一致検証（第8章 §8.4）が fidelity にも接続�
   chunk のみ（ブリッジも禁止）。従来どおり rescue にも poisoned 登録。
 - **すでに exact ピクセルを表示していた**（rescued / block-exact）のに
   ズレたブロック → 配置そのものが誤り → `canonical-only` 降格:
-  provisional を空白にして canonical page に任せる。
+  provisional を表示候補から外し、直前の紙面を保持して canonical page を待つ。
 - 降格は `fnv1a(block.text)` に粘着し、**ソースが変わるまで戻らない**。
 - ブラウザ側も `document.fonts.load()` で各 `@font-face` の実ロードを
   検証し、失敗を `POST /font-fail` で報告 → `demoteFontFamily()` が
@@ -160,7 +161,7 @@ canonical 着地時の一致検証（第8章 §8.4）が fidelity にも接続�
 | 表示対象 | 現在の実装 |
 |---|---|
 | display math がTeX品質 | math 行は exact chunk |
-| inline math 段落の編集中に本文が古い chunk に隠れない | current glyph、math は exact chunk 待ちの間 blank（§9.4） |
+| inline math 段落の編集中に本文が古い chunk に隠れない | 全数式の exact chunk とフォントが揃うまで完成済みページを保持（§9.4） |
 | 隣接する `\texttt` / `\textit` が遅れて差し替わらない | safe 行を構造化 glyph のまま維持＋font manifest を同時配送 |
 | CM / LM / unicode-math / CJK が fallback しない | フォントティア＋`xb` 検出＋font-fail 降格 |
 | TikZ / PDF literal は常にTeX由来 | 従来の `blk_gfx`（変更なし） |
@@ -170,3 +171,31 @@ canonical 着地時の一致検証（第8章 §8.4）が fidelity にも接続�
 
 Inspector には gate の集計（safe / exact / canon-only / 降格数 / chunk
 待ち数）が常時表示されます（`stats.fidelity`）。
+
+## 9.9 直接編集の座標
+
+`pdf-edit-geometry.js` は PDF.js の text operator から文字送り・kerning・CTM を読む。
+canonical・render chunk・shipping PDF は同じ抽出器を使い、crop の原点を差し引く。
+`/canonical/glyphs`、`/chunk-glyphs`、`/ship-glyphs` は表示世代を照合する。
+TeX64は同梱PDF.jsの場所を `TDOM_PDFJS_PATH` で渡す。
+
+`web/direct-edit-geometry.js` は文字と MathLive の要素を実 PDF の glyph に対応させる。
+数式は SyncTeX の範囲内から式全体の記号構成を照合し、分子・分母・添字・行列の
+配置で同じ記号を区別する。入力値や表示面が取得中に変わった座標は採用しない。
+増分描画の文字位置はその chunk の実 PDF と SVG から取得し、canonical / shipping
+PDF に切り替わったら座標もその世代へ切り替える。隔離組版されたブロックにも
+ソースの編集範囲を渡す。クリックの照合中に届いた打鍵はカーソルの確定後に適用する。
+表示したchunkの文字座標とソースsnapshotは紙面と一緒に保持し、エンジンが次の版へ
+進んでも失わない。別文書への切替は `documentEpoch` でも照合する。
+数式の局所的な編集では元ソースの改行・空白と命令の区切りを保持する。
+同じ式・文字列の繰り返しはソースと実際の描画の対応をまとめて照合する。
+カーソル・選択・候補位置をこの座標から描き、透明な入力面のブラウザ座標とは分ける。
+IME の未確定文字は入力開始時の PDF 座標へ下線付きで重ねる。変換中はソースへ送らず、
+候補の選択・確定・取消キーを WYSIWYG や編集セッションの操作として消費しない。
+
+現在の glyph 抽出は横書きが対象。縦書き・Type3・回転した個別 glyph は誤った水平
+カーソルに変換しない。合字内部の文字境界は実 glyph の送りを分割する。
+
+未取得の数式・画像・脚注・float は display list の `pending-exact` で通知する。
+高さがまだ分からない初回rescueはページ全体の完成判定を保留し、高さを推測しない。
+画像・フォント・座標・ソース対応の準備後にだけ次の紙面を表示する。
