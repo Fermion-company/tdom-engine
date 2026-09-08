@@ -40,16 +40,15 @@ export function finalizeUpdate(engine, {
 
   engine.rev++;
   engine.srcRev++;
-  // Start the only sub-second, complete-PDF path before arming any
-  // replaceable background work. The schedulers below observe the shared
-  // post-edit priority window and stay idle until the shipping deadline has
-  // passed; this ordering also binds the shipping generation to srcRev.
+  // Bind shipping and the foreground exact-render cohort to the same source
+  // revision. Cold work keeps the shipping priority window; edited blocks
+  // and their changed neighbors may supply an earlier complete preview.
   shipUpdate(text);
   // converge to exact: the canonical compile of THIS source is scheduled
   // off the hot path; when it lands the client swaps every clean page to
   // LuaLaTeX's own pixels
   engine.canonical.schedule(text, engine.srcRev);
-  scheduleBackground(fgStop, dirtyBlocks);
+  scheduleBackground(fgStop, dirtyBlocks, { interactive: !rebooted });
   timer.lap('schedule');
   return buildUpdateResponse({
     rev: engine.rev,

@@ -1157,6 +1157,27 @@ const server = http.createServer(async (req, res) => {
         canonical: engine.canonical.info(),
       });
     }
+    if (req.method === 'POST' && url.pathname === '/canonical/display-demand') {
+      const body = JSON.parse(await readBody(req));
+      const validId = id => id == null || typeof id === 'string' && /^[A-Za-z0-9:_-]{1,128}$/.test(id);
+      if (!Number.isSafeInteger(body?.documentEpoch) || !Number.isSafeInteger(body?.srcRev) ||
+          body.documentEpoch < 0 || body.srcRev < 0 || !validId(body.demandId) || body.fulfilled != null && typeof body.fulfilled !== 'boolean' ||
+          body.residentImpossible != null && typeof body.residentImpossible !== 'boolean' ||
+          body.fulfilled === true && !body.demandId) {
+        return json(res, { error: 'invalid display demand' }, 400);
+      }
+      if (pendingDocumentReset || body.documentEpoch !== documentEpoch || body.srcRev !== engine.srcRev) {
+        return json(res, { ok: false, stale: true, documentEpoch, srcRev: engine.srcRev }, 409);
+      }
+      const result = body.fulfilled === true
+        ? engine.canonical.fulfillDisplay(body.srcRev, body.documentEpoch, body.demandId)
+        : engine.canonical.requestDisplay(body.srcRev, body.documentEpoch, {
+            demandId: body.demandId ?? null,
+            residentImpossible: body.residentImpossible ?? false,
+          });
+      return json(res, { ok: true, ...result, documentEpoch, srcRev: body.srcRev,
+        demandId: body.demandId ?? null, scheduledInMs: engine.canonical.info().scheduledInMs });
+    }
     if (req.method === 'POST' && url.pathname === '/ship-presented') {
       const body = JSON.parse(await readBody(req));
       const gen = Number(body.gen);
@@ -1335,6 +1356,18 @@ const server = http.createServer(async (req, res) => {
       const page = Number(url.searchParams.get('page'));
       const glyphs = await engine.canonical.pageEditGlyphs(id, page);
       return json(res, { id, page, glyphs: glyphs ?? [] }, glyphs ? 200 : 404);
+    }
+    if (req.method === 'POST' && url.pathname === '/canonical/source-boxes') {
+      const body = JSON.parse(await readBody(req));
+      const epoch = documentEpoch;
+      if (Number(body.documentEpoch) !== epoch) return json(res, { boxes: [] }, 404);
+      const file = canonicalInputForProjectFile(body.file);
+      const id = Number(body.id), page = Number(body.page);
+      const boxes = file ? await engine.canonical.sourceEditBoxes({
+        file, id, page, startLine: Number(body.startLine), endLine: Number(body.endLine),
+      }) : null;
+      if (documentEpoch !== epoch) return json(res, { boxes: [] }, 404);
+      return json(res, { id, page, documentEpoch: epoch, boxes: boxes ?? [] }, boxes ? 200 : 404);
     }
     if (req.method === 'GET' && url.pathname === '/canonical/boxes') {
       const id = url.searchParams.get('c');

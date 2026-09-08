@@ -101,6 +101,12 @@ export function initializeEngineState(
     workDir: path.join(engine.workDir, 'canonical'),
     docDir: engine.docDir,
     overlayDir: engine.overlayDir,
+    residentDisplayState: (rev) => {
+      const cohort = engine.interactiveRenderCohort;
+      if (engine.mode !== 'structured' || engine.srcRev !== rev || cohort?.rev !== rev ||
+          cohort.unavailable) return null;
+      return { pending: cohort.queued.size > 0 || cohort.active.size > 0, settledAt: cohort.settledAt };
+    },
   });
   engine.canonical.onResult = onCanonicalResult;
   engine.onCanonical = null; // callback(info) for the server's SSE fanout
@@ -175,6 +181,7 @@ export function initializeEngineState(
   // (the block just edited gets its exact pixels first), small
   // concurrency so an edit burst never forks a render storm
   engine.renderWant = new Map(); // block.id -> queue marker
+  engine.interactiveRenderCohort = null; // only the current edit's resident-capable exact work
   engine.renderPumping = 0;
   engine.renderTask = Promise.resolve();
   engine.renderSeq = 0; // unique protocol ids keep render forks distinct from foreground JOBs

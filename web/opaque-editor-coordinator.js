@@ -202,11 +202,16 @@
         if (!unique.has(key)) unique.set(key, box);
       }
       const boxes = [...unique.values()];
-      const requestedPage = Number.isInteger(Number(pageNumber))
-        ? Number(pageNumber)
-        : Number.isInteger(Number(near?.page)) ? Number(near.page) : null;
+      // An omitted page lets an active editor follow its source to another
+      // page. Number(null) is zero, not an explicit PDF page constraint.
+      const explicitPage = pageNumber != null && Number.isInteger(Number(pageNumber)) && Number(pageNumber) > 0
+        ? Number(pageNumber) : null;
+      const requestedPage = explicitPage ?? (
+        near?.page != null && Number.isInteger(Number(near.page)) && Number(near.page) > 0
+          ? Number(near.page) : null
+      );
       const onPage = requestedPage == null ? boxes : boxes.filter((box) => box.page === requestedPage);
-      const available = onPage.length ? onPage : Number.isInteger(Number(pageNumber)) ? [] : boxes;
+      const available = onPage.length ? onPage : explicitPage != null ? [] : boxes;
       if (!available.length) return null;
 
       if (Number.isFinite(Number(near?.x)) && Number.isFinite(Number(near?.y))) {

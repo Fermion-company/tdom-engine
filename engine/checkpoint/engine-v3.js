@@ -1069,7 +1069,7 @@ export class CheckpointEngine {
         displayList: (page) => this.#displayList(page),
         scheduleHeaders: () => this.#scheduleHeaders(),
         enforceCheckpointCap: () => this.#enforceCheckpointCap(),
-        scheduleBackground: (fgStop, dirtyBlocks) => this.#scheduleBackground(fgStop, dirtyBlocks),
+        scheduleBackground: (fgStop, dirtyBlocks, options) => this.#scheduleBackground(fgStop, dirtyBlocks, options),
         shipUpdate: (sourceText) => this.#shipUpdate(sourceText),
         fidelitySummary: () => this.#fidelitySummary(),
       },
@@ -1360,14 +1360,14 @@ export class CheckpointEngine {
     for (const k of labels ?? []) cur.labels.add(k);
   }
 
-  #scheduleBackground(fromIdx, dirtyBlocks) {
+  #scheduleBackground(fromIdx, dirtyBlocks, options) {
     scheduleBackgroundHelper(this, dirtyBlocks, {
       locked: (fn) => this.#locked(fn),
       runChainPass: () => this.#runChainPass(),
       chunkTargets: (block) => this.#chunkTargets(block),
-      queueRender: (id) => this.#queueRender(id),
+      queueRender: (id, renderOptions) => this.#queueRender(id, renderOptions),
       retireOffGrid: (idx) => this.#retireOffGrid(idx),
-    });
+    }, options);
   }
 
   async #runChainPass() {
@@ -1406,14 +1406,14 @@ export class CheckpointEngine {
     return chunkTargets(block);
   }
 
-  #queueRender(blockId) {
+  #queueRender(blockId, options) {
     queueRenderHelper(this, blockId, {
       awaitRender: (key, timeout) => this.#await(key, timeout),
       renderIsolated: (block, idx) => this.#renderIsolated(block, idx),
       asyncRepaginate: () => this.#asyncRepaginate(),
       chunkTargets: (block) => this.#chunkTargets(block),
       releaseRenderHold: (idx) => this.#releaseRenderHold(idx),
-    });
+    }, options);
   }
 
   /**
