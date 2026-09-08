@@ -114,7 +114,7 @@ display list は本文 glyph と行単位の exact chunk を別素材として�
 
 欠けた数式・不一致のページ構成・編集位置の未証明などで新しい紙面を提示できない場合、client は `POST /canonical/display-demand` に現在の `documentEpoch`・`srcRev`・表示側の `demandId` を送る。その版の既存予約だけを display cadence へ早め、追加の組版は作らない。完成したresidentページ群を実際に提示できたら同IDの `fulfilled: true` を送り、全表示側の需要が解消した未開始予約だけを通常のauthority cadenceへ戻す。待機の起点は最終編集時刻を保つ。同版を再び保留した場合やiframeを再作成した場合は新IDで再取得でき、遅延したfulfilledは別表示側の需要を消さない。IDは128文字、現在の版の既出IDは最大64件とし、同IDの重複はtimerを延長・再有効化しない。開始済み・成功済み・失敗済みの組版を需要通知から追加・取消・再試行しない。需要は対象の完了・失敗・別版への更新・文書resetで終わり、後続の無関係な編集は通常のauthority cadenceに戻る。`canonical.info()` の `scheduledInMs` は予約までの残り時間、`compiling` は実組版中、`displayDemandRev` は需要対象の版を示す。`ensure()`（export 経路）は渡された snapshot だけを compile し、途中の打鍵を連続して追いかけない。
 
-現在のforeground resident cohortが正確なchunkを生成中の場合だけ、需要で早めたtimerの開始を待たせる。queuedとactiveを同じ原文revisionで追跡し、activeはTeX完了後のPDF変換・cropまで含む。完了後は提示通知用に200msを確保し、待機全体はその原文予約から1200msまでとする。失敗・isolated fallback・対象cohortなしは待機しない。改ページ・ページ数不一致・編集位置の未証明・canonical-only・decode失敗の需要は `residentImpossible: true` で待機を外し、複数表示側のうち1つでもこの需要が残れば延期しない。同じIDで許す変更は待機不可への昇格だけ。`ensure()`・`settle()`・opaque組版はこのtimer専用待機を通らない。
+現在のforeground resident cohortが正確なchunkを生成中の場合だけ、需要で早めたtimerの開始を待たせる。queuedとactiveを同じ原文revisionで追跡し、activeはTeX完了後のPDF変換・cropまで含む。完了後は提示通知用に500msを確保し、待機全体はその原文予約から2000msまでとする。失敗・isolated fallback・対象cohortなしは待機しない。改ページ・ページ数不一致・編集位置の未証明・canonical-onlyの需要は `residentImpossible: true` で待機を外し、複数表示側のうち1つでもこの需要が残れば延期しない。入力先行・anchor返信待ち・読込失敗は一時状態として通常の上限付き待機を保つ。同じIDで許す変更は待機不可への昇格だけ。`ensure()`・`settle()`・opaque組版はこのtimer専用待機を通らない。
 
 ## 10.10b checkpoint 予算の硬い上限
 

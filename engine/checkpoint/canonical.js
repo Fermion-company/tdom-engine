@@ -574,8 +574,8 @@ export class CanonicalRenderer {
       // Give only this foreground cohort a bounded chance to supply exact
       // pixels, then allow its viewer's fulfillment to arrive. Cold queues,
       // isolated fallback, export/settle and canonical-only work never wait.
-      const remaining = job.scheduledAt + 1200 - Date.now();
-      const ack = Number.isFinite(state?.settledAt) ? state.settledAt + 200 - Date.now() : 0;
+      const remaining = job.scheduledAt + 2000 - Date.now();
+      const ack = Number.isFinite(state?.settledAt) ? state.settledAt + 500 - Date.now() : 0;
       const wait = state?.pending ? Math.min(25, remaining) : Math.min(ack, remaining);
       if (wait > 0) {
         this.#armPending(wait);
