@@ -21,7 +21,61 @@
 - preamble hash が変わったら `#bootRoot()` で resident root を起動し直す。
 - boot 失敗時は opaque に demote し、同じ preamble で毎打鍵 boot しない。
 
+raw source に危険環境が見えなくても、ローカル macro / custom environment の定義依存が
+page-building sink（環境、native column switch、強制列/改ページ、output routine primitive）へ到達する
+alias は ordered effect certificate を作る。開始・終了効果を一意に証明できる call site は source offset
+上の virtual event として segmenter に渡し、マクロで隠した `multicols` の内側を一つの atomic layout
+block にする。ブロックは stale-first を保ったまま exact rescue / ShippingChain へ送り、full canonical は
+background audit に限定する。証明不能な新 generation は page tree を公開せず last-known-good を保持する。
+解析は source generation ごとに作り直し、未使用の危険定義は structured のままにする。
+
 structured に復帰できる状態になったときは、opaque sticky を外して root を boot し直す。
+
+### 10.2a 表示境界と権威境界
+
+重い多段組文書では「すぐ見せられる範囲」と「正確だと宣言できる範囲」は一致しない。
+一つの source offset や page number に両方の責務を持たせず、次の四境界を区別する。
+
+| 境界 | 許されること | 必要な証明 |
+| --- | --- | --- |
+| `VisualCut` | 旧 exact page 上に編集近傍だけを provisional overlay として見せる | 旧 presentation slot 内に収まり、source region と line witness が一意 |
+| `ResumeCut` | 新 generation の TeX replay を開始する | entry state、definition epoch、checkpoint lineage が一致 |
+| `PageSealCut` | 一枚の新 exact page を表示候補にする | 完全 replay PDF 内で page ship が閉じ、世代と source snapshot が一致 |
+| `TreeCommitCut` | page count と suffix page tree を新世代へ切り替える | 影響 suffix の complete bundle が揃い、generation CAS を通過 |
+
+TeX の実行は編集 offset からではなく、その編集に因果的に先行する最寄りの certified `ResumeCut`
+から始める。`multicols` の内部に checkpoint/resume 能力がない場合、開始 alias より前へ戻る。
+一方 `VisualCut` は paragraph 内に置いてよいが、常に非権威であり、ページ数・後続ページ位置・
+現在 generation の完成を主張しない。複数 generation の共存は presentation slot ごとの
+last-known-good と pending 表示に限り、同じ page/tree を途中で splice しない。
+
+現行 Phase A は、ordered effect を証明できた page-building alias を `shipping-exact` policy にする。
+source/checkpoint の incremental 処理は維持するが、JS paginator の page patch は表示せず、直前の
+exact page を保持して complete ShippingChain wave だけを原子的に昇格する。通常本文の編集応答では
+表示不可能な resident state/rescue walk も行わず、source generation を先に ShippingChain へ渡す。
+ただし埋め込み直接編集では、Shipping の原文・SyncTeX の世代対応と editor 転送の証明がないため
+wave を表示せず直前の編集可能な面を保持し、既存の版・需要IDを使って canonical 表示を要求する。
+Shipping replay の plain edit admission は brace depth 0 を要求しない。代わりに旧新の source partition が
+同じで差分が一つの balanced unit に閉じること、選択した checkpoint の consumed-unit cursor がその unit
+より前であることを要求する。したがって `\footnote{...}` や TikZ node の braced visible text も、その
+argument 全体を再入力できる cut からだけ replay する。複数ページを生成する巨大 macro argument は一つの
+unit のままなので、その unit を既に token list 化した内部 page checkpoint は選ばれない。math、comment、
+control word、inline verb / verbatim、TeX 特殊文字は fail closed のままである。moving argument が `.lof`
+などの出力 manifest を変えた generation は実行できても `TreeCommitCut` を通さず、旧 exact page を保つ。
+通常の小文書は
+`structured` のままなので、この保守策のために canonical 全文 compile を foreground で待たない。
+Phase B では lexical paragraph children と `AtomicLayoutRegion` を分離し、領域内でも証明できる
+plain-text edit だけを `VisualCut` overlay として先行表示する。
+
+性能契約は、200行級の通常 `structured` 文書で provisional p95 120ms以内、exact/current p95
+250ms以内（p99 400ms以内）を目標にする。100ページの `shipping-exact` 文書では source acceptance
+p95 150ms以内、edited-page exact p95 850ms以内を目標にし、期限を外した generation は表示せず
+last-known-good を保持する。
+
+現行 ShippingChain は `\begin{document}` hook 完了後、最初の user source unit を読む直前に page 0 の
+body-root checkpoint を作る。first page の plain edit は preamble を再実行せず、この root から全 body を
+exact replay する。700ms の replay deadline を越えた edit は exact tree を昇格せず、Phase B の
+`VisualCut` が入るまでは旧 exact pixels を保持する。source acceptance と新しい文字の即時描画は同義ではない。
 
 ## 10.3 diff と checkpoint rekey
 
@@ -97,19 +151,24 @@ isolated compile の dormant absorb には暴走上限（fires > 50）があり�
 
 ## 10.10 render、shipping、canonical
 
-hot path の最後に `#scheduleBackground(fgStop, dirtyBlocks)`、`#shipUpdate(source)`、`canonical.schedule(source, srcRev)` が呼ばれる。
+hot path の最後に `#shipUpdate(source)`、`canonical.schedule(source, srcRev)`、`#scheduleBackground(fgStop, dirtyBlocks, options)` が呼ばれる。
 
-`#scheduleBackground()` は二つの仕事を予約する。
+`#scheduleBackground()` は chain と resident render を予約する。
 
 - pending chain があれば idle 後に chain pass を走らせる。
 - dirty block 数が `TDOM_RENDER_HOT_MAX` 以下なら、needsRender な hot block を resident exact-render queue に積む。display math は foreground JOB の node list を post-block checkpoint に世代付きで保持し、queue 側は CAPTURE を先に試す。これにより block source の二重組版を避ける。保持 list が退役・世代不一致なら、pre-block checkpoint の従来 RENDER へ自動 fallback する。
-- 新しい編集は、前の edit/boot が残した resident exact render と未着手 queue を preempt する。render fork は foreground JOB と衝突しない固有 request id で追跡し、現在編集中の block が全 lane の解放を待たないようにする。
+- 通常編集の foreground で変わった bounded hot 集合には現在の `srcRev` を付け、後着の cold queue より先に、最終編集から `TDOM_RENDER_QUIET_MS`（既定120ms）後に処理する。編集中の block だけでなく、同じ紙面の一括表示に必要な隣接 block も含める。boot/reboot・過去世代・deferred chain は、有効な shipping baseline がある場合の優先時間（既定900ms）を維持し、現世代 hot への後着 background enqueue は優先度を落とさない。
+- 新しい編集は、前の edit/boot が残した resident render 子プロセスを preempt し、未着手 queue は保持する。旧世代の優先印は失効し、同時実行数（既定2）と checkpoint の上限は変えない。render fork は foreground JOB と衝突しない固有 request id で追跡する。
 
-exact chunk が stale の短い区間では、math-only 行は直前の正しい TeX pixel を保持する。新しい式を別フォントで近似する MathLive bridge は使わない。raw math run は初回 paint から透明で、inline / display / 複数行数式のいずれも、前回の安全な pixel を使えなければ exact chunk が届くまで空白へ fail closed する。fresh chunk は exact 判定された連続行だけの window として貼り、同じ block の安全な散文行は構造化 glyph のまま維持する。これにより数式の前後にある `\texttt` / `\textit` などの本文装飾を render 待ちに巻き込まない。
+display list は本文 glyph と行単位の exact chunk を別素材として保持する。stale chunk・未取得の exact 素材・透明な math run が残る場合、ビューアはその新しいページ群を公開せず、直前の完成した紙面を保持する。fresh chunk は exact 判定された連続行だけの window にし、安全な散文行や `\texttt` / `\textit` は glyph のまま使う。全素材・文字座標・ソース範囲が揃ってから、影響するページ群を同時に提示する。MathLiveによる別フォントの数式描画で補わない。
 
-各 edit report と async patch は、その時点の font manifest を page patch と同時に送る。client は新しい `@font-face` を登録してから patch を描き、face の decode が完了するまでは該当 run を透明に保つ。fallback font を途中状態として見せない。
+各 edit report と async patch は、その時点の font manifest を page patch と同時に送る。client は新しい `@font-face` を登録し、face の decode が完了するまでページ群の提示を待つ。画面外の準備中に該当 run が透明でも、表示中の完成ページは保持する。
 
-`canonical.schedule()` は source/rev を保存して timer を張るだけである。実際の full `lualatex` compile は edit response を待たせない。structured モードでは canonical は「権威」であって表示の主役ではない（リアルタイム provisional が主役）。cadence は「執筆中は走らない」設計である: 文書ごとの初回だけ `debounceMs`（既定 2500ms）で速攻の baseline を 1 回取り、以降は `idleMs`（既定 30s = 手が本当に止まった状態）＋コスト比例 cooldown（factor 2、cap は既定 600s — 旧 30s cap は長文書の duty 比バウンドを壊していた）を両方満たすまで再コンパイルしない。opaque モードでは canonical が唯一の表示なので `displayDebounceMs`（既定 350ms）で即応しつつ、half-duty の cost cooldown（factor 1、cap 60s）で長文書の連続再コンパイルを防ぐ（`delayFor()` が pressure で分岐）。`ensure()`（export 経路）は渡された snapshot だけを compile し、compile 中に届いた打鍵を loop で追いかけない。
+`canonical.schedule()` は source/rev を保存して timer を張るだけで、full `lualatex` compile は edit response を待たせない。完成した provisional 面を提示できる structured モードでは、初回だけ `debounceMs`（既定2500ms）で baseline を取得し、以降は最終編集後の `idleMs`（既定30s）とコスト比例 cooldown（factor 2、cap 600s）を満たしてから確定する。opaque モードでは `displayDebounceMs`（既定350ms）と display cooldown（factor 1、cap 60s）を使い、長文書の連続再組版を抑える。
+
+欠けた数式・不一致のページ構成・編集位置の未証明などで新しい紙面を提示できない場合、client は `POST /canonical/display-demand` に現在の `documentEpoch`・`srcRev`・表示側の `demandId` を送る。その版の既存予約だけを display cadence へ早め、追加の組版は作らない。完成したresidentページ群を実際に提示できたら同IDの `fulfilled: true` を送り、全表示側の需要が解消した未開始予約だけを通常のauthority cadenceへ戻す。待機の起点は最終編集時刻を保つ。同版を再び保留した場合やiframeを再作成した場合は新IDで再取得でき、遅延したfulfilledは別表示側の需要を消さない。IDは128文字、現在の版の既出IDは最大64件とし、同IDの重複はtimerを延長・再有効化しない。開始済み・成功済み・失敗済みの組版を需要通知から追加・取消・再試行しない。需要は対象の完了・失敗・別版への更新・文書resetで終わり、後続の無関係な編集は通常のauthority cadenceに戻る。`canonical.info()` の `scheduledInMs` は予約までの残り時間、`compiling` は実組版中、`displayDemandRev` は需要対象の版を示す。`ensure()`（export 経路）は渡された snapshot だけを compile し、途中の打鍵を連続して追いかけない。
+
+現在のforeground resident cohortが正確なchunkを生成中の場合だけ、需要で早めたtimerの開始を待たせる。queuedとactiveを同じ原文revisionで追跡し、activeはTeX完了後のPDF変換・cropまで含む。完了後は提示通知用に500msを確保し、待機全体はその原文予約から2000msまでとする。失敗・isolated fallback・対象cohortなしは待機しない。改ページ・ページ数不一致・編集位置の未証明・canonical-onlyの需要は `residentImpossible: true` で待機を外し、複数表示側のうち1つでもこの需要が残れば延期しない。入力先行・anchor返信待ち・読込失敗は一時状態として通常の上限付き待機を保つ。同じIDで許す変更は待機不可への昇格だけ。`ensure()`・`settle()`・opaque組版はこのtimer専用待機を通らない。
 
 ## 10.10b checkpoint 予算の硬い上限
 
@@ -133,3 +192,9 @@ exact chunk が stale の短い区間では、math-only 行は直前の正しい
 - shipping chain の boot、page ship、page SVG 変換。
 
 これらは async patch、canonical SSE、または次回 `GET /doc` の state として反映される。
+
+## 10.12 direct input の表示処理
+
+文字入力、MathLive の選択変更、スクロール、ズーム、リサイズは同じフレーム予約を共有する。位置の調整が必要なフレームでは、その調整とカーソル描画を一度に行う。クリックで確定した位置と新しい PDF geometry の採択は同期で反映し、古い描画予約を取り消す。
+
+未反映の入力に対しては、直前の紙面で証明したカーソル位置を保つ。新しいモデル全体の caret を計算してから捨てる処理は行わない。通常の選択表示はページ寸法を一度読み、全マーカーを detached fragment に作って一度で置き換える。選択文字数に比例して layout read と DOM write を交互に行わない。IME 未確定文字だけは、候補位置に必要な実ブラウザ寸法を表示後に読む。

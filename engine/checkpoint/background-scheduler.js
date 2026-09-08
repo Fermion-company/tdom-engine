@@ -1,6 +1,6 @@
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 
-export function scheduleBackground(engine, dirtyBlocks, callbacks) {
+export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive = false } = {}) {
   const { locked, runChainPass, chunkTargets, queueRender, retireOffGrid } = callbacks;
   // Deferred chain work is the ONLY background chain activity (docs/10
   // §I3): nothing runs while the user is typing. The pass starts after a
@@ -40,7 +40,7 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks) {
     const stale = chunkTargets(block).some(
       (t) => engine.chunks.get(t.key)?.forGalley !== block.galleyHash
     );
-    if (stale) queueRender(id);
+    if (stale) queueRender(id, { interactiveRev: interactive ? engine.srcRev : null });
   }
   // stale render holds: the held block moved/changed under its index, or
   // its chunks are already fresh — resume normal grid retirement

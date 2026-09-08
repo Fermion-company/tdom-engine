@@ -1,6 +1,10 @@
 import { fnv1a } from '../hash.js';
+import path from 'node:path';
 import { compareCanonicalText } from './canonical-verification.js';
-import { canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip } from './canonical-crop.js';
+import {
+  canonicalCropMetrics, canonicalBlockBands, leadingGalleySkip,
+  canonicalCropWitness, certifiedCanonicalCrop,
+} from './canonical-crop.js';
 import { cropSvgAt } from './util/svg.js';
 
 const PAPER_EPSILON_PT = 0.5;
@@ -83,8 +87,8 @@ export function onCanonicalResult(
 /**
  * Canonical-crop chunk source (the cheapest exact pixels in the system):
  * when a fresh canonical compile matches the current source, every block
- * whose exact preview chunk is missing/stale gets it cropped straight out
- * of the canonical page SVG. No compile at all: the pixels are the ones
+ * whose exact preview chunk is missing/stale can be cropped from the
+ * canonical page SVG only after a complete physical line proof. The pixels are the ones
  * the overlay already shows, but registering them as chunks means the
  * NEXT edit to that block holds a clean stale-exact band instead of
  * bridge glyphs. This is the ONLY bulk chunk source — the resident
@@ -95,13 +99,15 @@ export function onCanonicalResult(
 export async function cropCanonicalChunks(engine, info, { asyncRepaginate }) {
   if (engine.mode !== 'structured' || engine.srcRev !== info.rev) return;
   if (engine.previewPolicy !== 'structured') return;
-  // pagination drift means provisional coordinates cannot address the
-  // canonical pages — never crop pixels from the wrong page
+  // Page-count equality only avoids needless proof work; it does not prove
+  // that a provisional block occupies the same physical canonical band.
   if (engine.pages.length !== info.pageCount) return;
+  if (!engine.canonical.sourceMatches(engine.getSource(), info.id)) return;
   const geo = engine.geometry;
   if (!geo) return;
+  const pages = engine.pages;
   const cropMetrics = canonicalCropMetrics(geo);
-  const bands = canonicalBlockBands(engine.pages, cropMetrics.top);
+  const bands = canonicalBlockBands(pages, cropMetrics.top);
   let budget = Number(process.env.TDOM_CANON_CROP_MAX || 40);
   let changed = false;
   for (const block of engine.blocks) {
@@ -112,25 +118,60 @@ export async function cropCanonicalChunks(engine, info, { asyncRepaginate }) {
     if (engine.renderWant.has(block.id)) continue; // a hot render is coming
     const band = bands.get(block.id);
     if (!band || band.split) continue;
+    const witness = canonicalCropWitness(block);
+    if (!witness) continue;
+    budget--; // bound proof work as well as successful crops
+    const galley = block.galley, forGalley = block.galleyHash;
+    const candidates = await canonicalCropCandidates(engine, block, info.id);
+    if (!candidates?.length) continue;
+    const paintPages = await engine.canonical.pdfPaintPages(info.id, [band.page]);
+    if (!paintPages) continue;
     const lead = leadingGalleySkip(block.galley);
-    const h = block.galley.h + block.galley.d;
-    const w = block.galley.w;
-    if (!(h > 0) || !(w > 0)) continue;
-    const pageSvg = await engine.canonical.pageSVG(band.page, info.id).catch(() => null);
-    if (!pageSvg) continue;
-    if (engine.srcRev !== info.rev) return; // superseded mid-pass
+    const crop = certifiedCanonicalCrop({ witness, band, left: cropMetrics.left, lead, candidates, paintPages });
+    if (!crop) continue;
+    const [pageSvg, editGlyphs] = await Promise.all([
+      engine.canonical.pageSVG(crop.page, info.id).catch(() => null),
+      engine.canonical.pageEditGlyphs(info.id, crop.page),
+    ]);
+    if (!pageSvg || !editGlyphs) continue;
+    if (engine.srcRev !== info.rev || engine.pages !== pages ||
+        !engine.canonical.sourceMatches(engine.getSource(), info.id)) return;
+    if (block.galley !== galley || block.galleyHash !== forGalley || !engine.blocks.includes(block)) continue;
     const prev = engine.chunks.get(block.id);
+    if (prev && prev.forGalley === forGalley) continue; // a resident render won during the proof
     engine.chunks.set(block.id, {
-      svg: cropSvgAt(pageSvg, cropMetrics.left, band.top - lead, w, h),
-      wBp: w,
-      hBp: h,
+      svg: cropSvgAt(pageSvg, crop.left, crop.top, crop.width, crop.height),
+      editCanonicalId: info.id,
+      editPage: crop.page,
+      editX: crop.left,
+      editY: crop.top,
+      // The chunk can outlive the four retained canonical generations.
+      // Keep its immutable glyphs with its immutable SVG, not just an ID.
+      editGlyphs: Promise.resolve(editGlyphs),
+      wBp: crop.width,
+      hBp: crop.height,
       v: (prev?.v ?? 0) + 1,
-      forGalley: block.galleyHash,
+      forGalley,
     });
-    budget--;
     changed = true;
   }
   if (changed) asyncRepaginate();
+}
+
+async function canonicalCropCandidates(engine, block, id) {
+  const source = block.file ? block.sourceStart : engine.store.position(engine.file, block.start);
+  const end = block.file ? block.sourceEnd : engine.store.position(engine.file, block.end);
+  const first = Number(source?.line), last = Number(end?.line);
+  if (!Number.isInteger(first) || !Number.isInteger(last) || first < 1 || last < first || last - first >= 48) return null;
+  const file = block.file
+    ? engine.includes.get(block.file)?.readPath ?? block.file
+    : path.join(engine.canonical.workDir, 'canon.tex');
+  const groups = [];
+  for (let line = first; line <= last; line++) {
+    if (engine.canonical.generationCertificate(id)?.rev !== engine.srcRev) return null;
+    groups.push(await engine.canonical.forwardSyncAll({ file, line, column: line === first ? source.column : 1, id }));
+  }
+  return groups.flat();
 }
 
 /**

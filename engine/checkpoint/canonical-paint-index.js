@@ -139,7 +139,45 @@ export function buildPdfPaintPage({ pageNumber, textContent, operatorList, viewp
     extracted.item.safe &&= paint.safe;
   }
   if (items.some((item) => item.glyphSizes.length !== Array.from(item.paintText).length)) return null;
-  return { page: pageNumber, items };
+  return {
+    page: pageNumber,
+    items,
+    // A reusable SVG crop copies every kind of paint in its rectangle.
+    // The line index proves text geometry only: a background path, image,
+    // transparency group or clip can otherwise hitchhike with a paragraph
+    // and move when that galley is reused. This additional whole-page gate
+    // belongs only to the crop shortcut; canonical-anchor's line proof and
+    // existing eligibility remain unchanged.
+    cropSafe: items.every(item => item.safe) && cropPageHasOnlyTextPaint(operatorList, OPS),
+  };
+}
+
+function cropPageHasOnlyTextPaint(operatorList, OPS) {
+  const allowed = new Set([
+    'dependency', 'save', 'restore', 'transform',
+    'setLineWidth', 'setLineCap', 'setLineJoin', 'setMiterLimit', 'setDash',
+    'setRenderingIntent', 'setFlatness',
+    'beginText', 'endText', 'setCharSpacing', 'setWordSpacing', 'setHScale',
+    'setLeading', 'setFont', 'setTextRise', 'moveText', 'setLeadingMoveText',
+    'setTextMatrix', 'nextLine', 'showText', 'showSpacedText',
+    'nextLineShowText', 'nextLineSetSpacingShowText',
+    'setStrokeGray', 'setFillGray', 'setStrokeRGBColor', 'setFillRGBColor',
+    'setStrokeCMYKColor', 'setFillCMYKColor',
+  ].map(name => OPS[name]).filter(Number.isInteger));
+  for (let index = 0; index < operatorList.fnArray.length; index++) {
+    const op = operatorList.fnArray[index], args = operatorList.argsArray[index] ?? [];
+    if (op === OPS.setTextRenderingMode) {
+      if (Number(args[0]) !== 0) return false;
+    } else if (op === OPS.setGState) {
+      // Only explicit opaque/default compositing is understood. Unknown
+      // extended state (including soft masks and transfer functions) is not
+      // evidence that a crop contains only its witnessed glyphs.
+      if (!Array.isArray(args[0]) || args[0].some(([key, value]) =>
+        !((key === 'ca' || key === 'CA') && value === 1 ||
+          key === 'BM' && (value === 'Normal' || value === 'source-over')))) return false;
+    } else if (!allowed.has(op)) return false;
+  }
+  return true;
 }
 
 /** Certify a unique full matching from every base resident line to a

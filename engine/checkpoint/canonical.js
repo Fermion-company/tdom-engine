@@ -22,6 +22,8 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
+import { readFile } from 'node:fs/promises';
+import { gunzip } from 'node:zlib';
 import {
   mkdirSync,
   writeFileSync,
@@ -38,8 +40,11 @@ import { performance } from 'node:perf_hooks';
 import { fnv1a } from '../hash.js';
 import { withProjectInputs } from '../project-inputs.js';
 import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-index.js';
+import { pdfEditGlyphs } from './pdf-edit-geometry.js';
+import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
 
 const execFileP = promisify(execFile);
+const gunzipP = promisify(gunzip);
 const MAX_PASSES = 3;
 const SVG_CACHE_MAX = 400; // pages kept as SVG strings (LRU)
 // Keep the latest result plus three predecessors. A browser may still be
@@ -55,11 +60,11 @@ export class CanonicalRenderer {
     docDir,
     overlayDir = null,
     // Structured mode: canonical is the AUTHORITY, consumed when the user
-    // is DONE writing for a while or asks for it (export) — never per
-    // keystroke, never per short pause. Real writing does not recompile
-    // the document every few seconds; the provisional layer owns the live
-    // display and is already correct, so canonical is a background
-    // confirmation pass. Cadence:
+    // is DONE writing for a while or asks for it (export). While a complete
+    // provisional page is available, canonical is a background confirmation
+    // pass. If the viewer has to retain an older page, requestDisplay()
+    // promotes only that pending source revision to the display cadence.
+    // Background cadence:
     //   - no compile yet: debounceMs (fast first baseline, one compile)
     //   - after that: idleMs of continuous quiet (a real writing pause,
     //     not a glance at the preview) AND the cost cooldown below.
@@ -67,6 +72,7 @@ export class CanonicalRenderer {
     debounceMs = Number(process.env.TDOM_CANON_DEBOUNCE ?? 2500),
     idleMs = Number(process.env.TDOM_CANON_IDLE ?? 30_000),
     displayDebounceMs = Number(process.env.TDOM_CANON_DISPLAY_DEBOUNCE ?? 350),
+    residentDisplayState = null,
   }) {
     const resolvedWorkDir = path.resolve(workDir);
     mkdirSync(resolvedWorkDir, { recursive: true });
@@ -81,15 +87,27 @@ export class CanonicalRenderer {
     this.debounceMs = debounceMs;
     this.idleMs = idleMs;
     this.displayDebounceMs = displayDebounceMs;
+    this.residentDisplayState = residentDisplayState;
     this.timer = null;
+    this.timerDueAt = 0;
     this.running = null; // in-flight compile promise
+    this.runningJob = null; // revision/input ownership for display demand
     this.pendingJob = null; // {source, rev} superseding the in-flight compile
+    this.displayDemand = null; // {rev, inputEpoch}, only for existing work
+    this.displayDemandEpoch = null; // viewer document epoch for demand ownership
+    this.lastDisplayDemandRev = -1; // finished/failed revisions never retry
+    this.displayDemandInputEpoch = null;
+    this.displayDemandClosed = false;
+    this.activeDisplayDemandIds = new Set();
+    this.residentImpossibleDemandIds = new Set();
+    this.seenDisplayDemandIds = new Set(); // at most 64 IDs for this revision
     this.idSeq = 0;
     this.last = null; // last GOOD compile: {id, rev, srcHash, pdf, pageCount, paper, passes, ms}
     this.lastError = null; // {rev, message}
     // Demand-paced authority (docs/10 §I3): in structured mode the canonical
-    // output is consumed when the user is DONE writing or exports — not per
-    // edit. Recompiles are paced by their own cost (a cooldown of
+    // output normally confirms a completed provisional view after a writing
+    // pause or export. Display demand can promote one pending revision.
+    // Recompiles are paced by their own cost (a cooldown of
     // cooldownFactor × last compile time), which bounds canonical's CPU duty
     // cycle at ~1/(1+factor). The cap exists only so a pathological compile
     // cannot postpone the refresh forever; it must stay far above any real
@@ -126,6 +144,7 @@ export class CanonicalRenderer {
     // page.  Resolve that PDF content matrix lazily per retained page.
     this.syncTransformCache = new Map(); // `${id}:${page}` -> affine matrix | null (unsafe)
     this.syncTransformInFlight = new Map(); // `${id}:${page}` -> shared probe
+    this.sourceBoxInFlight = new Set(); // source-box reads must finish before document reset removes artifacts
     this.svgOutputSeq = 0;
     this.onResult = null; // callback({...info}) after every compile attempt
     this.disposed = false;
@@ -249,6 +268,7 @@ export class CanonicalRenderer {
       ...this.pdfDocumentInFlight.values(),
       ...this.paintPageInFlight.values(),
       ...this.syncTransformInFlight.values(),
+      ...this.sourceBoxInFlight,
     ]);
     if (jobs.size) await Promise.allSettled([...jobs]);
   }
@@ -342,6 +362,9 @@ export class CanonicalRenderer {
       passes: this.last?.passes ?? 0,
       ms: this.last?.ms ?? 0,
       inFlight: !!(this.running || this.timer || this.pendingJob),
+      compiling: Boolean(this.running),
+      scheduledInMs: this.timer ? Math.max(0, this.timerDueAt - Date.now()) : null,
+      displayDemandRev: this.displayDemand?.rev ?? null,
       error: this.lastError?.message ?? null,
       errorRev: this.lastError?.rev ?? 0,
       syncWarnings: this.last?.syncWarnings ?? [],
@@ -361,12 +384,105 @@ export class CanonicalRenderer {
     // audit runs (fuzz on CI) compare provisional state only — a full
     // lualatex per engine would OOM a 7GB hosted runner for nothing
     if (process.env.TDOM_NO_CANONICAL === '1') return;
-    this.pendingJob = { source, rev, inputEpoch: this.inputEpoch };
+    this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now() };
+    if (!this.#hasDisplayDemand(this.pendingJob)) this.displayDemand = null;
+    this.#armPending(this.delayFor());
+  }
+
+  /** Promote existing work while one or more viewers cannot present this revision. */
+  requestDisplay(rev, documentEpoch = 0, { demandId = null, residentImpossible = false } = {}) {
+    if (!Number.isSafeInteger(rev) || rev < 0 || !Number.isSafeInteger(documentEpoch) ||
+        documentEpoch < 0 || !this.#validDemandId(demandId) || typeof residentImpossible !== 'boolean' ||
+        this.disposed || this.resetting)
+      return { accepted: false, duplicate: false };
+    if (this.displayDemandEpoch !== null && documentEpoch < this.displayDemandEpoch)
+      return { accepted: false, duplicate: false };
+    if (documentEpoch !== this.displayDemandEpoch) {
+      this.displayDemandEpoch = documentEpoch;
+      this.lastDisplayDemandRev = -1;
+      this.displayDemand = null;
+    }
+    if (rev < this.lastDisplayDemandRev) return { accepted: false, duplicate: true };
+    if (rev > this.lastDisplayDemandRev) {
+      this.lastDisplayDemandRev = rev;
+      this.displayDemandInputEpoch = this.inputEpoch;
+      this.displayDemandClosed = false;
+      this.activeDisplayDemandIds.clear();
+      this.residentImpossibleDemandIds.clear();
+      this.seenDisplayDemandIds.clear();
+    }
+    const job = this.pendingJob;
+    if (this.seenDisplayDemandIds.has(demandId)) {
+      // A viewer can discover reflow after first waiting for a chunk. Its
+      // existing ownership may escalate once, but never reacquire or extend.
+      if (residentImpossible && this.activeDisplayDemandIds.has(demandId) &&
+          !this.residentImpossibleDemandIds.has(demandId) && this.#hasDisplayDemand(job) && job.rev === rev) {
+        this.residentImpossibleDemandIds.add(demandId);
+        this.#armPending(this.delayFor(job), { keepEarlier: true });
+      }
+      return { accepted: false, duplicate: true };
+    }
+    if (this.displayDemandClosed || this.displayDemandInputEpoch !== this.inputEpoch ||
+        !job || job.rev !== rev || job.inputEpoch !== this.inputEpoch || this.lastError?.rev === rev ||
+        this.runningJob?.rev === rev && this.runningJob.inputEpoch === this.inputEpoch)
+      return { accepted: false, duplicate: false };
+    if (this.seenDisplayDemandIds.size >= 64) return { accepted: false, duplicate: false, limited: true };
+    this.seenDisplayDemandIds.add(demandId);
+    this.activeDisplayDemandIds.add(demandId);
+    if (residentImpossible) this.residentImpossibleDemandIds.add(demandId);
+    this.displayDemand = { rev, inputEpoch: job.inputEpoch };
+    this.#armPending(this.delayFor(job), { keepEarlier: true });
+    return { accepted: true, duplicate: false };
+  }
+
+  /** A viewer committed complete resident ink before this demanded job started. */
+  fulfillDisplay(rev, documentEpoch, demandId) {
+    if (!Number.isSafeInteger(rev) || rev < 0 || !Number.isSafeInteger(documentEpoch) ||
+        documentEpoch !== this.displayDemandEpoch || !demandId || !this.#validDemandId(demandId) ||
+        this.disposed || this.resetting) return { released: false };
+    const job = this.pendingJob;
+    if (!this.#hasDisplayDemand(job) || job.rev !== rev || !this.activeDisplayDemandIds.has(demandId) ||
+        job.inputEpoch !== this.inputEpoch ||
+        this.runningJob?.rev === rev && this.runningJob.inputEpoch === this.inputEpoch) return { released: false };
+    this.activeDisplayDemandIds.delete(demandId);
+    this.residentImpossibleDemandIds.delete(demandId);
+    if (this.activeDisplayDemandIds.size) return { released: true, pendingViewers: this.activeDisplayDemandIds.size };
+    this.displayDemand = null;
+    // Preserve the last edit's idle deadline. Never cancel a running compile
+    // or create another job; a prior revision may be running independently.
+    if (this.pressure === 'authority') this.#armPending(this.delayFor(job, { preserveIdleStart: true }));
+    return { released: true, pendingViewers: 0 };
+  }
+
+  #validDemandId(id) {
+    return id === null || typeof id === 'string' && /^[A-Za-z0-9:_-]{1,128}$/.test(id);
+  }
+
+  #hasDisplayDemand(job) {
+    return !!(job && this.displayDemand && job.rev === this.displayDemand.rev &&
+      job.inputEpoch === this.displayDemand.inputEpoch && this.activeDisplayDemandIds.size);
+  }
+
+  #clearDisplayDemand(job) {
+    if (this.#hasDisplayDemand(job)) this.displayDemand = null;
+    if (this.lastDisplayDemandRev === job.rev && this.displayDemandInputEpoch === job.inputEpoch) {
+      this.activeDisplayDemandIds.clear();
+      this.residentImpossibleDemandIds.clear();
+      this.displayDemandClosed = true;
+    }
+  }
+
+  #armPending(delay, { keepEarlier = false } = {}) {
+    const wait = Math.max(0, Number(delay) || 0);
+    const dueAt = Date.now() + wait;
+    if (keepEarlier && this.timer && this.timerDueAt <= dueAt) return;
     clearTimeout(this.timer);
+    this.timerDueAt = dueAt;
     this.timer = setTimeout(() => {
       this.timer = null;
-      this.#drain();
-    }, this.delayFor());
+      this.timerDueAt = 0;
+      this.#drain({ waitForResident: true });
+    }, wait);
   }
 
   /**
@@ -375,21 +491,23 @@ export class CanonicalRenderer {
    * Authority (structured) mode: one fast baseline compile per document,
    * then nothing until the user has been quiet for idleMs AND the
    * cost-proportional cooldown has passed — active writing never pays a
-   * full compile. Display (opaque) mode: short debounce plus a half-duty
-   * cost cooldown. Public for tests.
+   * full compile. Opaque mode and a revision explicitly needed for display
+   * use a short debounce plus a half-duty cost cooldown. Public for tests.
    */
-  delayFor() {
+  delayFor(job = this.pendingJob, { preserveIdleStart = false } = {}) {
     const since = Date.now() - this.lastEndAt;
-    if (this.pressure !== 'authority') {
-      // opaque mode: canonical IS the display — stay responsive on small
+    if (this.pressure !== 'authority' || this.#hasDisplayDemand(job)) {
+      // canonical is needed for display — stay responsive on small
       // documents, but never let a long document compile back-to-back
       if (!this.last?.ms) return this.displayDebounceMs;
       const cool = Math.min(this.last.ms * this.displayCooldownFactor, this.displayCooldownCapMs);
       return Math.max(this.displayDebounceMs, cool - since);
     }
-    if (!this.last?.ms) return this.debounceMs; // fast first baseline
+    const elapsed = preserveIdleStart && Number.isFinite(job?.scheduledAt)
+      ? Math.max(0, Date.now() - job.scheduledAt) : 0;
+    if (!this.last?.ms) return Math.max(0, this.debounceMs - elapsed); // fast first baseline
     const cooldown = Math.min(this.last.ms * this.cooldownFactor, this.cooldownCapMs);
-    return Math.max(this.idleMs, cooldown - since);
+    return Math.max(0, this.idleMs - elapsed, cooldown - since);
   }
 
   /**
@@ -413,12 +531,15 @@ export class CanonicalRenderer {
     // No await between the check above and this assignment: #drain and
     // ensure both claim `running` synchronously, so two compiles can never
     // share the workdir.
+    this.runningJob = { rev, inputEpoch };
     this.running = this.#compile({ source, rev, inputEpoch })
       .catch((err) => {
         this.lastError = { rev, message: String(err?.message || err) };
       })
       .finally(() => {
         this.running = null;
+        this.runningJob = null;
+        this.#clearDisplayDemand({ rev, inputEpoch });
       });
     await this.running;
     this.lastEndAt = Date.now();
@@ -437,21 +558,37 @@ export class CanonicalRenderer {
       if (this.timer) {
         clearTimeout(this.timer);
         this.timer = null;
+        this.timerDueAt = 0;
       }
       await (this.running ?? this.#drain());
     }
   }
 
-  async #drain() {
+  async #drain({ waitForResident = false } = {}) {
     if (this.running) return this.running;
     if (!this.pendingJob) return;
     const job = this.pendingJob;
+    if (waitForResident && this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
+        !this.residentImpossibleDemandIds.size && typeof this.residentDisplayState === 'function') {
+      const state = this.residentDisplayState(job.rev);
+      // Give only this foreground cohort a bounded chance to supply exact
+      // pixels, then allow its viewer's fulfillment to arrive. Cold queues,
+      // isolated fallback, export/settle and canonical-only work never wait.
+      const remaining = job.scheduledAt + 2000 - Date.now();
+      const ack = Number.isFinite(state?.settledAt) ? state.settledAt + 500 - Date.now() : 0;
+      const wait = state?.pending ? Math.min(25, remaining) : Math.min(ack, remaining);
+      if (wait > 0) {
+        this.#armPending(wait);
+        return;
+      }
+    }
     this.pendingJob = null;
     if (this.last && this.last.srcHash === this.#sourceHash(job.source, job.inputEpoch)) {
       // the newest source is already compiled (an export ran it, or the
       // edits round-tripped back) — record the rev, skip the compile
       this.last.rev = job.rev;
       this.lastError = null;
+      this.#clearDisplayDemand(job);
       try {
         this.onResult?.(this.info());
       } catch {
@@ -459,18 +596,21 @@ export class CanonicalRenderer {
       }
       return;
     }
+    this.runningJob = { rev: job.rev, inputEpoch: job.inputEpoch };
     this.running = this.#compile({
       ...job,
       // Scheduled authority confirmation is intentionally below the live
-      // complete-PDF path. Export (`ensure`) and opaque display compiles stay
+      // complete-PDF path. Export, opaque display and demanded revisions stay
       // at normal priority because the user is directly waiting for them.
-      background: this.pressure === 'authority',
+      background: this.pressure === 'authority' && !this.#hasDisplayDemand(job),
     })
       .catch((err) => {
         this.lastError = { rev: job.rev, message: String(err?.message || err) };
       })
       .finally(() => {
         this.running = null;
+        this.runningJob = null;
+        this.#clearDisplayDemand(job);
       });
     await this.running;
     this.lastEndAt = Date.now();
@@ -480,16 +620,13 @@ export class CanonicalRenderer {
       /* observer errors must not break the drain loop */
     }
     // An edit landed while we compiled: converge on the newest source — at
-    // the authority cadence, NOT immediately. The old unconditional re-drain
+    // the job's authority/display cadence, not immediately. Unconditional re-drain
     // ran full compiles back-to-back for as long as the user kept typing,
     // which was the single biggest CPU sink on long documents. settle()
     // still converges promptly for exports/tests (it clears the timer and
     // drains directly).
     if (this.pendingJob && !this.disposed && !this.timer) {
-      this.timer = setTimeout(() => {
-        this.timer = null;
-        this.#drain();
-      }, this.delayFor());
+      this.#armPending(this.delayFor());
     }
   }
 
@@ -771,6 +908,37 @@ export class CanonicalRenderer {
     }
   }
 
+  async sourceEditBoxes({ file, page, startLine, endLine, id } = {}) {
+    if (!file || ![page, startLine, endLine, id].every(Number.isInteger) ||
+        page < 1 || startLine < 1 || endLine < startLine || endLine - startLine > 512) return null;
+    const cur = this.#acquireGeneration(id);
+    if (!cur) return null;
+    try {
+      if (!cur.synctex) return null;
+      const key = `${file}:${page}:${startLine}:${endLine}`;
+      cur.sourceBoxCache ??= new Map();
+      if (!cur.sourceBoxCache.has(key)) {
+        let job;
+        job = (async () => {
+          const compressed = await readFile(cur.synctex);
+          if (compressed.length > 8 * 1024 * 1024) return null;
+          const text = await gunzipP(compressed, { maxOutputLength: 32 * 1024 * 1024 });
+          const boxes = parseSyncTeXSourceBoxes(text.toString('utf8'), { file, page, startLine, endLine });
+          if (!boxes || this.disposed || this.resetting) return null;
+          const transform = await this.#syncContentTransform(cur, page);
+          if (transform == null) return null;
+          return boxes.map(box => ({ ...box, ...syncTeXResultToDisplayed(box, cur.papers?.[page - 1], transform) }));
+        })().catch(() => null).finally(() => this.sourceBoxInFlight.delete(job));
+        this.sourceBoxInFlight.add(job);
+        cur.sourceBoxCache.set(key, job);
+        while (cur.sourceBoxCache.size > 32) cur.sourceBoxCache.delete(cur.sourceBoxCache.keys().next().value);
+      }
+      return await cur.sourceBoxCache.get(key);
+    } finally {
+      this.#releaseGeneration(cur);
+    }
+  }
+
   /** True only when the supplied resident source is byte-identical to the
    * source/input epoch that produced one retained canonical generation. */
   sourceMatches(source, id = null) {
@@ -984,6 +1152,37 @@ export class CanonicalRenderer {
     return job;
   }
 
+  async pageEditGlyphs(id, pageNumber) {
+    const generation = this.#resolveGeneration(id);
+    if (!generation || !Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > generation.pageCount) return null;
+    // Store with the generation itself: retirement releases geometry as
+    // well as its PDF, and concurrent clicks share the same parse.
+    generation.editGlyphs ??= new Map();
+    if (!generation.editGlyphs.has(pageNumber)) {
+      generation.editGlyphs.set(pageNumber, (async () => {
+        const [pdfjs, document] = await Promise.all([this.#loadPdfJs(), this.#pdfDocument(generation.id)]);
+        if (!document || !this.#resolveGeneration(generation.id)) return null;
+        const page = await document.getPage(pageNumber);
+        const operatorList = await page.getOperatorList();
+        const glyphs = pdfEditGlyphs({ operatorList, viewport: page.getViewport({ scale: 1 }),
+          commonObjs: page.commonObjs, OPS: pdfjs.OPS, Util: pdfjs.Util });
+        return this.#resolveGeneration(generation.id) ? glyphs : null;
+      })().catch(() => null));
+    }
+    return generation.editGlyphs.get(pageNumber);
+  }
+
+  async pdfEditGlyphs(bytes, pageNumber) {
+    const pdfjs = await this.#loadPdfJs();
+    const document = await pdfjs.getDocument({ data: new Uint8Array(bytes),
+      isEvalSupported: false, stopAtErrors: true }).promise;
+    try {
+      const page = await document.getPage(pageNumber);
+      return pdfEditGlyphs({ operatorList: await page.getOperatorList(), viewport: page.getViewport({ scale: 1 }),
+        commonObjs: page.commonObjs, OPS: pdfjs.OPS, Util: pdfjs.Util });
+    } finally { await document.destroy(); }
+  }
+
   /**
    * Per-page plain text of the canonical PDF (for the exactness
    * verification pass). Returns null when pdftotext is unavailable.
@@ -1029,6 +1228,11 @@ export class CanonicalRenderer {
   /** Mark non-source inputs dirty. The next schedule/ensure compiles again. */
   invalidateInputs() {
     this.inputEpoch++;
+    this.displayDemand = null;
+    this.activeDisplayDemandIds.clear();
+    this.residentImpossibleDemandIds.clear();
+    this.seenDisplayDemandIds.clear();
+    this.displayDemandClosed = true;
   }
 
   /**
@@ -1043,7 +1247,15 @@ export class CanonicalRenderer {
     this.authorityPausedUntil = 0;
     clearTimeout(this.timer);
     this.timer = null;
+    this.timerDueAt = 0;
     this.pendingJob = null;
+    this.displayDemand = null;
+    this.displayDemandEpoch = null;
+    this.lastDisplayDemandRev = -1;
+    this.activeDisplayDemandIds.clear();
+    this.residentImpossibleDemandIds.clear();
+    this.seenDisplayDemandIds.clear();
+    this.displayDemandClosed = true;
     for (const child of this.children) {
       try {
         if (this.authorityChildren.has(child) && child.pid) {
@@ -1077,7 +1289,15 @@ export class CanonicalRenderer {
     this.authorityPausedUntil = 0;
     clearTimeout(this.timer);
     this.timer = null;
+    this.timerDueAt = 0;
     this.pendingJob = null;
+    this.displayDemand = null;
+    this.displayDemandEpoch = null;
+    this.lastDisplayDemandRev = -1;
+    this.activeDisplayDemandIds.clear();
+    this.residentImpossibleDemandIds.clear();
+    this.seenDisplayDemandIds.clear();
+    this.displayDemandClosed = true;
     for (const child of this.children) {
       try {
         if (this.authorityChildren.has(child) && child.pid) {

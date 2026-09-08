@@ -1,4 +1,5 @@
 import { SAFE_GLYPH } from './fidelity.js';
+import { instrumentEditRegions } from '../edit-regions.js';
 
 export function buildDomSnapshot({
   rev,
@@ -63,7 +64,10 @@ export function buildDomSnapshot({
     blocks: blocks.map((b, i) => {
       const chunkKeys = chunkTargets(b).map((t) => t.key);
       const blockRegions = [
-        ...(b.editRegions ?? []).map((region) => ({
+        // Canonical snapshots can arrive before an isolated rescue's
+        // resident metadata. Source spans are lexical and already known;
+        // never freeze a temporarily empty editing map into that PDF.
+        ...(b.editRegions ?? instrumentEditRegions(b.text).regions).map((region) => ({
           id: `${b.id}:${region.id}`,
           kind: region.kind,
           value: region.value,

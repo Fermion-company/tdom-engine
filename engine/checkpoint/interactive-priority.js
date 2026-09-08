@@ -1,8 +1,8 @@
 /**
  * Reserve the first post-edit window for the complete replay PDF.  The
- * checkpoint chain, exact block renders and header work are all valuable,
- * but none of them may make a publishable shipping generation miss its
- * user-visible deadline by competing for CPU first.
+ * checkpoint chain, cold block renders and header work remain behind this
+ * window. The current foreground's exact-render cohort has its own short
+ * debounce because its complete pixels can satisfy direct editing sooner.
  *
  * The guard is intentionally a little longer than the wave cutoff: the
  * browser still needs a small interval to strict-open the PDF and render

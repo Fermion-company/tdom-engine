@@ -56,12 +56,22 @@ async function enginePages() {
   });
   try {
     await engine.open(texSource);
-    // let the background chain, the async rescue pump AND the exact-render
-    // tier settle so the display lists carry their final chunk overlays
-    // (first-ever rescues are placeholders until the pump lands them)
-    await drain(engine);
-    await (engine.renderTask ?? Promise.resolve()).catch(() => {});
-    await (engine.hfTask ?? Promise.resolve()).catch(() => {});
+    // The resident render pump hands cold/missing checkpoints to a separate
+    // isolated queue and releases its lane immediately. Waiting for only
+    // renderTask can therefore compare a pending-exact table or formula.
+    // Canonical completion opens that queue's idle gate; then let every
+    // renderer finish and repeat if its arrivals scheduled another pass.
+    for (;;) {
+      await drain(engine);
+      await engine.canonical.settle();
+      const tasks = [engine.bgTask, engine.renderTask, engine.hfTask, engine.isoRenderQueue];
+      await Promise.allSettled(tasks);
+      await drain(engine);
+      const current = [engine.bgTask, engine.renderTask, engine.hfTask, engine.isoRenderQueue];
+      if (tasks.every((task, index) => task === current[index]) &&
+          !engine.renderPumping && !engine.renderWant.size &&
+          !(engine.isoRenderPending?.size) && !engine.canonical.info().inFlight) break;
+    }
     const dls = engine.getDisplayLists();
     const geo = engine.getGeometry();
     const debug = process.env.TDOM_DEBUG_BLOCKS

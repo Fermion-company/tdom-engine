@@ -46,22 +46,31 @@ const STANDALONE_LINE =
 const VERBATIM_BEGIN_RE =
   /\\begin\{(verbatim\*?|lstlisting|minted|alltt|filecontents\*?|[BLV]erbatim\*?)\}/;
 
-export function segmentBody(text, baseOffset) {
+export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
   const segs = [];
   const lines = splitLines(text);
+  const aliasEvents = [...structuralEvents].sort((a, b) => a.at - b.at);
+  let aliasEventIndex = 0;
   let envDepth = 0;
   let braceDepth = 0;
   let inDisplay = false;
   let inVerbatim = null; // env name while inside a literal environment
   let cur = null; // { start, end }
+  let curStructuralSinks = new Set();
 
   const flush = (endOffset) => {
     if (cur !== null) {
       const raw = text.slice(cur.start, endOffset);
       if (raw.trim().length > 0) {
-        segs.push({ start: baseOffset + cur.start, end: baseOffset + endOffset, text: raw });
+        segs.push({
+          start: baseOffset + cur.start,
+          end: baseOffset + endOffset,
+          text: raw,
+          structuralSinks: [...curStructuralSinks],
+        });
       }
       cur = null;
+      curStructuralSinks = new Set();
     }
   };
 
@@ -113,6 +122,15 @@ export function segmentBody(text, baseOffset) {
     // Track depth transitions on this line.
     envDepth += countMatches(stripped, /\\begin\{[^}]*\}/g);
     envDepth -= countMatches(stripped, /\\end\{[^}]*\}/g);
+    while (aliasEventIndex < aliasEvents.length && aliasEvents[aliasEventIndex].at <= ln.end) {
+      const event = aliasEvents[aliasEventIndex++];
+      if (event.at < ln.start) continue;
+      for (const sink of event.sinks ?? []) curStructuralSinks.add(sink);
+      for (const effect of event.effects ?? []) {
+        if (effect.kind === 'begin') envDepth++;
+        else if (effect.kind === 'end') envDepth--;
+      }
+    }
     if (envDepth < 0) envDepth = 0;
     // `\\[2mm]` in align/tabular is a row break with optional spacing, not
     // the display opener `\[`.  A substring regex sees the second slash of
@@ -228,6 +246,7 @@ export function diffBlocks(oldBlocks, segs, nextId) {
         includeStart: !!sg.includeStart,
         includeEnd: !!sg.includeEnd,
         externalGraphics: !!sg.externalGraphics,
+        structuralSinks: sg.structuralSinks ?? [],
         sourceChanged: true,
         typesetCostMs: ob.typesetCostMs,
       };
@@ -254,6 +273,7 @@ export function diffBlocks(oldBlocks, segs, nextId) {
       includeStart: !!sg.includeStart,
       includeEnd: !!sg.includeEnd,
       externalGraphics: !!sg.externalGraphics,
+      structuralSinks: sg.structuralSinks ?? [],
       sourceChanged: true,
     });
     dirty.add(id);
@@ -288,6 +308,7 @@ function refresh(block, seg) {
   block.includeStart = !!seg.includeStart;
   block.includeEnd = !!seg.includeEnd;
   block.externalGraphics = !!seg.externalGraphics;
+  block.structuralSinks = seg.structuralSinks ?? [];
   return block;
 }
 

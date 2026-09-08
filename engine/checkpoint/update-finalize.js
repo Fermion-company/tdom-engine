@@ -40,16 +40,15 @@ export function finalizeUpdate(engine, {
 
   engine.rev++;
   engine.srcRev++;
-  // Start the only sub-second, complete-PDF path before arming any
-  // replaceable background work. The schedulers below observe the shared
-  // post-edit priority window and stay idle until the shipping deadline has
-  // passed; this ordering also binds the shipping generation to srcRev.
+  // Bind shipping and the foreground exact-render cohort to the same source
+  // revision. Cold work keeps the shipping priority window; edited blocks
+  // and their changed neighbors may supply an earlier complete preview.
   shipUpdate(text);
   // converge to exact: the canonical compile of THIS source is scheduled
   // off the hot path; when it lands the client swaps every clean page to
   // LuaLaTeX's own pixels
   engine.canonical.schedule(text, engine.srcRev);
-  scheduleBackground(fgStop, dirtyBlocks);
+  scheduleBackground(fgStop, dirtyBlocks, { interactive: !rebooted });
   timer.lap('schedule');
   return buildUpdateResponse({
     rev: engine.rev,
@@ -78,6 +77,76 @@ export function finalizeUpdate(engine, {
     rebuilt,
     pages,
     changedLabels,
+    verifyState: engine.verifyState,
+    fidelity: fidelitySummary(),
+    fonts: engine.getFontManifest(),
+    diagnostics,
+    engineDiagnostics: engine.diagnostics,
+  });
+}
+
+/**
+ * A certified structural alias gives us safe source/region boundaries, not
+ * a trustworthy JS page tree.  When ShippingChain is available, an ordinary
+ * body keystroke therefore has no reason to wait for resident state jobs or
+ * isolated rescue adoption: neither result is eligible for presentation.
+ * Advance the immutable source generation immediately and let the native
+ * complete-PDF lane prove the next physical pages.  The resident tree stays
+ * last-known-good and is explicitly marked for a deferred rebuild.
+ */
+export function finalizeShippingExactUpdate(engine, {
+  text,
+  editLabel,
+  dirtySource,
+  firstDirty,
+  rebooted,
+  diagnostics,
+  timer,
+  callbacks,
+}) {
+  const { queueChainWork, shipUpdate, scheduleBackground, fidelitySummary } = callbacks;
+  queueChainWork('rebuild', Math.max(0, firstDirty), []);
+  timer.lap('typeset');
+  timer.lap('paginate');
+
+  engine.rev++;
+  engine.srcRev++;
+  // Bind the fast exact replay before scheduling the low-priority canonical
+  // audit.  Both consume this immutable source text/srcRev pair.
+  shipUpdate(text);
+  engine.canonical.schedule(text, engine.srcRev);
+  scheduleBackground(firstDirty, []);
+  timer.lap('schedule');
+
+  const canonical = engine.canonical.info();
+  return buildUpdateResponse({
+    rev: engine.rev,
+    srcRev: engine.srcRev,
+    editLabel,
+    backendName: engine.backendName,
+    mode: engine.mode,
+    modeReasons: engine.modeReasons,
+    previewPolicy: engine.previewPolicy,
+    previewReasons: engine.previewReasons,
+    canonical,
+    dirtySource,
+    dirtyBlocks: [...dirtySource],
+    depDirty: [],
+    dirtyPages: [],
+    patches: [],
+    timerStats: timer.done(),
+    blocks: engine.blocks,
+    typesetCount: 0,
+    forkMs: 0,
+    rebooted,
+    checkpoints: engine.checkpoints,
+    verdict: 'shipping-deferred',
+    pendingChain: engine.pendingChain,
+    reused: engine.pages.length,
+    rebuilt: 0,
+    pages: engine.pages,
+    reportedPageCount: canonical.pageCount || engine.pages.length,
+    changedLabels: new Set(),
     verifyState: engine.verifyState,
     fidelity: fidelitySummary(),
     fonts: engine.getFontManifest(),

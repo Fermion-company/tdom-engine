@@ -108,6 +108,18 @@ large math glyph、OpenType math、PUA/unencoded glyph、PDF literal などは d
 13. dirty block の high-fidelity render と deferred chain を schedule する。
 14. `canonical.schedule(source, srcRev)` で正本 compile を予約する。
 
+structured safety は raw 本文だけでは判定しない。preamble と展開済み project body にある
+ローカル定義（`newcommand` / primitive `def` / `let` / `newenvironment` / xparse 系）を軽量 lexer で読み、
+`multicols`・`paracol`・`longtable`・`twocolumn` / `onecolumn`・強制列/改ページ・output routine
+primitive などの page-building sink への依存を worklist で
+固定点伝播する。使用された alias の ordered structural effect を一意に証明できる場合は、元 source
+offset 上の virtual event として segmenter へ渡し、隠れた begin/end の内側を atomic layout block にする。
+その block は JS page builder ではなく exact rescue / ShippingChain が担当し、preview policy は
+`shipping-exact` になる。source/checkpoint は structured のまま保つが、resident page patch は表示せず、
+complete replay PDF の ship wave だけを新しい物理ページへ昇格する。証明できない generation は
+新しい page tree を公開せず last-known-good を保持し、full canonical を foreground では待たない。
+コメント・inline verb・verbatim 系環境は解析対象外である。
+
 foreground verification の現在の初期 budget は、galley divergence 用が 8 block、local state ripple 用が 4 block である。ここを超えた伝播は、編集応答の中で文書末尾まで歩かず async chain に送られる。
 
 ## 3.7 checkpoint suffix の扱い
@@ -126,11 +138,14 @@ foreground verification の現在の初期 budget は、galley divergence 用が
 `pagebuilder.js` は、daemon から受けた real node stream を page に割る。現在扱う主なものは次である。
 
 - TeX の合法 break point と badness/penalty による page break。
-- `\topskip`、`\maxdepth`、`\skip\footins`、footnote rule。
+- `\topskip`、`\maxdepth`、`\skip\footins`、footnote rule。脚注区切りの幅・伸縮は各ページの最初の脚注で一度だけ改ページ判断へ計上する。
 - LaTeX float placement の主要経路。
 - `\newpage` / `\clearpage` などの eject marker。
 - raggedbottom / flushbottom の glue distribution。
+- `\enlargethispage` の本文組版高とstar版の縮小。計測driverはmarkerを記録し、実際に出力するisolated childではLaTeXの元命令を使う。通常ページの紙面高・フッター位置は維持する。
 - page boundary snapshot による incremental rebuild と page reuse。
+
+warm/rescue の組版結果が同一でも、chunkの版が変わった場合は表示リストを再生成し、画像と入力座標が参照する版を揃える。
 
 標準 class option の二段組と本文中の `\onecolumn` / `\twocolumn` は、page builder の結果を表示せず、resident LuaLaTeX の実定義・実列幅による行組みだけを canonical-addressed overlay に使う。列切替時の `\box255` はTeXプリミティブで通常boxへ移してから dormant pageへ戻し、active column mode / width を exit state vector に含める。overlay は編集位置が可視本文 region 内であることと、内部段落なら行数が変わらないことを確認し、TeXのline boxが変化したsuffixだけを物理列上で差し替える。mid-document geometry change と `\balance` は `safety.js` 側で structured path から外れる。margin note は canonical-only block である。footnote は扱うが、TeX と同じ page-spanning split を完全再現する実装ではない。
 
@@ -142,7 +157,7 @@ exact chunk は主に四つの経路から来る。
 | --- | --- |
 | resident CAPTURE | display math の foreground JOB が既に組んだ node list を post-block checkpoint から copy-free で引き渡し、再組版せず shipout する |
 | resident RENDER | warm pre-block checkpoint から block を再実行して tight PDF として shipout する（capture 非対象・miss 時の fallback） |
-| canonical crop | fresh canonical SVG から block band を切り出して chunk として登録する |
+| canonical crop | source・SyncTeX・PDFの全行の位置を照合でき、未検証の描画がない場合に限りSVGから切り出す |
 | isolated render | standalone `lualatex` で該当 block を compile し、rescue chunk を作る |
 
 resident CAPTURE/RENDER は hot dirty block と async chain で実際に変化した block に寄せられる。大量の cold block を全文 sweep しない。dirty block 数が `TDOM_RENDER_HOT_MAX` を超える場合は hot render を抑制し、cold boot の全 checkpoint に node list を保持しない。

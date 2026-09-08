@@ -23,6 +23,11 @@ export function buildStream(block, chunks) {
   const canonicalOnly = !!fid?.canonicalOnly;
 
   const stream = [];
+  if (galley?.tdomPendingPaint) {
+    // No measured box exists for a first rescue/deferred block. This is a
+    // zero-layout readiness marker, not a fabricated box or page break.
+    stream.push({ t: 'pending-exact', bid: block.id });
+  }
   let li = 0;
   let yOff = 0;
   let insOrdinal = 0;
@@ -49,7 +54,10 @@ export function buildStream(block, chunks) {
       d: f.d ?? 0,
       gfx: f.gfx,
       blockId: block.id,
-      units: miniUnits(f.items, block.id, chunkRef, suppress, galley?.backend),
+      units: miniUnits(
+        f.items, block.id, chunkRef, suppress, galley?.backend,
+        suppress || (wantExact && !fc && !!f.gfx)
+      ),
     };
   };
 
@@ -146,6 +154,10 @@ export function buildStream(block, chunks) {
           // Even when fidelity forbids painting a glyph bridge, the real run
           // extents remain useful as transparent source-line hit geometry.
           editRuns: it.runs ?? [],
+          // An empty run list is not proof that the printed line is empty.
+          // Keep the missing exact-paint requirement after suppressing its
+          // browser glyphs, including graphics with only partial text runs.
+          pendingExact: !gfxChunk && (suppress || blockExact) ? 1 : undefined,
           gfxChunk,
           backend: galley?.backend ?? null,
         },
@@ -181,8 +193,9 @@ export function buildStream(block, chunks) {
 
 /** Convert a captured mini-galley (float body, footnote text) to draw
  * units. `suppress` blanks the glyph runs when the fidelity gate forbids a
- * glyph bridge and no exact chunk has landed yet. */
-export function miniUnits(items, blockId, chunkRef, suppress = false, backend = null) {
+ * glyph bridge and no exact chunk has landed yet. `pendingExact` also
+ * covers graphics whose harvested text runs represent only part of the ink. */
+export function miniUnits(items, blockId, chunkRef, suppress = false, backend = null, pendingExact = suppress) {
   const units = [];
   let y = 0;
   for (const it of items ?? []) {
@@ -201,6 +214,7 @@ export function miniUnits(items, blockId, chunkRef, suppress = false, backend = 
         boxH: it.h ?? 0,
         runs: suppress && !chunkRef ? [] : (it.runs ?? []),
         editRuns: it.runs ?? [],
+        pendingExact: !chunkRef && pendingExact ? 1 : undefined,
         backend,
         gfxChunk: chunkRef
           ? { blockId: chunkRef.key, yOff: y, w: chunkRef.w, stale: chunkRef.stale }

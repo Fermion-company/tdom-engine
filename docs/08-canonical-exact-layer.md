@@ -87,7 +87,7 @@ boot 失敗は preamble hash に sticky になる。ただし `#scheduleStructur
 
 `#cropCanonicalChunks()` は、fresh canonical compile が現 source rev と一致し、かつ provisional page count と canonical page count が一致するときに動く。
 
-条件を満たす single-page block について、canonical page SVG から block band を切り出し、chunk cache に登録する。上限は `TDOM_CANON_CROP_MAX`、既定 40 block である。page count が drift しているときや block が page をまたぐときは crop しない。
+切り出しには、段落の全行についてソース範囲・SyncTeX・実PDFの文字配置・増分ページの原点が一致する証明が必要である。画像・パス・透過などを含むページや数式・副作用を含むブロックはこの経路を使わず、常駐または隔離レンダーへ任せる。上限は `TDOM_CANON_CROP_MAX`、既定40ブロックの照合。世代ごとの文字座標もchunkと一緒に保持する。詳細は[表示忠実度](09-visual-fidelity-gate.md)を参照する。
 
 ## 8.9 shipping chain との関係
 

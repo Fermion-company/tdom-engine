@@ -89,7 +89,7 @@ import { rescueBlock as rescueBlockHelper } from './rescue-block.js';
 import { runChainPass as runChainPassHelper, chainAfterPass as chainAfterPassHelper } from './chain-pass.js';
 import { runUpdateTypesetPhase } from './update-typeset-phase.js';
 import { prepareUpdate } from './update-prepare.js';
-import { finalizeUpdate } from './update-finalize.js';
+import { finalizeShippingExactUpdate, finalizeUpdate } from './update-finalize.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
 import { buildClosureDeferredResponse } from './update-response.js';
 import {
@@ -276,6 +276,7 @@ export class CheckpointEngine {
       }
       const from = this.#nearestCheckpoint(target);
       let changed = false;
+      const beforeChunksRev = this.chunks.rev;
       this.bgActive = true;
       let replayed;
       try {
@@ -292,7 +293,9 @@ export class CheckpointEngine {
         return { status: 'superseded', sourceRev, target };
       }
       this.#enforceCheckpointCap();
-      if (changed) this.#asyncRepaginate();
+      // A cached rescue can replace its PDF chunk without changing any
+      // measured boxes or exit state. Its new version must reach page DLs.
+      if (changed || this.chunks.rev !== beforeChunksRev) this.#asyncRepaginate();
       const result = {
         status: this.checkpoints.has(target) && this.checkpoints.has(target + 1) ? 'ready' : 'incomplete',
         sourceRev,
@@ -537,7 +540,7 @@ export class CheckpointEngine {
     const started = performance.now();
     try {
       return await typesetBlockHelper(this, idx, {
-        needsRescue: (text) => this.#needsRescue(text),
+        needsRescue: (text, structuralSinks) => this.#needsRescue(text, structuralSinks),
         rescueBlock: (blockIdx, why) => this.#rescueBlock(blockIdx, why),
         brokenBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx),
         deferredBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx, false, true),
@@ -573,12 +576,13 @@ export class CheckpointEngine {
     });
   }
 
-  #needsRescue(text) {
+  #needsRescue(text, structuralSinks = []) {
     const result = needsRescue(text, {
       preHash: this.preHash,
       breakableFor: this._breakableFor,
       breakableRe: this._breakableRe,
       source: () => this.store.get(this.file) ?? '',
+      structuralSinks,
     });
     if (result.breakableFor !== this._breakableFor) this._breakableFor = result.breakableFor;
     if (result.breakableRe !== this._breakableRe) this._breakableRe = result.breakableRe;
@@ -677,7 +681,7 @@ export class CheckpointEngine {
       why,
       forceCold,
       rescueCacheKey: (targetBlock, blockIdx) => this.#rescueCacheKey(targetBlock, blockIdx),
-      needsRescue: (blockText) => this.#needsRescue(blockText),
+      needsRescue: (blockText, structuralSinks) => this.#needsRescue(blockText, structuralSinks),
       awaitRender: (key, timeout) => this.#await(key, timeout),
       isoCompileCold: () => this.#isoCompile(block, idx, why, true),
     });
@@ -1010,6 +1014,30 @@ export class CheckpointEngine {
     if (prepared.response) return prepared.response;
     const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
 
+    // Hidden output-routine regions keep their incremental source identity,
+    // but only a complete native replay may promote physical pages.  On an
+    // established document, do not synchronously walk/rescue an atomic
+    // region merely to produce JS pages the renderer is forbidden to show.
+    // Initial open still builds the resident witnesses, and deployments
+    // without ShippingChain retain the ordinary structured fallback.
+    if (this.previewPolicy === 'shipping-exact' && this.shipping && editLabel !== 'open' && !rebooted) {
+      return finalizeShippingExactUpdate(this, {
+        text,
+        editLabel,
+        dirtySource,
+        firstDirty,
+        rebooted,
+        diagnostics,
+        timer: t,
+        callbacks: {
+          queueChainWork: (kind, from, labels) => this.#queueChainWork(kind, from, labels),
+          shipUpdate: (sourceText) => this.#shipUpdate(sourceText),
+          scheduleBackground: (from, dirtyBlocks) => this.#scheduleBackground(from, dirtyBlocks),
+          fidelitySummary: () => this.#fidelitySummary(),
+        },
+      });
+    }
+
     // ---- foreground typeset: resume from the nearest kept snapshot -----
     // Any failure in the typeset phase (dead checkpoint, TeX emergency
     // stop, protocol timeout) triggers ONE full rebuild retry; if that
@@ -1066,7 +1094,7 @@ export class CheckpointEngine {
         displayList: (page) => this.#displayList(page),
         scheduleHeaders: () => this.#scheduleHeaders(),
         enforceCheckpointCap: () => this.#enforceCheckpointCap(),
-        scheduleBackground: (fgStop, dirtyBlocks) => this.#scheduleBackground(fgStop, dirtyBlocks),
+        scheduleBackground: (fgStop, dirtyBlocks, options) => this.#scheduleBackground(fgStop, dirtyBlocks, options),
         shipUpdate: (sourceText) => this.#shipUpdate(sourceText),
         fidelitySummary: () => this.#fidelitySummary(),
       },
@@ -1270,6 +1298,7 @@ export class CheckpointEngine {
         return 'done';
       }
       const before = block.galleyHash + '|' + block.stateVec;
+      const beforeChunksRev = this.chunks.rev;
       // cache hit inside → the exact galley adopts in milliseconds; the
       // chain continues to convergence exactly like a foreground edit,
       // but YIELDS to an incoming edit and re-queues so the propagation
@@ -1299,7 +1328,12 @@ export class CheckpointEngine {
           if (l.h != null) this.hrefTable.set(l.k, l.h);
         }
       }
-      if (before !== block.galleyHash + '|' + block.stateVec) this.#asyncRepaginate();
+      // Re-adopting identical geometry still registers a new chunk version.
+      // Publishing only layout changes leaves the page requesting a retired
+      // SVG/glyph version, so an atomic viewer waits for it indefinitely.
+      if (before !== block.galleyHash + '|' + block.stateVec || this.chunks.rev !== beforeChunksRev) {
+        this.#asyncRepaginate();
+      }
       this.#queueMovedOffsets();
       // the resume walk left checkpoints at the blocks it re-typeset — collapse
       // back to the grid so the boot rescue storm can't creep the live set
@@ -1351,14 +1385,14 @@ export class CheckpointEngine {
     for (const k of labels ?? []) cur.labels.add(k);
   }
 
-  #scheduleBackground(fromIdx, dirtyBlocks) {
+  #scheduleBackground(fromIdx, dirtyBlocks, options) {
     scheduleBackgroundHelper(this, dirtyBlocks, {
       locked: (fn) => this.#locked(fn),
       runChainPass: () => this.#runChainPass(),
       chunkTargets: (block) => this.#chunkTargets(block),
-      queueRender: (id) => this.#queueRender(id),
+      queueRender: (id, renderOptions) => this.#queueRender(id, renderOptions),
       retireOffGrid: (idx) => this.#retireOffGrid(idx),
-    });
+    }, options);
   }
 
   async #runChainPass() {
@@ -1397,14 +1431,14 @@ export class CheckpointEngine {
     return chunkTargets(block);
   }
 
-  #queueRender(blockId) {
+  #queueRender(blockId, options) {
     queueRenderHelper(this, blockId, {
       awaitRender: (key, timeout) => this.#await(key, timeout),
       renderIsolated: (block, idx) => this.#renderIsolated(block, idx),
       asyncRepaginate: () => this.#asyncRepaginate(),
       chunkTargets: (block) => this.#chunkTargets(block),
       releaseRenderHold: (idx) => this.#releaseRenderHold(idx),
-    });
+    }, options);
   }
 
   /**

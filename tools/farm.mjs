@@ -2,9 +2,11 @@
 //
 // For every corpus entry: structured docs run the verify-layout referee
 // ("pseudo PDF == real PDF" at glyph-baseline level, chunk windows counted
-// as covered); opaque entries assert the safety gate demotes. Aggregates a
-// metrics table and exits non-zero on any unexpected outcome, so this can
-// gate CI and every phase of the roadmap.
+// as covered); shipping-exact entries assert that the structured source is
+// retained but only native Shipping/canonical pages may be presented; opaque
+// entries assert the safety gate demotes. Aggregates a metrics table and
+// exits non-zero on any unexpected outcome, so this can gate CI and every
+// phase of the roadmap.
 //
 // Usage: node tools/farm.mjs [--full] [--json=path]
 //   --full   include the slow entries (ja stress doc)
@@ -29,13 +31,18 @@ const JSON_OUT = (args.find((a) => a.startsWith('--json=')) ?? '').slice(7);
 const manifest = JSON.parse(readFileSync(path.join(CORPUS, 'manifest.json'), 'utf8'));
 const entries = [...manifest.docs, ...(FULL ? manifest.full : [])];
 
-async function runOpaqueCheck(texPath) {
+async function runPolicyCheck(texPath) {
   const work = path.join(os.tmpdir(), `tdom-farm-opq-${process.pid}`);
   rmSync(work, { recursive: true, force: true });
   const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(texPath) });
   try {
     const r = await eng.open(readFileSync(texPath, 'utf8'));
-    return { mode: r.mode, reasons: r.modeReasons ?? [] };
+    return {
+      mode: r.mode,
+      reasons: r.modeReasons ?? [],
+      previewPolicy: r.previewPolicy,
+      previewReasons: r.previewReasons ?? [],
+    };
   } finally {
     await eng.close();
     rmSync(work, { recursive: true, force: true });
@@ -76,11 +83,29 @@ for (const entry of entries) {
   }
   process.stdout.write(`${name} … `);
   if (entry.expect === 'opaque') {
-    const r = await runOpaqueCheck(texPath);
+    const r = await runPolicyCheck(texPath);
     const ok = r.mode === 'opaque';
     if (!ok) unexpected++;
     results.push({ name, expect: 'opaque', mode: r.mode, ok });
     console.log(ok ? `OK (opaque: ${r.reasons.join('; ')})` : `UNEXPECTED mode=${r.mode}`);
+    continue;
+  }
+  if (entry.expect === 'shipping-exact') {
+    const r = await runPolicyCheck(texPath);
+    const ok = r.mode === 'structured' && r.previewPolicy === 'shipping-exact';
+    if (!ok) unexpected++;
+    results.push({
+      name,
+      expect: 'shipping-exact',
+      mode: r.mode,
+      previewPolicy: r.previewPolicy,
+      ok,
+    });
+    console.log(
+      ok
+        ? `OK (shipping-exact: ${r.previewReasons.join('; ')})`
+        : `UNEXPECTED mode=${r.mode} previewPolicy=${r.previewPolicy}`
+    );
     continue;
   }
   const r = await runReferee(texPath);

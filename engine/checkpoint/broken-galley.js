@@ -36,7 +36,9 @@ export async function brokenBlockGalley(engine, idx, frozen, deferred, { jobBloc
   // frozen=false: a PENDING placeholder (first-ever rescue queued on the
   // pump), not a freeze — frozenBlockIds derives real freezes from
   // isoFailCache if that compile then fails
-  const g = { items: [], floats: [], w: 0, h: 0, d: 0, state, labels: [], toclines: [], refs: block.galley?.refs ?? [], fonts: {} };
+  // There is no measured layout yet. Keep that fact separate from an
+  // intentionally empty TeX block instead of inventing a placeholder box.
+  const g = { items: [], floats: [], w: 0, h: 0, d: 0, state, labels: [], toclines: [], refs: block.galley?.refs ?? [], fonts: {}, tdomPendingPaint: true };
   if (frozen) g.tdomFrozen = true;
   if (deferred) g.tdomDeferred = true;
   return g;
