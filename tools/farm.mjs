@@ -20,6 +20,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { rmSync } from 'node:fs';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
+import { matchesKnownDivergence } from './farm-known-divergence.mjs';
 
 const execFileP = promisify(execFile);
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -62,6 +63,9 @@ async function runReferee(texPath) {
   const total = out.match(/total: (\d+)\/(\d+) lines matched/);
   return {
     ok: !r.failed,
+    kind: out.includes('<< PAGE COUNT MISMATCH')
+      ? 'page-count-mismatch'
+      : r.failed ? 'referee-failure' : null,
     secs: (Date.now() - t0) / 1000,
     enginePages: pages ? Number(pages[1]) : null,
     realPages: pages ? Number(pages[2]) : null,
@@ -112,7 +116,7 @@ for (const entry of entries) {
   const pagesOk = r.enginePages !== null && r.enginePages === r.realPages;
   const rate = r.lines ? r.matched / r.lines : 0;
   const ok = r.ok;
-  const tolerated = !ok && entry.knownDiverged;
+  const tolerated = !ok && matchesKnownDivergence(entry.knownDiverged, r);
   if (!ok && !tolerated) unexpected++;
   results.push({
     name,
@@ -127,8 +131,11 @@ for (const entry of entries) {
     matchRate: Math.round(rate * 1000) / 1000,
     secs: Math.round(r.secs * 10) / 10,
   });
+  const knownIssue = tolerated && typeof entry.knownDiverged === 'object'
+    ? ` #${entry.knownDiverged.issue}`
+    : '';
   console.log(
-    `${ok ? 'IDENTICAL' : tolerated ? 'DIVERGED (known)' : 'DIVERGED'} ` +
+    `${ok ? 'IDENTICAL' : tolerated ? `DIVERGED (known${knownIssue})` : 'DIVERGED'} ` +
       `pages=${r.enginePages}/${r.realPages} lines=${r.matched}/${r.lines} ${r.secs.toFixed(0)}s`
   );
   if (!ok && !tolerated) {

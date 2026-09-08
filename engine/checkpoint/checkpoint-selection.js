@@ -31,6 +31,13 @@ export function checkpointKeepSet(blocks, maxCheckpoints) {
     }
   }
 
+  // The final block has no clean successor to stop on, so a tail edit pays
+  // every block after its resume boundary. Spend the reserved coverage slot
+  // on that stable input boundary while measured hot-block choices evolve.
+  // If a hot block already selected it, the quantile fill below uses the
+  // remaining slot instead.
+  if (keep.size < limit && count > 1) keep.add(count - 1);
+
   // Fill the remaining budget at weighted quantiles. This preserves useful
   // reachability through long all-prose regions and naturally shifts the
   // skeleton toward moderately expensive areas.
