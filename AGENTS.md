@@ -25,6 +25,9 @@ this machine to unusability several times.
   ```
 - If `ps aux | grep -c '[l]ualatex'` climbs past ~30, STOP and
   `pkill -9 lualatex`.
+- `host/` (the host-app integration layer) is the exception: its tests run
+  against a fake engine over loopback HTTP and never boot TeX, so
+  `npm run test:host` is always safe to run locally.
 
 ## Workflow
 
