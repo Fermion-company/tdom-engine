@@ -47,6 +47,11 @@ const CONDITIONALS = new Set([
 
 const fail = (reason, at) => ({ closed: false, reason, at });
 
+function skipSpace(text, at) {
+  while (at < text.length && /\s/.test(text[at])) at++;
+  return at;
+}
+
 function bracedArgument(text, at) {
   let i = at;
   while (i < text.length && /\s/.test(text[i])) i++;
@@ -71,6 +76,7 @@ function bracedArgument(text, at) {
 export function sourceClosure(text) {
   const envs = [];
   const conditionals = [];
+  const customConditionals = new Set();
   const math = [];
   let groups = 0;
   let literal = null;
@@ -165,7 +171,18 @@ export function sourceClosure(text) {
       continue;
     }
 
-    if (CONDITIONALS.has(name)) conditionals.push(name);
+    if (name === 'newif') {
+      const nextAt = skipSpace(text, end);
+      if (text[nextAt] === '\\') {
+        let nextEnd = nextAt + 2;
+        while (nextEnd < text.length && /[A-Za-z@]/.test(text[nextEnd])) nextEnd++;
+        const custom = text.slice(nextAt + 1, nextEnd);
+        if (custom.startsWith('if') && custom.length > 2) customConditionals.add(custom);
+        i = nextEnd;
+        continue;
+      }
+    }
+    if (CONDITIONALS.has(name) || customConditionals.has(name)) conditionals.push(name);
     else if (name === 'fi') {
       if (!conditionals.length) return fail('unexpected:fi', i);
       conditionals.pop();

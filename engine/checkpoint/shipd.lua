@@ -34,6 +34,7 @@ local PRIVATE_PDF = false
 local PDFPATH = ''
 local ACTIVE_FEED = ''
 local BRANCHDIR = ''
+local ROOT_CHECKPOINTED = false
 
 local function send(s) conn:send(s) end
 
@@ -156,6 +157,26 @@ local function wait_as_checkpoint()
       fk.close_fd(prepared_input)
       -- parent remains the frozen checkpoint and waits for another clone
     end
+  end
+end
+
+-- Page-zero resume frontier: \begin{document} and every begin-document hook
+-- have completed, but no user body unit has entered TeX's input/token buffers.
+-- A first-page edit can therefore clone this process and re-read the complete
+-- body without re-running the preamble or waiting for a cold full compile.
+local function ensure_root_checkpoint()
+  if ROOT_CHECKPOINTED or ROLE ~= 'root' or PAGE ~= 0 or NLINE ~= 0 then return end
+  ROOT_CHECKPOINTED = true
+  local checkpoint_dir = WORKDIR .. '/ship-g' .. GEN .. '-ck0'
+  local checkpoint_branch = prepare_branch(checkpoint_dir)
+  local cpid = fk.fork()
+  if cpid == 0 then
+    ROLE = 'ckpt'
+    pcall(function() conn:close() end)
+    adopt_branch(checkpoint_dir, checkpoint_branch)
+    connect('ckpt', 0)
+    wait_as_checkpoint()
+    return
   end
 end
 
@@ -316,6 +337,7 @@ function tdom_ship_feed()
     tex.print('\\csname @@end\\endcsname')
     return
   end
+  ensure_root_checkpoint()
   local u = next_unit()
   if u == nil then
     send('SEND ' .. PAGE .. ' ' .. NLINE .. '\n')

@@ -205,7 +205,9 @@ test('native IME anchor preserves its exact relative PDF point across reflow', (
   assert.equal(Coordinator.caretAnchorRatio({ left: 0, top: 0, right: 0, bottom: 10 }, { x: 0, y: 1 }), null);
   assert.match(APP, /control\.style\.transform = `translate3d\(\$\{dx\}px, \$\{dy\}px, 0\)`;/);
   assert.match(APP, /session\.imeComposing !== true[\s\S]*?!session\.canonicalAnchorPoint/);
-  assert.match(APP, /compositionstart[\s\S]*?directEditor\.imeComposing = true[\s\S]*?compositionend[\s\S]*?directEditor\.imeComposing = false/);
+  const compositionHandlers = APP.slice(APP.indexOf("control.addEventListener('compositionstart'"), APP.indexOf("control.addEventListener('compositionend'") + 500);
+  assert.match(compositionHandlers, /directEditor\?\.sessionId === sessionId[\s\S]*?const session = directEditor;[\s\S]*?session\.imeComposing = true/);
+  assert.match(compositionHandlers, /compositionend[\s\S]*?directEditor\?\.sessionId === sessionId[\s\S]*?directEditor\.imeComposing = false/);
   assert.match(APP, /const caretAnchorRatio = Coordinator\?\.caretAnchorRatio\?\.\(printBounds, clickOnPaper\) \?\? null;/);
   assert.match(APP, /directEditor\.element\.style\.minHeight[\s\S]*?alignOpaqueNativeCaretAnchor\(\);/);
 });
@@ -302,6 +304,10 @@ test('the browser entrypoint enforces the planner before the batch commit loop',
 });
 
 test('canonical-surface caret placement never falls through to browser hit geometry', () => {
-  assert.match(APP, /if \(usesCanonicalSurface\(\)\) \{[\s\S]*?\} else if \(clickPoint\) \{\s+range = document\.caretRangeFromPoint/);
-  assert.match(APP, /\} else if \(usesCanonicalSurface\(\)\) \{[\s\S]*?control\.position = Number\(control\.lastOffset\);[\s\S]*?\} else if \(clickPoint && typeof control\.getOffsetFromPoint/);
+  assert.match(APP, /function usesDirectEditSurface\(page = null\) \{\s+return usesCanonicalSurface\(\) \|\|/);
+  const placementStart = APP.indexOf('const sourceCaret = region.kind');
+  const placement = APP.slice(placementStart, APP.indexOf('alignOpaqueNativeCaretAnchor(sessionId);', placementStart));
+  assert.match(placement, /if \(usesDirectEditSurface\(\)\) \{[\s\S]*?range\.setStart\(textNode,[\s\S]*?\} else if \(clickPoint\) \{\s+range = document\.caretRangeFromPoint/);
+  assert.match(placement, /\} else if \(Number\.isInteger\(openingMathOffset\)\) \{\s+setDirectSelection\(directEditor, openingMathOffset\);\s+\} else if \(usesDirectEditSurface\(\)\) \{\s+if \(Number\.isInteger\(sourceCaret\) && sourceCaret >= 0\) control\.position = sourceCaret;\s+\} else if \(clickPoint && typeof control\.getOffsetFromPoint/);
+  assert.doesNotMatch(placement, /control\.position = Number\(control\.lastOffset\)/, 'an unresolved PDF caret must not jump to the end of the formula');
 });
