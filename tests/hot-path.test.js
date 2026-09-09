@@ -488,6 +488,15 @@ test('newif-created conditionals close without weakening package-macro conservat
   assert.equal(sourceClosure(String.raw`\ifnum 1=1 unfinished`).closed, false);
 });
 
+test('loop repeat closes only its own pending conditional', () => {
+  assert.equal(sourceClosure(String.raw`\newcommand{\lines}[1]{\loop\ifnum\count0<#1 x\repeat}`).closed, true);
+  assert.equal(sourceClosure(String.raw`\iftrue\loop\ifnum1<2 {\loop\ifnum2<3 x\repeat}\repeat\fi`).closed, true);
+  for (const text of [String.raw`\loop\ifnum1<2 x`, String.raw`\loop x\repeat`,
+    String.raw`\iftrue\loop x\repeat`, String.raw`\loop\iftrue\iftrue x\repeat`]) {
+    assert.equal(sourceClosure(text).closed, false, text);
+  }
+});
+
 const para = (s) =>
   `${s} paragraph with enough plain words to make a couple of real lines ` +
   `of typeset material for the measurement to mean something at all.`;
@@ -1622,6 +1631,84 @@ ActiveMarker !abcd.
     const at = e.getSource().indexOf('abcd') + 4;
     const report = await e.edit(at, at, 'e');
     assert.notEqual(report.stats.chainVerdict, 'verify');
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('deferred root and include edits converge, report errors, and recover exact page counts', opts, async () => {
+  await eng.close();
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-closure-convergence-'));
+  const child = path.join(root, 'child.tex');
+  writeFileSync(child, 'ChildWitnessA.\n');
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  e.canonical.displayDebounceMs = 10;
+  e.canonical.displayCooldownFactor = 0;
+  const replace = async (from, to) => {
+    const at = e.getSource().indexOf(from);
+    assert.ok(at >= 0, from);
+    return e.edit(at, at + from.length, to);
+  };
+  const exact = async (marker, pages) => {
+    await e.canonical.settle();
+    const info = e.canonical.info();
+    assert.equal(info.error, null);
+    assert.equal(info.rev, e.srcRev);
+    assert.equal(info.pageCount, pages);
+    assert.match((await e.canonical.pageTexts(info.id)).join('\n'), new RegExp(marker));
+  };
+  try {
+    await e.open(String.raw`\documentclass{article}
+\newcount\linecount
+\newcommand{\lines}[1]{\loop\ifnum\linecount<#1\advance\linecount by1 X\repeat}
+\newif\ifanswers\answerstrue
+\begin{document}
+RootWitnessA.
+
+\newpage
+\input{child.tex}
+
+\newpage AnswerWitness.
+\end{document}`);
+    await exact('RootWitnessA', 3);
+    const rootEdit = await replace('RootWitnessA', 'RootWitnessB');
+    assert.notEqual(rootEdit.stats.chainVerdict, 'closure-deferred');
+    await exact('RootWitnessB', 3);
+    writeFileSync(child, 'ChildWitnessB.\n');
+    const childEdit = await e.refresh();
+    assert.notEqual(childEdit.stats.chainVerdict, 'closure-deferred');
+    await exact('ChildWitnessB', 3);
+
+    // An unused environment-opening macro is valid TeX but deliberately
+    // beyond the lexical gate. Exact convergence cannot need its approval.
+    const deferred = await replace('\\begin{document}', String.raw`\newcommand{\startquote}{\begin{quote}}
+\begin{document}`);
+    assert.equal(deferred.stats.chainVerdict, 'closure-deferred');
+    assert.equal(deferred.canonical.scheduledRev, deferred.srcRev);
+    assert.match(deferred.canonical.fallbackReason, /^closure-deferred:/);
+    assert.ok(deferred.canonical.scheduledInMs < 1000, 'display cadence without a viewer request');
+    await replace('RootWitnessB', 'RootWitnessC');
+    writeFileSync(child, 'ChildWitnessC.\n');
+    const newest = await e.refresh();
+    assert.equal(newest.canonical.scheduledRev, e.srcRev, 'latest included input owns fallback');
+    await exact('ChildWitnessC', 3);
+    assert.match((await e.canonical.pageTexts()).join('\n'), /RootWitnessC/);
+
+    const goodId = e.canonical.info().id;
+    await replace('\\end{document}', '\\begin{quote}\n\\end{document}');
+    await e.canonical.settle();
+    assert.ok(e.canonical.info().error);
+    assert.equal(e.canonical.info().errorRev, e.srcRev);
+    assert.equal(e.canonical.info().id, goodId, 'syntax failure retains last-good PDF');
+    await replace('\\begin{quote}\n\\end{document}', '\\end{document}');
+    await exact('RootWitnessC', 3);
+    await replace('\\newpage AnswerWitness.', '\\ifanswers\\newpage AnswerWitness.\\fi');
+    await exact('AnswerWitness', 3);
+    await replace('\\answerstrue', '\\answersfalse');
+    await exact('RootWitnessC', 2);
+    await replace('\\newpage\n\\input{child.tex}', '\\input{child.tex}');
+    await exact('ChildWitnessC', 1);
   } finally {
     await e.close();
     rmSync(root, { recursive: true, force: true });

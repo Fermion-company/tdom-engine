@@ -366,12 +366,12 @@ export class CheckpointEngine {
       canonicalInfo: this.canonical.info(),
       pages: this.pages,
       checkpoints: this.checkpoints,
-      blocks: this.blocks,
+      blocks: this.closureDeferred ? [] : this.blocks,
       chunkTargets: (b) => this.#chunkTargets(b),
       file: this.file,
       position: (file, offset) => this.store.position(file, offset),
       labelTable: this.labelTable,
-      preambleEditRegions: this.preambleEditRegions,
+      preambleEditRegions: this.closureDeferred ? [] : this.preambleEditRegions,
     });
   }
 
@@ -971,6 +971,10 @@ export class CheckpointEngine {
         deferClosureUpdate: (label, timer, closure) => {
           this.rev++;
           this.srcRev++;
+          this.closureDeferred = closure;
+          this.canonical.schedule(this.store.get(this.file), this.srcRev, {
+            fallbackReason: `closure-deferred:${closure.scope}:${closure.reason}`,
+          });
           return buildClosureDeferredResponse({
             rev: this.rev,
             srcRev: this.srcRev,

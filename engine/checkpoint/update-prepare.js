@@ -10,6 +10,7 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   const { opaqueUpdate, deferClosureUpdate, bootRoot, scheduleStructuredReprobe, expandIncludes, unindexBlock } = callbacks;
   const text = engine.store.get(engine.file);
   const diagnostics = [];
+  engine.closureDeferred = null;
 
   const bounds = documentBounds(text);
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
@@ -20,7 +21,9 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   // environment makes the segmenter absorb every following paragraph; if
   // that temporary segmentation were committed, "hold last good" would
   // still make the document tail disappear. The source store advances, but
-  // no TeX path or layout identity advances until the closing syntax lands.
+  // no resident layout identity advances until the closing syntax lands.
+  // The lexical gate is not a TeX parser: canonical must still compile the
+  // current input, either proving it valid or reporting the actual error.
   if (engine.blocks.length) {
     const preClosure = sourceClosure(preamble);
     if (!preClosure.closed) {

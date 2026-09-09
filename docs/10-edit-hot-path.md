@@ -158,6 +158,8 @@ isolated compile の dormant absorb には暴走上限（fires > 50）があり�
 
 ## 10.10 render、shipping、canonical
 
+`sourceClosure()` は `\loop\if...\repeat` の条件終端を認識する。字句的に閉じていないソースは `closure-deferred` として resident のブロック・紙面を保持するが、最新 `srcRev` の canonical を display cadence で必ず予約する。これには `external-include` も含む。字句解析ではマクロ定義と実行を完全に区別できないため、正否とエラーは LuaLaTeX が決める。保留中の旧ブロック範囲は直接編集へ渡さず、旧紙面を現在のソースとして検証・cropしない。canonical の `runningRev`・`scheduledRev`・`fallbackReason` で予約と実行の対象を確認できる。エラー終了時の部分PDFは採用せず、最後に成功したPDFと世代を保持する。
+
 hot path の最後に `#shipUpdate(source)`、`canonical.schedule(source, srcRev)`、`#scheduleBackground(fgStop, dirtyBlocks, options)` が呼ばれる。
 
 `#scheduleBackground()` は chain と resident render を予約する。

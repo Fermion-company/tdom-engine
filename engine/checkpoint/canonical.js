@@ -363,6 +363,9 @@ export class CanonicalRenderer {
       ms: this.last?.ms ?? 0,
       inFlight: !!(this.running || this.timer || this.pendingJob),
       compiling: Boolean(this.running),
+      runningRev: this.runningJob?.rev ?? null,
+      scheduledRev: this.pendingJob?.rev ?? null,
+      fallbackReason: this.pendingJob?.fallbackReason ?? this.runningJob?.fallbackReason ?? null,
       scheduledInMs: this.timer ? Math.max(0, this.timerDueAt - Date.now()) : null,
       displayDemandRev: this.displayDemand?.rev ?? null,
       error: this.lastError?.message ?? null,
@@ -379,12 +382,12 @@ export class CanonicalRenderer {
    * touches, and it does nothing but store the newest source and arm a
    * timer. The compile itself never blocks an edit.
    */
-  schedule(source, rev) {
+  schedule(source, rev, { fallbackReason = null } = {}) {
     if (this.disposed) return;
     // audit runs (fuzz on CI) compare provisional state only — a full
     // lualatex per engine would OOM a 7GB hosted runner for nothing
     if (process.env.TDOM_NO_CANONICAL === '1') return;
-    this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now() };
+    this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now(), fallbackReason };
     if (!this.#hasDisplayDemand(this.pendingJob)) this.displayDemand = null;
     this.#armPending(this.delayFor());
   }
@@ -496,7 +499,7 @@ export class CanonicalRenderer {
    */
   delayFor(job = this.pendingJob, { preserveIdleStart = false } = {}) {
     const since = Date.now() - this.lastEndAt;
-    if (this.pressure !== 'authority' || this.#hasDisplayDemand(job)) {
+    if (this.pressure !== 'authority' || job?.fallbackReason || this.#hasDisplayDemand(job)) {
       // canonical is needed for display — stay responsive on small
       // documents, but never let a long document compile back-to-back
       if (!this.last?.ms) return this.displayDebounceMs;
@@ -568,7 +571,7 @@ export class CanonicalRenderer {
     if (this.running) return this.running;
     if (!this.pendingJob) return;
     const job = this.pendingJob;
-    if (waitForResident && this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
+    if (waitForResident && !job.fallbackReason && this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
         !this.residentImpossibleDemandIds.size && typeof this.residentDisplayState === 'function') {
       const state = this.residentDisplayState(job.rev);
       // Give only this foreground cohort a bounded chance to supply exact
@@ -596,13 +599,13 @@ export class CanonicalRenderer {
       }
       return;
     }
-    this.runningJob = { rev: job.rev, inputEpoch: job.inputEpoch };
+    this.runningJob = { rev: job.rev, inputEpoch: job.inputEpoch, fallbackReason: job.fallbackReason };
     this.running = this.#compile({
       ...job,
       // Scheduled authority confirmation is intentionally below the live
       // complete-PDF path. Export, opaque display and demanded revisions stay
       // at normal priority because the user is directly waiting for them.
-      background: this.pressure === 'authority' && !this.#hasDisplayDemand(job),
+      background: this.pressure === 'authority' && !job.fallbackReason && !this.#hasDisplayDemand(job),
     })
       .catch((err) => {
         this.lastError = { rev: job.rev, message: String(err?.message || err) };
@@ -729,6 +732,7 @@ export class CanonicalRenderer {
       const latexArgs = [
         '-synctex=1',
         '-interaction=nonstopmode',
+        '-halt-on-error',
         '-output-directory',
         this.workDir,
         tex,
@@ -756,9 +760,10 @@ export class CanonicalRenderer {
       );
       out = (r.stdout || '') + (r.stderr || '');
     } catch (err) {
-      // nonstopmode exits non-zero on any error but often still ships a
-      // usable PDF — the caller decides based on the artifacts
       out = (err.stdout || '') + (err.stderr || '') || String(err.message || err);
+      // TeX can ship pages before failing. Those partial bytes must never
+      // replace the last successful generation or hide its error report.
+      throw new Error(texErrorFrom(out) || String(err.message || err));
     }
     return out;
   }

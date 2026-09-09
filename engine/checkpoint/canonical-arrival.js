@@ -65,7 +65,7 @@ export function onCanonicalResult(
   try {
     engine.onCanonical?.({ ...info, modeReasons: engine.modeReasons });
   } catch { /* observer errors are not ours */ }
-  if (info.error || process.env.TDOM_NO_VERIFY) return;
+  if (info.error || engine.closureDeferred || process.env.TDOM_NO_VERIFY) return;
   // verify only at convergence: the compile must be of the CURRENT source
   if (engine.mode !== 'structured' || info.rev !== engine.srcRev) return;
   // canonical-anchor deliberately does not claim that JS pagination maps
