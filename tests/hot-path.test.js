@@ -1246,3 +1246,50 @@ test('backward ref updates when the label moves to a value already visible in th
     await e.close();
   }
 });
+
+test('forced-break rescue consumes the TeX output box and supplies exact page material', opts, async () => {
+  await eng.open(String.raw`\documentclass{article}
+\begin{document}
+Ordinary prose before the rescued material.
+
+\begin{center}Rescued material with a forced break.\end{center}
+\newpage
+
+Ordinary prose after the rescued material.
+\end{document}`);
+  await drain(eng);
+  const rescued = eng.blocks.find(block => block.text.includes('\\newpage'));
+  assert.ok(rescued?.rescued, 'the forced-break block completes its rescue');
+  assert.equal(rescued.galley.tdomPendingPaint, undefined, 'no page-wide pending marker remains');
+  assert.ok([...eng.chunks.keys()].some(key => key === rescued.id || key.startsWith(rescued.id + '@')),
+    `the rescued text has exact pixels: ${JSON.stringify({ items: rescued.galley.items, keys: [...eng.chunks.keys()], diagnostics: eng.diagnostics })}`);
+  const chunk = [...eng.chunks.entries()].find(([key]) => key === rescued.id || key.startsWith(rescued.id + '@'))[1];
+  const pdf = path.join(WORK, 'forced-break-rescue.pdf');
+  writeFileSync(pdf, chunk.editPdf);
+  const { stdout } = await promisify(execFile)('pdftotext', [pdf, '-']);
+  assert.match(stdout, /Rescued material with a forced break/, 'the exact PDF retains the rescued text');
+  assert.doesNotMatch(eng.rootLogRef?.() ?? '', /Output routine didn't use all of/,
+    'the forked rescue must consume box255 through TeX');
+  const at = eng.getSource().indexOf('Ordinary prose before') + 'Ordinary prose'.length;
+  const report = await eng.edit(at, at, ' edited');
+  assert.ok(report.stats.blocksTypeset <= 2, 'adjacent prose stays bounded');
+  await drain(eng);
+  assert.equal(eng.blocks.some(block => block.galley?.tdomPendingPaint), false);
+});
+
+
+test('resident forced output retains material before and after a page break', opts, async () => {
+  await eng.open(String.raw`\documentclass{article}
+\begin{document}
+Before forced output.\par
+\pagebreak
+After forced output.\par
+\end{document}`);
+  await drain(eng);
+  assert.equal(eng.mode, 'structured');
+  const text = eng.getDisplayLists().flatMap(page => page.commands)
+    .filter(command => command.op === 'glyphs').map(command => command.text).join('');
+  assert.match(text.replace(/\s/g, ''), /Beforeforcedoutput/);
+  assert.match(text.replace(/\s/g, ''), /Afterforcedoutput/);
+  assert.doesNotMatch(eng.rootLogRef?.() ?? '', /Output routine didn't use all of/);
+});
