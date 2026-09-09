@@ -1685,6 +1685,48 @@ NeighborWitness.
   }
 });
 
+test('input preserves attached paragraph geometry and child editing addresses', opts, async () => {
+  await eng.close();
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-input-paragraph-'));
+  const child = path.join(root, 'child.tex');
+  const childText = String.raw`\begin{tcolorbox}
+AttachedWitness $x^2$.
+\end{tcolorbox}`;
+  writeFileSync(child, childText);
+  const prefix = String.raw`\documentclass{article}
+\usepackage{tcolorbox}
+\begin{document}
+\par\medskip\noindent\textbf{(1)}\quad
+`;
+  const suffix = '\n\\par\\medskip\nTailWitness.\n\\end{document}';
+  const geometry = e => e.pages.map(page => page.draw.map(draw =>
+    [draw.y, draw.u.h, draw.u.d]));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'mapped'), docDir: root });
+  let expected;
+  try {
+    await e.open(prefix + '\\input{child.tex}' + suffix);
+    await drain(e);
+    expected = geometry(e);
+    const block = e.blocks.find(b => b.text.includes('AttachedWitness'));
+    assert.ok(block.text.includes('\\textbf{(1)}'), 'the open parent paragraph stays with its box');
+    const regions = e.getDOM().blocks.flatMap(b => b.editRegions);
+    const math = regions.find(region => region.value === 'x^2');
+    assert.equal(math.source.file, child);
+    assert.equal(math.source.start.line, 2);
+    assert.equal(math.source.start.column, childText.split('\n')[1].indexOf('x^2') + 1);
+    assert.equal((await e.warmEditOffset(childText.indexOf('x^2'), child)).status, 'ready');
+  } finally { await e.close(); }
+  const continuous = new CheckpointEngine({ workDir: path.join(root, 'continuous'), docDir: root });
+  try {
+    await continuous.open(prefix + childText + suffix);
+    await drain(continuous);
+    assert.deepEqual(geometry(continuous), expected, 'input adds no paragraph or box spacing');
+  } finally {
+    await continuous.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('deferred root and include edits converge, report errors, and recover exact page counts', opts, async () => {
   await eng.close();
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-closure-convergence-'));
@@ -1720,7 +1762,7 @@ RootWitnessA.
 \newpage AnswerWitness.
 \end{document}`);
     await exact('RootWitnessA', 3);
-    const childBlock = e.blocks.findIndex(block => block.file === child);
+    const childBlock = e.blocks.findIndex(block => block.file === child || block.sourceParts?.some(part => part.file === child));
     assert.ok(childBlock > 0);
     const childWarm = await e.warmEditOffset(3, child);
     assert.equal(childWarm.target, childBlock, 'child offsets must never warm a root block');

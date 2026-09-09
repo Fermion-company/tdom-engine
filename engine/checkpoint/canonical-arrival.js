@@ -159,6 +159,7 @@ export async function cropCanonicalChunks(engine, info, { asyncRepaginate }) {
 }
 
 async function canonicalCropCandidates(engine, block, id) {
+  if (block.sourceParts) return null;
   const source = block.file ? block.sourceStart : engine.store.position(engine.file, block.start);
   const end = block.file ? block.sourceEnd : engine.store.position(engine.file, block.end);
   const first = Number(source?.line), last = Number(end?.line);

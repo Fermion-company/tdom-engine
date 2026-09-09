@@ -54,7 +54,7 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   let segs = segmentBody(bodyText, bounds.body.start, {
     structuralEvents: rawStructuralGate.segmentEvents,
   });
-  segs = expandIncludes(segs, 0);
+  segs = expandIncludes(segs, 0, { structuralEvents: rawStructuralGate.segmentEvents });
   // Macro wrappers can hide output-routine environments from both the raw
   // segmenter and block rescue classifier. Analyse the expanded project body
   // before granting structured display; an exact canonical page is the only

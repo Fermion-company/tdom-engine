@@ -25,7 +25,7 @@
 
 import { fnv1a } from './hash.js';
 
-const FORCED_START = /^\s*\\(chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
+const FORCED_START = /^\s*\\(par|chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
 
 // Standalone generated-content commands. Each performs its own \par and
 // emits display material nobody types into (the title block, the toc/lof/lot
@@ -243,6 +243,7 @@ export function diffBlocks(oldBlocks, segs, nextId) {
         file: sg.file ?? null,
         sourceStart: sg.sourceStart ?? null,
         sourceEnd: sg.sourceEnd ?? null,
+        sourceParts: sg.sourceParts ?? null,
         includeStart: !!sg.includeStart,
         includeEnd: !!sg.includeEnd,
         externalGraphics: !!sg.externalGraphics,
@@ -270,6 +271,7 @@ export function diffBlocks(oldBlocks, segs, nextId) {
       file: sg.file ?? null,
       sourceStart: sg.sourceStart ?? null,
       sourceEnd: sg.sourceEnd ?? null,
+      sourceParts: sg.sourceParts ?? null,
       includeStart: !!sg.includeStart,
       includeEnd: !!sg.includeEnd,
       externalGraphics: !!sg.externalGraphics,
@@ -305,6 +307,7 @@ function refresh(block, seg) {
   block.file = seg.file ?? null;
   block.sourceStart = seg.sourceStart ?? null;
   block.sourceEnd = seg.sourceEnd ?? null;
+  block.sourceParts = seg.sourceParts ?? null;
   block.includeStart = !!seg.includeStart;
   block.includeEnd = !!seg.includeEnd;
   block.externalGraphics = !!seg.externalGraphics;

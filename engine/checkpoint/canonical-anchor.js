@@ -12,7 +12,8 @@ export function captureCanonicalAnchorBase({ blocks, domBlocks, edit, certificat
   const start = Number(edit?.start);
   const end = Number(edit?.end);
   if (![start, end].every(Number.isFinite) || end < start || !certificate?.id) return null;
-  const block = blocks.find((item) => start >= Number(item.start) && end <= Number(item.end));
+  const block = blocks.find((item) => !item.file && !item.sourceParts &&
+    start >= Number(item.start) && end <= Number(item.end));
   const dom = domBlocks.find((item) => item.id === block?.id);
   if (!block || !dom || hasGalleySideEffects(block.galley) || block.fidelity?.level !== SAFE_GLYPH) return null;
   const lineWitnesses = galleyLineWitnesses(block.galley);

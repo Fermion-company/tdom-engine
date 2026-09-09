@@ -256,6 +256,8 @@ export class CheckpointEngine {
     const request = ++this.warmSeq;
     const sourceRev = this.srcRev;
     const target = this.blocks.findIndex((block, index) => {
+      if (block.sourceParts) return block.sourceParts.some(part =>
+        path.resolve(this.docDir, part.file) === sourceFile && numericOffset >= part.start && numericOffset <= part.end);
       if (path.resolve(this.docDir, block.file ?? this.file) !== sourceFile) return false;
       const start = Number(block.start);
       const end = Number(block.end);
@@ -1053,7 +1055,7 @@ export class CheckpointEngine {
           return this.#bootRoot();
         },
         scheduleStructuredReprobe: (preHash) => this.#scheduleStructuredReprobe(preHash),
-        expandIncludes: (segs, depth) => this.#expandIncludes(segs, depth),
+        expandIncludes: (segs, depth, options) => this.#expandIncludes(segs, depth, options),
         unindexBlock: (id) => this.#unindexBlock(id),
       },
     });
@@ -1585,9 +1587,12 @@ export class CheckpointEngine {
     });
   }
 
-  #expandIncludes(segs, depth) {
+  #expandIncludes(segs, depth, options = {}) {
     const source = this.store.get(this.file) ?? '';
     return expandIncludes(segs, depth, {
+      source,
+      file: this.file,
+      structuralEvents: options.structuralEvents,
       docDir: this.docDir,
       overlayDir: this.overlayDir,
       workDir: this.workDir,

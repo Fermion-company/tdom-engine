@@ -844,8 +844,9 @@ function provisionalStageKeepsEditor(stage, region) {
   if (!session) return true;
   if (!region) return false;
   const owners = (stage.snapshot.blocks ?? []).filter(block =>
-    sameSourceFile(block.source?.file, region.source.file) &&
-    sourceContainsPosition(block, region.source.start) && sourceContainsPosition(block, region.source.end));
+    (block.sourceRanges ?? [block.source]).some(source =>
+      sameSourceFile(source?.file, region.source.file) &&
+      sourceContainsPosition({ source }, region.source.start) && sourceContainsPosition({ source }, region.source.end)));
   if (owners.length !== 1) return false;
   const owner = owners[0];
   const identical = (owner.editRegions ?? []).filter(item => item.kind === session.kind &&

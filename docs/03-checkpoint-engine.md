@@ -16,6 +16,9 @@
 | `engine/checkpoint/safety.js` | structured path に入れてよい文書かを判定する |
 | `engine/checkpoint/fidelity.js` | glyph 表示と exact chunk の切り替え判定 |
 | `engine/checkpoint/mathmap.js` | legacy math font の twin font mapping |
+| `engine/checkpoint/mapped-inputs.js` | `\\input` を展開してから段落を分割し、複数ファイルにまたがる block の元ソース位置を保持する |
+
+`\\input` の前後には段落境界を追加しない。空行・明示的な `\\par`・sectioning が block の境界になる。複数ファイルを含む block の `sourceParts` は各テキスト範囲と元ファイル位置を持ち、DOM の `sourceRanges` と個々の `editRegions.source` に変換される。カーソル位置の warming もこの対応で対象 block を解決する。
 
 ## 3.2 プロセスモデル
 

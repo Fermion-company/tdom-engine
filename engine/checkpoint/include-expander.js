@@ -3,9 +3,11 @@ import path from 'node:path';
 import { fnv1a } from '../hash.js';
 import { segmentBody } from '../segmenter.js';
 import { resolveProjectInput } from '../project-inputs.js';
+import { expandInputParagraphs } from './mapped-inputs.js';
 
 export function expandIncludes(segs, depth, context) {
   if (depth > 3) return segs;
+  if (depth === 0) segs = expandInputParagraphs(segs, context);
   const out = [];
   for (const seg of segs) {
     // Classic BibTeX's \bibliography command is just an input of
@@ -79,7 +81,8 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false) 
     context.includes.set(full, { mtime: st.mtimeMs, readPath, text });
     context.watchInclude(readPath);
     const subs = expandIncludes(
-      segmentBody(text, 0).map((seg) => ({ ...seg, resourceBaseDir: path.dirname(full) })),
+      expandInputParagraphs(segmentBody(text, 0), { ...context, source: text, file: full, structuralEvents: [] })
+        .map((seg) => ({ ...seg, resourceBaseDir: seg.resourceBaseDir ?? path.dirname(full) })),
       depth + 1,
       context
     );
