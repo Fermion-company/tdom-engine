@@ -60,6 +60,8 @@ const provisionalRemovedPages = new Set();
 const provisionalDisplayLists = new Map(); // complete resident page layout, including unchanged pages
 let committedCanonicalGeneration = null;
 let lastEngineStatus = null;
+let viewportWarmTimer = null;
+let viewportWarmKey = '';
 let liveSearch = { query: '', results: [], current: -1 };
 let editDomCache = null;
 let directEditor = null;
@@ -683,6 +685,31 @@ function directPresentationBlocked() {
 function shippingPresentationBlocked() {
   return documentReset.pending || Boolean(directEditor) || Boolean(openingDirectInput) ||
     queuedDirectOpenings.length > 0 || flushingDirectPresentation || opaqueBatchCommitDepth > 0;
+}
+
+function scheduleViewportWarm() {
+  window.clearTimeout(viewportWarmTimer);
+  viewportWarmTimer = window.setTimeout(() => {
+    if (documentReset.pending || usesCanonicalSurface() || directEditor || inFlight || composing) return;
+    const viewport = pagesEl.getBoundingClientRect();
+    const center = (viewport.top + viewport.bottom) / 2;
+    let nearest = null;
+    let distance = Infinity;
+    for (const [page, div] of pageDivs) {
+      const bounds = div.getBoundingClientRect();
+      if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) continue;
+      const gap = Math.abs((bounds.top + bounds.bottom) / 2 - center);
+      if (gap < distance) { nearest = page; distance = gap; }
+    }
+    if (nearest === null) return;
+    const key = `${documentReset.adoptedEpoch}:${appliedSrcRev}:${nearest}`;
+    if (viewportWarmKey === key) return;
+    viewportWarmKey = key;
+    void fetch('/warm', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ page: nearest }),
+    }).catch(() => { if (viewportWarmKey === key) viewportWarmKey = ''; });
+  }, 160);
 }
 
 function flushDirectPresentationUpdates() {
@@ -2065,6 +2092,7 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   // The editor can move from a removed tail page to a surviving page.
   // Transfer it while both ancestors are still connected.
   reconcileOpaquePageCount(batch.pageCount);
+  scheduleViewportWarm();
   updateBadge();
 }
 
@@ -6219,6 +6247,7 @@ window.addEventListener('resize', () => {
 });
 pagesEl.addEventListener('scroll', () => {
   if (directEditor) scheduleDirectEditorVisuals(true);
+  scheduleViewportWarm();
 }, { passive: true });
 // Embed mode (?embed=1): a host app (e.g. TeX64) shows only the pages —
 // no topbar, no pane title, no inspector — and owns the editor, pushing

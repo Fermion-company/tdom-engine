@@ -22,18 +22,11 @@ import { stripComments } from './safety.js';
 const OUTPUT_HIJACK_RE =
   /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded|wrapfigure|wraptable|sidewaysfigure|sidewaystable)\}|\\begin\{algorithm\*?\}(?!\[[^\]]*H)|\\begin\{tcolorbox\}\[[^\]]*breakable|\\includepdf\b/;
 
-// Forced page breaks are output-routine hijackers too: \newpage/\clearpage
-// end with \penalty-\@M, which fires the output routine REGARDLESS of page
-// fullness — on the dormant page the routine absorbs everything contributed
-// so far and the harvest sees an EMPTY galley, so the block's material
-// silently vanishes from the provisional layer. \maketitle is the everyday
-// victim (article's non-titlepage branch runs \newpage before \@maketitle):
-// observed live as "title/author/date disappear from the preview after any
-// edit until canonical lands" (2026-08-20). The rescue tier is the designed
-// answer — the isolated compile has a real page builder, so the galley
-// carries the true title-box height for pagination and the chunk pixels are
-// print-identical.
-const FORCED_BREAK_RE = /\\(?:maketitle|newpage|clearpage|cleardoublepage)\b/;
+// Ordinary forced breaks are retained by the native output absorb, including
+// material before/after the break. Isolating them loses page context and can
+// turn clearpage's empty output into another printed page. Title machinery
+// still uses the isolated path for class-specific output and page styles.
+const TITLE_RE = /\\maketitle\b/;
 
 function skipSpace(source, at) {
   while (at < source.length && /\s/.test(source[at])) at++;
@@ -96,7 +89,7 @@ export function collectBreakableTcolorboxNames(preamble) {
  */
 export function needsRescue(text, { preHash, breakableFor, breakableRe, source, structuralSinks = [] }) {
   const live = stripComments(text); // `% \begin{longtable}` must not cost a rescue
-  if (structuralSinks.length || OUTPUT_HIJACK_RE.test(live) || FORCED_BREAK_RE.test(live)) {
+  if (structuralSinks.length || OUTPUT_HIJACK_RE.test(live) || TITLE_RE.test(live)) {
     return { needs: true, breakableFor, breakableRe };
   }
   if (breakableFor !== preHash) {

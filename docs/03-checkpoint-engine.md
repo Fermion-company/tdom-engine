@@ -149,6 +149,8 @@ warm/rescue の組版結果が同一でも、chunkの版が変わった場合は
 
 `/warm` は `offset` と任意の `filePath` を受け取り、そのソースファイルに属する block の前後を保持する。子ファイルの offset は子ファイルの本文長と照合し、親ファイルの同じ数値の位置へ置き換えない。`filePath` 省略時は従来どおり root を対象にする。
 
+同じページに欠けている exact chunk があれば、その block まで同じ中断可能な chain を準備し、既存の並列数制限付き render pump へ渡す。`/warm` の `page` 指定はそのページの先頭 block を起点にする。viewer は canonical の表示確定後とスクロール停止後に表示中のページを準備する。入力や文書切替による世代変更は既存の abort 経路で優先される。
+
 標準 class option の二段組と本文中の `\onecolumn` / `\twocolumn` は、page builder の結果を表示せず、resident LuaLaTeX の実定義・実列幅による行組みだけを canonical-addressed overlay に使う。列切替時の `\box255` はTeXプリミティブで通常boxへ移してから dormant pageへ戻し、active column mode / width を exit state vector に含める。overlay は編集位置が可視本文 region 内であることと、内部段落なら行数が変わらないことを確認し、TeXのline boxが変化したsuffixだけを物理列上で差し替える。mid-document geometry change と `\balance` は `safety.js` 側で structured path から外れる。margin note は canonical-only block である。footnote は扱うが、TeX と同じ page-spanning split を完全再現する実装ではない。
 
 ## 3.9 exact chunk の経路
@@ -170,6 +172,8 @@ render lane の終了時にも queue を再確認する。全 lane が終了判�
 CAPTURE の初期対象は `\[...\]`、`$$...$$`、equation/align/gather/multline 等の display math に限定する。token は source edit ごとに単調増加し、block id と token の両方が一致した場合だけ shipout する。capture child を fork した直後に checkpoint 親の list を解放し、次の JOB child は継承した古い list を組版前に破棄する。graphics、float、breakable box は backend/output-routine state の所有境界が異なるため、従来の RENDER/isolated 経路を使う。
 
 通常driverとisolated rescueの吸収用output routineは、TeXの `\global\setbox...=\box255\relax` で出力boxを専用boxへ移してからLuaで回収する。`\relax` はbox番号の読み取りを終え、代入前に後続の `\directlua` が展開されることを防ぐ。isolated rescueの最終回収はpage listとcontribution listの両方を連結し、改ページ直後にcontribution側へ戻った本文も保持する。
+
+通常の `\newpage`・`\clearpage`・`\cleardoublepage` は native の吸収処理で前後の素材と eject marker を保持し、命令名だけでは isolated rescue にしない。`\maketitle` の class 固有出力と、独自 output routine を使う環境は rescue 判定を維持する。
 
 isolated render は idle-gated の低優先度経路である。`rescueQueue` が空、canonical が compile 中でない、直近編集から一定時間が経過、などの条件を見て動く。
 

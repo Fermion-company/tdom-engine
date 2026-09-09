@@ -1244,8 +1244,14 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/warm') {
       const body = JSON.parse(await readBody(req));
       const offset = Number(body.offset);
-      if (!Number.isFinite(offset)) return json(res, { error: 'warm requires a finite offset' }, 400);
-      void engine.warmEditOffset(offset, typeof body.filePath === 'string' ? body.filePath : engine.file).catch((error) => {
+      const page = Number(body.page);
+      if (!Number.isFinite(offset) && !(Number.isSafeInteger(page) && page > 0)) {
+        return json(res, { error: 'warm requires a finite offset or positive page' }, 400);
+      }
+      const warming = Number.isFinite(offset)
+        ? engine.warmEditOffset(offset, typeof body.filePath === 'string' ? body.filePath : engine.file)
+        : engine.warmPage(page);
+      void warming.catch((error) => {
         engine.warmInfo = { status: 'error', message: error?.message ?? String(error) };
       });
       return json(res, { scheduled: true, srcRev: engine.srcRev });

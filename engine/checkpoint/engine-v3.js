@@ -236,6 +236,14 @@ export class CheckpointEngine {
    * its promise to tests, while the app deliberately schedules it fire-and-
    * forget during cursor idle time.
    */
+  async warmPage(pageNumber) {
+    const page = this.pages.find(item => item.number === Number(pageNumber));
+    const ids = new Set(page?.draw?.map(draw => draw.u?.blockId));
+    const block = this.blocks.find(item => ids.has(item.id));
+    if (!block) return { status: 'rejected', reason: 'unknown-page' };
+    return this.warmEditOffset(block.start, block.file ?? this.file);
+  }
+
   async warmEditOffset(offset, file = this.file) {
     const sourceFile = path.resolve(this.docDir, file);
     const rootFile = path.resolve(this.docDir, this.file);
@@ -258,6 +266,16 @@ export class CheckpointEngine {
     });
     if (target < 0) return { status: 'rejected', reason: 'outside-body' };
 
+    // A page is published atomically. Warm its missing exact neighbors too;
+    // a fast edited chunk alone cannot replace an otherwise unpaintable page.
+    const targetId = this.blocks[target].id;
+    const pageIds = new Set(this.pages.filter(page => page.draw?.some(draw => draw.u?.blockId === targetId))
+      .flatMap(page => page.draw.map(draw => draw.u?.blockId)));
+    const missing = this.blocks.map((block, index) => ({ block, index })).filter(({ block }) =>
+      pageIds.has(block.id) && block.needsRender && this.#chunkTargets(block).some(chunk =>
+        this.chunks.get(chunk.key)?.forGalley !== block.galleyHash));
+    const first = Math.min(target, ...missing.map(item => item.index));
+    const last = Math.max(target, ...missing.map(item => item.index));
     this.warmInfo = { status: 'scheduled', sourceRev, target, offset: numericOffset, file: sourceFile };
     // Cursor movement outranks background rescue/settle work, but never an
     // edit. Reuse the established abort path so a deep LuaTeX-ja job cannot
@@ -281,7 +299,7 @@ export class CheckpointEngine {
       this.editHold = [...new Set([target, target + 1, ...this.editHold])]
         .filter((idx) => idx >= 0 && idx <= this.blocks.length)
         .slice(0, 8);
-      if (this.checkpoints.has(target) && this.checkpoints.has(target + 1)) {
+      if (!missing.length && this.checkpoints.has(target) && this.checkpoints.has(target + 1)) {
         this.#enforceCheckpointCap();
         const ready = {
           status: 'ready',
@@ -294,7 +312,7 @@ export class CheckpointEngine {
         this.warmInfo = ready;
         return ready;
       }
-      const from = this.#nearestCheckpoint(target);
+      const from = this.#nearestCheckpoint(first);
       let changed = false;
       const beforeChunksRev = this.chunks.rev;
       this.bgActive = true;
@@ -302,8 +320,12 @@ export class CheckpointEngine {
       try {
         replayed = await this.#retypesetChain(
           from,
-          target,
-          (_idx, blockChanged) => { changed ||= blockChanged; },
+          last,
+          (idx, blockChanged) => {
+            changed ||= blockChanged;
+            const block = this.blocks[idx];
+            if (pageIds.has(block.id) && block.needsRender) this.#queueRender(block.id, { interactiveRev: sourceRev });
+          },
           () => this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev
         );
       } finally {

@@ -1361,7 +1361,7 @@ test('backward ref updates when the label moves to a value already visible in th
   }
 });
 
-test('forced-break rescue consumes the TeX output box and supplies exact page material', opts, async () => {
+test('native forced breaks retain adjacent material without phantom pages or rescue work', opts, async () => {
   await eng.open(String.raw`\documentclass{article}
 \begin{document}
 Ordinary prose before the rescued material.
@@ -1370,20 +1370,21 @@ Ordinary prose before the rescued material.
 \newpage
 
 Ordinary prose after the rescued material.
+\clearpage
+
+Ordinary prose on the third page.
 \end{document}`);
   await drain(eng);
-  const rescued = eng.blocks.find(block => block.text.includes('\\newpage'));
-  assert.ok(rescued?.rescued, 'the forced-break block completes its rescue');
-  assert.equal(rescued.galley.tdomPendingPaint, undefined, 'no page-wide pending marker remains');
-  assert.ok([...eng.chunks.keys()].some(key => key === rescued.id || key.startsWith(rescued.id + '@')),
-    `the rescued text has exact pixels: ${JSON.stringify({ items: rescued.galley.items, keys: [...eng.chunks.keys()], diagnostics: eng.diagnostics })}`);
-  const chunk = [...eng.chunks.entries()].find(([key]) => key === rescued.id || key.startsWith(rescued.id + '@'))[1];
-  const pdf = path.join(WORK, 'forced-break-rescue.pdf');
-  writeFileSync(pdf, chunk.editPdf);
-  const { stdout } = await promisify(execFile)('pdftotext', [pdf, '-']);
-  assert.match(stdout, /Rescued material with a forced break/, 'the exact PDF retains the rescued text');
+  assert.equal(eng.blocks.some(block => block.rescued || block.galley?.tdomPendingPaint), false);
+  assert.equal(eng.rescueQueue.size, 0);
+  assert.equal(eng.pages.length, 3);
+  const text = eng.getDisplayLists().map(page => page.commands
+    .filter(command => command.op === 'glyphs').map(command => command.text).join('').replace(/\s/g, ''));
+  assert.match(text[0], /Rescuedmaterialwithaforcedbreak/);
+  assert.match(text[1], /Ordinaryproseafter/);
+  assert.match(text[2], /Ordinaryproseonthethirdpage/);
   assert.doesNotMatch(eng.rootLogRef?.() ?? '', /Output routine didn't use all of/,
-    'the forked rescue must consume box255 through TeX');
+    'the native output routine must consume box255 through TeX');
   const at = eng.getSource().indexOf('Ordinary prose before') + 'Ordinary prose'.length;
   const report = await eng.edit(at, at, ' edited');
   assert.ok(report.stats.blocksTypeset <= 2, 'adjacent prose stays bounded');
@@ -1632,6 +1633,53 @@ ActiveMarker !abcd.
     const report = await e.edit(at, at, 'e');
     assert.notEqual(report.stats.chainVerdict, 'verify');
   } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('warming a cold page supplies every exact neighbor before an included box edit', opts, async () => {
+  await eng.close();
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-warm-page-'));
+  const child = path.join(root, 'child.tex');
+  writeFileSync(child, String.raw`\begin{tcolorbox}[enhanced,title=Target]
+TargetWitness $x^2$.
+\end{tcolorbox}`);
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const previousHot = process.env.TDOM_RENDER_HOT_MAX;
+  process.env.TDOM_RENDER_HOT_MAX = '1';
+  const missing = page => e.getDisplayLists().find(item => item.page === page)?.commands.filter(command =>
+    command.op === 'pending-exact' || command.op === 'chunk' && command.st);
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage[most]{tcolorbox}
+\begin{document}
+First page.
+\newpage
+
+\begin{tcolorbox}[enhanced,title=Neighbor]
+NeighborWitness.
+\end{tcolorbox}
+
+\input{child.tex}
+\end{document}`);
+    assert.ok(missing(2).length > 0, 'cold page starts without exact graphics');
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    const warmed = await e.warmPage(2);
+    assert.equal(warmed.status, 'ready');
+    await e.renderTask;
+    assert.deepEqual(missing(2), [], 'unchanged neighbor cannot block the next atomic page paint');
+    writeFileSync(child, readFileSync(child, 'utf8').replace('x^2', 'x^3'));
+    const report = await e.refresh();
+    assert.ok(report.stats.blocksTypeset <= 2, 'child uses the warmed page checkpoint');
+    await e.renderTask;
+    assert.deepEqual(missing(2), []);
+    assert.equal(e.pages.length, 2);
+    assert.equal(e.rescueQueue.size, 0);
+  } finally {
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
     await e.close();
     rmSync(root, { recursive: true, force: true });
   }
