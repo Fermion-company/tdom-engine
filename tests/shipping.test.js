@@ -17,7 +17,9 @@ import { ShippingChain } from '../engine/checkpoint/shipping.js';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 
 const execFileP = promisify(execFile);
-const WORK = fileURLToPath(new URL('../.tdom-ship-test', import.meta.url));
+const WORK = process.env.TDOM_TEST_WORK_ROOT
+  ? path.join(process.env.TDOM_TEST_WORK_ROOT, '.tdom-ship-test')
+  : fileURLToPath(new URL('../.tdom-ship-test', import.meta.url));
 const DOC = fileURLToPath(new URL('../samples/demo-lua.tex', import.meta.url));
 
 const available = await promisify(execFile)('lualatex', ['--version'], { timeout: 15_000 }).then(

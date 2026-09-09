@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import path from 'node:path';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 import { buildDisplayList } from '../engine/checkpoint/display-list.js';
 import { buildStream } from '../engine/checkpoint/stream.js';
@@ -29,9 +30,13 @@ import {
   planTerminalCanonicalAnchor,
 } from '../engine/checkpoint/canonical-anchor.js';
 
-const WORK = fileURLToPath(new URL('../.tdom-hotpath-test', import.meta.url));
-const WORK2 = fileURLToPath(new URL('../.tdom-hotpath-test-scratch', import.meta.url));
-const WORK3 = fileURLToPath(new URL('../.tdom-hotpath-test-mixed-shipping', import.meta.url));
+const TEST_WORK_ROOT = process.env.TDOM_TEST_WORK_ROOT;
+const workDir = (name) => TEST_WORK_ROOT
+  ? path.join(TEST_WORK_ROOT, name)
+  : fileURLToPath(new URL(`../${name}`, import.meta.url));
+const WORK = workDir('.tdom-hotpath-test');
+const WORK2 = workDir('.tdom-hotpath-test-scratch');
+const WORK3 = workDir('.tdom-hotpath-test-mixed-shipping');
 
 const available = await promisify(execFile)('lualatex', ['--version'], { timeout: 15_000 }).then(
   () => true,

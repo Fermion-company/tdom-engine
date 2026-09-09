@@ -33,6 +33,11 @@ jobs:
 
       - name: Full test suite
         run: npm test
+        env:
+          # The checkout is a container bind mount with host-dependent I/O
+          # latency. Keep the 700ms production gate meaningful by measuring
+          # TeX scratch work on the runner-local filesystem.
+          TDOM_TEST_WORK_ROOT: /tmp/tdom-engine-tests
 
       - name: Farm (pseudo == real referee)
         run: npm run farm
