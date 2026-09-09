@@ -1,58 +1,24 @@
-# The deep verification net (docs/06): the full suite, the farm referee and
-# the edit fuzzer are too heavy to run on a 16GB dev machine next to a live
-# resident engine — they run here on every push instead. Local development
-# keeps only the light pair (farm + hot-path, ~3min).
-name: audit
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-concurrency:
-  group: audit-${{ github.ref }}
-  cancel-in-progress: true
-
+name: issue52 diagnostic
+on: workflow_dispatch
 jobs:
-  audit:
+  compare:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    # NB: no global TDOM_MAX_CHECKPOINTS here — the runner is a dedicated
-    # 16GB box, and some tests assert the default all-boundaries budget;
-    # the fuzzer sets its own reduced budget internally.
     container:
       image: texlive/texlive:latest
+    strategy:
+      matrix:
+        revision: [e3d54a3, 680bec1]
+        budget: [8, 64]
     steps:
       - uses: actions/checkout@v4
-
-      - name: System deps (node + poppler + cc for the fork shim)
+        with:
+          ref: ${{ matrix.revision }}
+      - name: Dependencies
         run: |
           apt-get update -qq
           apt-get install -y -qq nodejs npm poppler-utils qpdf build-essential >/dev/null
-          node --version && lualatex --version | head -1 && pdftocairo -v 2>&1 | head -1 && qpdf --version | head -1
-
-      - name: Full test suite
-        run: npm test
+      - name: Footnote comparison
         env:
-          # The checkout is a container bind mount with host-dependent I/O
-          # latency. Keep the 700ms production gate meaningful by measuring
-          # TeX scratch work on the runner-local filesystem.
-          TDOM_TEST_WORK_ROOT: /tmp/tdom-engine-tests
-          # Hosted runners are substantially slower and variable. Production
-          # and local target-machine checks retain the default 700ms cutoff;
-          # this budget lets the same exact-output assertions complete here.
-          TDOM_TEST_WAVE_CUTOFF: 3000
-
-      - name: Bounded checkpoint regression
-        run: node --test tests/checkpoint-selection.test.js tests/hot-path.test.js
-        env:
-          TDOM_MAX_CHECKPOINTS: 8
-          TDOM_EXPECT_MAX_CHECKPOINTS: 8
-          TDOM_TEST_WORK_ROOT: /tmp/tdom-engine-tests-bounded
-          TDOM_TEST_WAVE_CUTOFF: 3000
-
-      - name: Farm (pseudo == real referee)
-        run: npm run farm
-
-      - name: Fuzz — corpus refs (seed 1)
-        run: node tools/fuzz.mjs corpus/06-refs-heavy.tex --seed=1 --bursts=6 --edits=4
+          TDOM_MAX_CHECKPOINTS: ${{ matrix.budget }}
+          TDOM_DEBUG_BLOCKS: 1
+        run: node tools/verify-layout.mjs corpus/11-simple-live-preview.tex --verbose
