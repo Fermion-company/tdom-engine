@@ -6,6 +6,7 @@ jobs:
     container:
       image: texlive/texlive:latest
     strategy:
+      fail-fast: false
       matrix:
         revision: [e3d54a3f39cf84c948fa185624291b8399e9302a, 680bec11af9bdfa2c947c192074cc4ce1524ee45]
         budget: [8, 64]
@@ -17,6 +18,14 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq nodejs npm poppler-utils qpdf build-essential >/dev/null
+      - name: Detailed renderer evidence
+        run: |
+          python3 - <<'CODE'
+          from pathlib import Path
+          p=Path('tools/verify-layout.mjs')
+          s=p.read_text().replace('needsRender: block.needsRender,', "needsRender: block.needsRender, fidelity: {...block.fidelity, ins: [...(block.fidelity?.ins ?? [])]}, galleyHash: block.galleyHash, foot: block.galley?.items?.filter(item => item.k === 'ins'), chunks: [...engine.chunks.map ?? []], diagnostics: engine.diagnostics, renderStats: engine.renderStats,")
+          p.write_text(s)
+          CODE
       - name: Footnote comparison
         env:
           TDOM_MAX_CHECKPOINTS: ${{ matrix.budget }}
