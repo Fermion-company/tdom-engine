@@ -183,8 +183,6 @@ function tdom_boot(port, workdir, counters)
   sock = require('socket')
   conn = assert(sock.connect('127.0.0.1', PORT))
   conn:setoption('tcp-nodelay', true)
-  conn:send('HELLO ckpt 0 ' .. fk.getpid() .. '\n')
-  texio.write_nl('tdom: daemon resident, checkpoint 0, pid ' .. fk.getpid())
   -- A recovered TeX error may still reach the injected tdom_report().  That
   -- output is not a successful preview generation: mark the JOB so the host
   -- can discard its child checkpoint and keep the previous good galley.
@@ -955,6 +953,29 @@ local function reseed_page()
   end)
 end
 
+local function checkpoint_gc(initial)
+  if os.getenv('TDOM_NO_CKPT_GC') then return end
+  if initial or not TDOM_GC_FLOOR then
+    collectgarbage('collect')
+    collectgarbage('collect')
+    TDOM_GC_FLOOR = collectgarbage('count')
+    return
+  end
+  -- Advance the inherited incremental collector instead of sweeping the
+  -- entire Japanese font heap twice on each fork from the same boundary.
+  -- A hard garbage allowance still bounds deep lineages when a block
+  -- allocates faster than these incremental steps can reclaim it.
+  local completed = collectgarbage('step', 2048)
+  local kb = collectgarbage('count')
+  if completed then
+    TDOM_GC_FLOOR = kb
+  elseif kb > TDOM_GC_FLOOR + 65536 then
+    collectgarbage('collect')
+    collectgarbage('collect')
+    TDOM_GC_FLOOR = collectgarbage('count')
+  end
+end
+
 function tdom_seed()
   pcall(function() tex.triggerbuildpage() end)
   local old = tex.lists.page_head
@@ -966,6 +987,11 @@ function tdom_seed()
   reseed_page()
   -- fresh document start: no interline glue above the first line
   tex.nest[0].prevdepth = -65536000
+  checkpoint_gc(true)
+  -- Readiness includes the font warmup and heap cleanup. A JOB measured
+  -- before this point would charge preamble work to its source block.
+  conn:send('HELLO ckpt 0 ' .. fk.getpid() .. '\n')
+  texio.write_nl('tdom: daemon resident, checkpoint 0, pid ' .. fk.getpid())
 end
 
 -- Collect the freshly typeset MVL nodes (page list + any contributions the
@@ -1263,20 +1289,7 @@ function tdom_report()
   if head and not capture then node.flush_list(head) end
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
   conn:send(payload)
-  -- Collect BEFORE this process becomes a long-lived checkpoint: the fork
-  -- chain inherits the whole Lua heap, so uncollected per-job garbage
-  -- (luatexja's per-paragraph tables, payload strings) compounds across
-  -- generations — on Japanese documents the per-block cost was measured
-  -- growing from ~1ms to ~11s along a 450-block chain without this.
-  -- Thresholded so clean-heap blocks don't pay a full GC sweep each.
-  if not os.getenv('TDOM_NO_CKPT_GC') then
-    local kb = collectgarbage('count')
-    if kb > (TDOM_GC_FLOOR or 0) + 8192 then
-      collectgarbage('collect')
-      collectgarbage('collect')
-      TDOM_GC_FLOOR = collectgarbage('count')
-    end
-  end
+  checkpoint_gc(false)
   -- this child now becomes the next checkpoint in the chain
   CKPT = JOB.ckpt
   conn:send('CKPT ' .. CKPT .. ' ' .. fk.getpid() .. '\n')

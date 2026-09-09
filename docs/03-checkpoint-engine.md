@@ -16,15 +16,17 @@
 | `engine/checkpoint/safety.js` | structured path に入れてよい文書かを判定する |
 | `engine/checkpoint/fidelity.js` | glyph 表示と exact chunk の切り替え判定 |
 | `engine/checkpoint/mathmap.js` | legacy math font の twin font mapping |
-| `engine/checkpoint/mapped-inputs.js` | `\\input` を展開してから段落を分割し、複数ファイルにまたがる block の元ソース位置を保持する |
+| `engine/checkpoint/mapped-inputs.js` | `\input` を展開してから段落を分割し、複数ファイルにまたがる block の元ソース位置を保持する |
 
-`\\input` の前後には段落境界を追加しない。空行・明示的な `\\par`・sectioning が block の境界になる。複数ファイルを含む block の `sourceParts` は各テキスト範囲と元ファイル位置を持ち、DOM の `sourceRanges` と個々の `editRegions.source` に変換される。カーソル位置の warming もこの対応で対象 block を解決する。
+`\input` の前後には段落境界を追加しない。空行・明示的な `\par`・sectioning が block の境界になる。複数ファイルを含む block の `sourceParts` は各テキスト範囲と元ファイル位置を持ち、DOM の `sourceRanges` と個々の `editRegions.source` に変換される。カーソル位置の warming もこの対応で対象 block を解決する。
 
 ## 3.2 プロセスモデル
 
 Shipping の checkpoint も `TDOM_MAX_CHECKPOINTS` を上限とする。併用時の枠は、基準上限の2倍から現在の resident 数を差し引いて制限する（再開用 root は1個保持）。root・最新ページを優先し、古いページは間隔が最も狭い境界から間引く。resident の checkpoint 増加時にも Shipping を即時整理する。編集中・描画中に保持する resident の一時枠は別途存続する。
 
 root は `lualatex --shell-escape -interaction=nonstopmode driver.tex` として起動される。`--shell-escape` は `tdomfork.c` の共有ライブラリを `package.loadlib` するために使われる。
+
+checkpoint 0 の準備完了は font warmup と初期 GC の後に通知する。各 JOB の末尾では Lua の incremental GC を 2048KB 分進め、完了した cycle の使用量を基準にする。未回収分が基準から64MB増えた場合は full GC を行う。毎回同じ checkpoint から編集しても、8MBの増加ごとに日本語フォントを含む heap 全体を2回走査することはない。
 
 ```text
 Node.js engine
