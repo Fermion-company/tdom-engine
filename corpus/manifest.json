@@ -49,7 +49,7 @@
         "kind": "page-count-mismatch",
         "enginePages": 1,
         "realPages": 2,
-        "matched": 21,
+        "matched": [18, 21],
         "lines": 34
       }
     },
