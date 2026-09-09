@@ -20,6 +20,8 @@ export async function bootRoot(
     }
   }
   engine.checkpoints.clear();
+  engine.confirmedLiveHeapKb = 0;
+  engine.calibrateInitialHeap = true;
   if (engine.root) {
     try { engine.root.kill('SIGKILL'); } catch { /* gone */ }
     engine.root = null;

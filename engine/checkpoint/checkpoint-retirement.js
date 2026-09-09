@@ -2,14 +2,17 @@ import { maybeHoldRenderCheckpoint } from './render-hold.js';
 
 // A changing cost estimate may select boundaries the walk has already
 // passed. Retain nearby existing snapshots until their replacements exist.
-function availableKeepSet(checkpoints, desired) {
+function availableKeepSet(checkpoints, desired, protectedIndices) {
   const kept = new Set([...desired].filter(index => checkpoints.has(index)));
   for (const target of desired) {
     if (kept.size >= desired.size) break;
     if (checkpoints.has(target)) continue;
     let nearest = null;
-    for (const index of checkpoints.keys()) {
-      if (kept.has(index)) continue;
+    const candidates = [...checkpoints.keys()].filter(index => !kept.has(index));
+    const unpinned = candidates.filter(index => !protectedIndices.has(index));
+    // Edit/render owners already survive outside the coverage budget. Using
+    // them as substitutes can evict a distant frontier without saving a PID.
+    for (const index of unpinned.length ? unpinned : candidates) {
       if (nearest === null || Math.abs(index - target) < Math.abs(nearest - target) ||
           (Math.abs(index - target) === Math.abs(nearest - target) && index < nearest)) nearest = index;
     }
@@ -18,8 +21,8 @@ function availableKeepSet(checkpoints, desired) {
   return kept;
 }
 
-export function enforceCheckpointCap({ checkpoints, keep, editHold, renderHold, dyingPids }) {
-  const available = availableKeepSet(checkpoints, keep);
+export function enforceCheckpointCap({ checkpoints, keep, editHold, coveragePins = editHold, renderHold, dyingPids }) {
+  const available = availableKeepSet(checkpoints, keep, new Set([...coveragePins, ...renderHold.keys()]));
   for (const [idx, peer] of [...checkpoints]) {
     if (available.has(idx)) continue; // measured-cost skeleton
     if (editHold.includes(idx)) continue; // block being typed in
@@ -31,7 +34,7 @@ export function enforceCheckpointCap({ checkpoints, keep, editHold, renderHold, 
 }
 
 export function retireOffGrid({ idx, keep, checkpoints, editHold, renderHold, block, dyingPids }) {
-  if (availableKeepSet(checkpoints, keep).has(idx)) return;
+  if (availableKeepSet(checkpoints, keep, new Set([...editHold, ...renderHold.keys()])).has(idx)) return;
   if (!checkpoints.has(idx + 1)) return; // successor must exist first
   // edit-locus pin: keep the boundaries around the block being typed in,
   // so a keystroke burst never pays a grid replay

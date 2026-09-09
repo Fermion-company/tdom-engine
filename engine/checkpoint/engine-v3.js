@@ -338,6 +338,7 @@ export class CheckpointEngine {
       if (replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev) {
         return { status: 'superseded', sourceRev, target };
       }
+      this.editHold = [...new Set([target, target + 1, from + replayed, ...this.editHold])].slice(0, 8);
       this.#enforceCheckpointCap();
       // A cached rescue can replace its PDF chunk without changing any
       // measured boxes or exit state. Its new version must reach page DLs.
@@ -536,11 +537,14 @@ export class CheckpointEngine {
         this.checkpoints.delete(idx);
         this.currentJob.pid = ck.pid;
       }
-      ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${interactive ? 'F' : 'B'} ${Number(block.galley?.gcFloorKb) || 0}\n`);
+      const calibrate = !override && this.calibrateInitialHeap && idx === this.blocks.length - 1;
+      const liveFloor = Math.max(Number(block.galley?.gcFloorKb) || 0, this.confirmedLiveHeapKb || 0);
+      ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}\n`);
       ck.sendRaw(body);
       const [galley, nextCheckpoint] = await Promise.all([galleyP, ckptP]);
       nextCheckpoint.replayToken = replayToken;
       galley.gcFloorKb = nextCheckpoint.gcFloorKb;
+      this.confirmedLiveHeapKb = Math.max(this.confirmedLiveHeapKb || 0, nextCheckpoint.gcFloorKb || 0);
       if (process.env.TDOM_TRACE_JOB) console.error('[job-gc]', jobId, JSON.stringify({ interactive, gcMs: nextCheckpoint.gcMs, ...galley.tm }));
       block.typesetCleanupMs = (block.typesetCleanupMs ?? 0) + (nextCheckpoint.gcMs ?? 0);
       if (!override && block.nativeClosureRequired !== false && galley.closure === 'error') {
@@ -569,6 +573,7 @@ export class CheckpointEngine {
         galley.refs = [...new Set([...(galley.refs ?? []), ...Object.keys(refSnapshot)])];
       }
       this.#recordTypesetCost(block, performance.now() - jobStarted - (nextCheckpoint.gcMs ?? 0));
+      if (calibrate) this.calibrateInitialHeap = false;
       if (!advance) this.#retireOffGrid(idx);
       this.#enforceCheckpointCap(idx + 1);
       return galley;
@@ -761,6 +766,9 @@ export class CheckpointEngine {
   #recordTypesetCost(block, elapsedMs) {
     if (!block || !Number.isFinite(elapsedMs)) return;
     const previous = Number(block.typesetCostMs) || 0;
+    // Warming reopens cached font faces from an older snapshot. That
+    // one-time cost must not displace distant coverage for unchanged source.
+    if (this.warming && previous) return;
     if (elapsedMs <= previous) return;
     block.typesetCostMs = elapsedMs;
     // Avoid an O(blocks log blocks) sort after every cheap JOB in a long
@@ -806,6 +814,7 @@ export class CheckpointEngine {
       checkpoints: this.checkpoints,
       keep: this.#checkpointKeepSet(),
       editHold: [...this.editHold, ...active, ...(continuation === null ? [] : [continuation])],
+      coveragePins: this.editHold,
       renderHold: this.renderHold,
       dyingPids: this.dyingPids,
     });

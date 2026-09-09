@@ -130,6 +130,7 @@ local function adopt_private_input(prepared)
 end
 
 local function wait_as_checkpoint()
+  fk.set_interactive(0)
   while true do
     local line = conn:receive('*l')
     if not line then fk._exit(0) end
@@ -146,6 +147,7 @@ local function wait_as_checkpoint()
       local prepared_input = prepare_private_input()
       local resume_pid = fk.fork()
       if resume_pid == 0 then
+        fk.set_interactive(1)
         adopt_private_input(prepared_input)
         adopt_branch(resume_dir, branch)
         GEN = resume_gen

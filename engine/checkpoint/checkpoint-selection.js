@@ -1,3 +1,22 @@
+import { stripComments } from './safety.js';
+
+// This only chooses a replay frontier; every source token still executes.
+// Trailing spacing/flush commands are poor anchors for editing visible ink.
+function tailCheckpoint(blocks, limit) {
+  const textAt = index => typeof blocks[index]?.text === 'string'
+    ? stripComments(blocks[index].text).trim() : null;
+  const spacing = /^(?:\s*\\(?:par|smallskip|medskip|bigskip|newpage|clearpage)\s*)*$/;
+  let tail = blocks.length - 1;
+  while (tail > 0 && textAt(tail) !== null && spacing.test(textAt(tail))) tail--;
+  // Include the last page's heading and unchanged exact neighbors, when a
+  // nearby explicit page boundary is available within the coverage interval.
+  const lookback = Math.max(4, Math.ceil(blocks.length / Math.max(1, limit - 1)));
+  for (let index = tail - 1; index >= Math.max(0, tail - lookback); index--) {
+    if (/\\(?:newpage|clearpage)\s*$/.test(textAt(index) ?? '')) return index + 1;
+  }
+  return tail;
+}
+
 export function checkpointGrid(blockCount, maxCheckpoints) {
   return Math.max(1, Math.ceil((blockCount + 1) / maxCheckpoints));
 }
@@ -37,12 +56,11 @@ export function checkpointKeepSet(blocks, maxCheckpoints) {
     }
   }
 
-  // The final block has no clean successor to stop on, so a tail edit pays
-  // every block after its resume boundary. Spend the reserved coverage slot
-  // on that stable input boundary while measured hot-block choices evolve.
+  // Spend the reserved tail slot before the final visible material and its
+  // nearby page context, rather than after it at a terminal page flush.
   // If a hot block already selected it, the quantile fill below uses the
   // remaining slot instead.
-  if (keep.size < limit && count > 1) keep.add(count - 1);
+  if (keep.size < limit && count > 1) keep.add(tailCheckpoint(blocks, limit));
 
   // Fill the remaining budget at weighted quantiles. This preserves useful
   // reachability through long all-prose regions and naturally shifts the

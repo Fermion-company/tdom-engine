@@ -2,7 +2,7 @@
  *
  * The checkpoint engine freezes TeX states by fork(): the parent process IS
  * the snapshot, children are alternative continuations. This shim exposes
- * exactly the four primitives that mechanism needs.
+ * the process and descriptor primitives that mechanism needs.
  *
  * Lua API symbols are resolved against the host luatex process at load time,
  * so no Lua headers or libraries are needed to build:
@@ -21,6 +21,9 @@
 #include <string.h>
 #include <errno.h>
 #include <dirent.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 typedef struct lua_State lua_State;
 typedef long long lua_Integer;
@@ -36,6 +39,17 @@ extern void lua_setfield(lua_State *L, int idx, const char *k);
 
 static int l_fork(lua_State *L) {
   lua_pushinteger(L, (lua_Integer)fork());
+  return 1;
+}
+
+static int l_set_interactive(lua_State *L) {
+  int result = 0;
+#ifdef __APPLE__
+  int interactive = lua_tointegerx(L, 1, NULL) != 0;
+  result = pthread_set_qos_class_self_np(
+    interactive ? QOS_CLASS_USER_INITIATED : QOS_CLASS_DEFAULT, 0);
+#endif
+  lua_pushboolean(L, result == 0);
   return 1;
 }
 
@@ -322,6 +336,8 @@ int luaopen_tdomfork(lua_State *L) {
   lua_createtable(L, 0, 8);
   lua_pushcclosure(L, l_fork, 0);
   lua_setfield(L, -2, "fork");
+  lua_pushcclosure(L, l_set_interactive, 0);
+  lua_setfield(L, -2, "set_interactive");
   lua_pushcclosure(L, l_getpid, 0);
   lua_setfield(L, -2, "getpid");
   lua_pushcclosure(L, l_waitpid, 0);

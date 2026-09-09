@@ -26,7 +26,9 @@ Shipping の checkpoint も `TDOM_MAX_CHECKPOINTS` を上限とする。併用�
 
 root は `lualatex --shell-escape -interaction=nonstopmode driver.tex` として起動される。`--shell-escape` は `tdomfork.c` の共有ライブラリを `package.loadlib` するために使われる。
 
-checkpoint 0 の準備完了は font warmup と初期 GC の後に通知する。background JOB の末尾では Lua の incremental GC を 2048KB 分進め、完了した cycle の使用量を基準にする。foreground は前回同じ block の回収後に確認した live heap も基準にし、そこから64MB以内なら collector を止めて atomic scan を延期する。font cache の再読込を毎回未回収ゴミと数えない。未回収分が基準から64MB増えた場合は full GC を行う。毎回同じ checkpoint から編集しても、8MBの増加ごとに日本語フォントを含む heap 全体を2回走査することはない。
+checkpoint 0 の準備完了は font warmup と初期 GC の後に通知する。background JOB の末尾では Lua の incremental GC を 2048KB 分進め、完了した cycle の使用量を基準にする。初期本文の最終 JOB で一度回収を完了させ、本文フォントを含む live heap を記録する。foreground は同じ root のどの block で確認した live heap も基準にし、そこから64MB以内なら collector を止めて atomic scan を延期する。font cache の再読込を毎回未回収ゴミと数えない。未回収分が基準から64MB増えた場合は full GC を行う。毎回同じ checkpoint から編集しても、8MBの増加ごとに日本語フォントを含む heap 全体を2回走査することはない。
+
+macOS の foreground JOB と Shipping の編集継続は、その worker thread に `QOS_CLASS_USER_INITIATED` を設定する。非対話 JOB と Shipping の保存用待機では default に戻す。親アプリや起動方法の実行優先度に編集応答が左右されるのを抑え、他 OS のスケジューリングは変更しない。
 
 ```text
 Node.js engine
@@ -43,7 +45,9 @@ checkpoint は「ある block 境界まで処理済みの TeX プロセス」で
 
 cold prefix の walk は、直前に自身が作った未保持の continuation に限り `STEP` で進める。ブロックごとの native 組版、galley/state 検証は従来と同じで、既存の保存状態・編集中の input・描画中の所有者では必ず fork する。保存対象の境界では直前の JOB node list も保持し、未変更の exact neighbor を再組版せず描画できる。
 
-checkpoint の配置は、回収処理を除いた再組版時間で選ぶ。平均的な block に保存枠を集中させず、中央値の8倍かつ全体の再実行費用に対して十分重い block だけ両側を優先し、残りを費用の分位点へ配置する。未測定 block には測定済み中央値を使い、boot の測定進行に応じて配置を更新する。新しい保存先がまだ存在しない間は、近い既存 checkpoint を枠内で残す。各 JOB の完了時に、次の処理に必要な continuation を残して保持数を整理する。
+checkpoint の配置は、回収処理を除いた再組版時間で選ぶ。平均的な block に保存枠を集中させず、中央値の8倍かつ全体の再実行費用に対して十分重い block だけ両側を優先し、残りを費用の分位点へ配置する。末尾用の枠は終端の空白・改ページ処理より前、近い明示改ページがある場合は最後の本文ページの冒頭に置く。未測定 block には測定済み中央値を使い、boot の測定進行に応じて配置を更新する。新しい保存先がまだ存在しない間は、近い既存 checkpoint を枠内で残す。各 JOB の完了時に、次の処理に必要な continuation を残して保持数を整理する。
+
+未作成の保存先を既存 checkpoint で代替する際、edit/render 用に別枠で保持する checkpoint は後回しにする。編集中の局所的な保存状態が文書全体の到達性を奪わない。page warming の完了地点も既存の editHold 上限内に残す。既に費用を計測した block の warming は配置費用を更新しないため、古い snapshot からの一時的な font 再読込で大域的な配置が変わらない。
 
 ## 3.3 driver.tex の注入内容
 
@@ -69,7 +73,7 @@ checkpoint の配置は、回収処理を除いた再組版時間で選ぶ。平
 
 | command | 内容 |
 | --- | --- |
-| `JOB <blockId> <newCkptIdx> <len> <captureToken\|-> <F\|B> <liveFloorKb>` | block を組版し、結果を返して次 checkpoint になる。display math の hot job は node list を世代付きで保持する |
+| `JOB <blockId> <newCkptIdx> <len> <captureToken\|-> <F\|B\|C> <liveFloorKb>` | block を組版し、結果を返して次 checkpoint になる。display math の hot job は node list を世代付きで保持する |
 | `STEP` | 同じ walk が作った一時 continuation を次の block へ進める。JOB と同じ引数・結果で、保存用 checkpoint は消費しない |
 | `CAPTURE <blockId> <token> <jobDir> <requestId>` | post-block checkpoint が保持する JOB node list を再組版せず shipout する |
 | `RENDER <blockId> <jobDir> <len> <requestId>` | block を tight PDF として shipout する |

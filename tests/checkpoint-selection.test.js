@@ -61,6 +61,22 @@ test('small documents retain every available boundary', () => {
   );
 });
 
+test('terminal page flushes retain the last visible page and its exact neighbors', () => {
+  const blocks = [
+    ...Array.from({ length: 210 }, () => ({ text: 'Ordinary text.', typesetCostMs: 2 })),
+    { text: 'Earlier page.\\newpage % page boundary', typesetCostMs: 2 },
+    { text: '\\section{Last page}', typesetCostMs: 2 },
+    { text: '\\par\\medskip', typesetCostMs: 2 },
+    { text: '\\begin{tcolorbox}Editable body.\\end{tcolorbox}', typesetCostMs: 2 },
+    { text: '\\par\\medskip % input boundary', typesetCostMs: 2 },
+    { text: '\\clearpage', typesetCostMs: 2 },
+  ];
+  const keep = checkpointKeepSet(blocks, 8);
+  assert.equal(keep.size, 8);
+  assert.ok(keep.has(211), 'the final heading and box share a nearby replay frontier');
+  assert.ok(!keep.has(215), 'a flush after all visible ink does not consume the tail slot');
+});
+
 test('ordinary blocks retain coverage instead of spending every slot on similar early costs', () => {
   for (const measuredCount of [8, 224]) {
     const blocks = Array.from({ length: 224 }, (_, index) =>
@@ -93,4 +109,22 @@ test('unmaterialized cost boundaries retain available checkpoints until replacem
   assert.ok(checkpoints.has(0));
   assert.ok(checkpoints.has(25));
   assert.equal(retired.length, 2);
+});
+
+test('temporary edit and render owners do not displace distant coverage frontiers', () => {
+  for (const owner of ['edit', 'render']) {
+    const retired = [];
+    const checkpoints = new Map([0, 1, 26, 54, 90, 124, 155, 188, 219, 221, 222]
+      .map(index => [index, { send: () => retired.push(index) }]));
+    const pins = [1, 221, 222];
+    const state = { checkpoints, keep: new Set([0, 12, 44, 78, 113, 149, 185, 219]),
+      editHold: owner === 'edit' ? pins : [],
+      renderHold: new Map(owner === 'render' ? pins.map(index => [index, `b${index}`]) : []),
+      dyingPids: new Set() };
+    retireOffGrid({ ...state, idx: 26 });
+    enforceCheckpointCap(state);
+    assert.ok(checkpoints.has(26), `${owner} pins must not force the next cold edit back to root`);
+    assert.equal(checkpoints.size, state.keep.size + pins.length);
+    assert.deepEqual(retired, []);
+  }
 });

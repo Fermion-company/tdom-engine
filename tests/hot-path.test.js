@@ -1975,6 +1975,13 @@ Target${index} $x^2$.
     assert.ok(missing(targetPage).length > 0);
     if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
     else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    const tailMarker = 'Target11 $x^';
+    const tailAt = e.getSource().indexOf(tailMarker) + tailMarker.length;
+    const tailReport = await e.edit(tailAt, tailAt + 1, '3');
+    assert.ok(tailReport.stats.blocksTypeset <= 3,
+      'a first edit on the final visible page starts with its unchanged neighbor');
+    await e.renderTask;
+    assert.deepEqual(missing(12), [], 'the final page has fresh exact neighbors before canonical');
     for (const exponent of ['3', '4']) {
       const marker = `Target${targetNumber} $x^`;
       const at = e.getSource().indexOf(marker) + marker.length;
@@ -2071,6 +2078,14 @@ TARGET${index} uses \VisibleWord. Ordinary text continues with the inherited def
   try {
     await e.open(source);
     assert.equal(checkpointExcess, 0, 'checkpoint count stays bounded during every boot step');
+    assert.equal(e.calibrateInitialHeap, false, 'initial body fonts have a completed heap calibration');
+    const liveFloor = e.confirmedLiveHeapKb;
+    assert.ok(liveFloor > 0, 'the native collector reported a live heap baseline');
+    const coverage = [...e.checkpointKeepCache];
+    const firstParagraph = e.getSource().indexOf('TARGET0');
+    await e.warmEditOffset(firstParagraph);
+    assert.deepEqual([...e.checkpointKeepCache], coverage,
+      'warming unchanged text leaves the document coverage plan stable');
     const candidates = e.blocks.map((block, index) => {
       const marker = /TARGET\d+/.exec(block.text)?.[0];
       const prefix = Math.max(...[...e.checkpoints.keys()].filter(boundary => boundary <= index));
@@ -2085,9 +2100,18 @@ TARGET${index} uses \VisibleWord. Ordinary text continues with the inherited def
       if (message.kind === 'FORKED') announcements.push({ pid: message.pid, parent: peer.pid });
       return recordMessage(peer, message);
     };
+    const input = e.checkpoints.get(target.index - target.distance);
+    const send = input.send.bind(input);
+    const jobHeaders = [];
+    input.send = message => {
+      if (message.startsWith('JOB ')) jobHeaders.push(message.trim().split(/\s+/));
+      return send(message);
+    };
     const at = e.getSource().indexOf(target.marker) + target.marker.length;
     const report = await e.edit(at, at, 'x');
     assert.ok(report.stats.blocksTypeset >= 5);
+    assert.ok(jobHeaders.some(header => header[5] === 'F' && Number(header[6]) >= liveFloor),
+      'a cold prefix can reuse the confirmed heap of fonts loaded later in the document');
     assert.ok(announcements.some(item => item.pid === item.parent), 'the prefix reuses a transient process');
     assert.equal(e.checkpoints.get(0).pid, rootPid, 'the frozen root is never consumed');
     await drain(e);

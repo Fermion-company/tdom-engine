@@ -1297,7 +1297,7 @@ function tdom_report()
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
   conn:send(payload)
   local gc_started = os.gettimeofday and os.gettimeofday() or os.clock()
-  checkpoint_gc(false, JOB.interactive)
+  checkpoint_gc(JOB.calibrate, JOB.interactive)
   local gc_ms = ((os.gettimeofday and os.gettimeofday() or os.clock()) - gc_started) * 1000
   -- this child now becomes the next checkpoint in the chain
   CKPT = JOB.ckpt
@@ -1515,7 +1515,7 @@ function tdom_wait()
         FAULT_SILENT = tonumber(b) or 0
       end
     elseif cmd == 'JOB' or cmd == 'STEP' then
-      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B> <liveFloorKb>
+      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B|C> <liveFloorKb>
       local id = a
       local newckpt = tonumber(b) or (CKPT + 1)
       local len = tonumber(c) or 0
@@ -1537,8 +1537,9 @@ function tdom_wait()
         -- checkpoint generation. The parent keeps its own COW copy until
         -- CAPTURE or checkpoint retirement.
         drop_capture()
-        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F' }
-        -- Re-loading a font already measured in this block is live growth,
+        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F', calibrate = mode == 'C' }
+        fk.set_interactive(JOB.interactive and 1 or 0)
+        -- Re-loading a font already measured in this document is live growth,
         -- not another 64MB of garbage to sweep on every fork from its input.
         if JOB.interactive then
           TDOM_GC_FLOOR = math.max(TDOM_GC_FLOOR or 0, tonumber(live_floor) or 0)

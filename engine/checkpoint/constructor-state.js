@@ -95,6 +95,8 @@ export function initializeEngineState(
   engine.maxCheckpoints = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
+  engine.confirmedLiveHeapKb = 0;
+  engine.calibrateInitialHeap = false;
 
   // canonical layer: the exact-output authority (see file header)
   engine.canonical = new CanonicalRenderer({
