@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { documentBounds } from '../segmenter.js';
+import { withProjectInputs } from '../project-inputs.js';
 import { waitForPdf } from './util/fs.js';
 import { cropRenderTargets } from './render-chunks.js';
 import { buildIsolatedRenderSource } from './isolated-render-source.js';
@@ -114,6 +115,7 @@ export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, as
       const run = execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
         cwd: jobdir,
         timeout: 90_000,
+        env: withProjectInputs(process.env, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
       });
       if (run.child) engine.isoChildren.add(run.child);
       await run.catch(() => {}).finally(() => {

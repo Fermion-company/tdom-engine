@@ -22,6 +22,7 @@
 -- and \shipout a real PDF page, so the chunk pixels are the PDF's pixels.
 
 local fk = nil
+local PDF_FD = -1
 local sock = nil
 local conn = nil
 local PORT = 0
@@ -174,6 +175,11 @@ function tdom_boot(port, workdir, counters)
   end
   fk = shim()
   fk.ignore_sigchld()
+  -- Establish one descriptor even when the preamble has not opened PDF yet.
+  -- Every descendant clones it together with its backend object state.
+  pdf.immediateobj('<<>>')
+  PDF_FD = fk.prepare_pdf(workdir .. '/driver.pdf')
+  assert(PDF_FD >= 0, 'cannot privatize resident PDF output')
   sock = require('socket')
   conn = assert(sock.connect('127.0.0.1', PORT))
   conn:setoption('tcp-nodelay', true)
@@ -1402,7 +1408,7 @@ local function fork_for(id)
     conn:send('FORKFAIL ' .. id .. '\n')
     return nil
   end
-  local pid = fk.fork()
+  local pid = fk.fork_pdf(PDF_FD)
   if not pid or pid < 0 then
     texio.write_nl('term and log', 'TDOMFORKFAIL job=' .. tostring(id) .. ' ckpt=' .. tostring(CKPT))
     conn:send('FORKFAIL ' .. id .. '\n')
@@ -1545,6 +1551,7 @@ function tdom_wait()
         FLOAT_COPIES = {}
         FOOT_COPIES = {}
         reconnect('render', 0)
+        assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish resident PDF')
         lfs.chdir(jobdir)
         -- under LaTeX, raw callback.register is owned by luatexbase
         local notify = function()
@@ -1581,6 +1588,7 @@ function tdom_wait()
           FLOAT_COPIES = {}
           FOOT_COPIES = {}
           reconnect('render', 0)
+          assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish captured PDF')
           lfs.chdir(jobdir)
           local notify = function()
             pcall(function()
@@ -1625,20 +1633,9 @@ function tdom_wait()
         JOB = { id = id, ckpt = -1, body = body }
         RENDER_MODE = false
         reconnect('iso', 0)
-        local rootcwd = lfs.currentdir()
+        assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish isolated PDF')
         lfs.chdir(jobdir)
         local notify = function()
-          -- the PDF backend can resolve \jobname.pdf against the process's
-          -- ORIGINAL cwd (package code in the body may also wander it):
-          -- finish_pdffile fires while the file is still open, and a POSIX
-          -- rename keeps the remaining writes flowing into the moved inode
-          -- — so claim it into the jobdir deterministically, then notify
-          pcall(function()
-            if lfs.attributes(jobdir .. '/driver.pdf') == nil and
-               lfs.attributes(rootcwd .. '/driver.pdf') ~= nil then
-              os.rename(rootcwd .. '/driver.pdf', jobdir .. '/driver.pdf')
-            end
-          end)
           pcall(function()
             conn:send('DONE ' .. id .. '\n')
           end)

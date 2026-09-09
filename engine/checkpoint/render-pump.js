@@ -159,16 +159,6 @@ async function renderBlockInner(engine, block, callbacks) {
     releaseRenderHold(idx);
     return true;
   }
-  if (engine.pdfOpenedAtRoot) {
-    // resident children share hyperref's open PDF fd and cannot ship.
-    // Fire-and-forget into the idle-gated isolated queue — it must NOT
-    // occupy a pump lane (its gate can stay closed for minutes while
-    // rescues/canonical churn, and each compile is minutes on
-    // package-heavy documents). Meanwhile the canonical-crop pass
-    // supplies exact pixels for these blocks.
-    renderIsolated(block, idx);
-    return false;
-  }
   const ck = engine.checkpoints.get(idx);
   const captureCk = block.galley?.capture ? engine.checkpoints.get(idx + 1) : null;
   if (!ck && !captureCk) {

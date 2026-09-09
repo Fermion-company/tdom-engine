@@ -9,8 +9,8 @@ const MATHY_RE =
 // Node-list capture is deliberately narrower than the general render
 // heuristic.  Display math is self-contained galley material and can be
 // shipped from the post-JOB checkpoint without re-running the source.  Keep
-// graphics/floats/tcolorbox on the proven RENDER path until their backend
-// objects and output-routine state have an equally strict ownership proof.
+// source-only graphics/floats/tcolorbox guesses on RENDER. Native graphics
+// with measured closure can use the separate admission check below.
 const DISPLAY_MATH_RE =
   /\$\$|\\\[|\\begin\{(?:equation|align|alignat|gather|multline|eqnarray|displaymath)\*?\}/;
 const CAPTURE_UNSAFE_RE =
@@ -59,4 +59,14 @@ export function maybeHoldRenderCheckpoint(idx, block, renderHold) {
 
 export function releaseRenderHold(renderHold, idx) {
   return renderHold.delete(idx);
+}
+
+/** Graphics captures retain current TeX nodes, never old decoration pixels.
+ * Float/insert pages need separate retained lists and remain on RENDER. */
+export function mayCaptureNativeBlock(block) {
+  return mayCaptureDisplayMath(block) || (
+    block?.galley?.gfx === true && block.galley.closure === 'native' &&
+    !block.rescued && !(block.galley.floats?.length) &&
+    !block.galley.items?.some(item => item.k === 'ins' || item.k === 'eject')
+  );
 }

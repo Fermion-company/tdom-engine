@@ -58,7 +58,9 @@ export async function renderResidentBlock(
     let shippedCapture = false;
     const captureToken = block.galley?.capture;
     const captureCk = captureToken ? engine.checkpoints.get(idx + 1) : null;
-    if (captureToken && captureCk) {
+    if (captureToken && captureCk && targets.length === 1 &&
+        !block.galley?.floats?.length &&
+        !block.galley?.items?.some(item => item.k === 'ins' || item.k === 'eject')) {
       try {
         const requestId = `rr@${++engine.renderSeq}`;
         await runShipCommand(engine, {
