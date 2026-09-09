@@ -22,6 +22,8 @@
 
 ## 3.2 プロセスモデル
 
+Shipping の checkpoint も `TDOM_MAX_CHECKPOINTS` を上限とする。併用時の枠は、基準上限の2倍から現在の resident 数を差し引いて制限する（再開用 root は1個保持）。root・最新ページを優先し、古いページは間隔が最も狭い境界から間引く。resident の checkpoint 増加時にも Shipping を即時整理する。編集中・描画中に保持する resident の一時枠は別途存続する。
+
 root は `lualatex --shell-escape -interaction=nonstopmode driver.tex` として起動される。`--shell-escape` は `tdomfork.c` の共有ライブラリを `package.loadlib` するために使われる。
 
 ```text

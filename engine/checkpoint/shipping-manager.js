@@ -231,6 +231,7 @@ export function makeShippingChain(engine, queueShipBoot) {
     workDir: path.join(engine.workDir, 'ship'),
     docDir: engine.docDir,
     overlayDir: engine.overlayDir,
+    checkpointBudget: () => Math.max(1, engine.maxCheckpoints * 2 - engine.checkpoints.size),
   });
   chain.onWave = (wave) => {
     if (engine.shipStale || chain !== engine.shipping) return;

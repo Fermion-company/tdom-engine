@@ -48,6 +48,39 @@ const available = await promisify(execFile)('lualatex', ['--version'], { timeout
 );
 const opts = available ? {} : { skip: 'lualatex not installed' };
 
+test('shipping checkpoints stay bounded across long documents and resident budget changes', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-shipping-cap-'));
+  let budget = 8;
+  const chain = new ShippingChain({ workDir: root, checkpointBudget: () => budget });
+  const retired = [];
+  const peer = page => ({ alive: true, pid: 0, send: message => {
+    assert.equal(message, 'DIE\n');
+    retired.push(page);
+  } });
+  try {
+    for (let page = 0; page <= 316; page++) {
+      chain.checkpoints.set(page, peer(page));
+      chain.trimCheckpoints();
+      assert.ok(chain.checkpoints.size <= 8);
+      assert.ok(chain.checkpoints.has(0), 'the root remains a replay frontier');
+      assert.ok(chain.checkpoints.has(page), 'recent page stays warm');
+    }
+    assert.ok(retired.length >= 309);
+    assert.ok([...chain.checkpoints.keys()].some(page => page > 0 && page < 160), 'sparse earlier coverage survives');
+    budget = 2;
+    chain.trimCheckpoints();
+    assert.deepEqual([...chain.checkpoints.keys()], [0, 316]);
+    budget = 1;
+    chain.trimCheckpoints();
+    assert.deepEqual([...chain.checkpoints.keys()], [0]);
+    assert.equal(chain.info().checkpointLimit, 1);
+    assert.equal(chain.info().checkpointCount, 1);
+  } finally {
+    await chain.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('document switches bind replacement shipping to the new project and overlay', async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-document-context-'));
   const first = path.join(root, 'first');
@@ -61,6 +94,10 @@ test('document switches bind replacement shipping to the new project and overlay
   else process.env.TDOM_SHIP = previousShip;
   try {
     const initial = engine.shipping;
+    const checkpoints = engine.checkpoints;
+    engine.checkpoints = new Map(Array.from({ length: engine.maxCheckpoints * 2 - 2 }, (_, i) => [i, {}]));
+    assert.equal(initial.checkpointLimit(), 2, 'the resident tree reduces the actual shipping chain budget');
+    engine.checkpoints = checkpoints;
     await engine.setDocumentContext({ docDir: second, overlayDir: overlay });
     assert.notEqual(engine.shipping, initial);
     assert.equal(engine.shipping.docDir, second);

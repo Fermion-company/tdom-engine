@@ -140,7 +140,7 @@ class Peer {
 }
 
 export class ShippingChain {
-  constructor({ workDir, docDir, overlayDir = null }) {
+  constructor({ workDir, docDir, overlayDir = null, checkpointBudget = null }) {
     this.workDir = path.resolve(workDir);
     this.docDir = docDir ? path.resolve(docDir) : this.workDir;
     this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
@@ -155,6 +155,8 @@ export class ShippingChain {
     this.source = '';
     this.ships = []; // {page, nline, gen} in ship order for the LIVE lineage
     this.checkpoints = new Map(); // page -> Peer (state after that page)
+    this.maxCheckpoints = Math.max(1, Math.floor(Number(process.env.TDOM_MAX_CHECKPOINTS) || 64));
+    this.checkpointBudget = checkpointBudget;
     this.labels = new Map(); // key -> {val, page} captured this lineage
     this.pagePdf = new Map(); // page -> pdf path (current generation wins)
     this.pageGen = new Map(); // page -> generation owning pagePdf
@@ -337,6 +339,7 @@ export class ShippingChain {
           }
         }
         this.checkpoints.set(peer.idx, peer);
+        this.trimCheckpoints();
       }
       return;
     }
@@ -373,8 +376,12 @@ export class ShippingChain {
       for (const [pg, ck] of [...this.checkpoints]) {
         if (pg > page - recent || pg % grid === 0) continue;
         ck.send('DIE\n');
+        if (Number.isInteger(ck.pid) && ck.pid > 0) {
+          try { process.kill(ck.pid, 'SIGKILL'); } catch { /* retired child already exited */ }
+        }
         this.checkpoints.delete(pg);
       }
+      this.trimCheckpoints();
       this.onShip?.({ page, nline, gen });
       return;
     }
@@ -877,11 +884,43 @@ export class ShippingChain {
     return svg;
   }
 
+  checkpointLimit() {
+    const budget = Number(this.checkpointBudget?.() ?? this.maxCheckpoints);
+    return Math.max(1, Math.min(this.maxCheckpoints, Number.isFinite(budget) ? Math.floor(budget) : this.maxCheckpoints));
+  }
+
+  trimCheckpoints() {
+    for (const [page, peer] of this.checkpoints) {
+      if (peer.alive === false) this.checkpoints.delete(page);
+    }
+    const limit = this.checkpointLimit();
+    while (this.checkpoints.size > limit) {
+      const pages = [...this.checkpoints.keys()].sort((a, b) => a - b);
+      // Keep the root and the latest frontier. Remove the most redundant
+      // interior snapshot so older pages retain sparse coverage in a fixed
+      // budget, instead of keeping every eighth page without an upper bound.
+      let victim = pages.at(-1);
+      let smallest = Infinity;
+      for (let i = 1; i + 1 < pages.length; i++) {
+        const gap = pages[i + 1] - pages[i - 1];
+        if (gap < smallest) { smallest = gap; victim = pages[i]; }
+      }
+      const peer = this.checkpoints.get(victim);
+      this.checkpoints.delete(victim);
+      peer.send('DIE\n');
+      if (Number.isInteger(peer.pid) && peer.pid > 0) {
+        try { process.kill(peer.pid, 'SIGKILL'); } catch { /* retired child already exited */ }
+      }
+    }
+  }
+
   info() {
     const retry = this.retryState;
     return {
       gen: this.gen,
       pages: this.ships.length,
+      checkpointCount: this.checkpoints.size,
+      checkpointLimit: this.checkpointLimit(),
       shipped: [...new Set(this.ships.map((ship) => ship.page))].sort((a, b) => a - b),
       done: this.done,
       error: this.err?.message ?? null,

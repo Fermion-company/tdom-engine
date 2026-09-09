@@ -6,6 +6,7 @@ export function handlePeerMessage(engine, peer, msg) {
       peer.idxAnnounced = msg.idx;
       if (msg.role === 'ckpt' && msg.idx === 0) {
         engine.checkpoints.set(0, peer);
+        engine.shipping?.trimCheckpoints?.();
         engine._fulfill('ckpt:0', peer);
       }
       break;
@@ -41,6 +42,7 @@ export function handlePeerMessage(engine, peer, msg) {
           }
         }
         engine.checkpoints.set(msg.idx, peer);
+        engine.shipping?.trimCheckpoints?.();
         engine._fulfill('ckpt:' + msg.idx, peer);
       } else {
         peer.send('DIE\n');
