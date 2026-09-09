@@ -247,6 +247,7 @@ test('a complete but late generation never reaches the renderer', opts, async ()
 });
 
 test('standard two-column output ships the same physical pages as cold LuaLaTeX', opts, async () => {
+  const previousCutoff = process.env.TDOM_SHIP_WAVE_CUTOFF;
   const paragraphs = Array.from({ length: 90 }, (_, index) =>
     `Paragraph ${index + 1}. The quick brown fox follows the exact two column output routine.\n\n`
   ).join('');
@@ -278,6 +279,11 @@ test('standard two-column output ships the same physical pages as cold LuaLaTeX'
       'Paragraph 90.',
       `Paragraph 90.${' additional ordinary prose'.repeat(1200)}`
     );
+    // This case verifies the page-count safety gate, not replay speed. Give
+    // the deliberately repaginated nine-page tail enough time to reach that
+    // gate even on a shared CI runner; the dedicated deadline test above
+    // independently proves that late generations stay invisible.
+    process.env.TDOM_SHIP_WAVE_CUTOFF = '30000';
     const result = local.resume(expanded);
     assert.equal(result.mode, 'resumed');
     await waitDone(local);
@@ -288,6 +294,8 @@ test('standard two-column output ships the same physical pages as cold LuaLaTeX'
     assert.equal(local.info().rejectReason, 'page-count-changed');
     assert.equal(waves.length, 0, 'repaginated wave stayed invisible');
   } finally {
+    if (previousCutoff === undefined) delete process.env.TDOM_SHIP_WAVE_CUTOFF;
+    else process.env.TDOM_SHIP_WAVE_CUTOFF = previousCutoff;
     await local.close();
   }
 });

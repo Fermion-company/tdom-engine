@@ -229,6 +229,11 @@ test('mixed heavy document resumes exact waves from visible edits in rich TeX co
   const sourcePath = fileURLToPath(
     new URL('../corpus/14-mixed-heavy-columns.tex', import.meta.url)
   );
+  const previousWaveCutoff = process.env.TDOM_SHIP_WAVE_CUTOFF;
+  const waveCutoffMs = Number(
+    process.env.TDOM_TEST_WAVE_CUTOFF ?? previousWaveCutoff ?? 700
+  );
+  process.env.TDOM_SHIP_WAVE_CUTOFF = String(waveCutoffMs);
   rmSync(WORK3, { recursive: true, force: true });
   const chain = new ShippingChain({ workDir: WORK3, docDir: fileURLToPath(new URL('../corpus', import.meta.url)) });
   const waves = [];
@@ -297,8 +302,8 @@ test('mixed heavy document resumes exact waves from visible edits in rich TeX co
         source = next;
         continue;
       }
-      assert.ok(wave, `${label}: exact wave missed the production cutoff (${JSON.stringify(chain.info())})`);
-      assert.ok(wave.elapsedMs < 700, `${label}: exact wave took ${wave.elapsedMs}ms`);
+      assert.ok(wave, `${label}: exact wave missed the configured cutoff (${JSON.stringify(chain.info())})`);
+      assert.ok(wave.elapsedMs < waveCutoffMs, `${label}: exact wave took ${wave.elapsedMs}ms`);
       const pdf = chain.info().completePdf;
       assert.ok(pdf, `${label}: complete PDF published`);
       const { stdout } = await promisify(execFile)('pdftotext', [pdf, '-'], { timeout: 30_000 });
@@ -362,6 +367,8 @@ test('mixed heavy document resumes exact waves from visible edits in rich TeX co
       assert.equal(chain.source, source, `${label}: certified source remains untouched`);
     }
   } finally {
+    if (previousWaveCutoff === undefined) delete process.env.TDOM_SHIP_WAVE_CUTOFF;
+    else process.env.TDOM_SHIP_WAVE_CUTOFF = previousWaveCutoff;
     await chain.close();
     for (const dir of [WORK3, `${WORK3}-truth`, `${WORK3}-ship-raster`, `${WORK3}-truth-raster`]) {
       rmSync(dir, { recursive: true, force: true });
