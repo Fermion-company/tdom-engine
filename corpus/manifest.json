@@ -43,15 +43,7 @@
     },
     {
       "file": "11-simple-live-preview.tex",
-      "expect": "structured",
-      "knownDiverged": {
-        "issue": 9,
-        "kind": "page-count-mismatch",
-        "enginePages": 1,
-        "realPages": 2,
-        "matched": [18, 21],
-        "lines": 34
-      }
+      "expect": "structured"
     },
     {
       "file": "12-macro-wrapped-columns.tex",

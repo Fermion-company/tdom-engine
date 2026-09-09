@@ -7,12 +7,24 @@ import { matchesKnownDivergence } from '../tools/farm-known-divergence.mjs';
 const manifest = JSON.parse(
   readFileSync(new URL('../corpus/manifest.json', import.meta.url), 'utf8')
 );
-const expected = manifest.docs.find(
+const issue9Entry = manifest.docs.find(
   (entry) => entry.file === '11-simple-live-preview.tex'
-)?.knownDiverged;
+);
+const expected = {
+  issue: 9,
+  kind: 'page-count-mismatch',
+  enginePages: 1,
+  realPages: 2,
+  matched: [18, 21],
+  lines: 34,
+};
+
+test('Issue #9 fixture no longer carries a known-divergence exception', () => {
+  assert.ok(issue9Entry, 'Issue #9 fixture remains in the corpus manifest');
+  assert.equal(issue9Entry.knownDiverged, undefined);
+});
 
 test('known farm divergences require their registered failure signature', () => {
-  assert.ok(expected, 'Issue #9 signature is registered in the corpus manifest');
   assert.equal(matchesKnownDivergence(expected, { ...expected, matched: 18 }), true);
   assert.equal(matchesKnownDivergence(expected, { ...expected, matched: 21 }), true);
   for (const [key, value] of [

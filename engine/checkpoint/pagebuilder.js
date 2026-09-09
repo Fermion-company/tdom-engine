@@ -389,20 +389,13 @@ class PageBuilder {
         if (!this.#pageHasMaterial()) break;
 
         // \enddocument runs \clearpage. Feed its final \newpage sequence
-        // through the ordinary contribution loop: the first closing glue is
-        // a legal breakpoint and may need to fire an already-overfull page
+        // through the ordinary contribution loop: \vfil is a legal
+        // breakpoint and may need to fire an already-overfull page
         // at its remembered best break before the forced penalty arrives.
         // Keeping the tail in `pending` also ensures everything after that
         // break is reprocessed on the next page instead of being dropped.
         const closing = [];
         if (this.hasBox) {
-          const pd = this.prevdepth ?? 0;
-          if (pd > 0) {
-            closing.push({
-              t: 'glue', a: -Math.min(pd, this.maxdepth),
-              st: 0, sto: 0, sh: 0, sho: 0,
-            });
-          }
           closing.push({ t: 'glue', a: 0, st: FIL, sto: 2, sh: 0, sho: 0 });
         }
         closing.push({ t: 'eject', v: EJECT });
@@ -546,7 +539,16 @@ class PageBuilder {
   #appendGlue(e) {
     if (!this.hasBox) return;
     this.contents.push({ e });
-    this.total += e.a ?? 0;
+    // tex.web UPDATE_HEIGHTS: once glue is accepted, the preceding box's
+    // pending depth becomes part of \pagetotal and \pagedepth resets.
+    this.total += this.depth + (e.a ?? 0);
+    this.depth = 0;
+    // LuaTeX's common CONTRIBUTE tail reapplies maxdepth after every
+    // UPDATE_HEIGHTS path; this matters when \maxdepth is negative.
+    if (this.depth > this.maxdepth) {
+      this.total += this.depth - this.maxdepth;
+      this.depth = this.maxdepth;
+    }
     this.stretch[e.sto ?? 0] += e.st ?? 0;
     if ((e.sho ?? 0) === 0) this.shrink += e.sh ?? 0;
     else if (e.sh) this.shrinkInf = true;
@@ -563,7 +565,13 @@ class PageBuilder {
       return;
     }
     this.contents.push({ e });
-    this.total += e.a ?? 0;
+    // Kerns take the same UPDATE_HEIGHTS path as glue in TeX's page builder.
+    this.total += this.depth + (e.a ?? 0);
+    this.depth = 0;
+    if (this.depth > this.maxdepth) {
+      this.total += this.depth - this.maxdepth;
+      this.depth = this.maxdepth;
+    }
   }
 
   #contributePen(e) {
@@ -620,7 +628,9 @@ class PageBuilder {
     // \newpage (-10000): forced break at this point. A boxless page is
     // suppressed, but its event markers carry over to the next real page.
     if (this.hasBox || this.feet.length || this.toplist.length || this.botlist.length) {
-      const fired = this.#evalBreak(this.contents.length, EJECT, null);
+      // If an earlier breakpoint wins, TeX puts this still-unconsumed
+      // penalty back after the carried material so it can end that page too.
+      const fired = this.#evalBreak(this.contents.length, EJECT, e);
       if (!fired) this.#firePage(this.contents.length, null);
     }
   }
@@ -661,7 +671,10 @@ class PageBuilder {
           .map((x) => x.e.t + (x.e.t === 'pen' ? `(${x.e.v})` : x.e.t === 'box' ? `(h${(x.e.u?.h ?? 0).toFixed(0)})` : ''));
         console.error(`FIRE at ${this.best.index} pen=${this.best.pen} around=[${around.join(' ')}]`);
       }
-      this.#firePage(this.best.index, this.best.pen, pending);
+      // A forced eject at the winning position is the consumed breakpoint;
+      // only carry it when an earlier remembered breakpoint wins.
+      const carry = pending?.t === 'eject' && this.best.index === index ? null : pending;
+      this.#firePage(this.best.index, this.best.pen, carry);
       return true;
     }
     return false;
