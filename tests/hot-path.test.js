@@ -1941,7 +1941,8 @@ test('a cold page edit retains its native owners and prepares unchanged exact ne
   await eng?.close();
   eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-cold-edit-page-'));
-  const e = new CheckpointEngine({ workDir: path.join(root, 'work'), maxCheckpoints: 2 });
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.maxCheckpoints = 4;
   const previousHot = process.env.TDOM_RENDER_HOT_MAX;
   process.env.TDOM_RENDER_HOT_MAX = '1';
   const missing = page => e.getDisplayLists().find(item => item.page === page)?.commands.filter(command =>
@@ -2048,6 +2049,7 @@ test('cold native prefix replay advances only its fresh continuation and preserv
   eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-prefix-continuation-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.maxCheckpoints = Math.min(e.maxCheckpoints, 8);
   const source = String.raw`\documentclass{article}
 \newcommand{\VisibleWord}{seed}
 \begin{document}
