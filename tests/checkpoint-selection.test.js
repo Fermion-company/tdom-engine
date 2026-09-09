@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { checkpointKeepSet } from '../engine/checkpoint/checkpoint-selection.js';
+import { enforceCheckpointCap, retireOffGrid } from '../engine/checkpoint/checkpoint-retirement.js';
 
 test('measured-cost checkpoint selection brackets unknown expensive blocks', () => {
   const blocks = Array.from({ length: 51 }, () => ({ typesetCostMs: 2 }));
@@ -58,4 +59,38 @@ test('small documents retain every available boundary', () => {
     [...checkpointKeepSet([{ typesetCostMs: 10 }, { typesetCostMs: 20 }], 8)],
     [0, 1, 2]
   );
+});
+
+test('ordinary blocks retain coverage instead of spending every slot on similar early costs', () => {
+  for (const measuredCount of [8, 224]) {
+    const blocks = Array.from({ length: 224 }, (_, index) =>
+      index < measuredCount ? { typesetCostMs: index < 3 ? 30 : 20 } : {});
+    const keep = [...checkpointKeepSet(blocks, 8)].sort((a, b) => a - b);
+    assert.equal(keep.length, 8);
+    const gaps = keep.slice(1).map((boundary, index) => boundary - keep[index]);
+    assert.ok(Math.max(...gaps) <= 50, `measured ${measuredCount}: coverage ${keep.join(',')}`);
+  }
+});
+
+
+test('unmaterialized cost boundaries retain available checkpoints until replacements arrive', () => {
+  const checkpoints = new Map();
+  const retired = [];
+  const peer = index => ({ send: message => {
+    assert.equal(message, 'DIE\n');
+    retired.push(index);
+  } });
+  for (let index = 0; index <= 8; index++) checkpoints.set(index, peer(index));
+  const state = { checkpoints, keep: new Set([0, 25, 50, 75, 100, 125, 150, 175]),
+    editHold: [], renderHold: new Map(), dyingPids: new Set() };
+  retireOffGrid({ ...state, idx: 7 });
+  assert.ok(checkpoints.has(7), 'an available fallback survives a desired frontier that does not exist');
+  enforceCheckpointCap(state);
+  assert.equal(checkpoints.size, 8);
+  checkpoints.set(25, peer(25));
+  enforceCheckpointCap(state);
+  assert.equal(checkpoints.size, 8);
+  assert.ok(checkpoints.has(0));
+  assert.ok(checkpoints.has(25));
+  assert.equal(retired.length, 2);
 });

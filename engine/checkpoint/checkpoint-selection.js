@@ -15,7 +15,12 @@ export function checkpointKeepSet(blocks, maxCheckpoints) {
   if (count + 1 <= limit) return new Set(Array.from({ length: count + 1 }, (_, i) => i));
 
   const keep = new Set([0]);
-  const cost = blocks.map((block) => Math.max(0.1, Number(block.typesetCostMs) || 1));
+  const measured = blocks.map(block => Number(block.typesetCostMs))
+    .filter(value => Number.isFinite(value) && value > 0).sort((a, b) => a - b);
+  const median = measured[Math.floor(measured.length / 2)] ?? 1;
+  const cost = blocks.map((block) => Math.max(0.1, Number(block.typesetCostMs) || median));
+  const total = cost.reduce((sum, value) => sum + value, 0);
+  const hotThreshold = Math.max(median * 8, total / limit / 2);
   const ranked = cost
     .map((value, index) => ({ value, index }))
     .sort((a, b) => b.value - a.value || a.index - b.index);
@@ -24,7 +29,8 @@ export function checkpointKeepSet(blocks, maxCheckpoints) {
   // wants its input boundary (editing the block) and output boundary
   // (editing ordinary prose after it).
   const hotSlots = Math.max(0, limit - 2);
-  for (const { index } of ranked) {
+  for (const { value, index } of ranked) {
+    if (value < hotThreshold) break;
     if (keep.size >= 1 + hotSlots) break;
     for (const boundary of [index, index + 1]) {
       if (boundary > 0 && boundary <= count && keep.size < 1 + hotSlots) keep.add(boundary);
@@ -41,10 +47,9 @@ export function checkpointKeepSet(blocks, maxCheckpoints) {
   // Fill the remaining budget at weighted quantiles. This preserves useful
   // reachability through long all-prose regions and naturally shifts the
   // skeleton toward moderately expensive areas.
-  const total = cost.reduce((sum, value) => sum + value, 0);
+  let ordinal = 0;
   while (keep.size < limit) {
-    const ordinal = keep.size;
-    const target = total * ordinal / limit;
+    const target = total * ++ordinal / Math.max(1, limit - 1);
     let sum = 0;
     let boundary = count;
     for (let i = 0; i < cost.length; i++) {

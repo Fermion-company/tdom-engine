@@ -22,11 +22,11 @@
 
 ## 3.2 プロセスモデル
 
-Shipping の checkpoint も `TDOM_MAX_CHECKPOINTS` を上限とする。併用時の枠は、基準上限の2倍から現在の resident 数を差し引いて制限する（再開用 root は1個保持）。root・最新ページを優先し、古いページは間隔が最も狭い境界から間引く。resident の checkpoint 増加時にも Shipping を即時整理する。編集中・描画中に保持する resident の一時枠は別途存続する。
+Shipping の checkpoint も `TDOM_MAX_CHECKPOINTS` を上限とする。併用時の枠は、基準上限の2倍から現在の resident 数を差し引いて制限する（再開用 root は1個保持）。root・最新ページを優先し、古いページは間隔が最も狭い境界から間引く。resident の checkpoint 増加時にも Shipping を即時整理する。再開時は保持済み prefix を除いた残枠から tail の保存間隔を決め、最終 `\end{document}` の後には新しい checkpoint を作らない。編集中・描画中に保持する resident の一時枠は別途存続する。
 
 root は `lualatex --shell-escape -interaction=nonstopmode driver.tex` として起動される。`--shell-escape` は `tdomfork.c` の共有ライブラリを `package.loadlib` するために使われる。
 
-checkpoint 0 の準備完了は font warmup と初期 GC の後に通知する。各 JOB の末尾では Lua の incremental GC を 2048KB 分進め、完了した cycle の使用量を基準にする。未回収分が基準から64MB増えた場合は full GC を行う。毎回同じ checkpoint から編集しても、8MBの増加ごとに日本語フォントを含む heap 全体を2回走査することはない。
+checkpoint 0 の準備完了は font warmup と初期 GC の後に通知する。background JOB の末尾では Lua の incremental GC を 2048KB 分進め、完了した cycle の使用量を基準にする。foreground は前回同じ block の回収後に確認した live heap も基準にし、そこから64MB以内なら collector を止めて atomic scan を延期する。font cache の再読込を毎回未回収ゴミと数えない。未回収分が基準から64MB増えた場合は full GC を行う。毎回同じ checkpoint から編集しても、8MBの増加ごとに日本語フォントを含む heap 全体を2回走査することはない。
 
 ```text
 Node.js engine
@@ -40,6 +40,10 @@ Node.js engine
 ```
 
 checkpoint は「ある block 境界まで処理済みの TeX プロセス」である。OS の copy-on-write `fork()` が TeX 状態の snapshot になるため、マクロ、catcode、counter、font、box register などを JavaScript 側で保存・復元しない。
+
+cold prefix の walk は、直前に自身が作った未保持の continuation に限り `STEP` で進める。ブロックごとの native 組版、galley/state 検証は従来と同じで、既存の保存状態・編集中の input・描画中の所有者では必ず fork する。保存対象の境界では直前の JOB node list も保持し、未変更の exact neighbor を再組版せず描画できる。
+
+checkpoint の配置は、回収処理を除いた再組版時間で選ぶ。平均的な block に保存枠を集中させず、中央値の8倍かつ全体の再実行費用に対して十分重い block だけ両側を優先し、残りを費用の分位点へ配置する。未測定 block には測定済み中央値を使い、boot の測定進行に応じて配置を更新する。新しい保存先がまだ存在しない間は、近い既存 checkpoint を枠内で残す。各 JOB の完了時に、次の処理に必要な continuation を残して保持数を整理する。
 
 ## 3.3 driver.tex の注入内容
 
@@ -65,7 +69,8 @@ checkpoint は「ある block 境界まで処理済みの TeX プロセス」で
 
 | command | 内容 |
 | --- | --- |
-| `JOB <blockId> <newCkptIdx> <len> <captureToken\|->` | block を組版し、結果を返して次 checkpoint になる。display math の hot job は node list を世代付きで保持する |
+| `JOB <blockId> <newCkptIdx> <len> <captureToken\|-> <F\|B> <liveFloorKb>` | block を組版し、結果を返して次 checkpoint になる。display math の hot job は node list を世代付きで保持する |
+| `STEP` | 同じ walk が作った一時 continuation を次の block へ進める。JOB と同じ引数・結果で、保存用 checkpoint は消費しない |
 | `CAPTURE <blockId> <token> <jobDir> <requestId>` | post-block checkpoint が保持する JOB node list を再組版せず shipout する |
 | `RENDER <blockId> <jobDir> <len> <requestId>` | block を tight PDF として shipout する |
 | `DROP_CAPTURE <blockId> <token>` | exact pixel が不要だった保持 node list を解放する |
@@ -80,7 +85,7 @@ checkpoint は「ある block 境界まで処理済みの TeX プロセス」で
 | `GEO` | paper/text/float/footnote などの geometry |
 | `TWIN` | twin math font の glyph metrics |
 | `GALLEY` | block の node-list 抽出結果 |
-| `CKPT` | checkpoint 昇格通知 |
+| `CKPT` | checkpoint 昇格通知と回収済み live heap の基準 |
 | `FORKED` | 子 process pid 通知 |
 | `DONE` | RENDER PDF 完了通知 |
 | `CAPTUREMISS` | capture が無い、または編集世代が一致しないため fallback を要求 |
@@ -95,6 +100,8 @@ daemon は block を real main vertical list 上で組み、その結果を JSON
 glyph run は同一 font/size/color/baseline shift の連続として送られる。ただし kern/glue で必ず分割されるため、run 内の描画位置は font advance の積み上げで確定する。
 
 large math glyph、OpenType math、PUA/unencoded glyph、PDF literal などは daemon 側で flag され、`fidelity.js` が glyph 表示か exact chunk かを決める。
+
+resident RENDER / CAPTURE と isolated RENDER の PDF は、TeX の論理幅の左右に元の用紙幅だけ余白を持つ。`render-padding.txt` の実測余白を chunk の `xBp` と画像幅へ反映し、文字原点と sourcebox の論理幅を保つ。負の x 座標に描く枠線も PDF 化の時点で失われず、最終的な表示範囲は物理ページが切り取る。
 
 ## 3.6 `#updateInner()` の現行順序
 

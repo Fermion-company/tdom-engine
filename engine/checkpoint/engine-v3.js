@@ -318,6 +318,7 @@ export class CheckpointEngine {
       let changed = false;
       const beforeChunksRev = this.chunks.rev;
       this.bgActive = true;
+      this.warming = true;
       let replayed;
       try {
         replayed = await this.#retypesetChain(
@@ -332,6 +333,7 @@ export class CheckpointEngine {
         );
       } finally {
         this.bgActive = false;
+        this.warming = false;
       }
       if (replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev) {
         return { status: 'superseded', sourceRev, target };
@@ -480,11 +482,12 @@ export class CheckpointEngine {
 
   // ------------------------------------------------------------- typeset
 
-  async #jobBlock(idx, override = null) {
+  async #jobBlock(idx, override = null, replayToken = null) {
     const block = this.blocks[idx];
     const jobStarted = performance.now();
     const ck = this.checkpoints.get(idx);
     if (!ck) throw new Error(`no checkpoint at ${idx} for block ${block.id}`);
+    this.jobInput = ck;
     await this.#reapDying(); // bound the live-fork set before minting ckpt idx+1
     const { body, jobId, refSnapshot } = buildJobBlockBody({
       block,
@@ -515,13 +518,31 @@ export class CheckpointEngine {
       // every checkpoint.
       const capture =
         !override &&
-        mayCaptureNativeBlock(block) &&
-        (!!block.galley || this.blocks.length <= Number(process.env.TDOM_RENDER_HOT_MAX || 64))
+        ((mayCaptureNativeBlock(block) &&
+          (!!block.galley || this.blocks.length <= Number(process.env.TDOM_RENDER_HOT_MAX || 64))) ||
+          this.#checkpointKeepSet().has(idx + 1))
           ? `c${++this.captureSeq}`
           : '-';
-      ck.send(`JOB ${jobId} ${idx + 1} ${body.length} ${capture}\n`);
+      const interactive = !override && !!block.galley &&
+        (this.updating && !this.bgActive || this.warming);
+      const previous = this.blocks[idx - 1];
+      const advance = !!replayToken && ck.replayToken === replayToken && !override &&
+        !this.#checkpointKeepSet().has(idx) && !this.editHold.includes(idx) && !this.renderHold.has(idx) &&
+        !this.renderWant.has(previous?.id) &&
+        !this.rendering?.has(previous?.id + ':' + previous?.galleyHash);
+      if (advance) {
+        // Only this walk's unretained continuation is consumed. Frozen
+        // document/edit/render owners always fork as before.
+        this.checkpoints.delete(idx);
+        this.currentJob.pid = ck.pid;
+      }
+      ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${interactive ? 'F' : 'B'} ${Number(block.galley?.gcFloorKb) || 0}\n`);
       ck.sendRaw(body);
-      const [galley] = await Promise.all([galleyP, ckptP]);
+      const [galley, nextCheckpoint] = await Promise.all([galleyP, ckptP]);
+      nextCheckpoint.replayToken = replayToken;
+      galley.gcFloorKb = nextCheckpoint.gcFloorKb;
+      if (process.env.TDOM_TRACE_JOB) console.error('[job-gc]', jobId, JSON.stringify({ interactive, gcMs: nextCheckpoint.gcMs, ...galley.tm }));
+      block.typesetCleanupMs = (block.typesetCleanupMs ?? 0) + (nextCheckpoint.gcMs ?? 0);
       if (!override && block.nativeClosureRequired !== false && galley.closure === 'error') {
         const bad = this.checkpoints.get(idx + 1);
         if (bad) {
@@ -547,8 +568,9 @@ export class CheckpointEngine {
         // earlier consumer in the same incremental pass.
         galley.refs = [...new Set([...(galley.refs ?? []), ...Object.keys(refSnapshot)])];
       }
-      this.#recordTypesetCost(block, performance.now() - jobStarted);
-      this.#retireOffGrid(idx);
+      this.#recordTypesetCost(block, performance.now() - jobStarted - (nextCheckpoint.gcMs ?? 0));
+      if (!advance) this.#retireOffGrid(idx);
+      this.#enforceCheckpointCap(idx + 1);
       return galley;
     } catch (err) {
       // A stuck fork child (e.g. a TeX infinite loop in this block) never
@@ -575,19 +597,21 @@ export class CheckpointEngine {
       throw err;
     } finally {
       this.currentJob = null;
+      this.jobInput = null;
     }
   }
 
-  async #typesetBlock(idx) {
+  async #typesetBlock(idx, replayToken = null) {
     const block = this.blocks[idx];
     const started = performance.now();
+    block.typesetCleanupMs = 0;
     try {
       return await typesetBlockHelper(this, idx, {
         needsRescue: (text, structuralSinks) => this.#needsRescue(text, structuralSinks),
         rescueBlock: (blockIdx, why) => this.#rescueBlock(blockIdx, why),
         brokenBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx),
         deferredBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx, false, true),
-        jobBlock: (blockIdx) => this.#jobBlock(blockIdx),
+        jobBlock: (blockIdx) => this.#jobBlock(blockIdx, null, replayToken),
         rescueCacheKey: (targetBlock, blockIdx) => this.#rescueCacheKey(targetBlock, blockIdx),
         pumpRescues: () => this.#pumpRescues(),
         sourceClosure,
@@ -597,7 +621,7 @@ export class CheckpointEngine {
       // Session-high-water cost is intentional: a later rescue-cache hit
       // must not make the scheduler forget the expensive cold replay that a
       // distant edit would pay again after checkpoint retirement.
-      this.#recordTypesetCost(block, performance.now() - started);
+      this.#recordTypesetCost(block, performance.now() - started - block.typesetCleanupMs);
     }
   }
 
@@ -743,7 +767,10 @@ export class CheckpointEngine {
     // boot. Refresh only when this measurement can materially enter the hot
     // set; the first few samples establish its floor, then a 1.5x hysteresis
     // prevents near-equal costs from churning the plan.
-    if (!this.checkpointKeepCache || elapsedMs > this.checkpointHotFloorMs * 1.5) {
+    if (!previous) this.checkpointCostSamples = (this.checkpointCostSamples ?? 0) + 1;
+    const stride = Math.max(1, Math.ceil(this.blocks.length / this.maxCheckpoints));
+    if (!this.checkpointKeepCache || elapsedMs > this.checkpointHotFloorMs * 1.5 ||
+        (!previous && this.checkpointCostSamples % stride === 0)) {
       this.#checkpointKeepSet(true);
     }
   }
@@ -773,11 +800,12 @@ export class CheckpointEngine {
    * hot/coverage boundaries and the edit-locus / render pins; DIE the rest.
    * Idempotent — safe to call after any checkpoint-creating pass.
    */
-  #enforceCheckpointCap() {
+  #enforceCheckpointCap(continuation = null) {
+    const active = [...this.checkpoints].filter(([, peer]) => peer === this.jobInput).map(([index]) => index);
     enforceCheckpointCapHelper({
       checkpoints: this.checkpoints,
       keep: this.#checkpointKeepSet(),
-      editHold: this.editHold,
+      editHold: [...this.editHold, ...active, ...(continuation === null ? [] : [continuation])],
       renderHold: this.renderHold,
       dyingPids: this.dyingPids,
     });
@@ -818,7 +846,7 @@ export class CheckpointEngine {
    * resume normal measured-skeleton retirement. */
   #releaseRenderHold(idx) {
     if (!releaseRenderHold(this.renderHold, idx)) return;
-    this.#retireOffGrid(idx);
+    this.#enforceCheckpointCap();
   }
 
   #nearestCheckpoint(idx) {
@@ -837,11 +865,12 @@ export class CheckpointEngine {
    */
   async #retypesetChain(from, target, onBlock, shouldAbort = null) {
     let n = 0;
+    const replayToken = {};
     for (let j = from; j < this.blocks.length; j++) {
       if (shouldAbort?.()) return -(n + 1); // strictly negative: aborted
       const block = this.blocks[j];
       const before = { hash: block.galleyHash, state: block.stateVec };
-      const g = await this.#typesetBlock(j).catch(() => null);
+      const g = await this.#typesetBlock(j, j < target ? replayToken : null).catch(() => null);
       if (!g) break;
       this.#adoptGalley(block, g);
       n++;
@@ -1115,7 +1144,7 @@ export class CheckpointEngine {
         plainPreviewAdmission,
         callbacks: {
           nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
-          typesetBlock: (idx) => this.#typesetBlock(idx),
+          typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),
           adoptGalley: (block, galley) => this.#adoptGalley(block, galley),
           queueChainWork: (kind, from, labels) => this.#queueChainWork(kind, from, labels),
           retypesetChain: (from, target, onBlock, shouldAbort) =>
@@ -1373,7 +1402,10 @@ export class CheckpointEngine {
         n = await this.#retypesetChain(
           this.#nearestCheckpoint(idx),
           idx,
-          () => {},
+          (index, changed) => {
+            const successor = this.blocks[index];
+            if (changed && successor.needsRender) this.#queueRender(successor.id);
+          },
           () => this.bgAbort
         );
       } catch (err) {
@@ -1455,14 +1487,14 @@ export class CheckpointEngine {
       runChainPass: () => this.#runChainPass(),
       chunkTargets: (block) => this.#chunkTargets(block),
       queueRender: (id, renderOptions) => this.#queueRender(id, renderOptions),
-      retireOffGrid: (idx) => this.#retireOffGrid(idx),
+      enforceCheckpointCap: () => this.#enforceCheckpointCap(),
     }, options);
   }
 
   async #runChainPass() {
     return runChainPassHelper(this, {
       nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
-      typesetBlock: (idx) => this.#typesetBlock(idx),
+      typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),
       adoptGalley: (block, galley) => this.#adoptGalley(block, galley),
       queueRender: (blockId) => this.#queueRender(blockId),
       asyncRepaginate: () => this.#asyncRepaginate(),

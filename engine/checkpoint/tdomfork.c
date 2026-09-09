@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <dirent.h>
 
 typedef struct lua_State lua_State;
 typedef long long lua_Integer;
@@ -130,21 +131,53 @@ static int fd_matches_path(int fd, const char *wanted) {
   return 0;
 #endif
   char resolved_actual[PATH_MAX];
-  char resolved_wanted[PATH_MAX];
   const char *left = realpath(actual, resolved_actual) ? resolved_actual : actual;
-  const char *right = realpath(wanted, resolved_wanted) ? resolved_wanted : wanted;
-  return strcmp(left, right) == 0;
+  return strcmp(left, wanted) == 0;
 }
 
-static int find_writable_fd(const char *source) {
+static int fd_matches_access(int fd, const char *source, int writable) {
+  int flags = fcntl(fd, F_GETFL);
+  if (flags == -1) return 0;
+  if (writable ? (flags & O_ACCMODE) == O_RDONLY : (flags & O_ACCMODE) == O_WRONLY) return 0;
+  return fd_matches_path(fd, source);
+}
+
+static int find_file_fd(const char *source, int writable) {
+  char resolved[PATH_MAX];
+  const char *wanted = realpath(source, resolved) ? resolved : source;
+#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__)
+  DIR *descriptors = opendir("/dev/fd");
+#else
+  DIR *descriptors = opendir("/proc/self/fd");
+#endif
+  if (descriptors) {
+    int found = -1;
+    struct dirent *entry;
+    // Enumerate afresh: TeX can close and reuse descriptors between jobs.
+    // Probing the entire descriptor limit for every absent aux extension
+    // makes a page checkpoint pay thousands of failed system calls.
+    while ((entry = readdir(descriptors)) != NULL) {
+      char *end;
+      long fd = strtol(entry->d_name, &end, 10);
+      if (end == entry->d_name || *end || fd < 3 || fd > INT_MAX) continue;
+      if (found >= 0 && fd >= found) continue;
+      if (fd_matches_access((int)fd, wanted, writable)) found = (int)fd;
+    }
+    closedir(descriptors);
+    return found;
+  }
+#endif
   long max_fd = sysconf(_SC_OPEN_MAX);
   if (max_fd < 0 || max_fd > 4096) max_fd = 4096;
   for (int fd = 3; fd < max_fd; fd++) {
-    if (fcntl(fd, F_GETFD) == -1 || !fd_matches_path(fd, source)) continue;
-    int flags = fcntl(fd, F_GETFL);
-    if (flags != -1 && (flags & O_ACCMODE) != O_RDONLY) return fd;
+    if (fd_matches_access(fd, wanted, writable)) return fd;
   }
   return -1;
+}
+
+static int find_writable_fd(const char *source) {
+  return find_file_fd(source, 1);
 }
 
 static int l_prepare_pdf(lua_State *L) {
@@ -159,14 +192,7 @@ static int l_prepare_pdf(lua_State *L) {
 }
 
 static int find_readable_fd(const char *source) {
-  long max_fd = sysconf(_SC_OPEN_MAX);
-  if (max_fd < 0 || max_fd > 4096) max_fd = 4096;
-  for (int fd = 3; fd < max_fd; fd++) {
-    if (fcntl(fd, F_GETFD) == -1 || !fd_matches_path(fd, source)) continue;
-    int flags = fcntl(fd, F_GETFL);
-    if (flags != -1 && (flags & O_ACCMODE) != O_WRONLY) return fd;
-  }
-  return -1;
+  return find_file_fd(source, 0);
 }
 
 static int copy_path(const char *source, const char *target) {

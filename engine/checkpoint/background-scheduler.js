@@ -1,7 +1,7 @@
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 
-export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive = false } = {}) {
-  const { locked, runChainPass, chunkTargets, queueRender, retireOffGrid } = callbacks;
+export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive = false, pageRenderIds = [] } = {}) {
+  const { locked, runChainPass, chunkTargets, queueRender, enforceCheckpointCap } = callbacks;
   // Deferred chain work is the ONLY background chain activity (docs/10
   // §I3): nothing runs while the user is typing. The pass starts after a
   // short idle gate, aborts between blocks on the next edit (#update sets
@@ -34,7 +34,7 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
   // cold case: cap it. Small documents render their whole set at boot
   // (a few seconds, and the referee tools rely on it).
   const hot = dirtyBlocks.length <= Number(process.env.TDOM_RENDER_HOT_MAX || 64) ? dirtyBlocks : [];
-  for (const id of hot) {
+  for (const id of new Set([...hot, ...pageRenderIds])) {
     const block = engine.blocks.find((b) => b.id === id);
     if (!block?.needsRender) continue;
     const stale = chunkTargets(block).some(
@@ -48,9 +48,8 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
     const b = engine.blocks[idx];
     const freshAll =
       b && !chunkTargets(b).some((t) => engine.chunks.get(t.key)?.forGalley !== b.galleyHash);
-    if (!b || b.id !== id || freshAll) {
-      engine.renderHold.delete(idx);
-      retireOffGrid(idx);
-    }
+    const queued = engine.renderWant.has(id) || engine.rendering?.has(id + ':' + b?.galleyHash);
+    if (!b || b.id !== id || freshAll || !queued) engine.renderHold.delete(idx);
   }
+  enforceCheckpointCap();
 }

@@ -125,6 +125,7 @@ function singleReplayUnit(oldUnits, newUnits) {
 
 class Peer {
   constructor(socket) {
+    socket.setNoDelay(true);
     this.socket = socket;
     this.buf = Buffer.alloc(0);
     this.role = null;
@@ -354,7 +355,7 @@ export class ShippingChain {
         // The final unit is our fixed \end{document}. A normal source run
         // exits while processing it and therefore never asks for SEOF.
         if (n === this.lines.length) peer.sentEnd = true;
-        peer.send(`SLINE ${body.length}\n`);
+        peer.send(`SLINE ${body.length} ${n === this.lines.length ? 'END' : '-'}\n`);
         peer.socket.write(body);
       } else {
         peer.send('SEOF\n');
@@ -813,7 +814,12 @@ export class ShippingChain {
     this.waveFromPage = best.page + 1;
     this.wavePrefixPage = best.page;
     this.waveStartedAt = Date.now();
-    peer.send(`RESUME ${this.gen}\n`);
+    // Sample the known tail within its available budget before forking.
+    // Creating and then immediately retiring every page checkpoint forces
+    // the replay root to copy the same font heap over and over.
+    const slots = Math.max(0, this.checkpointLimit() - this.checkpoints.size);
+    const stride = slots > 0 ? Math.max(1, Math.ceil((this.baselinePages - best.page) / slots)) : 0;
+    peer.send(`RESUME ${this.gen} ${stride}\n`);
     const cutoffMs = Math.max(1, Number(process.env.TDOM_SHIP_WAVE_CUTOFF ?? 700));
     const deadlineGen = this.gen;
     this.waveDeadlineTimer = setTimeout(() => {

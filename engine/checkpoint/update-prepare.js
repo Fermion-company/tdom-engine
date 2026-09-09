@@ -2,7 +2,7 @@ import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch } from './safety.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
-import { firstDirtyIndex } from './update-helpers.js';
+import { firstDirtyIndex, nextEditHold, editPageRenderIds } from './update-helpers.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { sourceClosure } from './closure.js';
 
@@ -225,6 +225,12 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
     bounds: diff.bounds,
     dyingPids: engine.dyingPids,
   }));
+
+  // Pin before the walk can retire a newly materialized input or capture
+  // owner. Finalization cannot recover a checkpoint that has already died.
+  engine.editHold = rebooted ? [] : nextEditHold(firstDirty,
+    [...dirtySource, ...editPageRenderIds(engine.blocks, engine.pages, dirtySource)],
+    engine.blocks, engine.editHold);
 
   return { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted };
 }

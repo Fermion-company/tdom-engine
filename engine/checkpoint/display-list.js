@@ -48,9 +48,9 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       chunk: gfxOpen.blockId,
       // The SVG already contains paragraph indentation. Anchor it at the
       // text block origin; adding run.x here would indent exact lines twice.
-      x: r2(L),
+      x: r2(L + (meta?.xBp ?? 0)),
       y: r2(gfxOpen.top + clip0),
-      w: r2(gfxOpen.w),
+      w: r2(meta?.wBp ?? gfxOpen.w),
       h: r2(visibleHeight),
       sy: r2(clip0),
       ch: r2(chunkHeight),

@@ -27,6 +27,8 @@ export function handlePeerMessage(engine, peer, msg) {
       // the rescue/retry that replaced it, and future jobs would fork
       // from the wrong state
       if (engine.waiters.has('ckpt:' + msg.idx)) {
+        peer.gcFloorKb = Number.isFinite(msg.gcFloorKb) ? msg.gcFloorKb : 0;
+        peer.gcMs = Number.isFinite(msg.gcMs) ? Math.max(0, msg.gcMs) : 0;
         // A preserved suffix can already occupy this boundary.  The new
         // child is the checkpoint produced by re-typesetting the edited
         // block, so it replaces that suffix snapshot.  Retire the old peer

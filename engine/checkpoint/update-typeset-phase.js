@@ -63,6 +63,7 @@ export async function runUpdateTypesetPhase(engine, {
       break;
     }
   }
+  const replayToken = {};
   let i = nearestCheckpoint(Math.min(firstDirty, engine.blocks.length));
   while (i < engine.blocks.length) {
     // /status liveness marker: which block the foreground pass is on —
@@ -76,7 +77,7 @@ export async function runUpdateTypesetPhase(engine, {
       block.galley === plainPreviewAdmission.galley && block.stateVec === plainPreviewAdmission.stateVec
       ? plainPreviewAdmission.witness : null;
     const t0 = performance.now();
-    const galley = await typesetBlock(i);
+    const galley = await typesetBlock(i, i < firstDirty ? replayToken : null);
     forkMs += performance.now() - t0;
     typesetCount++;
     const wasClean = before.hadGalley && !dirtySource.has(block.id);

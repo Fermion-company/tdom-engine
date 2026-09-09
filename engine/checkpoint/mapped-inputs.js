@@ -62,16 +62,22 @@ export function expandInputParagraphs(segs, context) {
   expand(context.source, root, segs[0].start, segs.at(-1).end, 0, context.structuralEvents ?? []);
   if (!expanded) return segs;
   const text = pieces.map(piece => piece.text).join('');
+  const lineIndexes = new Map();
+  let firstPiece = 0;
   return segmentBody(text, 0, { structuralEvents: events }).flatMap(seg => {
-    const parts = pieces.filter(piece => piece.file && piece.at < seg.end && piece.at + piece.text.length > seg.start)
-      .map(piece => {
-        const from = Math.max(seg.start, piece.at);
-        const to = Math.min(seg.end, piece.at + piece.text.length);
-        const start = piece.start + from - piece.at;
-        const end = piece.start + to - piece.at;
-        return { file: piece.file, at: from - seg.start, to: to - seg.start, start, end,
-          sourceStart: offsetPosition(piece.source, start), sourceEnd: offsetPosition(piece.source, end) };
-      });
+    while (firstPiece < pieces.length && pieces[firstPiece].at + pieces[firstPiece].text.length <= seg.start) firstPiece++;
+    const parts = [];
+    for (let index = firstPiece; index < pieces.length && pieces[index].at < seg.end; index++) {
+      const piece = pieces[index];
+      if (!piece.file) continue;
+      const from = Math.max(seg.start, piece.at);
+      const to = Math.min(seg.end, piece.at + piece.text.length);
+      const start = piece.start + from - piece.at;
+      const end = piece.start + to - piece.at;
+      parts.push({ file: piece.file, at: from - seg.start, to: to - seg.start, start, end,
+        sourceStart: offsetPosition(piece.source, start, lineIndexes),
+        sourceEnd: offsetPosition(piece.source, end, lineIndexes) });
+    }
     const first = parts[0];
     if (!first) return [];
     const single = parts.length === 1 && first.at === 0 && first.to === seg.text.length;
@@ -86,8 +92,18 @@ export function expandInputParagraphs(segs, context) {
   });
 }
 
-function offsetPosition(text, offset) {
-  const prefix = text.slice(0, offset);
-  const last = prefix.lastIndexOf('\n');
-  return { line: prefix.split('\n').length, column: offset - last };
+function offsetPosition(text, offset, indexes) {
+  let starts = indexes.get(text);
+  if (!starts) {
+    starts = [0];
+    for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
+    indexes.set(text, starts);
+  }
+  let lo = 0, hi = starts.length;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (starts[mid] <= offset) lo = mid;
+    else hi = mid;
+  }
+  return { line: lo + 1, column: offset - starts[lo] + 1 };
 }

@@ -35,6 +35,8 @@ local PDFPATH = ''
 local ACTIVE_FEED = ''
 local BRANCHDIR = ''
 local ROOT_CHECKPOINTED = false
+local REPLAY_FROM = 0
+local REPLAY_STRIDE = 1
 
 local function send(s) conn:send(s) end
 
@@ -131,7 +133,7 @@ local function wait_as_checkpoint()
   while true do
     local line = conn:receive('*l')
     if not line then fk._exit(0) end
-    local cmd, a = line:match('^(%S+)%s*(%S*)')
+    local cmd, a, stride = line:match('^(%S+)%s*(%S*)%s*(%S*)')
     if cmd == 'DIE' then
       fk._exit(0)
     elseif cmd == 'RESUME' then
@@ -147,6 +149,8 @@ local function wait_as_checkpoint()
         adopt_private_input(prepared_input)
         adopt_branch(resume_dir, branch)
         GEN = resume_gen
+        REPLAY_FROM = PAGE
+        REPLAY_STRIDE = math.max(0, tonumber(stride) or 1)
         ROLE = 'root'
         EOF = false
         pcall(function() conn:close() end)
@@ -167,6 +171,8 @@ end
 local function ensure_root_checkpoint()
   if ROOT_CHECKPOINTED or ROLE ~= 'root' or PAGE ~= 0 or NLINE ~= 0 then return end
   ROOT_CHECKPOINTED = true
+  collectgarbage('collect')
+  collectgarbage('collect')
   local checkpoint_dir = WORKDIR .. '/ship-g' .. GEN .. '-ck0'
   local checkpoint_branch = prepare_branch(checkpoint_dir)
   local cpid = fk.fork()
@@ -267,6 +273,7 @@ function tdom_ship_after()
   if not PRIVATE_PDF or ROLE ~= 'root' then return end
   PAGE = PAGE + 1
   send('SSHIP ' .. PAGE .. ' ' .. NLINE .. ' ' .. GEN .. '\n')
+  if EOF or REPLAY_STRIDE == 0 or (PAGE - REPLAY_FROM) % REPLAY_STRIDE ~= 0 then return end
   local checkpoint_page = PAGE
   local checkpoint_gen = GEN
   local checkpoint_dir = WORKDIR .. '/ship-g' .. checkpoint_gen .. '-ck' .. checkpoint_page
@@ -300,8 +307,9 @@ local function next_unit()
   while true do
     local line = conn:receive('*l')
     if not line then fk._exit(0) end
-    local cmd, a = line:match('^(%S+)%s*(%S*)')
+    local cmd, a, terminal = line:match('^(%S+)%s*(%S*)%s*(%S*)')
     if cmd == 'SLINE' then
+      EOF = terminal == 'END'
       local len = tonumber(a) or 0
       return len > 0 and conn:receive(len) or ''
     elseif cmd == 'SEOF' then

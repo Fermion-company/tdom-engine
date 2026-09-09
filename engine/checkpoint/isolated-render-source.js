@@ -45,8 +45,12 @@ export function buildIsolatedRenderSource({
     'function tdom_iso_float() local b = tex.box[tdom_iso_fbox] ' +
     'if b then tdom_iso_nf = tdom_iso_nf + 1 tdom_iso_floats[tdom_iso_nf] = node.copy_list(b) end end ' +
     'function tdom_iso_load_box(b) ' +
+    'local pad = math.max(tex.dimen.paperwidth or tex.pagewidth or 0, 65536) ' +
+    'tex.hoffset = pad - tex.sp("1in") ' +
+    'local f = assert(io.open("render-padding.txt", "w")) ' +
+    'f:write(tostring(pad / 65536 * 72 / 72.27)) f:close() ' +
     'tex.box[255] = b ' +
-    'tex.pagewidth = math.max(b.width or 0, 65536) ' +
+    'tex.pagewidth = math.max(b.width or 0, 65536) + 2 * pad ' +
     'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536) end ' +
     'function tdom_iso_load_float(i) local b = tdom_iso_floats[i] ' +
     'if not b then return end tdom_iso_floats[i] = false tdom_iso_load_box(b) end ' +
@@ -129,8 +133,7 @@ export function buildIsolatedRenderSource({
       // galley (float-only block) would make \shipout void = no page
       // and shift every float's page index
       'local b = out and node.vpack(out) or node.new("hlist") ' +
-      'tex.box[255] = b tex.pagewidth = math.max(b.width or 0, 65536) ' +
-      'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536)}'
+      'tdom_iso_load_box(b)}'
   );
   L.push('\\shipout\\box255');
   L.push('\\directlua{tdom_iso_ship_floats()}');

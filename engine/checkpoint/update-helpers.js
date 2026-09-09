@@ -39,6 +39,15 @@ export function hasDefinitionEdit(oldBlocks, blocks, bounds, defRe) {
   return false;
 }
 
+export function editPageRenderIds(blocks, pages, dirtySource) {
+  const nearby = new Set();
+  for (const page of pages) {
+    if (!page.draw?.some(draw => dirtySource.has(draw.u?.blockId))) continue;
+    for (const draw of page.draw) nearby.add(draw.u?.blockId);
+  }
+  return blocks.filter(block => nearby.has(block.id) && block.needsRender).map(block => block.id);
+}
+
 export function nextEditHold(fgStop, dirtyBlocks, blocks, editHold) {
   const locusPins = [fgStop];
   for (const id of dirtyBlocks) {

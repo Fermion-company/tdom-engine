@@ -1,5 +1,5 @@
 import { reconcile } from './pagebuilder.js';
-import { nextEditHold } from './update-helpers.js';
+import { nextEditHold, editPageRenderIds } from './update-helpers.js';
 import { buildPagePatches } from './page-patches.js';
 import { buildUpdateResponse } from './update-response.js';
 
@@ -18,7 +18,7 @@ export function finalizeUpdate(engine, {
     callbacks;
   const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict } = typesetResult;
   // pin the edit locus so the next keystroke is fork-once, typeset-once
-  engine.editHold = nextEditHold(fgStop, dirtyBlocks, engine.blocks, engine.editHold);
+  engine.editHold = rebooted ? [] : nextEditHold(fgStop, dirtySource, engine.blocks, engine.editHold);
 
   // ---- pages, display lists, patches ---------------------------------
   const pagesRaw = paginateNow();
@@ -49,7 +49,10 @@ export function finalizeUpdate(engine, {
   // off the hot path; when it lands the client swaps every clean page to
   // LuaLaTeX's own pixels
   engine.canonical.schedule(text, engine.srcRev);
-  scheduleBackground(fgStop, dirtyBlocks, { interactive: !rebooted });
+  scheduleBackground(fgStop, dirtyBlocks, {
+    interactive: !rebooted,
+    pageRenderIds: rebooted ? [] : editPageRenderIds(engine.blocks, engine.pages, dirtySource),
+  });
   timer.lap('schedule');
   return buildUpdateResponse({
     rev: engine.rev,

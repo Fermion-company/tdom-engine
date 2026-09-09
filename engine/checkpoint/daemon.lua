@@ -953,7 +953,7 @@ local function reseed_page()
   end)
 end
 
-local function checkpoint_gc(initial)
+local function checkpoint_gc(initial, interactive)
   if os.getenv('TDOM_NO_CKPT_GC') then return end
   if initial or not TDOM_GC_FLOOR then
     collectgarbage('collect')
@@ -965,8 +965,12 @@ local function checkpoint_gc(initial)
   -- entire Japanese font heap twice on each fork from the same boundary.
   -- A hard garbage allowance still bounds deep lineages when a block
   -- allocates faster than these incremental steps can reclaim it.
-  local completed = collectgarbage('step', 2048)
   local kb = collectgarbage('count')
+  -- A collector step may enter an atomic scan of the entire font heap.
+  -- Foreground forks defer it while remaining inside the garbage allowance.
+  if interactive and kb <= TDOM_GC_FLOOR + 65536 then return end
+  local completed = collectgarbage('step', 2048)
+  kb = collectgarbage('count')
   if completed then
     TDOM_GC_FLOOR = kb
   elseif kb > TDOM_GC_FLOOR + 65536 then
@@ -1251,6 +1255,9 @@ function tdom_report()
     tm = {
       typeset = math.floor((TR0 - (T_JOB or TR0)) * 100000 + 0.5) / 100,
       harvest = math.floor((TR1 - TR0) * 100000 + 0.5) / 100,
+      heapKb = collectgarbage('count'),
+      gcFloorKb = TDOM_GC_FLOOR,
+      interactive = JOB.interactive,
     }
   end
   local capture = nil
@@ -1289,14 +1296,27 @@ function tdom_report()
   if head and not capture then node.flush_list(head) end
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
   conn:send(payload)
-  checkpoint_gc(false)
+  local gc_started = os.gettimeofday and os.gettimeofday() or os.clock()
+  checkpoint_gc(false, JOB.interactive)
+  local gc_ms = ((os.gettimeofday and os.gettimeofday() or os.clock()) - gc_started) * 1000
   -- this child now becomes the next checkpoint in the chain
   CKPT = JOB.ckpt
-  conn:send('CKPT ' .. CKPT .. ' ' .. fk.getpid() .. '\n')
+  conn:send('CKPT ' .. CKPT .. ' ' .. fk.getpid() .. ' ' .. (TDOM_GC_FLOOR or 0) .. ' ' .. gc_ms .. '\n')
   JOB = nil
 end
 
 -- ------------------------------------------------------------ shipping
+
+-- Graphics may paint outside their logical TeX box. Preserve a physical
+-- page's horizontal overhang; the host still clips at the document page.
+local function render_horizontal_padding()
+  local pad = math.max(tex.dimen.paperwidth or tex.pagewidth or 0, 65536)
+  tex.hoffset = pad - tex.sp('1in')
+  local file = assert(io.open('render-padding.txt', 'w'))
+  file:write(string.format('%.8f', bp(pad)))
+  file:close()
+  return pad
+end
 
 -- Vpack an owned MVL node list and install it as one tight PDF page.
 -- Both paths call this exact routine: legacy RENDER harvests a second
@@ -1342,7 +1362,7 @@ local function ship_node_list(head)
   local w = math.max(b.width or 0, 65536)
   local total = math.max((b.height or 0) + (b.depth or 0), 65536)
   tex.box[255] = b
-  tex.pagewidth = w
+  tex.pagewidth = w + 2 * render_horizontal_padding()
   tex.pageheight = total
 end
 
@@ -1393,7 +1413,7 @@ local function load_ship_box(b)
   local w = math.max(b.width or 0, 65536)
   local total = math.max((b.height or 0) + (b.depth or 0), 65536)
   tex.box[255] = b
-  tex.pagewidth = w
+  tex.pagewidth = w + 2 * render_horizontal_padding()
   tex.pageheight = total
 end
 
@@ -1480,7 +1500,7 @@ function tdom_wait()
     if not line then
       fk._exit(0) -- orchestrator went away
     end
-    local cmd, a, b, c, d = line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)')
+    local cmd, a, b, c, d, mode, live_floor = line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)')
     if cmd == 'DIE' then
       fk._exit(0)
     elseif cmd == 'PING' then
@@ -1494,8 +1514,8 @@ function tdom_wait()
       elseif a == 'SILENT' then
         FAULT_SILENT = tonumber(b) or 0
       end
-    elseif cmd == 'JOB' then
-      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|->
+    elseif cmd == 'JOB' or cmd == 'STEP' then
+      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B> <liveFloorKb>
       local id = a
       local newckpt = tonumber(b) or (CKPT + 1)
       local len = tonumber(c) or 0
@@ -1507,7 +1527,7 @@ function tdom_wait()
         texio.write_nl('term and log', 'TDOMFAULT silent job=' .. tostring(id))
       else
       local wedge = take_wedge_fault()
-      local pid = fork_for(id)
+      local pid = cmd == 'STEP' and 0 or fork_for(id)
       if pid == 0 then
         if wedge then
           os.execute('/bin/sleep 30')
@@ -1517,7 +1537,13 @@ function tdom_wait()
         -- checkpoint generation. The parent keeps its own COW copy until
         -- CAPTURE or checkpoint retirement.
         drop_capture()
-        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil }
+        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F' }
+        -- Re-loading a font already measured in this block is live growth,
+        -- not another 64MB of garbage to sweep on every fork from its input.
+        if JOB.interactive then
+          TDOM_GC_FLOOR = math.max(TDOM_GC_FLOOR or 0, tonumber(live_floor) or 0)
+        end
+        collectgarbage(JOB.interactive and 'stop' or 'restart')
         T_JOB = os.gettimeofday and os.gettimeofday() or os.clock()
         blk_labels = {}
         blk_refs = {}
@@ -1530,7 +1556,11 @@ function tdom_wait()
         pending_fmarks = {}
         tdom_absorb_reset()
         RENDER_MODE = false
-        reconnect('job', newckpt)
+        if cmd == 'STEP' then
+          conn:send('FORKED ' .. id .. ' ' .. fk.getpid() .. '\n')
+        else
+          reconnect('job', newckpt)
+        end
         if os.getenv('TDOM_TRACE_HANG') then
           -- hang forensics: if this job burns absurd Lua instruction counts,
           -- dump WHERE and bail — a silent C-side spin never trips this hook

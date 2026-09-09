@@ -1,5 +1,6 @@
 export class Peer {
   constructor(sock, engine) {
+    sock.setNoDelay(true);
     this.sock = sock;
     this.engine = engine;
     this.role = '?';
@@ -63,7 +64,7 @@ export class Peer {
           this.pendingHeader = { kind: 'GALLEY', id: parts[1], len: Number(parts[2]) };
           break;
         case 'CKPT':
-          this.engine._onMessage(this, { kind: 'CKPT', idx: Number(parts[1]), pid: Number(parts[2]) });
+          this.engine._onMessage(this, { kind: 'CKPT', idx: Number(parts[1]), pid: Number(parts[2]), gcFloorKb: Number(parts[3]), gcMs: Number(parts[4]) });
           break;
         case 'DONE':
           this.engine._onMessage(this, { kind: 'DONE', id: parts[1] });

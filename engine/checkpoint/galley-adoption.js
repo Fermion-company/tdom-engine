@@ -24,6 +24,8 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
       chunks.set(c.key, {
         svg: c.svg,
         wBp: c.wBp,
+        logicalWBp: c.logicalWBp,
+        xBp: c.xBp,
         hBp: c.hBp,
         v: (prev?.v ?? 0) + 1,
         forGalley: block.galleyHash,

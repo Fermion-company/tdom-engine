@@ -4,7 +4,7 @@
 // engine computes from the final source". These fork real lualatex processes;
 // skipped without a TeX installation.
 
-import { test, before, after } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -983,16 +983,20 @@ test('fresh partial-exact pixels replace only contiguous math lines', () => {
 
 let eng;
 let openReport;
-before(async () => {
-  if (!available) return;
-  rmSync(WORK, { recursive: true, force: true });
-  rmSync(WORK2, { recursive: true, force: true });
-  eng = new CheckpointEngine({ workDir: WORK });
-  openReport = await eng.open(makeDoc());
-  await drain(eng);
-});
+function sharedTest(name, options, body) {
+  test(name, options, async (context) => {
+    if (!eng) {
+      rmSync(WORK, { recursive: true, force: true });
+      rmSync(WORK2, { recursive: true, force: true });
+      eng = new CheckpointEngine({ workDir: WORK });
+      openReport = await eng.open(makeDoc());
+      await drain(eng);
+    }
+    await body(context);
+  });
+}
 
-test('edit reports atomically carry newly registered texttt and textit faces', opts, async () => {
+sharedTest('edit reports atomically carry newly registered texttt and textit faces', opts, async () => {
   assert.deepEqual(new Set(openReport.fonts), new Set(eng.getFontManifest()));
   const anchor = 'Opening alpha';
   const insert = '\\texttt{aaaa}\\textit{BBBB}';
@@ -1013,7 +1017,7 @@ after(async () => {
   if (eng) await eng.close();
 });
 
-test('display-math exact render reuses the foreground JOB node list', opts, async () => {
+sharedTest('display-math exact render reuses the foreground JOB node list', opts, async () => {
   await eng.renderTask.catch(() => {});
   const beforeHits = eng.renderStats.captureHits;
   const at = eng.getSource().indexOf('a^2');
@@ -1040,7 +1044,7 @@ test('display-math exact render reuses the foreground JOB node list', opts, asyn
   await drain(eng);
 });
 
-test('mixed prose and display math reaches fresh exact pixels without canonical compile', opts, async () => {
+sharedTest('mixed prose and display math reaches fresh exact pixels without canonical compile', opts, async () => {
   await eng.renderTask.catch(() => {});
   const beforeHits = eng.renderStats.captureHits;
   const source = eng.getSource();
@@ -1075,7 +1079,7 @@ test('mixed prose and display math reaches fresh exact pixels without canonical 
   await drain(eng);
 });
 
-test('steady-state keystrokes stay fork-once (edit-locus pin)', opts, async () => {
+sharedTest('steady-state keystrokes stay fork-once (edit-locus pin)', opts, async () => {
   const src = () => eng.getSource();
   let worstBlocks = 0;
   let worstWall = 0;
@@ -1095,7 +1099,7 @@ test('steady-state keystrokes stay fork-once (edit-locus pin)', opts, async () =
   await drain(eng);
 });
 
-test('a tail edit right after a mid edit is NOT charged the distance', opts, async () => {
+sharedTest('a tail edit right after a mid edit is NOT charged the distance', opts, async () => {
   if (process.env.TDOM_EXPECT_MAX_CHECKPOINTS !== undefined) {
     assert.equal(
       eng.maxCheckpoints,
@@ -1137,7 +1141,7 @@ test('a tail edit right after a mid edit is NOT charged the distance', opts, asy
   await drain(eng);
 });
 
-test('a null edit pair leaves the document identity untouched', opts, async () => {
+sharedTest('a null edit pair leaves the document identity untouched', opts, async () => {
   const before = signature(eng);
   const pos = eng.getSource().indexOf('Delta filler 3');
   await eng.edit(pos, pos, 'Z');
@@ -1146,7 +1150,7 @@ test('a null edit pair leaves the document identity untouched', opts, async () =
   assert.deepEqual(signature(eng), before, 'insert+revert must be a no-op');
 });
 
-test('section insert: fast response, async renumbering to convergence', opts, async () => {
+sharedTest('section insert: fast response, async renumbering to convergence', opts, async () => {
   const pos = eng.getSource().indexOf('\\section{Gamma}');
   const t0 = performance.now();
   const r = await eng.edit(pos, pos, '\\section{Inserted}\\label{sec:ins}\n\n' + para('Inserted body') + '\n\n');
@@ -1164,7 +1168,7 @@ test('section insert: fast response, async renumbering to convergence', opts, as
   assert.equal(labels['sec:eps'], '6');
 });
 
-test('definition edit: suffix rebuilt off the hot path', opts, async () => {
+sharedTest('definition edit: suffix rebuilt off the hot path', opts, async () => {
   const src = eng.getSource();
   const pos = src.indexOf('alpha-value');
   const t0 = performance.now();
@@ -1184,28 +1188,7 @@ test('definition edit: suffix rebuilt off the hot path', opts, async () => {
   assert.match(text, /beta/, 'downstream block reflects the new definition');
 });
 
-test('THE defining equation: incremental result equals a fresh engine', opts, async () => {
-  await drain(eng);
-  const finalSrc = eng.getSource();
-  const scratch = new CheckpointEngine({ workDir: WORK2 });
-  try {
-    await scratch.open(finalSrc);
-    await drain(scratch);
-    assert.equal(eng.blocks.length, scratch.blocks.length, 'same segmentation');
-    const a = signature(eng);
-    const b = signature(scratch);
-    const mismatches = [];
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] !== b[i]) mismatches.push(`#${i} ${eng.blocks[i].id}`);
-    }
-    assert.deepEqual(mismatches, [], 'every block identical to from-scratch');
-    assert.equal(eng.pages.length, scratch.pages.length, 'same page count');
-  } finally {
-    await scratch.close();
-  }
-});
-
-test('idle engine holds no deferred work and a bounded process set', opts, async () => {
+sharedTest('idle engine holds no deferred work and a bounded process set', opts, async () => {
   await drain(eng);
   assert.equal(eng.pendingChain, null);
   assert.equal(eng.bgActive, false);
@@ -1214,6 +1197,31 @@ test('idle engine holds no deferred work and a bounded process set', opts, async
     eng.checkpoints.size <= eng.maxCheckpoints + 16,
     `checkpoint processes bounded (${eng.checkpoints.size})`
   );
+});
+
+sharedTest('THE defining equation: incremental result equals a fresh engine', opts, async () => {
+  await drain(eng);
+  const finalSrc = eng.getSource();
+  const incremental = { signature: signature(eng), pages: eng.pages.length,
+    ids: eng.blocks.map(block => block.id) };
+  await eng?.close();
+  eng = null;
+  const scratch = new CheckpointEngine({ workDir: WORK2 });
+  try {
+    await scratch.open(finalSrc);
+    await drain(scratch);
+    assert.equal(incremental.ids.length, scratch.blocks.length, 'same segmentation');
+    const a = incremental.signature;
+    const b = signature(scratch);
+    const mismatches = [];
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) mismatches.push(`#${i} ${incremental.ids[i]}`);
+    }
+    assert.deepEqual(mismatches, [], 'every block identical to from-scratch');
+    assert.equal(incremental.pages, scratch.pages.length, 'same page count');
+  } finally {
+    await scratch.close();
+  }
 });
 
 // Broken-TeX freeze semantics (docs/10 §10.9). The breakage class that
@@ -1248,6 +1256,8 @@ const tikzDoc = (fill) =>
 // where they were — zero churn while the user is mid-edit — and the block
 // heals on the next edit that fixes it.
 test('broken block freezes at its last good galley, downstream untouched, heals on fix', opts, async () => {
+  await eng?.close();
+  eng = null;
   rmSync(WORK2, { recursive: true, force: true });
   const e = new CheckpointEngine({ workDir: WORK2 });
   try {
@@ -1286,6 +1296,8 @@ test('broken block freezes at its last good galley, downstream untouched, heals 
 // skips and reverts when it sees tdomFrozen). This test pins the fresh-boot
 // half: empty freeze, engine alive, state passthrough.
 test('fresh boot on a broken source: empty freeze, engine alive', opts, async () => {
+  await eng?.close();
+  eng = null;
   rmSync(WORK2, { recursive: true, force: true });
   const scratch = new CheckpointEngine({ workDir: WORK2 });
   try {
@@ -1311,6 +1323,8 @@ test('fresh boot on a broken source: empty freeze, engine alive', opts, async ()
 // page supplies the margin pixels through the 'canon' display band), and
 // keystrokes inside it stay on the fast path.
 test('margin marks stay structured as canonical-only blocks', opts, async () => {
+  await eng?.close();
+  eng = null;
   rmSync(WORK2, { recursive: true, force: true });
   const e = new CheckpointEngine({ workDir: WORK2 });
   try {
@@ -1361,6 +1375,8 @@ test('margin marks stay structured as canonical-only blocks', opts, async () => 
 // (found by the fuzzer: corpus/06 seed 1, burst 2). resolvedInGalley now
 // compares the exact values injected at typeset time (galley.tdomRefVals).
 test('backward ref updates when the label moves to a value already visible in the block', opts, async () => {
+  await eng?.close();
+  eng = null;
   const refsDoc = readFileSync(
     fileURLToPath(new URL('../corpus/06-refs-heavy.tex', import.meta.url)),
     'utf8'
@@ -1377,16 +1393,19 @@ test('backward ref updates when the label moves to a value already visible in th
     const at = e.getSource().indexOf(anchor) + anchor.length;
     await e.edit(at, at, '\n\n\\begin{equation}\n  q^2 = p\n\\end{equation}\n');
     await drain(e);
+    const incremental = { signature: signature(e), ids: e.blocks.map(block => block.id) };
+    const finalSrc = e.getSource();
+    await e.close();
     const scratch = new CheckpointEngine({ workDir: WORK2 + '-scratch' });
     try {
-      await scratch.open(e.getSource());
+      await scratch.open(finalSrc);
       await drain(scratch);
-      assert.equal(e.blocks.length, scratch.blocks.length, 'same segmentation');
-      const a = signature(e);
+      assert.equal(incremental.ids.length, scratch.blocks.length, 'same segmentation');
+      const a = incremental.signature;
       const b = signature(scratch);
       const mismatches = [];
       for (let i = 0; i < a.length; i++) {
-        if (a[i] !== b[i]) mismatches.push(`#${i} ${e.blocks[i].id}`);
+        if (a[i] !== b[i]) mismatches.push(`#${i} ${incremental.ids[i]}`);
       }
       assert.deepEqual(mismatches, [], 'every block identical to from-scratch');
     } finally {
@@ -1398,7 +1417,7 @@ test('backward ref updates when the label moves to a value already visible in th
   }
 });
 
-test('native forced breaks retain adjacent material without phantom pages or rescue work', opts, async () => {
+sharedTest('native forced breaks retain adjacent material without phantom pages or rescue work', opts, async () => {
   await eng.open(String.raw`\documentclass{article}
 \begin{document}
 Ordinary prose before the rescued material.
@@ -1430,7 +1449,7 @@ Ordinary prose on the third page.
 });
 
 
-test('resident forced output retains material before and after a page break', opts, async () => {
+sharedTest('resident forced output retains material before and after a page break', opts, async () => {
   await eng.open(String.raw`\documentclass{article}
 \begin{document}
 Before forced output.\par
@@ -1447,7 +1466,8 @@ After forced output.\par
 });
 
 test('decorated boxes retain private PDF resources across capture, resize, and sibling edits', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-private-pdf-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
   const source = String.raw`\documentclass{article}
@@ -1524,7 +1544,8 @@ SiblingResource.
 });
 
 test('exact box pages exclude lastskip primer material from RENDER and CAPTURE', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-primer-crop-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
   try {
@@ -1583,7 +1604,8 @@ After.
 });
 
 test('stable native prose paints before graphics verification and retains burst work', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-plain-preview-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
   const source = String.raw`\documentclass{article}
@@ -1650,7 +1672,8 @@ Tail.
 });
 
 test('active ordinary-looking source characters cannot grant a native plain preview', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-active-source-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
   try {
@@ -1676,7 +1699,8 @@ ActiveMarker !abcd.
 });
 
 test('warming a cold page supplies every exact neighbor before an included box edit', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-warm-page-'));
   const child = path.join(root, 'child.tex');
   writeFileSync(child, String.raw`\begin{tcolorbox}[enhanced,title=Target]
@@ -1723,7 +1747,8 @@ NeighborWitness.
 });
 
 test('input preserves attached paragraph geometry and child editing addresses', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-input-paragraph-'));
   const child = path.join(root, 'child.tex');
   const childText = String.raw`\begin{tcolorbox}
@@ -1765,7 +1790,8 @@ AttachedWitness $x^2$.
 });
 
 test('deferred root and include edits converge, report errors, and recover exact page counts', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-closure-convergence-'));
   const child = path.join(root, 'child.tex');
   writeFileSync(child, 'ChildWitnessA.\n');
@@ -1846,6 +1872,235 @@ RootWitnessA.
     await exact('ChildWitnessC', 1);
   } finally {
     await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an asynchronous title rescue regenerates downstream math and footnote chunks', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-rescue-exact-successor-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  let targetId, reports = 0, replayHeld = false, oldHash;
+  let rendered;
+  const oldRendered = new Promise(resolve => { rendered = resolve; });
+  const fulfill = e._fulfill.bind(e);
+  e._fulfill = (key, value) => {
+    if (key.startsWith('galley:') && value?.items?.some(item => item.k === 'ins')) {
+      targetId ??= key.slice('galley:'.length);
+      if (key === 'galley:' + targetId && ++reports === 1) {
+        const set = e.chunks.set.bind(e.chunks);
+        e.chunks.set = (chunkKey, chunk) => {
+          const result = set(chunkKey, chunk);
+          if (chunkKey === targetId + '@fn0') {
+            oldHash ??= chunk.forGalley;
+            rendered();
+          }
+          return result;
+        };
+      } else if (key === 'galley:' + targetId && reports === 2) {
+        // Make the old render win this race before the rescue adopts the
+        // corrected paragraph. The successor must then get a new render.
+        replayHeld = true;
+        oldRendered.then(() => fulfill(key, value));
+        return;
+      }
+    }
+    fulfill(key, value);
+  };
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage{amsmath}
+\title{A title}\author{Author}\date{}
+\begin{document}
+\maketitle
+
+\section{Text}
+A formula $x^2$ followed by a footnote.\footnote{FootnoteWitness.}
+
+Tail.
+\end{document}`);
+    await drain(e);
+    await e.renderTask;
+    const block = e.blocks.find(item => item.id === targetId);
+    assert.ok(replayHeld, 'the asynchronous rescue actually revisited the paragraph');
+    assert.notEqual(block.galleyHash, oldHash, 'the test crosses a real galley generation change');
+    for (const key of [targetId, targetId + '@fn0']) {
+      assert.equal(e.chunks.get(key)?.forGalley, block.galleyHash, key + ' must describe the corrected paragraph');
+    }
+    assert.ok(e.getDisplayLists().some(page => page.commands.some(command =>
+      command.op === 'chunk' && command.chunk === targetId + '@fn0' && !command.st)));
+  } finally {
+    rendered();
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a cold page edit retains its native owners and prepares unchanged exact neighbors', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-cold-edit-page-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work'), maxCheckpoints: 2 });
+  const previousHot = process.env.TDOM_RENDER_HOT_MAX;
+  process.env.TDOM_RENDER_HOT_MAX = '1';
+  const missing = page => e.getDisplayLists().find(item => item.page === page)?.commands.filter(command =>
+    command.op === 'pending-exact' || command.op === 'chunk' && command.st);
+  const source = String.raw`\documentclass{article}
+\usepackage[most]{tcolorbox}
+\begin{document}
+` + Array.from({ length: 12 }, (_, index) => String.raw`
+\begin{tcolorbox}[enhanced,title=Neighbor]
+Neighbor ${index}.
+\end{tcolorbox}
+
+\begin{tcolorbox}[enhanced,title=Target]
+Target${index} $x^2$.
+\end{tcolorbox}
+
+\newpage
+
+`).join('') + '\\end{document}';
+  try {
+    await e.open(source);
+    assert.equal(e.renderHold.size, 0, 'unqueued cold work must not monopolize the render holds');
+    const target = e.blocks.findIndex((block, index) => {
+      const number = /Target(\d+) /.exec(block.text)?.[1];
+      return number != null && Number(number) > 0 && Number(number) < 11 && !e.checkpoints.has(index);
+    });
+    assert.ok(target >= 0, 'a target starts outside the resident budget');
+    const targetNumber = Number(/Target(\d+) /.exec(e.blocks[target].text)[1]);
+    const targetPage = targetNumber + 1;
+    assert.ok(missing(targetPage).length > 0);
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    for (const exponent of ['3', '4']) {
+      const marker = `Target${targetNumber} $x^`;
+      const at = e.getSource().indexOf(marker) + marker.length;
+      const report = await e.edit(at, at + 1, exponent);
+      assert.ok(e.checkpoints.has(target), 'the edit input remains available before async rendering');
+      assert.ok(e.checkpoints.has(target + 1), 'the current node capture remains available');
+      if (exponent === '4') assert.ok(report.stats.blocksTypeset <= 2, 'typing twice must not repeat a cold prefix walk');
+      await e.renderTask;
+      assert.deepEqual(missing(targetPage), [], 'unchanged neighbor and changed box are both paintable without canonical');
+      assert.equal(e.renderHold.size, 0, 'completed renders relinquish their temporary owners');
+    }
+  } finally {
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('native exact renders preserve decoration ink outside the logical box', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-overhanging-ink-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  const source = String.raw`\documentclass{article}
+\usepackage[most]{tcolorbox}
+\begin{document}
+\begin{tcolorbox}[enhanced,before skip=0pt,after skip=0pt,
+  overlay={\fill[black] ([xshift=-12bp]frame.north west)
+    rectangle ([xshift=-4bp,yshift=-10bp]frame.north west);}]
+Inside $x^2$.
+\end{tcolorbox}
+\end{document}`;
+  try {
+    await e.open(source);
+    for (const exponent of ['2', '3']) {
+      if (exponent !== '2') {
+        const at = e.getSource().indexOf('x^2') + 2;
+        await e.edit(at, at + 1, exponent);
+      }
+      await e.renderTask;
+      const block = e.blocks.find(item => item.text.includes('Inside'));
+      const chunk = e.chunks.get(block.id);
+      assert.equal(chunk?.forGalley, block.galleyHash);
+      const command = e.getDisplayLists().flatMap(page => page.commands)
+        .find(item => item.op === 'chunk' && item.chunk === block.id);
+      const textLeft = 72 + e.geometry.oddsidemargin;
+      assert.ok(Math.abs(command.x - chunk.xBp - textLeft) < 0.02,
+        'the padded image preserves the logical text origin');
+      const pdf = path.join(root, `ink-${exponent}.pdf`);
+      const raster = path.join(root, `ink-${exponent}`);
+      writeFileSync(pdf, chunk.editPdf);
+      await promisify(execFile)('pdftoppm', [
+        '-f', '1', '-singlefile', '-gray', '-r', '72',
+        '-x', String(Math.round(-chunk.xBp) - 10), '-y', '2',
+        '-W', '4', '-H', '4', pdf, raster,
+      ]);
+      const pgm = readFileSync(raster + '.pgm');
+      assert.match(pgm.subarray(0, 32).toString('latin1'), /^P5\s+4\s+4\s+255\s/);
+      assert.ok(pgm.subarray(-16).every(value => value < 16),
+        'the black decoration remains visible left of the TeX box in RENDER and CAPTURE');
+    }
+    assert.ok(e.renderStats.captureHits > 0);
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cold native prefix replay advances only its fresh continuation and preserves TeX definitions', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-prefix-continuation-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  const source = String.raw`\documentclass{article}
+\newcommand{\VisibleWord}{seed}
+\begin{document}
+` + Array.from({ length: 70 }, (_, index) => String.raw`
+\gdef\VisibleWord{word${index}}
+
+TARGET${index} uses \VisibleWord. Ordinary text continues with the inherited definition.
+
+`).join('') + '\\end{document}';
+  let finalSource, expected;
+  let checkpointExcess = 0;
+  const onMessage = e._onMessage.bind(e);
+  e._onMessage = (peer, message) => {
+    const result = onMessage(peer, message);
+    checkpointExcess = Math.max(checkpointExcess,
+      e.checkpoints.size - e.maxCheckpoints - e.editHold.length - e.renderHold.size - 2);
+    return result;
+  };
+  try {
+    await e.open(source);
+    assert.equal(checkpointExcess, 0, 'checkpoint count stays bounded during every boot step');
+    const candidates = e.blocks.map((block, index) => {
+      const marker = /TARGET\d+/.exec(block.text)?.[0];
+      const prefix = Math.max(...[...e.checkpoints.keys()].filter(boundary => boundary <= index));
+      return { index, marker, distance: index - prefix };
+    }).filter(item => item.marker && item.distance >= 5).sort((a, b) => b.distance - a.distance);
+    assert.ok(candidates.length > 0, 'a cold target spans multiple native definitions');
+    const target = candidates[0];
+    const rootPid = e.checkpoints.get(0).pid;
+    const announcements = [];
+    const recordMessage = e._onMessage.bind(e);
+    e._onMessage = (peer, message) => {
+      if (message.kind === 'FORKED') announcements.push({ pid: message.pid, parent: peer.pid });
+      return recordMessage(peer, message);
+    };
+    const at = e.getSource().indexOf(target.marker) + target.marker.length;
+    const report = await e.edit(at, at, 'x');
+    assert.ok(report.stats.blocksTypeset >= 5);
+    assert.ok(announcements.some(item => item.pid === item.parent), 'the prefix reuses a transient process');
+    assert.equal(e.checkpoints.get(0).pid, rootPid, 'the frozen root is never consumed');
+    await drain(e);
+    finalSource = e.getSource();
+    expected = signature(e);
+  } finally {
+    await e.close();
+  }
+  const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh') });
+  try {
+    await fresh.open(finalSource);
+    await drain(fresh);
+    assert.deepEqual(signature(fresh), expected, 'every native galley and exit state matches a fresh run');
+  } finally {
+    await fresh.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
