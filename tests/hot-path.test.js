@@ -6,7 +6,8 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -22,9 +23,12 @@ import { classifyDocument } from '../engine/checkpoint/safety.js';
 import { sourceClosure } from '../engine/checkpoint/closure.js';
 import { classifyStructuralAliases } from '../engine/checkpoint/structural-aliases.js';
 import { ShippingChain } from '../engine/checkpoint/shipping.js';
+import { renderIsolatedBlock } from '../engine/checkpoint/isolated-render.js';
+import { isoCompile } from '../engine/checkpoint/iso-compile.js';
 import { segmentBody } from '../engine/segmenter.js';
 import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finalize.js';
 import { classifyResidentEdit } from '../engine/checkpoint/resident-edit-admission.js';
+import { plainPreviewWitness, canDeferPlainVerification } from '../engine/checkpoint/plain-preview.js';
 import {
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
@@ -43,6 +47,107 @@ const available = await promisify(execFile)('lualatex', ['--version'], { timeout
   () => false
 );
 const opts = available ? {} : { skip: 'lualatex not installed' };
+
+test('document switches bind replacement shipping to the new project and overlay', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-document-context-'));
+  const first = path.join(root, 'first');
+  const second = path.join(root, 'second');
+  const overlay = path.join(root, 'overlay');
+  for (const dir of [first, second, overlay]) mkdirSync(dir);
+  const previousShip = process.env.TDOM_SHIP;
+  process.env.TDOM_SHIP = '1';
+  const engine = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: first });
+  if (previousShip === undefined) delete process.env.TDOM_SHIP;
+  else process.env.TDOM_SHIP = previousShip;
+  try {
+    const initial = engine.shipping;
+    await engine.setDocumentContext({ docDir: second, overlayDir: overlay });
+    assert.notEqual(engine.shipping, initial);
+    assert.equal(engine.shipping.docDir, second);
+    assert.equal(engine.shipping.overlayDir, overlay);
+    assert.equal(engine.canonical.docDir, second);
+    assert.equal(engine.canonical.overlayDir, overlay);
+    await engine.setDocumentContext({ docDir: first });
+    assert.equal(engine.shipping.docDir, first);
+    assert.equal(engine.shipping.overlayDir, null, 'previous unsaved inputs must not leak');
+  } finally {
+    await engine.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('isolated exact chunks resolve project classes and prefer unsaved inputs', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-isolated-inputs-'));
+  const docDir = path.join(root, 'project');
+  const overlayDir = path.join(root, 'overlay');
+  for (const dir of [docDir, overlayDir]) mkdirSync(dir);
+  writeFileSync(path.join(docDir, 'tdomlocal.cls'), String.raw`\LoadClass{article}`);
+  writeFileSync(path.join(docDir, 'content.tex'), String.raw`\errmessage{Stale disk input}`);
+  writeFileSync(path.join(overlayDir, 'content.tex'), 'OverlayInputWitness');
+  const block = { id: 'local', text: String.raw`\input{content.tex}`, galley: {}, galleyHash: 'local-inputs' };
+  const engine = {
+    workDir: path.join(root, 'work'), docDir, overlayDir,
+    blocks: [block], counters: [], chunks: new Map(), isoChildren: new Set(),
+    rescueQueue: new Map(), canonical: { info: () => ({ inFlight: false }) },
+    labelTable: new Map(), hrefTable: new Map(), geometry: {}, file: 'main.tex',
+    store: { get: () => String.raw`\documentclass{tdomlocal}\begin{document}\input{content.tex}\end{document}` },
+  };
+  let repaginated = false;
+  try {
+    await renderIsolatedBlock(engine, {
+      block, idx: 0,
+      chunkTargets: () => [{ key: block.id, page: 1, w: 400, h: 30 }],
+      asyncRepaginate: () => { repaginated = true; },
+    });
+    const chunk = engine.chunks.get(block.id);
+    assert.ok(chunk?.editPdf, 'local class must produce an exact PDF');
+    assert.equal(repaginated, true);
+    const pdf = path.join(root, 'result.pdf');
+    writeFileSync(pdf, chunk.editPdf);
+    const result = await promisify(execFile)('pdftotext', [pdf, '-']);
+    assert.match(result.stdout, /OverlayInputWitness/, 'unsaved input must shadow disk');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a malformed fork PDF retries cold without adopting partial chunks', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-corrupt-fork-'));
+  let finished;
+  const peer = {
+    send(command) {
+      const jobdir = decodeURIComponent(command.trim().split(' ')[2]);
+      writeFileSync(path.join(jobdir, 'driver.pdf'), '%PDF-1.7\ninvalid objects\n%%EOF\n');
+      writeFileSync(path.join(jobdir, 'state.json'), JSON.stringify({ w: 100, h: 10, d: 0, items: [] }));
+      finished();
+    },
+    sendRaw() {},
+  };
+  const block = { id: 'corrupt', text: 'Text' };
+  const engine = {
+    file: 'main.tex', workDir: root, blocks: [block], counters: [],
+    checkpoints: new Map([[0, peer]]), isoForkBroken: new Set(), isoFailCache: new Map(),
+    labelTable: new Map(), geometry: {}, chunks: new Map(),
+    store: { get: () => String.raw`\documentclass{article}\begin{document}Text\end{document}` },
+  };
+  const coldResult = { chunks: ['verified cold result'] };
+  let retries = 0;
+  try {
+    const result = await isoCompile(engine, {
+      block, idx: 0, why: 'conversion regression', forceCold: false,
+      rescueCacheKey: () => 'corrupt-key', needsRescue: () => false,
+      awaitRender: () => new Promise(resolve => { finished = resolve; }),
+      isoCompileCold: async () => { retries++; return coldResult; },
+    });
+    assert.equal(result, coldResult);
+    assert.equal(retries, 1);
+    assert.equal(engine.isoForkBroken.has(block.id), true);
+    assert.equal(engine.chunks.size, 0);
+    assert.equal(engine.isoFailCache.size, 0, 'corrupt fork must not poison the cold retry');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('exact page-building aliases segment as one block and ambiguous aliases fail closed', () => {
   const direct = String.raw`\newcommand\OpenLedgerColumns{\begin{multicols}{2}}
@@ -1292,4 +1397,233 @@ After forced output.\par
   assert.match(text.replace(/\s/g, ''), /Beforeforcedoutput/);
   assert.match(text.replace(/\s/g, ''), /Afterforcedoutput/);
   assert.doesNotMatch(eng.rootLogRef?.() ?? '', /Output routine didn't use all of/);
+});
+
+test('decorated boxes retain private PDF resources across capture, resize, and sibling edits', opts, async () => {
+  await eng.close();
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-private-pdf-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  const source = String.raw`\documentclass{article}
+\usepackage[textheight=110pt]{geometry}
+\usepackage[most]{tcolorbox}
+\usepackage{hyperref}
+\begin{document}
+Before.
+
+\begin{tcolorbox}[enhanced,title=Notice,interior style={left color=white,right color=blue!30},underlay={\draw[red,line width=2pt] (frame.south west)--(frame.north east);}]
+ResourceWitness alpha.
+\end{tcolorbox}
+
+After.
+
+\begin{tcolorbox}[enhanced,interior style={left color=yellow,right color=red!50}]
+SiblingResource.
+\end{tcolorbox}
+\end{document}`;
+  const samples = [];
+  const pageCounts = [];
+  try {
+    await e.open(source);
+    await drain(e);
+    await e.renderTask;
+    const rootPdf = readFileSync(path.join(e.workDir, 'driver.pdf'));
+    for (const [from, to] of [
+      ['alpha.', 'alpha beta.'],
+      ['alpha beta.', 'alpha ' + 'wrap words '.repeat(40) + 'beta.'],
+      ['right color=blue!30', 'right color=green!30'],
+      ['alpha ' + 'wrap words '.repeat(40) + 'beta.', 'alpha.'],
+    ]) {
+      const at = e.getSource().indexOf(from);
+      assert.ok(at >= 0);
+      const beforeHits = e.renderStats.captureHits;
+      await e.edit(at, at + from.length, to);
+      await e.renderTask;
+      const block = e.blocks.find(b => b.text.includes('ResourceWitness'));
+      const chunk = e.chunks.get(block.id);
+      assert.equal(chunk?.forGalley, block.galleyHash, 'current graphics are available without canonical');
+      assert.ok(e.renderStats.captureHits > beforeHits, 'ships the freshly typeset node list ' + JSON.stringify({gfx:block.galley.gfx, closure:block.galley.closure, rescued:block.rescued, stats:e.renderStats, items:block.galley.items.map(i=>i.k)}));
+      assert.deepEqual(readFileSync(path.join(e.workDir, 'driver.pdf')), rootPdf, 'sibling output cannot mutate root resources');
+      const chunks = new Map();
+      await renderIsolatedBlock({ ...e, chunks, lastEditAt: 0,
+        rescueQueue: new Map(), canonical: { info: () => ({ inFlight: false }) },
+      }, { block, idx: e.blocks.indexOf(block),
+        chunkTargets: () => [{ key: block.id, page: 1, w: chunk.wBp, h: chunk.hBp }],
+        asyncRepaginate() {},
+      });
+      const cold = chunks.get(block.id);
+      assert.ok(cold?.editPdf, 'independent cold PDF exists');
+      const images = [];
+      for (const [label, bytes] of [['resident', chunk.editPdf], ['cold', cold.editPdf]]) {
+        const pdf = path.join(root, label + '.pdf');
+        const raster = path.join(root, label);
+        writeFileSync(pdf, bytes);
+        await promisify(execFile)('pdftoppm', ['-f', '1', '-singlefile', '-r', '72', pdf, raster]);
+        images.push(readFileSync(raster + '.ppm'));
+      }
+      assert.equal(createHash('sha256').update(images[0]).digest('hex'), createHash('sha256').update(images[1]).digest('hex'),
+        'capture pixels equal independent cold typesetting, including changed decoration');
+      samples.push(chunk.hBp);
+      pageCounts.push(e.pages.length);
+    }
+    assert.ok(samples[1] > samples[0], 'wrapping grows the real frame');
+    assert.equal(samples[3], samples[0], 'undo restores frame height');
+    assert.ok(pageCounts[1] > pageCounts[0], 'growth crosses a physical page boundary');
+    assert.equal(pageCounts[3], pageCounts[0], 'undo restores pagination');
+    assert.deepEqual(e.diagnostics, []);
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('exact box pages exclude lastskip primer material from RENDER and CAPTURE', opts, async () => {
+  await eng.close();
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-primer-crop-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage[most]{tcolorbox}
+\begin{document}
+Opening.\par\vskip12pt
+
+\begin{tcolorbox}
+PrimerWitness alpha.
+\end{tcolorbox}
+
+After.
+\end{document}`);
+    await drain(e);
+    for (let editIndex = 0; editIndex < 3; editIndex++) {
+      if (editIndex) {
+        const at = e.getSource().indexOf('alpha') + 5;
+        await e.edit(at, at, editIndex === 1 ? 'Z' : ' wrap words'.repeat(35));
+      }
+      await e.renderTask;
+      const block = e.blocks.find(b => b.text.includes('PrimerWitness'));
+      const idx = e.blocks.indexOf(block);
+      assert.ok(JSON.parse(e.blocks[idx - 1].stateVec).at(-1) > 0, 'nonzero previous skip exercises the primer');
+      const chunk = e.chunks.get(block.id);
+      assert.equal(chunk?.forGalley, block.galleyHash);
+      const pdf = path.join(root, 'chunk.pdf');
+      writeFileSync(pdf, chunk.editPdf);
+      const { stdout } = await promisify(execFile)('pdfinfo', [pdf]);
+      const size = stdout.match(/Page size:\s+([\d.]+) x ([\d.]+) pts/);
+      assert.ok(size, 'tight PDF dimensions available');
+      assert.ok(Math.abs(Number(size[2]) - chunk.hBp) < 0.02,
+        `PDF height ${size[2]} matches the display extent ${chunk.hBp}; no invisible primer is shipped`);
+      if (editIndex) assert.ok(e.renderStats.captureHits > 0);
+      const chunks = new Map();
+      await renderIsolatedBlock({ ...e, chunks, lastEditAt: 0,
+        rescueQueue: new Map(), canonical: { info: () => ({ inFlight: false }) },
+      }, { block, idx,
+        chunkTargets: () => [{ key: block.id, page: 1, w: chunk.wBp, h: chunk.hBp }],
+        asyncRepaginate() {},
+      });
+      const images = [];
+      for (const [label, bytes] of [['resident', chunk.editPdf], ['cold', chunks.get(block.id)?.editPdf]]) {
+        const pdfPath = path.join(root, label + '.pdf');
+        const raster = path.join(root, label);
+        writeFileSync(pdfPath, bytes);
+        await promisify(execFile)('pdftoppm', ['-f', '1', '-singlefile', '-r', '72', pdfPath, raster]);
+        images.push(readFileSync(raster + '.ppm'));
+      }
+      assert.deepEqual(images[0], images[1], 'resident and cold preserve the same frame, including after wrapping');
+    }
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('stable native prose paints before graphics verification and retains burst work', opts, async () => {
+  await eng.close();
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-plain-preview-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  const source = String.raw`\documentclass{article}
+\usepackage{fontspec}
+\usepackage{tcolorbox}
+\begin{document}
+Lead.
+
+PlainMarker abcd.
+
+\begin{tcolorbox}
+Next graphics witness.
+\end{tcolorbox}
+
+Tail.
+\end{document}`;
+  try {
+    await e.open(source);
+    await drain(e);
+    const original = e.blocks.find(b => b.text.includes('PlainMarker'));
+    const witness = plainPreviewWitness(original);
+    assert.ok(witness, JSON.stringify({ closure: original.closure, galley: original.galley, fidelity: original.fidelity }));
+    const admission = { blockId: original.id, witness };
+    for (const mutate of [
+      b => { b.galley.items.find(i => i.k === 'box').h += 1; },
+      b => { b.galley.state.extra = 1; },
+      b => { b.galley.items.push({ k: 'glue', a: 1 }); },
+      b => { b.galley.tdomSourceCatcodesSafe = false; },
+      b => { b.galley.events = [{ kind: 'write' }]; },
+      b => { b.closure.native = false; },
+    ]) {
+      const changed = structuredClone(original);
+      mutate(changed);
+      assert.equal(canDeferPlainVerification(admission, witness, changed), false);
+    }
+    for (const char of ['a', 'b', 'c']) {
+      const at = e.getSource().indexOf('abcd') + 4;
+      const report = await e.edit(at, at, char);
+      assert.equal(report.stats.blocksTypeset, 1, 'graphics neighbor is not on the response path: ' + JSON.stringify({ char,
+        before: witness, after: plainPreviewWitness(e.blocks.find(b => b.id === original.id)),
+        stats: report.stats }));
+      assert.equal(report.stats.chainVerdict, 'verify', 'preview does not claim suffix convergence');
+      assert.equal(e.pendingChain?.plainBlockId, original.id, 'every burst retains verification');
+    }
+    await drain(e);
+    assert.equal(e.pendingChain, null, 'verification actually finishes');
+    const at = e.getSource().indexOf('abcd') + 4;
+    const wrap = await e.edit(at, at, ' wrap words'.repeat(45));
+    assert.notEqual(wrap.stats.chainVerdict, 'verify', 'changed layout retains ordinary foreground verification');
+    await drain(e);
+    const finalSource = e.getSource();
+    const incremental = signature(e);
+    await e.close();
+    const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh') });
+    try {
+      await fresh.open(finalSource);
+      await drain(fresh);
+      assert.deepEqual(signature(fresh), incremental, 'deferred result equals a fresh engine');
+    } finally { await fresh.close(); }
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('active ordinary-looking source characters cannot grant a native plain preview', opts, async () => {
+  await eng.close();
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-active-source-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage{fontspec}
+\usepackage{tcolorbox}
+${'\\catcode`\\!=13 \\def!{X}'}
+\begin{document}
+ActiveMarker !abcd.
+
+\begin{tcolorbox}Next.\end{tcolorbox}
+\end{document}`);
+    await drain(e);
+    const block = e.blocks.find(b => b.text.includes('ActiveMarker'));
+    assert.equal(block.galley.tdomSourceCatcodesSafe, false);
+    const at = e.getSource().indexOf('abcd') + 4;
+    const report = await e.edit(at, at, 'e');
+    assert.notEqual(report.stats.chainVerdict, 'verify');
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

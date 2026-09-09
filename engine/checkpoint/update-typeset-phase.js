@@ -4,6 +4,7 @@ import { performance } from 'node:perf_hooks';
 import { hasDefinitionEdit } from './update-helpers.js';
 import { flushVanishedLabels, labelReferenceCandidates, pushLabelDependencies } from './reference-deps.js';
 import { push2, resolvedInGalley, vecLocalsEqual } from './util/galley.js';
+import { canDeferPlainVerification } from './plain-preview.js';
 
 export async function runUpdateTypesetPhase(engine, {
   oldBlocks,
@@ -12,6 +13,7 @@ export async function runUpdateTypesetPhase(engine, {
   firstDirty,
   timer,
   defRe,
+  plainPreviewAdmission = null,
   callbacks,
 }) {
   const {
@@ -68,6 +70,11 @@ export async function runUpdateTypesetPhase(engine, {
     engine.progress = { phase: 'typeset', at: i + 1, total: engine.blocks.length };
     const block = engine.blocks[i];
     const before = { hash: block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
+    // The edited source block carries the old galley but not its closure;
+    // that certificate was checked on oldBlocks before the walk.
+    const plainBefore = plainPreviewAdmission?.blockId === block.id &&
+      block.galley === plainPreviewAdmission.galley && block.stateVec === plainPreviewAdmission.stateVec
+      ? plainPreviewAdmission.witness : null;
     const t0 = performance.now();
     const galley = await typesetBlock(i);
     forkMs += performance.now() - t0;
@@ -96,6 +103,12 @@ export async function runUpdateTypesetPhase(engine, {
     // while a later source-dirty block is still waiting.
     if (i <= lastDirty) continue;
     if (!wasClean) {
+      if (!defEdit && changed && i > lastNoGalley && i < engine.blocks.length &&
+          dirtyBlocks.length === 1 && dirtyBlocks[0] === block.id && !changedLabels.size &&
+          canDeferPlainVerification(plainPreviewAdmission, plainBefore, block)) {
+        verdict = 'verify';
+        break;
+      }
       // an EDITED block that reproduced its galley AND exit state exactly
       // (stale-first rescue reuse, comment-only change) moved nothing:
       // converge without paying a verification job
@@ -137,7 +150,7 @@ export async function runUpdateTypesetPhase(engine, {
   const fgStop = i;
 
   // verdict dispatch: anything beyond the foreground bound is DEFERRED
-  if (verdict === 'counters' || verdict === 'leak') {
+  if (verdict === 'counters' || verdict === 'leak' || verdict === 'verify') {
     if (verdict === 'leak') {
       // the suffix lineage can no longer be trusted — kill it; the async
       // rebuild re-typesets serially from the stop point
@@ -153,6 +166,7 @@ export async function runUpdateTypesetPhase(engine, {
       }
     }
     queueChainWork(verdict === 'leak' ? 'rebuild' : 'settle', fgStop, changedLabels);
+    if (verdict === 'verify') engine.pendingChain.plainBlockId = plainPreviewAdmission.blockId;
   }
 
   flushVanishedLabels(engine.vanishedLabels, engine.labelCount, engine.labelTable, changedLabels);

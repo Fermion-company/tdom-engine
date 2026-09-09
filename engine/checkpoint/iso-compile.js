@@ -78,5 +78,13 @@ export async function isoCompile(
     entryOff,
     labelSnap,
     isoCompileCold,
+  }).catch((err) => {
+    // A fork can leave a PDF with an EOF marker but invalid shared-backend
+    // objects. Treat conversion rejection like its missing-artifact case;
+    // no chunks have been adopted until readIsoCompileResult returns.
+    if (!ck0 || err?.code !== 1 || !String(err?.cmd ?? '').startsWith('pdftocairo ')) throw err;
+    engine.isoForkBroken.add(block.id);
+    if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
+    return isoCompileCold();
   });
 }

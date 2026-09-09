@@ -94,9 +94,7 @@ export async function bootRoot(
   await Promise.all([ckptReady, geoReady]).catch((err) => {
     throw new Error(`preamble build failed — ${texErrorFrom(rootLog) || err.message}`);
   });
-  // hyperref (and friends) write PDF objects during \begin{document},
-  // which opens the shared output file at the root — checkpoint children
-  // can then no longer ship their own tight pages. Fall back to isolated
-  // per-block compiles for the exact-render tier in that case.
+  // Kept as diagnostic metadata: daemon forks now own private PDF bytes,
+  // so preamble-created objects no longer disable resident exact rendering.
   engine.pdfOpenedAtRoot = existsSync(path.join(engine.workDir, 'driver.pdf'));
 }

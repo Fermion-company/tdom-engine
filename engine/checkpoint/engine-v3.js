@@ -75,7 +75,7 @@ import { indexBlock, unindexBlock } from './block-index.js';
 import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
 import { brokenBlockGalley as brokenBlockGalleyHelper } from './broken-galley.js';
 import { sourceClosure } from './closure.js';
-import { mayCaptureDisplayMath, mayNeedRender, releaseRenderHold } from './render-hold.js';
+import { mayCaptureNativeBlock, mayNeedRender, releaseRenderHold } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
 import { preemptResidentRenders, queueRender as queueRenderHelper } from './render-pump.js';
@@ -122,6 +122,7 @@ import {
 } from './tex-templates.js';
 import { isoCompile as isoCompileHelper } from './iso-compile.js';
 import { buildJobBlockBody } from './job-body.js';
+import { classifyPlainPreviewEdit } from './plain-preview.js';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -186,6 +187,10 @@ export class CheckpointEngine {
     await this.bgTask.catch(() => {});
     return this.#locked(async () => {
       await this.canonical.resetDocument(nextDir, nextOverlay);
+      // The replacement shipping chain captures these input roots at
+      // construction, just like the canonical renderer above.
+      this.docDir = nextDir;
+      this.overlayDir = nextOverlay;
       clearTimeout(this.shipBootTimer);
       this.shipBootTimer = null;
       if (this.shipping) {
@@ -197,8 +202,6 @@ export class CheckpointEngine {
       }
       this.watchers.clear();
       this.includes.clear();
-      this.docDir = nextDir;
-      this.overlayDir = nextOverlay;
       this.preHash = null;
       this.preGate = null;
       this.opaqueStickyPre = null;
@@ -475,7 +478,7 @@ export class CheckpointEngine {
     ckptP.catch(() => {});
     this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1 };
     try {
-      // A display-math JOB already owns the exact TeX node list that the
+      // An exact-render JOB already owns the exact TeX node list that the
       // asynchronous preview needs.  Retain it in the post-block checkpoint
       // instead of asking a later RENDER child to typeset the same source a
       // second time.  Capture only hot/small-document work; a long cold boot
@@ -483,8 +486,7 @@ export class CheckpointEngine {
       // every checkpoint.
       const capture =
         !override &&
-        !this.pdfOpenedAtRoot &&
-        mayCaptureDisplayMath(block) &&
+        mayCaptureNativeBlock(block) &&
         (!!block.galley || this.blocks.length <= Number(process.env.TDOM_RENDER_HOT_MAX || 64))
           ? `c${++this.captureSeq}`
           : '-';
@@ -1026,6 +1028,9 @@ export class CheckpointEngine {
     });
     if (prepared.response) return prepared.response;
     const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
+    const plainPreviewAdmission = classifyPlainPreviewEdit(this, {
+      text, editContext, oldBlocks, dirtySource, rebooted,
+    });
     const residentAdmission = this.previewPolicy === 'shipping-exact'
       ? classifyResidentEdit(this, {
           text,
@@ -1074,6 +1079,7 @@ export class CheckpointEngine {
         firstDirty,
         timer: t,
         defRe: DEF_RE,
+        plainPreviewAdmission,
         callbacks: {
           nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
           typesetBlock: (idx) => this.#typesetBlock(idx),
@@ -1404,6 +1410,7 @@ export class CheckpointEngine {
       return;
     }
     cur.kind = cur.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle';
+    delete cur.plainBlockId;
     cur.from = Math.min(cur.from, from);
     cur.phase = 'blocks';
     for (const k of labels ?? []) cur.labels.add(k);

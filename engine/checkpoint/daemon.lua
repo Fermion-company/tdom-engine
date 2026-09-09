@@ -22,6 +22,7 @@
 -- and \shipout a real PDF page, so the chunk pixels are the PDF's pixels.
 
 local fk = nil
+local PDF_FD = -1
 local sock = nil
 local conn = nil
 local PORT = 0
@@ -174,6 +175,11 @@ function tdom_boot(port, workdir, counters)
   end
   fk = shim()
   fk.ignore_sigchld()
+  -- Establish one descriptor even when the preamble has not opened PDF yet.
+  -- Every descendant clones it together with its backend object state.
+  pdf.immediateobj('<<>>')
+  PDF_FD = fk.prepare_pdf(workdir .. '/driver.pdf')
+  assert(PDF_FD >= 0, 'cannot privatize resident PDF output')
   sock = require('socket')
   conn = assert(sock.connect('127.0.0.1', PORT))
   conn:setoption('tcp-nodelay', true)
@@ -1251,6 +1257,7 @@ function tdom_report()
     events = blk_events,
     closure = JOB.had_error and 'error' or 'native',
     closure_error = JOB.error,
+    tdomSourceCatcodesSafe = JOB.sourceCatcodesSafe == true,
     backend = resident_backend_profile(),
   })
   if head and not capture then node.flush_list(head) end
@@ -1301,7 +1308,10 @@ local function ship_node_list(head)
         FOOT_COPIES[#FOOT_COPIES + 1] = node.vpack(node.copy_list(content))
       end
       node.free(n)
-    elseif is_dummy(n) then
+    elseif is_dummy(n) or node.has_attribute(n, LASTSKIP_ATTR) ~= nil or
+        (n.id == GLUE and (n.subtype or 0) == 10) then
+      -- Match extract_items: primer and top-level topskip have no galley
+      -- extent, so shipping them would shift pixels outside the chunk clip.
       node.free(n)
     else
       if tail then
@@ -1402,7 +1412,7 @@ local function fork_for(id)
     conn:send('FORKFAIL ' .. id .. '\n')
     return nil
   end
-  local pid = fk.fork()
+  local pid = fk.fork_pdf(PDF_FD)
   if not pid or pid < 0 then
     texio.write_nl('term and log', 'TDOMFORKFAIL job=' .. tostring(id) .. ' ckpt=' .. tostring(CKPT))
     conn:send('FORKFAIL ' .. id .. '\n')
@@ -1545,6 +1555,7 @@ function tdom_wait()
         FLOAT_COPIES = {}
         FOOT_COPIES = {}
         reconnect('render', 0)
+        assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish resident PDF')
         lfs.chdir(jobdir)
         -- under LaTeX, raw callback.register is owned by luatexbase
         local notify = function()
@@ -1581,6 +1592,7 @@ function tdom_wait()
           FLOAT_COPIES = {}
           FOOT_COPIES = {}
           reconnect('render', 0)
+          assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish captured PDF')
           lfs.chdir(jobdir)
           local notify = function()
             pcall(function()
@@ -1625,20 +1637,9 @@ function tdom_wait()
         JOB = { id = id, ckpt = -1, body = body }
         RENDER_MODE = false
         reconnect('iso', 0)
-        local rootcwd = lfs.currentdir()
+        assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish isolated PDF')
         lfs.chdir(jobdir)
         local notify = function()
-          -- the PDF backend can resolve \jobname.pdf against the process's
-          -- ORIGINAL cwd (package code in the body may also wander it):
-          -- finish_pdffile fires while the file is still open, and a POSIX
-          -- rename keeps the remaining writes flowing into the moved inode
-          -- — so claim it into the jobdir deterministically, then notify
-          pcall(function()
-            if lfs.attributes(jobdir .. '/driver.pdf') == nil and
-               lfs.attributes(rootcwd .. '/driver.pdf') ~= nil then
-              os.rename(rootcwd .. '/driver.pdf', jobdir .. '/driver.pdf')
-            end
-          end)
           pcall(function()
             conn:send('DONE ' .. id .. '\n')
           end)
@@ -1677,10 +1678,30 @@ function inject_raw(body)
   tex.print(lines)
 end
 
+-- This certifies only input tokenization, never the complete TeX state.
+local function native_source_catcodes_safe(body)
+  local ok, safe = pcall(function()
+    if body == '' or tex.endlinechar ~= 13 or tex.getcatcode(13) ~= 5 then return false end
+    local special = { [92]=true, [36]=true, [37]=true, [123]=true, [125]=true,
+      [35]=true, [38]=true, [94]=true, [95]=true, [126]=true }
+    for _, cp in utf8.codes(body) do
+      if special[cp] then return false end
+      if cp ~= 10 then
+        if cp < 32 or cp == 127 then return false end
+        local cc = tex.getcatcode(cp)
+        if cc ~= 10 and cc ~= 11 and cc ~= 12 then return false end
+      end
+    end
+    return true
+  end)
+  return ok and safe == true
+end
+
 function inject_job(body, ship)
   -- Typeset ON the main vertical list — full state continuity with the
   -- previous blocks (prevdepth, \everypar, spacefactor, open counters...).
   -- The dormant page collects the nodes; tdom_report harvests them.
+  JOB.sourceCatcodesSafe = native_source_catcodes_safe(body)
   local lines = {}
   for l in (body .. '\n'):gmatch('(.-)\n') do
     lines[#lines + 1] = l

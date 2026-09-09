@@ -38,6 +38,57 @@ static int l_fork(lua_State *L) {
   return 1;
 }
 
+/* Each resident continuation owns its PDF bytes as well as the backend's
+ * in-memory object table. Anonymous files are reclaimed with the process;
+ * checkpoint retirement needs no path bookkeeping. */
+static int copy_pdf_fd(int source, int output) {
+  char buffer[65536];
+  off_t at = 0;
+  for (;;) {
+    ssize_t n = pread(source, buffer, sizeof(buffer), at);
+    if (n == 0) break;
+    if (n < 0) { if (errno == EINTR) continue; return 0; }
+    ssize_t written = 0;
+    while (written < n) {
+      ssize_t k = write(output, buffer + written, (size_t)(n - written));
+      if (k < 0 && errno == EINTR) continue;
+      if (k <= 0) return 0;
+      written += k;
+    }
+    at += n;
+  }
+  off_t offset = lseek(source, 0, SEEK_CUR);
+  return offset >= 0 && lseek(output, offset, SEEK_SET) >= 0;
+}
+
+static int l_fork_pdf(lua_State *L) {
+  int fd = (int)lua_tointegerx(L, 1, NULL);
+  if (fflush(NULL) != 0) { lua_pushinteger(L, -1); return 1; }
+  /* Prepare before fork: a failed copy is an ordinary FORKFAIL, and the
+   * parent never receives a child that still shares writable PDF state. */
+  FILE *private_file = tmpfile();
+  if (!private_file || !copy_pdf_fd(fd, fileno(private_file))) {
+    if (private_file) fclose(private_file);
+    lua_pushinteger(L, -1);
+    return 1;
+  }
+  pid_t pid = fork();
+  if (pid == 0 && dup2(fileno(private_file), fd) < 0) _exit(125);
+  fclose(private_file);
+  lua_pushinteger(L, (lua_Integer)pid);
+  return 1;
+}
+
+static int l_publish_pdf(lua_State *L) {
+  int fd = (int)lua_tointegerx(L, 1, NULL);
+  const char *target = lua_tolstring(L, 2, NULL);
+  int output = target ? open(target, O_RDWR | O_CREAT | O_TRUNC, 0600) : -1;
+  int ok = output >= 0 && fflush(NULL) == 0 && copy_pdf_fd(fd, output) && dup2(output, fd) >= 0;
+  if (output >= 0) close(output);
+  lua_pushboolean(L, ok);
+  return 1;
+}
+
 static int l_getpid(lua_State *L) {
   lua_pushinteger(L, (lua_Integer)getpid());
   return 1;
@@ -94,6 +145,17 @@ static int find_writable_fd(const char *source) {
     if (flags != -1 && (flags & O_ACCMODE) != O_RDONLY) return fd;
   }
   return -1;
+}
+
+static int l_prepare_pdf(lua_State *L) {
+  const char *source = lua_tolstring(L, 1, NULL);
+  int fd = source ? find_writable_fd(source) : -1;
+  int readable = source && fflush(NULL) == 0 ? open(source, O_RDWR) : -1;
+  off_t offset = fd >= 0 ? lseek(fd, 0, SEEK_CUR) : -1;
+  int ok = readable >= 0 && offset >= 0 && lseek(readable, offset, SEEK_SET) >= 0 && dup2(readable, fd) >= 0;
+  if (readable >= 0) close(readable);
+  lua_pushinteger(L, ok ? fd : -1);
+  return 1;
 }
 
 static int find_readable_fd(const char *source) {
@@ -246,6 +308,12 @@ int luaopen_tdomfork(lua_State *L) {
   lua_setfield(L, -2, "clone_open_fd");
   lua_pushcclosure(L, l_copy_open_fd, 0);
   lua_setfield(L, -2, "copy_open_fd");
+  lua_pushcclosure(L, l_prepare_pdf, 0);
+  lua_setfield(L, -2, "prepare_pdf");
+  lua_pushcclosure(L, l_fork_pdf, 0);
+  lua_setfield(L, -2, "fork_pdf");
+  lua_pushcclosure(L, l_publish_pdf, 0);
+  lua_setfield(L, -2, "publish_pdf");
   lua_pushcclosure(L, l_redirect_open_fd, 0);
   lua_setfield(L, -2, "redirect_open_fd");
   lua_pushcclosure(L, l_prepare_read_fd, 0);

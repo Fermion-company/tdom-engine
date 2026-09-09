@@ -4,9 +4,14 @@ import { instrumentEditRegions } from '../edit-regions.js';
 export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, applyFidelity }) {
   const reusedStaleGalley = !!galley.tdomStale;
   block.galley = galley;
-  block.galleyHash = fnv1a(
-    JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events])
-  );
+  const identity = [galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events];
+  // PDF literals/resources are not glyph runs: changing only a gradient or
+  // underlay must invalidate its exact chunk even when every box is identical.
+  if (galley.gfx) {
+    if (!reusedStaleGalley) galley.tdomPaintSourceHash = block.hash;
+    identity.push(galley.tdomPaintSourceHash);
+  }
+  block.galleyHash = fnv1a(JSON.stringify(identity));
   if (galley.tdomIsoChunks) {
     // Isolated rescue bypasses buildJobBlockBody, which normally records
     // editable source spans. Its real PDF still contains editable prose

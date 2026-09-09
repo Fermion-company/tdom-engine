@@ -2,6 +2,7 @@ import { mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { waitForPdf } from './util/fs.js';
 import { cropRenderTargets } from './render-chunks.js';
+import { buildLastskipPrimer } from './job-body.js';
 
 async function runShipCommand(engine, {
   block,
@@ -52,13 +53,15 @@ export async function renderResidentBlock(
     mkdirSync(jobdir, { recursive: true });
     const pdf = path.join(jobdir, 'driver.pdf');
     rmSync(pdf, { force: true });
-    const body = Buffer.from(block.text, 'utf8');
+    const body = Buffer.from(buildLastskipPrimer(block, idx, engine.blocks) + block.text, 'utf8');
     engine.renderStats ??= { captureHits: 0, captureMisses: 0, retypesets: 0 };
 
     let shippedCapture = false;
     const captureToken = block.galley?.capture;
     const captureCk = captureToken ? engine.checkpoints.get(idx + 1) : null;
-    if (captureToken && captureCk) {
+    if (captureToken && captureCk && targets.length === 1 &&
+        !block.galley?.floats?.length &&
+        !block.galley?.items?.some(item => item.k === 'ins' || item.k === 'eject')) {
       try {
         const requestId = `rr@${++engine.renderSeq}`;
         await runShipCommand(engine, {
