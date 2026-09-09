@@ -21,4 +21,9 @@ jobs:
         env:
           TDOM_MAX_CHECKPOINTS: ${{ matrix.budget }}
           TDOM_DEBUG_BLOCKS: 1
-        run: node tools/verify-layout.mjs corpus/11-simple-live-preview.tex --verbose
+        run: |
+          failed=0
+          for trial in 1 2 3 4 5 6 7 8; do
+            node tools/verify-layout.mjs corpus/11-simple-live-preview.tex --verbose || failed=1
+          done
+          exit "$failed"
