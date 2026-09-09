@@ -288,7 +288,7 @@ export function buildDriverSource({
   // detach and re-seed that ordinary box register without recovery errors.
   L.push('\\newbox\\TDOMabsorbbox');
   L.push('\\directlua{TDOM_ABSORBBOX=\\number\\TDOMabsorbbox}');
-  L.push('\\output={\\global\\setbox\\TDOMabsorbbox=\\box255\\directlua{tdom_absorb_output(TDOM_ABSORBBOX)}}');
+  L.push('\\output={\\global\\setbox\\TDOMabsorbbox=\\box255\\relax\\directlua{tdom_absorb_output(TDOM_ABSORBBOX)}}');
   // a real box first: flips the page builder's internal page_contents
   // flag to box_there (unreachable from Lua); tdom_seed then swaps the
   // list for the marker dummy
@@ -485,17 +485,17 @@ export function buildIsoCompileSource({
       'm.data = "tdom:tl:" .. (tdom_iso.ntl - 1) ' +
       'node.write(m) end) ' +
       'end ' +
-      'function tdom_iso_absorb() ' +
+      'function tdom_iso_absorb(boxnum) ' +
       'tdom_iso.fires = tdom_iso.fires + 1 ' +
       // runaway page builder (splitting env making no progress — usually a
       // bogus page context): material is DISCARDED, so the harvest must
       // not be trusted — count it and let the node side fail the compile
-      'if tdom_iso.fires > 50 then tdom_iso.discarded = (tdom_iso.discarded or 0) + 1 tex.box[255] = nil return end ' +
+      'if tdom_iso.fires > 50 then tdom_iso.discarded = (tdom_iso.discarded or 0) + 1 tex.box[boxnum] = nil return end ' +
       'tex.deadcycles = 0 ' +
       'if tdom_iso.ships == 0 then tdom_iso.preabsorbs = (tdom_iso.preabsorbs or 0) + 1 end ' +
-      'local b = tex.box[255] ' +
+      'local b = tex.box[boxnum] ' +
       'local list = nil ' +
-      'if b then list = b.list b.list = nil tex.box[255] = nil end ' +
+      'if b then list = b.list b.list = nil tex.box[boxnum] = nil end ' +
       'if list then ' +
       // an absorbed fire IS a real page break: leave an eject marker at
       // the boundary so the harvested stream carries the break position
@@ -511,7 +511,13 @@ export function buildIsoCompileSource({
   );
   L.push('\\holdinginserts=1');
   L.push('\\maxdeadcycles=200');
-  if (!realOutput) L.push('\\output={\\directlua{tdom_iso_absorb()}}');
+  if (!realOutput) {
+    // TeX must consume its output box before Lua takes ownership of the
+    // nodes; assigning tex.box[255] bypasses that output-routine invariant.
+    L.push('\\newbox\\TDOMisoabsorbbox');
+    L.push('\\output={\\global\\setbox\\TDOMisoabsorbbox=\\box255\\relax' +
+      '\\directlua{tdom_iso_absorb(\\number\\TDOMisoabsorbbox)}}');
+  }
   // material taller than the page inside an output-hijack env (multicols'
   // own routine) ships REAL pages — count them so the harvest knows the
   // pre-body machinery (and the isostart marker) left with page 1
@@ -564,8 +570,12 @@ export function buildIsoCompileSource({
     '\\directlua{' +
       "tdom_iso_counter('tdom@pd', math.floor(tex.nest[0].prevdepth or 0)) " +
       'tex.triggerbuildpage() ' +
-      'local head = tex.lists.page_head ' +
+      'local head = tex.lists.page_head local contrib = tex.lists.contrib_head ' +
       'tex.lists.page_head = nil tex.lists.contrib_head = nil ' +
+      // A forced break returns its box to contributions; TeX need not have
+      // moved that list back to the page before this harvest runs.
+      'if head and contrib then local tail = node.tail(head) tail.next = contrib contrib.prev = tail end ' +
+      'head = head or contrib ' +
       'local INS = node.id("ins") local WH = node.id("whatsit") ' +
       'local HL = node.id("hlist") local VL = node.id("vlist") ' +
       'local GL = node.id("glue") local KE = node.id("kern") ' +
