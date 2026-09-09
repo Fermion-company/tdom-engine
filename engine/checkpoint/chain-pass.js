@@ -66,6 +66,7 @@ export async function runChainPass(engine, callbacks) {
         }
         const changed = block.galleyHash !== before.hash || block.stateVec !== before.state;
         if (changed) {
+          delete work.plainBlockId;
           if (block.needsRender) queueRender(block.id);
           if (++sinceRepaint >= 8) {
             asyncRepaginate();

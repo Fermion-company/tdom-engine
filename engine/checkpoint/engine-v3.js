@@ -122,6 +122,7 @@ import {
 } from './tex-templates.js';
 import { isoCompile as isoCompileHelper } from './iso-compile.js';
 import { buildJobBlockBody } from './job-body.js';
+import { classifyPlainPreviewEdit } from './plain-preview.js';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1027,6 +1028,9 @@ export class CheckpointEngine {
     });
     if (prepared.response) return prepared.response;
     const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
+    const plainPreviewAdmission = classifyPlainPreviewEdit(this, {
+      text, editContext, oldBlocks, dirtySource, rebooted,
+    });
     const residentAdmission = this.previewPolicy === 'shipping-exact'
       ? classifyResidentEdit(this, {
           text,
@@ -1075,6 +1079,7 @@ export class CheckpointEngine {
         firstDirty,
         timer: t,
         defRe: DEF_RE,
+        plainPreviewAdmission,
         callbacks: {
           nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
           typesetBlock: (idx) => this.#typesetBlock(idx),
@@ -1405,6 +1410,7 @@ export class CheckpointEngine {
       return;
     }
     cur.kind = cur.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle';
+    delete cur.plainBlockId;
     cur.from = Math.min(cur.from, from);
     cur.phase = 'blocks';
     for (const k of labels ?? []) cur.labels.add(k);

@@ -28,6 +28,7 @@ import { isoCompile } from '../engine/checkpoint/iso-compile.js';
 import { segmentBody } from '../engine/segmenter.js';
 import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finalize.js';
 import { classifyResidentEdit } from '../engine/checkpoint/resident-edit-admission.js';
+import { plainPreviewWitness, canDeferPlainVerification } from '../engine/checkpoint/plain-preview.js';
 import {
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
@@ -1528,6 +1529,99 @@ After.
       }
       assert.deepEqual(images[0], images[1], 'resident and cold preserve the same frame, including after wrapping');
     }
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('stable native prose paints before graphics verification and retains burst work', opts, async () => {
+  await eng.close();
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-plain-preview-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  const source = String.raw`\documentclass{article}
+\usepackage{fontspec}
+\usepackage{tcolorbox}
+\begin{document}
+Lead.
+
+PlainMarker abcd.
+
+\begin{tcolorbox}
+Next graphics witness.
+\end{tcolorbox}
+
+Tail.
+\end{document}`;
+  try {
+    await e.open(source);
+    await drain(e);
+    const original = e.blocks.find(b => b.text.includes('PlainMarker'));
+    const witness = plainPreviewWitness(original);
+    assert.ok(witness, JSON.stringify({ closure: original.closure, galley: original.galley, fidelity: original.fidelity }));
+    const admission = { blockId: original.id, witness };
+    for (const mutate of [
+      b => { b.galley.items.find(i => i.k === 'box').h += 1; },
+      b => { b.galley.state.extra = 1; },
+      b => { b.galley.items.push({ k: 'glue', a: 1 }); },
+      b => { b.galley.tdomSourceCatcodesSafe = false; },
+      b => { b.galley.events = [{ kind: 'write' }]; },
+      b => { b.closure.native = false; },
+    ]) {
+      const changed = structuredClone(original);
+      mutate(changed);
+      assert.equal(canDeferPlainVerification(admission, witness, changed), false);
+    }
+    for (const char of ['a', 'b', 'c']) {
+      const at = e.getSource().indexOf('abcd') + 4;
+      const report = await e.edit(at, at, char);
+      assert.equal(report.stats.blocksTypeset, 1, 'graphics neighbor is not on the response path: ' + JSON.stringify({ char,
+        before: witness, after: plainPreviewWitness(e.blocks.find(b => b.id === original.id)),
+        stats: report.stats }));
+      assert.equal(report.stats.chainVerdict, 'verify', 'preview does not claim suffix convergence');
+      assert.equal(e.pendingChain?.plainBlockId, original.id, 'every burst retains verification');
+    }
+    await drain(e);
+    assert.equal(e.pendingChain, null, 'verification actually finishes');
+    const at = e.getSource().indexOf('abcd') + 4;
+    const wrap = await e.edit(at, at, ' wrap words'.repeat(45));
+    assert.notEqual(wrap.stats.chainVerdict, 'verify', 'changed layout retains ordinary foreground verification');
+    await drain(e);
+    const finalSource = e.getSource();
+    const incremental = signature(e);
+    await e.close();
+    const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh') });
+    try {
+      await fresh.open(finalSource);
+      await drain(fresh);
+      assert.deepEqual(signature(fresh), incremental, 'deferred result equals a fresh engine');
+    } finally { await fresh.close(); }
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('active ordinary-looking source characters cannot grant a native plain preview', opts, async () => {
+  await eng.close();
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-active-source-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage{fontspec}
+\usepackage{tcolorbox}
+${'\\catcode`\\!=13 \\def!{X}'}
+\begin{document}
+ActiveMarker !abcd.
+
+\begin{tcolorbox}Next.\end{tcolorbox}
+\end{document}`);
+    await drain(e);
+    const block = e.blocks.find(b => b.text.includes('ActiveMarker'));
+    assert.equal(block.galley.tdomSourceCatcodesSafe, false);
+    const at = e.getSource().indexOf('abcd') + 4;
+    const report = await e.edit(at, at, 'e');
+    assert.notEqual(report.stats.chainVerdict, 'verify');
   } finally {
     await e.close();
     rmSync(root, { recursive: true, force: true });

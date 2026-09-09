@@ -15,6 +15,13 @@
 
 ## 10.2 safety と boot
 
+structured 文書の plain 本文が exact graphics の直前にある場合、単一段落の編集で
+native closure・投入時 catcode・glyph fidelity を確認し、縦組版の全 item 寸法と報告済み
+exit state が一致すれば、本文の更新を返してから隣接 graphics を settle pass で確認する。
+応答の chainVerdict は `verify` であり、収束済みとは宣言しない。TeX hook の未報告状態が
+あり得るため確認自体は省略しない。同じ段落への連続入力は未完了の確認を引き継ぎ、
+裏処理で差分が見つかった場合や別の chain work が合流した場合は通常の保守的経路へ戻る。
+
 `#updateInner()` は最初に document bounds と preamble hash を取り、`classifyDocument()` を呼ぶ。
 
 - safety gate が unsafe なら `#opaqueUpdate()` へ行く。

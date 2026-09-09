@@ -1257,6 +1257,7 @@ function tdom_report()
     events = blk_events,
     closure = JOB.had_error and 'error' or 'native',
     closure_error = JOB.error,
+    tdomSourceCatcodesSafe = JOB.sourceCatcodesSafe == true,
     backend = resident_backend_profile(),
   })
   if head and not capture then node.flush_list(head) end
@@ -1677,10 +1678,30 @@ function inject_raw(body)
   tex.print(lines)
 end
 
+-- This certifies only input tokenization, never the complete TeX state.
+local function native_source_catcodes_safe(body)
+  local ok, safe = pcall(function()
+    if body == '' or tex.endlinechar ~= 13 or tex.getcatcode(13) ~= 5 then return false end
+    local special = { [92]=true, [36]=true, [37]=true, [123]=true, [125]=true,
+      [35]=true, [38]=true, [94]=true, [95]=true, [126]=true }
+    for _, cp in utf8.codes(body) do
+      if special[cp] then return false end
+      if cp ~= 10 then
+        if cp < 32 or cp == 127 then return false end
+        local cc = tex.getcatcode(cp)
+        if cc ~= 10 and cc ~= 11 and cc ~= 12 then return false end
+      end
+    end
+    return true
+  end)
+  return ok and safe == true
+end
+
 function inject_job(body, ship)
   -- Typeset ON the main vertical list — full state continuity with the
   -- previous blocks (prevdepth, \everypar, spacefactor, open counters...).
   -- The dormant page collects the nodes; tdom_report harvests them.
+  JOB.sourceCatcodesSafe = native_source_catcodes_safe(body)
   local lines = {}
   for l in (body .. '\n'):gmatch('(.-)\n') do
     lines[#lines + 1] = l
