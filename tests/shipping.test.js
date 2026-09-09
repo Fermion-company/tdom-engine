@@ -30,6 +30,7 @@ const opts = available ? {} : { skip: 'lualatex not installed' };
 
 const source = readFileSync(DOC, 'utf8');
 const privatePdf = process.env.TDOM_SHIP_PRIVATE_PDF !== '0';
+const previousWaveCutoff = process.env.TDOM_SHIP_WAVE_CUTOFF;
 
 async function coldCompile(src, dir) {
   rmSync(dir, { recursive: true, force: true });
@@ -80,6 +81,9 @@ let truth0;
 let baselineOutcomes = [];
 before(async () => {
   if (!available) return;
+  if (process.env.TDOM_TEST_WAVE_CUTOFF) {
+    process.env.TDOM_SHIP_WAVE_CUTOFF = process.env.TDOM_TEST_WAVE_CUTOFF;
+  }
   rmSync(WORK, { recursive: true, force: true });
   mkdirSync(WORK, { recursive: true });
   truth0 = await coldCompile(source, path.join(WORK, 'truth0'));
@@ -90,6 +94,8 @@ before(async () => {
 });
 after(async () => {
   if (chain) await chain.close();
+  if (previousWaveCutoff === undefined) delete process.env.TDOM_SHIP_WAVE_CUTOFF;
+  else process.env.TDOM_SHIP_WAVE_CUTOFF = previousWaveCutoff;
 });
 
 test('slice 1: every page ships as a real PDF identical to a cold compile', opts, async () => {
