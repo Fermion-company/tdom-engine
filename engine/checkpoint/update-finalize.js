@@ -10,6 +10,7 @@ export function finalizeUpdate(engine, {
   typesetResult,
   rebooted,
   diagnostics,
+  residentEditCandidate = false,
   timer,
   callbacks,
 }) {
@@ -82,6 +83,7 @@ export function finalizeUpdate(engine, {
     fonts: engine.getFontManifest(),
     diagnostics,
     engineDiagnostics: engine.diagnostics,
+    residentEditCandidate,
   });
 }
 

@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import path from 'node:path';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 import { buildDisplayList } from '../engine/checkpoint/display-list.js';
 import { buildStream } from '../engine/checkpoint/stream.js';
@@ -23,14 +24,19 @@ import { classifyStructuralAliases } from '../engine/checkpoint/structural-alias
 import { ShippingChain } from '../engine/checkpoint/shipping.js';
 import { segmentBody } from '../engine/segmenter.js';
 import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finalize.js';
+import { classifyResidentEdit } from '../engine/checkpoint/resident-edit-admission.js';
 import {
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
 } from '../engine/checkpoint/canonical-anchor.js';
 
-const WORK = fileURLToPath(new URL('../.tdom-hotpath-test', import.meta.url));
-const WORK2 = fileURLToPath(new URL('../.tdom-hotpath-test-scratch', import.meta.url));
-const WORK3 = fileURLToPath(new URL('../.tdom-hotpath-test-mixed-shipping', import.meta.url));
+const TEST_WORK_ROOT = process.env.TDOM_TEST_WORK_ROOT;
+const workDir = (name) => TEST_WORK_ROOT
+  ? path.join(TEST_WORK_ROOT, name)
+  : fileURLToPath(new URL(`../${name}`, import.meta.url));
+const WORK = workDir('.tdom-hotpath-test');
+const WORK2 = workDir('.tdom-hotpath-test-scratch');
+const WORK3 = workDir('.tdom-hotpath-test-mixed-shipping');
 
 const available = await promisify(execFile)('lualatex', ['--version'], { timeout: 15_000 }).then(
   () => true,
@@ -172,10 +178,62 @@ test('shipping-exact edits publish source immediately without resident page patc
   ]);
 });
 
+test('shipping-exact foreground admission is limited to independent plain paragraphs', () => {
+  const oldBlock = {
+    id: 'b1', start: 20, end: 55, text: 'ordinary prose here\ncontinued prose',
+    galley: { items: [] }, fidelity: { level: 'safe-glyph' },
+    structuralSinks: [],
+  };
+  const block = { ...oldBlock, end: 56, text: 'ordinary prose! here\ncontinued prose' };
+  const before = `${'x'.repeat(20)}${oldBlock.text}`;
+  const after = `${'x'.repeat(20)}${block.text}`;
+  const context = {
+    file: 'main.tex', start: 34, end: 34, replacement: '!',
+    before, after, baseSrcRev: 7,
+  };
+  const engine = {
+    file: 'main.tex', srcRev: 7, blocks: [block], pendingChain: null,
+  };
+  assert.deepEqual(classifyResidentEdit(engine, {
+    text: after,
+    editContext: context,
+    oldBlocks: [oldBlock],
+    dirtySource: new Set(['b1']),
+    rebooted: false,
+  }), { kind: 'probe', blockId: 'b1' });
+
+  const atomicOld = {
+    ...oldBlock,
+    text: '\\begin{multicols}{2}\nordinary prose here\n\\end{multicols}',
+    end: 20 + '\\begin{multicols}{2}\nordinary prose here\n\\end{multicols}'.length,
+  };
+  const atomicBlock = { ...atomicOld, text: atomicOld.text.replace('prose', 'prose!'), end: atomicOld.end + 1 };
+  const atomicBefore = `${'x'.repeat(20)}${atomicOld.text}`;
+  const atomicAfter = `${'x'.repeat(20)}${atomicBlock.text}`;
+  assert.deepEqual(classifyResidentEdit({ ...engine, blocks: [atomicBlock] }, {
+    text: atomicAfter,
+    editContext: {
+      ...context,
+      start: atomicBefore.indexOf('prose') + 5,
+      end: atomicBefore.indexOf('prose') + 5,
+      before: atomicBefore,
+      after: atomicAfter,
+    },
+    oldBlocks: [atomicOld],
+    dirtySource: new Set(['b1']),
+    rebooted: false,
+  }), { kind: 'exact-only', reason: 'atomic-layout-region' });
+});
+
 test('mixed heavy document resumes exact waves from visible edits in rich TeX contexts', opts, async () => {
   const sourcePath = fileURLToPath(
     new URL('../corpus/14-mixed-heavy-columns.tex', import.meta.url)
   );
+  const previousWaveCutoff = process.env.TDOM_SHIP_WAVE_CUTOFF;
+  const waveCutoffMs = Number(
+    process.env.TDOM_TEST_WAVE_CUTOFF ?? previousWaveCutoff ?? 700
+  );
+  process.env.TDOM_SHIP_WAVE_CUTOFF = String(waveCutoffMs);
   rmSync(WORK3, { recursive: true, force: true });
   const chain = new ShippingChain({ workDir: WORK3, docDir: fileURLToPath(new URL('../corpus', import.meta.url)) });
   const waves = [];
@@ -244,8 +302,8 @@ test('mixed heavy document resumes exact waves from visible edits in rich TeX co
         source = next;
         continue;
       }
-      assert.ok(wave, `${label}: exact wave missed the production cutoff (${JSON.stringify(chain.info())})`);
-      assert.ok(wave.elapsedMs < 700, `${label}: exact wave took ${wave.elapsedMs}ms`);
+      assert.ok(wave, `${label}: exact wave missed the configured cutoff (${JSON.stringify(chain.info())})`);
+      assert.ok(wave.elapsedMs < waveCutoffMs, `${label}: exact wave took ${wave.elapsedMs}ms`);
       const pdf = chain.info().completePdf;
       assert.ok(pdf, `${label}: complete PDF published`);
       const { stdout } = await promisify(execFile)('pdftotext', [pdf, '-'], { timeout: 30_000 });
@@ -309,6 +367,8 @@ test('mixed heavy document resumes exact waves from visible edits in rich TeX co
       assert.equal(chain.source, source, `${label}: certified source remains untouched`);
     }
   } finally {
+    if (previousWaveCutoff === undefined) delete process.env.TDOM_SHIP_WAVE_CUTOFF;
+    else process.env.TDOM_SHIP_WAVE_CUTOFF = previousWaveCutoff;
     await chain.close();
     for (const dir of [WORK3, `${WORK3}-truth`, `${WORK3}-ship-raster`, `${WORK3}-truth-raster`]) {
       rmSync(dir, { recursive: true, force: true });
@@ -885,6 +945,13 @@ test('steady-state keystrokes stay fork-once (edit-locus pin)', opts, async () =
 });
 
 test('a tail edit right after a mid edit is NOT charged the distance', opts, async () => {
+  if (process.env.TDOM_EXPECT_MAX_CHECKPOINTS !== undefined) {
+    assert.equal(
+      eng.maxCheckpoints,
+      Number(process.env.TDOM_EXPECT_MAX_CHECKPOINTS),
+      'the bounded regression must exercise its declared checkpoint budget'
+    );
+  }
   const src = eng.getSource();
   const mid = src.indexOf('MIDWORD');
   assert.ok(mid >= 0);
