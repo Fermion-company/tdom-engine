@@ -158,6 +158,7 @@ hot path の最後に `#shipUpdate(source)`、`canonical.schedule(source, srcRev
 - pending chain があれば idle 後に chain pass を走らせる。
 - dirty block 数が `TDOM_RENDER_HOT_MAX` 以下なら、needsRender な hot block を resident exact-render queue に積む。display math と native closure 済みの graphics（float/insert/eject を含まないもの）は foreground JOB の node list を post-block checkpoint に世代付きで保持し、queue 側は CAPTURE を先に試す。これにより block source の二重組版を避ける。保持 list が退役・世代不一致なら、pre-block checkpoint の従来 RENDER へ自動 fallback する。
 - resident の PDF descriptor は boot で読み書き可能にし、各 JOB/CAPTURE/RENDER/ISO fork の直前に現在の bytes と位置を匿名ファイルへ複製する。子だけが複製先を継続し、出力時に専用 job directory へ移す。TikZ/hyperref が先に PDF object を作っていても cold compile は不要。装飾は過去画像を再利用せず、その編集で組版した node list を ship する。graphics の chunk identity には source hash も含め、寸法を変えない色・underlay 編集でも再描画する。エラーで凍結した galley は以前の paint identity を維持する。
+- exact chunk の ship は、galley 抽出と同じく前ブロックの lastskip primer と最上位 topskip を除く。RENDER と isolated fallback も前ブロックの lastskip を復元してから組版するため、余白の max-merge と SVG の原点・高さが foreground JOB に一致する。
 - 通常編集の foreground で変わった bounded hot 集合には現在の `srcRev` を付け、後着の cold queue より先に、最終編集から `TDOM_RENDER_QUIET_MS`（既定120ms）後に処理する。編集中の block だけでなく、同じ紙面の一括表示に必要な隣接 block も含める。boot/reboot・過去世代・deferred chain は、有効な shipping baseline がある場合の優先時間（既定900ms）を維持し、現世代 hot への後着 background enqueue は優先度を落とさない。
 - 新しい編集は、前の edit/boot が残した resident render 子プロセスを preempt し、未着手 queue は保持する。旧世代の優先印は失効し、同時実行数（既定2）と checkpoint の上限は変えない。render fork は foreground JOB と衝突しない固有 request id で追跡する。
 

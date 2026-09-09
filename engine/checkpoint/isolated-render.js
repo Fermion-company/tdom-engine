@@ -7,6 +7,7 @@ import { withProjectInputs } from '../project-inputs.js';
 import { waitForPdf } from './util/fs.js';
 import { cropRenderTargets } from './render-chunks.js';
 import { buildIsolatedRenderSource } from './isolated-render-source.js';
+import { trailingGlueSpec } from './util/galley.js';
 
 const execFileP = promisify(execFile);
 
@@ -102,6 +103,7 @@ export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, as
       entry,
       prevPd,
       prevNobreak,
+      prevLastskip: trailingGlueSpec(idx > 0 ? engine.blocks[idx - 1].galley : null, prevVec.at(-1) ?? 0),
       blockText: block.text,
     });
     const jobdir = path.join(engine.workDir, `render-${block.id}-${forGalley}`);

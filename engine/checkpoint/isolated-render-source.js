@@ -1,4 +1,4 @@
-import { labelDefBody, startsVertical } from './util/tex.js';
+import { labelDefBody, startsAddvspace, startsVertical } from './util/tex.js';
 
 export function buildIsolatedRenderSource({
   preamble,
@@ -8,6 +8,7 @@ export function buildIsolatedRenderSource({
   entry,
   prevPd,
   prevNobreak,
+  prevLastskip,
   blockText,
 }) {
   const L = [];
@@ -88,6 +89,14 @@ export function buildIsolatedRenderSource({
   L.push('\\hbox to0pt{}');
   L.push('\\special{tdom:isostart}');
   L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(prevPd)}}`);
+  // The primer participates in addvspace merging but has no chunk extent.
+  if (prevLastskip?.widthSp && startsAddvspace(blockText)) {
+    const g = prevLastskip;
+    L.push(`\\directlua{local g=node.new('glue') g.width=${g.widthSp} ` +
+      `g.stretch=${g.stretchSp} g.shrink=${g.shrinkSp} ` +
+      `g.stretch_order=${g.stretchOrder} g.shrink_order=${g.shrinkOrder} ` +
+      'node.set_attribute(g,8124,1) node.write(g)}');
+  }
   // see #isoCompile: vertical-env blocks keep the @nobreak flag instead
   // of \noindent, so their own before-skip glue survives
   if (prevNobreak) L.push(startsVertical(blockText) ? '\\makeatletter\\@nobreaktrue\\makeatother' : '\\noindent');
@@ -108,10 +117,11 @@ export function buildIsolatedRenderSource({
       'if ismark then break end end ' +
       'local out, tail = nil, nil local n = head ' +
       'while n do local nxt = n.next n.next = nil n.prev = nil ' +
+      'if node.has_attribute(n,8124) or (n.id == node.id("glue") and n.subtype == 10) then node.free(n) ' +
       // footnote bodies ship as their own pages after the floats (kept
       // even when empty so page indices stay aligned with the galley's
       // ins items)
-      'if n.id == INS then local c = n.head or n.list ' +
+      'elseif n.id == INS then local c = n.head or n.list ' +
       'local b if c then b = node.vpack(node.copy_list(c)) else b = node.new("hlist") end ' +
       'tdom_iso_nfeet = tdom_iso_nfeet + 1 tdom_iso_feet[tdom_iso_nfeet] = b ' +
       'node.free(n) else if tail then tail.next = n n.prev = tail else out = n end tail = n end n = nxt end ' +

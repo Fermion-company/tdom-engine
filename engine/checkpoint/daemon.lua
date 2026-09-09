@@ -1307,7 +1307,10 @@ local function ship_node_list(head)
         FOOT_COPIES[#FOOT_COPIES + 1] = node.vpack(node.copy_list(content))
       end
       node.free(n)
-    elseif is_dummy(n) then
+    elseif is_dummy(n) or node.has_attribute(n, LASTSKIP_ATTR) ~= nil or
+        (n.id == GLUE and (n.subtype or 0) == 10) then
+      -- Match extract_items: primer and top-level topskip have no galley
+      -- extent, so shipping them would shift pixels outside the chunk clip.
       node.free(n)
     else
       if tail then

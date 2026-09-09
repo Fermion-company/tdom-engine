@@ -1474,3 +1474,62 @@ SiblingResource.
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('exact box pages exclude lastskip primer material from RENDER and CAPTURE', opts, async () => {
+  await eng.close();
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-primer-crop-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage[most]{tcolorbox}
+\begin{document}
+Opening.\par\vskip12pt
+
+\begin{tcolorbox}
+PrimerWitness alpha.
+\end{tcolorbox}
+
+After.
+\end{document}`);
+    await drain(e);
+    for (let editIndex = 0; editIndex < 3; editIndex++) {
+      if (editIndex) {
+        const at = e.getSource().indexOf('alpha') + 5;
+        await e.edit(at, at, editIndex === 1 ? 'Z' : ' wrap words'.repeat(35));
+      }
+      await e.renderTask;
+      const block = e.blocks.find(b => b.text.includes('PrimerWitness'));
+      const idx = e.blocks.indexOf(block);
+      assert.ok(JSON.parse(e.blocks[idx - 1].stateVec).at(-1) > 0, 'nonzero previous skip exercises the primer');
+      const chunk = e.chunks.get(block.id);
+      assert.equal(chunk?.forGalley, block.galleyHash);
+      const pdf = path.join(root, 'chunk.pdf');
+      writeFileSync(pdf, chunk.editPdf);
+      const { stdout } = await promisify(execFile)('pdfinfo', [pdf]);
+      const size = stdout.match(/Page size:\s+([\d.]+) x ([\d.]+) pts/);
+      assert.ok(size, 'tight PDF dimensions available');
+      assert.ok(Math.abs(Number(size[2]) - chunk.hBp) < 0.02,
+        `PDF height ${size[2]} matches the display extent ${chunk.hBp}; no invisible primer is shipped`);
+      if (editIndex) assert.ok(e.renderStats.captureHits > 0);
+      const chunks = new Map();
+      await renderIsolatedBlock({ ...e, chunks, lastEditAt: 0,
+        rescueQueue: new Map(), canonical: { info: () => ({ inFlight: false }) },
+      }, { block, idx,
+        chunkTargets: () => [{ key: block.id, page: 1, w: chunk.wBp, h: chunk.hBp }],
+        asyncRepaginate() {},
+      });
+      const images = [];
+      for (const [label, bytes] of [['resident', chunk.editPdf], ['cold', chunks.get(block.id)?.editPdf]]) {
+        const pdfPath = path.join(root, label + '.pdf');
+        const raster = path.join(root, label);
+        writeFileSync(pdfPath, bytes);
+        await promisify(execFile)('pdftoppm', ['-f', '1', '-singlefile', '-r', '72', pdfPath, raster]);
+        images.push(readFileSync(raster + '.ppm'));
+      }
+      assert.deepEqual(images[0], images[1], 'resident and cold preserve the same frame, including after wrapping');
+    }
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

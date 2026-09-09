@@ -2,6 +2,16 @@ import { labelDefBody, startsAddvspace } from './util/tex.js';
 import { trailingGlueSpec } from './util/galley.js';
 import { instrumentEditRegions } from '../edit-regions.js';
 
+export function buildLastskipPrimer(block, idx, blocks) {
+  if (idx <= 0 || !startsAddvspace(block.text)) return '';
+  const pv = JSON.parse(blocks[idx - 1].stateVec ?? '[]');
+  const ls = pv.at(-1) ?? 0;
+  if (!ls) return '';
+  const g = trailingGlueSpec(blocks[idx - 1].galley, ls);
+  return `\\directlua{tdom_prime_lastskip(${g.widthSp},${g.stretchSp},${g.shrinkSp},` +
+    `${g.stretchOrder},${g.shrinkOrder})}`;
+}
+
 export function buildJobBlockBody({
   block,
   idx,
@@ -68,17 +78,7 @@ export function buildJobBlockBody({
     // (sectioning, list/box environment, \vspace…) that MERGES against
     // \lastskip. A plain paragraph keeps \lastskip untouched and adds its own
     // material, so a primer there would just sit as extra height.
-    let primer = '';
-    if (idx > 0 && startsAddvspace(block.text)) {
-      const pv = JSON.parse(blocks[idx - 1].stateVec ?? '[]');
-      const ls = pv.length ? pv[pv.length - 1] : 0;
-      if (ls) {
-        const g = trailingGlueSpec(blocks[idx - 1].galley, ls);
-        primer =
-          `\\directlua{tdom_prime_lastskip(${g.widthSp},${g.stretchSp},${g.shrinkSp},` +
-          `${g.stretchOrder},${g.shrinkOrder})}`;
-      }
-    }
+    const primer = buildLastskipPrimer(block, idx, blocks);
     const volatilePre = ck.vstale && idx > 0 ? volatilePrelude(idx) : '';
     const prelude =
       volatilePre + (defs.length ? `\\makeatletter ${defs.join(' ')}\\makeatother\n` : '') + primer;
