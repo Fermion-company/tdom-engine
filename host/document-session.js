@@ -233,7 +233,7 @@ export class DocumentSession {
     if (!Number.isFinite(offset)) return { ok: false, error: 'focus requires a finite offset' };
     const response = await this.request(`${url}/warm`, {
       method: 'POST',
-      body: { offset },
+      body: { offset, ...(typeof payload.filePath === 'string' ? { filePath: payload.filePath } : {}) },
       timeoutMs: 2_000,
     });
     return { ok: true, ...response };

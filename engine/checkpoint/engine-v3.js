@@ -236,14 +236,19 @@ export class CheckpointEngine {
    * its promise to tests, while the app deliberately schedules it fire-and-
    * forget during cursor idle time.
    */
-  async warmEditOffset(offset) {
-    const numericOffset = Math.max(0, Math.min(this.getSource().length, Math.floor(Number(offset))));
+  async warmEditOffset(offset, file = this.file) {
+    const sourceFile = path.resolve(this.docDir, file);
+    const rootFile = path.resolve(this.docDir, this.file);
+    const source = sourceFile === rootFile ? this.getSource() : this.includes.get(sourceFile)?.text;
+    if (typeof source !== 'string') return { status: 'rejected', reason: 'unknown-source' };
+    const numericOffset = Math.max(0, Math.min(source.length, Math.floor(Number(offset))));
     if (!Number.isFinite(numericOffset) || !this.blocks.length || this.closed) {
       return { status: 'rejected', reason: 'invalid-offset' };
     }
     const request = ++this.warmSeq;
     const sourceRev = this.srcRev;
     const target = this.blocks.findIndex((block, index) => {
+      if (path.resolve(this.docDir, block.file ?? this.file) !== sourceFile) return false;
       const start = Number(block.start);
       const end = Number(block.end);
       if (Number.isFinite(start) && Number.isFinite(end) && numericOffset >= start && numericOffset <= end) {
@@ -253,7 +258,7 @@ export class CheckpointEngine {
     });
     if (target < 0) return { status: 'rejected', reason: 'outside-body' };
 
-    this.warmInfo = { status: 'scheduled', sourceRev, target, offset: numericOffset };
+    this.warmInfo = { status: 'scheduled', sourceRev, target, offset: numericOffset, file: sourceFile };
     // Cursor movement outranks background rescue/settle work, but never an
     // edit. Reuse the established abort path so a deep LuaTeX-ja job cannot
     // hold the foreground lock until its timeout.
@@ -269,7 +274,7 @@ export class CheckpointEngine {
       if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev) {
         return { status: 'superseded', sourceRev, target };
       }
-      this.warmInfo = { status: 'running', sourceRev, target, offset: numericOffset };
+      this.warmInfo = { status: 'running', sourceRev, target, offset: numericOffset, file: sourceFile };
       // Pin before walking: #jobBlock retires off-grid parents as soon as a
       // successor exists, so a late pin would lose the exact boundary we are
       // warming for the first keystroke.

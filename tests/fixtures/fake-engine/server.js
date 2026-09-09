@@ -26,7 +26,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'POST' && req.url === '/warm') {
     const body = JSON.parse((await readBody(req)) || '{}');
-    warms.push({ offset: Number(body.offset) });
+    warms.push({ offset: Number(body.offset), ...(typeof body.filePath === 'string' ? { filePath: body.filePath } : {}) });
     return res.end(JSON.stringify({ scheduled: true }));
   }
   if (req.method === 'POST' && req.url === '/open') {

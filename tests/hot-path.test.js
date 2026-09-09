@@ -1672,6 +1672,14 @@ RootWitnessA.
 \newpage AnswerWitness.
 \end{document}`);
     await exact('RootWitnessA', 3);
+    const childBlock = e.blocks.findIndex(block => block.file === child);
+    assert.ok(childBlock > 0);
+    const childWarm = await e.warmEditOffset(3, child);
+    assert.equal(childWarm.target, childBlock, 'child offsets must never warm a root block');
+    assert.equal(childWarm.status, 'ready');
+    const rootWarm = await e.warmEditOffset(e.getSource().indexOf('RootWitnessA'));
+    assert.equal(e.blocks[rootWarm.target].file ?? e.file, e.file);
+    assert.equal((await e.warmEditOffset(3, path.join(root, 'missing.tex'))).reason, 'unknown-source');
     const rootEdit = await replace('RootWitnessA', 'RootWitnessB');
     assert.notEqual(rootEdit.stats.chainVerdict, 'closure-deferred');
     await exact('RootWitnessB', 3);
