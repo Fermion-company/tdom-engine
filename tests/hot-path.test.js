@@ -945,6 +945,13 @@ test('steady-state keystrokes stay fork-once (edit-locus pin)', opts, async () =
 });
 
 test('a tail edit right after a mid edit is NOT charged the distance', opts, async () => {
+  if (process.env.TDOM_EXPECT_MAX_CHECKPOINTS !== undefined) {
+    assert.equal(
+      eng.maxCheckpoints,
+      Number(process.env.TDOM_EXPECT_MAX_CHECKPOINTS),
+      'the bounded regression must exercise its declared checkpoint budget'
+    );
+  }
   const src = eng.getSource();
   const mid = src.indexOf('MIDWORD');
   assert.ok(mid >= 0);

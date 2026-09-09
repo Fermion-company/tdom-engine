@@ -43,6 +43,14 @@ jobs:
           # this budget lets the same exact-output assertions complete here.
           TDOM_TEST_WAVE_CUTOFF: 3000
 
+      - name: Bounded checkpoint regression
+        run: node --test tests/checkpoint-selection.test.js tests/hot-path.test.js
+        env:
+          TDOM_MAX_CHECKPOINTS: 8
+          TDOM_EXPECT_MAX_CHECKPOINTS: 8
+          TDOM_TEST_WORK_ROOT: /tmp/tdom-engine-tests-bounded
+          TDOM_TEST_WAVE_CUTOFF: 3000
+
       - name: Farm (pseudo == real referee)
         run: npm run farm
 
