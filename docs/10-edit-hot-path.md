@@ -101,6 +101,8 @@ body は `segmentBody()` と `#expandIncludes()` で block 列になる。`diffB
 
 foreground は nearest checkpoint から始まる。各 block について `#typesetBlock()` を呼び、`#adoptGalley()` で galley、font、label/ref、state を採用する。
 
+同じ cold prefix walk が作った一時 continuation は、前回の native 成功証明があり、deferred・frozen・rescue 状態でない block に限って `STEP` で直接消費する。`STEP` 中に今回初めて native error や timeout が起きた場合、失敗した continuation は捨て、通常予算で残る最寄りの正しい checkpoint から通常 `JOB` でその input を一度だけ復元する。その後に last-good exit state を入れる既存 fallback を行うため、壊れた TeX 状態を後続 block の入口として採用しない。
+
 停止判定は次を見る。
 
 | 判定 | 意味 |

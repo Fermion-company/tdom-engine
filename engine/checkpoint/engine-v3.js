@@ -510,6 +510,7 @@ export class CheckpointEngine {
     galleyP.catch(() => {});
     ckptP.catch(() => {});
     this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1 };
+    let advance = false;
     try {
       // An exact-render JOB already owns the exact TeX node list that the
       // asynchronous preview needs.  Retain it in the post-block checkpoint
@@ -527,7 +528,7 @@ export class CheckpointEngine {
       const interactive = !override && !!block.galley &&
         (this.updating && !this.bgActive || this.warming);
       const previous = this.blocks[idx - 1];
-      const advance = !!replayToken && ck.replayToken === replayToken && !override &&
+      advance = !!replayToken && ck.replayToken === replayToken && !override &&
         !this.#checkpointKeepSet().has(idx) && !this.editHold.includes(idx) && !this.renderHold.has(idx) &&
         !this.renderWant.has(previous?.id) &&
         !this.rendering?.has(previous?.id + ':' + previous?.galleyHash);
@@ -597,6 +598,13 @@ export class CheckpointEngine {
         // (or was swallowed): infrastructure, not this block's content
         if (err.tdomTimeout && !(pid && pid > 0)) err.tdomNoChild = true;
       }
+      // STEP consumes its input process in place.  If this particular run
+      // failed, the normal content-failure ladder may still need that exact
+      // boundary for an @state continuation.  Mark only this consumptive
+      // failure; #typesetBlock rebuilds the input from an older live TeX
+      // checkpoint before attempting any fallback and never trusts the
+      // failed continuation as an input state.
+      if (advance) err.tdomConsumedReplayInput = idx;
       this._reject(galleyKey, err);
       this._reject(ckptKey, err);
       throw err;
@@ -610,13 +618,23 @@ export class CheckpointEngine {
     const block = this.blocks[idx];
     const started = performance.now();
     block.typesetCleanupMs = 0;
+    // typeset-dispatch replaces block.closure with the new lexical result
+    // before running the native job.  Capture the previous native proof now:
+    // a deferred/frozen/rescued block can need its input again for the state
+    // fallback, so its continuation must be forked rather than consumed.
+    const priorNativeSuccess = block.closure?.closed === true && block.closure?.native === true;
+    const replayMayConsume = !!replayToken && priorNativeSuccess && !!block.galley &&
+      !block.rescued && !this.poisoned.has(block.id) &&
+      !block.galley.tdomDeferred && !block.galley.tdomFrozen &&
+      !block.galley.tdomPendingPaint && !block.galley.tdomStale;
     try {
       return await typesetBlockHelper(this, idx, {
         needsRescue: (text, structuralSinks) => this.#needsRescue(text, structuralSinks),
         rescueBlock: (blockIdx, why) => this.#rescueBlock(blockIdx, why),
         brokenBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx),
         deferredBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx, false, true),
-        jobBlock: (blockIdx) => this.#jobBlock(blockIdx, null, replayToken),
+        jobBlock: (blockIdx) => this.#jobBlock(blockIdx, null, replayMayConsume ? replayToken : null),
+        restoreReplayInput: (blockIdx, failure) => this.#restoreReplayInput(blockIdx, failure),
         rescueCacheKey: (targetBlock, blockIdx) => this.#rescueCacheKey(targetBlock, blockIdx),
         pumpRescues: () => this.#pumpRescues(),
         sourceClosure,
@@ -627,6 +645,61 @@ export class CheckpointEngine {
       // must not make the scheduler forget the expensive cold replay that a
       // distant edit would pay again after checkpoint retirement.
       this.#recordTypesetCost(block, performance.now() - started - block.typesetCleanupMs);
+    }
+  }
+
+  /** Recreate the input boundary consumed by one failed STEP.  A live
+   * checkpoint at or before idx is a real TeX snapshot from the current
+   * source generation.  Replaying forward with ordinary JOB forks restores
+   * the same contract the failure fallback had before STEP existed. */
+  async #restoreReplayInput(idx, failure) {
+    if (failure?.tdomConsumedReplayInput !== idx || this.checkpoints.has(idx)) return;
+    if (failure.tdomReplayRecoveryAttempted) {
+      throw new Error(`replay input recovery repeated at ${idx}`);
+    }
+    failure.tdomReplayRecoveryAttempted = true;
+    const from = this.#nearestCheckpoint(idx);
+    if (!this.checkpoints.has(from)) {
+      throw new Error(`no recovery checkpoint at or before ${idx}`);
+    }
+    for (let j = from; j < idx; j++) {
+      const block = this.blocks[j];
+      if (!block.galley || block.galleyHash == null || block.stateVec == null) {
+        throw new Error(`replay input recovery lacks a prior witness at ${j}`);
+      }
+      const before = {
+        hash: block.galleyHash,
+        state: block.stateVec,
+        metadata: JSON.stringify({
+          labels: block.galley.labels ?? [],
+          refs: block.galley.refs ?? [],
+          toclines: block.galley.toclines ?? [],
+        }),
+      };
+      // No replay token here: recovery must retain every current input until
+      // its successor exists, including inputs needed by native-error,
+      // isolated-rescue, and broken-galley state continuations.
+      const galley = await this.#typesetBlock(j, null);
+      this.#adoptGalley(block, galley);
+      const metadata = JSON.stringify({
+        labels: galley.labels ?? [],
+        refs: galley.refs ?? [],
+        toclines: galley.toclines ?? [],
+      });
+      if (block.galleyHash !== before.hash || block.stateVec !== before.state || metadata !== before.metadata) {
+        // Recovery is only valid for an invariant prefix. A changed galley,
+        // exit vector, or dependency witness belongs to the ordinary update
+        // accounting; restart through the existing full-rebuild safety net
+        // rather than silently adopting it inside this local repair.
+        throw new Error(`replay input recovery diverged at ${j} for ${block.id}`);
+      }
+      for (const label of galley.labels ?? []) {
+        this.labelTable.set(label.k, label.v);
+        if (label.h != null) this.hrefTable.set(label.k, label.h);
+      }
+    }
+    if (!this.checkpoints.has(idx)) {
+      throw new Error(`failed to restore checkpoint ${idx}`);
     }
   }
 

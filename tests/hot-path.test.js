@@ -2222,3 +2222,94 @@ TARGET${index} uses \VisibleWord. Ordinary text continues with the inherited def
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a failed prefix STEP restores its input and a known native hold is replayed by JOB', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-prefix-step-recovery-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.maxCheckpoints = Math.min(e.maxCheckpoints, 4);
+  e.canonical.schedule = () => {};
+  const source = String.raw`\documentclass{article}
+\newcommand{\VisibleWord}{seed}
+\begin{document}
+` + Array.from({ length: 90 }, (_, index) => String.raw`
+RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition.
+
+`).join('') + '\\end{document}';
+  let injectedId = null;
+  let pendingStep = null;
+  let injectStepFailure = true;
+  const commands = [];
+  const wrapped = new WeakSet();
+  const wrapPeer = (peer) => {
+    if (wrapped.has(peer)) return;
+    wrapped.add(peer);
+    const send = peer.send.bind(peer);
+    peer.send = message => {
+      const header = /^(JOB|STEP)\s+(\S+)/.exec(message);
+      if (header) {
+        commands.push({ command: header[1], id: header[2] });
+        if (injectStepFailure && header[1] === 'STEP') pendingStep = header[2];
+      }
+      return send(message);
+    };
+  };
+  try {
+    await e.open(source);
+    await drain(e);
+    for (const peer of e.peers) wrapPeer(peer);
+    const onMessage = e._onMessage.bind(e);
+    e._onMessage = (peer, message) => {
+      wrapPeer(peer);
+      if (injectStepFailure && message.kind === 'GALLEY' && message.id === pendingStep) {
+        injectedId = message.id;
+        injectStepFailure = false;
+        pendingStep = null;
+        message = {
+          ...message,
+          json: { ...message.json, closure: 'error', closure_error: 'injected STEP native error' },
+        };
+      }
+      return onMessage(peer, message);
+    };
+    const candidates = e.blocks.map((block, index) => {
+      const marker = /RECOVERY\d+/.exec(block.text)?.[0];
+      const prefix = Math.max(...[...e.checkpoints.keys()].filter(boundary => boundary <= index));
+      return { index, marker, distance: index - prefix };
+    }).filter(item => item.marker && item.distance >= 8).sort((a, b) => b.distance - a.distance);
+    assert.ok(candidates.length > 0, 'the edit has a consumptive prefix continuation');
+    const target = candidates[0];
+    const at = e.getSource().indexOf(target.marker) + target.marker.length;
+    const first = await e.edit(at, at, 'x');
+    assert.ok(injectedId, 'one previously certified STEP was made to fail');
+    assert.equal(first.stats.rebooted, false, 'the consumed input is restored without a root reboot');
+    assert.equal(first.stats.diagnostics.some(line => line.includes('typeset phase failed')), false);
+    const held = e.blocks.find(block => block.id === injectedId);
+    assert.equal(held.closure?.reason, 'native-error');
+    assert.equal(held.galley?.tdomDeferred, true, 'the failed continuation itself was not adopted');
+
+    const heldIndex = e.blocks.indexOf(held);
+    const crossing = e.blocks.map((block, index) => {
+      const marker = /RECOVERY\d+/.exec(block.text)?.[0];
+      const prefix = Math.max(...[...e.checkpoints.keys()].filter(boundary => boundary <= index));
+      return { index, marker, prefix };
+    }).find(item => item.marker && item.prefix < heldIndex && item.index > heldIndex + 1);
+    assert.ok(crossing, 'a later warm walk crosses the held block from an older checkpoint');
+    commands.length = 0;
+    await e.warmEditOffset(e.getSource().indexOf(crossing.marker));
+    const heldCommands = commands.filter(item => item.id === injectedId).map(item => item.command);
+    assert.ok(heldCommands.includes('JOB'), 'the known native hold retains its recovery input');
+    assert.equal(heldCommands.includes('STEP'), false, 'the known native hold is never consumed in place');
+    assert.equal(held.closure?.native, true, 'the valid block heals through real LuaLaTeX');
+    assert.equal(held.galley?.tdomDeferred, undefined);
+
+    const tailAt = e.getSource().indexOf(target.marker) + target.marker.length + 1;
+    const second = await e.edit(tailAt, tailAt, 'y');
+    assert.equal(second.stats.rebooted, false, 'normal editing continues after local recovery');
+    assert.equal(second.stats.diagnostics.some(line => line.includes('typeset phase failed')), false);
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

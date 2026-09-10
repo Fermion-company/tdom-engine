@@ -43,7 +43,7 @@ Node.js engine
 
 checkpoint は「ある block 境界まで処理済みの TeX プロセス」である。OS の copy-on-write `fork()` が TeX 状態の snapshot になるため、マクロ、catcode、counter、font、box register などを JavaScript 側で保存・復元しない。
 
-cold prefix の walk は、直前に自身が作った未保持の continuation に限り `STEP` で進める。ブロックごとの native 組版、galley/state 検証は従来と同じで、既存の保存状態・編集中の input・描画中の所有者では必ず fork する。保存対象の境界では直前の JOB node list も保持し、未変更の exact neighbor を再組版せず描画できる。
+cold prefix の walk は、直前に自身が作った未保持の continuation に限り `STEP` で進める。さらに、その block が直前の実行で native 成功済みで、deferred・frozen・rescue 中ではないことを必要とする。今回の `STEP` が新たに失敗した場合は、失敗後の TeX 状態を採用せず、残っている最寄りの祖先 checkpoint から通常の `JOB` だけで入力境界を一度再構築してから既存の state fallback を行う。ブロックごとの native 組版、galley/state 検証は従来と同じで、既存の保存状態・編集中の input・描画中の所有者では必ず fork する。保存対象の境界では直前の JOB node list も保持し、未変更の exact neighbor を再組版せず描画できる。
 
 checkpoint の配置は、回収処理を除いた再組版時間で選ぶ。平均的な block に保存枠を集中させず、中央値の8倍かつ全体の再実行費用に対して十分重い block だけ両側を優先し、残りを費用の分位点へ配置する。末尾用の枠は終端の空白・改ページ処理より前、近い明示改ページがある場合は最後の本文ページの冒頭に置く。未測定 block には測定済み中央値を使い、boot の測定進行に応じて配置を更新する。新しい保存先がまだ存在しない間は、近い既存 checkpoint を枠内で残す。各 JOB の完了時に、次の処理に必要な continuation を残して保持数を整理する。
 
