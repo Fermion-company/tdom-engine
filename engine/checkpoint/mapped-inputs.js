@@ -18,7 +18,7 @@ export function expandInputParagraphs(segs, context) {
     pieces.push({ text, file, start, source, at: length });
     length += text.length;
   };
-  const expand = (source, file, start, end, depth, structuralEvents = []) => {
+  const expand = (source, file, start, end, depth, structuralEvents = [], inheritedRootUnit = null) => {
     const local = segmentBody(source.slice(start, end), start, { structuralEvents });
     let cursor = start;
     const literal = stop => {
@@ -30,7 +30,8 @@ export function expandInputParagraphs(segs, context) {
       }
       cursor = stop;
     };
-    for (const seg of local) {
+    for (let segmentIndex = 0; segmentIndex < local.length; segmentIndex++) {
+      const seg = local[segmentIndex];
       const match = seg.text.match(/^\s*\\input\s*\{([^}]+)\}\s*$/);
       if (!match || depth >= 4) continue;
       const resolved = resolveProjectInput(match[1], {
@@ -47,8 +48,18 @@ export function expandInputParagraphs(segs, context) {
         context.includes.set(resolved.actualPath, { mtime: stat.mtimeMs, readPath: resolved.readPath, text });
         context.watchInclude(resolved.readPath);
       } catch { continue; }
+      const rootUnit = depth === 0 ? segmentIndex + 1 : inheritedRootUnit;
+      context.includeTrace?.push({
+        actualPath: resolved.actualPath,
+        readPath: resolved.readPath,
+        command: 'input',
+        raw: match[1],
+        depth,
+        parentFile: file,
+        rootUnit,
+      });
       literal(seg.start);
-      expand(text, resolved.actualPath, 0, text.length, depth + 1);
+      expand(text, resolved.actualPath, 0, text.length, depth + 1, [], rootUnit);
       // EOF supplies an endline even when the file has no final newline.
       // Consume the input command's own endline with a comment: inserting
       // an empty physical line here would manufacture a \par at every EOF.

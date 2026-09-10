@@ -23,6 +23,7 @@ import { classifyDocument } from '../engine/checkpoint/safety.js';
 import { sourceClosure } from '../engine/checkpoint/closure.js';
 import { classifyStructuralAliases } from '../engine/checkpoint/structural-aliases.js';
 import { ShippingChain } from '../engine/checkpoint/shipping.js';
+import { makeShippingChain, shippingInputState } from '../engine/checkpoint/shipping-manager.js';
 import { renderIsolatedBlock } from '../engine/checkpoint/isolated-render.js';
 import { isoCompile } from '../engine/checkpoint/iso-compile.js';
 import { segmentBody } from '../engine/segmenter.js';
@@ -75,6 +76,205 @@ test('shipping checkpoints stay bounded across long documents and resident budge
     assert.deepEqual([...chain.checkpoints.keys()], [0]);
     assert.equal(chain.info().checkpointLimit, 1);
     assert.equal(chain.info().checkpointCount, 1);
+  } finally {
+    await chain.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('shipping treats one known literal child edit as a real immutable replay unit', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-shipping-child-input-'));
+  const docDir = path.join(root, 'project');
+  const overlayDir = path.join(root, 'overlay');
+  const workDir = path.join(root, 'ship');
+  const child = path.join(docDir, 'content', 'child.tex');
+  const overlayChild = path.join(overlayDir, 'content', 'child.tex');
+  mkdirSync(path.dirname(child), { recursive: true });
+  mkdirSync(path.dirname(overlayChild), { recursive: true });
+  mkdirSync(workDir, { recursive: true });
+  writeFileSync(child, 'disk fallback\n');
+  const source = String.raw`\documentclass{article}
+\begin{document}
+prefix\newpage
+
+\input{content/child.tex}
+
+tail
+\end{document}
+`;
+  const unitsOf = (text) => {
+    const begin = text.indexOf('\\begin{document}') + '\\begin{document}'.length;
+    const end = text.indexOf('\\end{document}', begin);
+    const body = text.slice(begin, end);
+    const segments = segmentBody(body, 0);
+    const units = segments.map((segment, index) =>
+      body.slice(index === 0 ? 0 : segment.start, segments[index + 1]?.start ?? body.length));
+    units.push('\\end{document}');
+    return units;
+  };
+  const targetUnit = unitsOf(source).findIndex((unit) => unit.includes('\\input{content/child.tex}')) + 1;
+  assert.ok(targetUnit > 1);
+  let revision = 1;
+  let currentChild = '観測値はAです。\n';
+  const engine = {
+    workDir,
+    docDir,
+    overlayDir,
+    file: 'main.tex',
+    preHash: 'pre',
+    srcRev: revision,
+    shipSessionId: 'child-session',
+    shipDocumentEpoch: 1,
+    shipDesiredCanonicalId: 1,
+    shipDesiredCanonicalHash: 'canon',
+    includes: new Map(),
+    shippingIncludeTrace: [],
+    store: { get: () => source },
+  };
+  const state = (value, changes = null, { command = 'input', sourceText = source } = {}) => {
+    currentChild = value;
+    writeFileSync(overlayChild, value);
+    engine.srcRev = revision++;
+    engine.store = { get: () => sourceText };
+    engine.includes.set(child, { mtime: engine.srcRev, readPath: overlayChild, text: value });
+    const rootUnit = unitsOf(sourceText).findIndex((unit) =>
+      unit.includes(`\\${command}{content/child.tex}`)) + 1;
+    engine.shippingIncludeTrace = [{
+      actualPath: child,
+      readPath: overlayChild,
+      command,
+      raw: 'content/child.tex',
+      depth: 0,
+      parentFile: path.join(docDir, 'main.tex'),
+      rootUnit,
+    }];
+    return shippingInputState(engine, changes);
+  };
+  const unreachable = path.join(docDir, 'content', 'no-longer-read.tex');
+  writeFileSync(unreachable, 'current disk bytes\n');
+  engine.includes.set(unreachable, {
+    mtime: 1,
+    readPath: unreachable,
+    text: 'stale cached bytes\n',
+  });
+  const stateA = state(currentChild);
+  assert.equal(stateA.dependencies.some((entry) => entry.actualPath === unreachable), false,
+    'a no-longer-reached include cache entry is outside the input snapshot');
+  assert.equal(stateA.mirrorEntries.some((entry) => entry.projectPath === 'content/no-longer-read.tex'), false,
+    'stale cached bytes cannot shadow the current disk fallback');
+  const chain = new ShippingChain({ workDir, docDir, overlayDir });
+  const sent = new Map();
+  const peer = (page) => ({ alive: true, pid: 0, gen: 0, send: (message) => {
+    if (!sent.has(page)) sent.set(page, []);
+    sent.get(page).push(message);
+  } });
+  chain.source = source;
+  chain.lines = unitsOf(source);
+  chain.inputState = stateA;
+  chain.acceptedSnapshotId = stateA.identity.snapshotId;
+  chain.baselinePages = 8;
+  chain.baselineManifest = {};
+  chain.checkpoints.set(0, peer(0));
+  chain.checkpoints.set(4, peer(4));
+  chain.checkpoints.set(5, peer(5));
+  chain.ships = [
+    { page: 4, nline: targetUnit - 1, gen: 0 },
+    { page: 5, nline: targetUnit, gen: 0 },
+  ];
+  try {
+    const stateB = state('観測値はBです。\n', { changed: [child], removed: [] });
+    const b = chain.resume(source, stateB);
+    assert.deepEqual(b, { mode: 'resumed', fromPage: 5, firstChanged: targetUnit });
+    assert.deepEqual(sent.get(5), ['DIE\n'], 'checkpoint inside the old child input is retired');
+    assert.match(readFileSync(path.join(chain.inputMirrorDir, 'content', 'child.tex'), 'utf8'), /B/);
+    assert.equal(chain.acceptedSnapshotId, stateB.identity.snapshotId);
+
+    const bGeneration = chain.gen;
+    const stateC = state('観測値はCです。\n', { changed: [child], removed: [] });
+    const c = chain.resume(source, stateC);
+    assert.equal(c.mode, 'resumed');
+    assert.ok(chain.gen > bGeneration, 'a rapid child edit supersedes the B lineage');
+    assert.match(readFileSync(path.join(chain.inputMirrorDir, 'content', 'child.tex'), 'utf8'), /C/);
+    assert.equal(chain.acceptedSnapshotId, stateC.identity.snapshotId);
+
+    const acceptedGeneration = chain.gen;
+    const acceptedSnapshot = chain.acceptedSnapshotId;
+    const unknown = state('観測値はCです。\n', { changed: [], removed: [], unknown: true });
+    assert.deepEqual(chain.resume(source, unknown), {
+      mode: 'reboot-needed', reason: 'dependency-change-unobserved',
+    });
+    assert.equal(chain.gen, acceptedGeneration);
+    assert.equal(chain.acceptedSnapshotId, acceptedSnapshot, 'unknown refresh cannot retag old pixels');
+
+    const mixedSource = source.replace('tail', 'tail changed');
+    const mixed = state('観測値はCです。\n', { changed: [], removed: [], unknown: true }, {
+      sourceText: mixedSource,
+    });
+    assert.deepEqual(chain.resume(mixedSource, mixed), {
+      mode: 'reboot-needed', reason: 'mixed-source-dependency-edit',
+    });
+
+    const dynamicSource = source.replace('prefix\\newpage', String.raw`\def\p{content/}
+\input{\p child.tex}
+prefix\newpage`);
+    const dynamicOld = state('観測値はCです。\n', null, { sourceText: dynamicSource });
+    const dynamicNew = state('観測値はDです。\n', { changed: [child], removed: [] }, {
+      sourceText: dynamicSource,
+    });
+    chain.source = dynamicSource;
+    chain.lines = unitsOf(dynamicSource);
+    chain.inputState = dynamicOld;
+    chain.acceptedSnapshotId = dynamicOld.identity.snapshotId;
+    chain.ships = [{ page: 4, nline: dynamicNew.dependencies[0].reads[0].rootUnit - 1, gen: chain.gen }];
+    chain.checkpoints.set(4, peer(4));
+    assert.deepEqual(chain.resume(dynamicSource, dynamicNew), {
+      mode: 'reboot-needed', reason: 'dependency-reboot-required',
+    }, 'an unresolved earlier reader prevents child-local replay');
+
+    const unsafeRoot = source.replace('prefix\\newpage', String.raw`\directlua{texio.write('stateful')}
+prefix\newpage`);
+    const unsafeOld = state('観測値はCです。\n', null, { sourceText: unsafeRoot });
+    const unsafeNew = state('観測値はDです。\n', { changed: [child], removed: [] }, {
+      sourceText: unsafeRoot,
+    });
+    chain.source = unsafeRoot;
+    chain.lines = unitsOf(unsafeRoot);
+    chain.inputState = unsafeOld;
+    chain.acceptedSnapshotId = unsafeOld.identity.snapshotId;
+    assert.deepEqual(chain.resume(unsafeRoot, unsafeNew), {
+      mode: 'reboot-needed', reason: 'dependency-reboot-required',
+    }, 'child replay keeps the root document-effect safety profile');
+
+    const includeSource = source.replace('\\input{content/child.tex}', '\\include{content/child.tex}');
+    const includeOld = state('観測値はCです。\n', null, { command: 'include', sourceText: includeSource });
+    const includeNew = state('観測値はDです。\n', { changed: [child], removed: [] }, {
+      command: 'include', sourceText: includeSource,
+    });
+    chain.source = includeSource;
+    chain.lines = unitsOf(includeSource);
+    chain.inputState = includeOld;
+    chain.acceptedSnapshotId = includeOld.identity.snapshotId;
+    assert.deepEqual(chain.resume(includeSource, includeNew), {
+      mode: 'reboot-needed', reason: 'dependency-reboot-required',
+    }, '\\include keeps its conservative aux/clearpage path');
+
+    const delayed = [];
+    const guardEngine = {
+      ...engine,
+      maxCheckpoints: 8,
+      checkpoints: new Map(),
+      shipStale: false,
+      shipGenRev: new Map([[7, 2]]),
+      shipGenSnapshot: new Map([[7, stateB.identity.snapshotId]]),
+      shipDesiredInputSnapshot: stateC.identity.snapshotId,
+      srcRev: 3,
+      onShipWave: (wave) => delayed.push(wave),
+    };
+    const guardedChain = makeShippingChain(guardEngine, () => {});
+    guardEngine.shipping = guardedChain;
+    guardedChain.onWave({ gen: 7, snapshotId: stateB.identity.snapshotId });
+    assert.deepEqual(delayed, [], 'an unsupported C revision blocks a delayed B wave');
+    await guardedChain.close();
   } finally {
     await chain.close();
     rmSync(root, { recursive: true, force: true });

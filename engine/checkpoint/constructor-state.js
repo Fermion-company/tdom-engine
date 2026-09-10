@@ -119,6 +119,10 @@ export function initializeEngineState(
   engine.onShipPage = null; // legacy callback retained for embedders
   engine.onShipWave = null; // callback({pages, gen, srcRev}) after end/closure
   engine.shipGenRev = new Map(); // wave generation -> srcRev it converges to
+  engine.shipGenSnapshot = new Map(); // wave generation -> immutable input snapshot
+  engine.shipDesiredInputSnapshot = null;
+  engine.shippingIncludeTrace = []; // static read order for certified literal child replay
+  engine.shipPendingInputChanges = null;
   engine.shipBootedFor = null; // preamble hash the chain booted with
   // A replay lineage is authoritative only when it starts from the aux
   // family of a converged production compile.  Provisional TOC/label seeds

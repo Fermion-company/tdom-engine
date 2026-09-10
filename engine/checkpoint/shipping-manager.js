@@ -1,14 +1,49 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { ShippingChain } from './shipping.js';
 import { shippingLabelSeed } from './shipping-seeds.js';
 
 const RETRY_LIMIT = 3;
 const TRANSIENT_CODES = new Set(['EAGAIN', 'ENOMEM', 'EMFILE', 'ENFILE', 'ETIMEDOUT', 'ECONNRESET']);
 const digest = (value) => createHash('sha256').update(String(value)).digest('hex');
+const digestBytes = (value) => createHash('sha256').update(value).digest('hex');
+
+function relativeProjectPath(root, candidate) {
+  if (!root || !candidate) return null;
+  const rel = path.relative(path.resolve(root), path.resolve(candidate));
+  if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
+  return rel.split(path.sep).join('/');
+}
+
+function insideReal(root, candidate) {
+  try {
+    return relativeProjectPath(realpathSync(root), realpathSync(candidate)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+function overlayFiles(overlayDir, dir = overlayDir, out = []) {
+  if (!overlayDir || !dir) return out;
+  let names;
+  try { names = readdirSync(dir); } catch { return out; }
+  for (const name of names) {
+    const full = path.join(dir, name);
+    let stat;
+    try { stat = lstatSync(full); } catch { continue; }
+    if (stat.isDirectory()) overlayFiles(overlayDir, full, out);
+    else if (stat.isFile()) out.push(full);
+  }
+  return out;
+}
 
 function includeSnapshot(engine) {
+  const reached = new Set((engine.shippingIncludeTrace ?? [])
+    .map((read) => typeof read?.actualPath === 'string' ? path.resolve(read.actualPath) : null)
+    .filter(Boolean));
   return [...(engine.includes ?? new Map())]
+    .filter(([name]) => reached.has(path.resolve(name)))
     .map(([name, value]) => [name, value?.mtime ?? null, digest(value?.text ?? '')])
     .sort(([a], [b]) => String(a).localeCompare(String(b)));
 }
@@ -44,6 +79,74 @@ export function shippingInputSnapshot(engine) {
     ...identity,
     snapshotId: digest(JSON.stringify(identity)),
   };
+}
+
+/** Exact bytes and static read evidence used by one shipping revision. */
+export function shippingInputState(engine, projectInputChanges = null) {
+  const dependencies = [];
+  const trace = Array.isArray(engine.shippingIncludeTrace) ? engine.shippingIncludeTrace : [];
+  const reached = new Set(trace
+    .map((read) => typeof read?.actualPath === 'string' ? path.resolve(read.actualPath) : null)
+    .filter(Boolean));
+  for (const [actualName, value] of engine.includes ?? []) {
+    const actualPath = path.resolve(actualName);
+    // includes is a cross-update cache. Only inputs reached by the current
+    // expansion belong to this revision; otherwise old bytes can shadow a
+    // now-unreferenced on-disk file in the private shipping mirror.
+    if (!reached.has(actualPath)) continue;
+    const projectPath = relativeProjectPath(engine.docDir, actualPath);
+    const readPath = path.resolve(value?.readPath ?? actualPath);
+    const overlayPath = relativeProjectPath(engine.overlayDir, readPath);
+    const readPathSafe = projectPath !== null && (
+      overlayPath !== null
+        ? overlayPath === projectPath && insideReal(engine.overlayDir, readPath)
+        : readPath === actualPath && insideReal(engine.docDir, actualPath)
+    );
+    const bytes = Buffer.from(String(value?.text ?? ''), 'utf8');
+    dependencies.push(Object.freeze({
+      actualPath,
+      projectPath,
+      readPath,
+      readPathSafe,
+      bytes,
+      hash: digestBytes(bytes),
+      reads: trace.filter((read) => typeof read?.actualPath === 'string' &&
+          path.resolve(read.actualPath) === actualPath)
+        .map((read) => Object.freeze({ ...read })),
+    }));
+  }
+  dependencies.sort((a, b) => String(a.projectPath).localeCompare(String(b.projectPath)));
+
+  const mirror = new Map();
+  for (const full of overlayFiles(engine.overlayDir)) {
+    const projectPath = relativeProjectPath(engine.overlayDir, full);
+    if (!projectPath || !insideReal(engine.overlayDir, full)) continue;
+    try { mirror.set(projectPath, readFileSync(full)); } catch { /* a later mutation will refresh */ }
+  }
+  for (const dependency of dependencies) {
+    if (dependency.readPathSafe && dependency.projectPath) mirror.set(dependency.projectPath, dependency.bytes);
+  }
+
+  const normalizeChanges = (items) => (Array.isArray(items) ? items : []).map((item) => {
+    const raw = String(item);
+    const absolute = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(engine.docDir, raw);
+    return { raw: absolute, projectPath: relativeProjectPath(engine.docDir, absolute) };
+  });
+  const changes = projectInputChanges === null ? null : Object.freeze({
+    changed: normalizeChanges(projectInputChanges.changed),
+    removed: normalizeChanges(projectInputChanges.removed),
+    unknown: projectInputChanges.unknown === true,
+  });
+  return Object.freeze({
+    source: engine.store.get(engine.file),
+    sourceFile: path.resolve(engine.docDir, engine.file),
+    docDir: path.resolve(engine.docDir),
+    identity: shippingInputSnapshot(engine),
+    dependencies: Object.freeze(dependencies),
+    mirrorEntries: Object.freeze([...mirror].map(([projectPath, bytes]) =>
+      Object.freeze({ projectPath, bytes: Buffer.from(bytes), hash: digestBytes(bytes) }))),
+    changes,
+  });
 }
 
 function retryState(engine) {
@@ -234,7 +337,10 @@ export function makeShippingChain(engine, queueShipBoot) {
     checkpointBudget: () => Math.max(1, engine.maxCheckpoints * 2 - engine.checkpoints.size),
   });
   chain.onWave = (wave) => {
-    if (engine.shipStale || chain !== engine.shipping) return;
+    if (engine.shipStale || chain !== engine.shipping ||
+        engine.shipGenSnapshot.get(wave.gen) !== wave.snapshotId ||
+        engine.shipDesiredInputSnapshot !== wave.snapshotId ||
+        engine.shipGenRev.get(wave.gen) !== engine.srcRev) return;
     // The renderer's atomic batch gate needs the complete immutable-wave
     // envelope.  Dropping deadlineAt used to turn setTimeout(NaN) into an
     // immediate cancellation even though the native PDF had certified in
@@ -268,11 +374,19 @@ export function makeShippingChain(engine, queueShipBoot) {
 export async function bootShipping(engine, { makeShipping, paginateNow, computeToc, shipUpdate }) {
   if (!engine.shipping || engine.mode !== 'structured' || engine.shipBooting) return;
   engine.shipBooting = true;
+  // shipUpdate only populates this while shipBooting is true. Reset it
+  // before the first await so a mutation arriving during close/open cannot
+  // be erased by the boot that it supersedes.
+  engine.shipPendingInputChanges = null;
   try {
     const text = engine.store.get(engine.file);
-    const preHash = engine.preHash;
-    const canonicalGeneration = engine.canonical.sourceMatches(text)
+    const sourceGeneration = engine.canonical.sourceMatches(text)
       ? engine.canonical.last
+      : null;
+    const canonicalGeneration = sourceGeneration &&
+      (!Number.isInteger(engine.canonical.inputEpoch) ||
+        sourceGeneration.inputEpoch === engine.canonical.inputEpoch)
+      ? sourceGeneration
       : null;
     // Never certify a fast lineage from the resident paginator's inferred
     // TOC/labels.  Those are useful for provisional layout, but they are not
@@ -289,12 +403,12 @@ export async function bootShipping(engine, { makeShipping, paginateNow, computeT
     }
     engine.shipDesiredCanonicalId = canonicalGeneration.id;
     engine.shipDesiredCanonicalHash = canonicalGeneration.pdfHash ?? null;
-    if (engine.shipBootedFor !== null || engine.shipping.rootPeer || engine.shipping.disposed) {
-      // a previous run exists: replace the whole instance (its net server
-      // and process tree die with it)
-      await engine.shipping.close().catch(() => {});
-      engine.shipping = makeShipping();
-    }
+    // Capture every source-dependent boot input in one synchronous epoch.
+    // close() and open() are both await boundaries; consulting the live
+    // engine after either one could pair old root bytes with new child bytes,
+    // revision, preamble hash, or canonical seeds.
+    const inputState = shippingInputState(engine, null);
+    const snapshot = inputState.identity;
     const prov = paginateNow();
     const labelSeed = shippingLabelSeed(
       engine.pages,
@@ -303,22 +417,31 @@ export async function bootShipping(engine, { makeShipping, paginateNow, computeT
       engine.shipLabelOverrides
     );
     const toc = computeToc(prov);
+    const seedFiles = canonicalGeneration.seedFiles;
+    engine.shipDesiredInputSnapshot = snapshot.snapshotId;
+    if (engine.shipBootedFor !== null || engine.shipping.rootPeer || engine.shipping.disposed) {
+      // a previous run exists: replace the whole instance (its net server
+      // and process tree die with it). Detach it synchronously so a delayed
+      // callback cannot publish or settle as current during the close await.
+      const previous = engine.shipping;
+      engine.shipping = makeShipping();
+      await previous.close().catch(() => {});
+    }
     engine.shipStale = false;
     engine.shipGenRev.clear();
-    engine.shipGenRev.set(0, engine.srcRev);
-    const snapshot = shippingInputSnapshot(engine);
+    engine.shipGenSnapshot?.clear();
+    engine.shipGenRev.set(0, snapshot.sourceRevision);
+    engine.shipGenSnapshot?.set(0, snapshot.snapshotId);
     const chain = engine.shipping;
     const attempt = beginShippingAttempt(engine, chain, snapshot);
-    await engine.shipping.open(text, {
+    await engine.shipping.open(inputState.source, {
       labelSeed,
       contents: toc.contents,
-      seedFiles: canonicalGeneration.seedFiles,
+      seedFiles,
       baselineIdentity: attempt,
+      inputState,
     });
-    engine.shipBootedFor = preHash;
-    // an edit landed while booting: converge the wave to it now
-    const now = engine.store.get(engine.file);
-    if (now !== text) shipUpdate(now);
+    engine.shipBootedFor = snapshot.preHash;
   } catch (err) {
     engine.diagnostics.push('shipping boot failed: ' + err.message);
     const chain = engine.shipping;
@@ -336,6 +459,9 @@ export async function bootShipping(engine, { makeShipping, paginateNow, computeT
     engine.shipBootedFor = null;
   } finally {
     engine.shipBooting = false;
+    const pending = engine.shipPendingInputChanges;
+    engine.shipPendingInputChanges = null;
+    if (pending) shipUpdate(pending.text, pending.projectInputChanges);
   }
 }
 
@@ -372,9 +498,17 @@ export function queueShipBoot(engine, bootShipping) {
 }
 
 /** Hot-path hook: cheap (a unit diff + one socket line). */
-export function shipUpdate(engine, text, queueShipBoot) {
+export function shipUpdate(engine, text, projectInputChanges, queueShipBoot) {
   if (!engine.shipping || engine.mode !== 'structured') return;
-  if (engine.shipBooting) return; // boot-end convergence will catch up
+  if (engine.shipBooting) {
+    // Root bytes alone cannot detect an included-file edit. Preserve the
+    // latest explicit input evidence until this boot has installed its own
+    // immutable mirror, then converge or replace it.
+    const inputState = shippingInputState(engine, projectInputChanges);
+    engine.shipDesiredInputSnapshot = inputState.identity.snapshotId;
+    engine.shipPendingInputChanges = { text, projectInputChanges };
+    return;
+  }
   if (
     engine.shipping.err?.message?.startsWith('pdf-opened-at-root') &&
     engine.shipBootedFor === engine.preHash &&
@@ -391,11 +525,18 @@ export function shipUpdate(engine, text, queueShipBoot) {
     queueShipBoot();
     return;
   }
-  const r = engine.shipping.resume(text);
+  const inputState = shippingInputState(engine, projectInputChanges);
+  // This is the newest requested input universe even when it cannot use the
+  // current lineage. It prevents a delayed prior wave from publishing while
+  // the conservative canonical/baseline path takes over.
+  engine.shipDesiredInputSnapshot = inputState.identity.snapshotId;
+  const r = engine.shipping.resume(text, inputState);
   if (r.mode === 'resumed') {
     engine.shipGenRev.set(engine.shipping.gen, engine.srcRev);
+    engine.shipGenSnapshot?.set(engine.shipping.gen, inputState.identity.snapshotId);
   } else if (r.mode === 'unchanged') {
     engine.shipGenRev.set(engine.shipping.gen, engine.srcRev);
+    engine.shipGenSnapshot?.set(engine.shipping.gen, inputState.identity.snapshotId);
   } else if (r.mode === 'reboot-needed') {
     queueShipBoot();
   }

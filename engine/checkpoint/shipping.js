@@ -17,7 +17,9 @@ import net from 'node:net';
 import { spawn, execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs';
+import {
+  mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync, renameSync,
+} from 'node:fs';
 import path from 'node:path';
 import { withProjectInputs } from '../project-inputs.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -37,6 +39,9 @@ const INPUT_IDENTITY_UNSAFE = /\\(?:jobname|inputlineno|everyeof|endinput|Curren
 // outside the certified profile.
 const NONDETERMINISM_UNSAFE = /\\(?:time|day|month|year|pdfelapsedtime|pdfrandomseed|uniformdeviate|openin|read|ifeof|filemoddate|filesize|mdfivesum|ShellEscape)\b|\\input\s*\|/;
 const VERBATIM_ENV = /\\(begin|end)\{(verbatim\*?|lstlisting|minted|alltt|filecontents\*?|[BLV]erbatim\*?)\}/g;
+
+const replayProfileSafe = (source) => !DOCUMENT_EFFECT_UNSAFE.test(source) &&
+  !INPUT_IDENTITY_UNSAFE.test(source) && !NONDETERMINISM_UNSAFE.test(source);
 
 function literalAt(source, offset) {
   let depth = 0;
@@ -74,8 +79,7 @@ function plainReplayEdit(before, after) {
   const inserted = after.slice(start, newEnd);
   if (PLAIN_EDIT_UNSAFE.test(removed) || PLAIN_EDIT_UNSAFE.test(inserted) ||
       literalAt(before, start) ||
-      DOCUMENT_EFFECT_UNSAFE.test(before) || INPUT_IDENTITY_UNSAFE.test(before) ||
-      NONDETERMINISM_UNSAFE.test(before)) return false;
+      !replayProfileSafe(before)) return false;
 
   // Conservative lexical state at the changed byte.  Group depth alone is
   // NOT an admission boundary: a checkpoint preceding the complete source
@@ -145,6 +149,9 @@ export class ShippingChain {
     this.workDir = path.resolve(workDir);
     this.docDir = docDir ? path.resolve(docDir) : this.workDir;
     this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
+    this.inputMirrorDir = path.join(this.workDir, 'input-mirror');
+    this.inputState = null;
+    this.acceptedSnapshotId = null;
     mkdirSync(this.workDir, { recursive: true });
     this.server = null;
     this.port = 0;
@@ -491,10 +498,12 @@ export class ShippingChain {
     for (let page = this.waveFromPage; page <= pageCount; page++) expected.push(page);
     const cutoffMs = Number(process.env.TDOM_SHIP_WAVE_CUTOFF ?? 700);
     const validatingGen = this.gen;
+    const validatingSnapshotId = this.acceptedSnapshotId;
     if (this.waveValidatingGen === validatingGen) return;
     this.waveValidatingGen = validatingGen;
     void this.#validateCompletePdf(completePdf, pageCount).then((valid) => {
-      if (this.disposed || validatingGen !== this.gen || this.wavePublishedGen === validatingGen) return;
+      if (this.disposed || validatingGen !== this.gen || validatingSnapshotId !== this.acceptedSnapshotId ||
+          this.wavePublishedGen === validatingGen) return;
       this.wavePublishedGen = validatingGen;
       clearTimeout(this.waveDeadlineTimer);
       this.waveDeadlineTimer = null;
@@ -546,6 +555,7 @@ export class ShippingChain {
         pages: Array.from({ length: pageCount }, (_, index) => index + 1),
         changedPages: expected,
         gen: validatingGen,
+        snapshotId: validatingSnapshotId,
         fromPage: this.waveFromPage,
         elapsedMs,
         acceptedAt: this.waveStartedAt,
@@ -575,6 +585,121 @@ export class ShippingChain {
     });
     units.push('\\end{document}');
     return units;
+  }
+
+  #stageInputState(state) {
+    if (!state?.identity?.snapshotId || !Array.isArray(state.mirrorEntries)) {
+      throw new Error('shipping input snapshot is incomplete');
+    }
+    const stage = path.join(this.workDir, `.input-mirror-${randomUUID()}`);
+    mkdirSync(stage, { recursive: true });
+    try {
+      for (const entry of state.mirrorEntries) {
+        const rel = String(entry?.projectPath ?? '').split('/').join(path.sep);
+        const target = path.resolve(stage, rel);
+        const within = path.relative(stage, target);
+        if (!rel || within === '..' || within.startsWith(`..${path.sep}`) || path.isAbsolute(within)) {
+          throw new Error('shipping input path escapes project mirror');
+        }
+        mkdirSync(path.dirname(target), { recursive: true });
+        writeFileSync(target, entry.bytes);
+      }
+      return stage;
+    } catch (error) {
+      rmSync(stage, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  #commitInputStage(stage) {
+    const backup = `${this.inputMirrorDir}.old-${randomUUID()}`;
+    let hadPrevious = false;
+    try {
+      if (existsSync(this.inputMirrorDir)) {
+        renameSync(this.inputMirrorDir, backup);
+        hadPrevious = true;
+      }
+      renameSync(stage, this.inputMirrorDir);
+      if (hadPrevious) rmSync(backup, { recursive: true, force: true });
+    } catch (error) {
+      if (!existsSync(this.inputMirrorDir) && hadPrevious && existsSync(backup)) {
+        try { renameSync(backup, this.inputMirrorDir); } catch { /* caller reboots */ }
+      }
+      rmSync(stage, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  #dependencyReplayUnit(newSource, nextState) {
+    const previous = this.inputState;
+    if (!previous || !nextState || newSource !== this.source) return null;
+    // Child-only replay inherits the same whole-document profile gate as a
+    // root edit. Moving the changed bytes to an input must not admit a root
+    // that observes clocks/files or mutates TeX's global scanning/output
+    // machinery across a checkpoint.
+    if (!replayProfileSafe(newSource)) return null;
+    const changes = nextState.changes;
+    if (!changes || changes.unknown || changes.removed.length !== 0 || changes.changed.length !== 1) return null;
+    const changedPath = changes.changed[0]?.projectPath;
+    if (!changedPath) return null;
+    const oldByPath = new Map(previous.dependencies.map((entry) => [entry.projectPath, entry]));
+    const newByPath = new Map(nextState.dependencies.map((entry) => [entry.projectPath, entry]));
+    if (oldByPath.size !== newByPath.size || [...oldByPath.keys()].some((key) => !newByPath.has(key))) return null;
+    const changed = [...newByPath].filter(([key, entry]) => oldByPath.get(key)?.hash !== entry.hash);
+    if (changed.length !== 1 || changed[0][0] !== changedPath) return null;
+    const before = oldByPath.get(changedPath);
+    const after = changed[0][1];
+    if (!before?.readPathSafe || !after?.readPathSafe) return null;
+    const reads = after.reads ?? [];
+    const oldReads = before.reads ?? [];
+    if (reads.length !== 1 || oldReads.length !== 1) return null;
+    const read = reads[0], oldRead = oldReads[0];
+    if (read.command !== 'input' || read.depth !== 0 || oldRead.command !== 'input' || oldRead.depth !== 0 ||
+        path.resolve(read.parentFile) !== nextState.sourceFile ||
+        path.resolve(oldRead.parentFile) !== previous.sourceFile ||
+        read.rootUnit !== oldRead.rootUnit || !Number.isInteger(read.rootUnit)) return null;
+    const unit = this.#unitsOf(newSource)[read.rootUnit - 1] ?? '';
+    const literal = unit.match(/^\s*\\input\s*\{([^}]+)\}\s*$/);
+    if (!literal || path.isAbsolute(literal[1]) || /[\\#{}]/.test(literal[1])) return null;
+    const raw = literal[1].replace(/^\.\//, '').split(path.sep).join('/');
+    const candidates = path.extname(raw) ? [raw] : [raw, `${raw}.tex`];
+    if (!candidates.includes(changedPath)) return null;
+    const alias = changedPath.replace(/\.tex$/i, '');
+    const bodyAt = newSource.indexOf('\\begin{document}');
+    const preamble = newSource.slice(0, Math.max(0, bodyAt));
+    const earlierUnits = this.#unitsOf(newSource).slice(0, read.rootUnit - 1);
+    const earlier = earlierUnits.join('');
+    if (preamble.includes(changedPath) || preamble.includes(alias) ||
+        earlier.includes(changedPath) || earlier.includes(alias)) return null;
+    // Every earlier project reader must be statically attributable. A macro
+    // path (\input{\p...}), embedded input, \openin or csname-built input
+    // could have consumed this child before the apparent direct unit and
+    // would leave an otherwise eligible page checkpoint holding old bytes.
+    const unresolvedReader = /\\(?:openin|read|InputIfFileExists|IfFileExists)\b|\\csname\s*(?:input|include)\b/;
+    if (unresolvedReader.test(preamble) || /\\(?:input|include)\b/.test(preamble)) return null;
+    const tracedRootUnits = new Set((nextState.dependencies ?? []).flatMap((entry) => entry.reads ?? [])
+      .filter((candidate) => candidate.depth === 0 && candidate.command === 'input')
+      .map((candidate) => candidate.rootUnit));
+    for (let index = 0; index < earlierUnits.length; index++) {
+      const earlierUnit = earlierUnits[index];
+      if (unresolvedReader.test(earlierUnit)) return null;
+      if (/\\(?:input|include)\b/.test(earlierUnit)) {
+        const direct = earlierUnit.match(/^\s*\\input\s*\{([^{}\\#]+)\}\s*$/);
+        if (!direct || !tracedRootUnits.has(index + 1)) return null;
+      }
+    }
+    for (const dependency of nextState.dependencies ?? []) {
+      const firstRead = Math.min(...(dependency.reads ?? []).map((candidate) => candidate.rootUnit ?? Infinity));
+      if (!(firstRead < read.rootUnit)) continue;
+      const text = dependency.bytes.toString('utf8');
+      if (unresolvedReader.test(text)) return null;
+      const readerCount = [...text.matchAll(/\\(?:input|include)\b/g)].length;
+      const tracedCount = (nextState.dependencies ?? []).flatMap((entry) => entry.reads ?? [])
+        .filter((candidate) => path.resolve(candidate.parentFile) === dependency.actualPath).length;
+      if (readerCount !== tracedCount) return null;
+    }
+    if (!plainReplayEdit(before.bytes.toString('utf8'), after.bytes.toString('utf8'))) return null;
+    return read.rootUnit;
   }
 
   #driverSource(preamble, labelSeed, hasCanonicalAux = false) {
@@ -623,7 +748,7 @@ export class ShippingChain {
   }
 
   /** Boot the chain on a full source. Body must be \par-line addressable. */
-  async open(source, { labelSeed, contents, seedFiles, baselineIdentity = null } = {}) {
+  async open(source, { labelSeed, contents, seedFiles, baselineIdentity = null, inputState = null } = {}) {
     // Generation directory names restart at zero with each server process.
     // Remove an older chain's private branches before Lua creates this
     // chain's branches, otherwise viewer SVGs or partially written outputs
@@ -637,6 +762,7 @@ export class ShippingChain {
     }
     await ensureShim(this.workDir);
     await this.#ensureServer();
+    if (inputState) this.#commitInputStage(this.#stageInputState(inputState));
     const b = source.indexOf('\\begin{document}');
     if (b < 0) throw new Error('shipping chain needs \\begin{document}');
     const preamble = source.slice(0, b);
@@ -647,6 +773,8 @@ export class ShippingChain {
     // (its final \clearpage ships the last partial page).
     this.lines = this.#unitsOf(source);
     this.source = source;
+    this.inputState = inputState;
+    this.acceptedSnapshotId = inputState?.identity?.snapshotId ?? null;
     this.gen = 0;
     this.ships = [];
     this.labels.clear();
@@ -693,7 +821,10 @@ export class ShippingChain {
       cwd: this.workDir,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: withProjectInputs(process.env, { docDir: this.docDir, overlayDir: this.overlayDir }),
+      env: withProjectInputs(process.env, {
+        docDir: this.docDir,
+        overlayDir: inputState ? this.inputMirrorDir : this.overlayDir,
+      }),
     });
     let log = '';
     this.root.stdout.on('data', (d) => {
@@ -735,18 +866,44 @@ export class ShippingChain {
    * covers the edit, {mode:'reboot-needed'} when the change reaches page-1
    * material (caller decides: full reboot or cold canonical only).
    */
-  resume(newSource) {
+  resume(newSource, nextInputState = null) {
     if (this.gen === 0 && this.baselinePages === null) {
       this.lastRejectReason = 'baseline-not-certified';
       return { mode: 'reboot-needed', reason: 'baseline-not-certified' };
     }
-    if (!plainReplayEdit(this.source, newSource)) {
+    const rootChanged = this.source !== newSource;
+    const dependencyContent = (state) => JSON.stringify((state?.dependencies ?? [])
+      .map((entry) => [entry.projectPath, entry.hash]));
+    const dependencyChanged = dependencyContent(this.inputState) !== dependencyContent(nextInputState ?? this.inputState);
+    const hasInputEvidence = !!nextInputState?.changes && (
+      nextInputState.changes.unknown || nextInputState.changes.changed.length ||
+      nextInputState.changes.removed.length
+    );
+    let dependencyUnit = null;
+    if (rootChanged && hasInputEvidence) {
+      this.lastRejectReason = 'mixed-source-dependency-edit';
+      return { mode: 'reboot-needed', reason: 'mixed-source-dependency-edit' };
+    }
+    if (nextInputState && !rootChanged && dependencyChanged) {
+      dependencyUnit = this.#dependencyReplayUnit(newSource, nextInputState);
+      if (dependencyUnit === null) {
+        this.lastRejectReason = 'dependency-reboot-required';
+        return { mode: 'reboot-needed', reason: 'dependency-reboot-required' };
+      }
+    } else if (nextInputState && !rootChanged && hasInputEvidence) {
+      this.lastRejectReason = 'dependency-change-unobserved';
+      return { mode: 'reboot-needed', reason: 'dependency-change-unobserved' };
+    } else if (nextInputState && rootChanged && dependencyChanged) {
+      this.lastRejectReason = 'mixed-source-dependency-edit';
+      return { mode: 'reboot-needed', reason: 'mixed-source-dependency-edit' };
+    }
+    if (rootChanged && !plainReplayEdit(this.source, newSource)) {
       this.lastRejectReason = 'non-plain-edit';
       return { mode: 'reboot-needed', reason: 'non-plain-edit' };
     }
     const newLines = this.#unitsOf(newSource);
-    const certifiedUnit = singleReplayUnit(this.lines, newLines);
-    if (certifiedUnit === null) {
+    const certifiedUnit = dependencyUnit === null ? singleReplayUnit(this.lines, newLines) : dependencyUnit - 1;
+    if (dependencyUnit === null && certifiedUnit === null) {
       this.lastRejectReason = 'unit-boundary-changed';
       return { mode: 'reboot-needed', reason: 'unit-boundary-changed' };
     }
@@ -758,11 +915,15 @@ export class ShippingChain {
     ) {
       first++;
     }
-    if (first >= this.lines.length && newLines.length === this.lines.length) {
+    if (dependencyUnit === null && first >= this.lines.length && newLines.length === this.lines.length) {
+      if (nextInputState) {
+        this.inputState = nextInputState;
+        this.acceptedSnapshotId = nextInputState.identity.snapshotId;
+      }
       return { mode: 'unchanged' };
     }
-    const firstChanged = first + 1; // 1-based
-    if (certifiedUnit + 1 !== firstChanged) {
+    const firstChanged = dependencyUnit ?? first + 1; // 1-based
+    if (dependencyUnit === null && certifiedUnit + 1 !== firstChanged) {
       this.lastRejectReason = 'unit-certificate-mismatch';
       return { mode: 'reboot-needed', reason: 'unit-certificate-mismatch' };
     }
@@ -777,13 +938,19 @@ export class ShippingChain {
         if (!best || s.page > best.page) best = s;
       }
     }
-    this.lines = newLines;
-    this.source = newSource;
     if (!best) return { mode: 'reboot-needed', firstChanged };
+    let inputStage = null;
+    if (dependencyUnit !== null) {
+      try {
+        inputStage = this.#stageInputState(nextInputState);
+      } catch {
+        this.lastRejectReason = 'dependency-mirror-failed';
+        return { mode: 'reboot-needed', reason: 'dependency-mirror-failed' };
+      }
+    }
     // kill everything in the stale tail
     clearTimeout(this.waveDeadlineTimer);
     this.waveDeadlineTimer = null;
-    this.gen++;
     for (const [page, peer] of [...this.checkpoints]) {
       if (page > best.page) {
         peer.send('DIE\n');
@@ -800,6 +967,21 @@ export class ShippingChain {
         try { process.kill(old.pid, 'SIGKILL'); } catch { /* gone */ }
       }
     }
+    if (inputStage) {
+      try {
+        this.#commitInputStage(inputStage);
+      } catch {
+        this.lastRejectReason = 'dependency-mirror-failed';
+        return { mode: 'reboot-needed', reason: 'dependency-mirror-failed' };
+      }
+    }
+    this.lines = newLines;
+    this.source = newSource;
+    if (nextInputState) {
+      this.inputState = nextInputState;
+      this.acceptedSnapshotId = nextInputState.identity.snapshotId;
+    }
+    this.gen++;
     this.ships = this.ships.filter((s) => s.page <= best.page);
     for (const [page] of [...this.pagePdf]) {
       if (page > best.page) {
@@ -927,6 +1109,7 @@ export class ShippingChain {
       pages: this.ships.length,
       checkpointCount: this.checkpoints.size,
       checkpointLimit: this.checkpointLimit(),
+      inputSnapshotId: this.acceptedSnapshotId,
       shipped: [...new Set(this.ships.map((ship) => ship.page))].sort((a, b) => a - b),
       done: this.done,
       error: this.err?.message ?? null,

@@ -620,7 +620,7 @@ function refreshProjectBibliography(changedFile) {
     } else {
       await materializeProjectBibliography(source, activeProject);
       engine.invalidateProjectInputs?.([path.join(engine.workDir, 'driver.bbl')]);
-      lastReport = await engine.refresh();
+      lastReport = await engine.refresh({ changed: [path.join(engine.workDir, 'driver.bbl')] });
     }
     completeDocumentReset();
     broadcast({ kind: 'update', report: lastReport });
@@ -695,7 +695,7 @@ engine.onDocumentResetComplete = ({ report } = {}) => {
 engine.onAsyncPatches = (partial) => {
   broadcast({ kind: 'patches', rev: partial.rev, fonts: partial.fonts, patches: partial.patches });
 };
-engine.onExternalChange = () => {
+engine.onExternalChange = (changedInput) => {
   withEngine(async () => {
     const source = engine.getSource();
     const nextBibliography = describeExternalBibliography(source, activeProject.docDir, activeProject.overlayDir);
@@ -717,12 +717,12 @@ engine.onExternalChange = () => {
       broadcast({ kind: 'update', report: lastReport });
       return lastReport;
     }
-    lastReport = await engine.refresh();
+    lastReport = await engine.refresh({ changed: changedInput ? [changedInput] : [], unknown: !changedInput });
     if (bibliographyChanged) {
       broadcast({ kind: 'update', report: lastReport });
       await materializeProjectBibliography(source, activeProject);
       engine.invalidateProjectInputs?.([path.join(engine.workDir, 'driver.bbl')]);
-      lastReport = await engine.refresh();
+      lastReport = await engine.refresh({ changed: [path.join(engine.workDir, 'driver.bbl')] });
     }
     completeDocumentReset();
     broadcast({ kind: 'update', report: lastReport });
@@ -1605,9 +1605,15 @@ const server = http.createServer(async (req, res) => {
             // Keep the last-good bibliography while the user is typing and
             // run only the latest snapshot after a short idle window.
             const report = rootChanged
-              ? await engine.edit(start, end, text)
+              ? await engine.edit(start, end, text, engine.file, {
+                  changed: overlayDelta.changed,
+                  removed: overlayDelta.removed,
+                })
               : changedInputs.length
-                ? await engine.refresh()
+                ? await engine.refresh({
+                    changed: overlayDelta.changed,
+                    removed: overlayDelta.removed,
+                  })
                 : await engine.edit(start, end, text);
             scheduleProjectBibliographyRefresh('unsaved biblatex input', 450);
             return report;
@@ -1638,8 +1644,14 @@ const server = http.createServer(async (req, res) => {
             return report;
           }
           let primaryReport;
-          if (rootChanged) primaryReport = await engine.edit(start, end, text);
-          else if (changedInputs.length) primaryReport = await engine.refresh();
+          if (rootChanged) primaryReport = await engine.edit(start, end, text, engine.file, {
+            changed: overlayDelta.changed,
+            removed: overlayDelta.removed,
+          });
+          else if (changedInputs.length) primaryReport = await engine.refresh({
+            changed: overlayDelta.changed,
+            removed: overlayDelta.removed,
+          });
           else primaryReport = await engine.edit(start, end, text);
           if (!bibliographyChanged) return primaryReport;
 
@@ -1651,7 +1663,7 @@ const server = http.createServer(async (req, res) => {
           broadcast({ kind: 'update', report: primaryReport });
           await materializeProjectBibliography(next, activeProject);
           engine.invalidateProjectInputs?.([path.join(engine.workDir, 'driver.bbl')]);
-          return engine.refresh();
+          return engine.refresh({ changed: [path.join(engine.workDir, 'driver.bbl')] });
         });
       } catch (err) {
         if (err?.status === 409) {

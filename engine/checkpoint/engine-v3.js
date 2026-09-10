@@ -209,12 +209,22 @@ export class CheckpointEngine {
     });
   }
 
-  async edit(start, end, replacement, file = this.file) {
+  async edit(start, end, replacement, file = this.file, projectInputChanges = null) {
     const p1 = this.store.position(file, start);
     const p2 = this.store.position(file, end);
     const editLabel = `${file}:${p1.line}:${p1.column}-${p2.line}:${p2.column}`;
     const before = this.store.get(file);
     const baseSrcRev = this.srcRev;
+    if (projectInputChanges && (
+      projectInputChanges.unknown === true ||
+      (Array.isArray(projectInputChanges.changed) && projectInputChanges.changed.length > 0) ||
+      (Array.isArray(projectInputChanges.removed) && projectInputChanges.removed.length > 0)
+    )) {
+      // A combined root+overlay request advances both input dimensions. If
+      // the root later returns to old bytes, its prior canonical generation
+      // must still be rejected because the child universe has changed.
+      this.canonical.invalidateInputs();
+    }
     this.store.applyEdit(file, start, end, replacement);
     const editContext = Object.freeze({
       file,
@@ -225,7 +235,7 @@ export class CheckpointEngine {
       after: this.store.get(file),
       baseSrcRev,
     });
-    return this.#update({ editLabel, editContext });
+    return this.#update({ editLabel, editContext, projectInputChanges });
   }
 
   /**
@@ -1103,7 +1113,13 @@ export class CheckpointEngine {
     }
   }
 
-  async #updateInner({ editLabel, editContext = null, retry = false, announceDocumentReset }) {
+  async #updateInner({
+    editLabel,
+    editContext = null,
+    projectInputChanges = null,
+    retry = false,
+    announceDocumentReset,
+  }) {
     const t = new Timer();
     const prepared = await prepareUpdate(this, {
       editLabel,
@@ -1143,7 +1159,7 @@ export class CheckpointEngine {
               editLabel: label,
             });
           }
-          return this.#opaqueUpdate(label, timer, reasons);
+          return this.#opaqueUpdate(label, timer, reasons, projectInputChanges);
         },
         // A root boot tears down the currently visible resident tree before
         // the replacement can produce its first honest page. Tell the host
@@ -1202,10 +1218,11 @@ export class CheckpointEngine {
         firstDirty,
         rebooted,
         diagnostics,
+        projectInputChanges,
         timer: t,
         callbacks: {
           queueChainWork: (kind, from, labels) => this.#queueChainWork(kind, from, labels),
-          shipUpdate: (sourceText) => this.#shipUpdate(sourceText),
+          shipUpdate: (sourceText, changes) => this.#shipUpdate(sourceText, changes),
           scheduleBackground: (from, dirtyBlocks) => this.#scheduleBackground(from, dirtyBlocks),
           fidelitySummary: () => this.#fidelitySummary(),
         },
@@ -1249,12 +1266,23 @@ export class CheckpointEngine {
         this.editHold = [];
         // direct inner call: we already hold the chain lock (re-entering
         // #update would deadlock on it)
-        return this.#updateInner({ editLabel, editContext, retry: true, announceDocumentReset });
+        return this.#updateInner({
+          editLabel,
+          editContext,
+          projectInputChanges,
+          retry: true,
+          announceDocumentReset,
+        });
       }
       // even the full rebuild failed: demote to opaque instead of erroring —
       // the canonical layer keeps the document visible and editable
       this.opaqueStickyPre = this.preHash;
-      return this.#opaqueUpdate(editLabel, t, [`structured typeset failed: ${err.message}`]);
+      return this.#opaqueUpdate(
+        editLabel,
+        t,
+        [`structured typeset failed: ${err.message}`],
+        projectInputChanges
+      );
     }
     return finalizeUpdate(this, {
       text,
@@ -1263,6 +1291,7 @@ export class CheckpointEngine {
       typesetResult: this._typesetResult,
       rebooted,
       diagnostics,
+      projectInputChanges,
       residentEditCandidate: residentAdmission.kind === 'probe',
       timer: t,
       callbacks: {
@@ -1271,7 +1300,7 @@ export class CheckpointEngine {
         scheduleHeaders: () => this.#scheduleHeaders(),
         enforceCheckpointCap: () => this.#enforceCheckpointCap(),
         scheduleBackground: (fgStop, dirtyBlocks, options) => this.#scheduleBackground(fgStop, dirtyBlocks, options),
-        shipUpdate: (sourceText) => this.#shipUpdate(sourceText),
+        shipUpdate: (sourceText, changes) => this.#shipUpdate(sourceText, changes),
         fidelitySummary: () => this.#fidelitySummary(),
       },
     });
@@ -1313,7 +1342,7 @@ export class CheckpointEngine {
       makeShipping: () => this.#makeShipping(),
       paginateNow: () => this.#paginateNow(),
       computeToc: (pages) => this.#computeToc(pages),
-      shipUpdate: (text) => this.#shipUpdate(text),
+      shipUpdate: (text, changes) => this.#shipUpdate(text, changes),
     });
   }
 
@@ -1322,14 +1351,14 @@ export class CheckpointEngine {
   }
 
   /** Hot-path hook: cheap (a unit diff + one socket line). */
-  #shipUpdate(text) {
-    shipUpdateHelper(this, text, () => this.#queueShipBoot());
+  #shipUpdate(text, projectInputChanges = null) {
+    shipUpdateHelper(this, text, projectInputChanges, () => this.#queueShipBoot());
   }
 
-  #opaqueUpdate(editLabel, t, reasons) {
+  #opaqueUpdate(editLabel, t, reasons, projectInputChanges = null) {
     return opaqueUpdateHelper(this, editLabel, t, reasons, {
       teardownTree: () => this.#teardownTree(),
-      shipUpdate: (text) => this.#shipUpdate(text),
+      shipUpdate: (text) => this.#shipUpdate(text, projectInputChanges),
     });
   }
 
@@ -1705,6 +1734,7 @@ export class CheckpointEngine {
 
   #expandIncludes(segs, depth, options = {}) {
     const source = this.store.get(this.file) ?? '';
+    if (depth === 0) this.shippingIncludeTrace = [];
     return expandIncludes(segs, depth, {
       source,
       file: this.file,
@@ -1713,6 +1743,7 @@ export class CheckpointEngine {
       overlayDir: this.overlayDir,
       workDir: this.workDir,
       includes: this.includes,
+      includeTrace: this.shippingIncludeTrace,
       diagnostics: this.diagnostics,
       includeOnly: includeOnlyFromSource(source),
       watchInclude: (full) => this.#watchInclude(full),
@@ -1727,9 +1758,20 @@ export class CheckpointEngine {
     watchInclude(full, this.watchers, (changed) => this.onExternalChange?.(changed));
   }
 
-  async refresh() {
+  async refresh(inputChanges = {}) {
     this.canonical.invalidateInputs();
-    return this.#update({ editLabel: 'external-include' });
+    const changed = Array.isArray(inputChanges)
+      ? inputChanges
+      : Array.isArray(inputChanges.changed) ? inputChanges.changed : [];
+    const removed = Array.isArray(inputChanges?.removed) ? inputChanges.removed : [];
+    return this.#update({
+      editLabel: 'external-include',
+      projectInputChanges: {
+        changed: [...changed],
+        removed: [...removed],
+        unknown: inputChanges?.unknown === true || (!changed.length && !removed.length),
+      },
+    });
   }
 
   invalidateProjectInputs(paths = []) {

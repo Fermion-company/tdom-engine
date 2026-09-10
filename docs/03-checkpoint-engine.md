@@ -20,6 +20,8 @@
 
 `\input` の前後には段落境界を追加しない。空行・明示的な `\par`・sectioning が block の境界になる。複数ファイルを含む block の `sourceParts` は各テキスト範囲と元ファイル位置を持ち、DOM の `sourceRanges` と個々の `editRegions.source` に変換される。カーソル位置の warming もこの対応で対象 block を解決する。
 
+ShippingChain は root bytes に加えて、現在の静的 expander が実際に読んだ project input の logical path・bytes・read order を revision snapshot に固定する。過去の include cache は snapshot/mirror に持ち込まない。既知の単一 brace-literal `\input` の plain-text 変更だけは、その input を読む root feed unit より前の page checkpoint から再開する。chain 専用 mirror が同じ logical path を immutable bytes で shadow し、変更前 child の input buffer を持つ unit 内 checkpoint は再利用しない。root と child の両方に既存の replay safety profile を適用する。未知 reader、`\include`、複数・削除・構造変更は baseline/canonical へ戻し、旧 shipping generation を新 `srcRev` に付け替えない。
+
 ## 3.2 プロセスモデル
 
 Shipping の checkpoint も `TDOM_MAX_CHECKPOINTS` を上限とする。併用時の枠は、基準上限の2倍から現在の resident 数を差し引いて制限する（再開用 root は1個保持）。root・最新ページを優先し、古いページは間隔が最も狭い境界から間引く。resident の checkpoint 増加時にも Shipping を即時整理する。再開時は保持済み prefix を除いた残枠から tail の保存間隔を決め、最終 `\end{document}` の後には新しい checkpoint を作らない。編集中・描画中に保持する resident の一時枠は別途存続する。

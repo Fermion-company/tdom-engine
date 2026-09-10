@@ -9,7 +9,8 @@ export function expandIncludes(segs, depth, context) {
   if (depth > 3) return segs;
   if (depth === 0) segs = expandInputParagraphs(segs, context);
   const out = [];
-  for (const seg of segs) {
+  for (let segmentIndex = 0; segmentIndex < segs.length; segmentIndex++) {
+    const seg = segs[segmentIndex];
     // Classic BibTeX's \bibliography command is just an input of
     // \jobname.bbl. The server materializes driver.bbl from the project's
     // real .bib files; expanding it here gives the existing live-bibliography
@@ -41,8 +42,26 @@ export function expandIncludes(segs, depth, context) {
       extensions: ['.tex'],
     });
     const expanded = resolved
-      ? expandTextFile(resolved.actualPath, depth, context, resolved.readPath, resolved.overlay)
+      ? expandTextFile(
+          resolved.actualPath,
+          depth,
+          context,
+          resolved.readPath,
+          resolved.overlay,
+          depth === 0 ? segmentIndex + 1 : context.rootUnit
+        )
       : null;
+    if (resolved) {
+      context.includeTrace?.push({
+        actualPath: resolved.actualPath,
+        readPath: resolved.readPath,
+        command,
+        raw: rel,
+        depth,
+        parentFile: seg.file ?? context.file,
+        rootUnit: depth === 0 ? segmentIndex + 1 : context.rootUnit ?? null,
+      });
+    }
     if (!expanded) {
       context.diagnostics.push(`\\${command} file not found: ${rel} (typeset literally)`);
       out.push(seg);
@@ -71,7 +90,7 @@ function normalizeIncludeName(value) {
   return String(value || '').trim().replace(/\\/g, '/').replace(/\.tex$/i, '').replace(/^\.\//, '');
 }
 
-function expandTextFile(full, depth, context, readPath = full, overlay = false) {
+function expandTextFile(full, depth, context, readPath = full, overlay = false, rootUnit = null) {
   try {
     const st = statSync(readPath);
     const cached = context.includes.get(full);
@@ -81,10 +100,16 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false) 
     context.includes.set(full, { mtime: st.mtimeMs, readPath, text });
     context.watchInclude(readPath);
     const subs = expandIncludes(
-      expandInputParagraphs(segmentBody(text, 0), { ...context, source: text, file: full, structuralEvents: [] })
+      expandInputParagraphs(segmentBody(text, 0), {
+        ...context,
+        source: text,
+        file: full,
+        rootUnit,
+        structuralEvents: [],
+      })
         .map((seg) => ({ ...seg, resourceBaseDir: seg.resourceBaseDir ?? path.dirname(full) })),
       depth + 1,
-      context
+      { ...context, file: full, rootUnit }
     );
     return subs.map((s) => {
       const direct = !s.file;
