@@ -2001,6 +2001,46 @@ Target${index} $x^2$.
   }
 });
 
+test('a word edit does not replay cold exact neighbors with retained native owners', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-retained-page-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.maxCheckpoints = 8;
+  e.canonical.schedule = () => {};
+  const previousHot = process.env.TDOM_RENDER_HOT_MAX;
+  process.env.TDOM_RENDER_HOT_MAX = '1';
+  try {
+    await e.open(String.raw`\documentclass{article}
+\begin{document}
+Watch the paragraph.
+
+Unchanged convergence paragraph.
+
+\[x^2\]
+
+\[y^2\]
+
+\[z^2\]
+\end{document}`);
+    assert.ok(e.blocks.length + 1 <= e.maxCheckpoints);
+    assert.ok(e.blocks.some(block => block.needsRender && e.chunks.get(block.id)?.forGalley !== block.galleyHash));
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    const at = e.getSource().indexOf('Watch');
+    const result = await e.edit(at, at + 5, 'Check');
+    assert.ok(result.stats.blocksTypeset <= 2, `edited + convergence probe only (got ${result.stats.blocksTypeset})`);
+    await e.renderTask;
+    assert.ok(e.getDisplayLists().every(page => page.commands.every(command =>
+      command.op !== 'pending-exact' && !(command.op === 'chunk' && command.st))));
+  } finally {
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a cold upper-page box edit prepares the exact material below its convergence point', opts, async () => {
   await eng?.close();
   eng = null;

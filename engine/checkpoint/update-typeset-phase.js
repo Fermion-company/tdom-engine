@@ -73,6 +73,10 @@ export async function runUpdateTypesetPhase(engine, {
       const block = engine.blocks[k];
       if (!engine.foregroundRenderIds.has(block.id) || !block.needsRender) continue;
       if (!chunkTargets(block).some(target => engine.chunks.get(target.key)?.forGalley !== block.galleyHash)) continue;
+      // RENDER can use a retained input directly; it needs no foreground
+      // replay merely because its exact pixels have not been requested yet.
+      if (engine.checkpoints.has(k) && (engine.blocks.length + 1 <= engine.maxCheckpoints ||
+          engine.editHold.includes(k) || engine.renderHold.has(k))) continue;
       firstDisplay = Math.min(firstDisplay, k);
       lastDisplay = Math.max(lastDisplay, k);
     }
