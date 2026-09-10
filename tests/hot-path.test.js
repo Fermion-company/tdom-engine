@@ -19,6 +19,7 @@ import { buildStream } from '../engine/checkpoint/stream.js';
 import { handlePeerMessage } from '../engine/checkpoint/peer-message.js';
 import { mayCaptureDisplayMath } from '../engine/checkpoint/render-hold.js';
 import { preemptResidentRenders } from '../engine/checkpoint/render-pump.js';
+import { abortBackgroundJob } from '../engine/checkpoint/abort-background-job.js';
 import { classifyDocument } from '../engine/checkpoint/safety.js';
 import { sourceClosure } from '../engine/checkpoint/closure.js';
 import { classifyStructuralAliases } from '../engine/checkpoint/structural-aliases.js';
@@ -2438,7 +2439,11 @@ RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition
 
 `).join('') + '\\end{document}';
   let injectedId = null;
+  let injectedStepIndex = null;
+  let injectedStepKeep = null;
   let pendingStep = null;
+  let pendingStepIndex = null;
+  let pendingStepKeep = null;
   let injectStepFailure = true;
   const commands = [];
   const wrapped = new WeakSet();
@@ -2447,10 +2452,14 @@ RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition
     wrapped.add(peer);
     const send = peer.send.bind(peer);
     peer.send = message => {
-      const header = /^(JOB|STEP)\s+(\S+)/.exec(message);
+      const header = /^(JOB|STEP)\s+(\S+)\s+(\d+)/.exec(message);
       if (header) {
         commands.push({ command: header[1], id: header[2] });
-        if (injectStepFailure && header[1] === 'STEP') pendingStep = header[2];
+        if (injectStepFailure && header[1] === 'STEP') {
+          pendingStep = header[2];
+          pendingStepIndex = Number(header[3]) - 1;
+          pendingStepKeep = new Set(e.checkpointKeepCache ?? []);
+        }
       }
       return send(message);
     };
@@ -2464,8 +2473,12 @@ RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition
       wrapPeer(peer);
       if (injectStepFailure && message.kind === 'GALLEY' && message.id === pendingStep) {
         injectedId = message.id;
+        injectedStepIndex = pendingStepIndex;
+        injectedStepKeep = new Set(pendingStepKeep);
         injectStepFailure = false;
         pendingStep = null;
+        pendingStepIndex = null;
+        pendingStepKeep = null;
         message = {
           ...message,
           json: { ...message.json, closure: 'error', closure_error: 'injected STEP native error' },
@@ -2490,15 +2503,51 @@ RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition
     assert.equal(held.galley?.tdomDeferred, true, 'the failed continuation itself was not adopted');
 
     const heldIndex = e.blocks.indexOf(held);
-    const crossing = e.blocks.map((block, index) => {
-      const marker = /RECOVERY\d+/.exec(block.text)?.[0];
-      const prefix = Math.max(...[...e.checkpoints.keys()].filter(boundary => boundary <= index));
-      return { index, marker, prefix };
-    }).find(item => item.marker && item.prefix < heldIndex && item.index > heldIndex + 1);
-    assert.ok(crossing, 'a later warm walk crosses the held block from an older checkpoint');
+    assert.equal(injectedStepIndex, heldIndex);
+    assert.ok(injectedStepKeep instanceof Set && !injectedStepKeep.has(heldIndex),
+      'the injected input was outside the measured checkpoint skeleton when STEP consumed it');
+
+    // Cost measurements and edit holds legitimately move the sparse
+    // topology after the first recovery. Build the second, independent cold
+    // gap explicitly: keep the live root, retire every successor through a
+    // later target, and restore a COPY of the keep plan under which this
+    // exact boundary was previously STEP-eligible.
+    abortBackgroundJob(e, 'test prepares a deterministic known-hold replay gap');
+    await e.bgTask.catch(() => {});
+    e.bgAbort = false;
+    e.checkpointKeepCache = new Set(injectedStepKeep);
+    e.editHold = e.editHold.filter(index => index !== heldIndex);
+    e.renderHold.delete(heldIndex);
+    const previousId = e.blocks[heldIndex - 1]?.id;
+    if (previousId) e.renderWant.delete(previousId);
+    assert.equal(e.checkpointKeepCache.has(heldIndex), false);
+    assert.equal(e.editHold.includes(heldIndex), false);
+    assert.equal(e.renderHold.has(heldIndex), false);
+    assert.equal(previousId ? e.renderWant.has(previousId) : false, false);
+    assert.equal(previousId ? [...(e.rendering ?? [])].some(key => key.startsWith(previousId + ':')) : false, false,
+      'the known native hold, not a grid/edit/render owner, must force JOB');
+
+    const crossing = e.blocks.map((block, index) => ({
+      index,
+      marker: /RECOVERY\d+/.exec(block.text)?.[0],
+    })).find(item => item.marker && item.index > heldIndex + 1);
+    assert.ok(crossing, 'the fixture has a later block to warm across the held block');
+    const rootCheckpoint = e.checkpoints.get(0);
+    assert.ok(rootCheckpoint && !rootCheckpoint.sock.destroyed,
+      'the root is a real live replay frontier');
+    for (const [index, peer] of [...e.checkpoints]) {
+      if (index === 0 || index > crossing.index) continue;
+      peer.send('DIE\n');
+      if (peer.pid) e.dyingPids.add(peer.pid);
+      e.checkpoints.delete(index);
+    }
+    assert.equal(Math.max(...[...e.checkpoints.keys()].filter(index => index <= crossing.index)), 0,
+      'the warm walk starts at root and must cross the known hold');
     commands.length = 0;
     await e.warmEditOffset(e.getSource().indexOf(crossing.marker));
     const heldCommands = commands.filter(item => item.id === injectedId).map(item => item.command);
+    assert.ok(commands.some(item => item.command === 'STEP' && item.id !== injectedId),
+      'the same warm walk still consumes ordinary STEP-eligible inputs');
     assert.ok(heldCommands.includes('JOB'), 'the known native hold retains its recovery input');
     assert.equal(heldCommands.includes('STEP'), false, 'the known native hold is never consumed in place');
     assert.equal(held.closure?.native, true, 'the valid block heals through real LuaLaTeX');
