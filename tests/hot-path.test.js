@@ -2454,7 +2454,7 @@ RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition
     peer.send = message => {
       const header = /^(JOB|STEP)\s+(\S+)\s+(\d+)/.exec(message);
       if (header) {
-        commands.push({ command: header[1], id: header[2] });
+        commands.push({ command: header[1], id: header[2], index: Number(header[3]) - 1 });
         if (injectStepFailure && header[1] === 'STEP') {
           pendingStep = header[2];
           pendingStepIndex = Number(header[3]) - 1;
@@ -2516,10 +2516,10 @@ RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition
     await e.bgTask.catch(() => {});
     e.bgAbort = false;
     e.checkpointKeepCache = new Set(injectedStepKeep);
-    e.editHold = e.editHold.filter(index => index !== heldIndex);
-    e.renderHold.delete(heldIndex);
+    e.editHold = [];
+    e.renderHold.clear();
+    e.renderWant.clear();
     const previousId = e.blocks[heldIndex - 1]?.id;
-    if (previousId) e.renderWant.delete(previousId);
     assert.equal(e.checkpointKeepCache.has(heldIndex), false);
     assert.equal(e.editHold.includes(heldIndex), false);
     assert.equal(e.renderHold.has(heldIndex), false);
@@ -2530,8 +2530,8 @@ RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition
     const crossing = e.blocks.map((block, index) => ({
       index,
       marker: /RECOVERY\d+/.exec(block.text)?.[0],
-    })).find(item => item.marker && item.index > heldIndex + 1);
-    assert.ok(crossing, 'the fixture has a later block to warm across the held block');
+    })).filter(item => item.marker && item.index >= heldIndex + 4).at(-1);
+    assert.ok(crossing, 'the fixture has a distant block after STEP can resume beyond the known hold');
     const rootCheckpoint = e.checkpoints.get(0);
     assert.ok(rootCheckpoint && !rootCheckpoint.sock.destroyed,
       'the root is a real live replay frontier');
@@ -2546,10 +2546,13 @@ RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition
     commands.length = 0;
     await e.warmEditOffset(e.getSource().indexOf(crossing.marker));
     const heldCommands = commands.filter(item => item.id === injectedId).map(item => item.command);
-    assert.ok(commands.some(item => item.command === 'STEP' && item.id !== injectedId),
-      'the same warm walk still consumes ordinary STEP-eligible inputs');
-    assert.ok(heldCommands.includes('JOB'), 'the known native hold retains its recovery input');
-    assert.equal(heldCommands.includes('STEP'), false, 'the known native hold is never consumed in place');
+    const commandTrace = JSON.stringify(commands);
+    assert.ok(commands.some(item => item.command === 'STEP' && item.index >= heldIndex + 2),
+      `the same warm walk resumes STEP after the known hold; trace=${commandTrace}`);
+    assert.ok(heldCommands.includes('JOB'),
+      `the known native hold retains its recovery input; trace=${commandTrace}`);
+    assert.equal(heldCommands.includes('STEP'), false,
+      `the known native hold is never consumed in place; trace=${commandTrace}`);
     assert.equal(held.closure?.native, true, 'the valid block heals through real LuaLaTeX');
     assert.equal(held.galley?.tdomDeferred, undefined);
 
