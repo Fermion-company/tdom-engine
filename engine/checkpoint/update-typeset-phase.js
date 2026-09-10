@@ -5,6 +5,7 @@ import { hasDefinitionEdit } from './update-helpers.js';
 import { flushVanishedLabels, labelReferenceCandidates, pushLabelDependencies } from './reference-deps.js';
 import { push2, resolvedInGalley, vecLocalsEqual } from './util/galley.js';
 import { canDeferPlainVerification } from './plain-preview.js';
+import { chunkTargets } from './chunk-targets.js';
 
 export async function runUpdateTypesetPhase(engine, {
   oldBlocks,
@@ -63,8 +64,21 @@ export async function runUpdateTypesetPhase(engine, {
       break;
     }
   }
+  // The page swaps atomically. A clean galley below the edited box is not
+  // a usable stopping point while later exact pixels on that page are cold.
+  let firstDisplay = firstDirty;
+  let lastDisplay = lastDirty;
+  if (engine.previewPolicy === 'structured' && engine.foregroundRenderIds) {
+    for (let k = 0; k < engine.blocks.length; k++) {
+      const block = engine.blocks[k];
+      if (!engine.foregroundRenderIds.has(block.id) || !block.needsRender) continue;
+      if (!chunkTargets(block).some(target => engine.chunks.get(target.key)?.forGalley !== block.galleyHash)) continue;
+      firstDisplay = Math.min(firstDisplay, k);
+      lastDisplay = Math.max(lastDisplay, k);
+    }
+  }
   const replayToken = {};
-  let i = nearestCheckpoint(Math.min(firstDirty, engine.blocks.length));
+  let i = nearestCheckpoint(Math.min(firstDisplay, engine.blocks.length));
   while (i < engine.blocks.length) {
     // /status liveness marker: which block the foreground pass is on —
     // a long boot walk shows movement instead of silence
@@ -102,7 +116,7 @@ export async function runUpdateTypesetPhase(engine, {
     // snapshot (for example an included chapter plus the generated .bbl at
     // the end). Never accept an intermediate clean block as convergence
     // while a later source-dirty block is still waiting.
-    if (i <= lastDirty) continue;
+    if (i <= lastDisplay) continue;
     if (!wasClean) {
       if (!defEdit && changed && i > lastNoGalley && i < engine.blocks.length &&
           dirtyBlocks.length === 1 && dirtyBlocks[0] === block.id && !changedLabels.size &&

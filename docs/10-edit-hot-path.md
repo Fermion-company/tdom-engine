@@ -186,6 +186,8 @@ display list は本文 glyph と行単位の exact chunk を別素材として�
 
 ## 10.10b checkpoint 予算の硬い上限
 
+structured page の差し替えには、その page の未変更部分も含む exact chunk が必要になる。foreground walk は source-dirty block の後で galley が収束しても、同じ既存 page の未準備 exact block までは続ける。前方の未準備 block も再開位置に含める。renderHold の枠はこの page 群を優先し、そこへ到達するためだけに再実行した無関係な prefix の描画で埋めない。保持数の上限は変えず、準備済み chunk がある page の通常の収束停止は維持する。
+
 `maxCheckpoints`（既定は env、主サーバは 8）は通常の常駐 checkpoint 骨格の予算である。骨格を block 数の等間隔にすると、編集点との間に巨大な TikZ / user macro block が一つあるだけで、無関係な地の文の毎打鍵がその block を再実行する（実測: 160 回の複合 macro 展開を跨いだ日本語 1 文字が 4.4 秒）。そこで各 block の cold typeset 高水位時間を記録し、最も高価な block の入力・出力境界を優先して残し、余りを重み付き分位へ配る。これは `tikzpicture` や `tcolorbox` の名前を判定する局所対応ではなく、未知 package / macro にも同じ実測原理で働く。上記 fixture では同じ編集が fresh-open 直後でも 15ms になった。
 末尾用の保存枠は、終端の `\par`・skip・改ページだけの block より前に置く。通常の保存間隔内に明示的な改ページがあればその直後を選び、最後の本文と未変更の見出しを同じ短い walk で用意する。このソース上の手掛かりは保存位置にのみ使い、組版する token は省略しない。選択順は root、高コスト block の入力・出力境界、末尾 anchor、残枠の重み付き分位である。予算内に全候補が収まらない場合は末尾の予測可能性を優先するため、予算値によらず分位境界や最後の高コスト block の出力境界が外れ、末尾以外の編集が追加 block を再実行する場合がある。
 

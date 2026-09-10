@@ -228,9 +228,15 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
 
   // Pin before the walk can retire a newly materialized input or capture
   // owner. Finalization cannot recover a checkpoint that has already died.
+  const pageRenderIds = editPageRenderIds(engine.blocks, engine.pages, dirtySource);
+  engine.foregroundRenderIds = rebooted || !dirtySource.size ? null : new Set([...dirtySource, ...pageRenderIds]);
+  if (engine.foregroundRenderIds) {
+    for (const [index, id] of engine.renderHold) {
+      if (!engine.foregroundRenderIds.has(id)) engine.renderHold.delete(index);
+    }
+  }
   engine.editHold = rebooted ? [] : nextEditHold(firstDirty,
-    [...dirtySource, ...editPageRenderIds(engine.blocks, engine.pages, dirtySource)],
-    engine.blocks, engine.editHold);
+    [...dirtySource, ...pageRenderIds], engine.blocks, engine.editHold);
 
   return { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted };
 }

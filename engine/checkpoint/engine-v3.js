@@ -827,7 +827,8 @@ export class CheckpointEngine {
       checkpoints: this.checkpoints,
       editHold: this.editHold,
       renderHold: this.renderHold,
-      block: this.blocks[idx],
+      block: this.foregroundRenderIds && !this.foregroundRenderIds.has(this.blocks[idx]?.id)
+        ? null : this.blocks[idx],
       dyingPids: this.dyingPids,
     });
   }
@@ -1017,6 +1018,7 @@ export class CheckpointEngine {
           return await this.#updateInner({ ...args, announceDocumentReset });
         } finally {
           this.updating = false;
+          this.foregroundRenderIds = null;
           this.progress = null; // /status liveness marker
         }
       });

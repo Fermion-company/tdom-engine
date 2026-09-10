@@ -2001,6 +2001,58 @@ Target${index} $x^2$.
   }
 });
 
+test('a cold upper-page box edit prepares the exact material below its convergence point', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-cold-upper-page-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.maxCheckpoints = 4;
+  e.canonical.schedule = () => {};
+  const previousHot = process.env.TDOM_RENDER_HOT_MAX;
+  process.env.TDOM_RENDER_HOT_MAX = '1';
+  const missing = page => e.getDisplayLists().find(item => item.page === page)?.commands.filter(command =>
+    command.op === 'pending-exact' || command.op === 'chunk' && command.st);
+  const source = String.raw`\documentclass{article}
+\usepackage[most]{tcolorbox}
+\usepackage{amsmath}
+\begin{document}
+` + Array.from({ length: 12 }, (_, index) => String.raw`
+\begin{tcolorbox}[title=Heading${index}]Unchanged heading.\end{tcolorbox}
+
+\begin{tcolorbox}Upper${index} text is edited here.\end{tcolorbox}
+
+\begin{tcolorbox}Lower${index} text stays unchanged.\end{tcolorbox}
+
+\[\frac{x+1}{y+1}\]
+
+\begin{tcolorbox}Another${index} box stays unchanged.\end{tcolorbox}
+
+\[\sum_{k=1}^{n} k\]
+
+\[\int_0^1 x^2\,dx\]
+
+\newpage
+
+`).join('') + '\\end{document}';
+  try {
+    await e.open(source);
+    assert.equal(e.pages.length, 12);
+    assert.ok(missing(7).length >= 5, 'the target starts with cold exact neighbors');
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    const at = e.getSource().indexOf('Upper6') + 'Upper6'.length;
+    await e.edit(at, at, ' has more text which changes the height of this upper box. '.repeat(3));
+    await e.renderTask;
+    assert.deepEqual(missing(7), [], 'the lower equations must not wait for an isolated cold compile');
+    assert.equal(e.pages.length, 12);
+  } finally {
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('native exact renders preserve decoration ink outside the logical box', opts, async () => {
   await eng?.close();
   eng = null;

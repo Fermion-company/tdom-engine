@@ -191,6 +191,7 @@ export function initializeEngineState(
   engine.captureSeq = 0; // monotonic generation token for retained JOB node lists
   engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };
   engine.renderHold = new Map(); // ckpt idx kept alive for a pending render -> block.id
+  engine.foregroundRenderIds = null;
   // Edit-locus pinning: the checkpoints at (and right after) the block the
   // user is typing in are exempt from grid retirement, so a keystroke burst
   // is always "fork once + typeset one block", never a grid replay.
