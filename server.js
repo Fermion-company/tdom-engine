@@ -16,7 +16,7 @@
 
 import http from 'node:http';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, watch, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -632,6 +632,13 @@ function isRealPathInside(root, candidate) {
   try { return isPathInside(realpathSync(root), realpathSync(candidate)); } catch { return false; }
 }
 
+function ownAutosaveOfEdit(readPath, file, diskBytes, requestedText, clientEditAtEpochMs) {
+  if (readPath !== file || diskBytes !== requestedText) return false;
+  const editedAt = Number(clientEditAtEpochMs);
+  if (!Number.isFinite(editedAt)) return false;
+  try { return statSync(file).mtimeMs >= editedAt; } catch { return false; }
+}
+
 function childAnchorEditBeforeOverlay(context, body, source, rootChanged) {
   const overlays = Array.isArray(body?.overlays) ? body.overlays : [];
   const removals = Array.isArray(body?.removeOverlays) ? body.removeOverlays : [];
@@ -665,7 +672,12 @@ function childAnchorEditBeforeOverlay(context, body, source, rootChanged) {
   if (!safeReadPath || !existsSync(readPath)) return null;
   let diskBytes;
   try { diskBytes = readFileSync(readPath, 'utf8'); } catch { return null; }
-  if (diskBytes !== prior.text) return null;
+  // Autosave may write this edit's own bytes before the edit reaches the
+  // engine; the write must postdate the keystroke. Any other bytes are an
+  // unobserved change to the witnessed input.
+  if (diskBytes !== prior.text && !ownAutosaveOfEdit(readPath, file, diskBytes, item.text, body?.clientEditAtEpochMs)) {
+    return null;
+  }
   const delta = singlePlainTextDelta(prior.text, item.text);
   return delta ? { ...delta, file, canonicalInputPath: readPath } : null;
 }

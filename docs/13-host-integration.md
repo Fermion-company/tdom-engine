@@ -78,6 +78,7 @@ Electron ホストは `execPath: process.execPath` と `extraEnv: { ELECTRON_RUN
 - 組版対象は常に **root 文書**である。子ファイルのタブに切り替えただけで root が差し替わることはない。
 - 未保存の子バッファは **overlay** として渡り、変わったものだけが差分として送られる。閉じられた（または保存された）バッファは `removeOverlays` で外れる。
 - `removeOverlays` の時点でディスクが overlay と同じバイト列なら（保存）、エンジンは overlay ファイルを入力として残す（`savedOverlays`）。実効入力は変わらないので srcRev・anchor epoch・canonical の input epoch を進めず、その `/edit` は直前の report を返す。overlay が被さっているファイルへのディスク書込み（自動保存の fs.watch 通知を含む）も入力変化として扱わない。保存済み overlay と異なるバイト列がディスクに書かれたときだけ overlay を外し、通常の除去として refresh する。
+- 子ファイル anchor の直前入力の検証は、ディスクが直前に読んだ内容と同じか、この編集の要求内容と同じで mtime が打鍵時刻（`clientEditAtEpochMs`）以降の場合だけ通す（編集がエンジンへ届く前に自動保存が同じ内容を書いた場合）。
 - root が未変更で mtime も同じなら、ディスクを読み直さず保持中のソースを使う。無意味な全文 diff を避ける。
 - `workspaceRoot` の外へ出るパスは拒否される。
 
