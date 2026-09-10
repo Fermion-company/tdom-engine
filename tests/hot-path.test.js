@@ -37,6 +37,7 @@ import {
   planTerminalCanonicalAnchor,
   singlePlainTextDelta,
 } from '../engine/checkpoint/canonical-anchor.js';
+import { singleLiteralChildReadProof } from '../engine/checkpoint/dependency-read-proof.js';
 
 const TEST_WORK_ROOT = process.env.TDOM_TEST_WORK_ROOT;
 const workDir = (name) => TEST_WORK_ROOT
@@ -838,6 +839,57 @@ async function drain(eng, timeoutMs = 120_000) {
 
 /** Lineage-independent identity of the whole document state. */
 const signature = (eng) => eng.blocks.map((b) => `${b.galleyHash}|${b.stateVec}`);
+
+test('child anchor read proof rejects aliases and untracked project readers', () => {
+  const root = path.resolve('/project/main.tex');
+  const child = path.resolve('/project/content/chapter.tex');
+  const stale = path.resolve('/project/content/old.tex');
+  const source = String.raw`\documentclass{article}
+\begin{document}
+\input{content/chapter}
+\end{document}`;
+  const read = {
+    actualPath: child, readPath: child, command: 'input', raw: 'content/chapter',
+    depth: 0, parentFile: root, rootUnit: 1,
+  };
+  const includes = new Map([
+    [child, { text: 'Visible child prose.\n' }],
+    [stale, { text: String.raw`\input{\dynamic}` }],
+  ]);
+  const proof = singleLiteralChildReadProof({
+    source, sourceFile: root, targetFile: child, trace: [read], includes, inputEpoch: 9,
+  });
+  assert.equal(proof?.targetFile, child);
+  assert.equal(proof?.inputEpoch, 9);
+  assert.equal(proof?.source, source);
+
+  const dynamicBefore = source.replace('\\input{content/chapter}',
+    String.raw`\input{\dynamic}
+\input{content/chapter}`);
+  const dynamicAfter = source.replace('\\input{content/chapter}',
+    String.raw`\input{content/chapter}
+\input{\dynamic}`);
+  for (const unsafeSource of [dynamicBefore, dynamicAfter]) {
+    assert.equal(singleLiteralChildReadProof({
+      source: unsafeSource, sourceFile: root, targetFile: child,
+      trace: [read], includes, inputEpoch: 9,
+    }), null, 'a dynamic reader before or after the target is not accounted');
+  }
+
+  assert.equal(singleLiteralChildReadProof({
+    source, sourceFile: root, targetFile: child,
+    trace: [read], includes: new Map([[child, { text: String.raw`\input{\dynamic}` }]]),
+    inputEpoch: 9,
+  }), null, 'a dynamic reader inside a reached child is not accounted');
+  assert.equal(singleLiteralChildReadProof({
+    source: source.replace('\\end{document}', '\\input{content/../content/chapter}\n\\end{document}'),
+    sourceFile: root,
+    targetFile: child,
+    trace: [read, { ...read, raw: 'content/../content/chapter', rootUnit: 2 }],
+    includes,
+    inputEpoch: 9,
+  }), null, 'a second alias to the same child is ambiguous');
+});
 
 test('one wholly-owned child prose edit keeps a frozen canonical input lineage', () => {
   const child = path.resolve('/project/content/chapter.tex');

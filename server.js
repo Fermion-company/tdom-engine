@@ -30,6 +30,7 @@ import {
   singlePlainTextDelta,
 } from './engine/checkpoint/canonical-anchor.js';
 import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
+import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read-proof.js';
 
 // Certified canonical anchoring is deliberately narrow: only plain-text
 // edits whose unchanged line structure, backend run semantics, SyncTeX
@@ -586,7 +587,7 @@ function isRealPathInside(root, candidate) {
   try { return isPathInside(realpathSync(root), realpathSync(candidate)); } catch { return false; }
 }
 
-function childAnchorEditBeforeOverlay(context, body, rootChanged) {
+function childAnchorEditBeforeOverlay(context, body, source, rootChanged) {
   const overlays = Array.isArray(body?.overlays) ? body.overlays : [];
   const removals = Array.isArray(body?.removeOverlays) ? body.removeOverlays : [];
   if (rootChanged || overlays.length !== 1 || removals.length !== 0) return null;
@@ -594,6 +595,16 @@ function childAnchorEditBeforeOverlay(context, body, rootChanged) {
   const file = typeof item?.filePath === 'string' ? path.resolve(item.filePath) : null;
   if (!file || typeof item?.text !== 'string' || !isPathInside(context.docDir, file) ||
       file === path.resolve(context.filePath) || path.extname(file).toLowerCase() !== '.tex') return null;
+  const readProof = singleLiteralChildReadProof({
+    source,
+    sourceFile: context.filePath,
+    targetFile: file,
+    trace: engine.shippingIncludeTrace,
+    includes: engine.includes,
+    inputEpoch: engine.canonical.inputEpoch,
+  });
+  if (!readProof || readProof.source !== source ||
+      readProof.inputEpoch !== engine.canonical.inputEpoch) return null;
   const prior = engine.includes.get(file);
   const readPath = typeof prior?.readPath === 'string' ? path.resolve(prior.readPath) : null;
   if (!readPath || typeof prior?.text !== 'string') return null;
@@ -1619,7 +1630,7 @@ const server = http.createServer(async (req, res) => {
           const next = current.slice(0, start) + text + current.slice(end);
           const rootChanged = next !== current;
           const childAnchorEdit = ENABLE_CANONICAL_ANCHOR
-            ? childAnchorEditBeforeOverlay(activeProject, body, rootChanged)
+            ? childAnchorEditBeforeOverlay(activeProject, body, current, rootChanged)
             : null;
           anchorEdit = rootChanged ? { start, end, text } : childAnchorEdit;
           if (ENABLE_CANONICAL_ANCHOR && anchorEdit) {
