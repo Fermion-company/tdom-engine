@@ -77,6 +77,7 @@ Electron ホストは `execPath: process.execPath` と `extraEnv: { ELECTRON_RUN
 
 - 組版対象は常に **root 文書**である。子ファイルのタブに切り替えただけで root が差し替わることはない。
 - 未保存の子バッファは **overlay** として渡り、変わったものだけが差分として送られる。閉じられた（または保存された）バッファは `removeOverlays` で外れる。
+- `removeOverlays` の時点でディスクが overlay と同じバイト列なら（保存）、エンジンは overlay ファイルを入力として残す（`savedOverlays`）。実効入力は変わらないので srcRev・anchor epoch・canonical の input epoch を進めず、その `/edit` は直前の report を返す。overlay が被さっているファイルへのディスク書込み（自動保存の fs.watch 通知を含む）も入力変化として扱わない。保存済み overlay と異なるバイト列がディスクに書かれたときだけ overlay を外し、通常の除去として refresh する。
 - root が未変更で mtime も同じなら、ディスクを読み直さず保持中のソースを使う。無意味な全文 diff を避ける。
 - `workspaceRoot` の外へ出るパスは拒否される。
 
@@ -109,7 +110,7 @@ IME 変換中は snapshot に `deferred: true` を立てる。ドライバは pu
 
 `createEmbedClient()` はその postMessage 往復を包む。
 
-- ホスト → frame: `{ source: 'tdom-host', activationId, action, ... }` — `zoom-in` / `zoom-out` / `zoom-fit` / `goto-page` / `page-prev` / `page-next` / `goto-sync` / `search` / `reset-ack`
+- ホスト → frame: `{ source: 'tdom-host', activationId, action, ... }` — `zoom-in` / `zoom-out` / `zoom-fit` / `goto-page` / `page-prev` / `page-next` / `goto-sync`/ `search` / `reset-ack`
 - frame → ホスト: `{ source: 'tdom-embed', activationId, ... }` — 400ms 間隔のスナップショット（`ready` / `pageCount` / `zoom` / `page` / `status` / `search`）に加え、`reset-pending`（文書リセット開始）・`source`（クリック位置のソース逆引き）・`edit`（プレビュー直接編集）
 
 `activationId` は URL でホストが渡す。前の活性化から残った iframe が、すでに別の文書やエンジンへ移ったビューアを操作できないようにするためである。

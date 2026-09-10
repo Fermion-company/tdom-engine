@@ -31,6 +31,7 @@ import {
 } from './engine/checkpoint/canonical-anchor.js';
 import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
 import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read-proof.js';
+import { watchInclude } from './engine/checkpoint/include-expander.js';
 import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
 
 // Certified canonical anchoring is deliberately narrow: only plain-text
@@ -548,14 +549,17 @@ async function materializeProjectBibliography(source, context) {
 }
 
 function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = {}, replace = false) {
-  if (!context.overlayDir) return { changed: [], removed: [] };
+  if (!context.overlayDir) return { changed: [], removed: [], saved: [] };
+  context.savedOverlays ??= new Map();
   if (replace) {
     rmSync(context.overlayDir, { recursive: true, force: true });
     context.overlays.clear();
+    context.savedOverlays.clear();
   }
   mkdirSync(context.overlayDir, { recursive: true });
   const changed = [];
   const removed = [];
+  const saved = [];
   let totalBytes = 0;
   for (const item of Array.isArray(overlays) ? overlays : []) {
     const filePath = typeof item?.filePath === 'string' ? path.resolve(item.filePath) : null;
@@ -567,6 +571,14 @@ function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = 
       throw new Error('project overlay exceeds the live-preview text limit');
     }
     if (context.overlays.get(filePath) === text) continue;
+    const savedText = context.savedOverlays.get(filePath);
+    context.savedOverlays.delete(filePath);
+    if (savedText === text) {
+      // The file is dirty again with the bytes its saved overlay already
+      // holds; the effective input has not changed.
+      context.overlays.set(filePath, text);
+      continue;
+    }
     const rel = path.relative(context.docDir, filePath);
     const target = path.join(context.overlayDir, rel);
     mkdirSync(path.dirname(target), { recursive: true });
@@ -577,12 +589,43 @@ function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = 
   for (const raw of Array.isArray(removeOverlays) ? removeOverlays : []) {
     const filePath = typeof raw === 'string' ? path.resolve(raw) : null;
     if (!filePath || !isPathInside(context.docDir, filePath) || !context.overlays.has(filePath)) continue;
+    const text = context.overlays.get(filePath);
     context.overlays.delete(filePath);
+    let diskText = null;
+    try { diskText = readFileSync(filePath, 'utf8'); } catch { /* deleted on disk */ }
+    if (diskText === text) {
+      // The host saved exactly the overlay bytes. Keep the overlay file as the
+      // physical input so resident reads, canonical SyncTeX paths and content
+      // signatures stay on one path; the effective input is unchanged. A later
+      // disk change with other bytes retires it (onExternalChange).
+      context.savedOverlays.set(filePath, text);
+      watchInclude(filePath, engine.watchers, (changedInput) => engine.onExternalChange?.(changedInput));
+      saved.push(filePath);
+      continue;
+    }
     const target = path.join(context.overlayDir, path.relative(context.docDir, filePath));
     rmSync(target, { force: true });
     removed.push(filePath);
   }
-  return { changed, removed };
+  return { changed, removed, saved };
+}
+
+// A disk write is a TeX input change only when no overlay shadows that file.
+// A saved overlay stays the input while the disk holds its bytes.
+function diskChangeShadowedByOverlay(context, file) {
+  if (!file || !context?.overlayDir) return false;
+  if (context.overlays.has(file)) return true;
+  const saved = context.savedOverlays?.get(file);
+  if (saved === undefined) return false;
+  try { return readFileSync(file, 'utf8') === saved; } catch { return false; }
+}
+
+// Make the disk file the input again after it diverged from its saved overlay.
+function retireSavedOverlay(context, file) {
+  if (!file || !context?.savedOverlays?.has(file)) return false;
+  context.savedOverlays.delete(file);
+  rmSync(path.join(context.overlayDir, path.relative(context.docDir, file)), { force: true });
+  return true;
 }
 
 function isRealPathInside(root, candidate) {
@@ -743,9 +786,15 @@ engine.onAsyncPatches = (partial) => {
   broadcast({ kind: 'patches', rev: partial.rev, fonts: partial.fonts, patches: partial.patches });
 };
 engine.onExternalChange = (changedInput) => {
+  const changedFile = typeof changedInput === 'string' ? path.resolve(changedInput) : null;
+  if (diskChangeShadowedByOverlay(activeProject, changedFile)) return;
   terminalAnchorLineage = null;
   terminalAnchorEpoch++;
   withEngine(async () => {
+    // An overlay can land while this refresh waits behind the edit that
+    // carries it; the write then no longer changes any TeX input.
+    if (diskChangeShadowedByOverlay(activeProject, changedFile)) return lastReport;
+    const retired = retireSavedOverlay(activeProject, changedFile);
     const source = engine.getSource();
     const nextBibliography = describeExternalBibliography(source, activeProject.docDir, activeProject.overlayDir);
     const previousBibliography = activeProject.bibliography;
@@ -766,7 +815,9 @@ engine.onExternalChange = (changedInput) => {
       broadcast({ kind: 'update', report: lastReport });
       return lastReport;
     }
-    lastReport = await engine.refresh({ changed: changedInput ? [changedInput] : [], unknown: !changedInput });
+    lastReport = retired
+      ? await engine.refresh({ removed: [changedFile] })
+      : await engine.refresh({ changed: changedInput ? [changedInput] : [], unknown: !changedInput });
     if (bibliographyChanged) {
       broadcast({ kind: 'update', report: lastReport });
       await materializeProjectBibliography(source, activeProject);
@@ -945,6 +996,14 @@ function docPayload() {
   };
 }
 
+// The bytes TeX currently reads for a project file when they are not the
+// disk file's: a live overlay, then a saved one. Callers read the disk
+// otherwise.
+function projectInputOverride(file) {
+  const resolved = path.resolve(file);
+  return activeProject.overlays.get(resolved) ?? activeProject.savedOverlays?.get(resolved) ?? null;
+}
+
 function bibliographySourceLocation(generatedText, generatedLine = null) {
   const lines = String(generatedText || '').split(/\r?\n/);
   const limit = Number.isFinite(generatedLine)
@@ -960,7 +1019,7 @@ function bibliographySourceLocation(generatedText, generatedLine = null) {
   for (const file of files) {
     let text;
     try {
-      text = activeProject.overlays.get(path.resolve(file)) ?? readFileSync(file, 'utf8');
+      text = projectInputOverride(file) ?? readFileSync(file, 'utf8');
     } catch {
       continue;
     }
@@ -1030,7 +1089,7 @@ function activeSourceLine(file, line) {
   const projectFile = path.resolve(file);
   let text = null;
   if (projectFile === path.resolve(activeProject.filePath)) text = engine.getSource();
-  else text = activeProject.overlays.get(projectFile) ?? null;
+  else text = projectInputOverride(projectFile);
   if (text == null) {
     try { text = readFileSync(projectFile, 'utf8'); } catch { return ''; }
   }
@@ -1609,6 +1668,7 @@ const server = http.createServer(async (req, res) => {
       let anchorEdit = null;
       let anchorMutation = false;
       let anchorPriorLineage = null;
+      let inputUnchanged = false;
       const anchorAcceptedAt = performance.now();
       const rawClientEditAt = Number(body.clientEditAtEpochMs);
       const nowEpoch = Date.now();
@@ -1650,6 +1710,12 @@ const server = http.createServer(async (req, res) => {
           }
           const overlayDelta = applyProjectOverlays(activeProject, body);
           const changedInputs = [...overlayDelta.changed, ...overlayDelta.removed];
+          if (!rootChanged && !changedInputs.length) {
+            // Saving an overlay's bytes leaves every TeX input as it was: no
+            // new source revision, anchor epoch or canonical input epoch.
+            inputUnchanged = true;
+            return lastReport;
+          }
           anchorMutation = rootChanged || changedInputs.length > 0;
           if (anchorMutation) {
             anchorEpoch = ++terminalAnchorEpoch;
@@ -1751,6 +1817,7 @@ const server = http.createServer(async (req, res) => {
         }
         throw err;
       }
+      if (inputUnchanged) return json(res, lastReport);
       if (Number(lastAnchorPresentation?.srcRev) !== Number(lastReport.srcRev)) {
         lastAnchorPresentation = null;
       }
