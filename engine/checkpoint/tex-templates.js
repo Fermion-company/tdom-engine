@@ -491,7 +491,9 @@ export function buildIsoCompileSource({
       // bogus page context): material is DISCARDED, so the harvest must
       // not be trusted — count it and let the node side fail the compile
       'if tdom_iso.fires > 50 then tdom_iso.discarded = (tdom_iso.discarded or 0) + 1 tex.box[boxnum] = nil return end ' +
-      'tex.deadcycles = 0 ' +
+      // LuaTeX ignores a tex.deadcycles assignment: hand the reset to TeX
+      // (runs inside \output, right after this call)
+      'tex.sprint(string.char(92) .. "deadcycles=0" .. string.char(92) .. "relax") ' +
       'if tdom_iso.ships == 0 then tdom_iso.preabsorbs = (tdom_iso.preabsorbs or 0) + 1 end ' +
       'local b = tex.box[boxnum] ' +
       'local list = nil ' +

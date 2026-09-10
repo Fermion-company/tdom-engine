@@ -1038,7 +1038,11 @@ function tdom_absorb_output(boxnum)
       ' times in one block — page-builder cycle, bailing out of this fork')
     fk._exit(3)
   end
-  tex.deadcycles = 0
+  -- LuaTeX ignores a tex.deadcycles assignment. Queue TeX's own reset to
+  -- run inside \output after this call; without it every absorbed fire
+  -- (two per \clearpage) accumulated along the fork lineage, and ~100 pages
+  -- in each later eject died with "Output loop" and a forced \shipout.
+  tex.sprint('\\deadcycles=0\\relax')
   local pen = tex.outputpenalty or -10000
   if os.getenv('TDOM_TRACE_OUTPUT') then
     local jid = JOB and JOB.id or '?'

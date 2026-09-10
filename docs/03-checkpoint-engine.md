@@ -191,7 +191,7 @@ render lane の終了時にも queue を再確認する。全 lane が終了判�
 
 CAPTURE の初期対象は `\[...\]`、`$$...$$`、equation/align/gather/multline 等の display math に限定する。token は source edit ごとに単調増加し、block id と token の両方が一致した場合だけ shipout する。capture child を fork した直後に checkpoint 親の list を解放し、次の JOB child は継承した古い list を組版前に破棄する。graphics、float、breakable box は backend/output-routine state の所有境界が異なるため、従来の RENDER/isolated 経路を使う。
 
-通常driverとisolated rescueの吸収用output routineは、TeXの `\global\setbox...=\box255\relax` で出力boxを専用boxへ移してからLuaで回収する。`\relax` はbox番号の読み取りを終え、代入前に後続の `\directlua` が展開されることを防ぐ。isolated rescueの最終回収はpage listとcontribution listの両方を連結し、改ページ直後にcontribution側へ戻った本文も保持する。
+通常driverとisolated rescueの吸収用output routineは、TeXの `\global\setbox...=\box255\relax` で出力boxを専用boxへ移してからLuaで回収する。`\relax` はbox番号の読み取りを終え、代入前に後続の `\directlua` が展開されることを防ぐ。吸収は ship しないので毎回 dead cycle になるが、LuaTeX は `tex.deadcycles` への代入を無視する。回収関数は `tex.sprint('\\deadcycles=0\\relax')` で TeX 自身に戻させ（output routine の中で Lua 呼び出しの直後に実行される）、fork の系列に沿って `\maxdeadcycles` へ積み上がらないようにする。暴走上限（fires > 50）に達した発火では戻さない。isolated rescueの最終回収はpage listとcontribution listの両方を連結し、改ページ直後にcontribution側へ戻った本文も保持する。
 
 通常の `\newpage`・`\clearpage`・`\cleardoublepage` は native の吸収処理で前後の素材と eject marker を保持し、命令名だけでは isolated rescue にしない。`\maketitle` の class 固有出力と、独自 output routine を使う環境は rescue 判定を維持する。
 
