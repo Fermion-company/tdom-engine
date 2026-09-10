@@ -6342,6 +6342,9 @@ pagesEl.addEventListener('scroll', () => {
       });
     };
     let embedSnapshotRaf = null;
+    // The last host goto-sync this frame actually scrolled to. The host keeps
+    // its static page up until the frame confirms the handed-off viewport.
+    let embedViewportToken = null;
     const postEmbedSnapshot = () => {
       try {
         const visible = visiblePageSnapshot();
@@ -6363,6 +6366,8 @@ pagesEl.addEventListener('scroll', () => {
             pageCount: visible.entries.length,
             zoom,
             page: visible.topPage,
+            srcRev: appliedSrcRev,
+            viewportToken: embedViewportToken,
             status: lastEngineStatus,
             search: {
               query: liveSearch.query,
@@ -6472,6 +6477,7 @@ pagesEl.addEventListener('scroll', () => {
         ? blockY + (Number.isFinite(blockHeight) ? blockHeight / 2 : 0)
         : Number(data.y);
       scrollPageToViewport(page, Number.isFinite(y) ? y : 0, true);
+      embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
       void refineSyncToSource(data);
       requestAnimationFrame(scheduleEmbedSnapshot);
     };

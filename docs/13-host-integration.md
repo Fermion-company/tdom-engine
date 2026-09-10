@@ -111,8 +111,8 @@ IME 変換中は snapshot に `deferred: true` を立てる。ドライバは pu
 
 `createEmbedClient()` はその postMessage 往復を包む。
 
-- ホスト → frame: `{ source: 'tdom-host', activationId, action, ... }` — `zoom-in` / `zoom-out` / `zoom-fit` / `goto-page` / `page-prev` / `page-next` / `goto-sync`/ `search` / `reset-ack`
-- frame → ホスト: `{ source: 'tdom-embed', activationId, ... }` — 400ms 間隔のスナップショット（`ready` / `pageCount` / `zoom` / `page` / `status` / `search`）に加え、`reset-pending`（文書リセット開始）・`source`（クリック位置のソース逆引き）・`edit`（プレビュー直接編集）
+- ホスト → frame: `{ source: 'tdom-host', activationId, action, ... }` — `zoom-in` / `zoom-out` / `zoom-fit` / `goto-page` / `page-prev` / `page-next` / `goto-sync`（任意の `viewportToken` を付けると、そのページへスクロールした後のスナップショットが同じ token を返す）/ `search` / `reset-ack`
+- frame → ホスト: `{ source: 'tdom-embed', activationId, ... }` — 400ms 間隔のスナップショット（`ready` / `presentationPending` / `pageCount` / `zoom` / `page` / `srcRev`（適用済みの source revision）/ `viewportToken`（最後にスクロールした `goto-sync` の token）/ `status` / `search`）に加え、`reset-pending`（文書リセット開始）・`source`（クリック位置のソース逆引き）・`edit`（プレビュー直接編集）
 
 `activationId` は URL でホストが渡す。前の活性化から残った iframe が、すでに別の文書やエンジンへ移ったビューアを操作できないようにするためである。
 
