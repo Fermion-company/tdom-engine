@@ -32,8 +32,10 @@ import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finaliz
 import { classifyResidentEdit } from '../engine/checkpoint/resident-edit-admission.js';
 import { plainPreviewWitness, canDeferPlainVerification } from '../engine/checkpoint/plain-preview.js';
 import {
+  captureCanonicalAnchorBase,
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
+  singlePlainTextDelta,
 } from '../engine/checkpoint/canonical-anchor.js';
 
 const TEST_WORK_ROOT = process.env.TDOM_TEST_WORK_ROOT;
@@ -836,6 +838,91 @@ async function drain(eng, timeoutMs = 120_000) {
 
 /** Lineage-independent identity of the whole document state. */
 const signature = (eng) => eng.blocks.map((b) => `${b.galleyHash}|${b.stateVec}`);
+
+test('one wholly-owned child prose edit keeps a frozen canonical input lineage', () => {
+  const child = path.resolve('/project/content/chapter.tex');
+  const diskInput = path.resolve('/project/content/chapter.tex');
+  const line = (text) => ({
+    k: 'box', w: 100, h: 8, d: 2,
+    runs: [{ t: text, x: 0, w: 60, s: 10, f: 'body', dy: 0 }],
+  });
+  const galley = (text) => ({
+    items: [line(text)], floats: [], events: [], labels: [], refs: [], toclines: [],
+  });
+  const oldBlock = {
+    id: 'child-prose', file: child, start: 0, end: 11, text: 'Alpha prose',
+    sourceStart: { line: 31, column: 1 }, sourceEnd: { line: 31, column: 12 },
+    fidelity: { level: 'safe-glyph' }, stateVec: '[1,2,3,4,5,6,7,8]',
+    editRegions: [{ kind: 'text', contentStart: 0, contentEnd: 11 }],
+    galley: galley('Alpha'),
+  };
+  const dom = {
+    id: oldBlock.id, file: child, span: null,
+    source: { file: child, start: oldBlock.sourceStart, end: oldBlock.sourceEnd },
+  };
+  const certificate = {
+    id: 7, rev: 10, inputEpoch: 4, pdfHash: 'pdf-a', synctexHash: 'sync-a',
+  };
+  const firstEdit = { ...singlePlainTextDelta('Alpha prose', 'Alpha prose B'),
+    file: child, canonicalInputPath: diskInput };
+  const baseSnapshot = captureCanonicalAnchorBase({
+    blocks: [oldBlock], domBlocks: [dom], edit: firstEdit, certificate,
+  });
+  assert.deepEqual(baseSnapshot?.span, { start: 0, end: 11 },
+    'the child-local range stays private while the public DOM span remains null');
+  assert.equal(dom.span, null);
+  assert.equal(baseSnapshot?.canonicalInputPath, diskInput,
+    'SyncTeX queries retain the pre-overlay physical input name');
+
+  const report = (srcRev, text) => ({
+    mode: 'structured', previewPolicy: 'canonical-anchor', srcRev,
+    canonical: { id: 7, rev: 10, pageCount: 316 }, stats: { pageCount: 134 },
+    dirtySourceNodes: ['src-child-prose'],
+    patches: [{ type: 'replace-page', page: 52, displayList: { commands: [
+      { op: 'glyphs', src: 'child-prose', line: 0, x: 72, y: 600, w: 60,
+        gh: 8, gd: 2, size: 10, text },
+    ] } }],
+  });
+  const current = (text) => ({
+    ...oldBlock, end: text.length, text,
+    editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length }],
+    galley: galley(text.endsWith('B') ? 'Bravo' : 'Charlie'),
+  });
+  const firstPlan = planTerminalCanonicalAnchor({
+    blocks: [current('Alpha prose B')], domBlocks: [dom], report: report(11, 'Bravo'),
+    geometry: { textheight: 680 }, edit: firstEdit, baseSnapshot, inputEpoch: 5,
+  });
+  assert.equal(firstPlan?.baseSnapshot, baseSnapshot);
+  assert.equal(firstPlan?.inputEpoch, 5);
+
+  const secondEdit = { ...singlePlainTextDelta('Alpha prose B', 'Alpha prose C'), file: child };
+  const secondPlan = planTerminalCanonicalAnchor({
+    blocks: [current('Alpha prose C')], domBlocks: [dom], report: report(12, 'Charlie'),
+    geometry: { textheight: 680 }, edit: secondEdit, inputEpoch: 6,
+    lineage: {
+      blockId: firstPlan.blockId, baseGeneration: firstPlan.baseGeneration,
+      baseRev: firstPlan.baseRev, lastSrcRev: firstPlan.srcRev, baseSnapshot,
+    },
+  });
+  assert.equal(secondPlan?.baseSnapshot, baseSnapshot,
+    'rapid B→C continues from immutable A rather than treating B as canonical');
+  assert.equal(secondPlan?.baseSnapshot.canonicalInputPath, diskInput);
+
+  assert.equal(captureCanonicalAnchorBase({
+    blocks: [oldBlock, { ...oldBlock, id: 'duplicate-instance' }],
+    domBlocks: [dom], edit: firstEdit, certificate,
+  }), null, 'repeated child ownership is ambiguous');
+  assert.equal(captureCanonicalAnchorBase({
+    blocks: [oldBlock, { ...oldBlock, id: 'mixed-owner',
+      sourceParts: [{ file: child, at: 0, to: 11, start: 0, end: 11 }] }],
+    domBlocks: [dom], edit: firstEdit, certificate,
+  }), null, 'mixed sourceParts never acquire a private anchor span');
+  assert.equal(captureCanonicalAnchorBase({
+    blocks: [oldBlock], domBlocks: [dom],
+    edit: { ...firstEdit, file: path.resolve('/project/content/sibling.tex') }, certificate,
+  }), null, 'an unrelated child cannot reuse this resident witness');
+  assert.equal(singlePlainTextDelta('plain prose', 'plain \\write prose'), null);
+});
 
 test('terminal prose without a frozen canonical line proof fails closed', () => {
   const block = {

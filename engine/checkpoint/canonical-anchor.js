@@ -1,9 +1,30 @@
 import { SAFE_GLYPH } from './fidelity.js';
 import { changedGalleyLines, galleyLineWitnesses } from './canonical-paint-index.js';
+import path from 'node:path';
 
 const PLAIN_FLOW_UNSAFE = /[\\$%{}&#^_~]/;
 const ANCHOR_BLEED_BP = 2;
 const SP_PER_BP = 65781.76;
+
+/** Return the one contiguous edit between two plain-text snapshots. */
+export function singlePlainTextDelta(before, after) {
+  const left = String(before ?? '');
+  const right = String(after ?? '');
+  if (left === right) return null;
+  let start = 0;
+  while (start < left.length && start < right.length && left[start] === right[start]) start++;
+  let oldEnd = left.length;
+  let newEnd = right.length;
+  while (oldEnd > start && newEnd > start && left[oldEnd - 1] === right[newEnd - 1]) {
+    oldEnd--;
+    newEnd--;
+  }
+  const removed = left.slice(start, oldEnd);
+  const text = right.slice(start, newEnd);
+  if (/[\r\n]/.test(removed) || /[\r\n]/.test(text) ||
+      PLAIN_FLOW_UNSAFE.test(removed) || PLAIN_FLOW_UNSAFE.test(text)) return null;
+  return { start, end: oldEnd, text };
+}
 
 /** Freeze the pre-edit resident witness while that exact source is still the
  * canonical generation. The server calls this inside its serialized edit
@@ -12,10 +33,21 @@ export function captureCanonicalAnchorBase({ blocks, domBlocks, edit, certificat
   const start = Number(edit?.start);
   const end = Number(edit?.end);
   if (![start, end].every(Number.isFinite) || end < start || !certificate?.id) return null;
-  const block = blocks.find((item) => !item.file && !item.sourceParts &&
-    start >= Number(item.start) && end <= Number(item.end));
+  const editFile = typeof edit?.file === 'string' ? path.resolve(edit.file) : null;
+  if (editFile && typeof edit?.canonicalInputPath !== 'string') return null;
+  if (editFile && blocks.some((item) => item.sourceParts?.some((part) =>
+    typeof part.file === 'string' && path.resolve(part.file) === editFile &&
+    start >= Number(part.start) && end <= Number(part.end)))) return null;
+  const candidates = blocks.filter((item) => {
+    if (item.sourceParts || start < Number(item.start) || end > Number(item.end)) return false;
+    if (!editFile) return !item.file;
+    return typeof item.file === 'string' && path.resolve(item.file) === editFile;
+  });
+  if (editFile ? candidates.length !== 1 : candidates.length === 0) return null;
+  const block = candidates[0];
   const dom = domBlocks.find((item) => item.id === block?.id);
   if (!block || !dom || hasGalleySideEffects(block.galley) || block.fidelity?.level !== SAFE_GLYPH) return null;
+  if (editFile && (typeof dom.source?.file !== 'string' || path.resolve(dom.source.file) !== editFile)) return null;
   const lineWitnesses = galleyLineWitnesses(block.galley);
   const structuralStateVec = canonicalAnchorStructuralState(block.stateVec);
   if (!lineWitnesses || structuralStateVec === null) return null;
@@ -25,7 +57,13 @@ export function captureCanonicalAnchorBase({ blocks, domBlocks, edit, certificat
     galleyHash: block.galleyHash,
     stateVec: JSON.stringify(block.stateVec ?? null),
     structuralStateVec,
-    span: { ...dom.span },
+    file: editFile,
+    span: editFile
+      ? { start: Number(block.start), end: Number(block.end) }
+      : { ...dom.span },
+    canonicalInputPath: typeof edit?.canonicalInputPath === 'string'
+      ? path.resolve(edit.canonicalInputPath)
+      : null,
     source: structuredClone(dom.source),
     lineWitnesses: structuredClone(lineWitnesses),
     certificate: { ...certificate },
@@ -48,6 +86,7 @@ export function planTerminalCanonicalAnchor({
   lineage = null,
   edit = null,
   baseSnapshot = null,
+  inputEpoch = null,
   acceptedAt = performance.now(),
   clientEditAtEpochMs = null,
 }) {
@@ -73,6 +112,10 @@ export function planTerminalCanonicalAnchor({
   const base = immediateBase ? baseSnapshot : lineage.baseSnapshot;
   if (!block || !dom || !base || base.blockId !== blockId ||
       base.certificate?.id !== canonical.id || base.certificate?.rev !== canonical.rev) return null;
+  const editFile = typeof edit?.file === 'string' ? path.resolve(edit.file) : null;
+  const blockFile = typeof block.file === 'string' ? path.resolve(block.file) : null;
+  const baseFile = typeof base.file === 'string' ? path.resolve(base.file) : null;
+  if (block.sourceParts || editFile !== blockFile || baseFile !== blockFile) return null;
   if (block.fidelity?.level !== SAFE_GLYPH || block.needsRender) return null;
   if (hasGalleySideEffects(block.galley)) return null;
   // Plain text legitimately changes the three volatile paragraph-tail
@@ -83,7 +126,7 @@ export function planTerminalCanonicalAnchor({
   // are excluded from the canonical-anchor structural witness.
   if (canonicalAnchorStructuralState(block.stateVec) !== base.structuralStateVec) return null;
 
-  const plainEdit = edit ? plainEditContext(block, dom, edit) : null;
+  const plainEdit = edit ? plainEditContext(block, dom, edit, base) : null;
   if (!plainEdit) return null;
   const currentLines = galleyLineWitnesses(block.galley);
   const changedLines = changedGalleyLines(base.lineWitnesses, currentLines);
@@ -131,6 +174,7 @@ export function planTerminalCanonicalAnchor({
     srcRev: report.srcRev,
     baseGeneration: canonical.id,
     baseRev: canonical.rev,
+    inputEpoch: Number.isInteger(Number(inputEpoch)) ? Number(inputEpoch) : null,
     physicalPageCount: canonical.pageCount,
     policy: canonicalAnchorPolicy ? 'canonical-anchor' : 'terminal',
     provisionalPages: [...new Set(linePlans.map((line) => line.provisionalPage))],
@@ -308,8 +352,8 @@ function sourceTailLocation(source, text) {
   };
 }
 
-function plainEditContext(block, dom, edit) {
-  const spanStart = Number(dom?.span?.start);
+function plainEditContext(block, dom, edit, base) {
+  const spanStart = Number(base?.span?.start);
   const editStart = Number(edit?.start);
   const editEnd = Number(edit?.end);
   const replacement = String(edit?.text ?? '');

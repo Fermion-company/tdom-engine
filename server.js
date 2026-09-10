@@ -16,7 +16,7 @@
 
 import http from 'node:http';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, watch, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, watch, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -27,6 +27,7 @@ import {
   captureCanonicalAnchorBase,
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
+  singlePlainTextDelta,
 } from './engine/checkpoint/canonical-anchor.js';
 import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
 
@@ -451,6 +452,7 @@ let lastAnchorPresentation = null;
 // reboot advances it before any client is allowed to discard old pixels.
 let documentEpoch = 1;
 let terminalAnchorLineage = null;
+let terminalAnchorEpoch = 0;
 let activeProject = {
   docDir: path.join(ROOT, 'samples'),
   file: sampleFile,
@@ -580,6 +582,38 @@ function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = 
   return { changed, removed };
 }
 
+function isRealPathInside(root, candidate) {
+  try { return isPathInside(realpathSync(root), realpathSync(candidate)); } catch { return false; }
+}
+
+function childAnchorEditBeforeOverlay(context, body, rootChanged) {
+  const overlays = Array.isArray(body?.overlays) ? body.overlays : [];
+  const removals = Array.isArray(body?.removeOverlays) ? body.removeOverlays : [];
+  if (rootChanged || overlays.length !== 1 || removals.length !== 0) return null;
+  const item = overlays[0];
+  const file = typeof item?.filePath === 'string' ? path.resolve(item.filePath) : null;
+  if (!file || typeof item?.text !== 'string' || !isPathInside(context.docDir, file) ||
+      file === path.resolve(context.filePath) || path.extname(file).toLowerCase() !== '.tex') return null;
+  const prior = engine.includes.get(file);
+  const readPath = typeof prior?.readPath === 'string' ? path.resolve(prior.readPath) : null;
+  if (!readPath || typeof prior?.text !== 'string') return null;
+  const logicalRelative = path.relative(context.docDir, file);
+  const expectedOverlay = context.overlayDir
+    ? path.resolve(context.overlayDir, logicalRelative)
+    : null;
+  if (!isRealPathInside(context.docDir, file)) return null;
+  const safeReadPath = readPath === file
+    ? true
+    : Boolean(expectedOverlay && readPath === expectedOverlay &&
+      isRealPathInside(context.overlayDir, readPath));
+  if (!safeReadPath || !existsSync(readPath)) return null;
+  let diskBytes;
+  try { diskBytes = readFileSync(readPath, 'utf8'); } catch { return null; }
+  if (diskBytes !== prior.text) return null;
+  const delta = singlePlainTextDelta(prior.text, item.text);
+  return delta ? { ...delta, file, canonicalInputPath: readPath } : null;
+}
+
 function ensureProjectOutputDirectories(source) {
   // \include{sections/foo} writes sections/foo.aux relative to the TeX
   // output directory. Both the resident driver and sandboxed canonical
@@ -696,6 +730,8 @@ engine.onAsyncPatches = (partial) => {
   broadcast({ kind: 'patches', rev: partial.rev, fonts: partial.fonts, patches: partial.patches });
 };
 engine.onExternalChange = (changedInput) => {
+  terminalAnchorLineage = null;
+  terminalAnchorEpoch++;
   withEngine(async () => {
     const source = engine.getSource();
     const nextBibliography = describeExternalBibliography(source, activeProject.docDir, activeProject.overlayDir);
@@ -1020,8 +1056,10 @@ async function validatedForwardSyncAll(location, id) {
   return validated.length ? validated : plausible.length ? plausible : candidates;
 }
 
-async function rawForwardCandidatesForRange(source, id, deadline) {
-  const file = canonicalInputForProjectFile(source?.file);
+async function rawForwardCandidatesForRange(source, id, deadline, canonicalInputPath = null) {
+  const file = typeof canonicalInputPath === 'string'
+    ? path.resolve(canonicalInputPath)
+    : canonicalInputForProjectFile(source?.file);
   const first = Math.floor(Number(source?.start?.line));
   const last = Math.floor(Number(source?.end?.line));
   if (!file || !Number.isInteger(first) || !Number.isInteger(last) || first < 1 || last < first) return null;
@@ -1049,9 +1087,14 @@ async function beforeDeadline(promise, deadline) {
   ]).finally(() => clearTimeout(timer));
 }
 
-async function resolveTerminalCanonicalAnchor(plan, epoch) {
+async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch) {
   const candidates = await beforeDeadline(
-    rawForwardCandidatesForRange(plan.source, plan.baseGeneration, plan.proofDeadline),
+    rawForwardCandidatesForRange(
+      plan.source,
+      plan.baseGeneration,
+      plan.proofDeadline,
+      plan.baseSnapshot.canonicalInputPath
+    ),
     plan.proofDeadline
   ).catch(() => null);
   const pages = [...new Set((candidates ?? []).map((candidate) => Number(candidate.page)))];
@@ -1059,7 +1102,9 @@ async function resolveTerminalCanonicalAnchor(plan, epoch) {
     ? await beforeDeadline(engine.canonical.pdfPaintPages(plan.baseGeneration, pages), plan.proofDeadline)
       .catch(() => null)
     : null;
-  if (documentEpoch !== epoch || engine.srcRev !== plan.srcRev) return;
+  if (documentEpoch !== epoch || terminalAnchorEpoch !== anchorEpoch ||
+      engine.srcRev !== plan.srcRev ||
+      engine.canonical.inputEpoch !== plan.inputEpoch) return;
   const currentCanonical = engine.canonical.info();
   const currentCertificate = engine.canonical.generationCertificate(plan.baseGeneration);
   if (currentCanonical.id !== plan.baseGeneration || currentCanonical.rev !== plan.baseRev ||
@@ -1544,9 +1589,13 @@ const server = http.createServer(async (req, res) => {
       if (typeof start !== 'number' || typeof end !== 'number' || typeof text !== 'string') {
         return json(res, { error: 'edit requires {start, end, text}' }, 400);
       }
+      let anchorEpoch = null;
       let resetEpoch = null;
       let anchorInputSafe = false;
       let anchorBaseSnapshot = null;
+      let anchorEdit = null;
+      let anchorMutation = false;
+      let anchorPriorLineage = null;
       const anchorAcceptedAt = performance.now();
       const rawClientEditAt = Number(body.clientEditAtEpochMs);
       const nowEpoch = Date.now();
@@ -1568,21 +1617,39 @@ const server = http.createServer(async (req, res) => {
           }
           const current = engine.getSource();
           const next = current.slice(0, start) + text + current.slice(end);
-          const overlayDelta = applyProjectOverlays(activeProject, body);
-          const changedInputs = [...overlayDelta.changed, ...overlayDelta.removed];
           const rootChanged = next !== current;
-          anchorInputSafe = rootChanged && changedInputs.length === 0;
-          if (ENABLE_CANONICAL_ANCHOR && anchorInputSafe) {
+          const childAnchorEdit = ENABLE_CANONICAL_ANCHOR
+            ? childAnchorEditBeforeOverlay(activeProject, body, rootChanged)
+            : null;
+          anchorEdit = rootChanged ? { start, end, text } : childAnchorEdit;
+          if (ENABLE_CANONICAL_ANCHOR && anchorEdit) {
             const certificate = engine.canonical.generationCertificate();
-            if (certificate && engine.canonical.sourceMatches(current, certificate.id)) {
+            if (certificate && certificate.rev === engine.srcRev &&
+                certificate.inputEpoch === engine.canonical.inputEpoch &&
+                engine.canonical.sourceMatches(current, certificate.id)) {
               anchorBaseSnapshot = captureCanonicalAnchorBase({
                 blocks: engine.blocks,
                 domBlocks: engine.getDOM().blocks,
-                edit: { start, end, text },
+                edit: anchorEdit,
                 certificate,
               });
             }
           }
+          const overlayDelta = applyProjectOverlays(activeProject, body);
+          const changedInputs = [...overlayDelta.changed, ...overlayDelta.removed];
+          anchorMutation = rootChanged || changedInputs.length > 0;
+          if (anchorMutation) {
+            anchorEpoch = ++terminalAnchorEpoch;
+            anchorPriorLineage = terminalAnchorLineage;
+            terminalAnchorLineage = null;
+          }
+          anchorInputSafe = Boolean(anchorEdit) && (
+            rootChanged
+              ? changedInputs.length === 0 && !anchorEdit.file
+              : overlayDelta.changed.length === 1 && overlayDelta.removed.length === 0 &&
+                path.resolve(overlayDelta.changed[0]) === anchorEdit.file
+          );
+          if (!anchorInputSafe) anchorBaseSnapshot = null;
           ensureProjectOutputDirectories(next);
           const nextBibliography = describeExternalBibliography(
             next,
@@ -1675,15 +1742,16 @@ const server = http.createServer(async (req, res) => {
         lastAnchorPresentation = null;
       }
       lastReport.previewFallback = dirtyWithoutPatchFallback(lastReport);
-      const anchorPlan = ENABLE_CANONICAL_ANCHOR && anchorInputSafe
+      const anchorPlan = ENABLE_CANONICAL_ANCHOR && anchorInputSafe && lastReport.rebooted !== true
         ? planTerminalCanonicalAnchor({
             blocks: engine.blocks,
             domBlocks: engine.getDOM().blocks,
             report: lastReport,
             geometry: engine.getGeometry(),
-            lineage: terminalAnchorLineage,
-            edit: { start, end, text },
+            lineage: anchorPriorLineage,
+            edit: anchorEdit,
             baseSnapshot: anchorBaseSnapshot,
+            inputEpoch: engine.canonical.inputEpoch,
             acceptedAt: anchorAcceptedAt,
             clientEditAtEpochMs: anchorClientEditAt,
           })
@@ -1698,7 +1766,7 @@ const server = http.createServer(async (req, res) => {
           lastSrcRev: anchorPlan.srcRev,
           baseSnapshot: anchorPlan.baseSnapshot,
         };
-      } else if (lastReport.dirtySourceNodes?.length) {
+      } else if (anchorMutation || lastReport.dirtySourceNodes?.length) {
         terminalAnchorLineage = null;
       }
       // one serialization for both consumers: the SSE fanout and the HTTP
@@ -1708,7 +1776,7 @@ const server = http.createServer(async (req, res) => {
       broadcastRaw(`{"kind":"update","documentEpoch":${documentEpoch},"report":${reportJson}}`);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(reportJson);
-      if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch);
+      if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, anchorEpoch);
       return;
     }
     if (req.method === 'POST' && url.pathname === '/open') {
