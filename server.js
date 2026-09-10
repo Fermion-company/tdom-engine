@@ -31,6 +31,7 @@ import {
 } from './engine/checkpoint/canonical-anchor.js';
 import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
 import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read-proof.js';
+import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
 
 // Certified canonical anchoring is deliberately narrow: only plain-text
 // edits whose unchanged line structure, backend run semantics, SyncTeX
@@ -475,6 +476,7 @@ let queue = Promise.resolve();
 // from a dead server while the queue is occupied.
 let engineBusy = 0;
 let engineBusySince = 0;
+const openRequests = new OpenRequestCache(8);
 function withEngine(fn) {
   engineBusy++;
   if (engineBusy === 1) engineBusySince = Date.now();
@@ -1812,6 +1814,11 @@ const server = http.createServer(async (req, res) => {
           if (isPathInside(candidate, filePath)) projectRoot = candidate;
         }
       }
+      const openRequestId = body.openRequestId == null ? null : body.openRequestId;
+      if (openRequestId !== null &&
+          (typeof openRequestId !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(openRequestId))) {
+        return json(res, { error: 'invalid openRequestId' }, 400);
+      }
       const docDir = projectRoot || path.dirname(filePath);
       const context = {
         docDir,
@@ -1821,26 +1828,42 @@ const server = http.createServer(async (req, res) => {
         overlays: new Map(),
         bibliography: null,
       };
-      applyProjectOverlays(context, body, true);
-      let resetEpoch = null;
-      lastReport = await withEngine(async () => {
-        resetEpoch = beginDocumentReset('open');
-        await engine.setDocumentContext({
-          docDir: context.docDir,
-          overlayDir: context.overlayDir,
-          force: true,
-        });
-        activeProject = context;
-        ensureProjectOutputDirectories(text);
-        await materializeProjectBibliography(text, activeProject);
-        return engine.open(text, context.file);
+      const identity = openRequestIdentity({
+        text,
+        filePath,
+        docDir,
+        overlays: body.overlays,
+        removeOverlays: body.removeOverlays,
       });
-      // Keep the previous exact document intact while the new root boots,
-      // then tell every client to fetch one complete, already-adoptable
-      // snapshot. Broadcasting before engine.open completed let /doc return
-      // the old project and later overwrite newer SSE state.
-      completeDocumentReset(resetEpoch);
-      return json(res, docPayload());
+      let payload;
+      try {
+        payload = await openRequests.run(openRequestId, identity, () => withEngine(async () => {
+          const resetEpoch = beginDocumentReset('open');
+          applyProjectOverlays(context, body, true);
+          await engine.setDocumentContext({
+            docDir: context.docDir,
+            overlayDir: context.overlayDir,
+            force: true,
+          });
+          activeProject = context;
+          ensureProjectOutputDirectories(text);
+          await materializeProjectBibliography(text, activeProject);
+          lastReport = await engine.open(text, context.file);
+          // Keep the previous exact document intact while the new root boots,
+          // then capture one complete, already-adoptable response before the
+          // next queued open can reset it again.
+          completeDocumentReset(resetEpoch);
+          return JSON.stringify(docPayload());
+        }));
+      } catch (error) {
+        if (error?.code === 'OPEN_REQUEST_ID_CONFLICT') {
+          return json(res, { error: error.message }, 409);
+        }
+        throw error;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(payload);
+      return;
     }
     res.writeHead(404);
     res.end('not found');
