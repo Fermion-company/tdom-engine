@@ -23,6 +23,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from './engine/checkpoint/engine-v3.js';
 import {
+  ANCHOR_PROOF_BUDGET_MS,
   buildTerminalCanonicalPatch,
   captureCanonicalAnchorBase,
   dirtyWithoutPatchFallback,
@@ -1171,8 +1172,26 @@ async function beforeDeadline(promise, deadline) {
   ]).finally(() => clearTimeout(timer));
 }
 
-async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch) {
-  const candidates = await beforeDeadline(
+// The base generation's SyncTeX records and paint index depend only on the
+// pre-edit witness. Start them alongside the resident edit so its typeset
+// time does not consume the fixed proof budget; the proof itself is unchanged.
+function prefetchCanonicalAnchorProof(base, deadline) {
+  const candidates = beforeDeadline(
+    rawForwardCandidatesForRange(base.source, base.certificate.id, deadline, base.canonicalInputPath),
+    deadline
+  ).catch(() => null);
+  const paintPages = candidates.then((list) => list?.length
+    ? beforeDeadline(
+        engine.canonical.pdfPaintPages(base.certificate.id, [...new Set(list.map((item) => Number(item.page)))]),
+        deadline
+      ).catch(() => null)
+    : null);
+  return { base, candidates, paintPages };
+}
+
+async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch = null) {
+  const prefetched = prefetch?.base === plan.baseSnapshot ? prefetch : null;
+  const candidates = await (prefetched?.candidates ?? beforeDeadline(
     rawForwardCandidatesForRange(
       plan.source,
       plan.baseGeneration,
@@ -1180,11 +1199,13 @@ async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch) {
       plan.baseSnapshot.canonicalInputPath
     ),
     plan.proofDeadline
-  ).catch(() => null);
+  ).catch(() => null));
   const pages = [...new Set((candidates ?? []).map((candidate) => Number(candidate.page)))];
   const paintPages = candidates?.length
-    ? await beforeDeadline(engine.canonical.pdfPaintPages(plan.baseGeneration, pages), plan.proofDeadline)
-      .catch(() => null)
+    ? await (prefetched?.paintPages ?? beforeDeadline(
+        engine.canonical.pdfPaintPages(plan.baseGeneration, pages),
+        plan.proofDeadline
+      ).catch(() => null))
     : null;
   if (documentEpoch !== epoch || terminalAnchorEpoch !== anchorEpoch ||
       engine.srcRev !== plan.srcRev ||
@@ -1681,6 +1702,7 @@ const server = http.createServer(async (req, res) => {
       let anchorMutation = false;
       let anchorPriorLineage = null;
       let inputUnchanged = false;
+      let anchorProofPrefetch = null;
       const anchorAcceptedAt = performance.now();
       const rawClientEditAt = Number(body.clientEditAtEpochMs);
       const nowEpoch = Date.now();
@@ -1741,6 +1763,12 @@ const server = http.createServer(async (req, res) => {
                 path.resolve(overlayDelta.changed[0]) === anchorEdit.file
           );
           if (!anchorInputSafe) anchorBaseSnapshot = null;
+          if (anchorBaseSnapshot) {
+            anchorProofPrefetch = prefetchCanonicalAnchorProof(
+              anchorBaseSnapshot,
+              anchorAcceptedAt + ANCHOR_PROOF_BUDGET_MS
+            );
+          }
           ensureProjectOutputDirectories(next);
           const nextBibliography = describeExternalBibliography(
             next,
@@ -1868,7 +1896,7 @@ const server = http.createServer(async (req, res) => {
       broadcastRaw(`{"kind":"update","documentEpoch":${documentEpoch},"report":${reportJson}}`);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(reportJson);
-      if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, anchorEpoch);
+      if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, anchorEpoch, anchorProofPrefetch);
       return;
     }
     if (req.method === 'POST' && url.pathname === '/open') {

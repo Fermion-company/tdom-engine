@@ -4,6 +4,10 @@ import path from 'node:path';
 
 const PLAIN_FLOW_UNSAFE = /[\\$%{}&#^_~]/;
 const ANCHOR_BLEED_BP = 2;
+// Budgets from edit acceptance; a proof or publication past them falls back
+// to the canonical build.
+export const ANCHOR_PROOF_BUDGET_MS = 700;
+export const ANCHOR_PUBLISH_BUDGET_MS = 850;
 const SP_PER_BP = 65781.76;
 
 /** Return the one contiguous edit between two plain-text snapshots. */
@@ -166,8 +170,8 @@ export function planTerminalCanonicalAnchor({
     });
   }
   const activeGeometry = geometryForGalley(geometry, block.galley);
-  const proofDeadline = Number(acceptedAt) + 700;
-  const publishDeadline = Number(acceptedAt) + 850;
+  const proofDeadline = Number(acceptedAt) + ANCHOR_PROOF_BUDGET_MS;
+  const publishDeadline = Number(acceptedAt) + ANCHOR_PUBLISH_BUDGET_MS;
 
   return {
     blockId,
