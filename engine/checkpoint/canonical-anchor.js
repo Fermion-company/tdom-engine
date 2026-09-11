@@ -1,5 +1,12 @@
-import { SAFE_GLYPH } from './fidelity.js';
-import { changedGalleyLines, galleyLineWitnesses } from './canonical-paint-index.js';
+import { SAFE_GLYPH, fontTier } from './fidelity.js';
+import { sourceBoxLineCommands } from './display-list.js';
+import {
+  changedGalleyLines,
+  changedMixedGalleyLines,
+  galleyLineWitnesses,
+  galleyMixedLineWitnesses,
+  mixedGalleyFrame,
+} from './canonical-paint-index.js';
 import path from 'node:path';
 
 const PLAIN_FLOW_UNSAFE = /[\\$%{}&#^_~]/;
@@ -50,9 +57,12 @@ export function captureCanonicalAnchorBase({ blocks, domBlocks, edit, certificat
   if (editFile ? candidates.length !== 1 : candidates.length === 0) return null;
   const block = candidates[0];
   const dom = domBlocks.find((item) => item.id === block?.id);
-  if (!block || !dom || hasGalleySideEffects(block.galley) || block.fidelity?.level !== SAFE_GLYPH) return null;
+  if (!block || !dom) return null;
+  const plain = !hasGalleySideEffects(block.galley) && block.fidelity?.level === SAFE_GLYPH;
   if (editFile && (typeof dom.source?.file !== 'string' || path.resolve(dom.source.file) !== editFile)) return null;
-  const lineWitnesses = galleyLineWitnesses(block.galley);
+  const plainWitnesses = plain ? galleyLineWitnesses(block.galley) : null;
+  const mixed = plainWitnesses ? null : mixedAnchorFrame(block);
+  const lineWitnesses = plainWitnesses ?? mixed?.lineWitnesses;
   const structuralStateVec = canonicalAnchorStructuralState(block.stateVec);
   if (!lineWitnesses || structuralStateVec === null) return null;
   return {
@@ -70,8 +80,163 @@ export function captureCanonicalAnchorBase({ blocks, domBlocks, edit, certificat
       : null,
     source: structuredClone(dom.source),
     lineWitnesses: structuredClone(lineWitnesses),
+    frame: mixed?.frame ?? null,
     certificate: { ...certificate },
   };
+}
+
+/** A block whose plain lines sit among opaque boxes (a heading box, framed
+ * material, graphics) or declare side effects (a toc line, labels) may still
+ * anchor an edit to one of its plain lines: the frame freezes everything
+ * else, and the plan requires it byte-identical after the edit. */
+function mixedAnchorFrame(block) {
+  const galley = block.galley;
+  if (!galley || galley.tdomFrozen || galley.tdomDeferred || block.fidelity?.canonicalOnly) return null;
+  // Only a resident harvest fingerprints paint whatsits per box (fx), keeps
+  // the state trail and contribution epochs, and reports active characters;
+  // with one active, "plain" text runs macros.
+  if (block.rescued || galley.closure !== 'native' || galley.tdomActive) return null;
+  if (typeof galley.trail !== 'string' || !Array.isArray(galley.epochs) ||
+      galley.epochs.length !== (galley.items ?? []).length) return null;
+  const lineWitnesses = galleyMixedLineWitnesses(galley);
+  const frame = lineWitnesses ? mixedGalleyFrame(galley, lineWitnesses) : null;
+  return frame ? { lineWitnesses, frame } : null;
+}
+
+/** A changed plain line of a mixed block must itself be a safe glyph line:
+ * fidelity flags are per galley item, the witnesses per box ordinal. */
+function mixedLinesPaintSafely(block, lineIndexes) {
+  const flags = block.fidelity?.itemFlags;
+  if (!Array.isArray(flags)) return false;
+  const boxItems = [];
+  (block.galley?.items ?? []).forEach((item, index) => {
+    if (item?.k === 'box') boxItems.push(index);
+  });
+  return lineIndexes.every((line) => Number.isInteger(boxItems[line]) && (flags[boxItems[line]] ?? 0) === 0);
+}
+
+/** The frame freezes every opaque box, so the canonical page holds exactly
+ * their resident glyphs. SyncTeX cannot say which source line a line's text
+ * came from (line boxes and the glue inside them carry the paragraph's
+ * closing line), so provenance is by content instead: when no opaque box
+ * paints a plain witness's glyph sequence, no line inside framed material
+ * can pass for that prose line in the proof. */
+function opaqueTextHoldsWitness(galley, witnesses) {
+  const texts = [];
+  let box = -1;
+  for (const item of galley?.items ?? []) {
+    if (item?.k !== 'box') continue;
+    box++;
+    if (witnesses[box]) continue;
+    texts.push((item.runs ?? []).filter((run) => !run.rule && run.t)
+      .map((run) => String(run.t).normalize('NFC')).join('').replace(/\s/gu, ''));
+  }
+  return witnesses.some((witness) => witness && texts.some((text) => text.includes(witness.paintText)));
+}
+
+const INCOMPARABLE_TEXT = /[\uE000-\uF8FF\uFFFD\u{F0000}-\u{10FFFF}]/u;
+
+/** The content provenance compares resident run text; the proof compares
+ * canonical ToUnicode text. Opaque text counts only where the two are the
+ * same representation: native font files, no remapped or math glyphs. */
+function opaqueTextComparable(galley, witnesses, fonts) {
+  if (!(fonts instanceof Map)) return false;
+  let box = -1;
+  for (const item of galley?.items ?? []) {
+    if (item?.k !== 'box') continue;
+    box++;
+    if (witnesses[box]) continue;
+    for (const run of item.runs ?? []) {
+      if (run.rule || !run.t) continue;
+      const meta = fonts.get(run.f);
+      if (run.m || fontTier(meta) !== 'native' || meta.remap || meta.mth || meta.omx ||
+          INCOMPARABLE_TEXT.test(String(run.t))) return false;
+    }
+  }
+  return true;
+}
+
+// Shipout filters add paint after the resident's harvest; node-list filters
+// see typed text. Each registration below is understood, by exact callback
+// and description: LuaTeX-ja and luaotfload shape and space glyphs and lines
+// (the resident runs them too, so the harvest has their output), lua-ul adds
+// its rules at hpack/vpack (harvested), ltj.direction resolves LuaTeX-ja's
+// direction nodes (a rotated tate line fails the proof's horizontal-matrix
+// check), and luacolor colors attribute-carrying nodes at shipout (a
+// repainted line must carry none, see `ca`). Anything else, under any name,
+// keeps the canonical build.
+const KNOWN_PAINT_CALLBACKS = {
+  pre_shipout_filter: new Set(['ltj.direction', 'luacolor.process']),
+  pre_linebreak_filter: new Set(['ltj.adjust_icflag', 'ltj.set_stack_level',
+    'luaotfload.node_processor', 'ltj.main']),
+  post_linebreak_filter: new Set(['luaotfload.harf.finalize_vlist', 'ltj.create_dir_whatsit',
+    'ltj.lineskip']),
+  hpack_filter: new Set(['ltj.adjust_icflag', 'ltj.set_stack_level', 'luaotfload.node_processor',
+    'ltj.main', 'luaotfload.harf.finalize_hlist', 'ltj.create_dir_whatsit', 'add underlines to list']),
+  vpack_filter: new Set(['ltj.direction', 'add underlines to list']),
+  pre_output_filter: new Set(['ltj.direction']),
+  append_to_vlist_filter: new Set(['ltj.lineskip']),
+  hyphenate: new Set(['ltj.hyphenate']),
+};
+
+/** Every paint callback the document has registered in this generation: the
+ * preamble's (GEO) and each galley's later ones. A block without a galley
+ * has run nothing the resident saw, so the set is unknown. */
+function documentPaintCallbacks(geometry, blocks) {
+  const boot = geometry?.paintCallbacks;
+  if (boot !== 'none' && (!boot || typeof boot !== 'object')) return null;
+  const callbacks = new Map();
+  const merge = (registered) => Object.entries(registered).every(([name, descriptions]) => {
+    if (!Array.isArray(descriptions)) return false;
+    const known = callbacks.get(name) ?? new Set();
+    for (const description of descriptions) known.add(String(description));
+    callbacks.set(name, known);
+    return true;
+  });
+  if (boot !== 'none' && !merge(boot)) return null;
+  for (const block of blocks ?? []) {
+    const late = block.galley?.paintLate;
+    if (!block.galley || late != null && (typeof late !== 'object' || !merge(late))) return null;
+  }
+  return callbacks;
+}
+
+function paintCallbacksKnown(callbacks) {
+  if (!callbacks) return false;
+  for (const [name, descriptions] of callbacks) {
+    const known = Object.hasOwn(KNOWN_PAINT_CALLBACKS, name) ? KNOWN_PAINT_CALLBACKS[name] : null;
+    if (!known || [...descriptions].some((description) => !known.has(description))) return false;
+  }
+  return true;
+}
+
+/** The frame's trail proves the state after the edited paragraph; inside it,
+ * code after the edit reads horizontal-mode state no sample sees. Every
+ * contribution that carries a changed line (its paragraph, with any display,
+ * \vadjust or insert material it moved) must therefore paint only what the
+ * harvest reads: no paint whatsit, shipout color, float or insert. */
+function editedContributionsReadable(galley, lineIndexes) {
+  const items = galley?.items ?? [];
+  const epochs = galley?.epochs;
+  const boxes = [];
+  items.forEach((item, index) => {
+    if (item?.k === 'box') boxes.push(index);
+  });
+  const edited = new Set();
+  for (const line of lineIndexes) {
+    const epoch = epochs?.[boxes[line]];
+    if (!Number.isInteger(epoch) || epoch <= 0) return false;
+    edited.add(epoch);
+  }
+  return items.every((item, index) => !edited.has(epochs[index]) ||
+    item?.k !== 'ins' && item?.k !== 'fm' && !(item?.k === 'box' && (item.fx || item.ca || item.fm)));
+}
+
+/** luacolor writes a node's color only at shipout: a line whose glyphs or
+ * rules carry its attribute (ca) paints a color the resident runs lack. */
+function linesCarryShipoutColor(galley, lineIndexes) {
+  const boxes = (galley?.items ?? []).filter((item) => item?.k === 'box');
+  return lineIndexes.some((line) => boxes[line]?.ca);
 }
 
 /**
@@ -93,6 +258,7 @@ export function planTerminalCanonicalAnchor({
   inputEpoch = null,
   acceptedAt = performance.now(),
   clientEditAtEpochMs = null,
+  paintContext = null,
 }) {
   const canonical = report?.canonical;
   const canonicalAnchorPolicy = report?.previewPolicy === 'canonical-anchor';
@@ -120,8 +286,16 @@ export function planTerminalCanonicalAnchor({
   const blockFile = typeof block.file === 'string' ? path.resolve(block.file) : null;
   const baseFile = typeof base.file === 'string' ? path.resolve(base.file) : null;
   if (block.sourceParts || editFile !== blockFile || baseFile !== blockFile) return null;
-  if (block.fidelity?.level !== SAFE_GLYPH || block.needsRender) return null;
-  if (hasGalleySideEffects(block.galley)) return null;
+  const mixed = typeof base.frame === 'string';
+  if (mixed) {
+    // The resident's exact chunk is irrelevant here: only plain lines are
+    // repainted, and everything else must be the same TeX output as the base.
+    const frame = mixedAnchorFrame(block);
+    if (!frame || frame.frame !== base.frame) return null;
+  } else {
+    if (block.fidelity?.level !== SAFE_GLYPH || block.needsRender) return null;
+    if (hasGalleySideEffects(block.galley)) return null;
+  }
   // Plain text legitimately changes the three volatile paragraph-tail
   // locals (prevdepth, nobreak and lastskip).  Requiring the complete exit
   // vector to stay byte-identical therefore rejects ordinary prose based on
@@ -132,9 +306,17 @@ export function planTerminalCanonicalAnchor({
 
   const plainEdit = edit ? plainEditContext(block, dom, edit, base) : null;
   if (!plainEdit) return null;
-  const currentLines = galleyLineWitnesses(block.galley);
-  const changedLines = changedGalleyLines(base.lineWitnesses, currentLines);
+  const currentLines = mixed ? galleyMixedLineWitnesses(block.galley) : galleyLineWitnesses(block.galley);
+  const changedLines = mixed
+    ? changedMixedGalleyLines(base.lineWitnesses, currentLines)
+    : changedGalleyLines(base.lineWitnesses, currentLines);
   if (!currentLines || !changedLines) return null;
+  if (linesCarryShipoutColor(block.galley, changedLines)) return null;
+  if (mixed && !mixedLinesPaintSafely(block, changedLines)) return null;
+  if (mixed && (!editedContributionsReadable(block.galley, changedLines) ||
+      !paintCallbacksKnown(documentPaintCallbacks(geometry, blocks)) ||
+      !opaqueTextComparable(block.galley, base.lineWitnesses, paintContext?.fonts) ||
+      opaqueTextHoldsWitness(block.galley, base.lineWitnesses))) return null;
 
   const containing = (report.patches ?? []).filter((patch) =>
     patch.type === 'replace-page' &&
@@ -151,7 +333,24 @@ export function planTerminalCanonicalAnchor({
     });
     if (owners.length !== 1) return null;
     const owner = owners[0];
-    const paint = owner.commands.filter((command) => command.op === 'glyphs' || command.op === 'rule');
+    const painted = (commands) => (commands ?? []).filter((command) => command.op === 'glyphs' || command.op === 'rule');
+    let paint = painted(owner.commands);
+    if (!paint.length && mixed) {
+      // A block with graphics routes every line to its exact chunk, so the
+      // page carries only the line's source hit box. Paint the safe line's
+      // own runs from that position, as the display list would have.
+      const hits = owner.commands.filter((command) => command.op === 'sourcebox');
+      const item = (block.galley?.items ?? []).filter((entry) => entry?.k === 'box')[lineIndex];
+      paint = hits.length === 1 && paintContext
+        ? painted(sourceBoxLineCommands(hits[0], item, {
+            src: blockId,
+            line: lineIndex,
+            fonts: paintContext.fonts ?? new Map(),
+            twinMetrics: paintContext.twinMetrics,
+            backend: block.galley?.backend ?? null,
+          }))
+        : [];
+    }
     if (!paint.length || paint.some((command) => command.math)) return null;
     const bounds = commandBounds(paint);
     const current = currentLines[lineIndex];
@@ -185,7 +384,8 @@ export function planTerminalCanonicalAnchor({
     source: base.source,
     sourceSpan: base.span,
     baseSnapshot: base,
-    baseLineWitnesses: base.lineWitnesses,
+    // The proof matches every plain line; opaque boxes carry no witness.
+    baseLineWitnesses: mixed ? base.lineWitnesses.filter(Boolean) : base.lineWitnesses,
     currentLineWitnesses: currentLines,
     changedLines,
     linePlans,
@@ -239,7 +439,12 @@ function geometryForGalley(geometry, galley) {
  * physical hbox for every base line or returned null. */
 export function buildTerminalCanonicalPatch(plan, matching) {
   if (!plan || !Array.isArray(matching) || matching.length !== plan.baseLineWitnesses?.length) return null;
-  const byLine = new Map(matching.map((entry) => [Number(entry.lineIndex), entry.candidate]));
+  // matching is positional over the certified witnesses; a mixed block's
+  // plain lines keep their own box ordinal, which the line plans use.
+  const byLine = new Map(matching.map((entry) => {
+    const witness = plan.baseLineWitnesses[Number(entry.lineIndex)];
+    return [Number.isInteger(witness?.index) ? witness.index : Number(entry.lineIndex), entry.candidate];
+  }));
   const pages = new Map();
   for (const line of plan.linePlans ?? []) {
     const anchor = byLine.get(line.lineIndex);

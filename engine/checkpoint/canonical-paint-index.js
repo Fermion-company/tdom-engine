@@ -22,60 +22,122 @@ export const PDF_PAINT_INDEX_VERSION = 1;
  * canonical generation. Spaces are TeX glue, not painted glyphs, so the
  * witness keeps the exact painted glyph sequence and its advance interval. */
 export function galleyLineWitnesses(galley) {
+  const lines = galleyBoxWitnesses(galley);
+  return lines && lines.every(Boolean) ? lines : null;
+}
+
+/** The same witnesses for a block that mixes plain lines with opaque boxes
+ * (a heading box, framed material, nested lines, graphics): one entry per
+ * box item, null where the box is not a single plain glyph line. */
+export function galleyMixedLineWitnesses(galley) {
+  const lines = galleyBoxWitnesses(galley);
+  return lines && lines.some(Boolean) ? lines : null;
+}
+
+function galleyBoxWitnesses(galley) {
   const boxes = (galley?.items ?? []).filter((item) => item?.k === 'box');
   if (!boxes.length) return null;
   const profileKey = residentBackendProfileKey(galley?.backend);
-  const lines = [];
-  for (let index = 0; index < boxes.length; index++) {
-    const item = boxes[index];
-    const runs = item.runs ?? [];
-    if (!runs.length) return null;
-    const glyphs = [];
-    let contentLeft = Infinity;
-    let contentRight = -Infinity;
-    for (const run of runs) {
-      const semantics = classifyResidentRun(run, galley?.backend);
-      if (semantics.tag === 'LayoutOnly') continue;
-      if (semantics.tag !== 'GlyphPaint') return null;
-      const x = Number(run.x);
-      const width = Number(run.w);
-      const size = Number(run.s);
-      const dy = Number(run.dy ?? 0);
-      if (![x, width, size, dy].every(Number.isFinite) || width < 0 || size <= 0 || Math.abs(dy) > EPSILON) {
-        return null;
-      }
-      const text = String(run.t).normalize('NFC');
-      if (!text || UNSAFE_TEXT.test(text) || /[\r\n]/u.test(text)) return null;
-      for (const char of Array.from(text)) {
-        if (/\s/u.test(char)) return null; // a painted space is ambiguous with synthesized extraction space
-        glyphs.push({ char, size, font: String(run.f ?? '') });
-      }
-      contentLeft = Math.min(contentLeft, x);
-      contentRight = Math.max(contentRight, x + width);
-    }
-    const lineWidth = Number(item.w);
-    const height = Number(item.h);
-    const depth = Number(item.d ?? 0);
-    if (![lineWidth, height, depth, contentLeft, contentRight].every(Number.isFinite) ||
-        lineWidth <= 0 || height <= 0 || depth < 0 || contentRight <= contentLeft || !glyphs.length) {
+  return boxes.map((item, index) => boxLineWitness(item, index, galley?.backend, profileKey));
+}
+
+function boxLineWitness(item, index, backend, profileKey) {
+  const runs = item.runs ?? [];
+  if (!runs.length) return null;
+  const glyphs = [];
+  let contentLeft = Infinity;
+  let contentRight = -Infinity;
+  for (const run of runs) {
+    const semantics = classifyResidentRun(run, backend);
+    if (semantics.tag === 'LayoutOnly') continue;
+    if (semantics.tag !== 'GlyphPaint') return null;
+    const x = Number(run.x);
+    const width = Number(run.w);
+    const size = Number(run.s);
+    const dy = Number(run.dy ?? 0);
+    if (![x, width, size, dy].every(Number.isFinite) || width < 0 || size <= 0 || Math.abs(dy) > EPSILON) {
       return null;
     }
-    lines.push({
-      index,
-      paintText: glyphs.map((glyph) => glyph.char).join(''),
-      glyphCount: glyphs.length,
-      glyphSizes: glyphs.map((glyph) => glyph.size),
-      glyphFonts: glyphs.map((glyph) => glyph.font),
-      lineWidth,
-      height,
-      depth,
-      contentLeft,
-      contentRight,
-      contentWidth: contentRight - contentLeft,
-      signature: stableLineSignature(item, profileKey),
-    });
+    const text = String(run.t).normalize('NFC');
+    if (!text || UNSAFE_TEXT.test(text) || /[\r\n]/u.test(text)) return null;
+    for (const char of Array.from(text)) {
+      if (/\s/u.test(char)) return null; // a painted space is ambiguous with synthesized extraction space
+      glyphs.push({ char, size, font: String(run.f ?? '') });
+    }
+    contentLeft = Math.min(contentLeft, x);
+    contentRight = Math.max(contentRight, x + width);
   }
-  return lines;
+  const lineWidth = Number(item.w);
+  const height = Number(item.h);
+  const depth = Number(item.d ?? 0);
+  if (![lineWidth, height, depth, contentLeft, contentRight].every(Number.isFinite) ||
+      lineWidth <= 0 || height <= 0 || depth < 0 || contentRight <= contentLeft || !glyphs.length) {
+    return null;
+  }
+  return {
+    index,
+    paintText: glyphs.map((glyph) => glyph.char).join(''),
+    glyphCount: glyphs.length,
+    glyphSizes: glyphs.map((glyph) => glyph.size),
+    glyphFonts: glyphs.map((glyph) => glyph.font),
+    lineWidth,
+    height,
+    depth,
+    contentLeft,
+    contentRight,
+    contentWidth: contentRight - contentLeft,
+    signature: stableLineSignature(item, profileKey),
+  };
+}
+
+/** Everything a mixed block lays out or declares except the glyph runs of
+ * its plain lines: opaque boxes verbatim, every glue/penalty/marker item,
+ * each plain line's box geometry and flags, the side-effect lists, and the
+ * state trail. Equal frames mean an edit changed nothing but the paint
+ * inside plain lines, and that the code after it ran from the same state. */
+export function mixedGalleyFrame(galley, witnesses) {
+  if (!galley || !Array.isArray(witnesses)) return null;
+  let box = -1;
+  const items = (galley.items ?? []).map((item) => {
+    if (item?.k !== 'box') return item;
+    box++;
+    if (!witnesses[box]) return item;
+    const { runs, ...frame } = item;
+    return frame;
+  });
+  if (box + 1 !== witnesses.length) return null;
+  return JSON.stringify([
+    residentBackendProfileKey(galley.backend),
+    Boolean(galley.gfx),
+    galley.w ?? null,
+    galley.h ?? null,
+    items,
+    galley.floats ?? [],
+    galley.labels ?? [],
+    galley.refs ?? [],
+    galley.toclines ?? [],
+    galley.events ?? [],
+    galley.trail ?? null,
+  ]);
+}
+
+/** Mixed counterpart of changedGalleyLines: opaque boxes stay opaque and
+ * unchanged (the caller compares frames), and only plain lines may change. */
+export function changedMixedGalleyLines(baseLines, currentLines) {
+  if (!Array.isArray(baseLines) || !Array.isArray(currentLines) ||
+      !baseLines.length || baseLines.length !== currentLines.length) return null;
+  const changed = [];
+  for (let index = 0; index < baseLines.length; index++) {
+    const before = baseLines[index];
+    const after = currentLines[index];
+    if (!before !== !after) return null;
+    if (!before) continue;
+    if (!sameNumber(before.lineWidth, after.lineWidth, EPSILON) ||
+        !sameNumber(before.height, after.height, EPSILON) ||
+        !sameNumber(before.depth, after.depth, EPSILON)) return null;
+    if (before.signature !== after.signature) changed.push(index);
+  }
+  return changed.length ? changed : null;
 }
 
 /** Return the complete base→current effect set. Unchanged lines must retain

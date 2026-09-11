@@ -1874,6 +1874,7 @@ const server = http.createServer(async (req, res) => {
             inputEpoch: engine.canonical.inputEpoch,
             acceptedAt: anchorAcceptedAt,
             clientEditAtEpochMs: anchorClientEditAt,
+            paintContext: { fonts: engine.fonts, twinMetrics: engine.twinMetrics },
           })
         : null;
       if (anchorPlan) {

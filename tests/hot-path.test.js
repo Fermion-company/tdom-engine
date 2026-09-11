@@ -32,12 +32,14 @@ import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finaliz
 import { classifyResidentEdit } from '../engine/checkpoint/resident-edit-admission.js';
 import { plainPreviewWitness, canDeferPlainVerification } from '../engine/checkpoint/plain-preview.js';
 import {
+  buildTerminalCanonicalPatch,
   captureCanonicalAnchorBase,
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
   singlePlainTextDelta,
 } from '../engine/checkpoint/canonical-anchor.js';
 import { singleLiteralChildReadProof } from '../engine/checkpoint/dependency-read-proof.js';
+import { galleyMixedLineWitnesses, mixedGalleyFrame } from '../engine/checkpoint/canonical-paint-index.js';
 
 const TEST_WORK_ROOT = process.env.TDOM_TEST_WORK_ROOT;
 const workDir = (name) => TEST_WORK_ROOT
@@ -976,6 +978,151 @@ test('one wholly-owned child prose edit keeps a frozen canonical input lineage',
   assert.equal(singlePlainTextDelta('plain prose', 'plain \\write prose'), null);
 });
 
+test('a prose line inside a mixed block anchors only while everything else is unchanged', () => {
+  // heading box, two prose lines, a toc marker and a framed box, as a
+  // \subsection + paragraph + tcolorbox block harvests
+  const prose = (text, h = 8, ca) => ({ k: 'box', w: 400, h, d: 2, ...(ca ? { ca: 1 } : {}),
+    runs: [{ t: text, x: 0, w: 10 * text.length, s: 10, f: 'body', dy: 0 }] });
+  const opaque = (text) => ({ k: 'box', w: 400, h: 40, d: 0, runs: [
+    { t: text, x: 10, w: 60, s: 10, f: 'body', dy: 0 },
+    { t: `${text} inside`, x: 10, w: 80, s: 10, f: 'body', dy: 14 },
+  ] });
+  // epochs: the heading, then the paragraph (its glue and both lines), then
+  // the toc marker and the frame, each moved by its own build_page
+  const galley = ({ second = 'Bravo', frame = 'Framed', toc = 'Heading', h, active, ca,
+    trail = 'trail', alphaFx, frameFx, paintLate } = {}) => ({
+    gfx: true, w: 400, h: 120, closure: 'native', ...(active ? { tdomActive: active } : {}),
+    items: [opaque('Heading'), { k: 'glue', a: 4 }, { ...prose('Alpha'), ...(alphaFx ? { fx: alphaFx } : {}) },
+      { k: 'glue', a: 3 }, prose(second, h, ca), { k: 'tl', n: 0 },
+      { ...opaque(frame), ...(frameFx ? { fx: frameFx } : {}) }],
+    epochs: [1, 2, 2, 2, 2, 3, 3], trail, ...(paintLate ? { paintLate } : {}),
+    floats: [], events: [], labels: [], refs: [],
+    toclines: [['toc', 'subsection', toc]],
+  });
+  const fidelity = (flags = 0) => ({ level: 'exact-preview-required', itemFlags: [1, 0, 0, 0, flags, 0, 1] });
+  const text = 'Alpha prose Bravo';
+  const oldBlock = {
+    id: 'mixed', start: 0, end: text.length, text, stateVec: '[1,2,3,4,5,6,7,8]',
+    needsRender: true, fidelity: fidelity(), galley: galley(),
+    editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length }],
+  };
+  const dom = { id: 'mixed', span: { start: 0, end: text.length },
+    source: { file: 'main.tex', start: { line: 20, column: 1 }, end: { line: 22, column: 1 } } };
+  const certificate = { id: 3, rev: 5, inputEpoch: 1, pdfHash: 'pdf', synctexHash: 'sync' };
+  const known = { pre_shipout_filter: ['ltj.direction', 'luacolor.process'],
+    hpack_filter: ['luaotfload.node_processor', 'ltj.main', 'add underlines to list'] };
+  const geometry = { textheight: 680, paintCallbacks: known };
+  const paintContext = { fonts: new Map([['body', { tier: 'native', family: 'f-body' }]]) };
+  const edit = singlePlainTextDelta(text, `${text}X`);
+  const base = captureCanonicalAnchorBase({ blocks: [oldBlock], domBlocks: [dom], edit, certificate });
+  assert.equal(typeof base?.frame, 'string', 'a mixed block freezes its opaque frame');
+  assert.deepEqual(base.lineWitnesses.map((line) => line?.index ?? null), [null, 1, 2, null]);
+
+  const report = { mode: 'structured', srcRev: 6, canonical: { id: 3, rev: 5, pageCount: 40 },
+    stats: { pageCount: 38 }, dirtySourceNodes: ['src-mixed'],
+    patches: [{ type: 'replace-page', page: 12, displayList: { commands: [
+      { op: 'glyphs', src: 'mixed', line: 2, x: 72, y: 300, w: 60, gh: 8, gd: 2, size: 10, text: 'BravoX' },
+    ] } }] };
+  const plan = (changes = {}, flags = 0, context = {}) => planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}X`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      fidelity: fidelity(flags), galley: galley({ second: 'BravoX', ...changes }) }],
+    domBlocks: [dom], report, geometry: context.geometry ?? geometry, edit,
+    baseSnapshot: context.base ?? base, paintContext: context.paintContext ?? paintContext,
+  });
+  const ok = plan();
+  assert.deepEqual(ok?.changedLines, [2], 'only the edited prose line is repainted');
+  // with graphics in the block its exact chunk owns every line, so the page
+  // carries only the line's source hit box; the safe runs paint from there
+  const hitOnly = planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}X`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      fidelity: fidelity(), galley: galley({ second: 'BravoX' }) }],
+    domBlocks: [dom], geometry, edit, baseSnapshot: base,
+    report: { ...report, patches: [{ type: 'replace-page', page: 12, displayList: { commands: [
+      { op: 'pending-exact', src: 'mixed', x: 72, y: 292, w: 400, h: 10 },
+      { op: 'sourcebox', src: 'mixed', line: 2, x: 72, y: 292, w: 60, h: 10, ink: 1 },
+    ] } }] },
+    paintContext,
+  });
+  assert.deepEqual(hitOnly?.linePlans?.[0]?.commands.map((command) =>
+    [command.op, command.fam, command.text, command.x, command.y]), [['glyphs', 'f-body', 'BravoX', 72, 300]]);
+  assert.deepEqual(ok.baseLineWitnesses.map((line) => line.index), [1, 2],
+    'the proof matches every prose line and no opaque box');
+  assert.equal(plan({ frame: 'Framed!' }), null, 'an opaque box that changed fails closed');
+  assert.equal(plan({ toc: 'Heading!' }), null, 'a changed side effect fails closed');
+  assert.equal(plan({ h: 9 }), null, 'a changed line box fails closed');
+  assert.equal(plan({}, 1), null, 'an edited line that needs exact paint fails closed');
+  assert.equal(plan({ active: ':' }), null, 'an active character can run a macro: not plain paint');
+  // SyncTeX tags a prose line with its paragraph's closing line, so the
+  // proof cannot tell prose from framed text by source line: framed text
+  // that paints a prose line's glyphs could stand in for it
+  const framedBase = captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, galley: galley({ frame: 'Framed Alpha' }) }],
+    domBlocks: [dom], edit, certificate });
+  assert.equal(typeof framedBase?.frame, 'string');
+  assert.equal(planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}X`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      fidelity: fidelity(), galley: galley({ second: 'BravoX', frame: 'Framed Alpha' }) }],
+    domBlocks: [dom], report, geometry, edit, baseSnapshot: framedBase, paintContext,
+  }), null, 'framed text that paints a prose line fails closed');
+  assert.equal(plan({}, 0, { geometry: { textheight: 680 } }), null, 'no callback report: fail closed');
+  assert.equal(plan({}, 0, { geometry: { textheight: 680, paintCallbacks: { ...known, pre_shipout_filter: ['mystery.paint'] } } }),
+    null, 'an unknown shipout filter may add paint the resident never saw');
+  assert.equal(plan({}, 0, { paintContext: { fonts: new Map([['body', { tier: 'twin', family: 'f-body' }]]) } }), null,
+    'framed text in a substituted font is not comparable with canonical ToUnicode text');
+  assert.equal(plan({ frame: 'Framed\uE001' }, 0, { base: captureCanonicalAnchorBase({
+    blocks: [{ ...oldBlock, galley: galley({ frame: 'Framed\uE001' }) }], domBlocks: [dom], edit, certificate }) }),
+  null, 'framed PUA text is not comparable');
+  assert.equal(plan({ ca: true }, 0, { base: captureCanonicalAnchorBase({
+    blocks: [{ ...oldBlock, galley: galley({ ca: true }) }], domBlocks: [dom], edit, certificate }) }),
+  null, 'luacolor colors this line at shipout: its resident runs do not show the color');
+  assert.equal(captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, rescued: true }], domBlocks: [dom], edit, certificate }),
+    null, 'a rescued galley carries no paint fingerprints');
+  assert.equal(captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, galley: { ...galley(), trail: undefined } }],
+    domBlocks: [dom], edit, certificate }), null, 'no state trail, no proof about the code after the edit');
+
+  // The trail samples TeX's state at every build_page: a later macro that
+  // reads what the edit changed can emit a literal the harvest cannot read.
+  assert.equal(plan({ trail: 'other' }), null, 'code after the edit ran from another state');
+  // Inside the edited paragraph no sample sees horizontal-mode state, so its
+  // contribution may carry only paint the harvest reads.
+  const fxBase = (changes) => captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, galley: galley(changes) }],
+    domBlocks: [dom], edit, certificate });
+  assert.equal(plan({ alphaFx: 'f00d' }, 0, { base: fxBase({ alphaFx: 'f00d' }) }), null,
+    'a paint whatsit in the edited paragraph fails closed');
+  assert.deepEqual(plan({ frameFx: 'f00d' }, 0, { base: fxBase({ frameFx: 'f00d' }) })?.changedLines, [2],
+    'an unchanged frame after the paragraph keeps its unreadable literal: the trail proves its inputs');
+
+  // Paint callbacks are known by exact name and description, and include any
+  // registered after the preamble, in any block of the document.
+  assert.equal(plan({}, 0, { geometry: { textheight: 680, paintCallbacks: { ...known,
+    hpack_filter: [...known.hpack_filter, 'ltj.mystery'] } } }), null, 'a name prefix is not a known callback');
+  assert.equal(plan({ paintLate: { pre_shipout_filter: ['late.paint'] } }), null,
+    'a filter the document registered after the preamble fails closed');
+  assert.deepEqual(plan({ paintLate: { vpack_filter: ['add underlines to list'] } })?.changedLines, [2],
+    'a late registration of a known filter is still known');
+  const withNeighbour = (neighbour) => planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}X`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      fidelity: fidelity(), galley: galley({ second: 'BravoX' }) }, neighbour],
+    domBlocks: [dom], report, geometry, edit, baseSnapshot: base, paintContext,
+  });
+  assert.deepEqual(withNeighbour({ id: 'later', galley: { items: [] } })?.changedLines, [2]);
+  assert.equal(withNeighbour({ id: 'later', galley: { items: [], paintLate: { pre_shipout_filter: ['late.paint'] } } }),
+    null, 'a later block on the same page may register a shipout filter');
+  assert.equal(withNeighbour({ id: 'later' }), null, 'a block the resident has not typeset: registrations unknown');
+
+  const pageGeometry = { oddsidemargin: 0, textwidth: 450, topmargin: 0, headheight: 12, headsep: 18,
+    textheight: 680 };
+  const line = (y) => ({ page: 12, y, box: { left: 72, top: y - 8, right: 472, bottom: y + 2 } });
+  const patch = buildTerminalCanonicalPatch({ ...ok, geometry: pageGeometry },
+    [{ lineIndex: 0, candidate: line(150) }, { lineIndex: 1, candidate: line(163) }]);
+  assert.deepEqual(patch?.pages?.map((page) => page.page), [12]);
+  assert.equal(patch.pages[0].commands[0].y, 163,
+    'positional matches map back to the witness box ordinal, not the first prose line');
+});
+
 test('terminal prose without a frozen canonical line proof fails closed', () => {
   const block = {
     id: 'b-tail',
@@ -1717,6 +1864,38 @@ test('boxes whose glyphs luacolor colors at shipout are marked', opts, async () 
     assert.deepEqual(marks('Red prose'), [1]);
     assert.ok(e.getGeometry().paintCallbacks?.pre_shipout_filter?.includes('luacolor.process'),
       'the resident reports the shipout filter that paints these colors');
+  } finally {
+    await e.close();
+  }
+});
+
+// LuaTeX exposes no payload for a pdf_literal TeX built, so a galley cannot
+// show that a later, unedited macro wrote a different one. It can show the
+// state that macro read: the trail samples it at every build_page.
+test('the state trail records what later code can read after an edit', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  const galley = () => e.blocks.find((b) => b.text.includes('Stretchy'))?.galley;
+  const frame = (g) => mixedGalleyFrame({ ...g, trail: null }, galleyMixedLineWitnesses(g));
+  try {
+    await e.open(String.raw`\documentclass{article}
+\begin{document}
+{\parfillskip=0pt plus 300pt Stretchy prose line.\par}
+\hbox{\pdfextension literal{\the\badness\space w}}
+\end{document}
+`);
+    await drain(e);
+    const before = galley();
+    assert.equal(typeof before?.trail, 'string');
+    assert.equal(before.epochs?.length, before.items.length, 'every top-level item knows its build_page');
+    const at = e.getSource().indexOf(' line.');
+    await e.edit(at, at, 'X');
+    await drain(e);
+    const after = galley();
+    assert.equal(frame(after), frame(before), 'the literal box looks the same to the harvest');
+    assert.notEqual(after.trail, before.trail, 'but the badness it was built from changed');
   } finally {
     await e.close();
   }

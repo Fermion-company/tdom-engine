@@ -220,6 +220,27 @@ function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, lin
   }
 }
 
+/** The commands a harvested line would paint at the position its source hit
+ * box records (sourceHitCommand: x = origin + first ink run, y = baseline -
+ * box height). A block whose exact chunk owns its pixels never emits them,
+ * yet canonical-anchor may repaint one plain line of such a block over the
+ * canonical page. Null when the line has no ink run to pin its origin. */
+export function sourceBoxLineCommands(sourcebox, item, { src, line, fonts, twinMetrics, backend = null }) {
+  const runs = item?.runs ?? [];
+  let left = Infinity;
+  for (const run of runs) {
+    if (!run.rule && !run.t) continue;
+    left = Math.min(left, run.x ?? 0);
+  }
+  const x = Number(sourcebox?.x);
+  const y = Number(sourcebox?.y);
+  const boxH = Number(item?.h ?? 0);
+  if (!Number.isFinite(left) || ![x, y, boxH].every(Number.isFinite)) return null;
+  const commands = [];
+  runCommands(commands, runs, x - left, y + boxH, src, { fonts, twinMetrics, line, backend });
+  return commands;
+}
+
 function runPaintsInk(run, backend) {
   if (!run?.rule) return !!run?.t;
   const semantics = classifyResidentRun(run, backend);
