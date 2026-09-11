@@ -887,25 +887,43 @@ export class CanonicalRenderer {
     try {
       if (!cur.synctex) return [];
       const input = `${Math.floor(line)}:${Math.max(1, Math.floor(Number(column) || 1))}:${path.resolve(file)}`;
-      const result = await this.#exec('synctex', ['view', '-i', input, '-o', cur.pdf], {
-        cwd: this.docDir,
-        timeout: 15_000,
-        maxBuffer: 4 * 1024 * 1024,
-        env: process.env,
-      });
-      const raw = parseSynctexViewOutputs(`${result.stdout || ''}\n${result.stderr || ''}`);
-      const transforms = new Map();
-      await Promise.all([...new Set(raw.map((item) => item.page))].map(async (pageNumber) => {
-        transforms.set(pageNumber, await this.#syncContentTransform(cur, pageNumber));
-      }));
-      return raw.flatMap((item) => {
-        const contentTransform = transforms.get(item.page);
-        return contentTransform == null ? [] : [syncTeXResultToDisplayed(
-          item,
-          cur.papers?.[item.page - 1] ?? null,
-          contentTransform ?? IDENTITY_AFFINE
-        )];
-      });
+      // One generation's SyncTeX never changes, and every CLI call re-reads
+      // the whole file: a long document's block proof (one query per source
+      // line) otherwise cannot fit the canonical-anchor budget. The caret
+      // warm prefetches through this cache; the edit's proof reuses it.
+      cur.forwardSyncCache ??= new Map();
+      let job = cur.forwardSyncCache.get(input);
+      if (!job) {
+        job = (async () => {
+          const result = await this.#exec('synctex', ['view', '-i', input, '-o', cur.pdf], {
+            cwd: this.docDir,
+            timeout: 15_000,
+            maxBuffer: 4 * 1024 * 1024,
+            env: process.env,
+          });
+          const raw = parseSynctexViewOutputs(`${result.stdout || ''}\n${result.stderr || ''}`);
+          const transforms = new Map();
+          await Promise.all([...new Set(raw.map((item) => item.page))].map(async (pageNumber) => {
+            transforms.set(pageNumber, await this.#syncContentTransform(cur, pageNumber));
+          }));
+          return raw.flatMap((item) => {
+            const contentTransform = transforms.get(item.page);
+            return contentTransform == null ? [] : [syncTeXResultToDisplayed(
+              item,
+              cur.papers?.[item.page - 1] ?? null,
+              contentTransform ?? IDENTITY_AFFINE
+            )];
+          });
+        })();
+        job.catch(() => {
+          if (cur.forwardSyncCache?.get(input) === job) cur.forwardSyncCache.delete(input);
+        });
+        cur.forwardSyncCache.set(input, job);
+        while (cur.forwardSyncCache.size > 4096) {
+          cur.forwardSyncCache.delete(cur.forwardSyncCache.keys().next().value);
+        }
+      }
+      return [...await job];
     } catch {
       return [];
     } finally {

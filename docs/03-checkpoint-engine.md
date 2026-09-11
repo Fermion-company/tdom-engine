@@ -167,7 +167,7 @@ foreground verification の現在の初期 budget は、galley divergence 用が
 
 warm/rescue の組版結果が同一でも、chunkの版が変わった場合は表示リストを再生成し、画像と入力座標が参照する版を揃える。
 
-`/warm` は `offset` と任意の `filePath` を受け取り、そのソースファイルに属する block の前後を保持する。子ファイルの offset は子ファイルの本文長と照合し、親ファイルの同じ数値の位置へ置き換えない。`filePath` 省略時は従来どおり root を対象にする。
+`/warm` は `offset` と任意の `filePath` を受け取り、そのソースファイルに属する block の前後を保持する。子ファイルの offset は子ファイルの本文長と照合し、親ファイルの同じ数値の位置へ置き換えない。`filePath` 省略時は従来どおり root を対象にする。offset 指定の warm が `ready` になり canonical がその時点のソースと一致していれば、サーバはキャレットの block の canonical-anchor 証明材料（ソース行ごとの SyncTeX 候補とページの paint index）を先に取得する。どちらも canonical generation ごとの cache に入り（SyncTeX は `synctex view` の呼び出し 1 回ずつがファイル全体を読み直すため、行数の多い block は編集後の予算内に取れない）、最初の打鍵の証明はそこから読む。
 
 同じページに欠けている exact chunk があれば、その block まで同じ中断可能な chain を準備し、既存の並列数制限付き render pump へ渡す。`/warm` の `page` 指定はそのページの先頭 block を起点にする。viewer は canonical の表示確定後とスクロール停止後に表示中のページを準備する。入力や文書切替による世代変更は既存の abort 経路で優先される。
 

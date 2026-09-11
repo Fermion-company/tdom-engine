@@ -1189,6 +1189,32 @@ function prefetchCanonicalAnchorProof(base, deadline) {
   return { base, candidates, paintPages };
 }
 
+// A block's proof inputs (one SyncTeX query per source line, the pages'
+// paint indexes) depend only on the canonical generation. Fetch them for the
+// block under a warmed caret so the first keystroke's proof reads the
+// generation caches instead of spending its budget on CLI calls.
+const WARM_PROOF_PREFETCH_MS = 10_000;
+
+function prefetchWarmAnchorProof(offset, filePath) {
+  if (!ENABLE_CANONICAL_ANCHOR || !Number.isFinite(offset)) return;
+  const certificate = engine.canonical.generationCertificate();
+  if (!certificate || certificate.rev !== engine.srcRev ||
+      certificate.inputEpoch !== engine.canonical.inputEpoch) return;
+  const file = typeof filePath === 'string' ? path.resolve(activeProject.docDir, filePath) : null;
+  const root = !file || file === path.resolve(activeProject.filePath);
+  const readPath = root ? null : engine.includes.get(file)?.readPath;
+  if (!root && typeof readPath !== 'string') return;
+  const base = captureCanonicalAnchorBase({
+    blocks: engine.blocks,
+    domBlocks: engine.getDOM().blocks,
+    edit: root
+      ? { start: offset, end: offset, text: '' }
+      : { start: offset, end: offset, text: '', file, canonicalInputPath: path.resolve(readPath) },
+    certificate,
+  });
+  if (base) prefetchCanonicalAnchorProof(base, performance.now() + WARM_PROOF_PREFETCH_MS);
+}
+
 async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch = null) {
   const prefetched = prefetch?.base === plan.baseSnapshot ? prefetch : null;
   const candidates = await (prefetched?.candidates ?? beforeDeadline(
@@ -1398,10 +1424,14 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isFinite(offset) && !(Number.isSafeInteger(page) && page > 0)) {
         return json(res, { error: 'warm requires a finite offset or positive page' }, 400);
       }
+      const filePath = typeof body.filePath === 'string' ? body.filePath : engine.file;
       const warming = Number.isFinite(offset)
-        ? engine.warmEditOffset(offset, typeof body.filePath === 'string' ? body.filePath : engine.file)
+        ? engine.warmEditOffset(offset, filePath)
         : engine.warmPage(page);
-      void warming.catch((error) => {
+      void warming.then((result) => {
+        if (result?.status !== 'ready' || !Number.isFinite(offset)) return;
+        try { prefetchWarmAnchorProof(offset, filePath); } catch { /* a missed prefetch only costs budget */ }
+      }, (error) => {
         engine.warmInfo = { status: 'error', message: error?.message ?? String(error) };
       });
       return json(res, { scheduled: true, srcRev: engine.srcRev });
