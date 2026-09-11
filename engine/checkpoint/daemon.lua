@@ -96,7 +96,14 @@ local function bp(sp) return math.floor(((sp or 0) / SP2BP) * 1000000 + 0.5) / 1
 
 local DUMMY_ATTR = 8123
 local LASTSKIP_ATTR = 8124 -- marks the \lastskip primer glue (see tdom_prime_lastskip)
-local EPOCH_ATTR = 8125 -- the build_page call that moved a top-level node (see note_trail)
+-- The build_page call that moved a top-level node (see note_trail). The
+-- canonical-anchor proof reads it, so it takes an allocated attribute rather
+-- than a fixed number a document could also set; the daemon loads after the
+-- preamble, so no package's attribute moves.
+local EPOCH_ATTR = (function()
+  local ok, attr = pcall(function() return luatexbase.new_attribute('tdom@epoch') end)
+  return ok and tonumber(attr) or 8125
+end)()
 
 -- The state trail. A plain-text edit reaches later, unedited code in its
 -- block only through what TeX keeps between contributions to the main
