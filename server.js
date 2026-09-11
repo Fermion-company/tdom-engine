@@ -1733,6 +1733,7 @@ const server = http.createServer(async (req, res) => {
       let anchorPriorLineage = null;
       let inputUnchanged = false;
       let anchorProofPrefetch = null;
+      const anchorDiagnostics = {};
       const anchorAcceptedAt = performance.now();
       const rawClientEditAt = Number(body.clientEditAtEpochMs);
       const nowEpoch = Date.now();
@@ -1769,7 +1770,10 @@ const server = http.createServer(async (req, res) => {
                 domBlocks: engine.getDOM().blocks,
                 edit: anchorEdit,
                 certificate,
+                diagnostics: anchorDiagnostics,
               });
+            } else {
+              anchorDiagnostics.reason = 'canonical-behind';
             }
           }
           const overlayDelta = applyProjectOverlays(activeProject, body);
@@ -1892,6 +1896,8 @@ const server = http.createServer(async (req, res) => {
         lastAnchorPresentation = null;
       }
       lastReport.previewFallback = dirtyWithoutPatchFallback(lastReport);
+      // Why the base capture refused wins over the plan's resulting no-base.
+      const baseRefusal = anchorDiagnostics.reason ?? null;
       const anchorPlan = ENABLE_CANONICAL_ANCHOR && anchorInputSafe && lastReport.rebooted !== true
         ? planTerminalCanonicalAnchor({
             blocks: engine.blocks,
@@ -1905,8 +1911,19 @@ const server = http.createServer(async (req, res) => {
             acceptedAt: anchorAcceptedAt,
             clientEditAtEpochMs: anchorClientEditAt,
             paintContext: { fonts: engine.fonts, twinMetrics: engine.twinMetrics },
+            diagnostics: anchorDiagnostics,
           })
         : null;
+      if (!anchorPlan && ENABLE_CANONICAL_ANCHOR && anchorMutation) {
+        // Not a state the client acts on: the only record of why this edit
+        // waits for the canonical build instead of a certified overlay.
+        const planRefusal = anchorDiagnostics.reason;
+        lastReport.canonicalAnchorRefused = !anchorEdit ? 'not-plain-text'
+          : !anchorInputSafe ? 'input-not-anchorable'
+          : lastReport.rebooted === true ? 'rebooted'
+          : planRefusal === 'no-base' && baseRefusal ? baseRefusal
+          : planRefusal ?? 'unknown';
+      }
       if (anchorPlan) {
         anchorPlan.public.acceptedElapsedMs = performance.now() - anchorAcceptedAt;
         lastReport.canonicalAnchor = anchorPlan.public;

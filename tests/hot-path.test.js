@@ -1034,6 +1034,7 @@ test('a prose line inside a mixed block anchors only while everything else is un
       fidelity: fidelity(flags), galley: galley({ second: 'BravoX', ...changes }) }],
     domBlocks: [dom], report, geometry: context.geometry ?? geometry, edit,
     baseSnapshot: context.base ?? base, paintContext: context.paintContext ?? paintContext,
+    diagnostics: context.diagnostics ?? null,
   });
   const ok = plan();
   assert.deepEqual(ok?.changedLines, [2], 'only the edited prose line is repainted');
@@ -1117,6 +1118,24 @@ test('a prose line inside a mixed block anchors only while everything else is un
   assert.equal(withNeighbour({ id: 'later', galley: { items: [], paintLate: { pre_shipout_filter: ['late.paint'] } } }),
     null, 'a later block on the same page may register a shipout filter');
   assert.equal(withNeighbour({ id: 'later' }), null, 'a block the resident has not typeset: registrations unknown');
+
+  // A refusal leaves the preview on the canonical build; its reason is the
+  // only trace of which check it was.
+  const refusal = (changes = {}, flags = 0, context = {}) => {
+    const diagnostics = {};
+    assert.equal(plan(changes, flags, { ...context, diagnostics }), null);
+    return diagnostics.reason;
+  };
+  assert.equal(refusal({ frame: 'Framed!' }), 'mixed-frame-changed');
+  assert.equal(refusal({ trail: 'other' }), 'mixed-frame-changed');
+  assert.equal(refusal({}, 1), 'mixed-line-flags');
+  assert.equal(refusal({ alphaFx: 'f00d' }, 0, { base: fxBase({ alphaFx: 'f00d' }) }), 'edited-contribution-paint');
+  assert.equal(refusal({ paintLate: { pre_shipout_filter: ['late.paint'] } }), 'paint-callbacks');
+  assert.equal(refusal({}, 0, { base: { ...base, blockId: 'other' } }), 'base-mismatch');
+  const captureRefusal = {};
+  assert.equal(captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, galley: galley({ active: ':' }) }],
+    domBlocks: [dom], edit, certificate, diagnostics: captureRefusal }), null);
+  assert.equal(captureRefusal.reason, 'mixed-active-chars');
 
   const pageGeometry = { oddsidemargin: 0, textwidth: 450, topmargin: 0, headheight: 12, headsep: 18,
     textheight: 680 };

@@ -40,31 +40,36 @@ export function singlePlainTextDelta(before, after) {
 /** Freeze the pre-edit resident witness while that exact source is still the
  * canonical generation. The server calls this inside its serialized edit
  * critical section, before engine.edit() can replace the galley. */
-export function captureCanonicalAnchorBase({ blocks, domBlocks, edit, certificate }) {
+export function captureCanonicalAnchorBase({ blocks, domBlocks, edit, certificate, diagnostics = null }) {
+  const reject = (reason) => {
+    if (diagnostics) diagnostics.reason = reason;
+    return null;
+  };
   const start = Number(edit?.start);
   const end = Number(edit?.end);
-  if (![start, end].every(Number.isFinite) || end < start || !certificate?.id) return null;
+  if (![start, end].every(Number.isFinite) || end < start || !certificate?.id) return reject('base-edit-span');
   const editFile = typeof edit?.file === 'string' ? path.resolve(edit.file) : null;
-  if (editFile && typeof edit?.canonicalInputPath !== 'string') return null;
+  if (editFile && typeof edit?.canonicalInputPath !== 'string') return reject('base-child-input');
   if (editFile && blocks.some((item) => item.sourceParts?.some((part) =>
     typeof part.file === 'string' && path.resolve(part.file) === editFile &&
-    start >= Number(part.start) && end <= Number(part.end)))) return null;
+    start >= Number(part.start) && end <= Number(part.end)))) return reject('base-shared-child');
   const candidates = blocks.filter((item) => {
     if (item.sourceParts || start < Number(item.start) || end > Number(item.end)) return false;
     if (!editFile) return !item.file;
     return typeof item.file === 'string' && path.resolve(item.file) === editFile;
   });
-  if (editFile ? candidates.length !== 1 : candidates.length === 0) return null;
+  if (editFile ? candidates.length !== 1 : candidates.length === 0) return reject('base-block');
   const block = candidates[0];
   const dom = domBlocks.find((item) => item.id === block?.id);
-  if (!block || !dom) return null;
+  if (!block || !dom) return reject('base-block');
   const plain = !hasGalleySideEffects(block.galley) && block.fidelity?.level === SAFE_GLYPH;
-  if (editFile && (typeof dom.source?.file !== 'string' || path.resolve(dom.source.file) !== editFile)) return null;
+  if (editFile && (typeof dom.source?.file !== 'string' || path.resolve(dom.source.file) !== editFile)) return reject('base-dom-file');
   const plainWitnesses = plain ? galleyLineWitnesses(block.galley) : null;
-  const mixed = plainWitnesses ? null : mixedAnchorFrame(block);
+  const mixed = plainWitnesses ? null : mixedAnchorFrame(block, diagnostics);
   const lineWitnesses = plainWitnesses ?? mixed?.lineWitnesses;
+  if (!lineWitnesses) return plain ? reject('base-plain-witness') : null;
   const structuralStateVec = canonicalAnchorStructuralState(block.stateVec);
-  if (!lineWitnesses || structuralStateVec === null) return null;
+  if (structuralStateVec === null) return reject('base-structural-state');
   return {
     blockId: block.id,
     blockHash: block.hash,
@@ -89,18 +94,23 @@ export function captureCanonicalAnchorBase({ blocks, domBlocks, edit, certificat
  * material, graphics) or declare side effects (a toc line, labels) may still
  * anchor an edit to one of its plain lines: the frame freezes everything
  * else, and the plan requires it byte-identical after the edit. */
-function mixedAnchorFrame(block) {
+function mixedAnchorFrame(block, diagnostics = null) {
+  const reject = (reason) => {
+    if (diagnostics) diagnostics.reason = reason;
+    return null;
+  };
   const galley = block.galley;
-  if (!galley || galley.tdomFrozen || galley.tdomDeferred || block.fidelity?.canonicalOnly) return null;
+  if (!galley || galley.tdomFrozen || galley.tdomDeferred || block.fidelity?.canonicalOnly) return reject('mixed-unavailable');
   // Only a resident harvest fingerprints paint whatsits per box (fx), keeps
   // the state trail and contribution epochs, and reports active characters;
   // with one active, "plain" text runs macros.
-  if (block.rescued || galley.closure !== 'native' || galley.tdomActive) return null;
+  if (block.rescued || galley.closure !== 'native') return reject('mixed-not-native');
+  if (galley.tdomActive) return reject('mixed-active-chars');
   if (typeof galley.trail !== 'string' || !Array.isArray(galley.epochs) ||
-      galley.epochs.length !== (galley.items ?? []).length) return null;
+      galley.epochs.length !== (galley.items ?? []).length) return reject('mixed-no-trail');
   const lineWitnesses = galleyMixedLineWitnesses(galley);
   const frame = lineWitnesses ? mixedGalleyFrame(galley, lineWitnesses) : null;
-  return frame ? { lineWitnesses, frame } : null;
+  return frame ? { lineWitnesses, frame } : reject('mixed-no-witness');
 }
 
 /** A changed plain line of a mixed block must itself be a safe glyph line:
@@ -259,14 +269,21 @@ export function planTerminalCanonicalAnchor({
   acceptedAt = performance.now(),
   clientEditAtEpochMs = null,
   paintContext = null,
+  diagnostics = null,
 }) {
+  // Every refusal names its check: the preview then silently waits for the
+  // canonical build, and a reason in the report is the only trace of why.
+  const reject = (reason) => {
+    if (diagnostics) diagnostics.reason = reason;
+    return null;
+  };
   const canonical = report?.canonical;
   const canonicalAnchorPolicy = report?.previewPolicy === 'canonical-anchor';
   const residentEditCandidate = report?.residentEditCandidate === true;
-  if (report?.mode !== 'structured' || !canonical?.id) return null;
+  if (report?.mode !== 'structured' || !canonical?.id) return reject('no-structured-canonical');
   if (!canonicalAnchorPolicy && !residentEditCandidate &&
-      canonical.pageCount === report.stats?.pageCount) return null;
-  if (report.dirtySourceNodes?.length !== 1) return null;
+      canonical.pageCount === report.stats?.pageCount) return reject('not-needed');
+  if (report.dirtySourceNodes?.length !== 1) return reject('dirty-blocks');
 
   const blockId = String(report.dirtySourceNodes[0]).replace(/^src-/, '');
   const immediateBase = canonical.rev === report.srcRev - 1;
@@ -276,25 +293,27 @@ export function planTerminalCanonicalAnchor({
     lineage.baseRev === canonical.rev &&
     lineage.lastSrcRev === report.srcRev - 1 &&
     lineage.baseSnapshot;
-  if (!immediateBase && !continuedBase) return null;
+  if (!immediateBase && !continuedBase) return reject('base-generation');
   const block = blocks.find((item) => item.id === blockId);
   const dom = domBlocks.find((item) => item.id === blockId);
   const base = immediateBase ? baseSnapshot : lineage.baseSnapshot;
-  if (!block || !dom || !base || base.blockId !== blockId ||
-      base.certificate?.id !== canonical.id || base.certificate?.rev !== canonical.rev) return null;
+  if (!block || !dom) return reject('block-missing');
+  if (!base) return reject('no-base');
+  if (base.blockId !== blockId ||
+      base.certificate?.id !== canonical.id || base.certificate?.rev !== canonical.rev) return reject('base-mismatch');
   const editFile = typeof edit?.file === 'string' ? path.resolve(edit.file) : null;
   const blockFile = typeof block.file === 'string' ? path.resolve(block.file) : null;
   const baseFile = typeof base.file === 'string' ? path.resolve(base.file) : null;
-  if (block.sourceParts || editFile !== blockFile || baseFile !== blockFile) return null;
+  if (block.sourceParts || editFile !== blockFile || baseFile !== blockFile) return reject('file-mismatch');
   const mixed = typeof base.frame === 'string';
   if (mixed) {
     // The resident's exact chunk is irrelevant here: only plain lines are
     // repainted, and everything else must be the same TeX output as the base.
     const frame = mixedAnchorFrame(block);
-    if (!frame || frame.frame !== base.frame) return null;
+    if (!frame || frame.frame !== base.frame) return reject('mixed-frame-changed');
   } else {
-    if (block.fidelity?.level !== SAFE_GLYPH || block.needsRender) return null;
-    if (hasGalleySideEffects(block.galley)) return null;
+    if (block.fidelity?.level !== SAFE_GLYPH || block.needsRender) return reject('not-safe-glyph');
+    if (hasGalleySideEffects(block.galley)) return reject('side-effects');
   }
   // Plain text legitimately changes the three volatile paragraph-tail
   // locals (prevdepth, nobreak and lastskip).  Requiring the complete exit
@@ -302,27 +321,29 @@ export function planTerminalCanonicalAnchor({
   // the depth of its final glyph.  Counters plus the active column mode and
   // width remain a hard proof boundary; only those three documented locals
   // are excluded from the canonical-anchor structural witness.
-  if (canonicalAnchorStructuralState(block.stateVec) !== base.structuralStateVec) return null;
+  if (canonicalAnchorStructuralState(block.stateVec) !== base.structuralStateVec) return reject('structural-state');
 
   const plainEdit = edit ? plainEditContext(block, dom, edit, base) : null;
-  if (!plainEdit) return null;
+  if (!plainEdit) return reject('plain-edit');
   const currentLines = mixed ? galleyMixedLineWitnesses(block.galley) : galleyLineWitnesses(block.galley);
   const changedLines = mixed
     ? changedMixedGalleyLines(base.lineWitnesses, currentLines)
     : changedGalleyLines(base.lineWitnesses, currentLines);
-  if (!currentLines || !changedLines) return null;
-  if (linesCarryShipoutColor(block.galley, changedLines)) return null;
-  if (mixed && !mixedLinesPaintSafely(block, changedLines)) return null;
-  if (mixed && (!editedContributionsReadable(block.galley, changedLines) ||
-      !paintCallbacksKnown(documentPaintCallbacks(geometry, blocks)) ||
-      !opaqueTextComparable(block.galley, base.lineWitnesses, paintContext?.fonts) ||
-      opaqueTextHoldsWitness(block.galley, base.lineWitnesses))) return null;
+  if (!currentLines || !changedLines) return reject('line-change');
+  if (linesCarryShipoutColor(block.galley, changedLines)) return reject('shipout-color');
+  if (mixed) {
+    if (!mixedLinesPaintSafely(block, changedLines)) return reject('mixed-line-flags');
+    if (!editedContributionsReadable(block.galley, changedLines)) return reject('edited-contribution-paint');
+    if (!paintCallbacksKnown(documentPaintCallbacks(geometry, blocks))) return reject('paint-callbacks');
+    if (!opaqueTextComparable(block.galley, base.lineWitnesses, paintContext?.fonts)) return reject('opaque-text-incomparable');
+    if (opaqueTextHoldsWitness(block.galley, base.lineWitnesses)) return reject('opaque-text-holds-witness');
+  }
 
   const containing = (report.patches ?? []).filter((patch) =>
     patch.type === 'replace-page' &&
     patch.displayList?.commands?.some((command) => command.src === blockId)
   );
-  if (!containing.length) return null;
+  if (!containing.length) return reject('no-page-patch');
   const linePlans = [];
   for (const lineIndex of changedLines) {
     const owners = containing.flatMap((patch) => {
@@ -331,7 +352,7 @@ export function planTerminalCanonicalAnchor({
       );
       return commands.length ? [{ page: patch.page, commands }] : [];
     });
-    if (owners.length !== 1) return null;
+    if (owners.length !== 1) return reject('line-owner');
     const owner = owners[0];
     const painted = (commands) => (commands ?? []).filter((command) => command.op === 'glyphs' || command.op === 'rule');
     let paint = painted(owner.commands);
@@ -351,14 +372,14 @@ export function planTerminalCanonicalAnchor({
           }))
         : [];
     }
-    if (!paint.length || paint.some((command) => command.math)) return null;
+    if (!paint.length || paint.some((command) => command.math)) return reject('line-paint');
     const bounds = commandBounds(paint);
     const current = currentLines[lineIndex];
     const baselines = uniqueBaselines(paint.filter((command) => command.op === 'glyphs'));
-    if (baselines.length !== 1) return null;
+    if (baselines.length !== 1) return reject('line-baseline');
     const lineBoxLeft = Number(bounds?.left) - current.contentLeft;
     const baseline = baselines[0];
-    if (!bounds || ![lineBoxLeft, baseline].every(Number.isFinite)) return null;
+    if (!bounds || ![lineBoxLeft, baseline].every(Number.isFinite)) return reject('line-bounds');
     linePlans.push({
       lineIndex,
       provisionalPage: owner.page,
