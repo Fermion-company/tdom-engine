@@ -1061,10 +1061,32 @@ function applyReport(report) {
   // never let an offscreen load commit a patch from an older revision.
   canonicalAnchorPendingPatch = null;
   const closureDeferred = !!report.stats?.closureDeferred;
-  if (closureDeferred && canonicalAnchorPreview) {
+  // A canonical build for an intermediate keystroke retires the server's
+  // proof lineage, so the next keystroke in the same block gets no anchor
+  // (base-generation / canonical-behind). The overlay already on paper is
+  // still that earlier revision's certified page: keep it as the last good
+  // presentation rather than dropping to the older base page underneath.
+  const dirtyBlock = report.dirtySourceNodes?.length === 1
+    ? String(report.dirtySourceNodes[0]).replace(/^src-/, '')
+    : null;
+  const leased = !anchorIntent && canonicalAnchorPreview && !canonicalAnchorPreview.retiring &&
+    (report.canonicalAnchorRefused === 'base-generation' ||
+      report.canonicalAnchorRefused === 'canonical-behind') &&
+    dirtyBlock === canonicalAnchorPreview.blockId;
+  if (canonicalAnchorPreview?.retiring) {
+    // A covering canonical is on its way to this page. Until that image
+    // commits (or a new anchor replaces the delta atomically), no report may
+    // clear the overlay or move its target: either would expose the older
+    // base page, or leave the delta over the covering one.
+  } else if (closureDeferred && canonicalAnchorPreview) {
     // The source revision advances while an unfinished TeX construct holds
     // the last successful pixels. Keep that exact previous overlay eligible
     // for the new revision; it will be replaced when native closure succeeds.
+    canonicalAnchorPreview.targetSrcRev = appliedSrcRev;
+  } else if (leased) {
+    // Ownership, not currency: presentation stays pending (the overlay's own
+    // srcRev is older than appliedSrcRev) until a new anchor or a canonical
+    // page covering this revision is on paper.
     canonicalAnchorPreview.targetSrcRev = appliedSrcRev;
   } else if (!anchorIntent || canonicalAnchorPreview && (
     canonicalAnchorPreview.blockId !== anchorIntent.blockId ||
@@ -1076,9 +1098,15 @@ function applyReport(report) {
     // resolving, but make its convergence target the newest source revision.
     canonicalAnchorPreview.targetSrcRev = anchorIntent.srcRev;
   }
+  const frozen = leased || Boolean(canonicalAnchorPreview?.retiring);
   const provisionalPatches = [];
   for (const patch of report.patches) {
     if (previewPolicy !== 'structured') continue;
+    // A leased refusal came before the plan could prove that this edit
+    // leaves line breaks and page count alone, and a retiring delta still
+    // sits on its base image: publishing any provisional page beside either
+    // could compose no real revision.
+    if (frozen) continue;
     if (patch.type === 'replace-page') {
       const dl = patch.displayList;
       if (anchorIntent && (anchorIntent.provisionalPages ?? [anchorIntent.provisionalPage]).includes(dl.page) &&
@@ -1097,7 +1125,9 @@ function applyReport(report) {
       provisionalPatches.push(patch);
     }
   }
-  stageProvisionalPatches(provisionalPatches, true, report.stats?.pageCount);
+  // Not even an empty call while frozen: it re-renders earlier staged pages
+  // for the new appliedSrcRev.
+  if (!frozen) stageProvisionalPatches(provisionalPatches, true, report.stats?.pageCount);
   for (const patch of provisionalPatches) {
     if (patch.type === 'replace-page') updateCanonState(patch.displayList.page);
   }
@@ -1110,10 +1140,30 @@ function clearCanonicalAnchorPreview() {
   canonicalAnchorPendingPatch = null;
 }
 
+/** A new anchor that fails (proof not ready, background unproven, deadline
+ * passed) is dropped alone: the certified overlay already on paper stays the
+ * last good presentation. */
+function discardPendingCanonicalAnchor() {
+  canonicalAnchorPendingPatch = null;
+}
+
+/** Called in the same DOM step that puts a canonical image on a page: a
+ * retiring overlay leaves with the base image it was addressed against.
+ * Only the committed delta goes; a newer anchor still pending (addressed to
+ * this very image) is retried instead of being dropped with it. */
+function retireCanonicalAnchorOnPage(div, presentedRev) {
+  const anchor = canonicalAnchorPreview;
+  if (!anchor?.retiring || !(Number(presentedRev) >= Number(anchor.targetSrcRev ?? anchor.srcRev))) return;
+  div.querySelectorAll('svg.tdom-canonical-delta').forEach((node) => node.remove());
+  if (pagesEl.querySelector('svg.tdom-canonical-delta')) return;
+  canonicalAnchorPreview = null;
+  if (canonicalAnchorPendingPatch) queueMicrotask(() => tryApplyPendingCanonicalAnchor());
+}
+
 function canonicalAnchorForPage(pageNumber) {
   const candidate = canonicalAnchorPendingPatch ?? canonicalAnchorPreview;
   const pagePatch = canonicalAnchorPages(candidate).find((page) => Number(page.page) === Number(pageNumber));
-  if (!candidate || !pagePatch) return null;
+  if (!candidate || !pagePatch || candidate.retiring) return null;
   if (Number(candidate.targetSrcRev ?? candidate.srcRev) !== Number(appliedSrcRev)) return null;
   return { ...candidate, ...pagePatch };
 }
@@ -1138,7 +1188,7 @@ function tryApplyPendingCanonicalAnchor() {
       if (!background) {
         // A solid mask is exact only when the canonical ink sits on a locally
         // uniform background. Gradients, artwork, and frames fail closed.
-        clearCanonicalAnchorPreview();
+        discardPendingCanonicalAnchor();
         return false;
       }
       rules.push({
@@ -1156,7 +1206,7 @@ function tryApplyPendingCanonicalAnchor() {
   // The deadline is checked again immediately before the atomic DOM commit;
   // image decode or background probing is not allowed to publish a stale win.
   if (!canonicalAnchorWithinDeadline(patch)) {
-    clearCanonicalAnchorPreview();
+    discardPendingCanonicalAnchor();
     return false;
   }
   pagesEl.querySelectorAll('svg.tdom-canonical-delta').forEach((node) => node.remove());
@@ -1305,7 +1355,7 @@ function applyCanonicalAnchorPatch(patch) {
   if (!patch || patch.srcRev !== appliedSrcRev) return;
   if (patch.baseGeneration !== canonical?.id || patch.baseRev !== canonical?.rev) return;
   if (patch.status !== 'ready') {
-    clearCanonicalAnchorPreview();
+    discardPendingCanonicalAnchor();
     return;
   }
   if (!canonicalAnchorWithinDeadline(patch)) return;
@@ -2230,6 +2280,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
           current.dataset.canonId = String(currentId);
           current.dataset.canonRev = String(currentRev);
           div.classList.remove('awaiting-canonical');
+          retireCanonicalAnchorOnPage(div, currentRev);
         });
       });
     } else if (shipRegistration) {
@@ -2321,6 +2372,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
       if (Number.isFinite(presentationRev)) {
         div.dataset.canonPresentedRev = String(presentationRev);
         candidate.dataset.canonRev = String(presentationRev);
+        retireCanonicalAnchorOnPage(div, presentationRev);
       } else {
         delete div.dataset.canonPresentedRev;
       }
@@ -6721,7 +6773,13 @@ function receivePreviewEvent(msg) {
       const activeAnchor = canonicalAnchorPendingPatch ?? canonicalAnchorPreview;
       if (activeAnchor && (
         msg.canonical?.rev >= Number(activeAnchor.targetSrcRev ?? activeAnchor.srcRev)
-      )) clearCanonicalAnchorPreview();
+      )) {
+        // Retire the overlay when a covering page replaces its base image,
+        // not now: until that image decodes and commits, removing the delta
+        // would show the older base page underneath.
+        canonicalAnchorPendingPatch = null;
+        if (canonicalAnchorPreview) canonicalAnchorPreview.retiring = true;
+      }
       canonical = msg.canonical;
       if (msg.mode) setMode(msg.mode, msg.canonical?.modeReasons ?? modeReasons);
       syncCanonical();
