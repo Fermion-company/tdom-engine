@@ -2340,6 +2340,42 @@ ActiveMarker !abcd.
   }
 });
 
+// A newer warm for the same region used to SIGKILL the running warm walk's
+// in-flight STEP child, the walk's only continuation, so viewer, file-focus
+// and caret warms for one region each restarted from one distant checkpoint.
+test('a superseding warm resumes from the boundary the earlier walk reached', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-warm-resume-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.maxCheckpoints = 3;
+  const slow = String.raw`\count255=0 \loop\advance\count255 by 1 \ifnum\count255<3000000 \repeat`;
+  try {
+    await e.open(`\\documentclass{article}\n\\begin{document}\n${
+      Array.from({ length: 40 }, (_, i) => `Paragraph${i} ${slow}.`).join('\n\n')}\n\\end{document}\n`);
+    const nearest = (i) => Math.max(0, ...[...e.checkpoints.keys()].filter((k) => k <= i));
+    let target = 1;
+    for (let i = 1; i < e.blocks.length - 1; i++) if (i - nearest(i) > target - nearest(target)) target = i;
+    const from = nearest(target);
+    assert.ok(target - from >= 8, 'the target starts far from every resident checkpoint');
+    // A STEP walk's frontier lives only between blocks; count re-adopted
+    // galleys to know the first walk is well past its starting checkpoint.
+    const galleys = e.blocks.map((block) => block.galley);
+    const replayed = () => e.blocks.slice(from, target).filter((block, i) => block.galley !== galleys[from + i]).length;
+    const first = e.warmEditOffset(e.blocks[target].start);
+    for (let i = 0; i < 6000 && replayed() < 3; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(replayed() >= 3 && replayed() < target - from, 'the first walk is mid-region');
+    // the caret settles one block earlier: only the reached boundary is closer than `from`
+    const second = await e.warmEditOffset(e.blocks[target - 1].start);
+    assert.equal((await first).status, 'superseded');
+    assert.equal(second.status, 'ready');
+    assert.ok(second.from > from + 1, `resumed at ${second.from}, not at the first walk's start ${from}`);
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('warming a cold page supplies every exact neighbor before an included box edit', opts, async () => {
   await eng?.close();
   eng = null;

@@ -169,7 +169,7 @@ warm/rescue の組版結果が同一でも、chunkの版が変わった場合は
 
 `/warm` は `offset` と任意の `filePath` を受け取り、そのソースファイルに属する block の前後を保持する。子ファイルの offset は子ファイルの本文長と照合し、親ファイルの同じ数値の位置へ置き換えない。`filePath` 省略時は従来どおり root を対象にする。offset 指定の warm が `ready` になり canonical がその時点のソースと一致していれば、サーバはキャレットの block の canonical-anchor 証明材料（ソース行ごとの SyncTeX 候補とページの paint index）を先に取得する。どちらも canonical generation ごとの cache に入り（SyncTeX は `synctex view` の呼び出し 1 回ずつがファイル全体を読み直すため、行数の多い block は編集後の予算内に取れない）、最初の打鍵の証明はそこから読む。
 
-同じページに欠けている exact chunk があれば、その block まで同じ中断可能な chain を準備し、既存の並列数制限付き render pump へ渡す。`/warm` の `page` 指定はそのページの先頭 block を起点にする。viewer は canonical の表示確定後とスクロール停止後に表示中のページを準備する。入力や文書切替による世代変更は既存の abort 経路で優先される。
+同じページに欠けている exact chunk があれば、その block まで同じ中断可能な chain を準備し、既存の並列数制限付き render pump へ渡す。`/warm` の `page` 指定はそのページの先頭 block を起点にする。viewer は canonical の表示確定後とスクロール停止後に表示中のページを準備する。入力や文書切替による世代変更は既存の abort 経路で優先される。新しい warm が実行中の warm walk を置き換えるときは、実行中の子を kill せず次の block 境界で止める（replay の STEP 子は walk の唯一の続きで、kill すると再実行分が全部失われる）。止まった walk は到達した境界を editHold に固定し、新しい warm はそこから再開する。
 
 標準 class option の二段組と本文中の `\onecolumn` / `\twocolumn` は、page builder の結果を表示せず、resident LuaLaTeX の実定義・実列幅による行組みだけを canonical-addressed overlay に使う。列切替時の `\box255` はTeXプリミティブで通常boxへ移してから dormant pageへ戻し、active column mode / width を exit state vector に含める。overlay は編集位置が可視本文 region 内であることと、内部段落なら行数が変わらないことを確認し、TeXのline boxが変化したsuffixだけを物理列上で差し替える。mid-document geometry change と `\balance` は `safety.js` 側で structured path から外れる。margin note は canonical-only block である。footnote は扱うが、TeX と同じ page-spanning split を完全再現する実装ではない。
 

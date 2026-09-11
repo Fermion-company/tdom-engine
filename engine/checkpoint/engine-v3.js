@@ -293,7 +293,11 @@ export class CheckpointEngine {
     // edit. Reuse the established abort path so a deep LuaTeX-ja job cannot
     // hold the foreground lock until its timeout.
     this.bgAbort = true;
-    abortBackgroundJob(this, 'background pass pre-empted by edit-locus warming');
+    // A warm walk being superseded stops at its next block boundary instead:
+    // its in-flight STEP child is the walk's only continuation, and killing
+    // it threw the replay away (viewer page, file focus and caret warms for
+    // one region each restarted from the same distant checkpoint).
+    if (!this.warming) abortBackgroundJob(this, 'background pass pre-empted by edit-locus warming');
     await this.bgTask.catch(() => {});
     if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev) {
       return { status: 'superseded', sourceRev, target };
@@ -346,6 +350,12 @@ export class CheckpointEngine {
         this.warming = false;
       }
       if (replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev) {
+        // Pin the boundary this walk reached so the warm that superseded it
+        // resumes there rather than at the walk's starting checkpoint.
+        const reached = from + (replayed < 0 ? -replayed - 1 : replayed);
+        if (sourceRev === this.srcRev && this.checkpoints.has(reached)) {
+          this.editHold = [...new Set([reached, ...this.editHold])].slice(0, 8);
+        }
         return { status: 'superseded', sourceRev, target };
       }
       this.editHold = [...new Set([target, target + 1, from + replayed, ...this.editHold])].slice(0, 8);
