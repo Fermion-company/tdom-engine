@@ -101,6 +101,11 @@ export class CanonicalRenderer {
     this.activeDisplayDemandIds = new Set();
     this.residentImpossibleDemandIds = new Set();
     this.seenDisplayDemandIds = new Set(); // at most 64 IDs for this revision
+    // One pending revision may inherit a short display-catch-up allowance
+    // from the first baseline. It survives the baseline's synchronous result
+    // broadcast because the viewer can escalate a soft demand only after
+    // observing those newly landed canonical pixels.
+    this.coldBaselineCatchup = null; // {baselineId, rev, inputEpoch, source}
     this.idSeq = 0;
     this.last = null; // last GOOD compile: {id, rev, srcHash, pdf, pageCount, paper, passes, ms}
     this.lastError = null; // {rev, message}
@@ -220,6 +225,8 @@ export class CanonicalRenderer {
   }
 
   #registerGeneration(generation) {
+    if (this.coldBaselineCatchup &&
+        generation.id !== this.coldBaselineCatchup.baselineId) this.coldBaselineCatchup = null;
     this.generations.set(generation.id, generation);
     this.last = generation;
     while (this.generations.size > GENERATION_MAX) {
@@ -388,6 +395,9 @@ export class CanonicalRenderer {
     // lualatex per engine would OOM a 7GB hosted runner for nothing
     if (process.env.TDOM_NO_CANONICAL === '1') return;
     this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now(), fallbackReason };
+    if (this.coldBaselineCatchup && !this.#hasColdBaselineCatchup(this.pendingJob)) {
+      this.coldBaselineCatchup = null;
+    }
     if (!this.#hasDisplayDemand(this.pendingJob)) this.displayDemand = null;
     this.#armPending(this.delayFor());
   }
@@ -466,6 +476,12 @@ export class CanonicalRenderer {
       job.inputEpoch === this.displayDemand.inputEpoch && this.activeDisplayDemandIds.size);
   }
 
+  #hasColdBaselineCatchup(job) {
+    const credit = this.coldBaselineCatchup;
+    return Boolean(job && credit && this.last?.id === credit.baselineId &&
+      job.rev === credit.rev && job.inputEpoch === credit.inputEpoch && job.source === credit.source);
+  }
+
   #clearDisplayDemand(job) {
     if (this.#hasDisplayDemand(job)) this.displayDemand = null;
     if (this.lastDisplayDemandRev === job.rev && this.displayDemandInputEpoch === job.inputEpoch) {
@@ -497,7 +513,7 @@ export class CanonicalRenderer {
    * full compile. Opaque mode and a revision explicitly needed for display
    * use a short debounce plus a half-duty cost cooldown. Public for tests.
    */
-  delayFor(job = this.pendingJob, { preserveIdleStart = false, coldBaselineCatchup = false } = {}) {
+  delayFor(job = this.pendingJob, { preserveIdleStart = false } = {}) {
     const since = Date.now() - this.lastEndAt;
     // One bounded exception to the display cooldown: the first canonical
     // baseline may land for revision N after an already-accepted edit made
@@ -505,8 +521,9 @@ export class CanonicalRenderer {
     // display path, waiting another full long-document cooldown merely keeps
     // old pixels on screen. #drain grants this only to the job immediately
     // behind a successfully landed first baseline; later compiles retain the
-    // normal duty-cycle bound.
-    if (coldBaselineCatchup && this.#hasDisplayDemand(job) &&
+    // normal duty-cycle bound. The credit persists across the first
+    // baseline's result broadcast so a viewer's soft demand can escalate.
+    if (this.#hasColdBaselineCatchup(job) && this.#hasDisplayDemand(job) &&
         this.residentImpossibleDemandIds.size) return this.displayDebounceMs;
     if (this.pressure !== 'authority' || job?.fallbackReason || this.#hasDisplayDemand(job)) {
       // canonical is needed for display — stay responsive on small
@@ -594,6 +611,7 @@ export class CanonicalRenderer {
         return;
       }
     }
+    if (this.#hasColdBaselineCatchup(job)) this.coldBaselineCatchup = null;
     this.pendingJob = null;
     if (this.last && this.last.srcHash === this.#sourceHash(job.source, job.inputEpoch)) {
       // the newest source is already compiled (an export ran it, or the
@@ -638,13 +656,18 @@ export class CanonicalRenderer {
     // which was the single biggest CPU sink on long documents. settle()
     // still converges promptly for exports/tests (it clears the timer and
     // drains directly).
-    if (this.pendingJob && !this.disposed && !this.timer) {
+    if (this.pendingJob && !this.disposed) {
       const landedFirstBaseline = startedWithoutCanonical &&
         this.last?.rev === job.rev && this.last?.inputEpoch === job.inputEpoch;
-      const coldBaselineCatchup = landedFirstBaseline &&
-        this.pendingJob.rev > job.rev && this.#hasDisplayDemand(this.pendingJob) &&
-        this.residentImpossibleDemandIds.size > 0;
-      this.#armPending(this.delayFor(this.pendingJob, { coldBaselineCatchup }));
+      if (landedFirstBaseline && this.pendingJob.rev > job.rev) {
+        this.coldBaselineCatchup = {
+          baselineId: this.last.id,
+          rev: this.pendingJob.rev,
+          inputEpoch: this.pendingJob.inputEpoch,
+          source: this.pendingJob.source,
+        };
+      }
+      if (!this.timer) this.#armPending(this.delayFor(this.pendingJob));
     }
   }
 
@@ -1266,6 +1289,7 @@ export class CanonicalRenderer {
   /** Mark non-source inputs dirty. The next schedule/ensure compiles again. */
   invalidateInputs() {
     this.inputEpoch++;
+    this.coldBaselineCatchup = null;
     this.displayDemand = null;
     this.activeDisplayDemandIds.clear();
     this.residentImpossibleDemandIds.clear();
@@ -1287,6 +1311,7 @@ export class CanonicalRenderer {
     this.timer = null;
     this.timerDueAt = 0;
     this.pendingJob = null;
+    this.coldBaselineCatchup = null;
     this.displayDemand = null;
     this.displayDemandEpoch = null;
     this.lastDisplayDemandRev = -1;
@@ -1329,6 +1354,7 @@ export class CanonicalRenderer {
     this.timer = null;
     this.timerDueAt = 0;
     this.pendingJob = null;
+    this.coldBaselineCatchup = null;
     this.displayDemand = null;
     this.displayDemandEpoch = null;
     this.lastDisplayDemandRev = -1;

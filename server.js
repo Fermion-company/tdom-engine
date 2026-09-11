@@ -1186,7 +1186,7 @@ function prefetchCanonicalAnchorProof(base, deadline) {
         deadline
       ).catch(() => null)
     : null);
-  return { base, candidates, paintPages };
+  return { base, deadline, candidates, paintPages };
 }
 
 // A block's proof inputs (one SyncTeX query per source line, the pages'
@@ -1216,8 +1216,22 @@ function prefetchWarmAnchorProof(offset, filePath) {
 }
 
 async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch = null) {
-  const prefetched = prefetch?.base === plan.baseSnapshot ? prefetch : null;
-  const candidates = await (prefetched?.candidates ?? beforeDeadline(
+  const stillCurrent = () => {
+    if (documentEpoch !== epoch || terminalAnchorEpoch !== anchorEpoch ||
+        engine.srcRev !== plan.srcRev || engine.canonical.inputEpoch !== plan.inputEpoch) return false;
+    const currentCanonical = engine.canonical.info();
+    const currentCertificate = engine.canonical.generationCertificate(plan.baseGeneration);
+    return currentCanonical.id === plan.baseGeneration && currentCanonical.rev === plan.baseRev &&
+      currentCertificate?.pdfHash === plan.baseSnapshot.certificate.pdfHash &&
+      currentCertificate?.synctexHash === plan.baseSnapshot.certificate.synctexHash;
+  };
+  if (!stillCurrent()) return;
+  // A prefetch whose acceptance-based window expired cannot decide the
+  // post-typeset proof. Start one fresh bounded attempt; completed generation
+  // lookups still return through the canonical caches.
+  const prefetched = prefetch?.base === plan.baseSnapshot &&
+    performance.now() < Number(prefetch.deadline) ? prefetch : null;
+  const freshCandidates = () => beforeDeadline(
     rawForwardCandidatesForRange(
       plan.source,
       plan.baseGeneration,
@@ -1225,22 +1239,21 @@ async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch
       plan.baseSnapshot.canonicalInputPath
     ),
     plan.proofDeadline
-  ).catch(() => null));
+  ).catch(() => null);
+  let candidates = prefetched ? await prefetched.candidates : await freshCandidates();
+  if (prefetched && (candidates === null ||
+      !candidates.length && performance.now() >= Number(prefetched.deadline))) {
+    candidates = await freshCandidates();
+  }
   const pages = [...new Set((candidates ?? []).map((candidate) => Number(candidate.page)))];
-  const paintPages = candidates?.length
-    ? await (prefetched?.paintPages ?? beforeDeadline(
-        engine.canonical.pdfPaintPages(plan.baseGeneration, pages),
-        plan.proofDeadline
-      ).catch(() => null))
-    : null;
-  if (documentEpoch !== epoch || terminalAnchorEpoch !== anchorEpoch ||
-      engine.srcRev !== plan.srcRev ||
-      engine.canonical.inputEpoch !== plan.inputEpoch) return;
-  const currentCanonical = engine.canonical.info();
-  const currentCertificate = engine.canonical.generationCertificate(plan.baseGeneration);
-  if (currentCanonical.id !== plan.baseGeneration || currentCanonical.rev !== plan.baseRev ||
-      currentCertificate?.pdfHash !== plan.baseSnapshot.certificate.pdfHash ||
-      currentCertificate?.synctexHash !== plan.baseSnapshot.certificate.synctexHash) return;
+  let paintPages = candidates?.length && prefetched ? await prefetched.paintPages : null;
+  if (candidates?.length && !paintPages) {
+    paintPages = await beforeDeadline(
+      engine.canonical.pdfPaintPages(plan.baseGeneration, pages),
+      plan.proofDeadline
+    ).catch(() => null);
+  }
+  if (!stillCurrent()) return;
   let rejectReason = null;
   if (!candidates?.length) rejectReason = 'NO_SYNC_CANDIDATES';
   else if (!paintPages) rejectReason = 'PDF_PAINT_INDEX_UNAVAILABLE';
@@ -1909,6 +1922,7 @@ const server = http.createServer(async (req, res) => {
             baseSnapshot: anchorBaseSnapshot,
             inputEpoch: engine.canonical.inputEpoch,
             acceptedAt: anchorAcceptedAt,
+            proofStartedAt: performance.now(),
             clientEditAtEpochMs: anchorClientEditAt,
             paintContext: { fonts: engine.fonts, twinMetrics: engine.twinMetrics },
             diagnostics: anchorDiagnostics,

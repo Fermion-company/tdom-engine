@@ -11,8 +11,9 @@ import path from 'node:path';
 
 const PLAIN_FLOW_UNSAFE = /[\\$%{}&#^_~]/;
 const ANCHOR_BLEED_BP = 2;
-// Budgets from edit acceptance; a proof or publication past them falls back
-// to the canonical build.
+// Once the resident edit has produced a viable plan, proof and publication
+// get one bounded window. Edit acceptance remains the latency origin carried
+// to diagnostics and the renderer.
 export const ANCHOR_PROOF_BUDGET_MS = 700;
 export const ANCHOR_PUBLISH_BUDGET_MS = 850;
 const SP_PER_BP = 65781.76;
@@ -267,6 +268,7 @@ export function planTerminalCanonicalAnchor({
   baseSnapshot = null,
   inputEpoch = null,
   acceptedAt = performance.now(),
+  proofStartedAt = acceptedAt,
   clientEditAtEpochMs = null,
   paintContext = null,
   diagnostics = null,
@@ -390,8 +392,8 @@ export function planTerminalCanonicalAnchor({
     });
   }
   const activeGeometry = geometryForGalley(geometry, block.galley);
-  const proofDeadline = Number(acceptedAt) + ANCHOR_PROOF_BUDGET_MS;
-  const publishDeadline = Number(acceptedAt) + ANCHOR_PUBLISH_BUDGET_MS;
+  const proofDeadline = Number(proofStartedAt) + ANCHOR_PROOF_BUDGET_MS;
+  const publishDeadline = Number(proofStartedAt) + ANCHOR_PUBLISH_BUDGET_MS;
 
   return {
     blockId,
@@ -496,7 +498,10 @@ export function buildTerminalCanonicalPatch(plan, matching) {
     baseGeneration: plan.baseGeneration,
     baseRev: plan.baseRev,
     changedLines: [...plan.changedLines],
-    publishWithinMs: 850,
+    publishWithinMs: Math.max(
+      ANCHOR_PUBLISH_BUDGET_MS,
+      Number(plan.publishDeadline) - Number(plan.acceptedAt)
+    ),
     clientEditAtEpochMs: plan.clientEditAtEpochMs,
     pages: pagePatches,
   };

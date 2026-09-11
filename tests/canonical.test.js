@@ -252,18 +252,25 @@ test('authority pressure: fast baseline, then deep idle + cost cooldown', () => 
     // no resident pixels. #drain grants exactly this immediate successor one
     // short-debounce catch-up instead of another long-document cooldown.
     c.pressure = 'authority';
+    c.last.id = 1;
     c.pendingJob = { source: 'new', rev: 2, inputEpoch: c.inputEpoch, scheduledAt: Date.now() };
+    c.coldBaselineCatchup = {
+      baselineId: 1,
+      rev: 2,
+      inputEpoch: c.inputEpoch,
+      source: 'new',
+    };
     c.displayDemand = { rev: 2, inputEpoch: c.inputEpoch };
     c.activeDisplayDemandIds.add('viewer');
     c.residentImpossibleDemandIds.add('viewer');
     assert.equal(
-      c.delayFor(c.pendingJob, { coldBaselineCatchup: true }),
+      c.delayFor(c.pendingJob),
       c.displayDebounceMs,
       'a resident-impossible edit immediately behind the first baseline uses the short debounce'
     );
     c.residentImpossibleDemandIds.clear();
     assert.ok(
-      c.delayFor(c.pendingJob, { coldBaselineCatchup: true }) >= 8000 * c.displayCooldownFactor - 100,
+      c.delayFor(c.pendingJob) >= 8000 * c.displayCooldownFactor - 100,
       'the allowance does not bypass pacing while resident pixels can still arrive'
     );
   } finally {
@@ -353,6 +360,53 @@ const DOC1 = [
   '\\end{document}',
   '',
 ].join('\n');
+
+test('first baseline credit survives a soft demand until the viewer escalates it', opts, async () => {
+  const work = WORK + '-cold-baseline-escalation';
+  rmSync(work, { recursive: true, force: true });
+  const c = new CanonicalRenderer({
+    workDir: work,
+    debounceMs: 0,
+    displayDebounceMs: 100,
+  });
+  const waitFor = async (predicate, label, timeoutMs = 15_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, `timed out waiting for ${label}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+  try {
+    c.schedule(DOC1, 1);
+    await waitFor(() => c.info().runningRev === 1, 'the first baseline to start');
+
+    const next = DOC1.replace('Page one canonical test.', 'Page one edited while baseline compiles.');
+    c.schedule(next, 2);
+    assert.deepEqual(
+      c.requestDisplay(2, 0, { demandId: 'viewer', residentImpossible: false }),
+      { accepted: true, duplicate: false }
+    );
+
+    await waitFor(
+      () => c.info().id === 1 && c.info().runningRev === null && c.info().scheduledRev === 2,
+      'the first baseline to land behind the pending edit'
+    );
+    assert.equal(c.coldBaselineCatchup?.rev, 2,
+      'the actual drain grants its immediate pending successor one catch-up credit');
+    assert.ok(c.info().scheduledInMs > c.displayDebounceMs,
+      'a soft demand alone retains the normal cost cooldown');
+
+    assert.deepEqual(
+      c.requestDisplay(2, 0, { demandId: 'viewer', residentImpossible: true }),
+      { accepted: false, duplicate: true }
+    );
+    assert.ok(c.info().scheduledInMs <= c.displayDebounceMs,
+      'the late hard escalation re-arms the credited job at the short debounce');
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
+  }
+});
 
 const MIXED_PAPER_DOC = [
   '\\documentclass{article}',

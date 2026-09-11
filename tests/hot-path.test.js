@@ -1034,9 +1034,17 @@ test('a prose line inside a mixed block anchors only while everything else is un
       fidelity: fidelity(flags), galley: galley({ second: 'BravoX', ...changes }) }],
     domBlocks: [dom], report, geometry: context.geometry ?? geometry, edit,
     baseSnapshot: context.base ?? base, paintContext: context.paintContext ?? paintContext,
+    acceptedAt: context.acceptedAt, proofStartedAt: context.proofStartedAt,
     diagnostics: context.diagnostics ?? null,
   });
   const ok = plan();
+  const acceptedAt = performance.now() - 900;
+  const proofStartedAt = performance.now();
+  const slowResidentPlan = plan({}, 0, { acceptedAt, proofStartedAt });
+  assert.equal(slowResidentPlan.proofDeadline - proofStartedAt, 700,
+    'proof owns its bounded window after resident typesetting is ready');
+  assert.equal(slowResidentPlan.publishDeadline - proofStartedAt, 850,
+    'publication remains bounded from proof readiness');
   assert.deepEqual(ok?.changedLines, [2], 'only the edited prose line is repainted');
   // with graphics in the block its exact chunk owns every line, so the page
   // carries only the line's source hit box; the safe runs paint from there
@@ -1145,6 +1153,12 @@ test('a prose line inside a mixed block anchors only while everything else is un
   assert.deepEqual(patch?.pages?.map((page) => page.page), [12]);
   assert.equal(patch.pages[0].commands[0].y, 163,
     'positional matches map back to the witness box ordinal, not the first prose line');
+  const slowResidentPatch = buildTerminalCanonicalPatch(
+    { ...slowResidentPlan, geometry: pageGeometry },
+    [{ lineIndex: 0, candidate: line(150) }, { lineIndex: 1, candidate: line(163) }]
+  );
+  assert.equal(slowResidentPatch.publishWithinMs, slowResidentPlan.publishDeadline - acceptedAt,
+    'the renderer deadline includes resident typesetting plus the bounded proof/paint window');
 });
 
 test('terminal prose without a frozen canonical line proof fails closed', () => {
