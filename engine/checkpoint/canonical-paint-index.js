@@ -15,12 +15,18 @@ const BOX_TOLERANCE_BP = 0.35;
 const CONTENT_TOLERANCE_BP = 0.55;
 const FONT_SIZE_TOLERANCE_BP = 0.035;
 const UNSAFE_TEXT = /[\uFFFD\uE000-\uF8FF]/u;
+const BLACK = '#000000';
+// pdf.js converts DeviceCMYK through a polynomial that turns 0 0 0 1 k
+// (black in xcolor's cmyk model) into this; the resident writes every
+// model's black as #000000.
+const PDFJS_CMYK_BLACK = '#2c2e35';
 
-export const PDF_PAINT_INDEX_VERSION = 1;
+export const PDF_PAINT_INDEX_VERSION = 2;
 
 /** Freeze the visible resident lines before the first edit against a
  * canonical generation. Spaces are TeX glue, not painted glyphs, so the
- * witness keeps the exact painted glyph sequence and its advance interval. */
+ * witness keeps the exact painted glyph sequence, its advance interval and
+ * the color the provisional renderer paints each glyph in. */
 export function galleyLineWitnesses(galley) {
   const lines = galleyBoxWitnesses(galley);
   return lines && lines.every(Boolean) ? lines : null;
@@ -60,9 +66,11 @@ function boxLineWitness(item, index, backend, profileKey) {
     }
     const text = String(run.t).normalize('NFC');
     if (!text || UNSAFE_TEXT.test(text) || /[\r\n]/u.test(text)) return null;
+    // the display list paints a run without a color black
+    const color = String(run.c || BLACK).toLowerCase();
     for (const char of Array.from(text)) {
       if (/\s/u.test(char)) return null; // a painted space is ambiguous with synthesized extraction space
-      glyphs.push({ char, size, font: String(run.f ?? '') });
+      glyphs.push({ char, size, font: String(run.f ?? ''), color });
     }
     contentLeft = Math.min(contentLeft, x);
     contentRight = Math.max(contentRight, x + width);
@@ -80,6 +88,7 @@ function boxLineWitness(item, index, backend, profileKey) {
     glyphCount: glyphs.length,
     glyphSizes: glyphs.map((glyph) => glyph.size),
     glyphFonts: glyphs.map((glyph) => glyph.font),
+    glyphColors: glyphs.map((glyph) => glyph.color),
     lineWidth,
     height,
     depth,
@@ -158,7 +167,8 @@ export function changedGalleyLines(baseLines, currentLines) {
 }
 
 /** Build one page of the immutable paint-run index. The operator list owns
- * glyph identity/safety; TextContent owns the final page-space geometry.
+ * glyph identity, fill color and safety; TextContent owns the final
+ * page-space geometry.
  * They must agree glyph-for-glyph after excluding non-painted TeX glue. */
 export function buildPdfPaintPage({ pageNumber, textContent, operatorList, viewport, OPS, Util }) {
   if (!Number.isInteger(pageNumber) || pageNumber < 1 || !OPS || !Util ||
@@ -186,6 +196,7 @@ export function buildPdfPaintPage({ pageNumber, textContent, operatorList, viewp
       baseline: Number(matrix[5]),
       paintText: chars.join(''),
       glyphSizes: [],
+      glyphColors: [],
       safe: width > 0 && item.dir === 'ltr' && !UNSAFE_TEXT.test(normalized) && simpleHorizontalMatrix(matrix),
     };
     if (![record.left, record.right, record.baseline].every(Number.isFinite) || record.right < record.left) return null;
@@ -198,6 +209,7 @@ export function buildPdfPaintPage({ pageNumber, textContent, operatorList, viewp
     const extracted = extractedGlyphs[index];
     if (paint.char !== extracted.char) return null;
     extracted.item.glyphSizes.push(paint.size);
+    extracted.item.glyphColors.push(paint.color);
     extracted.item.safe &&= paint.safe;
   }
   if (items.some((item) => item.glyphSizes.length !== Array.from(item.paintText).length)) return null;
@@ -293,6 +305,12 @@ export function candidateMatchesWitness(candidate, pageItems, witness) {
   if (glyphSizes.some((size, index) => !sameNumber(size, witness.glyphSizes[index], FONT_SIZE_TOLERANCE_BP))) {
     return false;
   }
+  // The resident follows the color stack only inside hboxes: a push in
+  // vertical mode (before a paragraph, or in an earlier block) fills the
+  // canonical line but never reaches its runs, which a repaint would use.
+  const glyphColors = inside.flatMap((item) => item.glyphColors ?? []);
+  if (glyphColors.length !== witness.glyphCount ||
+      glyphColors.some((color, index) => !color || color !== witness.glyphColors?.[index])) return false;
   const contentLeft = inside[0].left - box.left;
   const contentRight = inside.at(-1).right - box.left;
   return sameNumber(contentLeft, witness.contentLeft, CONTENT_TOLERANCE_BP) &&
@@ -318,26 +336,37 @@ function operatorGlyphs(operatorList, OPS) {
   let formDepth = 0;
   let markedDepth = 0;
   let clipped = false;
+  // The page starts black. pdf.js converts every fill color it can to
+  // setFillRGBColor; any other fill op (a pattern, transparent) leaves the
+  // color unknown, and an unknown color matches no witness.
+  let fillColor = BLACK;
+  const fillOps = new Set(['setFillColorSpace', 'setFillColor', 'setFillColorN', 'setFillGray',
+    'setFillRGBColor', 'setFillCMYKColor', 'setFillTransparent'].map((name) => OPS[name]).filter(Number.isInteger));
   const stack = [];
+  const formColors = []; // the canvas saves the graphics state around a form
   const glyphs = [];
   for (let index = 0; index < operatorList.fnArray.length; index++) {
     const op = operatorList.fnArray[index];
     const args = operatorList.argsArray[index] ?? [];
-    if (op === OPS.save) stack.push({ clipped, formDepth, markedDepth, textMode, fontSize });
+    if (op === OPS.save) stack.push({ clipped, formDepth, markedDepth, textMode, fontSize, fillColor });
     else if (op === OPS.restore) {
       const state = stack.pop();
       if (!state) return null;
-      ({ clipped, formDepth, markedDepth, textMode, fontSize } = state);
+      ({ clipped, formDepth, markedDepth, textMode, fontSize, fillColor } = state);
     } else if (op === OPS.setFont) {
       fontSize = Number(args[1]);
     } else if (op === OPS.setTextRenderingMode) {
       textMode = Number(args[0]);
+    } else if (fillOps.has(op)) {
+      fillColor = op === OPS.setFillRGBColor ? pdfFillColor(args[0]) : null;
     } else if (op === OPS.clip || op === OPS.eoClip) {
       clipped = true;
     } else if (op === OPS.paintFormXObjectBegin) {
       formDepth++;
+      formColors.push(fillColor);
     } else if (op === OPS.paintFormXObjectEnd) {
       formDepth = Math.max(0, formDepth - 1);
+      if (formColors.length) fillColor = formColors.pop();
     } else if (op === OPS.beginMarkedContent || op === OPS.beginMarkedContentProps) {
       markedDepth++;
     } else if (op === OPS.endMarkedContent) {
@@ -355,6 +384,7 @@ function operatorGlyphs(operatorList, OPS) {
           glyphs.push({
             char,
             size: fontSize,
+            color: fillColor,
             safe: simpleGlyph && textMode === 0 && formDepth === 0 && markedDepth === 0 && !clipped &&
               glyph.isInFont !== false && !glyph.accent && !glyph.operatorListId,
           });
@@ -363,6 +393,12 @@ function operatorGlyphs(operatorList, OPS) {
     }
   }
   return stack.length || formDepth || markedDepth ? null : glyphs;
+}
+
+function pdfFillColor(value) {
+  const color = typeof value === 'string' ? value.toLowerCase() : '';
+  if (!/^#[0-9a-f]{6}$/u.test(color)) return null;
+  return color === PDFJS_CMYK_BLACK ? BLACK : color;
 }
 
 function uniquePerfectMatching(edges, candidateCount) {

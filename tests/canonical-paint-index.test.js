@@ -42,12 +42,12 @@ const ruleRun = ({ subtype = 3, widthSp = 0, heightSp = 605_552, depthSp = 0, ..
   ...rest,
 });
 
-const lineBox = (text, { width = 240, x = 0, size = 9.2 } = {}) => ({
+const lineBox = (text, { width = 240, x = 0, size = 9.2, color = '#000000' } = {}) => ({
   k: 'box',
   w: width,
   h: 8.1,
   d: 1.1,
-  runs: [{ t: text, x, w: Array.from(text).length * size, s: size, f: 'body', dy: 0, c: '#000000' }],
+  runs: [{ t: text, x, w: Array.from(text).length * size, s: size, f: 'body', dy: 0, c: color }],
 });
 
 const witnessFor = (text, options) => galleyLineWitnesses({ items: [lineBox(text, options)] })[0];
@@ -68,9 +68,23 @@ const paintFor = (text, { page = 1, left = 48, baseline = 80, size = 9.2 } = {})
     baseline,
     paintText: text,
     glyphSizes: Array.from(text, () => size),
+    glyphColors: Array.from(text, () => '#000000'),
     safe: true,
   }],
 });
+
+const Util = {
+  transform(left, right) {
+    return [
+      left[0] * right[0] + left[2] * right[1],
+      left[1] * right[0] + left[3] * right[1],
+      left[0] * right[2] + left[2] * right[3],
+      left[1] * right[2] + left[3] * right[3],
+      left[0] * right[4] + left[2] * right[5] + left[4],
+      left[1] * right[4] + left[3] * right[5] + left[5],
+    ];
+  },
+};
 
 test('only certified LuaTeX empty_rule is omitted from the paint witness', () => {
   const empty = ruleRun();
@@ -243,18 +257,6 @@ test('operator-list glyph identity and TextContent geometry must agree exactly',
     beginMarkedContentProps: 11,
     endMarkedContent: 12,
   };
-  const Util = {
-    transform(left, right) {
-      return [
-        left[0] * right[0] + left[2] * right[1],
-        left[1] * right[0] + left[3] * right[1],
-        left[0] * right[2] + left[2] * right[3],
-        left[1] * right[2] + left[3] * right[3],
-        left[0] * right[4] + left[2] * right[5] + left[4],
-        left[1] * right[4] + left[3] * right[5] + left[5],
-      ];
-    },
-  };
   const glyph = (unicode) => ({ unicode, isSpace: false, isInFont: true, accent: null });
   const base = {
     pageNumber: 1,
@@ -298,6 +300,45 @@ test('operator-list glyph identity and TextContent geometry must agree exactly',
   });
   assert.equal(form.items.length, 1);
   assert.equal(form.items[0].safe, false, 'form reuse is not certified');
+});
+
+test('every canonical glyph must be filled in the color its witness paints', () => {
+  const OPS = {
+    setFont: 1, showText: 2, save: 3, restore: 4,
+    paintFormXObjectBegin: 8, paintFormXObjectEnd: 9,
+    setFillRGBColor: 13, setFillColorN: 14, setFillTransparent: 15,
+  };
+  const glyph = (unicode) => ({ unicode, isSpace: false, isInFont: true, accent: null });
+  // pdf.js reports every fill as setFillRGBColor with a hex string
+  const page = (before) => buildPdfPaintPage({
+    pageNumber: 1,
+    viewport: { transform: [1, 0, 0, -1, 0, 842], rotation: 0 },
+    OPS,
+    Util,
+    textContent: {
+      items: [{ str: 'AB', dir: 'ltr', width: 18.4, height: 9.2, transform: [9.2, 0, 0, 9.2, 48, 765] }],
+    },
+    operatorList: {
+      fnArray: [...before.map(([name]) => OPS[name]), OPS.setFont, OPS.showText],
+      argsArray: [...before.map(([, ...args]) => args), ['body', 9.2], [[glyph('A'), glyph('B')]]],
+    },
+  });
+  const certifies = (before, color = '#000000') => certifyCanonicalBlock({
+    witnesses: galleyLineWitnesses({ items: [lineBox('AB', { color })] }),
+    candidates: [candidateFor({ baseline: 77 })],
+    paintPages: [page(before)],
+  }) !== null;
+  assert.equal(certifies([]), true, 'the page starts black');
+  assert.equal(certifies([['setFillRGBColor', '#ff0000']]), false,
+    'a color the resident runs never saw would be repainted black');
+  assert.equal(certifies([['setFillRGBColor', '#ff0000']], '#ff0000'), true);
+  assert.equal(certifies([], '#ff0000'), false);
+  assert.equal(certifies([['save'], ['setFillRGBColor', '#ff0000'], ['restore']]), true);
+  assert.equal(certifies([['paintFormXObjectBegin'], ['setFillRGBColor', '#ff0000'], ['paintFormXObjectEnd']]), true,
+    "a form's fill color ends with the form");
+  assert.equal(certifies([['setFillRGBColor', '#2c2e35']]), true, 'pdf.js turns DeviceCMYK black into #2c2e35');
+  assert.equal(certifies([['setFillColorN', 'TilingPattern']]), false, 'a pattern is no witnessed color');
+  assert.equal(certifies([['setFillTransparent']]), false);
 });
 
 test('randomized arbitrary line counts and candidate orders keep a unique mapping', () => {

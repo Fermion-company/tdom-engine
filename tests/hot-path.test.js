@@ -39,7 +39,12 @@ import {
   singlePlainTextDelta,
 } from '../engine/checkpoint/canonical-anchor.js';
 import { singleLiteralChildReadProof } from '../engine/checkpoint/dependency-read-proof.js';
-import { galleyMixedLineWitnesses, mixedGalleyFrame } from '../engine/checkpoint/canonical-paint-index.js';
+import {
+  buildPdfPaintPage,
+  certifyCanonicalBlock,
+  galleyMixedLineWitnesses,
+  mixedGalleyFrame,
+} from '../engine/checkpoint/canonical-paint-index.js';
 
 const TEST_WORK_ROOT = process.env.TDOM_TEST_WORK_ROOT;
 const workDir = (name) => TEST_WORK_ROOT
@@ -1864,6 +1869,85 @@ test('boxes whose glyphs luacolor colors at shipout are marked', opts, async () 
     assert.deepEqual(marks('Red prose'), [1]);
     assert.ok(e.getGeometry().paintCallbacks?.pre_shipout_filter?.includes('luacolor.process'),
       'the resident reports the shipout filter that paints these colors');
+  } finally {
+    await e.close();
+  }
+});
+
+// Without luacolor, \color is a color-stack whatsit. Before a paragraph it
+// sits in vertical mode, where the harvest does not follow the stack: the
+// red paragraph's runs stay black, and only the canonical fill color keeps
+// canonical-anchor from repainting the edited line black.
+test('a line the canonical page fills in a color its runs lack neither certifies nor anchors', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  const planEdit = async (marker) => {
+    const at = e.getSource().indexOf(marker) + marker.length;
+    const edit = { start: at, end: at, text: 'X' };
+    const certificate = { id: 1, rev: e.srcRev, inputEpoch: 0, pdfHash: 'pdf', synctexHash: 'sync' };
+    const baseSnapshot = captureCanonicalAnchorBase({ blocks: e.blocks, domBlocks: e.getDOM().blocks, edit, certificate });
+    const report = await e.edit(at, at, 'X');
+    const plan = planTerminalCanonicalAnchor({
+      blocks: e.blocks, domBlocks: e.getDOM().blocks, geometry: e.getGeometry(), edit, baseSnapshot,
+      report: { ...report, previewPolicy: 'canonical-anchor', canonical: { id: 1, rev: report.srcRev - 1, pageCount: 1 } },
+      paintContext: { fonts: e.fonts, twinMetrics: e.twinMetrics },
+    });
+    await drain(e);
+    assert.equal(plan?.baseLineWitnesses?.length, 1, `${marker}: one prose line to prove`);
+    assert.deepEqual(plan.changedLines, [0]);
+    return plan;
+  };
+  // The base line on its canonical page, as pdf.js reports it: every fill
+  // is setFillRGBColor with a hex string (a vertical-mode \color{red} shows
+  // as #ff0000 just before the paragraph's text).
+  const certify = (plan, fill) => {
+    const [witness] = plan.baseLineWitnesses;
+    const { lineBoxLeft: left, baseline } = plan.linePlans[0];
+    const glyphs = Array.from(witness.paintText);
+    const OPS = { setFont: 1, showText: 2, setFillRGBColor: 3 };
+    const paint = buildPdfPaintPage({
+      pageNumber: 1,
+      viewport: { transform: [1, 0, 0, -1, 0, 792], rotation: 0 },
+      OPS,
+      Util: { transform: (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+        m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+        m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]] },
+      textContent: { items: [{ str: witness.paintText, dir: 'ltr', width: witness.contentWidth,
+        height: witness.glyphSizes[0], transform: [witness.glyphSizes[0], 0, 0, witness.glyphSizes[0],
+          left + witness.contentLeft, 792 - baseline] }] },
+      operatorList: {
+        fnArray: [OPS.setFillRGBColor, ...glyphs.flatMap(() => [OPS.setFont, OPS.showText])],
+        argsArray: [[fill], ...glyphs.flatMap((unicode, index) => [['f', witness.glyphSizes[index]],
+          [[{ unicode, isSpace: false, isInFont: true, accent: null }]]])],
+      },
+    });
+    const candidate = { page: 1, x: left, y: baseline,
+      box: { left, top: baseline - witness.height, right: left + witness.lineWidth, bottom: baseline + witness.depth } };
+    return certifyCanonicalBlock({ witnesses: plan.baseLineWitnesses, candidates: [candidate], paintPages: [paint] });
+  };
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage{xcolor}
+\begin{document}
+Black prose line.
+
+\color{red}
+Red prose line.
+\end{document}
+`);
+    await drain(e);
+    const black = await planEdit('Black prose line');
+    assert.equal(buildTerminalCanonicalPatch(black, certify(black, '#000000'))?.status, 'ready',
+      'a black line over black canonical paint anchors');
+    assert.ok(certify(black, '#2c2e35'), "pdf.js's DeviceCMYK black is black too");
+
+    const red = await planEdit('Red prose line');
+    assert.ok(certify(red, '#000000'), 'text and geometry alone cannot tell the lines apart');
+    assert.equal(certify(red, '#ff0000'), null, 'the canonical line is red: no proof, no black repaint');
+    assert.deepEqual([...new Set(red.baseLineWitnesses[0].glyphColors)], ['#000000'],
+      'the harvest does not see the color-stack push in vertical mode');
   } finally {
     await e.close();
   }
