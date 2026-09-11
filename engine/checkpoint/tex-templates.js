@@ -25,6 +25,14 @@ export function buildDriverSource({
   geometry,
 }) {
   const L = [];
+  // Log every callback registration from the first line on, before any
+  // package can keep its own reference to add_to_callback: canonical-anchor
+  // needs every paint filter the document adds, even one it removes again
+  // (daemon.lua, scan_paint_callbacks).
+  L.push('\\directlua{if luatexbase and luatexbase.add_to_callback then ' +
+    'local add = luatexbase.add_to_callback TDOM_CALLBACK_LOG = {} ' +
+    'luatexbase.add_to_callback = function(name, func, description, ...) ' +
+    'table.insert(TDOM_CALLBACK_LOG, { name, description }) return add(name, func, description, ...) end end}');
   L.push(preamble.trimEnd());
   // hyperref writes PDF catalog/anchor objects from its begin-document
   // hook, opening driver.pdf in checkpoint 0. Every fork then inherits the

@@ -240,7 +240,9 @@ end
 -- over canonical pixels only when it recognizes every one of them. GEO
 -- reports the preamble's registrations; each galley then reports every one
 -- made after that snapshot along its lineage (paint_late is inherited by
--- forks), including one a block adds and removes again.
+-- forks), including one a block adds and removes again: the driver's first
+-- line logs each add_to_callback call (TDOM_CALLBACK_LOG, tex-templates.js),
+-- and every report also re-reads the registry.
 local PAINT_CALLBACKS = { 'pre_shipout_filter', 'pre_linebreak_filter', 'post_linebreak_filter',
   'hpack_filter', 'vpack_filter', 'buildpage_filter', 'pre_output_filter', 'contribute_filter',
   'append_to_vlist_filter', 'hyphenate', 'ligaturing', 'kerning', 'linebreak_filter',
@@ -263,7 +265,13 @@ local function note_paint_callback(name, description, late)
   end
 end
 
+local paint_logged = 0 -- TDOM_CALLBACK_LOG entries already read
 local function scan_paint_callbacks(late)
+  local log = TDOM_CALLBACK_LOG or {}
+  if late then
+    for i = paint_logged + 1, #log do note_paint_callback(log[i][1], log[i][2], true) end
+  end
+  paint_logged = #log
   for _, name in ipairs(PAINT_CALLBACKS) do
     local ok, desc = pcall(function() return luatexbase.callback_descriptions(name) end)
     if ok and type(desc) == 'table' then
@@ -1129,14 +1137,9 @@ end
 
 function tdom_seed()
   luacolor_black() -- once in the root, before any fork
+  scan_paint_callbacks(true) -- anything the boot template added after GEO
   if luatexbase and luatexbase.add_to_callback then
-    local add = luatexbase.add_to_callback
-    scan_paint_callbacks(true) -- anything the boot template added after GEO
-    luatexbase.add_to_callback = function(name, func, description, ...)
-      note_paint_callback(name, description, true)
-      return add(name, func, description, ...)
-    end
-    pcall(add, 'buildpage_filter', note_trail, TRAIL_CALLBACK)
+    pcall(luatexbase.add_to_callback, 'buildpage_filter', note_trail, TRAIL_CALLBACK)
   end
   pcall(function() tex.triggerbuildpage() end)
   local old = tex.lists.page_head

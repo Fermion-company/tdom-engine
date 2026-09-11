@@ -1901,8 +1901,9 @@ test('the state trail records what later code can read after an edit', opts, asy
   }
 });
 
-// A package can register a paint filter from the document body, and even
-// drop it again within the block: GEO's preamble snapshot misses both.
+// A package can register a paint filter from the document body, even
+// through its own saved reference to add_to_callback, and drop it again
+// within the block: GEO's preamble snapshot misses all of that.
 test('paint callbacks registered after the preamble reach every later galley', opts, async () => {
   await eng?.close();
   eng = null;
@@ -1911,10 +1912,11 @@ test('paint callbacks registered after the preamble reach every later galley', o
   const late = (marker) => e.blocks.find((b) => b.text.includes(marker))?.galley?.paintLate ?? null;
   try {
     await e.open(String.raw`\documentclass{article}
+\directlua{tdomtest_add = luatexbase.add_to_callback}
 \begin{document}
 First prose.
 
-\directlua{luatexbase.add_to_callback('pre_shipout_filter', function() return true end, 'late.paint')
+\directlua{tdomtest_add('pre_shipout_filter', function() return true end, 'late.paint')
 luatexbase.remove_from_callback('pre_shipout_filter', 'late.paint')}Second prose.
 
 Third prose.
