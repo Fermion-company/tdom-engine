@@ -83,6 +83,11 @@ end
 --            pieces) — not even a glyph bridge is presentable
 local line_x = false
 local line_xb = false
+-- paint-state whatsits (literals, color stack, matrices, specials) met in
+-- the current top-level box; hashed onto the item so a galley records the
+-- graphics it draws, not just that it draws some
+local line_fx = nil
+local line_ca = false
 
 local SP2BP = 65781.76
 -- 6 decimals: page assembly sums hundreds of these; 3 decimals accumulated
@@ -91,6 +96,36 @@ local function bp(sp) return math.floor(((sp or 0) / SP2BP) * 1000000 + 0.5) / 1
 
 local DUMMY_ATTR = 8123
 local LASTSKIP_ATTR = 8124 -- marks the \lastskip primer glue (see tdom_prime_lastskip)
+local EPOCH_ATTR = 8125 -- the build_page call that moved a top-level node (see note_trail)
+
+-- The state trail. A plain-text edit reaches later, unedited code in its
+-- block only through what TeX keeps between contributions to the main
+-- vertical list: the nest's \prevgraf/\prevdepth, \badness, the page totals
+-- and the last-node quantities. Every build_page samples them; equal trails
+-- mean everything after the edited paragraph ran from the same state, so its
+-- output is the same even where the harvest cannot read it (a TeX-built
+-- pdf_literal's token list). Each sample also stamps the nodes it is about
+-- to move, so the harvest knows which contribution a top-level item was.
+local blk_trail = nil -- per job; nil outside one
+local function note_trail(info)
+  if not blk_trail then return end
+  local epoch = #blk_trail + 1
+  local n = tex.lists.contrib_head
+  while n do
+    if not node.has_attribute(n, EPOCH_ATTR) then node.set_attribute(n, EPOCH_ATTR, epoch) end
+    n = n.next
+  end
+  local nest = tex.nest[0]
+  local function get(name)
+    local ok, value = pcall(tex.get, name)
+    return ok and type(value) == 'number' and value or '?'
+  end
+  blk_trail[epoch] = table.concat({ tostring(info), nest.prevgraf or '?', nest.prevdepth or '?',
+    get('badness'), get('inputlineno'), tex.pagetotal or '?', tex.pagegoal or '?', tex.pagedepth or '?',
+    tex.pagestretch or '?', tex.pagefilstretch or '?', tex.pagefillstretch or '?',
+    tex.pagefilllstretch or '?', tex.pageshrink or '?', get('insertpenalties'),
+    tostring(tex.lastpenalty), tostring(tex.lastkern), tostring(tex.lastnodetype) }, ':')
+end
 
 -- A block is harvested on a freshly-seeded page, so \lastskip is 0 when it
 -- starts — but in a continuous run the previous block's trailing \addvspace
@@ -200,6 +235,43 @@ function tdom_boot(port, workdir, counters)
   end
 end
 
+-- Paint added after the resident's harvest (shipout filters) and node-list
+-- filters that see typed text: canonical-anchor repaints a resident line
+-- over canonical pixels only when it recognizes every one of them. GEO
+-- reports the preamble's registrations; each galley then reports every one
+-- made after that snapshot along its lineage (paint_late is inherited by
+-- forks), including one a block adds and removes again.
+local PAINT_CALLBACKS = { 'pre_shipout_filter', 'pre_linebreak_filter', 'post_linebreak_filter',
+  'hpack_filter', 'vpack_filter', 'buildpage_filter', 'pre_output_filter', 'contribute_filter',
+  'append_to_vlist_filter', 'hyphenate', 'ligaturing', 'kerning', 'linebreak_filter',
+  'mlist_to_hlist', 'process_rule' }
+local PAINT_WATCH = {}
+for _, name in ipairs(PAINT_CALLBACKS) do PAINT_WATCH[name] = true end
+local TRAIL_CALLBACK = 'tdom.state-trail' -- the resident's own instrument (below)
+local paint_seen = {}
+local paint_late = nil
+
+local function note_paint_callback(name, description, late)
+  if not PAINT_WATCH[name] or description == TRAIL_CALLBACK then return end
+  local key = name .. '\0' .. tostring(description)
+  if paint_seen[key] then return end
+  paint_seen[key] = true
+  if late then
+    paint_late = paint_late or {}
+    paint_late[name] = paint_late[name] or {}
+    table.insert(paint_late[name], tostring(description))
+  end
+end
+
+local function scan_paint_callbacks(late)
+  for _, name in ipairs(PAINT_CALLBACKS) do
+    local ok, desc = pcall(function() return luatexbase.callback_descriptions(name) end)
+    if ok and type(desc) == 'table' then
+      for _, description in ipairs(desc) do note_paint_callback(name, description, late) end
+    end
+  end
+end
+
 function tdom_geo()
   local function dim(name)
     local ok, v = pcall(function() return tex.dimen[name] end)
@@ -240,6 +312,13 @@ function tdom_geo()
     lineskipsh = bp(tex.lineskip.shrink or 0),
     lineskipsho = tex.lineskip.shrink_order or 0,
   }
+  local callbacks = {}
+  for _, name in ipairs(PAINT_CALLBACKS) do
+    local ok, desc = pcall(function() return luatexbase.callback_descriptions(name) end)
+    if ok and type(desc) == 'table' and #desc > 0 then callbacks[name] = desc end
+  end
+  scan_paint_callbacks(false)
+  geo.paintCallbacks = next(callbacks) and callbacks or 'none'
   for k, v in pairs(geo_extra) do geo[k] = v end
   local payload = jenc(geo)
   conn:send('GEO ' .. #payload .. '\n')
@@ -445,6 +524,57 @@ end
 local LIT_SUB = node.subtype and node.subtype('pdf_literal')
 local COL_SUB = node.subtype and node.subtype('pdf_colorstack')
 local SPECIAL_SUB = node.subtype and node.subtype('special')
+local FX_KIND = {}
+for _, name in ipairs({ 'pdf_literal', 'pdf_colorstack', 'pdf_setmatrix', 'pdf_save', 'pdf_restore', 'special', 'late_lua' }) do
+  local subtype = node.subtype and node.subtype(name)
+  if subtype then FX_KIND[subtype] = name end
+end
+
+-- luacolor keeps colors in an attribute and writes them into the page only
+-- at shipout (pre_shipout_filter), after this harvest: a box whose glyphs or
+-- rules carry that attribute paints a color the resident runs do not show.
+local LUACOLOR_ATTR = nil -- resolved once: the preamble has run before any harvest
+local function luacolor_attribute()
+  if LUACOLOR_ATTR == nil then
+    local ok, attr = pcall(function() return oberdiek.luacolor.getattribute() end)
+    LUACOLOR_ATTR = ok and tonumber(attr) or false
+  end
+  return LUACOLOR_ATTR or nil
+end
+
+-- Black is the one color the resident runs already paint. luacolor's value
+-- table is private, but getvalue() answers an already registered color with
+-- its value (a new one only adds an unused entry); ask once, in the root, so
+-- every fork inherits the same answer.
+local LUACOLOR_BLACK = nil
+local function luacolor_black()
+  if LUACOLOR_BLACK == nil then
+    LUACOLOR_BLACK = {}
+    pcall(function()
+      for _, color in ipairs({ '0 g 0 G', '0 0 0 rg 0 0 0 RG', '0 0 0 1 k 0 0 0 1 K' }) do
+        LUACOLOR_BLACK[oberdiek.luacolor.getvalue(color)] = true
+      end
+    end)
+  end
+  return LUACOLOR_BLACK
+end
+
+local function note_shipout_color(n)
+  if line_fx == nil or line_ca then return end
+  local attr = luacolor_attribute()
+  local value = attr and node.has_attribute(n, attr)
+  if value and not luacolor_black()[value] then line_ca = true end
+end
+
+local function note_fx(n)
+  local kind = line_fx and FX_KIND[n.subtype]
+  if not kind then return end
+  -- A late_lua payload may be a Lua function: its tostring() is a heap
+  -- address, and galley hashes must stay a pure function of TeX's output.
+  local payload = n.data or n.token or ''
+  line_fx[#line_fx + 1] = kind .. ':' .. tostring(n.mode or '') .. ':' .. tostring(n.stack or '') .. ':' ..
+    tostring(n.command or n.cmd or '') .. ':' .. (type(payload) == 'string' and payload or type(payload))
+end
 
 local function check_special(n)
   if SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data then
@@ -591,6 +721,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
   local n = head
   while n do
     local id = n.id
+    if id == GLYPH or id == RULE then note_shipout_color(n) end
     if id == GLYPH then
       note_font(n.font)
       local fi = seen_fonts[n.font]
@@ -694,6 +825,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
         node.free(fake)
       end
     elseif id == WHATSIT then
+      note_fx(n)
       if COL_SUB and n.subtype == COL_SUB then
         flush()
         local cmd = n.command or n.cmd
@@ -730,6 +862,7 @@ walk_v = function(box, x0, baseline_dy, out, math_mode)
       walk_v(n, x0 + bp(n.shift or 0), y + bp(n.height or 0), out, math_mode)
       y = y + bp(n.height or 0) + bp(n.depth or 0)
     elseif id == RULE then
+      note_shipout_color(n)
       local h = n.height
       local d = n.depth
       local w = n.width
@@ -743,6 +876,7 @@ walk_v = function(box, x0, baseline_dy, out, math_mode)
     elseif id == KERN then
       y = y + bp(n.kern or 0)
     elseif id == WHATSIT then
+      note_fx(n)
       if LIT_SUB and n.subtype == LIT_SUB then blk_gfx = true end
     end
     n = n.next
@@ -769,11 +903,13 @@ end
 -- builder runs TeX's own break-cost arithmetic over these values.
 -- `parentBox` is nil for the top-level MVL harvest (glue there is unset, so
 -- natural width IS the effective width).
+local top_epochs = {} -- per top-level item: the EPOCH_ATTR stamp of its node
 local function extract_items(head, parentBox)
   local items = {}
   local n = head
   while n do
     local id = n.id
+    local before = #items
     if is_dummy(n) then
       -- the page-keeper box: not document content
     elseif not parentBox and node.has_attribute(n, LASTSKIP_ATTR) then
@@ -793,6 +929,8 @@ local function extract_items(head, parentBox)
       -- walk of this one top-level line box
       line_x = false
       line_xb = false
+      line_fx = {}
+      line_ca = false
       if id == HLIST then
         -- shift_amount is how TeX indents \parshape/\hangindent lines —
         -- LaTeX lists live on it. The nested walks (519/587) honored it;
@@ -802,11 +940,16 @@ local function extract_items(head, parentBox)
       elseif id == VLIST then
         walk_v(n, bp(n.shift or 0), bp(h), runs)
       else
+        note_shipout_color(n)
         runs[1] = rule_run(n, 0, -bp(h), w, h, d, '#000000')
       end
       local item = { k = 'box', h = bp(h), d = bp(d), w = bp(w), runs = runs }
       if line_x then item.x = 1 end
       if line_xb then item.xb = 1 end
+      if #line_fx > 0 then item.fx = md5.sumhexa(table.concat(line_fx, '\n')) end
+      if line_ca then item.ca = 1 end
+      line_fx = nil
+      line_ca = false
       if #pending_fmarks > 0 then
         item.fm = pending_fmarks
         pending_fmarks = {}
@@ -889,6 +1032,10 @@ local function extract_items(head, parentBox)
       elseif LIT_SUB and n.subtype == LIT_SUB then
         blk_gfx = true
       end
+    end
+    if not parentBox and #items > before then
+      local epoch = node.has_attribute(n, EPOCH_ATTR) or 0
+      for i = before + 1, #items do top_epochs[i] = epoch end
     end
     n = n.next
   end
@@ -981,6 +1128,16 @@ local function checkpoint_gc(initial, interactive)
 end
 
 function tdom_seed()
+  luacolor_black() -- once in the root, before any fork
+  if luatexbase and luatexbase.add_to_callback then
+    local add = luatexbase.add_to_callback
+    scan_paint_callbacks(true) -- anything the boot template added after GEO
+    luatexbase.add_to_callback = function(name, func, description, ...)
+      note_paint_callback(name, description, true)
+      return add(name, func, description, ...)
+    end
+    pcall(add, 'buildpage_filter', note_trail, TRAIL_CALLBACK)
+  end
   pcall(function() tex.triggerbuildpage() end)
   local old = tex.lists.page_head
   local oldc = tex.lists.contrib_head
@@ -1233,7 +1390,11 @@ function tdom_report()
   local head = harvest_nodes()
   colstack = {}
   pending_fmarks = {}
+  top_epochs = {}
   local items = extract_items(head, nil)
+  local epochs = {}
+  for i = 1, #items do epochs[i] = top_epochs[i] or 0 end
+  scan_paint_callbacks(true)
   local w, hsum = 0, 0
   for _, it in ipairs(items) do
     if it.k == 'box' then
@@ -1295,6 +1456,10 @@ function tdom_report()
     closure = JOB.had_error and 'error' or 'native',
     closure_error = JOB.error,
     tdomSourceCatcodesSafe = JOB.sourceCatcodesSafe == true,
+    tdomActive = JOB.activeChars ~= '' and JOB.activeChars or nil,
+    trail = md5.sumhexa(table.concat(blk_trail or {}, '\n')),
+    epochs = epochs,
+    paintLate = paint_late,
     backend = resident_backend_profile(),
   })
   if head and not capture then node.flush_list(head) end
@@ -1558,6 +1723,7 @@ function tdom_wait()
         blk_gfx = false
         blk_floats = {}
         blk_fonts = {}
+        blk_trail = {}
         pending_fmarks = {}
         tdom_absorb_reset()
         RENDER_MODE = false
@@ -1745,11 +1911,32 @@ local function native_source_catcodes_safe(body)
   return ok and safe == true
 end
 
+-- Ordinary-looking characters that are active at the block's entry (babel
+-- shorthands, a document's own \catcode 13): typing one runs a macro, so an
+-- edit made of them is not plain paint. TeX's own specials are excluded:
+-- canonical-anchor already refuses edits that contain them.
+local function source_active_chars(body)
+  local ok, found = pcall(function()
+    local special = { [92]=true, [36]=true, [37]=true, [123]=true, [125]=true,
+      [35]=true, [38]=true, [94]=true, [95]=true, [126]=true }
+    local seen, out = {}, {}
+    for _, cp in utf8.codes(body) do
+      if cp >= 32 and not special[cp] and not seen[cp] and tex.getcatcode(cp) == 13 then
+        seen[cp] = true
+        out[#out + 1] = utf8.char(cp)
+      end
+    end
+    return table.concat(out)
+  end)
+  return ok and found or '?'
+end
+
 function inject_job(body, ship)
   -- Typeset ON the main vertical list — full state continuity with the
   -- previous blocks (prevdepth, \everypar, spacefactor, open counters...).
   -- The dormant page collects the nodes; tdom_report harvests them.
   JOB.sourceCatcodesSafe = native_source_catcodes_safe(body)
+  JOB.activeChars = source_active_chars(body)
   local lines = {}
   for l in (body .. '\n'):gmatch('(.-)\n') do
     lines[#lines + 1] = l

@@ -1657,6 +1657,99 @@ test('fresh boot on a broken source: empty freeze, engine alive', opts, async ()
   }
 });
 
+// A galley used to record only THAT a block draws (gfx), never WHAT: a
+// changed literal inside an otherwise identical box was invisible to the
+// mixed-block canonical-anchor frame.
+test('each galley box fingerprints the paint whatsits it draws', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  const fingerprints = (marker) => e.blocks.find((b) => b.text.includes(marker))
+    ?.galley?.items?.filter((item) => item.k === 'box').map((item) => item.fx ?? null);
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage{tikz}
+\begin{document}
+Plain prose line.
+
+Drawn \tikz\draw (0,0) -- (1,0); here.
+\end{document}
+`);
+    await drain(e);
+    assert.deepEqual(fingerprints('Plain prose'), [null], 'plain prose draws nothing');
+    const drawn = fingerprints('Drawn');
+    assert.equal(drawn.length, 1);
+    assert.match(drawn[0] ?? '', /^[0-9a-f]{32}$/);
+    // LuaTeX exposes no payload for token-list literals, so the fingerprint
+    // records each paint whatsit's kind and order; a second drawing counts
+    const at = e.getSource().indexOf(' here.');
+    await e.edit(at, at, String.raw` \tikz\fill (0,0) circle (1pt);`);
+    await drain(e);
+    assert.notEqual(fingerprints('Drawn')[0], drawn[0], 'more drawing is a different box');
+  } finally {
+    await e.close();
+  }
+});
+
+// luacolor keeps colors in an attribute and writes them only at shipout:
+// the resident runs of a colored line stay black, so canonical-anchor must
+// know which lines carry a color other than black.
+test('boxes whose glyphs luacolor colors at shipout are marked', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  const marks = (marker) => e.blocks.find((b) => b.text.includes(marker))
+    ?.galley?.items?.filter((item) => item.k === 'box').map((item) => item.ca ?? 0);
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage{xcolor}
+\usepackage{luacolor}
+\begin{document}
+\color{black}Black prose line.
+
+{\color{red}Red prose line.}
+\end{document}
+`);
+    await drain(e);
+    assert.deepEqual(marks('Black prose'), [0], 'black is what the resident runs already paint');
+    assert.deepEqual(marks('Red prose'), [1]);
+    assert.ok(e.getGeometry().paintCallbacks?.pre_shipout_filter?.includes('luacolor.process'),
+      'the resident reports the shipout filter that paints these colors');
+  } finally {
+    await e.close();
+  }
+});
+
+// A package can register a paint filter from the document body, and even
+// drop it again within the block: GEO's preamble snapshot misses both.
+test('paint callbacks registered after the preamble reach every later galley', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  const late = (marker) => e.blocks.find((b) => b.text.includes(marker))?.galley?.paintLate ?? null;
+  try {
+    await e.open(String.raw`\documentclass{article}
+\begin{document}
+First prose.
+
+\directlua{luatexbase.add_to_callback('pre_shipout_filter', function() return true end, 'late.paint')
+luatexbase.remove_from_callback('pre_shipout_filter', 'late.paint')}Second prose.
+
+Third prose.
+\end{document}
+`);
+    await drain(e);
+    assert.equal(late('First'), null, "the resident's own trail hook is not document paint");
+    assert.deepEqual(late('Second'), { pre_shipout_filter: ['late.paint'] }, 'added and removed inside one block');
+    assert.deepEqual(late('Third'), { pre_shipout_filter: ['late.paint'] }, 'the lineage keeps it');
+  } finally {
+    await e.close();
+  }
+});
+
 // The dormant absorb never ships, so every fire is a dead cycle, and LuaTeX
 // ignores a tex.deadcycles assignment. Without TeX's own reset each
 // \clearpage (two fires) counted toward \maxdeadcycles=200 across the fork
