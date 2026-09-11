@@ -99,10 +99,11 @@ local LASTSKIP_ATTR = 8124 -- marks the \lastskip primer glue (see tdom_prime_la
 -- The build_page call that moved a top-level node (see note_trail). The
 -- canonical-anchor proof reads it, so it takes an allocated attribute rather
 -- than a fixed number a document could also set; the daemon loads after the
--- preamble, so no package's attribute moves.
+-- preamble, so no package's attribute moves. Without one, nothing is stamped:
+-- every epoch reads 0 and the mixed anchor refuses (fail-closed).
 local EPOCH_ATTR = (function()
   local ok, attr = pcall(function() return luatexbase.new_attribute('tdom@epoch') end)
-  return ok and tonumber(attr) or 8125
+  return ok and tonumber(attr) or nil
 end)()
 
 -- The state trail. A plain-text edit reaches later, unedited code in its
@@ -117,7 +118,7 @@ local blk_trail = nil -- per job; nil outside one
 local function note_trail(info)
   if not blk_trail then return end
   local epoch = #blk_trail + 1
-  local n = tex.lists.contrib_head
+  local n = EPOCH_ATTR and tex.lists.contrib_head
   while n do
     if not node.has_attribute(n, EPOCH_ATTR) then node.set_attribute(n, EPOCH_ATTR, epoch) end
     n = n.next
@@ -1049,7 +1050,7 @@ local function extract_items(head, parentBox)
       end
     end
     if not parentBox and #items > before then
-      local epoch = node.has_attribute(n, EPOCH_ATTR) or 0
+      local epoch = EPOCH_ATTR and node.has_attribute(n, EPOCH_ATTR) or 0
       for i = before + 1, #items do top_epochs[i] = epoch end
     end
     n = n.next
