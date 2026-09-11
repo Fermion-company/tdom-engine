@@ -1657,6 +1657,36 @@ test('fresh boot on a broken source: empty freeze, engine alive', opts, async ()
   }
 });
 
+// The dormant absorb never ships, so every fire is a dead cycle, and LuaTeX
+// ignores a tex.deadcycles assignment. Without TeX's own reset each
+// \clearpage (two fires) counted toward \maxdeadcycles=200 across the fork
+// lineage, and past ~100 pages every later eject died with "Output loop".
+// A small \maxdeadcycles reproduces that within a few pages.
+test('absorbed page ejects do not accumulate dead cycles along the lineage', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  try {
+    const pages = Array.from({ length: 6 }, (_, i) => `Page ${i + 1}.\n\\clearpage`).join('\n\n');
+    await e.open(`\\documentclass{article}\n\\begin{document}\n\\maxdeadcycles=5\n\n${pages}\n\\end{document}\n`);
+    await drain(e);
+    const pageBlocks = e.blocks.filter((b) => /^Page \d/.test(b.text));
+    assert.equal(pageBlocks.length, 6);
+    for (const b of pageBlocks) {
+      assert.equal(b.closure?.native, true, `${b.text.split('\n')[0]} certifies natively`);
+      assert.equal(b.galley?.tdomDeferred, undefined);
+    }
+    const at = e.getSource().indexOf('Page 6.') + 'Page 6'.length;
+    await e.edit(at, at, ' again');
+    await drain(e);
+    const edited = e.blocks.find((b) => b.text.startsWith('Page 6 again.'));
+    assert.equal(edited?.closure?.native, true, 'an edit deep in the lineage still certifies natively');
+  } finally {
+    await e.close();
+  }
+});
+
 // Margin-bearing blocks (\marginpar / todonotes' \todo — the paper-draft
 // review-mark workflow) must NOT demote the document: the block typesets
 // in-chain for its body text, its fidelity is CANONICAL_ONLY (the canonical
