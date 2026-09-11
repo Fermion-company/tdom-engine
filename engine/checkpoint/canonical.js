@@ -497,8 +497,17 @@ export class CanonicalRenderer {
    * full compile. Opaque mode and a revision explicitly needed for display
    * use a short debounce plus a half-duty cost cooldown. Public for tests.
    */
-  delayFor(job = this.pendingJob, { preserveIdleStart = false } = {}) {
+  delayFor(job = this.pendingJob, { preserveIdleStart = false, coldBaselineCatchup = false } = {}) {
     const since = Date.now() - this.lastEndAt;
+    // One bounded exception to the display cooldown: the first canonical
+    // baseline may land for revision N after an already-accepted edit made
+    // revision N+1 the only presentable source. If that edit has no resident
+    // display path, waiting another full long-document cooldown merely keeps
+    // old pixels on screen. #drain grants this only to the job immediately
+    // behind a successfully landed first baseline; later compiles retain the
+    // normal duty-cycle bound.
+    if (coldBaselineCatchup && this.#hasDisplayDemand(job) &&
+        this.residentImpossibleDemandIds.size) return this.displayDebounceMs;
     if (this.pressure !== 'authority' || job?.fallbackReason || this.#hasDisplayDemand(job)) {
       // canonical is needed for display — stay responsive on small
       // documents, but never let a long document compile back-to-back
@@ -599,6 +608,7 @@ export class CanonicalRenderer {
       }
       return;
     }
+    const startedWithoutCanonical = !this.last;
     this.runningJob = { rev: job.rev, inputEpoch: job.inputEpoch, fallbackReason: job.fallbackReason };
     this.running = this.#compile({
       ...job,
@@ -629,7 +639,12 @@ export class CanonicalRenderer {
     // still converges promptly for exports/tests (it clears the timer and
     // drains directly).
     if (this.pendingJob && !this.disposed && !this.timer) {
-      this.#armPending(this.delayFor());
+      const landedFirstBaseline = startedWithoutCanonical &&
+        this.last?.rev === job.rev && this.last?.inputEpoch === job.inputEpoch;
+      const coldBaselineCatchup = landedFirstBaseline &&
+        this.pendingJob.rev > job.rev && this.#hasDisplayDemand(this.pendingJob) &&
+        this.residentImpossibleDemandIds.size > 0;
+      this.#armPending(this.delayFor(this.pendingJob, { coldBaselineCatchup }));
     }
   }
 

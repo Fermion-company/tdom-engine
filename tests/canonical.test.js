@@ -248,6 +248,24 @@ test('authority pressure: fast baseline, then deep idle + cost cooldown', () => 
       c.delayFor() >= 8000 * c.displayCooldownFactor - 100,
       `display pacing scales with compile cost (got ${c.delayFor()})`
     );
+    // The first baseline can finish behind an edit for which the viewer has
+    // no resident pixels. #drain grants exactly this immediate successor one
+    // short-debounce catch-up instead of another long-document cooldown.
+    c.pressure = 'authority';
+    c.pendingJob = { source: 'new', rev: 2, inputEpoch: c.inputEpoch, scheduledAt: Date.now() };
+    c.displayDemand = { rev: 2, inputEpoch: c.inputEpoch };
+    c.activeDisplayDemandIds.add('viewer');
+    c.residentImpossibleDemandIds.add('viewer');
+    assert.equal(
+      c.delayFor(c.pendingJob, { coldBaselineCatchup: true }),
+      c.displayDebounceMs,
+      'a resident-impossible edit immediately behind the first baseline uses the short debounce'
+    );
+    c.residentImpossibleDemandIds.clear();
+    assert.ok(
+      c.delayFor(c.pendingJob, { coldBaselineCatchup: true }) >= 8000 * c.displayCooldownFactor - 100,
+      'the allowance does not bypass pacing while resident pixels can still arrive'
+    );
   } finally {
     c.dispose();
   }
