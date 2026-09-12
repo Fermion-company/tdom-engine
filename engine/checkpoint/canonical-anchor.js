@@ -18,6 +18,16 @@ export const ANCHOR_PROOF_BUDGET_MS = 700;
 export const ANCHOR_PUBLISH_BUDGET_MS = 850;
 const SP_PER_BP = 65781.76;
 
+/** A deadline-stopped concurrent range must never masquerade as a complete
+ * candidate set: Array#every skips holes in sparse arrays. */
+export function flattenCompleteAnchorCandidateGroups(groups, expectedLength) {
+  if (!Array.isArray(groups) || groups.length !== expectedLength) return null;
+  for (let index = 0; index < expectedLength; index++) {
+    if (!Array.isArray(groups[index])) return null;
+  }
+  return groups.flat();
+}
+
 /** Return the one contiguous edit between two plain-text snapshots. */
 export function singlePlainTextDelta(before, after) {
   const left = String(before ?? '');

@@ -23,10 +23,10 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from './engine/checkpoint/engine-v3.js';
 import {
-  ANCHOR_PROOF_BUDGET_MS,
   buildTerminalCanonicalPatch,
   captureCanonicalAnchorBase,
   dirtyWithoutPatchFallback,
+  flattenCompleteAnchorCandidateGroups,
   planTerminalCanonicalAnchor,
   singlePlainTextDelta,
 } from './engine/checkpoint/canonical-anchor.js';
@@ -1159,7 +1159,7 @@ async function rawForwardCandidatesForRange(source, id, deadline, canonicalInput
     }
   });
   await Promise.all(workers);
-  return groups.every(Array.isArray) ? groups.flat() : null;
+  return flattenCompleteAnchorCandidateGroups(groups, lines.length);
 }
 
 async function beforeDeadline(promise, deadline) {
@@ -1175,18 +1175,23 @@ async function beforeDeadline(promise, deadline) {
 // The base generation's SyncTeX records and paint index depend only on the
 // pre-edit witness. Start them alongside the resident edit so its typeset
 // time does not consume the fixed proof budget; the proof itself is unchanged.
-function prefetchCanonicalAnchorProof(base, deadline) {
-  const candidates = beforeDeadline(
-    rawForwardCandidatesForRange(base.source, base.certificate.id, deadline, base.canonicalInputPath),
-    deadline
+function prefetchCanonicalAnchorProof(base, completionDeadline) {
+  const rawCandidates = rawForwardCandidatesForRange(
+    base.source,
+    base.certificate.id,
+    completionDeadline,
+    base.canonicalInputPath
   ).catch(() => null);
-  const paintPages = candidates.then((list) => list?.length
+  // Cache filling runs beside resident typesetting. It never publishes by
+  // itself; the resolver still applies its own proof deadline and exact
+  // request identity checks.
+  const paintPages = rawCandidates.then((list) => list?.length
     ? beforeDeadline(
         engine.canonical.pdfPaintPages(base.certificate.id, [...new Set(list.map((item) => Number(item.page)))]),
-        deadline
+        completionDeadline
       ).catch(() => null)
     : null);
-  return { base, deadline, candidates, paintPages };
+  return { base, completionDeadline, rawCandidates, paintPages };
 }
 
 // A block's proof inputs (one SyncTeX query per source line, the pages'
@@ -1226,11 +1231,10 @@ async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch
       currentCertificate?.synctexHash === plan.baseSnapshot.certificate.synctexHash;
   };
   if (!stillCurrent()) return;
-  // A prefetch whose acceptance-based window expired cannot decide the
-  // post-typeset proof. Start one fresh bounded attempt; completed generation
-  // lookups still return through the canonical caches.
-  const prefetched = prefetch?.base === plan.baseSnapshot &&
-    performance.now() < Number(prefetch.deadline) ? prefetch : null;
+  // Reuse the immutable background work only inside this edit's post-typeset
+  // proof window. If its cache-fill deadline stopped before completing the
+  // range, one fresh bounded attempt finishes the missing entries.
+  const prefetched = prefetch?.base === plan.baseSnapshot ? prefetch : null;
   const freshCandidates = () => beforeDeadline(
     rawForwardCandidatesForRange(
       plan.source,
@@ -1240,13 +1244,16 @@ async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch
     ),
     plan.proofDeadline
   ).catch(() => null);
-  let candidates = prefetched ? await prefetched.candidates : await freshCandidates();
-  if (prefetched && (candidates === null ||
-      !candidates.length && performance.now() >= Number(prefetched.deadline))) {
+  let candidates = prefetched
+    ? await beforeDeadline(prefetched.rawCandidates, plan.proofDeadline).catch(() => null)
+    : await freshCandidates();
+  if (prefetched && candidates === null) {
     candidates = await freshCandidates();
   }
   const pages = [...new Set((candidates ?? []).map((candidate) => Number(candidate.page)))];
-  let paintPages = candidates?.length && prefetched ? await prefetched.paintPages : null;
+  let paintPages = candidates?.length && prefetched
+    ? await beforeDeadline(prefetched.paintPages, plan.proofDeadline).catch(() => null)
+    : null;
   if (candidates?.length && !paintPages) {
     paintPages = await beforeDeadline(
       engine.canonical.pdfPaintPages(plan.baseGeneration, pages),
@@ -1813,7 +1820,7 @@ const server = http.createServer(async (req, res) => {
           if (anchorBaseSnapshot) {
             anchorProofPrefetch = prefetchCanonicalAnchorProof(
               anchorBaseSnapshot,
-              anchorAcceptedAt + ANCHOR_PROOF_BUDGET_MS
+              anchorAcceptedAt + WARM_PROOF_PREFETCH_MS
             );
           }
           ensureProjectOutputDirectories(next);

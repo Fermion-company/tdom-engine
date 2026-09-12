@@ -34,6 +34,7 @@ import { plainPreviewWitness, canDeferPlainVerification } from '../engine/checkp
 import {
   buildTerminalCanonicalPatch,
   captureCanonicalAnchorBase,
+  flattenCompleteAnchorCandidateGroups,
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
   singlePlainTextDelta,
@@ -846,6 +847,15 @@ async function drain(eng, timeoutMs = 120_000) {
 
 /** Lineage-independent identity of the whole document state. */
 const signature = (eng) => eng.blocks.map((b) => `${b.galleyHash}|${b.stateVec}`);
+
+test('anchor candidate ranges reject sparse deadline-stopped results', () => {
+  const partial = Array(19);
+  for (let index = 0; index < 8; index++) partial[index] = [{ line: index + 28 }];
+  assert.equal(flattenCompleteAnchorCandidateGroups(partial, 19), null,
+    'sparse holes are missing queries, not a complete eight-line result');
+  const complete = Array.from({ length: 19 }, (_, index) => [{ line: index + 28 }]);
+  assert.equal(flattenCompleteAnchorCandidateGroups(complete, 19).length, 19);
+});
 
 test('child anchor read proof rejects aliases and untracked project readers', () => {
   const root = path.resolve('/project/main.tex');
