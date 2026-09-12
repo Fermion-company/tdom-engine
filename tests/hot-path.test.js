@@ -38,6 +38,7 @@ import {
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
   singlePlainTextDelta,
+  warmCanonicalProofOutcome,
 } from '../engine/checkpoint/canonical-anchor.js';
 import { singleLiteralChildReadProof } from '../engine/checkpoint/dependency-read-proof.js';
 import {
@@ -855,6 +856,17 @@ test('anchor candidate ranges reject sparse deadline-stopped results', () => {
     'sparse holes are missing queries, not a complete eight-line result');
   const complete = Array.from({ length: 19 }, (_, index) => [{ line: index + 28 }]);
   assert.equal(flattenCompleteAnchorCandidateGroups(complete, 19).length, 19);
+});
+
+test('caret readiness requires complete canonical candidates and paint', () => {
+  assert.deepEqual(warmCanonicalProofOutcome(null, null),
+    { status: 'proof-unavailable', reason: 'sync-prefetch-incomplete' });
+  assert.deepEqual(warmCanonicalProofOutcome([], []),
+    { status: 'proof-unavailable', reason: 'no-sync-candidates' });
+  assert.deepEqual(warmCanonicalProofOutcome([{ page: 1 }], null),
+    { status: 'proof-unavailable', reason: 'paint-prefetch-incomplete' });
+  assert.deepEqual(warmCanonicalProofOutcome([{ page: 1 }], [{ page: 1 }]),
+    { status: 'ready', reason: null });
 });
 
 test('child anchor read proof rejects aliases and untracked project readers', () => {

@@ -29,6 +29,7 @@ import {
   flattenCompleteAnchorCandidateGroups,
   planTerminalCanonicalAnchor,
   singlePlainTextDelta,
+  warmCanonicalProofOutcome,
 } from './engine/checkpoint/canonical-anchor.js';
 import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
 import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read-proof.js';
@@ -457,6 +458,7 @@ let lastAnchorPresentation = null;
 let documentEpoch = 1;
 let terminalAnchorLineage = null;
 let terminalAnchorEpoch = 0;
+let warmProofRequestSeq = 0;
 let activeProject = {
   docDir: path.join(ROOT, 'samples'),
   file: sampleFile,
@@ -1217,7 +1219,9 @@ function prefetchWarmAnchorProof(offset, filePath) {
       : { start: offset, end: offset, text: '', file, canonicalInputPath: path.resolve(readPath) },
     certificate,
   });
-  if (base) prefetchCanonicalAnchorProof(base, performance.now() + WARM_PROOF_PREFETCH_MS);
+  return base
+    ? prefetchCanonicalAnchorProof(base, performance.now() + WARM_PROOF_PREFETCH_MS)
+    : null;
 }
 
 async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch = null) {
@@ -1445,14 +1449,62 @@ const server = http.createServer(async (req, res) => {
         return json(res, { error: 'warm requires a finite offset or positive page' }, 400);
       }
       const filePath = typeof body.filePath === 'string' ? body.filePath : engine.file;
+      const requestedFile = path.resolve(activeProject.docDir, filePath);
+      const warmProofRequest = ++warmProofRequestSeq;
       const warming = Number.isFinite(offset)
         ? engine.warmEditOffset(offset, filePath)
         : engine.warmPage(page);
-      void warming.then((result) => {
-        if (result?.status !== 'ready' || !Number.isFinite(offset)) return;
-        try { prefetchWarmAnchorProof(offset, filePath); } catch { /* a missed prefetch only costs budget */ }
+      void warming.then(async (result) => {
+        if (warmProofRequest !== warmProofRequestSeq || result?.status !== 'ready' || !Number.isFinite(offset)) return;
+        if (engine.warmInfo !== result) return;
+        const epoch = documentEpoch;
+        const anchorEpoch = terminalAnchorEpoch;
+        let prefetch;
+        try { prefetch = prefetchWarmAnchorProof(offset, filePath); } catch { prefetch = null; }
+        if (!prefetch) {
+          const unavailable = { ...result, status: 'proof-unavailable', reason: 'anchor-proof-ineligible', offset, file: requestedFile };
+          if (warmProofRequest === warmProofRequestSeq && engine.warmInfo === result) {
+            engine.warmInfo = unavailable;
+            broadcast({ kind: 'warm', warm: unavailable });
+          }
+          return;
+        }
+        const certificate = prefetch.base.certificate;
+        const proofing = { ...result, status: 'proofing', offset, file: requestedFile, canonicalId: certificate.id };
+        engine.warmInfo = proofing;
+        broadcast({ kind: 'warm', warm: proofing });
+        const [candidates, paintPages] = await Promise.all([
+          prefetch.rawCandidates.catch(() => null),
+          prefetch.paintPages.catch(() => null),
+        ]);
+        if (warmProofRequest !== warmProofRequestSeq || engine.warmInfo !== proofing) return;
+        const currentCertificate = engine.canonical.generationCertificate(certificate.id);
+        const currentCanonical = engine.canonical.info();
+        if (documentEpoch !== epoch || terminalAnchorEpoch !== anchorEpoch ||
+            engine.srcRev !== result.sourceRev || engine.canonical.inputEpoch !== certificate.inputEpoch ||
+            currentCanonical.id !== certificate.id || currentCanonical.rev !== certificate.rev ||
+            currentCertificate?.rev !== certificate.rev || currentCertificate?.pdfHash !== certificate.pdfHash ||
+            currentCertificate?.synctexHash !== certificate.synctexHash) {
+          const stale = { ...proofing, status: 'proof-unavailable', reason: 'proof-identity-stale' };
+          engine.warmInfo = stale;
+          broadcast({ kind: 'warm', warm: stale });
+          return;
+        }
+        const completed = {
+          ...result,
+          ...warmCanonicalProofOutcome(candidates, paintPages),
+          offset,
+          file: requestedFile,
+          canonicalId: certificate.id,
+        };
+        engine.warmInfo = completed;
+        broadcast({ kind: 'warm', warm: completed });
       }, (error) => {
-        engine.warmInfo = { status: 'error', message: error?.message ?? String(error) };
+        const failed = { status: 'error', message: error?.message ?? String(error), offset, file: requestedFile };
+        if (warmProofRequest === warmProofRequestSeq) {
+          engine.warmInfo = failed;
+          broadcast({ kind: 'warm', warm: failed });
+        }
       });
       return json(res, { scheduled: true, srcRev: engine.srcRev });
     }

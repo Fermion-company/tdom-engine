@@ -28,6 +28,22 @@ export function flattenCompleteAnchorCandidateGroups(groups, expectedLength) {
   return groups.flat();
 }
 
+/** A caret is fully prepared only after both resident state and immutable
+ * canonical proof inputs are ready. Unsupported or deadline-stopped work
+ * remains explicit instead of advertising a false ready state. */
+export function warmCanonicalProofOutcome(candidates, paintPages) {
+  if (!Array.isArray(candidates)) {
+    return { status: 'proof-unavailable', reason: 'sync-prefetch-incomplete' };
+  }
+  if (!candidates.length) {
+    return { status: 'proof-unavailable', reason: 'no-sync-candidates' };
+  }
+  if (!Array.isArray(paintPages) || paintPages.some((page) => !page)) {
+    return { status: 'proof-unavailable', reason: 'paint-prefetch-incomplete' };
+  }
+  return { status: 'ready', reason: null };
+}
+
 /** Return the one contiguous edit between two plain-text snapshots. */
 export function singlePlainTextDelta(before, after) {
   const left = String(before ?? '');
