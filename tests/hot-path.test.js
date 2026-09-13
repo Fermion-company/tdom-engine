@@ -1068,6 +1068,47 @@ test('a prose line inside a mixed block anchors only while everything else is un
   assert.equal(slowResidentPlan.publishDeadline - proofStartedAt, 850,
     'publication remains bounded from proof readiness');
   assert.deepEqual(ok?.changedLines, [2], 'only the edited prose line is repainted');
+  const restoredEdit = singlePlainTextDelta(`${text}X`, text);
+  const restored = planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, fidelity: fidelity(), galley: galley() }],
+    domBlocks: [dom], geometry, edit: restoredEdit, paintContext,
+    report: {
+      ...report,
+      srcRev: 7,
+      patches: [{ type: 'replace-page', page: 12, displayList: { commands: [
+        { op: 'glyphs', src: 'mixed', line: 2, x: 72, y: 300, w: 50,
+          gh: 8, gd: 2, size: 10, text: 'Bravo' },
+      ] } }],
+    },
+    lineage: {
+      blockId: ok.blockId, baseGeneration: ok.baseGeneration, baseRev: ok.baseRev,
+      lastSrcRev: ok.srcRev, baseSnapshot: base, changedLines: ok.changedLines,
+    },
+  });
+  assert.deepEqual(restored?.changedLines, [2],
+    'returning exactly to the base repaints the previous delta line');
+  const nextEdit = singlePlainTextDelta(text, `${text}Y`);
+  const afterRestore = planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}Y`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      fidelity: fidelity(), galley: galley({ second: 'BravoY' }) }],
+    domBlocks: [dom], geometry, edit: nextEdit, paintContext,
+    report: {
+      ...report,
+      srcRev: 8,
+      patches: [{ type: 'replace-page', page: 12, displayList: { commands: [
+        { op: 'glyphs', src: 'mixed', line: 2, x: 72, y: 300, w: 60,
+          gh: 8, gd: 2, size: 10, text: 'BravoY' },
+      ] } }],
+    },
+    lineage: {
+      blockId: restored.blockId, baseGeneration: restored.baseGeneration,
+      baseRev: restored.baseRev, lastSrcRev: restored.srcRev,
+      baseSnapshot: base, changedLines: restored.changedLines,
+    },
+  });
+  assert.deepEqual(afterRestore?.changedLines, [2],
+    'the edit after a full restoration continues from the immutable base');
   // with graphics in the block its exact chunk owns every line, so the page
   // carries only the line's source hit box; the safe runs paint from there
   const hitOnly = planTerminalCanonicalAnchor({
@@ -1170,6 +1211,11 @@ test('a prose line inside a mixed block anchors only while everything else is un
   const pageGeometry = { oddsidemargin: 0, textwidth: 450, topmargin: 0, headheight: 12, headsep: 18,
     textheight: 680 };
   const line = (y) => ({ page: 12, y, box: { left: 72, top: y - 8, right: 472, bottom: y + 2 } });
+  const restoredPatch = buildTerminalCanonicalPatch({ ...restored, geometry: pageGeometry },
+    [{ lineIndex: 0, candidate: line(150) }, { lineIndex: 1, candidate: line(163) }]);
+  assert.deepEqual(restoredPatch?.commands?.filter((command) => command.op === 'glyphs')
+    .map((command) => command.text), ['Bravo'],
+  'base restoration uses the ordinary certified repaint transaction');
   const patch = buildTerminalCanonicalPatch({ ...ok, geometry: pageGeometry },
     [{ lineIndex: 0, candidate: line(150) }, { lineIndex: 1, candidate: line(163) }]);
   assert.deepEqual(patch?.pages?.map((page) => page.page), [12]);

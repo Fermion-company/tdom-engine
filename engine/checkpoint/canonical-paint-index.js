@@ -149,6 +149,26 @@ export function changedMixedGalleyLines(baseLines, currentLines) {
   return changed.length ? changed : null;
 }
 
+/** A valid no-op is distinct from changed*GalleyLines' historical null
+ * result, which also covers malformed/reflowed witnesses. This exact check
+ * is used only to repaint the previous anchor's affected lines when a
+ * cumulative edit returns them to the immutable canonical base. */
+export function identicalGalleyLines(baseLines, currentLines) {
+  if (!Array.isArray(baseLines) || !Array.isArray(currentLines) ||
+      !baseLines.length || baseLines.length !== currentLines.length) return false;
+  for (let index = 0; index < baseLines.length; index++) {
+    const before = baseLines[index];
+    const after = currentLines[index];
+    if (!before !== !after) return false;
+    if (!before) continue;
+    if (before.signature !== after.signature ||
+        !sameNumber(before.lineWidth, after.lineWidth, EPSILON) ||
+        !sameNumber(before.height, after.height, EPSILON) ||
+        !sameNumber(before.depth, after.depth, EPSILON)) return false;
+  }
+  return true;
+}
+
 /** Return the complete base→current effect set. Unchanged lines must retain
  * their exact display-list signature and every line box must retain geometry. */
 export function changedGalleyLines(baseLines, currentLines) {

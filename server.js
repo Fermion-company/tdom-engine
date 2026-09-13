@@ -2165,6 +2165,7 @@ const server = http.createServer(async (req, res) => {
           baseRev: anchorPlan.baseRev,
           lastSrcRev: anchorPlan.srcRev,
           baseSnapshot: anchorPlan.baseSnapshot,
+          changedLines: [...anchorPlan.changedLines],
         };
       } else if (anchorMutation || lastReport.dirtySourceNodes?.length) {
         terminalAnchorLineage = null;

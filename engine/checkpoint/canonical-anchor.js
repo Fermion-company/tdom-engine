@@ -5,6 +5,7 @@ import {
   changedMixedGalleyLines,
   galleyLineWitnesses,
   galleyMixedLineWitnesses,
+  identicalGalleyLines,
   mixedGalleyFrame,
 } from './canonical-paint-index.js';
 import path from 'node:path';
@@ -354,9 +355,22 @@ export function planTerminalCanonicalAnchor({
   const plainEdit = edit ? plainEditContext(block, dom, edit, base) : null;
   if (!plainEdit) return reject('plain-edit');
   const currentLines = mixed ? galleyMixedLineWitnesses(block.galley) : galleyLineWitnesses(block.galley);
-  const changedLines = mixed
+  let changedLines = mixed
     ? changedMixedGalleyLines(base.lineWitnesses, currentLines)
     : changedGalleyLines(base.lineWitnesses, currentLines);
+  // The previous patch may have painted a cumulative delta over this same
+  // canonical base. If the resident output is now exactly the frozen base,
+  // repaint those affected lines with their original commands. This removes
+  // the prior delta atomically through the ordinary proof/paint path and
+  // preserves the lineage for the following edit. A malformed or merely
+  // similar witness still follows the historical fail-closed null path.
+  if (!changedLines && continuedBase && identicalGalleyLines(base.lineWitnesses, currentLines)) {
+    const priorLines = Array.isArray(lineage.changedLines)
+      ? [...new Set(lineage.changedLines.filter((line) =>
+          Number.isInteger(line) && line >= 0 && line < currentLines.length && currentLines[line]))]
+      : [];
+    if (priorLines.length) changedLines = priorLines;
+  }
   if (!currentLines || !changedLines) return reject('line-change');
   if (linesCarryShipoutColor(block.galley, changedLines)) return reject('shipout-color');
   if (mixed) {
