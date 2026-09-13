@@ -167,11 +167,15 @@ async function canonicalCropCandidates(engine, block, id) {
   const file = block.file
     ? engine.includes.get(block.file)?.readPath ?? block.file
     : path.join(engine.canonical.workDir, 'canon.tex');
-  const groups = [];
-  for (let line = first; line <= last; line++) {
-    if (engine.canonical.generationCertificate(id)?.rev !== engine.srcRev) return null;
-    groups.push(await engine.canonical.forwardSyncAll({ file, line, column: line === first ? source.column : 1, id }));
-  }
+  if (engine.canonical.generationCertificate(id)?.rev !== engine.srcRev) return null;
+  const groups = await engine.canonical.forwardSyncRange({
+    file,
+    firstLine: first,
+    lastLine: last,
+    firstColumn: Number.isInteger(source.column) && source.column > 0 ? source.column : 1,
+    id,
+  });
+  if (!groups || engine.canonical.generationCertificate(id)?.rev !== engine.srcRev) return null;
   return groups.flat();
 }
 

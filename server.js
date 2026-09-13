@@ -1191,18 +1191,15 @@ async function rawForwardCandidatesForRange(source, id, deadline, canonicalInput
   const first = Math.floor(Number(source?.start?.line));
   const last = Math.floor(Number(source?.end?.line));
   if (!file || !Number.isInteger(first) || !Number.isInteger(last) || first < 1 || last < first) return null;
-  const lines = Array.from({ length: last - first + 1 }, (_, index) => first + index);
-  const groups = Array(lines.length);
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(8, lines.length) }, async () => {
-    while (cursor < lines.length) {
-      if (performance.now() >= deadline) return;
-      const index = cursor++;
-      groups[index] = await engine.canonical.forwardSyncAll({ file, line: lines[index], column: 1, id });
-    }
+  const groups = await engine.canonical.forwardSyncRange({
+    file,
+    firstLine: first,
+    lastLine: last,
+    firstColumn: 1,
+    id,
+    deadline,
   });
-  await Promise.all(workers);
-  return flattenCompleteAnchorCandidateGroups(groups, lines.length);
+  return flattenCompleteAnchorCandidateGroups(groups, last - first + 1);
 }
 
 async function beforeDeadline(promise, deadline) {

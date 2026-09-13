@@ -43,6 +43,7 @@ import { withProjectInputs } from '../project-inputs.js';
 import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-index.js';
 import { pdfEditGlyphs } from './pdf-edit-geometry.js';
 import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
+import { querySyncTeXRange } from './synctex-batch.js';
 
 const execFileP = promisify(execFile);
 const gunzipP = promisify(gunzip);
@@ -1305,7 +1306,7 @@ export class CanonicalRenderer {
       outputs[0] ?? null;
   }
 
-  async forwardSyncAll({ file, line, column = 1, id = null } = {}) {
+  async forwardSyncAll({ file, line, column = 1, id = null, deadline = Infinity, strict = false } = {}) {
     if (!file || !Number.isFinite(line) || line < 1) return [];
     const cur = this.#acquireGeneration(id);
     if (!cur) return [];
@@ -1320,9 +1321,13 @@ export class CanonicalRenderer {
       let job = cur.forwardSyncCache.get(input);
       if (!job) {
         job = (async () => {
+          const remaining = Number.isFinite(deadline)
+            ? Math.max(0, Math.floor(deadline - performance.now()))
+            : 15_000;
+          if (remaining <= 0) throw new Error('SyncTeX query deadline exceeded');
           const result = await this.#exec('synctex', ['view', '-i', input, '-o', cur.pdf], {
             cwd: this.docDir,
-            timeout: 15_000,
+            timeout: Math.min(15_000, remaining),
             maxBuffer: 4 * 1024 * 1024,
             env: process.env,
           });
@@ -1348,9 +1353,125 @@ export class CanonicalRenderer {
           cur.forwardSyncCache.delete(cur.forwardSyncCache.keys().next().value);
         }
       }
+      if (Number.isFinite(deadline)) {
+        const remaining = Math.max(0, Math.floor(deadline - performance.now()));
+        if (remaining <= 0) return strict ? null : [];
+        let timer;
+        const result = await Promise.race([
+          job,
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('SyncTeX query deadline exceeded')), remaining);
+          }),
+        ]).finally(() => clearTimeout(timer));
+        return [...result];
+      }
       return [...await job];
     } catch {
-      return [];
+      return strict ? null : [];
+    } finally {
+      this.#releaseGeneration(cur);
+    }
+  }
+
+  /** Query a source-line range against one retained generation. The native
+   * helper parses that generation's SyncTeX once. It is only an acceleration:
+   * unavailable, malformed, partial, or late helper output falls back to the
+   * existing per-line CLI queries before the caller's absolute deadline. */
+  async forwardSyncRange({ file, firstLine, lastLine, firstColumn = 1, id = null, deadline = Infinity } = {}) {
+    if (!file || !Number.isInteger(firstLine) || !Number.isInteger(lastLine) || firstLine < 1 ||
+        lastLine < firstLine || lastLine - firstLine >= 512 ||
+        !Number.isInteger(firstColumn) || firstColumn < 1) return null;
+    const cur = this.#acquireGeneration(id);
+    if (!cur) return null;
+    try {
+      if (!cur.synctex) return null;
+      const remaining = () => Number.isFinite(deadline)
+        ? Math.max(0, Math.floor(deadline - performance.now()))
+        : 15_000;
+      const syncPath = this.#syncInputPath(cur, file);
+      cur.forwardSyncCache ??= new Map();
+      const inputs = Array.from({ length: lastLine - firstLine + 1 }, (_, index) => {
+        const line = firstLine + index;
+        const column = index === 0 ? firstColumn : 1;
+        return `${line}:${column}:${syncPath}`;
+      });
+      if (inputs.every((input) => cur.forwardSyncCache.has(input))) {
+        const cached = await Promise.all(inputs.map((input) => this.forwardSyncAll({
+          file,
+          line: Number(input.slice(0, input.indexOf(':'))),
+          column: input === inputs[0] ? firstColumn : 1,
+          id: cur.id,
+          deadline,
+          strict: true,
+        })));
+        if (cached.every((group) => Array.isArray(group))) return cached;
+        if (remaining() <= 0) return null;
+      }
+      const helperBudget = Math.min(5_000, remaining());
+      let groups = helperBudget > 0 ? await querySyncTeXRange({
+        workDir: this.workDir,
+        pdf: cur.pdf,
+        file: syncPath,
+        firstLine,
+        lastLine,
+        firstColumn,
+        timeoutMs: helperBudget,
+        run: (cmd, args, opts) => this.#exec(cmd, args, opts),
+      }) : null;
+      if (groups) {
+        const pages = [...new Set(groups.flat().map((item) => item.page))];
+        const transforms = new Map();
+        await Promise.all(pages.map(async (pageNumber) => {
+          transforms.set(pageNumber, await this.#syncContentTransform(cur, pageNumber));
+        }));
+        let transformIncomplete = false;
+        groups = groups.map((items) => items.map((item) => {
+          const contentTransform = transforms.get(item.page);
+          if (contentTransform == null) {
+            transformIncomplete = true;
+            return null;
+          }
+          return syncTeXResultToDisplayed(
+            item,
+            cur.papers?.[item.page - 1] ?? null,
+            contentTransform ?? IDENTITY_AFFINE
+          );
+        }));
+        if (transformIncomplete || remaining() <= 0) groups = null;
+      }
+      if (groups) {
+        for (let index = 0; index < groups.length; index++) {
+          const input = inputs[index];
+          if (!cur.forwardSyncCache.has(input)) cur.forwardSyncCache.set(input, Promise.resolve(groups[index]));
+        }
+        while (cur.forwardSyncCache.size > 4096) {
+          cur.forwardSyncCache.delete(cur.forwardSyncCache.keys().next().value);
+        }
+        return groups;
+      }
+
+      const lines = Array.from({ length: lastLine - firstLine + 1 }, (_, index) => firstLine + index);
+      groups = Array(lines.length);
+      let cursor = 0;
+      const workers = Array.from({ length: Math.min(8, lines.length) }, async () => {
+        while (cursor < lines.length) {
+          if (remaining() <= 0) return;
+          const index = cursor++;
+          groups[index] = await this.forwardSyncAll({
+            file,
+            line: lines[index],
+            column: index === 0 ? firstColumn : 1,
+            id: cur.id,
+            deadline,
+            strict: true,
+          });
+        }
+      });
+      await Promise.all(workers);
+      return groups.length === lines.length &&
+        lines.every((_, index) => Array.isArray(groups[index])) ? groups : null;
+    } catch {
+      return null;
     } finally {
       this.#releaseGeneration(cur);
     }
