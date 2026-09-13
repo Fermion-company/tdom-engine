@@ -28,6 +28,10 @@ import {
   dirtyWithoutPatchFallback,
   flattenCompleteAnchorCandidateGroups,
   planTerminalCanonicalAnchor,
+  canonicalAnchorClientEditTimestamp,
+  classifyChildInputMutation,
+  isOwnAutosavePlainInput,
+  removedOverlayPlainTextDelta,
   singlePlainTextDelta,
   warmCanonicalProofOutcome,
 } from './engine/checkpoint/canonical-anchor.js';
@@ -647,20 +651,40 @@ function isRealPathInside(root, candidate) {
 }
 
 function ownAutosaveOfEdit(readPath, file, diskBytes, requestedText, clientEditAtEpochMs) {
-  if (readPath !== file || diskBytes !== requestedText) return false;
-  const editedAt = Number(clientEditAtEpochMs);
-  if (!Number.isFinite(editedAt)) return false;
-  try { return statSync(file).mtimeMs >= editedAt; } catch { return false; }
+  let diskMtimeMs;
+  try { diskMtimeMs = statSync(file).mtimeMs; } catch { return false; }
+  return isOwnAutosavePlainInput({
+    readPathIsLogical: readPath === file,
+    diskText: diskBytes,
+    requestedText,
+    diskMtimeMs,
+    clientEditAtEpochMs,
+  });
 }
 
-function childAnchorEditBeforeOverlay(context, body, source, rootChanged) {
-  const overlays = Array.isArray(body?.overlays) ? body.overlays : [];
-  const removals = Array.isArray(body?.removeOverlays) ? body.removeOverlays : [];
-  if (rootChanged || overlays.length !== 1 || removals.length !== 0) return null;
-  const item = overlays[0];
-  const file = typeof item?.filePath === 'string' ? path.resolve(item.filePath) : null;
-  if (!file || typeof item?.text !== 'string' || !isPathInside(context.docDir, file) ||
-      file === path.resolve(context.filePath) || path.extname(file).toLowerCase() !== '.tex') return null;
+function childAnchorEditBeforeOverlay(
+  context,
+  body,
+  source,
+  rootChanged,
+  clientEditAtEpochMs,
+  diagnostics = null
+) {
+  const reject = (reason) => {
+    if (diagnostics) diagnostics.reason = reason;
+    return null;
+  };
+  const classified = classifyChildInputMutation({
+    rootChanged,
+    overlays: body?.overlays,
+    removeOverlays: body?.removeOverlays,
+  });
+  if (!classified.mutation) return reject(classified.reason);
+  const mutation = classified.mutation;
+  if (diagnostics) diagnostics.inputTransition = mutation.kind;
+  const file = path.resolve(mutation.filePath);
+  if (!isPathInside(context.docDir, file) || file === path.resolve(context.filePath) ||
+      path.extname(file).toLowerCase() !== '.tex') return reject('child-input-path');
   const readProof = singleLiteralChildReadProof({
     source,
     sourceFile: context.filePath,
@@ -670,30 +694,82 @@ function childAnchorEditBeforeOverlay(context, body, source, rootChanged) {
     inputEpoch: engine.canonical.inputEpoch,
   });
   if (!readProof || readProof.source !== source ||
-      readProof.inputEpoch !== engine.canonical.inputEpoch) return null;
+      readProof.inputEpoch !== engine.canonical.inputEpoch) return reject('child-read-proof');
   const prior = engine.includes.get(file);
   const readPath = typeof prior?.readPath === 'string' ? path.resolve(prior.readPath) : null;
-  if (!readPath || typeof prior?.text !== 'string') return null;
+  if (!readPath || typeof prior?.text !== 'string') return reject('child-prior-input');
   const logicalRelative = path.relative(context.docDir, file);
   const expectedOverlay = context.overlayDir
     ? path.resolve(context.overlayDir, logicalRelative)
     : null;
-  if (!isRealPathInside(context.docDir, file)) return null;
+  if (diagnostics) {
+    diagnostics.readPathRole = readPath === file
+      ? 'logical'
+      : readPath === expectedOverlay ? 'overlay' : 'other';
+  }
+  if (!isRealPathInside(context.docDir, file)) return reject('child-input-realpath');
   const safeReadPath = readPath === file
     ? true
     : Boolean(expectedOverlay && readPath === expectedOverlay &&
       isRealPathInside(context.overlayDir, readPath));
-  if (!safeReadPath || !existsSync(readPath)) return null;
+  if (!safeReadPath || !existsSync(readPath)) return reject('child-read-path');
   let diskBytes;
-  try { diskBytes = readFileSync(readPath, 'utf8'); } catch { return null; }
+  try { diskBytes = readFileSync(readPath, 'utf8'); } catch { return reject('child-prior-unreadable'); }
+  if (mutation.kind === 'remove-overlay') {
+    // The app serializes only dirty buffers. If autosave wins the 80ms push
+    // race, the new child bytes are on disk and the request removes the old
+    // overlay instead of carrying a replacement overlay. Freeze the exact
+    // previous overlay/read witness before applyProjectOverlays removes it.
+    if (!expectedOverlay || readPath !== expectedOverlay) {
+      return reject('child-removal-read-path');
+    }
+    let nextDiskText;
+    let beforeStat;
+    let afterStat;
+    try {
+      beforeStat = statSync(file);
+      nextDiskText = readFileSync(file, 'utf8');
+      afterStat = statSync(file);
+    } catch {
+      return reject('child-removal-disk-unreadable');
+    }
+    if (beforeStat.dev !== afterStat.dev || beforeStat.ino !== afterStat.ino ||
+        beforeStat.size !== afterStat.size || beforeStat.mtimeMs !== afterStat.mtimeMs) {
+      return reject('child-removal-disk-raced');
+    }
+    const checked = removedOverlayPlainTextDelta({
+      priorText: prior.text,
+      activeOverlayText: context.overlays.get(file),
+      priorReadText: diskBytes,
+      diskText: nextDiskText,
+      diskMtimeMs: afterStat.mtimeMs,
+      clientEditAtEpochMs,
+    });
+    if (!checked.delta) return reject(checked.reason);
+    return {
+      ...checked.delta,
+      file,
+      canonicalInputPath: readPath,
+      inputTransition: 'remove-overlay',
+      inputText: nextDiskText,
+    };
+  }
   // Autosave may write this edit's own bytes before the edit reaches the
   // engine; the write must postdate the keystroke. Any other bytes are an
   // unobserved change to the witnessed input.
-  if (diskBytes !== prior.text && !ownAutosaveOfEdit(readPath, file, diskBytes, item.text, body?.clientEditAtEpochMs)) {
-    return null;
+  if (diskBytes !== prior.text && !ownAutosaveOfEdit(
+    readPath,
+    file,
+    diskBytes,
+    mutation.text,
+    clientEditAtEpochMs
+  )) {
+    return reject('child-unobserved-input');
   }
-  const delta = singlePlainTextDelta(prior.text, item.text);
-  return delta ? { ...delta, file, canonicalInputPath: readPath } : null;
+  const delta = singlePlainTextDelta(prior.text, mutation.text);
+  return delta
+    ? { ...delta, file, canonicalInputPath: readPath, inputTransition: 'overlay' }
+    : reject('child-not-plain-text');
 }
 
 function ensureProjectOutputDirectories(source) {
@@ -1961,12 +2037,11 @@ const server = http.createServer(async (req, res) => {
       let anchorProofPrefetch = null;
       const anchorDiagnostics = {};
       const anchorAcceptedAt = performance.now();
-      const rawClientEditAt = Number(body.clientEditAtEpochMs);
       const nowEpoch = Date.now();
-      const anchorClientEditAt = Number.isFinite(rawClientEditAt) &&
-        rawClientEditAt >= nowEpoch - 60_000 && rawClientEditAt <= nowEpoch + 1_000
-        ? rawClientEditAt
-        : null;
+      const anchorClientEditAt = canonicalAnchorClientEditTimestamp(
+        body.clientEditAtEpochMs,
+        nowEpoch
+      );
       try {
         lastReport = await withEngine(async () => {
           // optional optimistic-concurrency guard: a client that states the
@@ -1982,8 +2057,15 @@ const server = http.createServer(async (req, res) => {
           const current = engine.getSource();
           const next = current.slice(0, start) + text + current.slice(end);
           const rootChanged = next !== current;
-          const childAnchorEdit = ENABLE_CANONICAL_ANCHOR
-            ? childAnchorEditBeforeOverlay(activeProject, body, current, rootChanged)
+          const childAnchorEdit = ENABLE_CANONICAL_ANCHOR && !rootChanged
+            ? childAnchorEditBeforeOverlay(
+                activeProject,
+                body,
+                current,
+                rootChanged,
+                anchorClientEditAt,
+                anchorDiagnostics
+              )
             : null;
           anchorEdit = rootChanged ? { start, end, text } : childAnchorEdit;
           if (ENABLE_CANONICAL_ANCHOR && anchorEdit) {
@@ -2016,11 +2098,29 @@ const server = http.createServer(async (req, res) => {
             anchorPriorLineage = terminalAnchorLineage;
             terminalAnchorLineage = null;
           }
+          let removalInputMatches = false;
+          if (anchorEdit?.inputTransition === 'remove-overlay') {
+            try { removalInputMatches = readFileSync(anchorEdit.file, 'utf8') === anchorEdit.inputText; }
+            catch { removalInputMatches = false; }
+          }
+          const childInputMatches = Boolean(anchorEdit?.file) && (
+            anchorEdit.inputTransition === 'overlay'
+              ? overlayDelta.changed.length === 1 && overlayDelta.removed.length === 0 &&
+                path.resolve(overlayDelta.changed[0]) === anchorEdit.file
+              : anchorEdit.inputTransition === 'remove-overlay'
+                ? overlayDelta.changed.length === 0 && overlayDelta.removed.length === 1 &&
+                  path.resolve(overlayDelta.removed[0]) === anchorEdit.file && removalInputMatches
+                : false
+          );
+          if (anchorEdit?.inputTransition === 'remove-overlay' && !removalInputMatches) {
+            anchorDiagnostics.reason = 'child-removal-effective-input-changed';
+          } else if (anchorEdit?.file && !childInputMatches) {
+            anchorDiagnostics.reason = 'child-input-apply-mismatch';
+          }
           anchorInputSafe = Boolean(anchorEdit) && (
             rootChanged
               ? changedInputs.length === 0 && !anchorEdit.file
-              : overlayDelta.changed.length === 1 && overlayDelta.removed.length === 0 &&
-                path.resolve(overlayDelta.changed[0]) === anchorEdit.file
+              : childInputMatches
           );
           if (!anchorInputSafe) anchorBaseSnapshot = null;
           if (anchorBaseSnapshot) {
@@ -2147,7 +2247,7 @@ const server = http.createServer(async (req, res) => {
         // Not a state the client acts on: the only record of why this edit
         // waits for the canonical build instead of a certified overlay.
         const planRefusal = anchorDiagnostics.reason;
-        lastReport.canonicalAnchorRefused = !anchorEdit ? 'not-plain-text'
+        lastReport.canonicalAnchorRefused = !anchorEdit ? anchorDiagnostics.reason ?? 'not-plain-text'
           : !anchorInputSafe ? 'input-not-anchorable'
           : lastReport.rebooted === true ? 'rebooted'
           : planRefusal === 'no-base' && baseRefusal ? baseRefusal
@@ -2166,6 +2266,17 @@ const server = http.createServer(async (req, res) => {
         };
       } else if (anchorMutation || lastReport.dirtySourceNodes?.length) {
         terminalAnchorLineage = null;
+      }
+      if (anchorDiagnostics.inputTransition || anchorDiagnostics.reason) {
+        // Bounded provenance only: enough to diagnose overlay lifecycle races
+        // without exposing source text or file names in the report/SSE stream.
+        lastReport.canonicalAnchorInputDiagnostic = {
+          transition: anchorDiagnostics.inputTransition ?? null,
+          readPathRole: anchorDiagnostics.readPathRole ?? null,
+          guardReason: anchorDiagnostics.reason ?? null,
+          acceptedSrcRev: lastReport.srcRev,
+          inputEpoch: engine.canonical.inputEpoch,
+        };
       }
       // one serialization for both consumers: the SSE fanout and the HTTP
       // response used to stringify the full report (all patches) twice

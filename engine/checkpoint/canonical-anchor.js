@@ -65,6 +65,79 @@ export function singlePlainTextDelta(before, after) {
   return { start, end: oldEnd, text };
 }
 
+export function canonicalAnchorClientEditTimestamp(value, nowEpochMs = Date.now()) {
+  if (typeof value !== 'number' || !Number.isFinite(value) ||
+      typeof nowEpochMs !== 'number' || !Number.isFinite(nowEpochMs) ||
+      value < nowEpochMs - 60_000 || value > nowEpochMs + 1_000) return null;
+  return value;
+}
+
+export function isOwnAutosavePlainInput({
+  readPathIsLogical = false,
+  diskText,
+  requestedText,
+  diskMtimeMs,
+  clientEditAtEpochMs,
+} = {}) {
+  return readPathIsLogical === true && diskText === requestedText &&
+    typeof clientEditAtEpochMs === 'number' && Number.isFinite(clientEditAtEpochMs) &&
+    typeof diskMtimeMs === 'number' && Number.isFinite(diskMtimeMs) &&
+    diskMtimeMs >= clientEditAtEpochMs;
+}
+
+/** Classify the one child-input mutation that may be checked for a canonical
+ * anchor. A clean buffer after autosave is represented by one overlay removal,
+ * while a still-dirty buffer is represented by one overlay replacement. */
+export function classifyChildInputMutation({ rootChanged = false, overlays = [], removeOverlays = [] } = {}) {
+  const changed = Array.isArray(overlays) ? overlays : [];
+  const removed = Array.isArray(removeOverlays) ? removeOverlays : [];
+  if (rootChanged) return { mutation: null, reason: 'child-root-changed' };
+  if (changed.length === 1 && removed.length === 0) {
+    const item = changed[0];
+    if (typeof item?.filePath !== 'string' || typeof item?.text !== 'string') {
+      return { mutation: null, reason: 'child-overlay-malformed' };
+    }
+    return { mutation: { kind: 'overlay', filePath: item.filePath, text: item.text }, reason: null };
+  }
+  if (changed.length === 0 && removed.length === 1) {
+    if (typeof removed[0] !== 'string') {
+      return { mutation: null, reason: 'child-removal-malformed' };
+    }
+    return { mutation: { kind: 'remove-overlay', filePath: removed[0] }, reason: null };
+  }
+  return { mutation: null, reason: 'child-input-shape' };
+}
+
+/** Prove the bytes exposed by an autosave/removal are the one plain edit from
+ * the exact active overlay that the resident engine previously read. */
+export function removedOverlayPlainTextDelta({
+  priorText,
+  activeOverlayText,
+  priorReadText,
+  diskText,
+  diskMtimeMs,
+  clientEditAtEpochMs,
+} = {}) {
+  if (typeof priorText !== 'string' || typeof activeOverlayText !== 'string' ||
+      activeOverlayText !== priorText) {
+    return { delta: null, reason: 'child-removal-prior-mismatch' };
+  }
+  if (typeof priorReadText !== 'string' || priorReadText !== priorText) {
+    return { delta: null, reason: 'child-removal-prior-bytes' };
+  }
+  if (typeof diskText !== 'string') {
+    return { delta: null, reason: 'child-removal-disk-unreadable' };
+  }
+  if (!Number.isFinite(clientEditAtEpochMs) || !Number.isFinite(diskMtimeMs) ||
+      diskMtimeMs < clientEditAtEpochMs) {
+    return { delta: null, reason: 'child-removal-stale-autosave' };
+  }
+  const delta = singlePlainTextDelta(priorText, diskText);
+  return delta
+    ? { delta, reason: null }
+    : { delta: null, reason: 'child-removal-not-plain-text' };
+}
+
 /** Freeze the pre-edit resident witness while that exact source is still the
  * canonical generation. The server calls this inside its serialized edit
  * critical section, before engine.edit() can replace the galley. */

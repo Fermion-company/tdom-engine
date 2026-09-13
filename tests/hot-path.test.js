@@ -33,10 +33,14 @@ import { classifyResidentEdit } from '../engine/checkpoint/resident-edit-admissi
 import { plainPreviewWitness, canDeferPlainVerification } from '../engine/checkpoint/plain-preview.js';
 import {
   buildTerminalCanonicalPatch,
+  canonicalAnchorClientEditTimestamp,
   captureCanonicalAnchorBase,
+  classifyChildInputMutation,
   flattenCompleteAnchorCandidateGroups,
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
+  isOwnAutosavePlainInput,
+  removedOverlayPlainTextDelta,
   singlePlainTextDelta,
   warmCanonicalProofOutcome,
 } from '../engine/checkpoint/canonical-anchor.js';
@@ -920,6 +924,111 @@ test('child anchor read proof rejects aliases and untracked project readers', ()
   }), null, 'a second alias to the same child is ambiguous');
 });
 
+test('a saved child overlay removal retains only one proven plain edit', () => {
+  const child = path.resolve('/project/content/chapter.tex');
+  const before = 'Alpha reference prose';
+  const edited = 'Alpha evidence prose';
+  const overlay = { filePath: child, text: edited };
+  assert.deepEqual(classifyChildInputMutation({ overlays: [overlay] }), {
+    mutation: { kind: 'overlay', filePath: child, text: edited },
+    reason: null,
+  });
+  const removed = classifyChildInputMutation({ removeOverlays: [child] });
+  assert.deepEqual(removed, {
+    mutation: { kind: 'remove-overlay', filePath: child },
+    reason: null,
+  });
+  const now = 10_000_000;
+  assert.equal(canonicalAnchorClientEditTimestamp(now - 500, now), now - 500);
+  assert.equal(canonicalAnchorClientEditTimestamp(null, now), null,
+    'a missing timestamp is never coerced to the Unix epoch');
+  assert.equal(canonicalAnchorClientEditTimestamp(now - 60_001, now), null,
+    'an old client timestamp cannot authorize an autosave exception');
+  assert.equal(canonicalAnchorClientEditTimestamp(now + 1_001, now), null,
+    'a future client timestamp cannot authorize an autosave exception');
+  assert.equal(isOwnAutosavePlainInput({
+    readPathIsLogical: true,
+    diskText: edited,
+    requestedText: edited,
+    diskMtimeMs: now,
+    clientEditAtEpochMs: null,
+  }), false, 'the existing-overlay autosave exception requires an explicit finite timestamp');
+  assert.equal(isOwnAutosavePlainInput({
+    readPathIsLogical: true,
+    diskText: edited,
+    requestedText: edited,
+    diskMtimeMs: now,
+    clientEditAtEpochMs: now - 500,
+  }), true, 'the existing-overlay exception accepts matching bytes saved after the edit');
+  assert.deepEqual(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: before,
+    priorReadText: before,
+    diskText: edited,
+    diskMtimeMs: 1_010,
+    clientEditAtEpochMs: 1_000,
+  }), {
+    delta: singlePlainTextDelta(before, edited),
+    reason: null,
+  });
+
+  // Returning to the canonical base and redoing the same replacement are
+  // both ordinary plain deltas; lineage decides which frozen base to reuse.
+  assert.ok(removedOverlayPlainTextDelta({
+    priorText: edited,
+    activeOverlayText: edited,
+    priorReadText: edited,
+    diskText: before,
+    diskMtimeMs: 2_010,
+    clientEditAtEpochMs: 2_000,
+  }).delta);
+  assert.ok(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: before,
+    priorReadText: before,
+    diskText: edited,
+    diskMtimeMs: 3_010,
+    clientEditAtEpochMs: 3_000,
+  }).delta);
+
+  assert.equal(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: before,
+    priorReadText: before,
+    diskText: String.raw`Alpha \\write evidence`,
+    diskMtimeMs: 1_010,
+    clientEditAtEpochMs: 1_000,
+  }).delta, null, 'unsafe TeX is not a plain anchor edit');
+  assert.equal(classifyChildInputMutation({ removeOverlays: [child, '/project/other.tex'] }).mutation, null,
+    'multiple removals are never one witnessed child edit');
+  assert.equal(classifyChildInputMutation({ rootChanged: true, removeOverlays: [child] }).mutation, null,
+    'a root edit cannot be combined with a child removal anchor');
+  assert.equal(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: before,
+    priorReadText: before,
+    diskText: edited,
+    diskMtimeMs: 999,
+    clientEditAtEpochMs: 1_000,
+  }).delta, null, 'disk bytes older than the keystroke are rejected');
+  assert.equal(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: 'other prior bytes',
+    priorReadText: before,
+    diskText: edited,
+    diskMtimeMs: 1_010,
+    clientEditAtEpochMs: 1_000,
+  }).delta, null, 'the removed overlay must equal the resident prior input');
+  assert.equal(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: before,
+    priorReadText: 'stale physical overlay bytes',
+    diskText: edited,
+    diskMtimeMs: 1_010,
+    clientEditAtEpochMs: 1_000,
+  }).delta, null, 'the physical pre-removal input must equal the resident prior bytes');
+});
+
 test('one wholly-owned child prose edit keeps a frozen canonical input lineage', () => {
   const child = path.resolve('/project/content/chapter.tex');
   const diskInput = path.resolve('/project/content/chapter.tex');
@@ -967,7 +1076,7 @@ test('one wholly-owned child prose edit keeps a frozen canonical input lineage',
   const current = (text) => ({
     ...oldBlock, end: text.length, text,
     editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length }],
-    galley: galley(text.endsWith('B') ? 'Bravo' : 'Charlie'),
+    galley: galley(text.endsWith('B') ? 'Bravo' : text.endsWith('C') ? 'Charlie' : 'Alpha'),
   });
   const firstPlan = planTerminalCanonicalAnchor({
     blocks: [current('Alpha prose B')], domBlocks: [dom], report: report(11, 'Bravo'),
@@ -988,6 +1097,37 @@ test('one wholly-owned child prose edit keeps a frozen canonical input lineage',
   assert.equal(secondPlan?.baseSnapshot, baseSnapshot,
     'rapid B→C continues from immutable A rather than treating B as canonical');
   assert.equal(secondPlan?.baseSnapshot.canonicalInputPath, diskInput);
+
+  const restoredEdit = {
+    ...singlePlainTextDelta('Alpha prose B', 'Alpha prose'),
+    file: child,
+    inputTransition: 'remove-overlay',
+  };
+  const restoredPlan = planTerminalCanonicalAnchor({
+    blocks: [current('Alpha prose')], domBlocks: [dom], report: report(12, 'Alpha'),
+    geometry: { textheight: 680 }, edit: restoredEdit, inputEpoch: 6,
+    lineage: {
+      blockId: firstPlan.blockId, baseGeneration: firstPlan.baseGeneration,
+      baseRev: firstPlan.baseRev, lastSrcRev: firstPlan.srcRev, baseSnapshot,
+      changedLines: firstPlan.changedLines,
+    },
+  });
+  assert.ok(restoredPlan, 'autosave/removal can restore the exact frozen child base');
+  const redoEdit = {
+    ...singlePlainTextDelta('Alpha prose', 'Alpha prose B'),
+    file: child,
+    inputTransition: 'remove-overlay',
+  };
+  const redoPlan = planTerminalCanonicalAnchor({
+    blocks: [current('Alpha prose B')], domBlocks: [dom], report: report(13, 'Bravo'),
+    geometry: { textheight: 680 }, edit: redoEdit, inputEpoch: 7,
+    lineage: {
+      blockId: restoredPlan.blockId, baseGeneration: restoredPlan.baseGeneration,
+      baseRev: restoredPlan.baseRev, lastSrcRev: restoredPlan.srcRev, baseSnapshot,
+      changedLines: restoredPlan.changedLines,
+    },
+  });
+  assert.ok(redoPlan, 'redo after an exact-base removal keeps the same child lineage');
 
   assert.equal(captureCanonicalAnchorBase({
     blocks: [oldBlock, { ...oldBlock, id: 'duplicate-instance' }],
