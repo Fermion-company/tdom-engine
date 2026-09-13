@@ -33,6 +33,7 @@ import {
 } from './engine/checkpoint/canonical-anchor.js';
 import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
 import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read-proof.js';
+import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
 import { watchInclude } from './engine/checkpoint/include-expander.js';
 import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
 
@@ -1031,6 +1032,34 @@ function projectInputOverride(file) {
   return activeProject.overlays.get(resolved) ?? activeProject.savedOverlays?.get(resolved) ?? null;
 }
 
+function contextProjectPath(context, file) {
+  const resolved = path.resolve(file);
+  try {
+    const realRoot = realpathSync(context.docDir);
+    const realFile = realpathSync(resolved);
+    if (isPathInside(realRoot, realFile)) return path.join(context.docDir, path.relative(realRoot, realFile));
+  } catch { /* fall back to the path recorded by Build */ }
+  return resolved;
+}
+
+function contextInputOverride(context, file) {
+  const resolved = contextProjectPath(context, file);
+  return context.overlays.get(resolved) ?? context.savedOverlays?.get(resolved) ?? null;
+}
+
+function canonicalImportLogicalPath(context, file) {
+  const resolved = contextProjectPath(context, file);
+  if (resolved === path.resolve(context.filePath)) return path.join(engine.canonical.workDir, 'canon.tex');
+  const overlay = context.overlayDir && path.join(context.overlayDir, path.relative(context.docDir, resolved));
+  return overlay && existsSync(overlay) ? overlay : resolved;
+}
+
+function currentCanonicalIdentityMatches(identity) {
+  if (!identity || identity.documentEpoch !== documentEpoch || identity.srcRev !== engine.srcRev) return false;
+  const current = engine.canonical.compilationIdentity(engine.getSource());
+  return identity.inputEpoch === current.inputEpoch && identity.srcHash === current.srcHash;
+}
+
 function bibliographySourceLocation(generatedText, generatedLine = null) {
   const lines = String(generatedText || '').split(/\r?\n/);
   const limit = Number.isFinite(generatedLine)
@@ -1409,6 +1438,78 @@ const server = http.createServer(async (req, res) => {
       }
       const result = engine.canonical.releaseBuildLease(body.requestId, body.token);
       return json(res, { ok: result.released, ...result }, result.released ? 200 : 409);
+    }
+    if (req.method === 'POST' && url.pathname === '/canonical/build-lease/renew') {
+      const body = JSON.parse(await readBody(req));
+      const ttlMs = body?.ttlMs == null ? undefined : Number(body.ttlMs);
+      if (typeof body?.requestId !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(body.requestId) ||
+          typeof body?.token !== 'string' || !/^[0-9a-f-]{36}$/i.test(body.token) ||
+          ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs < 1_000 || ttlMs > 900_000)) {
+        return json(res, { error: 'invalid build lease renewal' }, 400);
+      }
+      const result = engine.canonical.renewBuildLease(body.requestId, body.token, ttlMs);
+      return json(res, { ok: result.renewed, ...result }, result.renewed ? 200 : 409);
+    }
+    if (req.method === 'POST' && url.pathname === '/canonical/build-import') {
+      const body = JSON.parse(await readBody(req));
+      const candidate = body?.canonicalBuild;
+      if (!candidate || !engine.canonical.ownsBuildLease(candidate.requestId, candidate.token)) {
+        return json(res, { ok: false, adopted: false, reason: 'build-lease-mismatch' }, 409);
+      }
+      if (!currentCanonicalIdentityMatches(body.identity)) {
+        return json(res, { ok: false, adopted: false, reason: 'source-identity-changed' }, 409);
+      }
+      const result = await withEngine(async () => {
+        if (!engine.canonical.ownsBuildLease(candidate.requestId, candidate.token) ||
+            !currentCanonicalIdentityMatches(body.identity)) {
+          return { ok: false, adopted: false, reason: 'source-identity-changed' };
+        }
+        const source = engine.getSource();
+        const rev = engine.srcRev;
+        const validation = await validateCanonicalBuildImport({
+          candidate,
+          projectRoot: activeProject.docDir,
+          mainFile: activeProject.file,
+          source,
+          effectiveProjectInput: (file) => projectInputOverride(file),
+        });
+        if (!validation.accepted) return { ok: false, adopted: false, reason: validation.reason };
+        let prepared = null;
+        try {
+          prepared = await engine.canonical.prepareBuildGeneration({
+            ...validation,
+            source,
+            rev,
+            inputEpoch: engine.canonical.inputEpoch,
+            syncInputMap: validation.syncInputMap.map((entry) => ({
+              logicalPath: canonicalImportLogicalPath(activeProject, entry.logicalPath),
+              recordedPath: entry.recordedPath,
+            })),
+          });
+          if (!currentCanonicalIdentityMatches(body.identity) || engine.getSource() !== source || engine.srcRev !== rev) {
+            return { ok: false, adopted: false, reason: 'source-identity-changed' };
+          }
+          // An active document may already have a matching canonical result
+          // and therefore no pending job. Create the exact current job while
+          // the owner lease still holds every full canonical start.
+          engine.canonical.schedule(source, rev);
+          const generation = await engine.canonical.commitBuildGeneration(prepared, source, rev);
+          prepared = null;
+          return {
+            ok: true,
+            adopted: true,
+            id: generation.id,
+            rev: generation.rev,
+            assumptions: validation.assumptions,
+            canonical: engine.canonical.info(),
+          };
+        } catch (error) {
+          return { ok: false, adopted: false, reason: String(error?.message || error) };
+        } finally {
+          engine.canonical.dropPreparedBuildGeneration(prepared);
+        }
+      });
+      return json(res, result, result.ok ? 200 : 409);
     }
     if (req.method === 'POST' && url.pathname === '/canonical/display-demand') {
       const body = JSON.parse(await readBody(req));
@@ -2120,11 +2221,18 @@ const server = http.createServer(async (req, res) => {
         docDir,
         overlays: body.overlays,
         removeOverlays: body.removeOverlays,
+        canonicalBuild: body.canonicalBuild,
       });
       let payload;
       try {
         payload = await openRequests.run(openRequestId, identity, () => withEngine(async () => {
-          await engine.canonical.waitForBuildLease();
+          const requestedImport = body.canonicalBuild ?? null;
+          if (requestedImport && !engine.canonical.ownsBuildLease(requestedImport.requestId, requestedImport.token)) {
+            const error = new Error('canonical Build import does not own the active Build lease');
+            error.code = 'BUILD_IMPORT_LEASE_MISMATCH';
+            throw error;
+          }
+          if (!requestedImport) await engine.canonical.waitForBuildLease();
           const resetEpoch = beginDocumentReset('open');
           applyProjectOverlays(context, body, true);
           await engine.setDocumentContext({
@@ -2135,15 +2243,88 @@ const server = http.createServer(async (req, res) => {
           activeProject = context;
           ensureProjectOutputDirectories(text);
           await materializeProjectBibliography(text, activeProject);
-          lastReport = await engine.open(text, context.file);
+          let preparedImport = null;
+          let importStatus = requestedImport ? { requested: true, adopted: false, reason: 'not-prepared' } : null;
+          const expectedSrcRev = engine.srcRev + 1;
+          if (requestedImport) {
+            const validation = await validateCanonicalBuildImport({
+              candidate: requestedImport,
+              projectRoot: context.docDir,
+              mainFile: context.file,
+              source: text,
+              effectiveProjectInput: (file) => contextInputOverride(context, file),
+            });
+            if (validation.accepted) {
+              const syncInputMap = validation.syncInputMap.map((entry) => ({
+                logicalPath: canonicalImportLogicalPath(context, entry.logicalPath),
+                recordedPath: entry.recordedPath,
+              }));
+              try {
+                preparedImport = await engine.canonical.prepareBuildGeneration({
+                  ...validation,
+                  source: text,
+                  rev: expectedSrcRev,
+                  inputEpoch: engine.canonical.inputEpoch,
+                  syncInputMap,
+                });
+                importStatus = {
+                  requested: true,
+                  adopted: false,
+                  reason: 'prepared',
+                  assumptions: validation.assumptions,
+                };
+              } catch (error) {
+                importStatus = {
+                  requested: true,
+                  adopted: false,
+                  reason: `prepare-failed: ${String(error?.message || error)}`,
+                };
+              }
+            } else {
+              importStatus = { requested: true, adopted: false, reason: validation.reason };
+            }
+          }
+          let openCompleted = false;
+          try {
+            lastReport = await engine.open(text, context.file);
+            openCompleted = true;
+            if (preparedImport) {
+              if (engine.srcRev !== expectedSrcRev || engine.getSource() !== text ||
+                  engine.canonical.inputEpoch !== preparedImport.inputEpoch) {
+                throw new Error('Build import source changed during open');
+              }
+              const adopted = await engine.canonical.commitBuildGeneration(preparedImport, text, expectedSrcRev);
+              preparedImport = null;
+              importStatus = {
+                requested: true,
+                adopted: true,
+                reason: null,
+                id: adopted.id,
+                rev: adopted.rev,
+                assumptions: importStatus.assumptions,
+              };
+              lastReport.canonical = engine.canonical.info();
+            }
+          } catch (error) {
+            if (preparedImport && openCompleted) {
+              importStatus = { requested: true, adopted: false, reason: String(error?.message || error) };
+            } else {
+              throw error;
+            }
+          } finally {
+            engine.canonical.dropPreparedBuildGeneration(preparedImport);
+          }
           // Keep the previous exact document intact while the new root boots,
           // then capture one complete, already-adoptable response before the
           // next queued open can reset it again.
           completeDocumentReset(resetEpoch);
-          return JSON.stringify(docPayload());
+          return JSON.stringify({ ...docPayload(), canonicalBuild: importStatus });
         }));
       } catch (error) {
         if (error?.code === 'OPEN_REQUEST_ID_CONFLICT') {
+          return json(res, { error: error.message }, 409);
+        }
+        if (error?.code === 'BUILD_IMPORT_LEASE_MISMATCH') {
           return json(res, { error: error.message }, 409);
         }
         throw error;

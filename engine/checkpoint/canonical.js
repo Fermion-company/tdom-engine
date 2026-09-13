@@ -22,7 +22,7 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
-import { readFile } from 'node:fs/promises';
+import { copyFile, readFile } from 'node:fs/promises';
 import { gunzip } from 'node:zlib';
 import {
   mkdirSync,
@@ -32,6 +32,7 @@ import {
   existsSync,
   rmSync,
   copyFileSync,
+  renameSync,
   realpathSync,
 } from 'node:fs';
 import path from 'node:path';
@@ -95,6 +96,10 @@ export class CanonicalRenderer {
     this.timerDueAt = 0;
     this.running = null; // in-flight compile promise
     this.runningJob = null; // revision/input ownership for display demand
+    // Invalidates a compile which was already running when an exact normal
+    // Build generation was adopted. A stopped TeX child can otherwise resume
+    // after the Build lease and publish older pixels over the adopted result.
+    this.compileEpoch = 0;
     this.pendingJob = null; // {source, rev} superseding the in-flight compile
     this.displayDemand = null; // {rev, inputEpoch}, only for existing work
     this.displayDemandEpoch = null; // viewer document epoch for demand ownership
@@ -188,6 +193,20 @@ export class CanonicalRenderer {
     return { inputEpoch: this.inputEpoch, srcHash: this.#sourceHash(source) };
   }
 
+  ownsBuildLease(requestId, token) {
+    return Boolean(this.buildLease && this.buildLease.requestId === requestId && this.buildLease.token === token);
+  }
+
+  #syncInputPath(generation, file) {
+    const resolved = path.resolve(file);
+    return generation?.syncInputMap?.get(resolved) ?? resolved;
+  }
+
+  #logicalInputPath(generation, file) {
+    const resolved = path.resolve(file);
+    return generation?.syncOutputMap?.get(resolved) ?? resolved;
+  }
+
   #resolveGeneration(id = null) {
     if (this.disposed || this.resetting) return null;
     if (id == null) return this.last;
@@ -273,7 +292,8 @@ export class CanonicalRenderer {
   #removeWorkArtifacts() {
     for (const name of readFileNames(this.workDir)) {
       if (/^canon(?:-\d+)?\.(?:aux|bbl|bcf|blg|log|lof|lot|out|pdf|run\.xml|svg|synctex\.gz|tex|toc)$/.test(name) ||
-          /^canon-\d+-p\d+(?:-\d+)?\.svg$/.test(name)) {
+          /^canon-\d+-p\d+(?:-\d+)?\.svg$/.test(name) ||
+          /^canon-import-[0-9a-f-]+\.(?:pdf|synctex\.gz)$/.test(name)) {
         rmSync(path.join(this.workDir, name), { force: true });
       }
     }
@@ -444,6 +464,19 @@ export class CanonicalRenderer {
     return this.#releaseBuildLease(requestId, token, 'released');
   }
 
+  renewBuildLease(requestId, token, ttlMs = BUILD_LEASE_DEFAULT_MS) {
+    if (!this.ownsBuildLease(requestId, token)) return { renewed: false, reason: 'lease-mismatch' };
+    const duration = Math.min(BUILD_LEASE_MAX_MS, Math.max(1_000, Number(ttlMs) || BUILD_LEASE_DEFAULT_MS));
+    clearTimeout(this.buildLease.timer);
+    this.buildLease.expiresAt = Date.now() + duration;
+    this.buildLease.timer = setTimeout(
+      () => this.#releaseBuildLease(requestId, token, 'expired'),
+      duration
+    );
+    this.buildLease.timer.unref?.();
+    return { renewed: true, requestId, token, expiresAt: this.buildLease.expiresAt };
+  }
+
   #releaseBuildLease(requestId, token, reason) {
     const lease = this.buildLease;
     if (!lease) {
@@ -471,6 +504,211 @@ export class CanonicalRenderer {
     while (this.buildLease) {
       await new Promise((resolve) => this.buildLeaseWaiters.add(resolve));
     }
+  }
+
+  async prepareBuildGeneration({
+    requestId,
+    token,
+    source,
+    rev,
+    inputEpoch = this.inputEpoch,
+    pdf,
+    pdfHash,
+    synctex,
+    synctexHash,
+    seedFiles = {},
+    syncInputMap = [],
+    profile = null,
+    passes = 0,
+    ms = 0,
+  } = {}) {
+    if (!this.ownsBuildLease(requestId, token) || this.disposed || this.resetting ||
+        typeof source !== 'string' || !Number.isSafeInteger(rev) || rev < 0 ||
+        inputEpoch !== this.inputEpoch || typeof pdf !== 'string' || typeof synctex !== 'string' ||
+        !/^[0-9a-f]{64}$/i.test(pdfHash || '') || !/^[0-9a-f]{64}$/i.test(synctexHash || '')) {
+      throw new Error('invalid Build generation');
+    }
+    const inputEntries = Array.isArray(syncInputMap) ? syncInputMap : [];
+    if (!inputEntries.length || inputEntries.length > 4096) throw new Error('invalid Build SyncTeX input map');
+    const inputMap = new Map();
+    const outputMap = new Map();
+    for (const entry of inputEntries) {
+      if (typeof entry?.logicalPath !== 'string' || !path.isAbsolute(entry.logicalPath) ||
+          typeof entry?.recordedPath !== 'string' || !path.isAbsolute(entry.recordedPath)) {
+        throw new Error('invalid Build SyncTeX input path');
+      }
+      const logical = path.resolve(entry.logicalPath);
+      const recorded = path.resolve(entry.recordedPath);
+      if (inputMap.has(logical) && inputMap.get(logical) !== recorded ||
+          outputMap.has(recorded) && outputMap.get(recorded) !== logical) {
+        throw new Error('ambiguous Build SyncTeX input map');
+      }
+      inputMap.set(logical, recorded);
+      outputMap.set(recorded, logical);
+    }
+    const allowedSeeds = {};
+    let seedBytes = 0;
+    for (const [ext, content] of Object.entries(seedFiles ?? {})) {
+      if (!['aux', 'toc', 'lof', 'lot', 'out'].includes(ext) || typeof content !== 'string') continue;
+      seedBytes += Buffer.byteLength(content);
+      if (seedBytes > 32 * 1024 * 1024) throw new Error('Build aux seed limit exceeded');
+      allowedSeeds[ext] = content;
+    }
+    const importId = randomUUID();
+    const keptPdf = path.join(this.workDir, `canon-import-${importId}.pdf`);
+    const keptSynctex = path.join(this.workDir, `canon-import-${importId}.synctex.gz`);
+    try {
+      const [sourcePdfHash, sourceSynctexHash] = await Promise.all([
+        sha256FileAsync(pdf),
+        sha256FileAsync(synctex),
+      ]);
+      if (sourcePdfHash !== pdfHash.toLowerCase() || sourceSynctexHash !== synctexHash.toLowerCase()) {
+        throw new Error('Build artifact hash mismatch');
+      }
+      await Promise.all([copyFile(pdf, keptPdf), copyFile(synctex, keptSynctex)]);
+      const [copiedPdfHash, copiedSynctexHash] = await Promise.all([
+        sha256FileAsync(keptPdf),
+        sha256FileAsync(keptSynctex),
+      ]);
+      if (copiedPdfHash !== sourcePdfHash || copiedSynctexHash !== sourceSynctexHash) {
+        throw new Error('Build artifact changed while copying');
+      }
+      const info = await this.#exec('pdfinfo', [keptPdf], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+      if (!/^(?:Creator|Producer):.*LuaTeX/im.test(info.stdout || '')) {
+        throw new Error('Build PDF was not produced by LuaTeX');
+      }
+      const pageCount = pdfInfoPageCount(info.stdout || '');
+      if (!pageCount) throw new Error('Build PDF has no pages');
+      const papers = await pageGeometries(
+        keptPdf,
+        pageCount,
+        (cmd, args, opts) => this.#exec(cmd, args, opts)
+      );
+      if (papers.length !== pageCount || papers.some((paper) => !paper)) {
+        throw new Error('Build PDF geometry is incomplete');
+      }
+      if (!this.ownsBuildLease(requestId, token) || this.disposed || this.resetting ||
+          inputEpoch !== this.inputEpoch) throw new Error('stale Build generation');
+      return {
+        requestId,
+        token,
+        sourceHash: this.#sourceHash(source, inputEpoch),
+        rev,
+        inputEpoch,
+        pdf: keptPdf,
+        synctex: keptSynctex,
+        pdfHash: copiedPdfHash,
+        synctexHash: copiedSynctexHash,
+        pageCount,
+        papers,
+        seedFiles: allowedSeeds,
+        syncInputMap: inputMap,
+        syncOutputMap: outputMap,
+        profile: profile ? structuredClone(profile) : null,
+        passes: Number.isSafeInteger(passes) && passes >= 0 ? passes : 0,
+        ms: Number.isFinite(ms) && ms >= 0 ? Math.round(ms) : 0,
+      };
+    } catch (error) {
+      rmSync(keptPdf, { force: true });
+      rmSync(keptSynctex, { force: true });
+      throw error;
+    }
+  }
+
+  async commitBuildGeneration(prepared, source, rev) {
+    if (!prepared || !this.ownsBuildLease(prepared.requestId, prepared.token) ||
+        this.disposed || this.resetting || typeof source !== 'string' || rev !== prepared.rev ||
+        prepared.inputEpoch !== this.inputEpoch || prepared.sourceHash !== this.#sourceHash(source, prepared.inputEpoch)) {
+      throw new Error('stale Build generation');
+    }
+    const job = this.pendingJob;
+    if (!job || job.rev !== rev || job.inputEpoch !== prepared.inputEpoch ||
+        this.#sourceHash(job.source, job.inputEpoch) !== prepared.sourceHash) {
+      throw new Error('Build generation does not own the pending source');
+    }
+    // A Build lease may have stopped a canonical TeX process which began
+    // before the lease was acquired. Supersede and settle that exact process
+    // before publication. Its catch path is epoch-gated below, so neither a
+    // late success nor a timeout may replace/requeue the adopted generation.
+    const superseded = this.running;
+    this.compileEpoch++;
+    if (superseded) {
+      for (const child of this.authorityChildren) {
+        try {
+          if (child.pid) {
+            try { process.kill(-child.pid, 'SIGKILL'); }
+            catch { child.kill('SIGKILL'); }
+          }
+        } catch { /* already gone */ }
+      }
+      for (const child of this.buildHeavyChildren) {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }
+      await superseded.catch(() => {});
+    }
+    if (!this.ownsBuildLease(prepared.requestId, prepared.token) ||
+        this.disposed || this.resetting || rev !== prepared.rev ||
+        prepared.inputEpoch !== this.inputEpoch ||
+        prepared.sourceHash !== this.#sourceHash(source, prepared.inputEpoch)) {
+      throw new Error('stale Build generation');
+    }
+    const currentJob = this.pendingJob;
+    if (!currentJob || currentJob.rev !== rev || currentJob.inputEpoch !== prepared.inputEpoch ||
+        this.#sourceHash(currentJob.source, currentJob.inputEpoch) !== prepared.sourceHash) {
+      throw new Error('Build generation does not own the pending source');
+    }
+    const id = ++this.idSeq;
+    const keptPdf = path.join(this.workDir, `canon-${id}.pdf`);
+    const keptSynctex = path.join(this.workDir, `canon-${id}.synctex.gz`);
+    try {
+      renameSync(prepared.pdf, keptPdf);
+      renameSync(prepared.synctex, keptSynctex);
+    } catch (error) {
+      rmSync(keptPdf, { force: true });
+      rmSync(keptSynctex, { force: true });
+      this.dropPreparedBuildGeneration(prepared);
+      throw error;
+    }
+    const generation = {
+      id,
+      rev,
+      srcHash: prepared.sourceHash,
+      inputEpoch: prepared.inputEpoch,
+      pdf: keptPdf,
+      synctex: keptSynctex,
+      pdfHash: prepared.pdfHash,
+      synctexHash: prepared.synctexHash,
+      pageCount: prepared.pageCount,
+      paper: prepared.papers[0] ? { w: prepared.papers[0].w, h: prepared.papers[0].h } : null,
+      papers: prepared.papers,
+      passes: prepared.passes,
+      ms: prepared.ms,
+      readers: 0,
+      retired: false,
+      filesDeleted: false,
+      syncWarnings: [],
+      seedFiles: prepared.seedFiles,
+      syncInputMap: prepared.syncInputMap,
+      syncOutputMap: prepared.syncOutputMap,
+      importedBuildProfile: prepared.profile,
+    };
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.timerDueAt = 0;
+    this.pendingJob = null;
+    this.#clearDisplayDemand(currentJob);
+    this.#registerGeneration(generation);
+    this.lastEndAt = Date.now();
+    this.lastError = null;
+    void this.prewarmPaintIndex(id);
+    try { this.onResult?.(this.info()); } catch { /* observer errors do not revoke a committed generation */ }
+    return generation;
+  }
+
+  dropPreparedBuildGeneration(prepared) {
+    if (!prepared) return;
+    if (typeof prepared.pdf === 'string') rmSync(prepared.pdf, { force: true });
+    if (typeof prepared.synctex === 'string') rmSync(prepared.synctex, { force: true });
   }
 
   /** Public snapshot for /doc payloads, reports and SSE events. */
@@ -682,9 +920,11 @@ export class CanonicalRenderer {
     // No await between the check above and this assignment: #drain and
     // ensure both claim `running` synchronously, so two compiles can never
     // share the workdir.
+    const compileEpoch = this.compileEpoch;
     this.runningJob = { rev, inputEpoch };
-    this.running = this.#compile({ source, rev, inputEpoch })
+    this.running = this.#compile({ source, rev, inputEpoch, compileEpoch })
       .catch((err) => {
+        if (compileEpoch !== this.compileEpoch) return;
         this.lastError = { rev, message: String(err?.message || err) };
       })
       .finally(() => {
@@ -693,6 +933,10 @@ export class CanonicalRenderer {
         this.#clearDisplayDemand({ rev, inputEpoch });
       });
     await this.running;
+    if (compileEpoch !== this.compileEpoch) {
+      if (this.last && this.last.srcHash === srcHash) return this.last;
+      throw new Error('canonical compile superseded');
+    }
     this.lastEndAt = Date.now();
     try {
       this.onResult?.(this.info());
@@ -751,15 +995,18 @@ export class CanonicalRenderer {
       return;
     }
     const startedWithoutCanonical = !this.last;
+    const compileEpoch = this.compileEpoch;
     this.runningJob = { rev: job.rev, inputEpoch: job.inputEpoch, fallbackReason: job.fallbackReason };
     this.running = this.#compile({
       ...job,
+      compileEpoch,
       // Scheduled authority confirmation is intentionally below the live
       // complete-PDF path. Export, opaque display and demanded revisions stay
       // at normal priority because the user is directly waiting for them.
       background: this.pressure === 'authority' && !job.fallbackReason && !this.#hasDisplayDemand(job),
     })
       .catch((err) => {
+        if (compileEpoch !== this.compileEpoch) return;
         this.lastError = { rev: job.rev, message: String(err?.message || err) };
         // execFile's wall timeout keeps advancing while SIGSTOP holds a
         // pre-existing compile. Preserve that exact job for one normal
@@ -775,6 +1022,7 @@ export class CanonicalRenderer {
         this.#clearDisplayDemand(job);
       });
     await this.running;
+    if (compileEpoch !== this.compileEpoch) return;
     this.lastEndAt = Date.now();
     try {
       this.onResult?.(this.info());
@@ -802,7 +1050,8 @@ export class CanonicalRenderer {
     }
   }
 
-  async #compile({ source, rev, inputEpoch = this.inputEpoch, background = false }) {
+  async #compile({ source, rev, inputEpoch = this.inputEpoch, background = false,
+    compileEpoch = this.compileEpoch }) {
     const t0 = performance.now();
     const srcHash = this.#sourceHash(source, inputEpoch);
     const tex = path.join(this.workDir, 'canon.tex');
@@ -828,6 +1077,7 @@ export class CanonicalRenderer {
       passes++;
       log = await this.#runLatex(tex, background);
       if (this.disposed) throw new Error('renderer disposed');
+      if (compileEpoch !== this.compileEpoch) throw new Error('canonical compile superseded');
       const after = auxState();
       const changed = after !== before;
       before = after;
@@ -883,9 +1133,9 @@ export class CanonicalRenderer {
       // cannot be reconstructed from the renderer's scalar label table.
       seedFiles,
     };
-    if (this.disposed) {
+    if (this.disposed || compileEpoch !== this.compileEpoch) {
       this.#deleteGenerationFiles(generation);
-      throw new Error('renderer disposed');
+      throw new Error(this.disposed ? 'renderer disposed' : 'canonical compile superseded');
     }
     this.#registerGeneration(generation);
     // Keep PDF import/open off the typing path. This intentionally does not
@@ -1034,7 +1284,8 @@ export class CanonicalRenderer {
         maxBuffer: 4 * 1024 * 1024,
         env: process.env,
       });
-      return parseSynctexEditOutput(`${result.stdout || ''}\n${result.stderr || ''}`, this.docDir);
+      const hit = parseSynctexEditOutput(`${result.stdout || ''}\n${result.stderr || ''}`, this.docDir);
+      return hit ? { ...hit, file: this.#logicalInputPath(cur, hit.file) } : null;
     } catch {
       return null;
     } finally {
@@ -1060,7 +1311,7 @@ export class CanonicalRenderer {
     if (!cur) return [];
     try {
       if (!cur.synctex) return [];
-      const input = `${Math.floor(line)}:${Math.max(1, Math.floor(Number(column) || 1))}:${path.resolve(file)}`;
+      const input = `${Math.floor(line)}:${Math.max(1, Math.floor(Number(column) || 1))}:${this.#syncInputPath(cur, file)}`;
       // One generation's SyncTeX never changes, and every CLI call re-reads
       // the whole file: a long document's block proof (one query per source
       // line) otherwise cannot fit the canonical-anchor budget. The caret
@@ -1120,7 +1371,9 @@ export class CanonicalRenderer {
           const compressed = await readFile(cur.synctex);
           if (compressed.length > 8 * 1024 * 1024) return null;
           const text = await gunzipP(compressed, { maxOutputLength: 32 * 1024 * 1024 });
-          const boxes = parseSyncTeXSourceBoxes(text.toString('utf8'), { file, page, startLine, endLine });
+          const boxes = parseSyncTeXSourceBoxes(text.toString('utf8'), {
+            file: this.#syncInputPath(cur, file), page, startLine, endLine,
+          });
           if (!boxes || this.disposed || this.resetting) return null;
           const transform = await this.#syncContentTransform(cur, page);
           if (transform == null) return null;
@@ -1440,6 +1693,7 @@ export class CanonicalRenderer {
    */
   async resetDocument(docDir = this.docDir, overlayDir = this.overlayDir) {
     this.resetting = true;
+    this.compileEpoch++;
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = null;
     this.authorityPausedUntil = 0;
@@ -1485,6 +1739,7 @@ export class CanonicalRenderer {
 
   dispose() {
     this.disposed = true;
+    this.compileEpoch++;
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = null;
     this.authorityPausedUntil = 0;
@@ -1946,6 +2201,16 @@ async function pageGeometries(pdfPath, pageCount, exec = execFileP) {
 
 function sha256File(file) {
   return createHash('sha256').update(readFileSync(file)).digest('hex');
+}
+
+async function sha256FileAsync(file) {
+  return createHash('sha256').update(await readFile(file)).digest('hex');
+}
+
+function pdfInfoPageCount(output) {
+  const match = String(output || '').match(/^Pages:\s*(\d+)\s*$/im);
+  const count = Number(match?.[1]);
+  return Number.isSafeInteger(count) && count > 0 ? count : 0;
 }
 
 function texErrorFrom(log) {

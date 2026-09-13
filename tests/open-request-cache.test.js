@@ -69,6 +69,23 @@ test('open identity includes the effective overlay removals', () => {
   assert.equal(removed, effective);
 });
 
+test('open identity binds the complete canonical Build proposal', () => {
+  const shared = {
+    text: 'source', filePath: '/project/main.tex', docDir: '/project',
+    canonicalBuild: {
+      schemaVersion: 1, requestId: 'build:1', token: 'token',
+      profile: { effectiveEngine: 'lualatex' },
+      artifacts: { pdf: { path: '/project/a.pdf', sha256: 'a'.repeat(64) } },
+    },
+  };
+  const first = openRequestIdentity(shared);
+  const fallback = openRequestIdentity({
+    ...shared,
+    canonicalBuild: { ...shared.canonicalBuild, profile: { effectiveEngine: 'pdflatex' } },
+  });
+  assert.notEqual(first, fallback);
+});
+
 test('serialized completed responses do not follow later source mutation', async () => {
   const cache = new OpenRequestCache(1);
   const response = { documentEpoch: 7, report: { srcRev: 1 } };

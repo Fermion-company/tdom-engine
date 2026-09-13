@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { isPathInside } from './project-inputs.js';
 
-export function openRequestIdentity({ text, filePath, docDir, overlays, removeOverlays }) {
+export function openRequestIdentity({ text, filePath, docDir, overlays, removeOverlays, canonicalBuild = null }) {
   const hash = createHash('sha256');
   const add = (value) => {
     const bytes = Buffer.from(String(value), 'utf8');
@@ -34,6 +34,12 @@ export function openRequestIdentity({ text, filePath, docDir, overlays, removeOv
   for (const [overlayPath, overlayText] of [...accepted].sort(([a], [b]) => a.localeCompare(b))) {
     add(overlayPath);
     add(overlayText);
+  }
+  if (canonicalBuild) {
+    // A request id identifies the exact import proposal as well as the editor
+    // bytes. Treat even a profile/path/provenance change as a conflict rather
+    // than returning an earlier adoption result for a different candidate.
+    add(JSON.stringify(canonicalBuild));
   }
   return hash.digest('hex');
 }
