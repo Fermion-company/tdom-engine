@@ -551,6 +551,16 @@ async function materializeProjectBibliography(source, context) {
   return descriptor;
 }
 
+function buildLeaseBinding(projectRoot, mainFile) {
+  if (typeof projectRoot !== 'string' || !path.isAbsolute(projectRoot) ||
+      typeof mainFile !== 'string' || !mainFile) return null;
+  const root = path.resolve(projectRoot);
+  const file = path.isAbsolute(mainFile) ? path.resolve(mainFile) : path.resolve(root, mainFile);
+  if (!isPathInside(root, file)) return null;
+  const bound = root === path.resolve(activeProject.docDir) && file === path.resolve(activeProject.filePath);
+  return { root, file, bound };
+}
+
 function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = {}, replace = false) {
   if (!context.overlayDir) return { changed: [], removed: [], saved: [] };
   context.savedOverlays ??= new Map();
@@ -720,6 +730,7 @@ function refreshProjectBibliography(changedFile) {
       });
       ensureProjectOutputDirectories(source);
       await materializeProjectBibliography(source, activeProject);
+      await engine.canonical.waitForBuildLease();
       lastReport = await engine.open(source, activeProject.file);
       completeDocumentReset(resetEpoch);
     } else {
@@ -825,6 +836,7 @@ engine.onExternalChange = (changedInput) => {
       });
       ensureProjectOutputDirectories(source);
       await materializeProjectBibliography(source, activeProject);
+      await engine.canonical.waitForBuildLease();
       lastReport = await engine.open(source, activeProject.file);
       completeDocumentReset(resetEpoch);
       broadcast({ kind: 'update', report: lastReport });
@@ -1357,6 +1369,47 @@ const server = http.createServer(async (req, res) => {
         canonical: engine.canonical.info(),
       });
     }
+    if (req.method === 'POST' && url.pathname === '/canonical/build-lease/acquire') {
+      const body = JSON.parse(await readBody(req));
+      const requestId = body?.requestId;
+      const binding = buildLeaseBinding(body?.projectRoot, body?.mainFile);
+      const ttlMs = body?.ttlMs == null ? undefined : Number(body.ttlMs);
+      if (typeof requestId !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(requestId) || !binding ||
+          ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs < 1_000 || ttlMs > 900_000)) {
+        return json(res, { error: 'invalid build lease' }, 400);
+      }
+      // A lease normally arrives before /open through the host's local gate.
+      // Never grant an orphaned lease after a client timeout when a reset has
+      // already entered its resident bootstrap. The host retries this explicit
+      // busy response before spawning TeX; old/unreachable engines remain its
+      // separate compatibility fallback.
+      if (pendingDocumentReset || engine.shipBooting || engine.warming) {
+        return json(res, { ok: false, acquired: false, reason: 'resident-bootstrap-active', retryAfterMs: 250 }, 409);
+      }
+      const result = engine.canonical.acquireBuildLease(requestId, ttlMs);
+      if (!result.acquired) return json(res, { ok: false, ...result }, result.reason === 'lease-busy' ? 409 : 503);
+      const identity = binding.bound ? {
+        documentEpoch,
+        srcRev: engine.srcRev,
+        ...engine.canonical.compilationIdentity(engine.getSource()),
+      } : null;
+      return json(res, {
+        ok: true,
+        ...result,
+        bound: binding.bound,
+        reason: binding.bound ? null : 'document-mismatch',
+        identity,
+      });
+    }
+    if (req.method === 'POST' && url.pathname === '/canonical/build-lease/release') {
+      const body = JSON.parse(await readBody(req));
+      if (typeof body?.requestId !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(body.requestId) ||
+          typeof body?.token !== 'string' || !/^[0-9a-f-]{36}$/i.test(body.token)) {
+        return json(res, { error: 'invalid build lease release' }, 400);
+      }
+      const result = engine.canonical.releaseBuildLease(body.requestId, body.token);
+      return json(res, { ok: result.released, ...result }, result.released ? 200 : 409);
+    }
     if (req.method === 'POST' && url.pathname === '/canonical/display-demand') {
       const body = JSON.parse(await readBody(req));
       const validId = id => id == null || typeof id === 'string' && /^[A-Za-z0-9:_-]{1,128}$/.test(id);
@@ -1451,9 +1504,12 @@ const server = http.createServer(async (req, res) => {
       const filePath = typeof body.filePath === 'string' ? body.filePath : engine.file;
       const requestedFile = path.resolve(activeProject.docDir, filePath);
       const warmProofRequest = ++warmProofRequestSeq;
-      const warming = Number.isFinite(offset)
-        ? engine.warmEditOffset(offset, filePath)
-        : engine.warmPage(page);
+      const warming = engine.canonical.waitForBuildLease().then(() => {
+        if (warmProofRequest !== warmProofRequestSeq) return { status: 'stale' };
+        return Number.isFinite(offset)
+          ? engine.warmEditOffset(offset, filePath)
+          : engine.warmPage(page);
+      });
       void warming.then(async (result) => {
         if (warmProofRequest !== warmProofRequestSeq || result?.status !== 'ready' || !Number.isFinite(offset)) return;
         if (engine.warmInfo !== result) return;
@@ -1912,6 +1968,7 @@ const server = http.createServer(async (req, res) => {
           }
           if (bibliographyNeedsReboot) {
             resetEpoch = beginDocumentReset('edit-bibliography-reboot');
+            await engine.canonical.waitForBuildLease();
             await engine.setDocumentContext({
               docDir: activeProject.docDir,
               overlayDir: activeProject.overlayDir,
@@ -1926,6 +1983,7 @@ const server = http.createServer(async (req, res) => {
           );
           if (preambleInputChanged) {
             resetEpoch = beginDocumentReset('edit-preamble-reboot');
+            await engine.canonical.waitForBuildLease();
             await engine.setDocumentContext({
               docDir: activeProject.docDir,
               overlayDir: activeProject.overlayDir,
@@ -2066,6 +2124,7 @@ const server = http.createServer(async (req, res) => {
       let payload;
       try {
         payload = await openRequests.run(openRequestId, identity, () => withEngine(async () => {
+          await engine.canonical.waitForBuildLease();
           const resetEpoch = beginDocumentReset('open');
           applyProjectOverlays(context, body, true);
           await engine.setDocumentContext({

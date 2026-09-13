@@ -20,7 +20,7 @@
 //     canonical result on screen and reports the TeX error.
 
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { readFile } from 'node:fs/promises';
 import { gunzip } from 'node:zlib';
@@ -53,6 +53,9 @@ const SVG_CACHE_MAX = 400; // pages kept as SVG strings (LRU)
 // The fixed window prevents a long editing session from retaining files
 // without bound.
 const GENERATION_MAX = 4;
+const BUILD_LEASE_DEFAULT_MS = 660_000;
+const BUILD_LEASE_MAX_MS = 900_000;
+const MUTABLE_COMPILE_ARTIFACT = /(?:^canon\.(?:log|pdf|synctex\.gz)$|\.(?:aux|bcf|blg|idx|ind|ilg|glo|gls|glg|acn|acr|alg|lof|lot|nav|out|run\.xml|snm|toc|vrb)$)/;
 
 export class CanonicalRenderer {
   constructor({
@@ -164,6 +167,11 @@ export class CanonicalRenderer {
     this.authorityPausedPids = new Map(); // pid -> true when signalled as a process group
     this.authorityPausedUntil = 0;
     this.authorityResumeTimer = null;
+    this.buildLease = null; // {requestId, token, expiresAt, timer}
+    this.lastBuildLeaseRelease = null;
+    this.buildLeaseWaiters = new Set();
+    this.buildHeavyChildren = new Set();
+    this.buildPausedPids = new Set();
     // Source text is not the whole compilation input: images, \input files
     // and bibliographies can change without a byte changing in the main
     // buffer.  Capture this epoch in every queued job so those changes
@@ -174,6 +182,10 @@ export class CanonicalRenderer {
 
   #sourceHash(source, inputEpoch = this.inputEpoch) {
     return fnv1a(`${inputEpoch}\0${source}`);
+  }
+
+  compilationIdentity(source) {
+    return { inputEpoch: this.inputEpoch, srcHash: this.#sourceHash(source) };
   }
 
   #resolveGeneration(id = null) {
@@ -267,6 +279,22 @@ export class CanonicalRenderer {
     }
   }
 
+  #removeMutableCompileArtifacts() {
+    const pending = [this.workDir];
+    while (pending.length) {
+      const dir = pending.pop();
+      let entries = [];
+      try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const entry of entries) {
+        const file = path.join(dir, entry.name);
+        if (entry.isDirectory()) pending.push(file);
+        else if (entry.isFile() && MUTABLE_COMPILE_ARTIFACT.test(entry.name)) {
+          rmSync(file, { force: true });
+        }
+      }
+    }
+  }
+
   async #settleReadJobs() {
     const jobs = new Set([
       ...this.svgInFlight.values(),
@@ -283,22 +311,38 @@ export class CanonicalRenderer {
   /** execFile with child tracking, so dispose() can kill in-flight work —
    * an orphaned canonical lualatex otherwise burns a core for up to its
    * 5-minute timeout after the server exits. */
-  #exec(cmd, args, opts, { authority = false } = {}) {
+  #exec(cmd, args, opts, { authority = false, buildHeavy = false } = {}) {
     const p = execFileP(cmd, args, authority ? { ...opts, detached: true } : opts);
     if (p.child) {
       if (authority) {
         this.authorityChildren.add(p.child);
-        if (Date.now() < this.authorityPausedUntil) this.#pauseAuthorityChild(p.child);
+        if (this.buildLease || Date.now() < this.authorityPausedUntil) this.#pauseAuthorityChild(p.child);
+      } else if (buildHeavy) {
+        this.buildHeavyChildren.add(p.child);
+        if (this.buildLease) this.#pauseBuildHeavyChild(p.child);
       }
       const cleanup = () => {
         this.children.delete(p.child);
         this.authorityChildren.delete(p.child);
         this.authorityPausedPids.delete(p.child.pid);
+        this.buildHeavyChildren.delete(p.child);
+        this.buildPausedPids.delete(p.child.pid);
       };
       this.children.add(p.child);
       p.then(cleanup, cleanup);
     }
     return p;
+  }
+
+  #pauseBuildHeavyChild(child) {
+    const pid = Number(child?.pid);
+    if (!(pid > 0) || this.buildPausedPids.has(pid)) return;
+    try {
+      child.kill('SIGSTOP');
+      this.buildPausedPids.add(pid);
+    } catch {
+      /* the compile may have finished between spawn and lease acquisition */
+    }
   }
 
   #pauseAuthorityChild(child) {
@@ -324,11 +368,27 @@ export class CanonicalRenderer {
   #resumeAuthority() {
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = null;
+    if (this.buildLease) return;
+    const remaining = this.authorityPausedUntil - Date.now();
+    if (remaining > 0) {
+      this.authorityResumeTimer = setTimeout(() => this.#resumeAuthority(), remaining);
+      this.authorityResumeTimer.unref?.();
+      return;
+    }
     this.authorityPausedUntil = 0;
     for (const [pid, asGroup] of [...this.authorityPausedPids]) {
       try { process.kill(asGroup ? -pid : pid, 'SIGCONT'); } catch { /* already gone */ }
       this.authorityPausedPids.delete(pid);
     }
+  }
+
+  #resumeBuildHeavy() {
+    if (this.buildLease) return;
+    for (const pid of [...this.buildPausedPids]) {
+      try { process.kill(pid, 'SIGCONT'); } catch { /* already gone */ }
+      this.buildPausedPids.delete(pid);
+    }
+    this.#resumeAuthority();
   }
 
   /**
@@ -344,18 +404,73 @@ export class CanonicalRenderer {
     this.authorityPausedUntil = Math.max(this.authorityPausedUntil, Date.now() + delay);
     for (const child of this.authorityChildren) this.#pauseAuthorityChild(child);
     clearTimeout(this.authorityResumeTimer);
-    const resumeWhenDue = () => {
-      const remaining = this.authorityPausedUntil - Date.now();
-      if (remaining > 0) {
-        this.authorityResumeTimer = setTimeout(resumeWhenDue, remaining);
-        this.authorityResumeTimer.unref?.();
-        return;
-      }
-      this.#resumeAuthority();
-    };
-    this.authorityResumeTimer = setTimeout(resumeWhenDue, delay);
+    this.authorityResumeTimer = setTimeout(() => this.#resumeAuthority(), delay);
     this.authorityResumeTimer.unref?.();
     return true;
+  }
+
+  acquireBuildLease(requestId, ttlMs = BUILD_LEASE_DEFAULT_MS) {
+    if (this.disposed || this.resetting || typeof requestId !== 'string' ||
+        !/^[A-Za-z0-9:_-]{1,128}$/.test(requestId)) {
+      return { acquired: false, reason: 'unavailable' };
+    }
+    if (this.buildLease) {
+      if (this.buildLease.requestId !== requestId) {
+        return { acquired: false, reason: 'lease-busy', expiresAt: this.buildLease.expiresAt };
+      }
+      return {
+        acquired: true,
+        idempotent: true,
+        requestId,
+        token: this.buildLease.token,
+        expiresAt: this.buildLease.expiresAt,
+      };
+    }
+    const duration = Math.min(BUILD_LEASE_MAX_MS, Math.max(1_000, Number(ttlMs) || BUILD_LEASE_DEFAULT_MS));
+    const token = randomUUID();
+    const expiresAt = Date.now() + duration;
+    const timer = setTimeout(() => this.#releaseBuildLease(requestId, token, 'expired'), duration);
+    timer.unref?.();
+    this.buildLease = { requestId, token, expiresAt, timer };
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.timerDueAt = 0;
+    for (const child of this.authorityChildren) this.#pauseAuthorityChild(child);
+    for (const child of this.buildHeavyChildren) this.#pauseBuildHeavyChild(child);
+    return { acquired: true, idempotent: false, requestId, token, expiresAt };
+  }
+
+  releaseBuildLease(requestId, token) {
+    return this.#releaseBuildLease(requestId, token, 'released');
+  }
+
+  #releaseBuildLease(requestId, token, reason) {
+    const lease = this.buildLease;
+    if (!lease) {
+      const previous = this.lastBuildLeaseRelease;
+      return previous?.requestId === requestId && previous?.token === token
+        ? { released: true, alreadyReleased: true, reason: previous.reason }
+        : { released: false, reason: 'lease-not-found' };
+    }
+    if (lease.requestId !== requestId || lease.token !== token) {
+      return { released: false, reason: 'lease-mismatch' };
+    }
+    clearTimeout(lease.timer);
+    this.buildLease = null;
+    this.lastBuildLeaseRelease = { requestId, token, reason };
+    this.#resumeBuildHeavy();
+    for (const resolve of this.buildLeaseWaiters) resolve();
+    this.buildLeaseWaiters.clear();
+    if (this.pendingJob && !this.running && !this.timer && !this.disposed && !this.resetting) {
+      this.#armPending(this.delayFor(this.pendingJob, { preserveIdleStart: true }));
+    }
+    return { released: true, alreadyReleased: false, reason };
+  }
+
+  async waitForBuildLease() {
+    while (this.buildLease) {
+      await new Promise((resolve) => this.buildLeaseWaiters.add(resolve));
+    }
   }
 
   /** Public snapshot for /doc payloads, reports and SSE events. */
@@ -381,6 +496,11 @@ export class CanonicalRenderer {
       authorityPaused: this.authorityPausedPids.size > 0,
       authorityChildren: this.authorityChildren.size,
       authorityPauseRemainingMs: Math.max(0, this.authorityPausedUntil - Date.now()),
+      buildLease: this.buildLease ? {
+        active: true,
+        requestId: this.buildLease.requestId,
+        expiresInMs: Math.max(0, this.buildLease.expiresAt - Date.now()),
+      } : { active: false },
     };
   }
 
@@ -492,6 +612,7 @@ export class CanonicalRenderer {
   }
 
   #armPending(delay, { keepEarlier = false } = {}) {
+    if (this.buildLease) return;
     const wait = Math.max(0, Number(delay) || 0);
     const dueAt = Date.now() + wait;
     if (keepEarlier && this.timer && this.timerDueAt <= dueAt) return;
@@ -549,6 +670,7 @@ export class CanonicalRenderer {
    * during an export). Newer edits stay on the normal cadence timer.
    */
   async ensure(source, rev) {
+    await this.waitForBuildLease();
     let inputEpoch = this.inputEpoch;
     let srcHash = this.#sourceHash(source, inputEpoch);
     if (this.last && this.last.srcHash === srcHash) return this.last;
@@ -583,6 +705,7 @@ export class CanonicalRenderer {
 
   /** Wait until no compile is queued or running (tests / export). */
   async settle() {
+    await this.waitForBuildLease();
     while (this.timer || this.running || this.pendingJob) {
       if (this.timer) {
         clearTimeout(this.timer);
@@ -596,6 +719,7 @@ export class CanonicalRenderer {
   async #drain({ waitForResident = false } = {}) {
     if (this.running) return this.running;
     if (!this.pendingJob) return;
+    if (this.buildLease) return;
     const job = this.pendingJob;
     if (waitForResident && !job.fallbackReason && this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
         !this.residentImpossibleDemandIds.size && typeof this.residentDisplayState === 'function') {
@@ -637,6 +761,13 @@ export class CanonicalRenderer {
     })
       .catch((err) => {
         this.lastError = { rev: job.rev, message: String(err?.message || err) };
+        // execFile's wall timeout keeps advancing while SIGSTOP holds a
+        // pre-existing compile. Preserve that exact job for one normal
+        // post-Build retry; a newer edit remains latest-wins.
+        if (this.buildLease && job.inputEpoch === this.inputEpoch &&
+            (!this.pendingJob || this.pendingJob.rev <= job.rev)) {
+          this.pendingJob = job;
+        }
       })
       .finally(() => {
         this.running = null;
@@ -690,6 +821,7 @@ export class CanonicalRenderer {
     let passes = 0;
     let log = '';
     let before = auxState();
+    try {
     // aux fixpoint, the honest way latexmk does it: rerun while the aux
     // family keeps changing (toc page numbers, forward refs), capped
     while (passes < MAX_PASSES) {
@@ -760,8 +892,12 @@ export class CanonicalRenderer {
     // await: canonical pixels are already committed and the index is merely
     // an optional fast-proof accelerator.
     void this.prewarmPaintIndex(id);
-    this.lastError = null;
-    return generation;
+      this.lastError = null;
+      return generation;
+    } catch (error) {
+      try { this.#removeMutableCompileArtifacts(); } catch { /* preserve the compile error */ }
+      throw error;
+    }
   }
 
   async #runLatex(tex, background = false) {
@@ -794,7 +930,7 @@ export class CanonicalRenderer {
             recursive: true,
           }),
         },
-        { authority: background }
+        { authority: background, buildHeavy: !background }
       );
       out = (r.stdout || '') + (r.stderr || '');
     } catch (err) {
@@ -1333,6 +1469,8 @@ export class CanonicalRenderer {
       this.children.clear();
       this.authorityChildren.clear();
       this.authorityPausedPids.clear();
+      this.buildHeavyChildren.clear();
+      this.buildPausedPids.clear();
       this.docDir = path.resolve(docDir);
       this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
       this.#clearGenerations();
@@ -1350,6 +1488,7 @@ export class CanonicalRenderer {
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = null;
     this.authorityPausedUntil = 0;
+    if (this.buildLease) this.#releaseBuildLease(this.buildLease.requestId, this.buildLease.token, 'disposed');
     clearTimeout(this.timer);
     this.timer = null;
     this.timerDueAt = 0;
@@ -1375,6 +1514,8 @@ export class CanonicalRenderer {
     this.children.clear();
     this.authorityChildren.clear();
     this.authorityPausedPids.clear();
+    this.buildHeavyChildren.clear();
+    this.buildPausedPids.clear();
     this.#clearGenerations();
     this.#removeWorkArtifacts();
   }
