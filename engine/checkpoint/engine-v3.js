@@ -79,6 +79,7 @@ import { mayCaptureNativeBlock, mayNeedRender, releaseRenderHold } from './rende
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
 import { preemptResidentRenders, queueRender as queueRenderHelper } from './render-pump.js';
+import { withReplaceablePreviewJob } from './build-lease-preview.js';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 import { queueMovedOffsets as queueMovedOffsetsHelper } from './rescue-offsets.js';
 import { isPathInside } from '../project-inputs.js';
@@ -1449,19 +1450,32 @@ export class CheckpointEngine {
     (async () => {
       try {
         while (!this.closed && this.rescueQueue.size) {
-          const [bid, key] = this.rescueQueue.entries().next().value;
-          this.rescueQueue.delete(bid);
-          try {
-            await this.#asyncRescueOne(bid, key);
-          } catch (err) {
-            // the exact compile failed for the block's CURRENT inputs — the
-            // stale pixels the foreground kept are a freeze for as long as
-            // those inputs persist. No sticky mark here: frozenBlockIds()
-            // derives the state from isoFailCache, so a block that was only
-            // collateral (a sane text re-rescued at a mid-breakage page
-            // offset) un-freezes by itself when its inputs revert.
-            this.diagnostics.push(`async rescue ${bid}: ${err?.message ?? err}`);
+          const [bid] = this.rescueQueue.entries().next().value;
+          while (
+            !this.closed &&
+            Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800)
+          ) {
+            await new Promise((r) => setTimeout(r, 200));
           }
+          if (this.closed) return;
+          await withReplaceablePreviewJob(this, 'async-rescue', async () => {
+            // Keep the latest-wins entry while the Build gate is closed. A
+            // newer edit may replace its cache key before this job starts.
+            if (!this.rescueQueue.has(bid)) return;
+            const key = this.rescueQueue.get(bid);
+            this.rescueQueue.delete(bid);
+            try {
+              await this.#asyncRescueOne(bid, key);
+            } catch (err) {
+              // the exact compile failed for the block's CURRENT inputs — the
+              // stale pixels the foreground kept are a freeze for as long as
+              // those inputs persist. No sticky mark here: frozenBlockIds()
+              // derives the state from isoFailCache, so a block that was only
+              // collateral (a sane text re-rescued at a mid-breakage page
+              // offset) un-freezes by itself when its inputs revert.
+              this.diagnostics.push(`async rescue ${bid}: ${err?.message ?? err}`);
+            }
+          });
         }
       } finally {
         this.rescuePumping = false;
@@ -1471,17 +1485,6 @@ export class CheckpointEngine {
 
   async #asyncRescueOne(bid, key) {
     if (this.closed || this.mode !== 'structured') return;
-    // typing-burst quiescence: a keystroke inside/near a rescue block
-    // supersedes the previous compile anyway — wait for a short pause so
-    // bursts cost ONE compile instead of one per keystroke, and the
-    // resident fork jobs keep the CPU while the user is typing
-    while (
-      !this.closed &&
-      Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800)
-    ) {
-      await new Promise((r) => setTimeout(r, 200));
-    }
-    if (this.closed) return;
     let idx = this.blocks.findIndex((b) => b.id === bid);
     if (idx < 0) return;
     let block = this.blocks[idx];

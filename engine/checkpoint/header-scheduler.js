@@ -1,6 +1,7 @@
 import { normalizeHeaderFooterPayload } from './header-footer.js';
 import { fnv1a } from '../hash.js';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
+import { withReplaceablePreviewJob } from './build-lease-preview.js';
 
 export function scheduleHeaders(
   engine,
@@ -28,8 +29,7 @@ export function scheduleHeaders(
 
 function runHeaderJob(engine, helpers, specs, sig) {
   const { hfJobBody, awaitGalley, registerFont, asyncRepaginate } = helpers;
-  const ck = engine.checkpoints.get(0);
-  if (!ck) return;
+  if (!engine.checkpoints.get(0)) return;
   engine.hfPending = sig;
   engine.hfTask = (async () => {
     // A complete root replay already contains the authoritative headers.
@@ -42,38 +42,41 @@ function runHeaderJob(engine, helpers, specs, sig) {
       if (remaining <= 0) break;
       await new Promise((resolve) => setTimeout(resolve, Math.min(25, remaining)));
     }
-    // A later edit queued a newer page-state signature while this job was
-    // waiting for the foreground lease. Skip the obsolete TeX work; the
-    // finally block below immediately starts the latest queued signature.
-    if (engine.hfQueuedSig && engine.hfQueuedSig !== sig) return;
-    const body = Buffer.from(hfJobBody(specs), 'utf8');
-    const done = awaitGalley('galley:__hf', 60_000);
-    done.catch(() => {});
-    // workDir percent-encoded (spaces in macOS paths shear the line)
-    ck.send(`RENDER __hf ${encodeURIComponent(engine.workDir)} ${body.length}\n`);
-    ck.sendRaw(body);
-    const payload = await done;
-    // The job may already have been in TeX when a newer edit arrived. Its
-    // pixels are now stale even though the protocol reply is valid.
-    if (engine.hfQueuedSig && engine.hfQueuedSig !== sig) return;
-    const map = normalizeHeaderFooterPayload(payload, registerFont);
-    // apply only between updates — never mid-#update (see this.updating)
-    await new Promise((resolve) => {
-      const apply = () => {
-        if (engine.closed) {
+    await withReplaceablePreviewJob(engine, 'header-render', async () => {
+      // A later edit may queue a newer page-state signature while this job
+      // waits for the Build gate. Skip obsolete work without consuming it.
+      if (engine.hfQueuedSig && engine.hfQueuedSig !== sig) return;
+      const ck = engine.checkpoints.get(0);
+      if (!ck) return;
+      const body = Buffer.from(hfJobBody(specs), 'utf8');
+      const done = awaitGalley('galley:__hf', 60_000);
+      done.catch(() => {});
+      // workDir percent-encoded (spaces in macOS paths shear the line)
+      ck.send(`RENDER __hf ${encodeURIComponent(engine.workDir)} ${body.length}\n`);
+      ck.sendRaw(body);
+      const payload = await done;
+      // The job may already have been in TeX when a newer edit arrived. Its
+      // pixels are now stale even though the protocol reply is valid.
+      if (engine.hfQueuedSig && engine.hfQueuedSig !== sig) return;
+      const map = normalizeHeaderFooterPayload(payload, registerFont);
+      // apply only between updates — never mid-#update (see this.updating)
+      await new Promise((resolve) => {
+        const apply = () => {
+          if (engine.closed) {
+            resolve();
+            return;
+          }
+          if (engine.updating) {
+            setTimeout(apply, 10);
+            return;
+          }
+          engine.hf = map;
+          engine.hfSig = sig;
+          asyncRepaginate();
           resolve();
-          return;
-        }
-        if (engine.updating) {
-          setTimeout(apply, 10);
-          return;
-        }
-        engine.hf = map;
-        engine.hfSig = sig;
-        asyncRepaginate();
-        resolve();
-      };
-      apply();
+        };
+        apply();
+      });
     });
   })()
     .catch((err) => {

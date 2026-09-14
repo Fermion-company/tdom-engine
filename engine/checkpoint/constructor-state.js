@@ -190,6 +190,10 @@ export function initializeEngineState(
   engine.interactiveRenderCohort = null; // only the current edit's resident-capable exact work
   engine.renderPumping = 0;
   engine.renderTask = Promise.resolve();
+  // Aggregate pump promises may themselves wait for a Build lease. Track
+  // only jobs that already passed the gate when deciding whether acquire is
+  // still settling finite work.
+  engine.buildLeasePreviewJobs = new Set();
   engine.renderSeq = 0; // unique protocol ids keep render forks distinct from foreground JOBs
   engine.cancelledRenderIds = new Set(); // late FORKED replies are killed after edit preemption
   engine.captureSeq = 0; // monotonic generation token for retained JOB node lists

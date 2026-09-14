@@ -38,6 +38,7 @@ import {
 import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
 import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read-proof.js';
 import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
+import { buildLeasePreviewSettlement } from './engine/checkpoint/build-lease-preview.js';
 import { watchInclude } from './engine/checkpoint/include-expander.js';
 import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
 
@@ -1490,6 +1491,8 @@ const server = http.createServer(async (req, res) => {
       }
       const result = engine.canonical.acquireBuildLease(requestId, ttlMs);
       if (!result.acquired) return json(res, { ok: false, ...result }, result.reason === 'lease-busy' ? 409 : 503);
+      const settlement = buildLeasePreviewSettlement(result, engine.buildLeasePreviewJobs);
+      if (settlement) return json(res, settlement, 503);
       const identity = binding.bound ? {
         documentEpoch,
         srcRev: engine.srcRev,

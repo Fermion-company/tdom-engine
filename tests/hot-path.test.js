@@ -14,11 +14,17 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
+import { CanonicalRenderer } from '../engine/checkpoint/canonical.js';
 import { buildDisplayList } from '../engine/checkpoint/display-list.js';
 import { buildStream } from '../engine/checkpoint/stream.js';
 import { handlePeerMessage } from '../engine/checkpoint/peer-message.js';
 import { mayCaptureDisplayMath } from '../engine/checkpoint/render-hold.js';
 import { preemptResidentRenders } from '../engine/checkpoint/render-pump.js';
+import {
+  buildLeasePreviewSettlement,
+  claimReplaceablePreviewJob,
+  withReplaceablePreviewJob,
+} from '../engine/checkpoint/build-lease-preview.js';
 import { abortBackgroundJob } from '../engine/checkpoint/abort-background-job.js';
 import { classifyDocument } from '../engine/checkpoint/safety.js';
 import { sourceClosure } from '../engine/checkpoint/closure.js';
@@ -65,6 +71,122 @@ const available = await promisify(execFile)('lualatex', ['--version'], { timeout
   () => false
 );
 const opts = available ? {} : { skip: 'lualatex not installed' };
+
+const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+test('Build lease settles active preview jobs and gates queued replacements', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-preview-build-lease-'));
+  const canonical = new CanonicalRenderer({ workDir: root });
+  const engine = { closed: false, canonical, buildLeasePreviewJobs: new Set() };
+  let finishActive;
+  try {
+    const active = withReplaceablePreviewJob(engine, 'isolated-render', () =>
+      new Promise((resolve) => { finishActive = resolve; }));
+    await nextTurn();
+    assert.equal(engine.buildLeasePreviewJobs.size, 1);
+
+    const acquired = canonical.acquireBuildLease('build:preview', 10_000);
+    const settling = buildLeasePreviewSettlement(acquired, engine.buildLeasePreviewJobs);
+    assert.equal(settling.reason, 'preview-work-settling');
+    assert.equal(settling.requestId, 'build:preview');
+    assert.equal(settling.token, acquired.token);
+    assert.equal(settling.activePreviewJobs, 1);
+    assert.deepEqual(settling.activePreviewWork.map((job) => job.kind), ['isolated-render']);
+    assert.equal(settling.activePreviewWork[0].activeMs >= 0, true);
+
+    const retried = canonical.acquireBuildLease('build:preview', 10_000);
+    assert.equal(retried.idempotent, true);
+    assert.equal(buildLeasePreviewSettlement(retried, engine.buildLeasePreviewJobs)?.reason,
+      'preview-work-settling');
+
+    const queue = new Map([['block', true]]);
+    let queuedStarted = false;
+    const queued = withReplaceablePreviewJob(engine, 'resident-render', async () => {
+      queuedStarted = true;
+      queue.delete('block');
+    });
+    await nextTurn();
+    assert.equal(queuedStarted, false);
+    assert.equal(queue.has('block'), true, 'the latest-wins entry remains while the lease is active');
+
+    finishActive();
+    await active;
+    assert.equal(engine.buildLeasePreviewJobs.size, 0);
+    assert.equal(buildLeasePreviewSettlement(
+      canonical.acquireBuildLease('build:preview', 10_000),
+      engine.buildLeasePreviewJobs
+    ), null, 'the same request receives its token as soon as finite work settles');
+
+    canonical.releaseBuildLease('build:preview', acquired.token);
+    await queued;
+    assert.equal(queuedStarted, true);
+    assert.equal(queue.has('block'), false);
+
+    await assert.rejects(
+      withReplaceablePreviewJob(engine, 'header-render', async () => {
+        throw new Error('injected preview failure');
+      }),
+      /injected preview failure/
+    );
+    assert.equal(engine.buildLeasePreviewJobs.size, 0, 'failed jobs release their active claim');
+    const claim = await claimReplaceablePreviewJob(engine, 'async-rescue');
+    assert.equal(claim.finish(), true);
+    assert.equal(claim.finish(), false, 'finishing a claim twice is harmless');
+  } finally {
+    canonical.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Build lease release, expiry, and close wake preview gate waiters', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-preview-build-wake-'));
+  const canonical = new CanonicalRenderer({ workDir: root });
+  const engine = { closed: false, canonical, buildLeasePreviewJobs: new Set() };
+  try {
+    const releasedLease = canonical.acquireBuildLease('build:release', 10_000);
+    let releasedStarted = false;
+    const afterRelease = withReplaceablePreviewJob(engine, 'resident-render', async () => {
+      releasedStarted = true;
+    });
+    await nextTurn();
+    assert.equal(releasedStarted, false);
+    canonical.releaseBuildLease('build:release', releasedLease.token);
+    await afterRelease;
+    assert.equal(releasedStarted, true);
+
+    canonical.acquireBuildLease('build:expiry', 1_000);
+    let expiryStarted = false;
+    let expiryDeadline;
+    try {
+      await Promise.race([
+        withReplaceablePreviewJob(engine, 'isolated-render', async () => {
+          expiryStarted = true;
+        }),
+        new Promise((_, reject) => {
+          expiryDeadline = setTimeout(() => reject(new Error('lease expiry did not wake')), 2_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(expiryDeadline);
+    }
+    assert.equal(expiryStarted, true);
+
+    canonical.acquireBuildLease('build:close', 10_000);
+    let closeStarted = false;
+    const afterClose = withReplaceablePreviewJob(engine, 'header-render', async () => {
+      closeStarted = true;
+    });
+    await nextTurn();
+    engine.closed = true;
+    canonical.dispose();
+    assert.equal(await afterClose, undefined);
+    assert.equal(closeStarted, false);
+    assert.equal(engine.buildLeasePreviewJobs.size, 0);
+  } finally {
+    canonical.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('shipping checkpoints stay bounded across long documents and resident budget changes', async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-shipping-cap-'));
@@ -342,7 +464,8 @@ test('isolated exact chunks resolve project classes and prefer unsaved inputs', 
   const engine = {
     workDir: path.join(root, 'work'), docDir, overlayDir,
     blocks: [block], counters: [], chunks: new Map(), isoChildren: new Set(),
-    rescueQueue: new Map(), canonical: { info: () => ({ inFlight: false }) },
+    rescueQueue: new Map(), buildLeasePreviewJobs: new Set(),
+    canonical: { buildLease: null, info: () => ({ inFlight: false }), waitForBuildLease: async () => {} },
     labelTable: new Map(), hrefTable: new Map(), geometry: {}, file: 'main.tex',
     store: { get: () => String.raw`\documentclass{tdomlocal}\begin{document}\input{content.tex}\end{document}` },
   };
@@ -2481,7 +2604,8 @@ SiblingResource.
       assert.deepEqual(readFileSync(path.join(e.workDir, 'driver.pdf')), rootPdf, 'sibling output cannot mutate root resources');
       const chunks = new Map();
       await renderIsolatedBlock({ ...e, chunks, lastEditAt: 0,
-        rescueQueue: new Map(), canonical: { info: () => ({ inFlight: false }) },
+        rescueQueue: new Map(),
+        canonical: { buildLease: null, info: () => ({ inFlight: false }), waitForBuildLease: async () => {} },
       }, { block, idx: e.blocks.indexOf(block),
         chunkTargets: () => [{ key: block.id, page: 1, w: chunk.wBp, h: chunk.hBp }],
         asyncRepaginate() {},
@@ -2551,7 +2675,8 @@ After.
       if (editIndex) assert.ok(e.renderStats.captureHits > 0);
       const chunks = new Map();
       await renderIsolatedBlock({ ...e, chunks, lastEditAt: 0,
-        rescueQueue: new Map(), canonical: { info: () => ({ inFlight: false }) },
+        rescueQueue: new Map(),
+        canonical: { buildLease: null, info: () => ({ inFlight: false }), waitForBuildLease: async () => {} },
       }, { block, idx,
         chunkTargets: () => [{ key: block.id, page: 1, w: chunk.wBp, h: chunk.hBp }],
         asyncRepaginate() {},
