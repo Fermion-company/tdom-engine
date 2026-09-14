@@ -1317,15 +1317,23 @@ function prefetchCanonicalAnchorProof(base, completionDeadline) {
 // generation caches instead of spending its budget on CLI calls.
 const WARM_PROOF_PREFETCH_MS = 10_000;
 
-function prefetchWarmAnchorProof(offset, filePath) {
-  if (!ENABLE_CANONICAL_ANCHOR || !Number.isFinite(offset)) return;
+function prefetchWarmAnchorProof(offset, filePath, diagnostics = null) {
+  const reject = (reason) => {
+    if (diagnostics) diagnostics.reason = reason;
+    return null;
+  };
+  if (!ENABLE_CANONICAL_ANCHOR) return reject('anchor-disabled');
+  if (!Number.isFinite(offset)) return reject('warm-offset');
   const certificate = engine.canonical.generationCertificate();
-  if (!certificate || certificate.rev !== engine.srcRev ||
-      certificate.inputEpoch !== engine.canonical.inputEpoch) return;
+  if (!certificate) return reject('canonical-certificate-missing');
+  if (certificate.rev !== engine.srcRev) return reject('canonical-revision-mismatch');
+  if (certificate.inputEpoch !== engine.canonical.inputEpoch) {
+    return reject('canonical-input-epoch-mismatch');
+  }
   const file = typeof filePath === 'string' ? path.resolve(activeProject.docDir, filePath) : null;
   const root = !file || file === path.resolve(activeProject.filePath);
   const readPath = root ? null : engine.includes.get(file)?.readPath;
-  if (!root && typeof readPath !== 'string') return;
+  if (!root && typeof readPath !== 'string') return reject('child-read-path-missing');
   const base = captureCanonicalAnchorBase({
     blocks: engine.blocks,
     domBlocks: engine.getDOM().blocks,
@@ -1333,6 +1341,7 @@ function prefetchWarmAnchorProof(offset, filePath) {
       ? { start: offset, end: offset, text: '' }
       : { start: offset, end: offset, text: '', file, canonicalInputPath: path.resolve(readPath) },
     certificate,
+    diagnostics,
   });
   return base
     ? prefetchCanonicalAnchorProof(base, performance.now() + WARM_PROOF_PREFETCH_MS)
@@ -1466,6 +1475,7 @@ const server = http.createServer(async (req, res) => {
         shipping: engine.shipping?.info?.() ?? null,
         shippingPresentation: lastShipPresentation,
         canonicalAnchorPresentation: lastAnchorPresentation,
+        canonicalAnchorInputDiagnostic: lastReport?.canonicalAnchorInputDiagnostic ?? null,
         warm: engine.warmInfo ?? null,
         foregroundLeaseMs: engine.foregroundLeaseMs ?? 0,
         authorityDeferred: engine.authorityDeferred ?? false,
@@ -1693,9 +1703,18 @@ const server = http.createServer(async (req, res) => {
         const epoch = documentEpoch;
         const anchorEpoch = terminalAnchorEpoch;
         let prefetch;
-        try { prefetch = prefetchWarmAnchorProof(offset, filePath); } catch { prefetch = null; }
+        const proofDiagnostics = {};
+        try { prefetch = prefetchWarmAnchorProof(offset, filePath, proofDiagnostics); }
+        catch { proofDiagnostics.reason = 'prefetch-error'; prefetch = null; }
         if (!prefetch) {
-          const unavailable = { ...result, status: 'proof-unavailable', reason: 'anchor-proof-ineligible', offset, file: requestedFile };
+          const unavailable = {
+            ...result,
+            status: 'proof-unavailable',
+            reason: 'anchor-proof-ineligible',
+            proofReason: proofDiagnostics.reason ?? 'unknown',
+            offset,
+            file: requestedFile,
+          };
           if (warmProofRequest === warmProofRequestSeq && engine.warmInfo === result) {
             engine.warmInfo = unavailable;
             broadcast({ kind: 'warm', warm: unavailable });
