@@ -1575,6 +1575,10 @@ const server = http.createServer(async (req, res) => {
               logicalPath: canonicalImportLogicalPath(activeProject, entry.logicalPath),
               recordedPath: entry.recordedPath,
             })),
+            inputManifest: (validation.inputManifest ?? []).map((entry) => ({
+              logicalPath: contextProjectPath(activeProject, entry.logicalPath),
+              sha256: entry.sha256,
+            })),
           });
           if (!currentCanonicalIdentityMatches(body.identity) || engine.getSource() !== source || engine.srcRev !== rev) {
             return { ok: false, adopted: false, reason: 'source-identity-changed' };

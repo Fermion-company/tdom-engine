@@ -225,8 +225,9 @@ export class CheckpointEngine {
     )) {
       // A combined root+overlay request advances both input dimensions. If
       // the root later returns to old bytes, its prior canonical generation
-      // must still be rejected because the child universe has changed.
-      this.canonical.invalidateInputs();
+      // is reused only when every changed child hashes back to its compiled
+      // bytes (canonical content identity); otherwise it stays rejected.
+      this.canonical.invalidateInputs(projectInputChanges);
     }
     this.store.applyEdit(file, start, end, replacement);
     const editContext = Object.freeze({
@@ -1792,19 +1793,17 @@ export class CheckpointEngine {
   }
 
   async refresh(inputChanges = {}) {
-    this.canonical.invalidateInputs();
     const changed = Array.isArray(inputChanges)
       ? inputChanges
       : Array.isArray(inputChanges.changed) ? inputChanges.changed : [];
     const removed = Array.isArray(inputChanges?.removed) ? inputChanges.removed : [];
-    return this.#update({
-      editLabel: 'external-include',
-      projectInputChanges: {
-        changed: [...changed],
-        removed: [...removed],
-        unknown: inputChanges?.unknown === true || (!changed.length && !removed.length),
-      },
-    });
+    const projectInputChanges = {
+      changed: [...changed],
+      removed: [...removed],
+      unknown: inputChanges?.unknown === true || (!changed.length && !removed.length),
+    };
+    this.canonical.invalidateInputs(projectInputChanges);
+    return this.#update({ editLabel: 'external-include', projectInputChanges });
   }
 
   invalidateProjectInputs(paths = []) {
@@ -1814,7 +1813,7 @@ export class CheckpointEngine {
         this.includes.delete(identity);
       }
     }
-    this.canonical.invalidateInputs();
+    this.canonical.invalidateInputs({ changed: [...changed] });
   }
 
   #displayList(page) {

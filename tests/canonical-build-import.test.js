@@ -85,6 +85,16 @@ test('Build import validates the current root and every project input recorded b
       { logicalPath: data.main, recordedPath: data.main },
       { logicalPath: data.child, recordedPath: data.child },
     ]);
+    // Every non-root project input with the hash of the bytes Build compiled:
+    // the canonical layer rebinds this generation to a later revision whose
+    // changed inputs hash back to exactly these bytes.
+    assert.deepEqual(
+      [...result.inputManifest].sort((a, b) => a.logicalPath.localeCompare(b.logicalPath)),
+      [
+        { logicalPath: data.child, sha256: hash(readFileSync(data.child)) },
+        { logicalPath: data.image, sha256: hash(readFileSync(data.image)) },
+      ]
+    );
     assert.deepEqual(result.assumptions, ['system-inputs-stable-for-process', 'fls-observable-inputs-only']);
   } finally {
     rmSync(data.root, { recursive: true, force: true });

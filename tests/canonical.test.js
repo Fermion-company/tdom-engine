@@ -3,6 +3,7 @@
 //   2. unknown/unsafe structure demotes to opaque instead of breaking.
 
 import { test } from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import {
   rmSync,
@@ -1022,5 +1023,178 @@ test('incremental pagination matches a from-scratch build after edits', opts, as
     }
   } finally {
     await eng.close();
+  }
+});
+
+// ------------------------------------------ content identity (issue #52, D)
+//
+// A child-file edit advances the canonical input epoch. Restoring the child to
+// the bytes the last generation was compiled from must rebind that generation
+// to the current revision at once (so the next anchor anywhere in the document
+// has canonical.rev === srcRev) instead of waiting for a full recompile.
+
+const IDENTITY_ROOT = [
+  '\\documentclass{article}',
+  '\\begin{document}',
+  'Root paragraph.',
+  '',
+  '\\input{chapter}',
+  '\\end{document}',
+  '',
+].join('\n');
+
+function identityFixture(name) {
+  const work = WORK + name;
+  rmSync(work, { recursive: true, force: true });
+  const docDir = path.join(work, 'doc');
+  const overlayDir = path.join(work, 'overlay');
+  const canonDir = path.join(work, 'canon');
+  for (const dir of [docDir, overlayDir, canonDir]) mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(docDir, 'chapter.tex'), 'Chapter text A.\n');
+  return { work, docDir, overlayDir, canonDir };
+}
+
+async function untilRunning(c, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!c.running) {
+    if (Date.now() > deadline) throw new Error('compile did not start');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+test('content identity: a child restored to its compiled bytes rebinds the last generation', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-identity');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  const results = [];
+  c.onResult = (info) => results.push({ id: info.id, rev: info.rev, rebound: info.rebound });
+  try {
+    const gen = await c.ensure(IDENTITY_ROOT, 1);
+    const child = path.join(c.docDir, 'chapter.tex');
+    const overlay = path.join(c.overlayDir, 'chapter.tex');
+    assert.ok(gen.inputManifest instanceof Map, 'the recorder file list yields an input manifest');
+    assert.equal(gen.inputManifest.get(child), createHash('sha256').update('Chapter text A.\n').digest('hex'),
+      'the manifest hashes the child bytes LuaLaTeX read');
+    assert.ok(![...gen.inputManifest.keys()].some((file) => file.endsWith('canon.tex')), 'the root is not an input');
+    assert.ok(![...gen.inputManifest.keys()].some((file) => /texmf/.test(file)), 'system files are not tracked');
+
+    // an unsaved child edit: not the compiled content, a compile is queued
+    writeFileSync(overlay, 'Chapter text AQ.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false);
+    c.schedule(IDENTITY_ROOT, 2);
+    assert.equal(c.pendingJob?.rev, 2);
+    assert.equal(c.info().rev, 1);
+
+    // the edit is undone: the generation is the exact compile of revision 3
+    writeFileSync(overlay, 'Chapter text A.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), true, 'restored bytes match the manifest');
+    results.length = 0;
+    c.schedule(IDENTITY_ROOT, 3);
+    assert.equal(c.pendingJob, null, 'no compile is queued for compiled content');
+    assert.equal(c.timer, null);
+    assert.equal(c.info().id, gen.id);
+    assert.equal(c.info().rev, 3, 'rebound synchronously to the current revision');
+    assert.equal(c.info().rebound, 1);
+    assert.equal(gen.inputEpoch, c.inputEpoch, 'the generation now owns the current input epoch');
+    assert.deepEqual(results, [{ id: gen.id, rev: 3, rebound: 1 }], 'observers see the rebound revision');
+    const certificate = c.generationCertificate();
+    assert.equal(certificate.rev, 3);
+    assert.equal(certificate.inputEpoch, c.inputEpoch);
+    await c.settle();
+    assert.equal(c.info().rev, 3);
+    assert.equal(c.info().error, null);
+    assert.equal(c.generations.size, 1, 'nothing was compiled');
+
+    // effective bytes follow TeX's search order: overlay first, then disk
+    writeFileSync(child, 'Chapter text B.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), true, 'disk is shadowed by the overlay');
+    rmSync(overlay);
+    c.invalidateInputs({ removed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false, 'without the overlay TeX would read B');
+    writeFileSync(child, 'Chapter text A.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), true);
+
+    // fail closed: a change outside the compile's inputs, or an unknown set
+    c.invalidateInputs({ changed: [path.join(c.docDir, 'never-read.tex')] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false, 'a path this compile never read is unprovable');
+    c.schedule(IDENTITY_ROOT, 4);
+    assert.equal(c.pendingJob?.rev, 4, 'unprovable inputs compile again');
+    await c.settle();
+    assert.equal(c.info().rev, 4);
+    assert.notEqual(c.info().id, gen.id, 'a real compile produced the next generation');
+    c.invalidateInputs({ unknown: true });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false, 'an unknown change set is unprovable');
+    c.invalidateInputs();
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false);
+  } finally {
+    c.dispose();
+  }
+});
+
+test('content identity: a root round-trip during a compile rebinds and retires the stale compile', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-identity-stale');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    const gen = await c.ensure(IDENTITY_ROOT, 1);
+    const edited = IDENTITY_ROOT.replace('Root paragraph.', 'Root paragraph edited.');
+    c.schedule(edited, 2);
+    const settled = c.settle();
+    await untilRunning(c);
+    assert.equal(c.runningJob?.rev, 2);
+    // the edit is undone while revision 2 compiles: revision 3 is compiled
+    // content, and the running compile's result must not move canonical back
+    c.schedule(IDENTITY_ROOT, 3);
+    assert.equal(c.info().id, gen.id);
+    assert.equal(c.info().rev, 3);
+    await settled;
+    assert.equal(c.info().id, gen.id, 'the stale compile did not replace the rebound generation');
+    assert.equal(c.info().rev, 3);
+    assert.equal(c.info().error, null, 'a retired compile is not an error');
+    assert.deepEqual([...c.generations.values()].map((g) => g.rev), [3], 'revision 2 never registered');
+  } finally {
+    c.dispose();
+  }
+});
+
+const MULTI_PASS_ROOT = [
+  '\\documentclass{article}',
+  '\\begin{document}',
+  '\\tableofcontents',
+  '\\section{First}',
+  'Body one.',
+  '\\newpage',
+  '\\section{Second}',
+  'Body two.',
+  '\\end{document}',
+  '',
+].join('\n');
+
+test('scheduled compiles yield between passes to a newer revision', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-passes');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    const gen = await c.ensure(MULTI_PASS_ROOT, 1);
+    assert.ok(gen.passes >= 2, `table of contents needs a second pass (got ${gen.passes})`);
+    // a heading edit rewrites the table of contents: revision 2 needs a
+    // second pass, and a fixpoint reached in one pass is published as usual
+    c.schedule(MULTI_PASS_ROOT.replace('\\section{First}', '\\section{First, revised}'), 2);
+    const settled = c.settle();
+    await untilRunning(c);
+    assert.equal(c.runningJob?.rev, 2);
+    // a newer edit lands during pass one of revision 2
+    const newest = MULTI_PASS_ROOT.replace('Body two.', 'Body two, newest.');
+    c.schedule(newest, 3);
+    await settled;
+    assert.equal(c.info().rev, 3, 'converged on the newest revision');
+    assert.equal(c.info().error, null);
+    assert.deepEqual([...c.generations.values()].map((g) => g.rev), [1, 3],
+      'the superseded revision 2 was abandoned after its pass instead of published');
+    const texts = await c.pageTexts();
+    if (texts) assert.match(texts.join('\n'), /Body two, newest/);
+  } finally {
+    c.dispose();
   }
 });

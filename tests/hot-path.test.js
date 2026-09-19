@@ -1250,6 +1250,18 @@ test('one wholly-owned child prose edit keeps a frozen canonical input lineage',
   assert.equal(firstPlan?.baseSnapshot, baseSnapshot);
   assert.equal(firstPlan?.inputEpoch, 5);
 
+  // Content identity rebound the generation to this very revision (the edit
+  // restored compiled bytes): the exact pages already cover the source.
+  const currentDiagnostics = {};
+  const currentPlan = planTerminalCanonicalAnchor({
+    blocks: [current('Alpha prose B')], domBlocks: [dom],
+    report: { ...report(11, 'Bravo'), canonical: { id: 7, rev: 11, pageCount: 316 } },
+    geometry: { textheight: 680 }, edit: firstEdit, baseSnapshot, inputEpoch: 5,
+    diagnostics: currentDiagnostics,
+  });
+  assert.equal(currentPlan, null);
+  assert.equal(currentDiagnostics.reason, 'canonical-current');
+
   const secondEdit = { ...singlePlainTextDelta('Alpha prose B', 'Alpha prose C'), file: child };
   const secondPlan = planTerminalCanonicalAnchor({
     blocks: [current('Alpha prose C')], domBlocks: [dom], report: report(12, 'Charlie'),

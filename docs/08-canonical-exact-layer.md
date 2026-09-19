@@ -28,6 +28,35 @@ structured mode では `pressure = 'authority'` で、基本 debounce に加え�
 
 `GET /pdf` は `engine.exportPDF()` 経由で `canonical.ensure()` を呼ぶ。表示用 checkpoint state から PDF を作る経路はない。
 
+### 8.2a content identity（世代の再束縛）
+
+generation の同一性は「root source のバイト列」と「compile が読んだ project input のバイト列」で決まる。
+root は `srcHash` が、input は `inputManifest`（logical path → sha256、`-recorder` の `canon.fls` から採取。
+Build 取り込みでは `.fls` 検証済みの records から受け取る）が担う。
+
+`inputEpoch` は子ファイル編集・外部変更・bibliography 更新のたびに単調増加するが、その epoch ごとに
+「どの logical path を無効化したか」を `inputInvalidations` に記録する。ある generation について、
+
+1. root が `srcHash` と一致し、
+2. generation の epoch 以降に無効化された path がすべて既知で、
+3. その path がすべて manifest に含まれ、現在 TeX が読むバイト列（overlay があれば overlay、なければ disk）の sha256 が manifest と一致する
+
+とき、その generation は現在 revision の exact compile である。`schedule()` はこれを同期的に判定し、
+`last` を現在 rev / epoch に再束縛して pending job を捨てる（`info().rebound` が回数）。編集応答の
+`canonical.rev === srcRev` になり、次の anchor はどのブロックでも即座に certified base を持てる。
+Build 直後に別章を編集して元に戻す往復はこれで recompile を要しない。
+
+証明できない場合（manifest なし、`unknown` な変更集合、compile が読んでいない path の変更、読めない入力、
+記憶上限を超えた古い epoch）は従来どおり fail closed で再 compile する。再束縛は `last` にのみ行い、
+より古い retained generation へは戻さない。compile 中に入力が無効化された generation は manifest を持たない。
+
+### 8.2b pass 間の譲り渡し
+
+`#drain` が起動した scheduled compile は、各 LuaLaTeX pass の正常終了時に「より新しい rev の pending job
+がある」か「再束縛で `last.rev` が自分の rev を追い越した」場合、追加 pass と publish を中止して最新へ進む
+（`tdomSuperseded`、エラーとして報告しない）。最初の baseline と `ensure()`（export・Build）は対象外で、
+依頼された snapshot を必ず組む。1 pass で fixpoint に達した compile はそのまま publish される。
+
 ## 8.3 client convergence
 
 `server.js` は canonical compile が着地すると SSE `canonical` event を送る。client は compile id を付けて `/canonical/:n.svg?c=<id>` を取りに行く。stale id なら 404 になり、現在の id で取り直す。

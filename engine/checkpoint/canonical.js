@@ -34,12 +34,14 @@ import {
   copyFileSync,
   renameSync,
   realpathSync,
+  statSync,
 } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { fnv1a } from '../hash.js';
-import { withProjectInputs } from '../project-inputs.js';
+import { withProjectInputs, isPathInside } from '../project-inputs.js';
+import { parseFlsFiles, MAX_FLS_INPUTS } from './fls.js';
 import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-index.js';
 import { pdfEditGlyphs } from './pdf-edit-geometry.js';
 import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
@@ -55,10 +57,15 @@ const SVG_CACHE_MAX = 400; // pages kept as SVG strings (LRU)
 // The fixed window prevents a long editing session from retaining files
 // without bound.
 const GENERATION_MAX = 4;
+// Input invalidations remembered for content identity (one per child edit,
+// external change or bibliography refresh). Older generations cannot be
+// proven current and compile again, exactly as before.
+const INPUT_INVALIDATION_MAX = 512;
+const INPUT_HASH_CACHE_MAX = 4096;
 const BUILD_LEASE_DEFAULT_MS = 660_000;
 const BUILD_LEASE_MAX_MS = 900_000;
 const SYNCTEX_HELPER_PREPARE_MS = 15_000;
-const MUTABLE_COMPILE_ARTIFACT = /(?:^canon\.(?:log|pdf|synctex\.gz)$|\.(?:aux|bcf|blg|idx|ind|ilg|glo|gls|glg|acn|acr|alg|lof|lot|nav|out|run\.xml|snm|toc|vrb)$)/;
+const MUTABLE_COMPILE_ARTIFACT = /(?:^canon\.(?:fls|log|pdf|synctex\.gz)$|\.(?:aux|bcf|blg|idx|ind|ilg|glo|gls|glg|acn|acr|alg|lof|lot|nav|out|run\.xml|snm|toc|vrb)$)/;
 
 export class CanonicalRenderer {
   constructor({
@@ -185,6 +192,11 @@ export class CanonicalRenderer {
     // invalidate the canonical cache without defeating normal source-hash
     // reuse.
     this.inputEpoch = 0;
+    // epoch -> Set of logical input paths that epoch invalidated, or null when
+    // the change set was unknown. Lets a generation prove that every input
+    // changed since its compile is back to the bytes it was compiled from.
+    this.inputInvalidations = new Map();
+    this.inputHashCache = new Map(); // readPath -> {size, mtimeMs, ino, sha256}
     this.syncTeXHelperPreparation = null;
     // The first anchor proof has a 700 ms post-typeset deadline, while a cold
     // helper build can take longer. Compile its document-independent binary
@@ -198,6 +210,162 @@ export class CanonicalRenderer {
 
   compilationIdentity(source) {
     return { inputEpoch: this.inputEpoch, srcHash: this.#sourceHash(source) };
+  }
+
+  // ------------------------------------------------- content identity
+  //
+  // A generation is compiled from the root source text plus every project
+  // input TeX read. The root is covered by `srcHash`; the inputs by an
+  // `inputManifest` (logical path -> sha256 of the bytes TeX read) taken from
+  // the recorder file list. `inputEpoch` still advances on every child edit,
+  // external change or bibliography refresh, but a generation whose root
+  // matches and whose changed inputs all hash back to their manifest bytes is
+  // the exact compile of the current revision: it is rebound to that revision
+  // instead of being compiled again. Anything unprovable (no manifest, an
+  // unknown change set, a changed path the compile never read, an unreadable
+  // input) keeps the old fail-closed answer.
+
+  /** Normalize a project input to one spelling: real path, overlay -> logical. */
+  #inputIdentity(file) {
+    const resolved = path.resolve(file);
+    let real = resolved;
+    try {
+      real = realpathSync(resolved);
+    } catch {
+      try { real = path.join(realpathSync(path.dirname(resolved)), path.basename(resolved)); }
+      catch { real = resolved; }
+    }
+    if (this.overlayDir && isPathInside(this.overlayDir, real)) {
+      return path.join(this.docDir, path.relative(this.overlayDir, real));
+    }
+    return real;
+  }
+
+  /** The file TeX reads for a logical project input right now. */
+  #effectiveInputPath(logical) {
+    if (this.overlayDir && isPathInside(this.docDir, logical)) {
+      const overlay = path.join(this.overlayDir, path.relative(this.docDir, logical));
+      if (existsSync(overlay)) return overlay;
+    }
+    return logical;
+  }
+
+  /** sha256 of the bytes TeX would read for a logical input, or null. */
+  #effectiveInputHash(logical) {
+    const readPath = this.#effectiveInputPath(logical);
+    let stats;
+    try { stats = statSync(readPath); } catch { return null; }
+    if (!stats.isFile()) return null;
+    const cached = this.inputHashCache.get(readPath);
+    if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ino === stats.ino) {
+      return cached.sha256;
+    }
+    let sha256;
+    try { sha256 = createHash('sha256').update(readFileSync(readPath)).digest('hex'); } catch { return null; }
+    if (this.inputHashCache.size >= INPUT_HASH_CACHE_MAX) {
+      this.inputHashCache.delete(this.inputHashCache.keys().next().value);
+    }
+    this.inputHashCache.set(readPath, { size: stats.size, mtimeMs: stats.mtimeMs, ino: stats.ino, sha256 });
+    return sha256;
+  }
+
+  /** Manifest of the project inputs the compile that just finished read. */
+  #inputManifestFromRecorder() {
+    let text;
+    try { text = readFileSync(path.join(this.workDir, 'canon.fls'), 'utf8'); } catch { return null; }
+    const files = parseFlsFiles(text, this.docDir);
+    if (!files) return null;
+    const rootTex = path.join(this.workDir, 'canon.tex');
+    const manifest = new Map();
+    for (const recorded of files.inputs) {
+      if (files.outputs.has(recorded)) continue;
+      const logical = this.#inputIdentity(recorded);
+      if (logical === rootTex || manifest.has(logical)) continue;
+      if (!isPathInside(this.docDir, logical) && !isPathInside(this.workDir, logical)) continue;
+      const sha256 = this.#effectiveInputHash(logical);
+      if (!sha256) return null;
+      manifest.set(logical, sha256);
+      if (manifest.size > MAX_FLS_INPUTS) return null;
+    }
+    return manifest;
+  }
+
+  /** Validate a manifest handed in by the Build import. */
+  #inputManifestFromRecords(records) {
+    if (!Array.isArray(records)) return null;
+    const manifest = new Map();
+    for (const record of records) {
+      if (typeof record?.logicalPath !== 'string' || !path.isAbsolute(record.logicalPath) ||
+          !/^[0-9a-f]{64}$/i.test(String(record.sha256 || ''))) return null;
+      manifest.set(this.#inputIdentity(record.logicalPath), String(record.sha256).toLowerCase());
+      if (manifest.size > MAX_FLS_INPUTS) return null;
+    }
+    return manifest;
+  }
+
+  /** Every input invalidated after the generation is back to its compiled bytes. */
+  #inputsUnchangedSince(generation) {
+    const manifest = generation.inputManifest;
+    if (!(manifest instanceof Map)) return false;
+    const changed = new Set();
+    for (let epoch = generation.inputEpoch + 1; epoch <= this.inputEpoch; epoch++) {
+      const paths = this.inputInvalidations.get(epoch);
+      if (!paths) return false; // unknown change set, or forgotten epoch
+      for (const file of paths) changed.add(file);
+    }
+    for (const logical of changed) {
+      const expected = manifest.get(logical);
+      if (!expected) return false; // a file this compile never read: unprovable
+      if (this.#effectiveInputHash(logical) !== expected) return false;
+    }
+    return true;
+  }
+
+  /** True when `generation` is the exact compile of `source` under the current inputs. */
+  #generationCurrent(generation, source) {
+    if (!generation || typeof source !== 'string') return false;
+    if (generation.srcHash !== this.#sourceHash(source, generation.inputEpoch)) return false;
+    if (generation.inputEpoch === this.inputEpoch) return true;
+    return this.#inputsUnchangedSince(generation);
+  }
+
+  /**
+   * Bind the last good generation to `rev` when it already is the exact
+   * compile of `source`, and drop any compile queued for that same content.
+   * Returns true when no compile is needed. Never moves a revision backwards
+   * and never runs under a Build lease, whose adoption owns the pending job.
+   */
+  #reconcile(source, rev) {
+    const last = this.last;
+    if (!last || this.disposed || this.resetting || !Number.isSafeInteger(rev) || rev < last.rev) return false;
+    if (!this.#generationCurrent(last, source)) return false;
+    if (last.rev !== rev || last.inputEpoch !== this.inputEpoch) {
+      last.rev = rev;
+      last.inputEpoch = this.inputEpoch;
+      last.srcHash = this.#sourceHash(source);
+      last.rebound = (last.rebound ?? 0) + 1;
+    }
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.timerDueAt = 0;
+    const job = this.pendingJob;
+    this.pendingJob = null;
+    this.lastError = null;
+    if (job) this.#clearDisplayDemand(job);
+    try {
+      this.onResult?.(this.info());
+    } catch {
+      /* observer errors must not break the edit path */
+    }
+    return true;
+  }
+
+  /** A compile whose result nobody wants any more: a rebind already made a
+   * newer revision current, or (for scheduled work) a newer edit is queued. */
+  #compileObsolete(rev, { pending = false } = {}) {
+    if (!this.last) return false; // the first baseline always lands
+    if (this.last.rev > rev) return true;
+    return pending && !!this.pendingJob && this.pendingJob.rev > rev;
   }
 
   ownsBuildLease(requestId, token) {
@@ -262,11 +430,13 @@ export class CanonicalRenderer {
     if ((generation.readers ?? 0) === 0) this.#deleteGenerationFiles(generation);
   }
 
-  #registerGeneration(generation) {
+  #registerGeneration(generation, { promote = true } = {}) {
     if (this.coldBaselineCatchup &&
         generation.id !== this.coldBaselineCatchup.baselineId) this.coldBaselineCatchup = null;
     this.generations.set(generation.id, generation);
-    this.last = generation;
+    // An export snapshot that a rebind overtook is retained for its caller
+    // but never promoted: canonical must not move to an older revision.
+    if (promote) this.last = generation;
     while (this.generations.size > GENERATION_MAX) {
       const oldestId = this.generations.keys().next().value;
       const oldest = this.generations.get(oldestId);
@@ -298,7 +468,7 @@ export class CanonicalRenderer {
 
   #removeWorkArtifacts() {
     for (const name of readFileNames(this.workDir)) {
-      if (/^canon(?:-\d+)?\.(?:aux|bbl|bcf|blg|log|lof|lot|out|pdf|run\.xml|svg|synctex\.gz|tex|toc)$/.test(name) ||
+      if (/^canon(?:-\d+)?\.(?:aux|bbl|bcf|blg|fls|log|lof|lot|out|pdf|run\.xml|svg|synctex\.gz|tex|toc)$/.test(name) ||
           /^canon-\d+-p\d+(?:-\d+)?\.svg$/.test(name) ||
           /^canon-import-[0-9a-f-]+\.(?:pdf|synctex\.gz)$/.test(name)) {
         rmSync(path.join(this.workDir, name), { force: true });
@@ -544,6 +714,7 @@ export class CanonicalRenderer {
     synctexHash,
     seedFiles = {},
     syncInputMap = [],
+    inputManifest = [],
     profile = null,
     passes = 0,
     ms = 0,
@@ -637,6 +808,7 @@ export class CanonicalRenderer {
         seedFiles: allowedSeeds,
         syncInputMap: inputMap,
         syncOutputMap: outputMap,
+        inputManifest: this.#inputManifestFromRecords(inputManifest),
         profile: profile ? structuredClone(profile) : null,
         passes: Number.isSafeInteger(passes) && passes >= 0 ? passes : 0,
         ms: Number.isFinite(ms) && ms >= 0 ? Math.round(ms) : 0,
@@ -723,6 +895,7 @@ export class CanonicalRenderer {
       seedFiles: prepared.seedFiles,
       syncInputMap: prepared.syncInputMap,
       syncOutputMap: prepared.syncOutputMap,
+      inputManifest: prepared.inputManifest instanceof Map ? prepared.inputManifest : null,
       importedBuildProfile: prepared.profile,
     };
     clearTimeout(this.timer);
@@ -754,6 +927,7 @@ export class CanonicalRenderer {
       papers: this.last?.papers ?? (this.last?.paper ? [this.last.paper] : []),
       passes: this.last?.passes ?? 0,
       ms: this.last?.ms ?? 0,
+      rebound: this.last?.rebound ?? 0,
       inFlight: !!(this.running || this.timer || this.pendingJob),
       compiling: Boolean(this.running),
       runningRev: this.runningJob?.rev ?? null,
@@ -785,6 +959,11 @@ export class CanonicalRenderer {
     // audit runs (fuzz on CI) compare provisional state only — a full
     // lualatex per engine would OOM a 7GB hosted runner for nothing
     if (process.env.TDOM_NO_CANONICAL === '1') return;
+    // The edits round-tripped back to compiled content (a root undo, or a
+    // child file restored to its compiled bytes): the last generation is the
+    // exact compile of this revision and is rebound to it right here, so the
+    // edit response and the next anchor see canonical.rev === srcRev.
+    if (!this.buildLease && this.#reconcile(source, rev)) return;
     this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now(), fallbackReason };
     if (this.coldBaselineCatchup && !this.#hasColdBaselineCatchup(this.pendingJob)) {
       this.coldBaselineCatchup = null;
@@ -942,14 +1121,12 @@ export class CanonicalRenderer {
    */
   async ensure(source, rev) {
     await this.waitForBuildLease();
-    let inputEpoch = this.inputEpoch;
-    let srcHash = this.#sourceHash(source, inputEpoch);
-    if (this.last && this.last.srcHash === srcHash) return this.last;
+    if (this.#reconcile(source, rev)) return this.last;
     while (this.running) await this.running;
     if (this.disposed) throw new Error('renderer disposed');
-    inputEpoch = this.inputEpoch;
-    srcHash = this.#sourceHash(source, inputEpoch);
-    if (this.last && this.last.srcHash === srcHash) return this.last;
+    if (this.#reconcile(source, rev)) return this.last;
+    const inputEpoch = this.inputEpoch;
+    const srcHash = this.#sourceHash(source, inputEpoch);
     // No await between the check above and this assignment: #drain and
     // ensure both claim `running` synchronously, so two compiles can never
     // share the workdir.
@@ -957,7 +1134,7 @@ export class CanonicalRenderer {
     this.runningJob = { rev, inputEpoch };
     this.running = this.#compile({ source, rev, inputEpoch, compileEpoch })
       .catch((err) => {
-        if (compileEpoch !== this.compileEpoch) return;
+        if (compileEpoch !== this.compileEpoch || err?.tdomSuperseded) return;
         this.lastError = { rev, message: String(err?.message || err) };
       })
       .finally(() => {
@@ -965,10 +1142,19 @@ export class CanonicalRenderer {
         this.runningJob = null;
         this.#clearDisplayDemand({ rev, inputEpoch });
       });
-    await this.running;
+    const compiled = await this.running;
     if (compileEpoch !== this.compileEpoch) {
-      if (this.last && this.last.srcHash === srcHash) return this.last;
+      if (this.#generationCurrent(this.last, source)) return this.last;
       throw new Error('canonical compile superseded');
+    }
+    if (compiled?.srcHash === srcHash && this.generations.has(compiled.id)) {
+      this.lastEndAt = Date.now();
+      try {
+        this.onResult?.(this.info());
+      } catch {
+        /* observer errors must not break the export path */
+      }
+      return compiled;
     }
     this.lastEndAt = Date.now();
     try {
@@ -977,6 +1163,7 @@ export class CanonicalRenderer {
       /* observer errors must not break the export path */
     }
     if (this.last && this.last.srcHash === srcHash) return this.last;
+    if (this.#reconcile(source, rev)) return this.last;
     throw new Error(this.lastError?.message || 'canonical compile failed');
   }
 
@@ -1014,17 +1201,11 @@ export class CanonicalRenderer {
     }
     if (this.#hasColdBaselineCatchup(job)) this.coldBaselineCatchup = null;
     this.pendingJob = null;
-    if (this.last && this.last.srcHash === this.#sourceHash(job.source, job.inputEpoch)) {
+    if (this.#generationCurrent(this.last, job.source)) {
       // the newest source is already compiled (an export ran it, or the
       // edits round-tripped back) — record the rev, skip the compile
-      this.last.rev = job.rev;
-      this.lastError = null;
       this.#clearDisplayDemand(job);
-      try {
-        this.onResult?.(this.info());
-      } catch {
-        /* observer errors must not break the drain loop */
-      }
+      this.#reconcile(job.source, job.rev);
       return;
     }
     const startedWithoutCanonical = !this.last;
@@ -1037,9 +1218,12 @@ export class CanonicalRenderer {
       // complete-PDF path. Export, opaque display and demanded revisions stay
       // at normal priority because the user is directly waiting for them.
       background: this.pressure === 'authority' && !job.fallbackReason && !this.#hasDisplayDemand(job),
+      // Scheduled work yields between passes once a newer edit is queued or
+      // a rebind made a newer revision current; export/ensure never does.
+      superseding: true,
     })
       .catch((err) => {
-        if (compileEpoch !== this.compileEpoch) return;
+        if (compileEpoch !== this.compileEpoch || err?.tdomSuperseded) return;
         this.lastError = { rev: job.rev, message: String(err?.message || err) };
         // execFile's wall timeout keeps advancing while SIGSTOP holds a
         // pre-existing compile. Preserve that exact job for one normal
@@ -1084,7 +1268,12 @@ export class CanonicalRenderer {
   }
 
   async #compile({ source, rev, inputEpoch = this.inputEpoch, background = false,
-    compileEpoch = this.compileEpoch }) {
+    compileEpoch = this.compileEpoch, superseding = false }) {
+    const superseded = () => {
+      const err = new Error('canonical compile superseded');
+      err.tdomSuperseded = true;
+      return err;
+    };
     const t0 = performance.now();
     const srcHash = this.#sourceHash(source, inputEpoch);
     const tex = path.join(this.workDir, 'canon.tex');
@@ -1115,7 +1304,15 @@ export class CanonicalRenderer {
       const changed = after !== before;
       before = after;
       if (!changed) break;
+      // Another pass of an obsolete snapshot only delays the revision the
+      // viewer is waiting for. The first baseline is exempt (#compileObsolete).
+      if (superseding && this.#compileObsolete(rev, { pending: true })) throw superseded();
     }
+    // A rebind made a newer revision current while this snapshot compiled:
+    // publishing it would move canonical backwards. Scheduled work stops
+    // here; an export keeps its bytes without promotion.
+    const obsolete = this.#compileObsolete(rev);
+    if (obsolete && superseding) throw superseded();
     const pdf = path.join(this.workDir, 'canon.pdf');
     const pageCount = pageCountFrom(log);
     if (!existsSync(pdf) || !pageCount) {
@@ -1141,11 +1338,15 @@ export class CanonicalRenderer {
       const file = path.join(this.workDir, name);
       if (existsSync(file)) seedFiles[path.extname(name).slice(1)] = readFileSync(file, 'utf8');
     }
+    // Only a compile no input change interrupted can vouch for the bytes it
+    // read; otherwise the generation keeps epoch-only identity.
+    const inputManifest = inputEpoch === this.inputEpoch ? this.#inputManifestFromRecorder() : null;
     const generation = {
       id,
       rev,
       srcHash,
       inputEpoch,
+      inputManifest,
       pdf: kept,
       synctex: hasSynctex ? keptSynctex : null,
       pdfHash: sha256File(kept),
@@ -1170,7 +1371,7 @@ export class CanonicalRenderer {
       this.#deleteGenerationFiles(generation);
       throw new Error(this.disposed ? 'renderer disposed' : 'canonical compile superseded');
     }
-    this.#registerGeneration(generation);
+    this.#registerGeneration(generation, { promote: !obsolete });
     // Keep PDF import/open off the typing path. This intentionally does not
     // await: canonical pixels are already committed and the index is merely
     // an optional fast-proof accelerator.
@@ -1188,6 +1389,7 @@ export class CanonicalRenderer {
     try {
       const latexArgs = [
         '-synctex=1',
+        '-recorder',
         '-interaction=nonstopmode',
         '-halt-on-error',
         '-output-directory',
@@ -1545,8 +1747,7 @@ export class CanonicalRenderer {
   /** True only when the supplied resident source is byte-identical to the
    * source/input epoch that produced one retained canonical generation. */
   sourceMatches(source, id = null) {
-    const generation = this.#resolveGeneration(id);
-    return Boolean(generation && generation.srcHash === this.#sourceHash(source, generation.inputEpoch));
+    return this.#generationCurrent(this.#resolveGeneration(id), source);
   }
 
   /** Immutable identity used by anchor tickets and tests. */
@@ -1828,9 +2029,25 @@ export class CanonicalRenderer {
     return readFileSync(this.last.pdf);
   }
 
-  /** Mark non-source inputs dirty. The next schedule/ensure compiles again. */
-  invalidateInputs() {
+  /** Mark non-source inputs dirty. The next schedule/ensure compiles again
+   * unless every path in `changes` hashes back to the bytes the last
+   * generation was compiled from. No `changes` (or `unknown`) records an
+   * unprovable epoch. */
+  invalidateInputs(changes = null) {
     this.inputEpoch++;
+    let paths = null;
+    if (changes && changes.unknown !== true) {
+      paths = new Set();
+      for (const list of [changes.changed, changes.removed]) {
+        for (const file of Array.isArray(list) ? list : []) {
+          if (typeof file === 'string' && file) paths.add(this.#inputIdentity(file));
+        }
+      }
+    }
+    this.inputInvalidations.set(this.inputEpoch, paths);
+    while (this.inputInvalidations.size > INPUT_INVALIDATION_MAX) {
+      this.inputInvalidations.delete(this.inputInvalidations.keys().next().value);
+    }
     this.coldBaselineCatchup = null;
     this.displayDemand = null;
     this.activeDisplayDemandIds.clear();
@@ -1884,6 +2101,8 @@ export class CanonicalRenderer {
       this.lastError = null;
       this.lastEndAt = 0;
       this.inputEpoch++;
+      this.inputInvalidations.clear();
+      this.inputHashCache.clear();
       this.#removeWorkArtifacts();
     } finally {
       this.resetting = false;

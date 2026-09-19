@@ -4,6 +4,7 @@ import { gunzip as gunzipCallback } from 'node:zlib';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { isPathInside } from '../project-inputs.js';
+import { parseFlsFiles } from './fls.js';
 
 const gunzip = promisify(gunzipCallback);
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -43,27 +44,6 @@ async function readRegularHashed(descriptor, { maxBytes = MAX_ARTIFACT_BYTES, ro
   } catch {
     return null;
   }
-}
-
-function parseFlsFiles(text, cwd) {
-  const inputs = new Set();
-  const outputs = new Set();
-  let compileCwd = cwd;
-  for (const line of String(text || '').split(/\r?\n/)) {
-    if (!line.startsWith('PWD ')) continue;
-    const value = line.slice(4).trim();
-    if (path.isAbsolute(value)) compileCwd = path.resolve(value);
-    break;
-  }
-  for (const line of String(text || '').split(/\r?\n/)) {
-    const kind = line.startsWith('INPUT ') ? 'input' : line.startsWith('OUTPUT ') ? 'output' : null;
-    if (!kind) continue;
-    const raw = line.slice(kind === 'input' ? 6 : 7).trim();
-    if (!raw) continue;
-    (kind === 'input' ? inputs : outputs).add(path.resolve(compileCwd, raw));
-    if (inputs.size + outputs.size > MAX_INPUTS * 2) return null;
-  }
-  return { inputs, outputs, compileCwd };
 }
 
 function parseSyncTeXInputs(text, cwd) {
@@ -245,6 +225,16 @@ export async function validateCanonicalBuildImport({
     const read = await readRegularHashed(item, { root, maxBytes: 32 * 1024 * 1024 });
     if (read) seedFiles[ext] = read.bytes.toString('utf8');
   }
+  // Content identity of every non-root project input the recorder observed,
+  // hashed over the bytes TeX actually read (an unsaved overlay shadows disk).
+  // The canonical layer proves a later revision equal to this generation by
+  // re-hashing only the inputs that changed since.
+  const inputManifest = [];
+  for (const identity of required.keys()) {
+    if (identity === realRootFile) continue;
+    const record = byPath.get(identity);
+    inputManifest.push({ logicalPath: record.file, sha256: record.sha256 });
+  }
   return {
     accepted: true,
     requestId: candidate.requestId,
@@ -255,6 +245,7 @@ export async function validateCanonicalBuildImport({
     synctexHash: synctex.sha256,
     seedFiles,
     syncInputMap,
+    inputManifest,
     profile: candidate.profile,
     passes: Number.isSafeInteger(candidate.metrics?.passes) ? candidate.metrics.passes : 0,
     ms: candidate.metrics.durationMs,

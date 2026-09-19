@@ -499,6 +499,10 @@ export function planTerminalCanonicalAnchor({
   if (!canonicalAnchorPolicy && !residentEditCandidate &&
       canonical.pageCount === report.stats?.pageCount) return reject('not-needed');
   if (report.dirtySourceNodes?.length !== 1) return reject('dirty-blocks');
+  // The edit returned the document to compiled content and the canonical
+  // layer rebound its generation to this revision: the exact pages already
+  // cover the source, so no provisional overlay is needed.
+  if (canonical.rev === report.srcRev) return reject('canonical-current');
 
   const blockId = String(report.dirtySourceNodes[0]).replace(/^src-/, '');
   const immediateBase = canonical.rev === report.srcRev - 1;
