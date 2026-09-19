@@ -1439,6 +1439,7 @@ const server = http.createServer(async (req, res) => {
         url.pathname === '/opaque-editor-coordinator.js' ||
         url.pathname === '/direct-edit-geometry.js' ||
         url.pathname === '/viewport-math.js' ||
+        url.pathname === '/canonical-anchor-raster.js' ||
         url.pathname === '/style.css' ||
         url.pathname === '/compare.js')
     ) {

@@ -11,6 +11,11 @@ const INDEX = readFileSync(fileURLToPath(new URL('../web/index.html', import.met
 const SERVER = readFileSync(fileURLToPath(new URL('../server.js', import.meta.url)), 'utf8');
 const STYLE = readFileSync(fileURLToPath(new URL('../web/style.css', import.meta.url)), 'utf8');
 
+test('the VisualCut raster verifier is loaded and served by the preview origin', () => {
+  assert.match(INDEX, /<script src="\/canonical-anchor-raster\.js"><\/script>/);
+  assert.match(SERVER, /url\.pathname === '\/canonical-anchor-raster\.js'/);
+});
+
 const targetSrc = '/canonical/2.svg?c=42';
 const base = {
   pageNumber: 2,
