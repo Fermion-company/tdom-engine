@@ -122,6 +122,24 @@ async function beforeTimeout(promise, timeoutMs) {
   }
 }
 
+/** Build the document-independent range helper before a first proof needs it.
+ * Failure is deliberately non-fatal: range queries retain their per-line
+ * SyncTeX CLI fallback when a compiler or zlib is unavailable. */
+export async function prepareSyncTeXBatchHelper({
+  workDir,
+  timeoutMs = BUILD_TIMEOUT_MS,
+  run = execFileP,
+} = {}) {
+  if (typeof workDir !== 'string' || !workDir ||
+      !Number.isFinite(timeoutMs) || timeoutMs < 1 || typeof run !== 'function') return null;
+  const budget = Math.min(BUILD_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs)));
+  try {
+    return await beforeTimeout(ensureHelper(workDir, run, budget), budget);
+  } catch {
+    return null;
+  }
+}
+
 function finiteNumber(value) {
   return typeof value === 'number' && Number.isFinite(value);
 }
@@ -195,7 +213,8 @@ export async function querySyncTeXRange({
     const deadline = Date.now() + Math.min(QUERY_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs)));
     const buildBudget = deadline - Date.now();
     if (buildBudget < 1) return null;
-    const executable = await beforeTimeout(ensureHelper(workDir, run, buildBudget), buildBudget);
+    const executable = await prepareSyncTeXBatchHelper({ workDir, timeoutMs: buildBudget, run });
+    if (!executable) return null;
     const remaining = deadline - Date.now();
     if (remaining < 1) return null;
     const result = await run(executable, [

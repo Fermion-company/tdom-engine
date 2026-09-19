@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseSyncTeXBatchOutput, querySyncTeXRange } from '../engine/checkpoint/synctex-batch.js';
+import {
+  parseSyncTeXBatchOutput,
+  prepareSyncTeXBatchHelper,
+  querySyncTeXRange,
+} from '../engine/checkpoint/synctex-batch.js';
 import { CanonicalRenderer } from '../engine/checkpoint/canonical.js';
 
 function payload(groups, overrides = {}) {
@@ -49,6 +53,9 @@ test('SyncTeX batch process accepts complete output and fails closed on invalid 
     return { stdout: output, stderr: '' };
   };
   try {
+    const executable = await prepareSyncTeXBatchHelper({ workDir, timeoutMs: 1_000, run });
+    assert.equal(executable, path.join(workDir,
+      process.platform === 'win32' ? 'tdom-synctex-batch.exe' : 'tdom-synctex-batch'));
     const groups = await querySyncTeXRange({
       workDir,
       pdf: '/paper/main.pdf',
@@ -59,7 +66,8 @@ test('SyncTeX batch process accepts complete output and fails closed on invalid 
       run,
     });
     assert.equal(groups?.[0]?.[0]?.page, 2);
-    assert.equal(calls.filter((call) => call.command === 'cc').length, 1);
+    assert.equal(calls.filter((call) => call.command === 'cc').length, 1,
+      'range query reuses the proactively prepared helper');
     assert.deepEqual(calls.at(-1).args, ['/paper/main.pdf', '/paper/main.tex', '8', '8', '1']);
     output = '{"schemaVersion":1,"complete":true';
     assert.equal(await querySyncTeXRange({

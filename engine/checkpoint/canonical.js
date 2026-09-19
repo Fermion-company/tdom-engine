@@ -43,7 +43,7 @@ import { withProjectInputs } from '../project-inputs.js';
 import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-index.js';
 import { pdfEditGlyphs } from './pdf-edit-geometry.js';
 import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
-import { querySyncTeXRange } from './synctex-batch.js';
+import { prepareSyncTeXBatchHelper, querySyncTeXRange } from './synctex-batch.js';
 
 const execFileP = promisify(execFile);
 const gunzipP = promisify(gunzip);
@@ -57,6 +57,7 @@ const SVG_CACHE_MAX = 400; // pages kept as SVG strings (LRU)
 const GENERATION_MAX = 4;
 const BUILD_LEASE_DEFAULT_MS = 660_000;
 const BUILD_LEASE_MAX_MS = 900_000;
+const SYNCTEX_HELPER_PREPARE_MS = 15_000;
 const MUTABLE_COMPILE_ARTIFACT = /(?:^canon\.(?:log|pdf|synctex\.gz)$|\.(?:aux|bcf|blg|idx|ind|ilg|glo|gls|glg|acn|acr|alg|lof|lot|nav|out|run\.xml|snm|toc|vrb)$)/;
 
 export class CanonicalRenderer {
@@ -184,6 +185,11 @@ export class CanonicalRenderer {
     // invalidate the canonical cache without defeating normal source-hash
     // reuse.
     this.inputEpoch = 0;
+    this.syncTeXHelperPreparation = null;
+    // The first anchor proof has a 700 ms post-typeset deadline, while a cold
+    // helper build can take longer. Compile its document-independent binary
+    // beside ordinary renderer initialization, before any canonical arrives.
+    void this.prepareSyncTeXHelper();
   }
 
   #sourceHash(source, inputEpoch = this.inputEpoch) {
@@ -325,7 +331,9 @@ export class CanonicalRenderer {
       ...this.paintPageInFlight.values(),
       ...this.syncTransformInFlight.values(),
       ...this.sourceBoxInFlight,
+      this.syncTeXHelperPreparation,
     ]);
+    jobs.delete(null);
     if (jobs.size) await Promise.allSettled([...jobs]);
   }
 
@@ -507,6 +515,23 @@ export class CanonicalRenderer {
     }
   }
 
+  /** Prepare the optional range accelerator through the renderer's tracked
+   * process runner. Missing build tools remain an ordinary CLI-fallback case. */
+  prepareSyncTeXHelper(timeoutMs = SYNCTEX_HELPER_PREPARE_MS) {
+    if (this.disposed || this.resetting) return Promise.resolve(false);
+    if (this.syncTeXHelperPreparation) return this.syncTeXHelperPreparation;
+    let job;
+    job = prepareSyncTeXBatchHelper({
+      workDir: this.workDir,
+      timeoutMs,
+      run: (cmd, args, opts) => this.#exec(cmd, args, opts),
+    }).then((executable) => Boolean(executable)).catch(() => false).finally(() => {
+      if (this.syncTeXHelperPreparation === job) this.syncTeXHelperPreparation = null;
+    });
+    this.syncTeXHelperPreparation = job;
+    return job;
+  }
+
   async prepareBuildGeneration({
     requestId,
     token,
@@ -529,6 +554,10 @@ export class CanonicalRenderer {
         !/^[0-9a-f]{64}$/i.test(pdfHash || '') || !/^[0-9a-f]{64}$/i.test(synctexHash || '')) {
       throw new Error('invalid Build generation');
     }
+    // Usually shared with constructor initialization. Starting here as well
+    // covers a helper build interrupted by document reset; artifact hashes,
+    // copies and geometry validation proceed in parallel with the C compile.
+    const helperPreparation = this.prepareSyncTeXHelper();
     const inputEntries = Array.isArray(syncInputMap) ? syncInputMap : [];
     if (!inputEntries.length || inputEntries.length > 4096) throw new Error('invalid Build SyncTeX input map');
     const inputMap = new Map();
@@ -588,6 +617,9 @@ export class CanonicalRenderer {
       if (papers.length !== pageCount || papers.some((paper) => !paper)) {
         throw new Error('Build PDF geometry is incomplete');
       }
+      // A missing helper is non-fatal, but a usable imported generation must
+      // not expose its first proof until bounded initialization has settled.
+      await helperPreparation;
       if (!this.ownsBuildLease(requestId, token) || this.disposed || this.resetting ||
           inputEpoch !== this.inputEpoch) throw new Error('stale Build generation');
       return {
@@ -1855,6 +1887,7 @@ export class CanonicalRenderer {
       this.#removeWorkArtifacts();
     } finally {
       this.resetting = false;
+      if (!this.disposed) void this.prepareSyncTeXHelper();
     }
   }
 
