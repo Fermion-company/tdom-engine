@@ -1501,7 +1501,10 @@ const server = http.createServer(async (req, res) => {
       // busy response before spawning TeX; old/unreachable engines remain its
       // separate compatibility fallback.
       if (pendingDocumentReset || engine.shipBooting || engine.warming) {
-        return json(res, { ok: false, acquired: false, reason: 'resident-bootstrap-active', retryAfterMs: 250 }, 409);
+        // Name the phase so a slow Build can be attributed to the exact
+        // bootstrap stage that held its lease.
+        const blockedBy = pendingDocumentReset ? 'document-reset' : engine.shipBooting ? 'shipping-boot' : 'warming';
+        return json(res, { ok: false, acquired: false, reason: 'resident-bootstrap-active', blockedBy, retryAfterMs: 250 }, 409);
       }
       const result = engine.canonical.acquireBuildLease(requestId, ttlMs);
       if (!result.acquired) return json(res, { ok: false, ...result }, result.reason === 'lease-busy' ? 409 : 503);

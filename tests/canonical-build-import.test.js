@@ -180,13 +180,23 @@ test('imported generation maps logical root paths to normal-Build SyncTeX paths'
     const lease = renderer.acquireBuildLease('build:1', 60_000);
     assert.equal(renderer.renewBuildLease('build:1', lease.token, 90_000).renewed, true);
     renderer.schedule('source', 1);
+    // stale aux files from an older canonical compile of this work directory
+    writeFileSync(path.join(workDir, 'canon.aux'), 'stale aux');
+    writeFileSync(path.join(workDir, 'canon.lof'), 'stale lof');
     const prepared = await renderer.prepareBuildGeneration({
       requestId: 'build:1', token: lease.token, source: 'source', rev: 1,
       pdf: data.pdf, pdfHash: hash(readFileSync(data.pdf)),
       synctex: data.synctex, synctexHash: hash(readFileSync(data.synctex)),
       syncInputMap: [{ logicalPath: path.join(workDir, 'canon.tex'), recordedPath: data.main }],
+      seedFiles: { aux: '\\relax\n\\gdef\\@abspage@last{1}\n', toc: '\\contentsline {section}{One}{1}{}\n', bogus: 'ignored' },
     });
     const generation = await renderer.commitBuildGeneration(prepared, 'source', 1);
+    // The Build's converged aux family now seeds the canonical work directory
+    // and every seed extension the Build lacks is gone.
+    assert.equal(readFileSync(path.join(workDir, 'canon.aux'), 'utf8'), '\\relax\n\\gdef\\@abspage@last{1}\n');
+    assert.equal(readFileSync(path.join(workDir, 'canon.toc'), 'utf8'), '\\contentsline {section}{One}{1}{}\n');
+    assert.equal(existsSync(path.join(workDir, 'canon.lof')), false, 'a stale seed the Build lacks is removed');
+    assert.equal(existsSync(path.join(workDir, 'canon.bogus')), false);
     const forward = await renderer.forwardSyncAll({ file: path.join(workDir, 'canon.tex'), line: 7, id: generation.id });
     assert.equal(forward.length, 1);
     assert.match(readFileSync(syncLog, 'utf8'), new RegExp(`7:1:${data.main.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));

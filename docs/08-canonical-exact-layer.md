@@ -50,7 +50,13 @@ Build 直後に別章を編集して元に戻す往復はこれで recompile を
 記憶上限を超えた古い epoch）は従来どおり fail closed で再 compile する。再束縛は `last` にのみ行い、
 より古い retained generation へは戻さない。compile 中に入力が無効化された generation は manifest を持たない。
 
-### 8.2b pass 間の譲り渡し
+### 8.2b Build seed の配置
+
+通常 Build を取り込む `commitBuildGeneration` は、検証済みの aux/toc/lof/lot/out を canonical の作業
+ディレクトリへ `canon.*` として配置し、Build に無い拡張子の古いファイルは消す。Build 後の最初の canonical
+compile は Build が収束させた aux 群から始まるので、本文編集なら 1 pass で fixpoint に達する。
+
+### 8.2c pass 間の譲り渡し
 
 `#drain` が起動した scheduled compile は、各 LuaLaTeX pass の正常終了時に「より新しい rev の pending job
 がある」か「再束縛で `last.rev` が自分の rev を追い越した」場合、追加 pass と publish を中止して最新へ進む

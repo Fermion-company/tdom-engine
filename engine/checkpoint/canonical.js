@@ -57,6 +57,7 @@ const SVG_CACHE_MAX = 400; // pages kept as SVG strings (LRU)
 // The fixed window prevents a long editing session from retaining files
 // without bound.
 const GENERATION_MAX = 4;
+const BUILD_SEED_EXTENSIONS = ['aux', 'toc', 'lof', 'lot', 'out'];
 // Input invalidations remembered for content identity (one per child edit,
 // external change or bibliography refresh). Older generations cannot be
 // proven current and compile again, exactly as before.
@@ -428,6 +429,24 @@ export class CanonicalRenderer {
       if (key.startsWith(prefix)) this.syncTransformCache.delete(key);
     }
     if ((generation.readers ?? 0) === 0) this.#deleteGenerationFiles(generation);
+  }
+
+  #seedBuildAuxFiles(seedFiles) {
+    const seeds = seedFiles && typeof seedFiles === 'object' ? seedFiles : {};
+    try {
+      for (const ext of BUILD_SEED_EXTENSIONS) {
+        const file = path.join(this.workDir, `canon.${ext}`);
+        const content = seeds[ext];
+        if (typeof content === 'string') writeFileSync(file, content, 'utf8');
+        else rmSync(file, { force: true });
+      }
+    } catch {
+      // A half-written seed set must not survive: the next compile then runs
+      // its full fixpoint from nothing, exactly as before seeding existed.
+      for (const ext of BUILD_SEED_EXTENSIONS) {
+        try { rmSync(path.join(this.workDir, `canon.${ext}`), { force: true }); } catch { /* best effort */ }
+      }
+    }
   }
 
   #registerGeneration(generation, { promote = true } = {}) {
@@ -903,6 +922,13 @@ export class CanonicalRenderer {
     this.timerDueAt = 0;
     this.pendingJob = null;
     this.#clearDisplayDemand(currentJob);
+    // The Build already converged this document's aux family. Seed the
+    // canonical work directory with it so the first post-Build compile
+    // starts at that fixpoint (one pass for a body edit) instead of
+    // rebuilding the table of contents from an empty or stale aux over up to
+    // three full passes. Every seed extension the Build lacks is removed so
+    // no stale file from an older compile survives beside the new ones.
+    this.#seedBuildAuxFiles(prepared.seedFiles);
     this.#registerGeneration(generation);
     this.lastEndAt = Date.now();
     this.lastError = null;

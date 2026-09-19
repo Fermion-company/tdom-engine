@@ -9,6 +9,7 @@ import {
   rmSync,
   mkdirSync,
   writeFileSync,
+  readFileSync,
   existsSync,
   realpathSync,
   symlinkSync,
@@ -1194,6 +1195,39 @@ test('scheduled compiles yield between passes to a newer revision', opts, async 
       'the superseded revision 2 was abandoned after its pass instead of published');
     const texts = await c.pageTexts();
     if (texts) assert.match(texts.join('\n'), /Body two, newest/);
+  } finally {
+    c.dispose();
+  }
+});
+
+test('Build seeds let the first post-Build canonical reach its fixpoint in one pass', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-build-seeds');
+  writeFileSync(path.join(docDir, 'main.tex'), MULTI_PASS_ROOT);
+  // a real Build of the same source: converged aux/toc plus PDF and SyncTeX
+  await promisify(execFile)('lualatex', ['-synctex=1', '-interaction=nonstopmode', 'main.tex'], { cwd: docDir, timeout: 120_000 });
+  await promisify(execFile)('lualatex', ['-synctex=1', '-interaction=nonstopmode', 'main.tex'], { cwd: docDir, timeout: 120_000 });
+  const sha = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
+  const seedFiles = { aux: readFileSync(path.join(docDir, 'main.aux'), 'utf8'), toc: readFileSync(path.join(docDir, 'main.toc'), 'utf8') };
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    const lease = c.acquireBuildLease('build:seed', 60_000);
+    c.schedule(MULTI_PASS_ROOT, 1);
+    const prepared = await c.prepareBuildGeneration({
+      requestId: 'build:seed', token: lease.token, source: MULTI_PASS_ROOT, rev: 1,
+      pdf: path.join(docDir, 'main.pdf'), pdfHash: sha(path.join(docDir, 'main.pdf')),
+      synctex: path.join(docDir, 'main.synctex.gz'), synctexHash: sha(path.join(docDir, 'main.synctex.gz')),
+      syncInputMap: [{ logicalPath: path.join(c.workDir, 'canon.tex'), recordedPath: path.join(docDir, 'main.tex') }],
+      seedFiles,
+    });
+    const build = await c.commitBuildGeneration(prepared, MULTI_PASS_ROOT, 1);
+    c.releaseBuildLease('build:seed', lease.token);
+    assert.equal(c.info().id, build.id);
+    // a body edit after the Build: the seeded toc is already right
+    c.schedule(MULTI_PASS_ROOT.replace('Body one.', 'Body one, revised.'), 2);
+    await c.settle();
+    assert.equal(c.info().rev, 2);
+    assert.equal(c.info().error, null);
+    assert.equal(c.info().passes, 1, 'the seeded aux family is the fixpoint of a body edit');
   } finally {
     c.dispose();
   }
