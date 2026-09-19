@@ -1328,7 +1328,7 @@ test('a prose line inside a mixed block anchors only while everything else is un
   const slowResidentPlan = plan({}, 0, { acceptedAt, proofStartedAt });
   assert.equal(slowResidentPlan.proofDeadline - proofStartedAt, 700,
     'proof owns its bounded window after resident typesetting is ready');
-  assert.equal(slowResidentPlan.publishDeadline - proofStartedAt, 850,
+  assert.equal(slowResidentPlan.publishDeadline, proofStartedAt + 850,
     'publication remains bounded from proof readiness');
   assert.deepEqual(ok?.changedLines, [2], 'only the edited prose line is repainted');
   const restoredEdit = singlePlainTextDelta(`${text}X`, text);
