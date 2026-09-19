@@ -1489,6 +1489,97 @@ test('a prose line inside a mixed block anchors only while everything else is un
   assert.deepEqual(visual?.changedLines, [2]);
   assert.equal(visual?.public.presentation, 'visual-cut');
   assert.equal(visual?.public.authoritative, false);
+
+  const compensationMarks = ['1'.repeat(32), '2'.repeat(32), '3'.repeat(32),
+    '4'.repeat(32), '5'.repeat(32)];
+  const compensatedGalley = ({
+    second = 'Bravo',
+    d = 2,
+    lineHeight = 8,
+    baselineAmount = 15,
+    baselineSubtype = 2,
+    baselineStretch,
+    leadingAmount = 4,
+    nextHeight = 0,
+    nextRuns = [],
+    nextExtra = {},
+    skeletonGlueExtra = {},
+    swapBreak = false,
+    extraGlue = false,
+    trail = 'trail',
+  } = {}) => {
+    const middle = swapBreak
+      ? [{ k: 'pen', v: 10000 }, { k: 'eject', v: -10000 }]
+      : [{ k: 'eject', v: -10000 }, { k: 'pen', v: 10000 }];
+    const items = [opaque('Heading'), { k: 'glue', a: leadingAmount }, prose('Alpha'),
+      { k: 'glue', a: 3 }, prose(second, lineHeight, false, d),
+      { k: 'glue', sub: 0, a: 0, st: 1, sto: 2, ...skeletonGlueExtra }, ...middle];
+    if (extraGlue) items.push({ k: 'glue', sub: 0, a: 0 });
+    items.push({ k: 'glue', sub: baselineSubtype, a: baselineAmount,
+      ...(baselineStretch == null ? {} : { st: baselineStretch }) },
+    { k: 'box', h: nextHeight, d: 0, w: 0, runs: nextRuns, ...nextExtra });
+    return {
+      gfx: true,
+      w: 400,
+      h: 120,
+      closure: 'native',
+      items,
+      epochs: extraGlue
+        ? [1, 2, 2, 2, 2, 3, 4, 3, 4, 5, 5]
+        : [1, 2, 2, 2, 2, 3, 4, 3, 5, 5],
+      trail,
+      trailMarks: compensationMarks,
+      floats: [], events: [], labels: [], refs: [], toclines: [],
+    };
+  };
+  const compensatedFidelity = {
+    level: 'exact-preview-required',
+    itemFlags: [1, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+  };
+  const compensatedBaseBlock = {
+    ...oldBlock,
+    galley: compensatedGalley(),
+    fidelity: compensatedFidelity,
+  };
+  const compensatedBase = captureCanonicalAnchorBase({
+    blocks: [compensatedBaseBlock], domBlocks: [dom], edit, certificate,
+  });
+  const compensatedPlan = (changes = {}, context = {}) => planTerminalCanonicalAnchor({
+    blocks: [{ ...compensatedBaseBlock, end: text.length + 1, text: `${text}X`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      galley: compensatedGalley({ second: 'BravoX', d: 2 + descenderDelta,
+        baselineAmount: 15 - descenderDelta, trail: 'other', ...changes }) }],
+    domBlocks: [dom], report: context.report ?? descenderReport, geometry, edit,
+    baseSnapshot: compensatedBase, paintContext,
+  });
+  const compensated = compensatedPlan();
+  assert.equal(compensated?.visualCut, true,
+    'a single baselineskip exactly compensating the changed depth admits the old-layout cut');
+  assert.deepEqual(compensated?.changedLines, [2]);
+  assert.equal(compensatedPlan({ leadingAmount: 4.25 }), null,
+    'an unrelated glue change stays outside the compensation');
+  assert.equal(compensatedPlan({ baselineStretch: 1 }), null,
+    'changed baselineskip stretch stays outside the compensation');
+  assert.equal(compensatedPlan({ baselineSubtype: 3 }), null,
+    'a non-baselineskip subtype cannot compensate line depth');
+  assert.equal(compensatedPlan({ nextHeight: 1 }), null,
+    'the box following the baselineskip must remain the same empty box');
+  assert.equal(compensatedPlan({ nextRuns: [{ text: 'paint' }] }), null,
+    'the clearpage sentinel box must not contain paint runs');
+  assert.equal(compensatedPlan({ nextExtra: { fx: true } }), null,
+    'the clearpage sentinel box has an exact paint-empty shape');
+  assert.equal(compensatedPlan({ skeletonGlueExtra: { unknown: 1 } }), null,
+    'the zero-natural clearpage glue accepts only harvested glue fields');
+  assert.equal(compensatedPlan({ swapBreak: true }), null,
+    'the bounded clearpage item order is exact');
+  assert.equal(compensatedPlan({ lineHeight: 9 }), null,
+    'the compensation covers depth only');
+  assert.equal(compensatedPlan({ extraGlue: true }), null,
+    'a second intervening glue is not admitted');
+  assert.equal(compensatedPlan({ baselineAmount: 15 - descenderDelta + 0.25 }), null,
+    'the baselineskip amount must exactly negate the depth delta');
+  assert.equal(compensatedPlan({ d: 2, baselineAmount: 15, trail: 'trail' }, { report })?.visualCut, false,
+    'a byte-identical exact mixed frame continues to use the exact path');
   assert.equal(plan({
     d: 2 + descenderDelta,
     height: 120 + descenderDelta,

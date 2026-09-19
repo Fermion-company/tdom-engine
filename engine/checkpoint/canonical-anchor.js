@@ -10,6 +10,7 @@ import {
   mixedGalleyFrameDifference,
   mixedGalleyVisualFrame,
   changedMixedVisualCutLines,
+  mixedVisualCutCompensatedFrame,
   mixedVisualCutHeightMatches,
 } from './canonical-paint-index.js';
 import { chmodSync, writeFileSync } from 'node:fs';
@@ -28,13 +29,28 @@ const SP_PER_BP = 65781.76;
 /** Explicit diagnostic escape hatch for a frozen native run. The normal SSE
  * remains value-free; only an absolute operator-supplied path receives the
  * latest complete base/current frames, in one mode-0600 file. */
-function dumpMixedFrameMismatch(baseFrame, currentFrame, { srcRev, blockId } = {}) {
+function dumpMixedFrameMismatch(baseFrame, currentFrame, {
+  srcRev,
+  blockId,
+  baseVisualFrame = null,
+  currentVisualFrame = null,
+  baseEpochs = null,
+  currentEpochs = null,
+  baseLineWitnesses = null,
+  currentLineWitnesses = null,
+} = {}) {
   const output = process.env.TDOM_MIXED_FRAME_DUMP_FILE;
   if (typeof output !== 'string' || !path.isAbsolute(output)) return false;
+  const serializedFrame = (value) => typeof value === 'string' ? value : 'null';
   try {
     writeFileSync(output, `{"schemaVersion":1,"recordedAt":${JSON.stringify(new Date().toISOString())},` +
       `"srcRev":${JSON.stringify(srcRev ?? null)},"blockId":${JSON.stringify(blockId ?? null)},` +
-      `"baseFrame":${baseFrame},"currentFrame":${currentFrame}}\n`, { mode: 0o600 });
+      `"baseFrame":${serializedFrame(baseFrame)},"currentFrame":${serializedFrame(currentFrame)},` +
+      `"baseVisualFrame":${serializedFrame(baseVisualFrame)},` +
+      `"currentVisualFrame":${serializedFrame(currentVisualFrame)},` +
+      `"baseEpochs":${JSON.stringify(baseEpochs)},"currentEpochs":${JSON.stringify(currentEpochs)},` +
+      `"baseLineWitnesses":${JSON.stringify(baseLineWitnesses)},` +
+      `"currentLineWitnesses":${JSON.stringify(currentLineWitnesses)}}\n`, { mode: 0o600 });
     chmodSync(output, 0o600);
     return true;
   } catch {
@@ -249,10 +265,10 @@ const TRAIL_MARK = /^[0-9a-f]{32}$/;
  * frame. The suffix remains the old canonical raster, so only the state
  * samples strictly before the edited contribution are required to match. */
 function mixedVisualCutAdmission(base, block, currentFrame, currentLines) {
-  if (typeof base?.visualFrame !== 'string' ||
-      currentFrame?.visualFrame !== base.visualFrame) {
+  if (typeof base?.visualFrame !== 'string' || typeof currentFrame?.visualFrame !== 'string') {
     return { changedLines: null, reason: 'frame' };
   }
+  const visualFrameExact = currentFrame.visualFrame === base.visualFrame;
   const beforeEpochs = base.epochs;
   const afterEpochs = block.galley?.epochs;
   if (!Array.isArray(beforeEpochs) || !Array.isArray(afterEpochs) ||
@@ -273,6 +289,16 @@ function mixedVisualCutAdmission(base, block, currentFrame, currentLines) {
   const changedLines = changedMixedVisualCutLines(base.lineWitnesses, currentLines);
   if (!changedLines) return { changedLines: null, reason: 'line-change' };
   const changedLine = changedLines[0];
+  const compensatedFrame = !visualFrameExact && mixedVisualCutCompensatedFrame({
+    baseVisualFrame: base.visualFrame,
+    currentVisualFrame: currentFrame.visualFrame,
+    baseLines: base.lineWitnesses,
+    currentLines,
+    changedLine,
+    baseHeight: base.visualHeight,
+    currentHeight: block.galley?.h,
+  });
+  if (!visualFrameExact && !compensatedFrame) return { changedLines: null, reason: 'frame' };
   let box = -1;
   let itemIndex = -1;
   for (let index = 0; index < (block.galley?.items ?? []).length; index++) {
@@ -292,7 +318,7 @@ function mixedVisualCutAdmission(base, block, currentFrame, currentLines) {
       return { changedLines: null, reason: 'trail-prefix' };
     }
   }
-  if (!mixedVisualCutHeightMatches(
+  if (!compensatedFrame && !mixedVisualCutHeightMatches(
     base.visualHeight,
     block.galley?.h,
     base.lineWitnesses[changedLine],
@@ -511,6 +537,12 @@ export function planTerminalCanonicalAnchor({
         diagnostics.mixedFrameDumped = dumpMixedFrameMismatch(base.frame, frame.frame, {
           srcRev: report.srcRev,
           blockId,
+          baseVisualFrame: base.visualFrame,
+          currentVisualFrame: frame.visualFrame,
+          baseEpochs: base.epochs,
+          currentEpochs: block.galley?.epochs,
+          baseLineWitnesses: base.lineWitnesses,
+          currentLineWitnesses: currentLines,
         });
       }
       const visual = mixedVisualCutAdmission(base, block, frame, currentLines);

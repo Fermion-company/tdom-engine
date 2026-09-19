@@ -160,6 +160,105 @@ export function mixedGalleyVisualFrame(galley, witnesses) {
   ]);
 }
 
+const VISUAL_FRAME_FIELDS = [
+  'backend', 'gfx', 'width', 'items', 'epochs',
+  'floats', 'labels', 'refs', 'toclines', 'events',
+];
+const VISUAL_COMPENSATION_PARSE_UNITS = 1024 * 1024;
+const VISUAL_COMPENSATION_MAX_ITEMS = 8192;
+
+function parsedVisualFrame(serialized) {
+  if (typeof serialized !== 'string' || serialized.length > VISUAL_COMPENSATION_PARSE_UNITS) return null;
+  try {
+    const value = JSON.parse(serialized);
+    if (!Array.isArray(value) || value.length !== VISUAL_FRAME_FIELDS.length) return null;
+    return Object.fromEntries(VISUAL_FRAME_FIELDS.map((field, index) => [field, value[index]]));
+  } catch {
+    return null;
+  }
+}
+
+/** Admit only TeX's metric-compensating baselineskip after one changed line.
+ * The ordinary visual frame remains byte-identical for every other item. */
+export function mixedVisualCutCompensatedFrame({
+  baseVisualFrame,
+  currentVisualFrame,
+  baseLines,
+  currentLines,
+  changedLine,
+  baseHeight,
+  currentHeight,
+}) {
+  const base = parsedVisualFrame(baseVisualFrame);
+  const current = parsedVisualFrame(currentVisualFrame);
+  const beforeLine = baseLines?.[changedLine];
+  const afterLine = currentLines?.[changedLine];
+  if (!base || !current ||
+      !Array.isArray(base.items) || !Array.isArray(current.items) ||
+      base.items.length === 0 || base.items.length > VISUAL_COMPENSATION_MAX_ITEMS ||
+      base.items.length !== current.items.length ||
+      !Array.isArray(base.epochs) || !Array.isArray(current.epochs) ||
+      base.epochs.length !== base.items.length || current.epochs.length !== current.items.length ||
+      JSON.stringify(base.epochs) !== JSON.stringify(current.epochs) ||
+      !Number.isInteger(changedLine) || !beforeLine || !afterLine ||
+      ![baseHeight, currentHeight, beforeLine.height, beforeLine.depth,
+        afterLine.height, afterLine.depth, beforeLine.lineWidth, afterLine.lineWidth].every(Number.isFinite) ||
+      !sameNumber(baseHeight, currentHeight, EPSILON) ||
+      !sameNumber(beforeLine.height, afterLine.height, EPSILON) ||
+      !sameNumber(beforeLine.lineWidth, afterLine.lineWidth, EPSILON)) return false;
+
+  for (const field of VISUAL_FRAME_FIELDS) {
+    if (field === 'items' || field === 'epochs') continue;
+    if (JSON.stringify(base[field]) !== JSON.stringify(current[field])) return false;
+  }
+  let box = -1;
+  let changedItem = -1;
+  let compensation = -1;
+  for (let index = 0; index < base.items.length; index++) {
+    const before = base.items[index];
+    const after = current.items[index];
+    if (before?.k !== after?.k) return false;
+    if (before?.k === 'box' && ++box === changedLine) changedItem = index;
+    if (JSON.stringify(before) === JSON.stringify(after)) continue;
+    if (compensation >= 0 || before?.k !== 'glue' || after?.k !== 'glue' ||
+        before.sub !== 2 || after.sub !== 2) return false;
+    const { a: beforeAmount, ...beforeRest } = before;
+    const { a: afterAmount, ...afterRest } = after;
+    if (![beforeAmount, afterAmount].every(Number.isFinite) ||
+        JSON.stringify(beforeRest) !== JSON.stringify(afterRest)) return false;
+    compensation = index;
+  }
+  if (changedItem < 0 || compensation < 0 || compensation + 1 >= base.items.length) return false;
+
+  const depthDelta = afterLine.depth - beforeLine.depth;
+  const glueDelta = Number(current.items[compensation].a) - Number(base.items[compensation].a);
+  if (Math.abs(depthDelta) <= EPSILON || !sameNumber(glueDelta, -depthDelta, EPSILON)) return false;
+
+  const next = compensation + 1;
+  if (base.items[next]?.k !== 'box' || current.items[next]?.k !== 'box' ||
+      JSON.stringify(base.items[next]) !== JSON.stringify(current.items[next]) ||
+      base.epochs[compensation] !== base.epochs[next]) return false;
+
+  const between = base.items.slice(changedItem + 1, compensation);
+  const zeroGlue = between[0];
+  const zeroGlueFields = zeroGlue && Object.keys(zeroGlue);
+  const emptyBox = base.items[next];
+  const clearPage = compensation === changedItem + 4 && next === changedItem + 5 &&
+    Number.isInteger(base.epochs[changedItem]) && Number.isInteger(base.epochs[compensation]) &&
+    base.epochs[compensation] > base.epochs[changedItem] &&
+    between.length === 3 &&
+    zeroGlue?.k === 'glue' && zeroGlue.sub === 0 && zeroGlue.a === 0 &&
+    zeroGlueFields.every((field) => ['k', 'sub', 'a', 'st', 'sh', 'sto', 'sho'].includes(field)) &&
+    ['st', 'sh'].every((field) => zeroGlue[field] == null || Number.isFinite(zeroGlue[field])) &&
+    ['sto', 'sho'].every((field) => zeroGlue[field] == null || Number.isInteger(zeroGlue[field])) &&
+    between[1]?.k === 'eject' && between[1].v === -10000 &&
+    between[2]?.k === 'pen' && between[2].v === 10000 &&
+    Object.keys(emptyBox).length === 5 && emptyBox.k === 'box' &&
+    emptyBox.h === 0 && emptyBox.d === 0 && emptyBox.w === 0 &&
+    Array.isArray(emptyBox.runs) && emptyBox.runs.length === 0;
+  return clearPage;
+}
+
 const MIXED_FRAME_FIELDS = [
   'backend', 'gfx', 'width', 'height', 'items', 'floats',
   'labels', 'refs', 'toclines', 'events', 'trail',
