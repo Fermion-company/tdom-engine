@@ -16,6 +16,50 @@ test('the VisualCut raster verifier is loaded and served by the preview origin',
   assert.match(SERVER, /url\.pathname === '\/canonical-anchor-raster\.js'/);
 });
 
+test('only a decoded same-document empty shell admits the last-good canonical fallback', () => {
+  const source = APP.slice(
+    APP.indexOf('function emptyStructuredCanonicalFallback'),
+    APP.indexOf('function tryApplyPendingCanonicalAnchor')
+  );
+  const image = { complete: true, naturalWidth: 665 };
+  const page = { dataset: {} };
+  const canonical = { id: 7, rev: 11, pageCount: 20 };
+  const documentReset = { pending: false, adoptedEpoch: 3 };
+  let presented = {
+    image, src: '/canonical/12.svg?c=7', id: 7, rev: 11,
+    snapshot: { srcRev: 11, documentEpoch: 3 },
+  };
+  const gates = Function('usesCanonicalSurface', 'documentReset', 'canonical',
+    'presentedPageState', `${source}; return {
+      fallback: emptyStructuredCanonicalFallback,
+      marker: retainCanonicalFallbackMarker,
+    };`)(
+      () => false, documentReset, canonical, () => presented
+    );
+
+  assert.equal(gates.fallback(12, page, image), true);
+  page.dataset.prov = '1';
+  assert.equal(gates.fallback(12, page, image), false, 'committed provisional ink always wins');
+  delete page.dataset.prov;
+  presented = { ...presented, id: 6 };
+  assert.equal(gates.fallback(12, page, image), false, 'another canonical generation cannot be reused');
+  presented = { ...presented, id: 7, snapshot: { srcRev: 11, documentEpoch: 2 } };
+  assert.equal(gates.fallback(12, page, image), false, 'a prior document epoch cannot populate this shell');
+  presented = { ...presented, snapshot: { srcRev: 11, documentEpoch: 3 } };
+  image.complete = false;
+  assert.equal(gates.fallback(12, page, image), false, 'decode must finish before the bitmap is exposed');
+
+  assert.equal(gates.marker({ newlyEligible: false, previouslyMarked: true,
+    canonicalSurface: false, final: true, freshTargetPresented: false }), true,
+  'old fallback stays non-ready while a fresh target is decoding');
+  assert.equal(gates.marker({ newlyEligible: false, previouslyMarked: true,
+    canonicalSurface: false, final: true, freshTargetPresented: true }), false,
+  'the marker retires only after the fresh target commits');
+  assert.equal(gates.marker({ newlyEligible: false, previouslyMarked: true,
+    canonicalSurface: false, final: false, freshTargetPresented: false }), false,
+  'a committed provisional surface retires the fallback marker');
+});
+
 const targetSrc = '/canonical/2.svg?c=42';
 const base = {
   pageNumber: 2,

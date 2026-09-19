@@ -1168,6 +1168,30 @@ function canonicalAnchorForPage(pageNumber) {
   return { ...candidate, ...pagePatch };
 }
 
+/** A lazy canonical page may decode only after a distant toolbar jump. Keep
+ * that certified last-good paper visible when this shell has never committed
+ * provisional ink. The marker prevents the embed readiness contract from
+ * mistaking the fallback for current-source pixels. */
+function emptyStructuredCanonicalFallback(pageNumber, page, image) {
+  if (!page || !image || usesCanonicalSurface() || documentReset.pending ||
+      'prov' in page.dataset || !Number.isInteger(pageNumber) || pageNumber < 1 ||
+      pageNumber > Number(canonical?.pageCount)) return false;
+  const presented = presentedPageState(page);
+  const expectedSrc = `/canonical/${pageNumber}.svg?c=${Number(canonical?.id)}`;
+  return Boolean(
+    presented && presented.image === image && presented.src === expectedSrc &&
+    image.complete && image.naturalWidth > 0 &&
+    presented.id === Number(canonical?.id) && presented.rev === Number(canonical?.rev) &&
+    Number(presented.snapshot?.srcRev) === presented.rev &&
+    Number(presented.snapshot?.documentEpoch) === documentReset.adoptedEpoch
+  );
+}
+
+function retainCanonicalFallbackMarker({ newlyEligible, previouslyMarked,
+  canonicalSurface, final, freshTargetPresented }) {
+  return newlyEligible || previouslyMarked && !canonicalSurface && final && !freshTargetPresented;
+}
+
 function tryApplyPendingCanonicalAnchor() {
   if (directPresentationBlocked()) return false;
   const patch = canonicalAnchorPendingPatch;
@@ -2636,9 +2660,21 @@ function updateCanonState(n) {
   const retainingCanonical = img && div.classList.contains('is-final') && (
     div.dataset.provPending === '1' || targetSrc || canonical?.id && n > canonical.pageCount
   );
+  const emptyCanonicalFallback = !fresh &&
+    emptyStructuredCanonicalFallback(n, div, img);
   const state = usesCanonicalSurface()
     ? (img ? 'final' : 'provisional')
-    : ((fresh && targetPresented || retainingCanonical) ? 'final' : 'provisional');
+    : ((fresh && targetPresented || retainingCanonical || emptyCanonicalFallback)
+        ? 'final' : 'provisional');
+  const keepCanonicalFallback = retainCanonicalFallbackMarker({
+    newlyEligible: emptyCanonicalFallback,
+    previouslyMarked: div.dataset.canonFallback === '1',
+    canonicalSurface: usesCanonicalSurface(),
+    final: state === 'final',
+    freshTargetPresented: fresh && targetPresented,
+  });
+  if (keepCanonicalFallback) div.dataset.canonFallback = '1';
+  else delete div.dataset.canonFallback;
   if (img) img.style.clipPath = '';
   const previousFinal = div.classList.contains('is-final');
   div.classList.toggle('is-final', state === 'final');
@@ -6398,6 +6434,7 @@ pagesEl.addEventListener('scroll', () => {
     };
     const previewReady = (required) => {
       if (!bootComplete || !documentReset.acceptsReady(documentReset.adoptedEpoch) || !required.length) return false;
+      if (required.some(([, page]) => page.dataset.canonFallback === '1')) return false;
       if (usesCanonicalSurface()) {
         return required.every(([, page]) => {
           const shipping = presentedShippingPageState(page);
