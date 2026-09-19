@@ -25,6 +25,9 @@ import { CheckpointEngine } from './engine/checkpoint/engine-v3.js';
 import {
   buildTerminalCanonicalPatch,
   captureCanonicalAnchorBase,
+  captureCanonicalAnchorLedger,
+  ledgerAdmitsBlock,
+  mergeCumulativeAnchorPatch,
   dirtyWithoutPatchFallback,
   flattenCompleteAnchorCandidateGroups,
   planTerminalCanonicalAnchor,
@@ -1292,6 +1295,19 @@ async function beforeDeadline(promise, deadline) {
 // The base generation's SyncTeX records and paint index depend only on the
 // pre-edit witness. Start them alongside the resident edit so its typeset
 // time does not consume the fixed proof budget; the proof itself is unchanged.
+// One ledger per (generation, source revision) at which that generation was
+// the exact compile of the resident: every keystroke at canonical-current
+// state would otherwise rebuild it over all blocks.
+let anchorLedgerCache = null;
+function anchorLedgerFor(certificate) {
+  const cached = anchorLedgerCache;
+  if (cached && cached.id === certificate.id && cached.rev === certificate.rev &&
+      cached.srcRev === engine.srcRev && cached.documentEpoch === documentEpoch) return cached.ledger;
+  const ledger = captureCanonicalAnchorLedger(engine.blocks);
+  anchorLedgerCache = { id: certificate.id, rev: certificate.rev, srcRev: engine.srcRev, documentEpoch, ledger };
+  return ledger;
+}
+
 function prefetchCanonicalAnchorProof(base, completionDeadline) {
   const rawCandidates = rawForwardCandidatesForRange(
     base.source,
@@ -1402,10 +1418,31 @@ async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch
     : null;
   if (!rejectReason && !matching) rejectReason = 'AMBIGUOUS_OR_MISMATCHED_ANCHOR';
   if (!rejectReason && performance.now() >= plan.publishDeadline) rejectReason = 'PUBLISH_DEADLINE_EXCEEDED';
-  const patch = matching && !rejectReason
+  let patch = matching && !rejectReason
     ? buildTerminalCanonicalPatch(plan, matching)
     : null;
   if (!rejectReason && !patch) rejectReason = 'PAINT_NOT_ISOLATED';
+  if (patch) {
+    // Publish the whole edited set of this lineage in one patch: the pages
+    // this proof certified plus those the other blocks already hold, all
+    // addressed against the same immutable base generation.
+    const lineage = terminalAnchorLineage;
+    const entry = lineage?.blocks instanceof Map && lineage.baseGeneration === plan.baseGeneration &&
+      lineage.baseRev === plan.baseRev && lineage.lastSrcRev === plan.srcRev
+      ? lineage.blocks.get(plan.blockId)
+      : null;
+    if (entry) {
+      entry.pages = structuredClone(patch.pages);
+      entry.visualCut = Boolean(patch.visualCut);
+      const others = [...lineage.blocks]
+        .filter(([id, other]) => id !== plan.blockId && Array.isArray(other.pages) && other.pages.length)
+        .map(([id, other]) => ({ blockId: id, pages: other.pages, visualCut: other.visualCut }));
+      if (others.length) {
+        patch = mergeCumulativeAnchorPatch(patch, others);
+        if (!patch) rejectReason = 'CUMULATIVE_PATCH_CONFLICT';
+      }
+    }
+  }
   if (patch) patch.proofMs = performance.now() - plan.acceptedAt;
   broadcast({
     // A distinct event kind is the capability boundary: clients predating
@@ -2069,6 +2106,7 @@ const server = http.createServer(async (req, res) => {
       let resetEpoch = null;
       let anchorInputSafe = false;
       let anchorBaseSnapshot = null;
+      let anchorLedger = null;
       let anchorEdit = null;
       let anchorMutation = false;
       let anchorPriorLineage = null;
@@ -2119,6 +2157,34 @@ const server = http.createServer(async (req, res) => {
                 certificate,
                 diagnostics: anchorDiagnostics,
               });
+              // The generation is the exact compile of every block right now:
+              // remember each block's identity so a later edit in another
+              // block can prove it still is what this generation typeset.
+              if (anchorBaseSnapshot) anchorLedger = anchorLedgerFor(certificate);
+            } else if (certificate && terminalAnchorLineage &&
+                terminalAnchorLineage.baseGeneration === certificate.id &&
+                terminalAnchorLineage.baseRev === certificate.rev &&
+                terminalAnchorLineage.lastSrcRev === engine.srcRev &&
+                terminalAnchorLineage.ledger instanceof Map) {
+              // Another block joins an unbroken anchored lineage on the same
+              // base: admissible only while that block is byte-for-byte what
+              // the base generation typeset (source, galley and exit state),
+              // so its resident witness is the base witness for its lines.
+              const joinDiagnostics = {};
+              const candidate = captureCanonicalAnchorBase({
+                blocks: engine.blocks,
+                domBlocks: engine.getDOM().blocks,
+                edit: anchorEdit,
+                certificate,
+                diagnostics: joinDiagnostics,
+              });
+              const block = candidate ? engine.blocks.find((item) => item.id === candidate.blockId) : null;
+              if (candidate && ledgerAdmitsBlock(terminalAnchorLineage.ledger, block)) {
+                anchorBaseSnapshot = candidate;
+                anchorLedger = terminalAnchorLineage.ledger;
+              } else {
+                anchorDiagnostics.reason = candidate ? 'ledger-mismatch' : joinDiagnostics.reason ?? 'canonical-behind';
+              }
             } else {
               anchorDiagnostics.reason = 'canonical-behind';
             }
@@ -2294,6 +2360,35 @@ const server = http.createServer(async (req, res) => {
       }
       if (anchorPlan) {
         anchorPlan.public.acceptedElapsedMs = performance.now() - anchorAcceptedAt;
+        // A cumulative lineage: one entry per block edited since the base
+        // generation. Only an unbroken chain of anchored edits continues it.
+        const prior = anchorPriorLineage &&
+          anchorPriorLineage.baseGeneration === anchorPlan.baseGeneration &&
+          anchorPriorLineage.baseRev === anchorPlan.baseRev &&
+          anchorPriorLineage.lastSrcRev === anchorPlan.srcRev - 1
+          ? anchorPriorLineage
+          : null;
+        const blocks = new Map();
+        if (prior?.blocks instanceof Map) {
+          for (const [id, entry] of prior.blocks) blocks.set(id, entry);
+        } else if (prior) {
+          blocks.set(prior.blockId, {
+            baseSnapshot: prior.baseSnapshot,
+            changedLines: [...(prior.changedLines ?? [])],
+            pages: prior.pages ?? null,
+            visualCut: Boolean(prior.visualCut),
+          });
+        }
+        // Until this keystroke's proof lands, the block keeps the pages its
+        // previous proof certified: that is what the paper still shows.
+        const previous = blocks.get(anchorPlan.blockId);
+        blocks.set(anchorPlan.blockId, {
+          baseSnapshot: anchorPlan.baseSnapshot,
+          changedLines: [...anchorPlan.changedLines],
+          pages: previous?.pages ?? null,
+          visualCut: previous?.pages ? Boolean(previous.visualCut) : Boolean(anchorPlan.visualCut),
+        });
+        anchorPlan.public.blockIds = [...blocks.keys()];
         lastReport.canonicalAnchor = anchorPlan.public;
         terminalAnchorLineage = {
           blockId: anchorPlan.blockId,
@@ -2302,6 +2397,8 @@ const server = http.createServer(async (req, res) => {
           lastSrcRev: anchorPlan.srcRev,
           baseSnapshot: anchorPlan.baseSnapshot,
           changedLines: [...anchorPlan.changedLines],
+          ledger: prior?.ledger instanceof Map ? prior.ledger : anchorLedger,
+          blocks,
         };
       } else if (anchorMutation || lastReport.dirtySourceNodes?.length) {
         terminalAnchorLineage = null;

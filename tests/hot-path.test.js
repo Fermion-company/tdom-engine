@@ -41,6 +41,9 @@ import {
   buildTerminalCanonicalPatch,
   canonicalAnchorClientEditTimestamp,
   captureCanonicalAnchorBase,
+  captureCanonicalAnchorLedger,
+  ledgerAdmitsBlock,
+  mergeCumulativeAnchorPatch,
   classifyChildInputMutation,
   flattenCompleteAnchorCandidateGroups,
   dirtyWithoutPatchFallback,
@@ -3764,4 +3767,117 @@ RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition
     await e.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+// ------------------------------------ cumulative multi-block anchor lineage
+
+test('another block joins an anchored lineage only while the ledger still admits it', () => {
+  // the exit state vector: structural values first, the three volatile
+  // paragraph-tail locals (prevdepth, nobreak, lastskip) last
+  const stateVec = '[1,2,3,4,5,6,7,8]';
+  const blocks = [
+    { id: 'alpha', hash: 'h-a', galleyHash: 'g-a', stateVec },
+    { id: 'beta', hash: 'h-b', galleyHash: 'g-b', stateVec },
+  ];
+  const ledger = captureCanonicalAnchorLedger(blocks);
+  assert.equal(ledger.size, 2);
+  assert.equal(ledgerAdmitsBlock(ledger, blocks[1]), true, 'an untouched block is what the base typeset');
+  assert.equal(ledgerAdmitsBlock(ledger, { ...blocks[1], galleyHash: 'g-b2' }), false, 'a retypeset galley is not');
+  assert.equal(ledgerAdmitsBlock(ledger, { ...blocks[1], hash: 'h-b2' }), false, 'nor edited source');
+  assert.equal(ledgerAdmitsBlock(ledger, { ...blocks[1], stateVec: '[1,9,3,4,5,6,7,8]' }), false,
+    'nor a moved structural exit state');
+  assert.equal(ledgerAdmitsBlock(ledger, { ...blocks[1], stateVec: '[1,2,3,4,5,6,7,99]' }), true,
+    'the volatile paragraph-tail locals stay excluded, as for the structural witness');
+  assert.equal(ledgerAdmitsBlock(ledger, { id: 'gamma', hash: 'x', galleyHash: 'y', stateVec }), false, 'unknown block');
+  assert.equal(ledgerAdmitsBlock(null, blocks[0]), false);
+});
+
+test('the plan accepts a joined base on an unbroken lineage and refuses it after a gap', () => {
+  const galley = (text) => ({ items: [
+    { k: 'box', w: 100, h: 8, d: 2, runs: [{ t: text, x: 0, w: 60, s: 10, f: 'body', dy: 0 }] },
+  ], floats: [], events: [], labels: [], refs: [], toclines: [] });
+  const stateVec = '[1,2,3,4,5,6,7,8]';
+  const make = (id, text) => ({
+    id, hash: `h-${id}`, galleyHash: `g-${id}`, start: 0, end: text.length, text, stateVec,
+    sourceStart: { line: 5, column: 1 }, sourceEnd: { line: 5, column: text.length + 1 },
+    fidelity: { level: 'safe-glyph' }, needsRender: false,
+    editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length }],
+    galley: galley(text),
+  });
+  const domFor = (id) => ({ id, span: { start: 0, end: 10 }, source: { start: 0, end: 10 } });
+  const certificate = { id: 7, rev: 10, inputEpoch: 4, pdfHash: 'pdf-a', synctexHash: 'sync-a' };
+  const beta = make('beta', 'Betaprose');
+  const edit = singlePlainTextDelta('Betaprose', 'BetaproseZ');
+  const joinedBase = captureCanonicalAnchorBase({ blocks: [beta], domBlocks: [domFor('beta')], edit, certificate });
+  assert.ok(joinedBase, 'the untouched block yields a base witness against the same generation');
+  const report = (srcRev) => ({
+    mode: 'structured', previewPolicy: 'canonical-anchor', srcRev,
+    canonical: { id: 7, rev: 10, pageCount: 316 }, stats: { pageCount: 134 },
+    dirtySourceNodes: ['src-beta'],
+    patches: [{ type: 'replace-page', page: 60, displayList: { commands: [
+      { op: 'glyphs', src: 'beta', line: 0, x: 72, y: 600, w: 60, gh: 8, gd: 2, size: 10, text: 'BetaproseZ' },
+    ] } }],
+  });
+  const current = make('beta', 'BetaproseZ');
+  const lineage = (lastSrcRev) => ({
+    blockId: 'alpha', baseGeneration: 7, baseRev: 10, lastSrcRev,
+    baseSnapshot: { blockId: 'alpha' }, changedLines: [0],
+    blocks: new Map([['alpha', { baseSnapshot: { blockId: 'alpha' }, changedLines: [0], pages: null }]]),
+  });
+  // alpha was anchored at rev 11; beta joins at rev 12
+  const joined = planTerminalCanonicalAnchor({
+    blocks: [current], domBlocks: [domFor('beta')], report: report(12), geometry: { textheight: 680 },
+    edit, baseSnapshot: joinedBase, lineage: lineage(11), inputEpoch: 5,
+  });
+  assert.ok(joined, 'a second block anchors on the same base through the ledger-verified witness');
+  assert.equal(joined.joinedBase, true);
+  assert.equal(joined.baseSnapshot, joinedBase);
+  // a gap in the chain (rev 11 was not anchored) is not a lineage
+  const gap = {};
+  assert.equal(planTerminalCanonicalAnchor({
+    blocks: [current], domBlocks: [domFor('beta')], report: report(13), geometry: { textheight: 680 },
+    edit, baseSnapshot: joinedBase, lineage: lineage(11), inputEpoch: 5, diagnostics: gap,
+  }), null);
+  assert.equal(gap.reason, 'base-generation');
+  // without a fresh witness for the joining block there is nothing to prove against
+  const missing = {};
+  assert.equal(planTerminalCanonicalAnchor({
+    blocks: [current], domBlocks: [domFor('beta')], report: report(12), geometry: { textheight: 680 },
+    edit, baseSnapshot: null, lineage: lineage(11), inputEpoch: 5, diagnostics: missing,
+  }), null);
+  assert.equal(missing.reason, 'base-generation');
+});
+
+test('a cumulative patch carries every block of the lineage and refuses conflicts', () => {
+  const box = (left, top) => ({ left, top, right: left + 100, bottom: top + 12 });
+  const own = {
+    status: 'ready', blockId: 'beta', srcRev: 12, baseGeneration: 7, baseRev: 10, visualCut: false,
+    changedLines: [0], authoritative: false, publishWithinMs: 850, clientEditAtEpochMs: null,
+    pages: [{ page: 60, masks: [box(72, 600)], commands: [{ op: 'glyphs', text: 'Z' }] }],
+    page: 60, mask: box(72, 600), commands: [{ op: 'glyphs', text: 'Z' }],
+  };
+  const alphaPages = [{ page: 12, masks: [box(72, 100)], commands: [{ op: 'glyphs', text: 'A' }] }];
+  const merged = mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: alphaPages, visualCut: false }]);
+  assert.deepEqual(merged.blockIds, ['beta', 'alpha']);
+  assert.deepEqual(merged.pages.map((page) => page.page), [12, 60]);
+  assert.equal(merged.page, undefined, 'the single-line transitional fields are dropped');
+  assert.equal(merged.blockId, 'beta', 'the edited block stays the patch owner');
+  // same page, disjoint masks: both deltas share the page
+  const samePage = mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: [{ page: 60, masks: [box(72, 300)], commands: [] }], visualCut: false }]);
+  assert.equal(samePage.pages.length, 1);
+  assert.equal(samePage.pages[0].masks.length, 2);
+  // overlapping masks from two blocks cannot compose one page
+  assert.equal(mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: [{ page: 60, masks: [box(80, 605)], commands: [] }], visualCut: false }]), null);
+  // an exact-frame page joins a VisualCut lineage with an empty raster ring
+  const alphaCut = [{ page: 12, masks: [box(72, 100)], baseMasks: [box(72, 100)], commands: [] }];
+  const promoted = mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: alphaCut, visualCut: true }]);
+  assert.equal(promoted.visualCut, true, 'the merged patch travels as a VisualCut event');
+  assert.deepEqual(promoted.pages.find((page) => page.page === 60).baseMasks, [box(72, 600)],
+    'the exact page gets baseMask = mask');
+  assert.deepEqual(promoted.pages.find((page) => page.page === 12).baseMasks, [box(72, 100)]);
+  // a VisualCut page without its base mask cannot be promoted
+  assert.equal(mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: alphaPages, visualCut: true }]), null);
+  // nothing to merge keeps the patch untouched
+  assert.equal(mergeCumulativeAnchorPatch(own, []), own);
 });

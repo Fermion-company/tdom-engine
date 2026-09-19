@@ -471,6 +471,84 @@ function linesCarryShipoutColor(galley, lineIndexes) {
  * canonical generation supplies the physical page address; provisional page
  * numbers never do.
  */
+/** Identity of every block at the moment a canonical generation was the
+ * exact compile of the source. A later edit in another block may join the
+ * same base only while its block still carries this identity: the block's
+ * source, galley and structural exit state are then exactly what the base
+ * generation typeset, so its resident witness is the base witness. */
+export function captureCanonicalAnchorLedger(blocks) {
+  const ledger = new Map();
+  for (const block of Array.isArray(blocks) ? blocks : []) {
+    if (!block?.id) continue;
+    const structural = canonicalAnchorStructuralState(block.stateVec);
+    ledger.set(String(block.id), {
+      hash: block.hash ?? null,
+      galleyHash: block.galleyHash ?? null,
+      structuralStateVec: structural,
+    });
+  }
+  return ledger;
+}
+
+export function ledgerAdmitsBlock(ledger, block) {
+  if (!(ledger instanceof Map) || !block?.id) return false;
+  const entry = ledger.get(String(block.id));
+  if (!entry || entry.structuralStateVec === null) return false;
+  return entry.hash === (block.hash ?? null) &&
+    entry.galleyHash === (block.galleyHash ?? null) &&
+    entry.structuralStateVec === canonicalAnchorStructuralState(block.stateVec);
+}
+
+/** One patch for the whole edited set: this block's freshly certified pages
+ * plus the certified pages every other block of the same base lineage
+ * already holds. Every page stays addressed against the same immutable
+ * generation; masks from different blocks must not touch, and the raster
+ * proof kind must be uniform because the client validates by kind. */
+export function mergeCumulativeAnchorPatch(patch, others) {
+  if (!patch || patch.status !== 'ready') return null;
+  const list = Array.isArray(others) ? others.filter((item) => item && Array.isArray(item.pages) && item.pages.length) : [];
+  if (!list.length) return patch;
+  // The client validates a VisualCut event by inspecting the raster ring
+  // `mask - baseMask` of every page. An exact-frame page joins such a patch
+  // with baseMask = mask: an empty ring, nothing extra to inspect, and the
+  // ordinary mask stays exactly what its own proof certified.
+  const visualCut = Boolean(patch.visualCut) || list.some((item) => Boolean(item.visualCut));
+  const pages = new Map();
+  const add = (pagePatch, sourceVisualCut) => {
+    const number = Number(pagePatch.page);
+    if (!Number.isInteger(number) || number < 1) return false;
+    if (!pages.has(number)) {
+      pages.set(number, { page: number, masks: [], commands: [], ...(visualCut ? { baseMasks: [] } : {}) });
+    }
+    const target = pages.get(number);
+    for (let index = 0; index < (pagePatch.masks ?? []).length; index++) {
+      const mask = pagePatch.masks[index];
+      if (!validBox(mask) || target.masks.some((other) => boxesOverlap(mask, other))) return false;
+      target.masks.push(mask);
+      if (visualCut) {
+        const baseMask = sourceVisualCut ? pagePatch.baseMasks?.[index] : { ...mask };
+        if (!validBox(baseMask) || !boxInside(baseMask, mask)) return false;
+        target.baseMasks.push(baseMask);
+      }
+    }
+    target.commands.push(...(pagePatch.commands ?? []));
+    return true;
+  };
+  for (const pagePatch of patch.pages ?? []) if (!add(pagePatch, Boolean(patch.visualCut))) return null;
+  for (const item of list) for (const pagePatch of item.pages) if (!add(pagePatch, Boolean(item.visualCut))) return null;
+  const merged = {
+    ...patch,
+    visualCut,
+    blockIds: [...new Set([patch.blockId, ...list.map((item) => String(item.blockId))])],
+    pages: [...pages.values()].sort((left, right) => left.page - right.page),
+  };
+  delete merged.page;
+  delete merged.mask;
+  delete merged.baseMask;
+  delete merged.commands;
+  return merged;
+}
+
 export function planTerminalCanonicalAnchor({
   blocks,
   domBlocks,
@@ -506,16 +584,27 @@ export function planTerminalCanonicalAnchor({
 
   const blockId = String(report.dirtySourceNodes[0]).replace(/^src-/, '');
   const immediateBase = canonical.rev === report.srcRev - 1;
-  const continuedBase = lineage &&
-    lineage.blockId === blockId &&
+  // An unbroken chain of anchored edits since the base generation: every
+  // keystroke since canonical.rev was itself anchored on this generation.
+  const lineageContinues = Boolean(lineage) &&
     lineage.baseGeneration === canonical.id &&
     lineage.baseRev === canonical.rev &&
-    lineage.lastSrcRev === report.srcRev - 1 &&
-    lineage.baseSnapshot;
-  if (!immediateBase && !continuedBase) return reject('base-generation');
+    lineage.lastSrcRev === report.srcRev - 1;
+  // The block's own entry: a cumulative lineage keeps one per edited block,
+  // the historical single-block lineage is its own entry.
+  const entry = lineage?.blocks instanceof Map
+    ? lineage.blocks.get(blockId) ?? null
+    : lineage && lineage.blockId === blockId ? lineage : null;
+  const continuedBase = lineageContinues && Boolean(entry?.baseSnapshot);
+  // Another block joins the same base: the server captured its base witness
+  // now, after proving through the ledger that the block is exactly what the
+  // base generation typeset.
+  const joinedBase = !immediateBase && !continuedBase && lineageContinues &&
+    Boolean(baseSnapshot) && baseSnapshot.blockId === blockId;
+  if (!immediateBase && !continuedBase && !joinedBase) return reject('base-generation');
   const block = blocks.find((item) => item.id === blockId);
   const dom = domBlocks.find((item) => item.id === blockId);
-  const base = immediateBase ? baseSnapshot : lineage.baseSnapshot;
+  const base = continuedBase ? entry.baseSnapshot : baseSnapshot;
   if (!block || !dom) return reject('block-missing');
   if (!base) return reject('no-base');
   if (base.blockId !== blockId ||
@@ -582,8 +671,8 @@ export function planTerminalCanonicalAnchor({
   // preserves the lineage for the following edit. A malformed or merely
   // similar witness still follows the historical fail-closed null path.
   if (!changedLines && continuedBase && identicalGalleyLines(base.lineWitnesses, currentLines)) {
-    const priorLines = Array.isArray(lineage.changedLines)
-      ? [...new Set(lineage.changedLines.filter((line) =>
+    const priorLines = Array.isArray(entry.changedLines)
+      ? [...new Set(entry.changedLines.filter((line) =>
           Number.isInteger(line) && line >= 0 && line < currentLines.length && currentLines[line]))]
       : [];
     if (priorLines.length) changedLines = priorLines;
@@ -669,6 +758,7 @@ export function planTerminalCanonicalAnchor({
     currentLineWitnesses: currentLines,
     changedLines,
     visualCut,
+    joinedBase,
     linePlans,
     geometry: activeGeometry,
     acceptedAt,

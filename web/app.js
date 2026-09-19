@@ -1069,10 +1069,18 @@ function applyReport(report) {
   const dirtyBlock = report.dirtySourceNodes?.length === 1
     ? String(report.dirtySourceNodes[0]).replace(/^src-/, '')
     : null;
+  // A cumulative overlay covers every block edited since its base; the
+  // server lists them so a refusal in any of them keeps the lease.
+  const previewBlocks = canonicalAnchorPreview
+    ? (Array.isArray(canonicalAnchorPreview.blockIds) ? canonicalAnchorPreview.blockIds : [canonicalAnchorPreview.blockId])
+    : [];
+  const intentBlocks = anchorIntent
+    ? (Array.isArray(anchorIntent.blockIds) ? anchorIntent.blockIds : [anchorIntent.blockId])
+    : [];
   const leased = !anchorIntent && canonicalAnchorPreview && !canonicalAnchorPreview.retiring &&
     (report.canonicalAnchorRefused === 'base-generation' ||
       report.canonicalAnchorRefused === 'canonical-behind') &&
-    dirtyBlock === canonicalAnchorPreview.blockId;
+    previewBlocks.includes(dirtyBlock);
   if (canonicalAnchorPreview?.retiring) {
     // A covering canonical is on its way to this page. Until that image
     // commits (or a new anchor replaces the delta atomically), no report may
@@ -1089,7 +1097,7 @@ function applyReport(report) {
     // page covering this revision is on paper.
     canonicalAnchorPreview.targetSrcRev = appliedSrcRev;
   } else if (!anchorIntent || canonicalAnchorPreview && (
-    canonicalAnchorPreview.blockId !== anchorIntent.blockId ||
+    !previewBlocks.every((id) => intentBlocks.includes(id)) ||
     canonicalAnchorPreview.baseGeneration !== anchorIntent.baseGeneration
   )) {
     clearCanonicalAnchorPreview();
@@ -1110,7 +1118,7 @@ function applyReport(report) {
     if (patch.type === 'replace-page') {
       const dl = patch.displayList;
       if (anchorIntent && (anchorIntent.provisionalPages ?? [anchorIntent.provisionalPage]).includes(dl.page) &&
-          dl.commands?.some((command) => command.src === anchorIntent.blockId)) {
+          dl.commands?.some((command) => intentBlocks.includes(command.src))) {
         // The provisional page number belongs to the resident renderer's
         // local address space. While canonical anchoring resolves, retain
         // the unchanged physical page instead of repainting the unrelated
@@ -1250,6 +1258,7 @@ function tryApplyPendingCanonicalAnchor() {
   const committedAt = performance.now();
   canonicalAnchorPreview = {
     blockId: patch.blockId,
+    blockIds: Array.isArray(patch.blockIds) ? [...patch.blockIds] : [patch.blockId],
     srcRev: patch.srcRev,
     targetSrcRev: patch.srcRev,
     baseGeneration: patch.baseGeneration,
