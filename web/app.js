@@ -1175,6 +1175,11 @@ function tryApplyPendingCanonicalAnchor() {
   const pagePatches = canonicalAnchorPages(patch);
   const transactions = [];
   for (const pagePatch of pagePatches) {
+    if (patch.visualCut === true &&
+        !globalThis.TdomCanonicalAnchorRaster?.validateVisualCutPage(pagePatch)) {
+      discardPendingCanonicalAnchor();
+      return false;
+    }
     const pageNumber = Number(pagePatch.page);
     const page = pageDivs.get(pageNumber);
     const presented = page?.isConnected ? presentedPageState(page) : null;
@@ -1182,9 +1187,11 @@ function tryApplyPendingCanonicalAnchor() {
         presented?.id !== Number(patch.baseGeneration) ||
         presented?.rev !== Number(patch.baseRev)) return false;
     const rules = [];
-    for (const mask of pagePatch.masks ?? []) {
+    for (let index = 0; index < (pagePatch.masks ?? []).length; index++) {
+      const mask = pagePatch.masks[index];
       if (!mask || ![mask.left, mask.top, mask.right, mask.bottom].every(Number.isFinite)) return false;
-      const background = canonicalAnchorBackground(page, mask);
+      const baseMask = patch.visualCut === true ? pagePatch.baseMasks[index] : null;
+      const background = canonicalAnchorBackground(page, mask, baseMask);
       if (!background) {
         // A solid mask is exact only when the canonical ink sits on a locally
         // uniform background. Gradients, artwork, and frames fail closed.
@@ -1223,6 +1230,7 @@ function tryApplyPendingCanonicalAnchor() {
     targetSrcRev: patch.srcRev,
     baseGeneration: patch.baseGeneration,
     baseRev: patch.baseRev,
+    visualCut: patch.visualCut === true,
     pages: pagePatches.map((page) => ({ page: page.page })),
   };
   canonicalAnchorPendingPatch = null;
@@ -1275,7 +1283,9 @@ function canonicalAnchorPages(patch) {
   if (!patch) return [];
   if (Array.isArray(patch.pages)) return patch.pages;
   return Number.isInteger(Number(patch.page))
-    ? [{ page: Number(patch.page), masks: patch.mask ? [patch.mask] : [], commands: patch.commands ?? [] }]
+    ? [{ page: Number(patch.page), masks: patch.mask ? [patch.mask] : [],
+        ...(patch.visualCut === true ? { baseMasks: patch.baseMask ? [patch.baseMask] : [] } : {}),
+        commands: patch.commands ?? [] }]
     : [];
 }
 
@@ -1286,7 +1296,7 @@ function canonicalAnchorWithinDeadline(patch) {
     performance.now() - startedAt < limit;
 }
 
-function canonicalAnchorBackground(page, mask) {
+function canonicalAnchorBackground(page, mask, baseMask = null) {
   const image = page?.querySelector('img.canon');
   if (!image?.naturalWidth || !image?.naturalHeight) return null;
   let cached = canonicalAnchorCanvasCache.get(image);
@@ -1343,6 +1353,42 @@ function canonicalAnchorBackground(page, mask) {
   const rgb = [0, 1, 2].map((channel) =>
     Math.round(samples.reduce((sum, sample) => sum + sample[channel], 0) / samples.length)
   );
+  if (baseMask) {
+    const raster = globalThis.TdomCanonicalAnchorRaster;
+    if (!raster?.ringPixelsUniform || !raster.validateVisualCutPage({ masks: [mask], baseMasks: [baseMask] })) {
+      return null;
+    }
+    const pixelLeft = Math.floor(mask.left * sx);
+    const pixelTop = Math.floor(mask.top * sy);
+    const pixelRight = Math.ceil(mask.right * sx);
+    const pixelBottom = Math.ceil(mask.bottom * sy);
+    if (pixelLeft < 0 || pixelTop < 0 || pixelRight > cached.canvas.width ||
+        pixelBottom > cached.canvas.height || pixelRight <= pixelLeft || pixelBottom <= pixelTop ||
+        (pixelRight - pixelLeft) * (pixelBottom - pixelTop) > raster.DEFAULT_MAX_PIXELS) return null;
+    let imageData;
+    try {
+      imageData = cached.context.getImageData(
+        pixelLeft,
+        pixelTop,
+        pixelRight - pixelLeft,
+        pixelBottom - pixelTop
+      );
+    } catch {
+      return null;
+    }
+    if (!raster.ringPixelsUniform({
+      data: imageData.data,
+      width: imageData.width,
+      height: imageData.height,
+      originX: pixelLeft,
+      originY: pixelTop,
+      sx,
+      sy,
+      mask,
+      baseMask,
+      background: rgb,
+    })) return null;
+  }
   return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
 }
 
@@ -1351,8 +1397,9 @@ function cssColor(value) {
   return match ? match.slice(1, 4).map(Number) : null;
 }
 
-function applyCanonicalAnchorPatch(patch) {
+function applyCanonicalAnchorPatch(patch, { allowVisualCut = false } = {}) {
   if (!patch || patch.srcRev !== appliedSrcRev) return;
+  if (patch.visualCut === true && (!allowVisualCut || patch.authoritative !== false)) return;
   if (patch.baseGeneration !== canonical?.id || patch.baseRev !== canonical?.rev) return;
   if (patch.status !== 'ready') {
     discardPendingCanonicalAnchor();
@@ -1364,6 +1411,9 @@ function applyCanonicalAnchorPatch(patch) {
     !Number.isInteger(Number(page.page)) || Number(page.page) < 1 ||
     !Array.isArray(page.masks) || !page.masks.length ||
     page.masks.some((mask) => !mask || ![mask.left, mask.top, mask.right, mask.bottom].every(Number.isFinite))
+  )) return;
+  if (patch.visualCut === true && pagePatches.some((page) =>
+    !globalThis.TdomCanonicalAnchorRaster?.validateVisualCutPage(page)
   )) return;
   canonicalAnchorPendingPatch = patch;
   for (const pagePatch of pagePatches) {
@@ -6787,6 +6837,12 @@ function receivePreviewEvent(msg) {
     }
     if (msg.kind === 'canonical-anchor') {
       applyCanonicalAnchorPatch(msg.patch);
+      return;
+    }
+    if (msg.kind === 'canonical-visual-cut') {
+      if (msg.patch?.visualCut === true && globalThis.TdomCanonicalAnchorRaster) {
+        applyCanonicalAnchorPatch(msg.patch, { allowVisualCut: true });
+      }
       return;
     }
     if (msg.kind === 'ship-wave') {

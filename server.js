@@ -1408,7 +1408,10 @@ async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch
   if (!rejectReason && !patch) rejectReason = 'PAINT_NOT_ISOLATED';
   if (patch) patch.proofMs = performance.now() - plan.acceptedAt;
   broadcast({
-    kind: 'canonical-anchor',
+    // A distinct event kind is the capability boundary: clients predating
+    // the exhaustive raster-ring proof ignore it instead of applying the
+    // larger mask through their ordinary canonical-anchor path.
+    kind: patch?.visualCut === true ? 'canonical-visual-cut' : 'canonical-anchor',
     patch: patch ?? {
       status: 'fallback',
       blockId: plan.blockId,
@@ -2299,6 +2302,7 @@ const server = http.createServer(async (req, res) => {
           guardReason: anchorDiagnostics.reason ?? null,
           mixedFrameDifference: anchorDiagnostics.mixedFrameDifference ?? null,
           mixedFrameDumped: anchorDiagnostics.mixedFrameDumped ?? false,
+          visualCutRefusal: anchorDiagnostics.visualCutRefusal ?? null,
           acceptedSrcRev: lastReport.srcRev,
           inputEpoch: engine.canonical.inputEpoch,
         };

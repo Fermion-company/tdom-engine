@@ -8,12 +8,16 @@ import {
   identicalGalleyLines,
   mixedGalleyFrame,
   mixedGalleyFrameDifference,
+  mixedGalleyVisualFrame,
+  changedMixedVisualCutLines,
+  mixedVisualCutHeightMatches,
 } from './canonical-paint-index.js';
 import { chmodSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const PLAIN_FLOW_UNSAFE = /[\\$%{}&#^_~]/;
 const ANCHOR_BLEED_BP = 2;
+const VISUAL_SLOT_TOLERANCE_BP = 0.35;
 // Once the resident edit has produced a viable plan, proof and publication
 // get one bounded window. Edit acceptance remains the latency origin carried
 // to diagnostics and the renderer.
@@ -206,6 +210,10 @@ export function captureCanonicalAnchorBase({ blocks, domBlocks, edit, certificat
     source: structuredClone(dom.source),
     lineWitnesses: structuredClone(lineWitnesses),
     frame: mixed?.frame ?? null,
+    visualFrame: mixed?.visualFrame ?? null,
+    visualHeight: mixed ? Number(block.galley?.h) : null,
+    epochs: mixed ? structuredClone(block.galley?.epochs ?? null) : null,
+    trailMarks: mixed ? structuredClone(block.galley?.trailMarks ?? null) : null,
     certificate: { ...certificate },
   };
 }
@@ -230,7 +238,67 @@ function mixedAnchorFrame(block, diagnostics = null) {
       galley.epochs.length !== (galley.items ?? []).length) return reject('mixed-no-trail');
   const lineWitnesses = galleyMixedLineWitnesses(galley);
   const frame = lineWitnesses ? mixedGalleyFrame(galley, lineWitnesses) : null;
-  return frame ? { lineWitnesses, frame } : reject('mixed-no-witness');
+  const visualFrame = lineWitnesses ? mixedGalleyVisualFrame(galley, lineWitnesses) : null;
+  return frame && visualFrame ? { lineWitnesses, frame, visualFrame } : reject('mixed-no-witness');
+}
+
+const VISUAL_CUT_MAX_TRAIL_MARKS = 8192;
+const TRAIL_MARK = /^[0-9a-f]{32}$/;
+
+/** Admit a separate old-layout VisualCut without weakening the exact mixed
+ * frame. The suffix remains the old canonical raster, so only the state
+ * samples strictly before the edited contribution are required to match. */
+function mixedVisualCutAdmission(base, block, currentFrame, currentLines) {
+  if (typeof base?.visualFrame !== 'string' ||
+      currentFrame?.visualFrame !== base.visualFrame) {
+    return { changedLines: null, reason: 'frame' };
+  }
+  const beforeEpochs = base.epochs;
+  const afterEpochs = block.galley?.epochs;
+  if (!Array.isArray(beforeEpochs) || !Array.isArray(afterEpochs) ||
+      beforeEpochs.length !== afterEpochs.length ||
+      beforeEpochs.length !== (block.galley?.items ?? []).length ||
+      beforeEpochs.some((epoch, index) => !Number.isInteger(epoch) || epoch < 0 || epoch !== afterEpochs[index])) {
+    return { changedLines: null, reason: 'epochs' };
+  }
+  const beforeMarks = base.trailMarks;
+  const afterMarks = block.galley?.trailMarks;
+  if (!Array.isArray(beforeMarks) || !Array.isArray(afterMarks) ||
+      beforeMarks.length === 0 || beforeMarks.length !== afterMarks.length ||
+      beforeMarks.length > VISUAL_CUT_MAX_TRAIL_MARKS ||
+      beforeMarks.some((mark, index) => !TRAIL_MARK.test(mark) || !TRAIL_MARK.test(afterMarks[index])) ||
+      afterEpochs.some((epoch) => epoch > beforeMarks.length)) {
+    return { changedLines: null, reason: 'trail-marks' };
+  }
+  const changedLines = changedMixedVisualCutLines(base.lineWitnesses, currentLines);
+  if (!changedLines) return { changedLines: null, reason: 'line-change' };
+  const changedLine = changedLines[0];
+  let box = -1;
+  let itemIndex = -1;
+  for (let index = 0; index < (block.galley?.items ?? []).length; index++) {
+    if (block.galley.items[index]?.k !== 'box') continue;
+    box++;
+    if (box === changedLine) {
+      itemIndex = index;
+      break;
+    }
+  }
+  const epoch = afterEpochs[itemIndex];
+  if (!Number.isInteger(epoch) || epoch <= 0 || epoch > beforeMarks.length) {
+    return { changedLines: null, reason: 'changed-epoch' };
+  }
+  for (let index = 0; index < epoch - 1; index++) {
+    if (beforeMarks[index] !== afterMarks[index]) {
+      return { changedLines: null, reason: 'trail-prefix' };
+    }
+  }
+  if (!mixedVisualCutHeightMatches(
+    base.visualHeight,
+    block.galley?.h,
+    base.lineWitnesses[changedLine],
+    currentLines[changedLine]
+  )) return { changedLines: null, reason: 'height-delta' };
+  return { changedLines, reason: null };
 }
 
 /** A changed plain line of a mixed block must itself be a safe glyph line:
@@ -427,12 +495,16 @@ export function planTerminalCanonicalAnchor({
   const baseFile = typeof base.file === 'string' ? path.resolve(base.file) : null;
   if (block.sourceParts || editFile !== blockFile || baseFile !== blockFile) return reject('file-mismatch');
   const mixed = typeof base.frame === 'string';
+  let visualCut = false;
+  let currentLines = null;
+  let changedLines = null;
   if (mixed) {
     // The resident's exact chunk is irrelevant here: only plain lines are
     // repainted, and everything else must be the same TeX output as the base.
     const frameDiagnostics = {};
     const frame = mixedAnchorFrame(block, frameDiagnostics);
     if (!frame) return reject(frameDiagnostics.reason ?? 'mixed-unavailable');
+    currentLines = frame.lineWitnesses;
     if (frame.frame !== base.frame) {
       if (diagnostics) {
         diagnostics.mixedFrameDifference = mixedGalleyFrameDifference(base.frame, frame.frame);
@@ -441,7 +513,13 @@ export function planTerminalCanonicalAnchor({
           blockId,
         });
       }
-      return reject('mixed-frame-changed');
+      const visual = mixedVisualCutAdmission(base, block, frame, currentLines);
+      if (!visual.changedLines) {
+        if (diagnostics) diagnostics.visualCutRefusal = visual.reason;
+        return reject('mixed-frame-changed');
+      }
+      visualCut = true;
+      changedLines = visual.changedLines;
     }
   } else {
     if (block.fidelity?.level !== SAFE_GLYPH || block.needsRender) return reject('not-safe-glyph');
@@ -457,8 +535,8 @@ export function planTerminalCanonicalAnchor({
 
   const plainEdit = edit ? plainEditContext(block, dom, edit, base) : null;
   if (!plainEdit) return reject('plain-edit');
-  const currentLines = mixed ? galleyMixedLineWitnesses(block.galley) : galleyLineWitnesses(block.galley);
-  let changedLines = mixed
+  currentLines ??= mixed ? galleyMixedLineWitnesses(block.galley) : galleyLineWitnesses(block.galley);
+  changedLines ??= mixed
     ? changedMixedGalleyLines(base.lineWitnesses, currentLines)
     : changedGalleyLines(base.lineWitnesses, currentLines);
   // The previous patch may have painted a cumulative delta over this same
@@ -554,6 +632,7 @@ export function planTerminalCanonicalAnchor({
     baseLineWitnesses: mixed ? base.lineWitnesses.filter(Boolean) : base.lineWitnesses,
     currentLineWitnesses: currentLines,
     changedLines,
+    visualCut,
     linePlans,
     geometry: activeGeometry,
     acceptedAt,
@@ -570,6 +649,8 @@ export function planTerminalCanonicalAnchor({
       baseRev: canonical.rev,
       provisionalPages: [...new Set(linePlans.map((line) => line.provisionalPage))],
       policy: canonicalAnchorPolicy ? 'canonical-anchor' : 'terminal',
+      presentation: visualCut ? 'visual-cut' : 'exact-frame',
+      authoritative: false,
       clientEditAtEpochMs: Number.isFinite(Number(clientEditAtEpochMs))
         ? Number(clientEditAtEpochMs)
         : null,
@@ -626,11 +707,23 @@ export function buildTerminalCanonicalPatch(plan, matching) {
     const commands = line.commands.map((command) => translateCommand(command, dx, dy));
     const translated = translateBox(line.bounds, dx, dy);
     if (!boxInside(translated, region, ANCHOR_BLEED_BP)) return null;
+    if (plan.visualCut &&
+        (translated.left < anchor.box.left - VISUAL_SLOT_TOLERANCE_BP ||
+         translated.right > anchor.box.right + VISUAL_SLOT_TOLERANCE_BP)) return null;
     const mask = unionBoxes(anchor.box, translated, ANCHOR_BLEED_BP);
     if (!validBox(mask)) return null;
-    if (!pages.has(anchor.page)) pages.set(anchor.page, { page: anchor.page, masks: [], commands: [] });
-    pages.get(anchor.page).masks.push(mask);
-    pages.get(anchor.page).commands.push(...commands);
+    const baseMask = plan.visualCut ? unionBoxes(anchor.box, anchor.box, ANCHOR_BLEED_BP) : null;
+    if (baseMask && (!validBox(baseMask) || !boxInside(baseMask, mask))) return null;
+    if (!pages.has(anchor.page)) {
+      const pagePatch = { page: anchor.page, masks: [], commands: [] };
+      if (plan.visualCut) pagePatch.baseMasks = [];
+      pages.set(anchor.page, pagePatch);
+    }
+    const page = pages.get(anchor.page);
+    if (plan.visualCut && page.masks.some((other) => boxesOverlap(mask, other))) return null;
+    page.masks.push(mask);
+    if (baseMask) page.baseMasks.push(baseMask);
+    page.commands.push(...commands);
   }
   if (!pages.size) return null;
   const pagePatches = [...pages.values()].sort((left, right) => left.page - right.page);
@@ -641,6 +734,8 @@ export function buildTerminalCanonicalPatch(plan, matching) {
     baseGeneration: plan.baseGeneration,
     baseRev: plan.baseRev,
     changedLines: [...plan.changedLines],
+    visualCut: Boolean(plan.visualCut),
+    authoritative: false,
     publishWithinMs: Math.max(
       ANCHOR_PUBLISH_BUDGET_MS,
       Number(plan.publishDeadline) - Number(plan.acceptedAt)
@@ -653,6 +748,7 @@ export function buildTerminalCanonicalPatch(plan, matching) {
   if (pagePatches.length === 1 && pagePatches[0].masks.length === 1) {
     patch.page = pagePatches[0].page;
     patch.mask = pagePatches[0].masks[0];
+    if (patch.visualCut) patch.baseMask = pagePatches[0].baseMasks[0];
     patch.commands = pagePatches[0].commands;
   }
   return patch;
@@ -844,6 +940,11 @@ function boxHeight(box) {
 function boxInside(box, region, bleed = 0) {
   return box.left >= region.left - bleed && box.right <= region.right + bleed &&
     box.top >= region.top - bleed && box.bottom <= region.bottom + bleed;
+}
+
+function boxesOverlap(left, right) {
+  return left.left < right.right && left.right > right.left &&
+    left.top < right.bottom && left.bottom > right.top;
 }
 
 function columnRegionForBox(geometry, page, box) {

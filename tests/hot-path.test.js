@@ -1313,7 +1313,7 @@ test('one wholly-owned child prose edit keeps a frozen canonical input lineage',
 test('a prose line inside a mixed block anchors only while everything else is unchanged', () => {
   // heading box, two prose lines, a toc marker and a framed box, as a
   // \subsection + paragraph + tcolorbox block harvests
-  const prose = (text, h = 8, ca) => ({ k: 'box', w: 400, h, d: 2, ...(ca ? { ca: 1 } : {}),
+  const prose = (text, h = 8, ca, d = 2) => ({ k: 'box', w: 400, h, d, ...(ca ? { ca: 1 } : {}),
     runs: [{ t: text, x: 0, w: 10 * text.length, s: 10, f: 'body', dy: 0 }] });
   const opaque = (text) => ({ k: 'box', w: 400, h: 40, d: 0, runs: [
     { t: text, x: 10, w: 60, s: 10, f: 'body', dy: 0 },
@@ -1321,13 +1321,15 @@ test('a prose line inside a mixed block anchors only while everything else is un
   ] });
   // epochs: the heading, then the paragraph (its glue and both lines), then
   // the toc marker and the frame, each moved by its own build_page
-  const galley = ({ second = 'Bravo', frame = 'Framed', toc = 'Heading', h, active, ca,
-    trail = 'trail', alphaFx, frameFx, paintLate } = {}) => ({
-    gfx: true, w: 400, h: 120, closure: 'native', ...(active ? { tdomActive: active } : {}),
-    items: [opaque('Heading'), { k: 'glue', a: 4 }, { ...prose('Alpha'), ...(alphaFx ? { fx: alphaFx } : {}) },
-      { k: 'glue', a: 3 }, prose(second, h, ca), { k: 'tl', n: 0 },
+  const baseTrailMarks = ['a'.repeat(32), 'b'.repeat(32), 'c'.repeat(32)];
+  const galley = ({ second = 'Bravo', frame = 'Framed', toc = 'Heading', h, d, height = 120,
+    alpha = 'Alpha', alphaH, active, ca, trail = 'trail', trailMarks = baseTrailMarks,
+    epochs = [1, 2, 2, 2, 2, 3, 3], alphaFx, frameFx, paintLate } = {}) => ({
+    gfx: true, w: 400, h: height, closure: 'native', ...(active ? { tdomActive: active } : {}),
+    items: [opaque('Heading'), { k: 'glue', a: 4 }, { ...prose(alpha, alphaH), ...(alphaFx ? { fx: alphaFx } : {}) },
+      { k: 'glue', a: 3 }, prose(second, h, ca, d), { k: 'tl', n: 0 },
       { ...opaque(frame), ...(frameFx ? { fx: frameFx } : {}) }],
-    epochs: [1, 2, 2, 2, 2, 3, 3], trail, ...(paintLate ? { paintLate } : {}),
+    epochs, trail, trailMarks, ...(paintLate ? { paintLate } : {}),
     floats: [], events: [], labels: [], refs: [],
     toclines: [['toc', 'subsection', toc]],
   });
@@ -1359,12 +1361,13 @@ test('a prose line inside a mixed block anchors only while everything else is un
     blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}X`,
       editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
       fidelity: fidelity(flags), galley: galley({ second: 'BravoX', ...changes }) }],
-    domBlocks: [dom], report, geometry: context.geometry ?? geometry, edit,
+    domBlocks: [dom], report: context.report ?? report, geometry: context.geometry ?? geometry, edit,
     baseSnapshot: context.base ?? base, paintContext: context.paintContext ?? paintContext,
     acceptedAt: context.acceptedAt, proofStartedAt: context.proofStartedAt,
     diagnostics: context.diagnostics ?? null,
   });
   const ok = plan();
+  assert.equal(ok?.visualCut, false, 'the byte-identical mixed frame keeps the exact path');
   const acceptedAt = performance.now() - 900;
   const proofStartedAt = performance.now();
   const slowResidentPlan = plan({}, 0, { acceptedAt, proofStartedAt });
@@ -1433,7 +1436,7 @@ test('a prose line inside a mixed block anchors only while everything else is un
     'the proof matches every prose line and no opaque box');
   assert.equal(plan({ frame: 'Framed!' }), null, 'an opaque box that changed fails closed');
   assert.equal(plan({ toc: 'Heading!' }), null, 'a changed side effect fails closed');
-  assert.equal(plan({ h: 9 }), null, 'a changed line box fails closed');
+  assert.equal(plan({ h: 9 }), null, 'a metric change without a matching block-height delta fails closed');
   assert.equal(plan({}, 1), null, 'an edited line that needs exact paint fails closed');
   assert.equal(plan({ active: ':' }), null, 'an active character can run a macro: not plain paint');
   // SyncTeX tags a prose line with its paragraph's closing line, so the
@@ -1466,7 +1469,68 @@ test('a prose line inside a mixed block anchors only while everything else is un
 
   // The trail samples TeX's state at every build_page: a later macro that
   // reads what the edit changed can emit a literal the harvest cannot read.
-  assert.equal(plan({ trail: 'other' }), null, 'code after the edit ran from another state');
+  const trailOnly = plan({ trail: 'other' });
+  assert.equal(trailOnly?.visualCut, true,
+    'a changed final trail uses the explicitly non-authoritative old-layout path');
+  const descenderDelta = 1.006236;
+  const descenderReport = {
+    ...report,
+    patches: [{ ...report.patches[0], displayList: { commands: [
+      { ...report.patches[0].displayList.commands[0], gd: 2 + descenderDelta },
+    ] } }],
+  };
+  const visual = plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+    trailMarks: [baseTrailMarks[0], 'd'.repeat(32), 'e'.repeat(32)],
+  }, 0, { report: descenderReport });
+  assert.equal(visual?.visualCut, true, 'one descender metric delta admits a VisualCut');
+  assert.deepEqual(visual?.changedLines, [2]);
+  assert.equal(visual?.public.presentation, 'visual-cut');
+  assert.equal(visual?.public.authoritative, false);
+  assert.equal(plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+    trailMarks: ['f'.repeat(32), 'd'.repeat(32), 'e'.repeat(32)],
+  }), null, 'a state change before the edited contribution fails closed');
+  assert.equal(plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+    trailMarks: undefined,
+  }, 0, { base: { ...base, trailMarks: null } }), null,
+  'missing per-epoch marks fail closed');
+  assert.equal(plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+    trailMarks: ['bad', 'd'.repeat(32), 'e'.repeat(32)],
+  }), null, 'malformed per-epoch marks fail closed');
+  assert.equal(plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta + 0.25,
+    trail: 'other',
+  }), null, 'the aggregate height must equal the edited line metric delta');
+  assert.equal(plan({
+    alphaH: 9,
+    d: 2 + descenderDelta,
+    height: 121 + descenderDelta,
+    trail: 'other',
+  }), null, 'another plain line metric cannot change');
+  assert.equal(plan({
+    alpha: 'AlphaX',
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+  }), null, 'two changed plain signatures cannot share one cut');
+  assert.equal(plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+    epochs: [1, 2, 2, 2, 3, 3, 3],
+  }), null, 'a contribution epoch change fails closed');
   // Inside the edited paragraph no sample sees horizontal-mode state, so its
   // contribution may carry only paint the harvest reads.
   const fxBase = (changes) => captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, galley: galley(changes) }],
@@ -1504,6 +1568,7 @@ test('a prose line inside a mixed block anchors only while everything else is un
   };
   const changedFrame = refusal({ frame: 'Framed!' });
   assert.equal(changedFrame.reason, 'mixed-frame-changed');
+  assert.equal(changedFrame.visualCutRefusal, 'frame');
   assert.deepEqual(changedFrame.mixedFrameDifference, {
     changedFieldCount: 2,
     changedFieldPaths: ['items[6].runs[0].t', 'items[6].runs[1].t'],
@@ -1511,7 +1576,9 @@ test('a prose line inside a mixed block anchors only while everything else is un
     serializationOnly: false,
     truncated: false,
   });
-  assert.deepEqual(refusal({ trail: 'other' }).mixedFrameDifference, {
+  const trailDiagnostics = {};
+  assert.equal(plan({ trail: 'other' }, 0, { diagnostics: trailDiagnostics })?.visualCut, true);
+  assert.deepEqual(trailDiagnostics.mixedFrameDifference, {
     changedFieldCount: 1,
     changedFieldPaths: ['trail'],
     unexaminedFieldPath: null,
@@ -1543,6 +1610,13 @@ test('a prose line inside a mixed block anchors only while everything else is un
   assert.deepEqual(patch?.pages?.map((page) => page.page), [12]);
   assert.equal(patch.pages[0].commands[0].y, 163,
     'positional matches map back to the witness box ordinal, not the first prose line');
+  const visualPatch = buildTerminalCanonicalPatch({ ...visual, geometry: pageGeometry },
+    [{ lineIndex: 0, candidate: line(150) }, { lineIndex: 1, candidate: line(163) }]);
+  assert.equal(visualPatch?.visualCut, true);
+  assert.equal(visualPatch?.authoritative, false);
+  assert.equal(visualPatch?.pages?.[0]?.baseMasks?.length, 1);
+  assert.ok(visualPatch.pages[0].masks[0].bottom > visualPatch.pages[0].baseMasks[0].bottom,
+    'the descender adds a raster-checked ring below the ordinary mask');
   const slowResidentPatch = buildTerminalCanonicalPatch(
     { ...slowResidentPlan, geometry: pageGeometry },
     [{ lineIndex: 0, candidate: line(150) }, { lineIndex: 1, candidate: line(163) }]

@@ -1417,6 +1417,8 @@ function tdom_report()
   end
   encode_runs(items)
   for _, f in ipairs(blk_floats) do encode_runs(f.items) end
+  local trail_marks = {}
+  for i, sample in ipairs(blk_trail or {}) do trail_marks[i] = md5.sumhexa(sample) end
   -- complete font table for THIS galley: every id its runs reference
   local fonts = {}
   for fid in pairs(blk_fonts) do
@@ -1469,6 +1471,7 @@ function tdom_report()
     tdomSourceCatcodesSafe = JOB.sourceCatcodesSafe == true,
     tdomActive = JOB.activeChars ~= '' and JOB.activeChars or nil,
     trail = md5.sumhexa(table.concat(blk_trail or {}, '\n')),
+    trailMarks = trail_marks,
     epochs = epochs,
     paintLate = paint_late,
     backend = resident_backend_profile(),

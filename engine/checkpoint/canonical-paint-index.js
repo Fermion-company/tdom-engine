@@ -130,6 +130,36 @@ export function mixedGalleyFrame(galley, witnesses) {
   ]);
 }
 
+/** The old-layout certificate for a provisional VisualCut. The exact mixed
+ * frame above keeps its full trail and every line metric. This separate frame
+ * omits only values the cut deliberately leaves to the old canonical layout:
+ * aggregate height, the final trail, and h/d of plain witness boxes. */
+export function mixedGalleyVisualFrame(galley, witnesses) {
+  if (!galley || !Array.isArray(witnesses) || !Array.isArray(galley.epochs) ||
+      galley.epochs.length !== (galley.items ?? []).length) return null;
+  let box = -1;
+  const items = (galley.items ?? []).map((item) => {
+    if (item?.k !== 'box') return item;
+    box++;
+    if (!witnesses[box]) return item;
+    const { runs, h, d, ...frame } = item;
+    return frame;
+  });
+  if (box + 1 !== witnesses.length) return null;
+  return JSON.stringify([
+    residentBackendProfileKey(galley.backend),
+    Boolean(galley.gfx),
+    galley.w ?? null,
+    items,
+    galley.epochs,
+    galley.floats ?? [],
+    galley.labels ?? [],
+    galley.refs ?? [],
+    galley.toclines ?? [],
+    galley.events ?? [],
+  ]);
+}
+
 const MIXED_FRAME_FIELDS = [
   'backend', 'gfx', 'width', 'height', 'items', 'floats',
   'labels', 'refs', 'toclines', 'events', 'trail',
@@ -335,6 +365,33 @@ export function changedMixedGalleyLines(baseLines, currentLines) {
     if (before.signature !== after.signature) changed.push(index);
   }
   return changed.length ? changed : null;
+}
+
+/** A VisualCut keeps the old line slots, so exactly one plain signature may
+ * change its h/d. Every other plain line and every line width stays exact. */
+export function changedMixedVisualCutLines(baseLines, currentLines) {
+  if (!Array.isArray(baseLines) || !Array.isArray(currentLines) ||
+      !baseLines.length || baseLines.length !== currentLines.length) return null;
+  const changed = [];
+  for (let index = 0; index < baseLines.length; index++) {
+    const before = baseLines[index];
+    const after = currentLines[index];
+    if (!before !== !after) return null;
+    if (!before) continue;
+    if (!sameNumber(before.lineWidth, after.lineWidth, EPSILON)) return null;
+    if (before.signature !== after.signature) changed.push(index);
+    else if (!sameNumber(before.height, after.height, EPSILON) ||
+        !sameNumber(before.depth, after.depth, EPSILON)) return null;
+  }
+  return changed.length === 1 ? changed : null;
+}
+
+export function mixedVisualCutHeightMatches(baseHeight, currentHeight, beforeLine, afterLine) {
+  if (![baseHeight, currentHeight, beforeLine?.height, beforeLine?.depth,
+    afterLine?.height, afterLine?.depth].every(Number.isFinite)) return false;
+  const blockDelta = currentHeight - baseHeight;
+  const lineDelta = afterLine.height + afterLine.depth - beforeLine.height - beforeLine.depth;
+  return sameNumber(blockDelta, lineDelta, EPSILON);
 }
 
 /** A valid no-op is distinct from changed*GalleyLines' historical null
