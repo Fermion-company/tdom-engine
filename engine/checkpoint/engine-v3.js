@@ -104,8 +104,10 @@ import { adoptGalleyBlock } from './galley-adoption.js';
 import { checkpointKeepSet, nearestCheckpoint } from './checkpoint-selection.js';
 import { reapDyingPids } from './dying-pids.js';
 import {
+  checkpointIndicesForPeers,
   enforceCheckpointCap as enforceCheckpointCapHelper,
   retireOffGrid as retireOffGridHelper,
+  sharedCheckpointBudget,
 } from './checkpoint-retirement.js';
 import {
   bootShipping as bootShippingHelper,
@@ -904,14 +906,32 @@ export class CheckpointEngine {
    */
   #enforceCheckpointCap(continuation = null) {
     const active = [...this.checkpoints].filter(([, peer]) => peer === this.jobInput).map(([index]) => index);
+    const activeRender = checkpointIndicesForPeers(
+      this.checkpoints,
+      [...(this.activeResidentRenderCheckpoints?.values() ?? [])].map(owner => owner.peer)
+    );
+    const budget = sharedCheckpointBudget({
+      maxCheckpoints: this.maxCheckpoints,
+      checkpoints: this.checkpoints,
+      shippingEnabled: !!this.shipping,
+      currentJob: this.currentJob,
+      activeResidentRenders: this.activeResidentRenderCheckpoints,
+    });
     enforceCheckpointCapHelper({
       checkpoints: this.checkpoints,
       keep: this.#checkpointKeepSet(),
-      editHold: [...this.editHold, ...active, ...(continuation === null ? [] : [continuation])],
+      editHold: [0, ...this.editHold, ...active, ...(continuation === null ? [] : [continuation])],
       coveragePins: this.editHold,
       renderHold: this.renderHold,
+      activeHold: activeRender,
+      maxPeers: budget.residentLimit,
       dyingPids: this.dyingPids,
     });
+    // CKPT acceptance can temporarily put the resident map one peer over
+    // its settled coverage. Reclaim that coverage before Shipping observes
+    // the shared allowance, or every foreground JOB would discard its local
+    // frontier during the few microtasks before this cap runs.
+    this.shipping?.trimCheckpoints?.();
   }
 
   #retireOffGrid(idx) {

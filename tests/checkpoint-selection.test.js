@@ -1,8 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import { checkpointKeepSet } from '../engine/checkpoint/checkpoint-selection.js';
-import { enforceCheckpointCap, retireOffGrid } from '../engine/checkpoint/checkpoint-retirement.js';
+import {
+  checkpointIndicesForPeers,
+  distinctCheckpointPeerCount,
+  enforceCheckpointCap,
+  retireOffGrid,
+  sharedCheckpointBudget,
+} from '../engine/checkpoint/checkpoint-retirement.js';
+import { ShippingChain } from '../engine/checkpoint/shipping.js';
 
 test('measured-cost checkpoint selection brackets unknown expensive blocks', () => {
   const blocks = Array.from({ length: 51 }, () => ({ typesetCostMs: 2 }));
@@ -126,5 +136,171 @@ test('temporary edit and render owners do not displace distant coverage frontier
     assert.ok(checkpoints.has(26), `${owner} pins must not force the next cold edit back to root`);
     assert.equal(checkpoints.size, state.keep.size + pins.length);
     assert.deepEqual(retired, []);
+  }
+});
+
+test('shared budget reclaims resident coverage before reducing shipping locality', () => {
+  const peers = Array.from({ length: 16 }, (_, index) => ({ pid: index + 1, send() {} }));
+  const checkpoints = new Map(peers.map((peer, index) => [index, peer]));
+  const budget = sharedCheckpointBudget({
+    maxCheckpoints: 8,
+    checkpoints,
+    shippingEnabled: true,
+  });
+  assert.equal(budget.residentLimit, 12);
+  assert.equal(budget.shippingLimit, 1, 'an unreclaimed resident tree safely shrinks shipping to its root');
+
+  const retired = [];
+  for (const [index, peer] of checkpoints) peer.send = () => retired.push(index);
+  enforceCheckpointCap({
+    checkpoints,
+    keep: new Set([0, 2, 4, 6, 8, 10, 12, 15]),
+    editHold: [14, 15],
+    renderHold: new Map([[13, 'math']]),
+    activeHold: [12],
+    maxPeers: budget.residentLimit,
+    dyingPids: new Set(),
+  });
+  assert.equal(distinctCheckpointPeerCount(checkpoints), 10,
+    'mandatory peers already at desired boundaries also satisfy that coverage');
+  assert.ok(checkpoints.has(0));
+  assert.ok(checkpoints.has(12));
+  assert.ok(checkpoints.has(13));
+  assert.ok(checkpoints.has(14));
+  assert.ok(checkpoints.has(15));
+  assert.equal(retired.length, 6);
+  assert.equal(sharedCheckpointBudget({
+    maxCheckpoints: 8,
+    checkpoints,
+    shippingEnabled: true,
+  }).shippingLimit, 3);
+});
+
+test('mandatory root, job input, and continuation consume capacity outside the coverage plan', () => {
+  const checkpoints = new Map(Array.from({ length: 11 }, (_, index) => [index, {
+    pid: 200 + index,
+    send() {},
+  }]));
+  enforceCheckpointCap({
+    checkpoints,
+    keep: new Set([1, 2, 3, 4, 5, 6, 7, 8]),
+    editHold: [0, 9, 10],
+    coveragePins: [],
+    renderHold: new Map(),
+    maxPeers: 6,
+    dyingPids: new Set(),
+  });
+  assert.equal(distinctCheckpointPeerCount(checkpoints), 6);
+  assert.ok(checkpoints.has(0), 'root is mandatory even outside the measured skeleton');
+  assert.ok(checkpoints.has(9), 'current JOB input is mandatory');
+  assert.ok(checkpoints.has(10), 'generated continuation is mandatory');
+  assert.deepEqual([...checkpoints.keys()].filter(index => index > 0 && index < 9), [1, 2, 3]);
+});
+
+test('shared budget counts peer aliases once and reserves unmaterialized resident forks', () => {
+  const root = { pid: 101, send() {} };
+  const next = { pid: 102, send() {} };
+  const checkpoints = new Map([[0, root], [1, root], [2, next]]);
+  const activeResidentRenders = new Map([['rr@1', { peer: next, index: 2 }]]);
+  const pending = sharedCheckpointBudget({
+    maxCheckpoints: 8,
+    checkpoints,
+    shippingEnabled: true,
+    currentJob: { ckptIdx: 3, pid: 103 },
+    activeResidentRenders,
+  });
+  assert.equal(distinctCheckpointPeerCount(checkpoints), 2);
+  assert.equal(pending.residentReservations, 2);
+  assert.equal(pending.residentLimit, 10);
+  assert.equal(pending.shippingLimit, 3);
+
+  checkpoints.set(3, { pid: 103, send() {} });
+  const materialized = sharedCheckpointBudget({
+    maxCheckpoints: 8,
+    checkpoints,
+    shippingEnabled: true,
+    currentJob: { ckptIdx: 3, pid: 103 },
+    activeResidentRenders,
+  });
+  assert.equal(materialized.residentReservations, 1, 'the same JOB child is not counted twice after CKPT');
+
+  const small = sharedCheckpointBudget({
+    maxCheckpoints: 2,
+    checkpoints: new Map([[0, root]]),
+    shippingEnabled: true,
+  });
+  assert.deepEqual(
+    { residentLimit: small.residentLimit, shippingLimit: small.shippingLimit },
+    { residentLimit: 1, shippingLimit: 2 },
+    'small budgets retain both roots and spend only the remaining shipping checkpoint slot'
+  );
+
+  let deaths = 0;
+  root.send = () => deaths++;
+  retireOffGrid({
+    idx: 1,
+    keep: new Set([2]),
+    checkpoints,
+    editHold: [],
+    renderHold: new Map(),
+    block: null,
+    dyingPids: new Set(),
+  });
+  assert.equal(deaths, 1);
+  assert.equal(checkpoints.has(0), false);
+  assert.equal(checkpoints.has(1), false);
+});
+
+test('an active render follows its peer when an edit rekeys the checkpoint boundary', () => {
+  const owner = { pid: 301, send() {} };
+  const other = { pid: 302, send() {} };
+  const checkpoints = new Map([[3, other], [7, owner]]);
+  const active = new Map([['rr@1', { peer: owner, index: 4 }]]);
+  const indices = checkpointIndicesForPeers(
+    checkpoints,
+    [...active.values()].map(item => item.peer)
+  );
+  assert.deepEqual(indices, [7]);
+
+  enforceCheckpointCap({
+    checkpoints,
+    keep: new Set([3]),
+    editHold: [],
+    renderHold: new Map(),
+    activeHold: indices,
+    maxPeers: 1,
+    dyingPids: new Set(),
+  });
+  assert.deepEqual([...checkpoints.keys()], [7], 'the current owner peer wins over its stale index');
+});
+
+test('shipping keeps root, certified base, then the local frontier as its budget shrinks', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tdom-shipping-budget-'));
+  let limit = 3;
+  const chain = new ShippingChain({ workDir: dir, checkpointBudget: () => limit });
+  const retired = [];
+  const peer = page => ({ alive: true, pid: 0, send: () => retired.push(page) });
+  try {
+    chain.wavePrefixPage = 5;
+    for (const page of [0, 4, 5, 8, 9]) chain.checkpoints.set(page, peer(page));
+    chain.trimCheckpoints();
+    assert.deepEqual([...chain.checkpoints.keys()], [0, 5, 9]);
+    assert.deepEqual(retired.sort((a, b) => a - b), [4, 8]);
+
+    limit = 2;
+    chain.trimCheckpoints();
+    assert.deepEqual([...chain.checkpoints.keys()], [0, 5], 'the old base survives before the frontier');
+
+    const rootPeer = chain.checkpoints.get(0);
+    chain.checkpoints.set(1, rootPeer);
+    assert.equal(chain.info().checkpointCount, 2, 'two indices for one process consume one logical slot');
+    limit = 1;
+    chain.trimCheckpoints();
+    assert.deepEqual([...chain.checkpoints.keys()].sort((a, b) => a - b), [0, 1, 5],
+      'root aliases and the certified base survive a transient one-slot allowance');
+    assert.equal(chain.info().checkpointCount, 2);
+  } finally {
+    await chain.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

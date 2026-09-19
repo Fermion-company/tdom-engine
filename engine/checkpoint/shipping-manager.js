@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { ShippingChain } from './shipping.js';
 import { shippingLabelSeed } from './shipping-seeds.js';
+import { sharedCheckpointBudget } from './checkpoint-retirement.js';
 
 const RETRY_LIMIT = 3;
 const TRANSIENT_CODES = new Set(['EAGAIN', 'ENOMEM', 'EMFILE', 'ENFILE', 'ETIMEDOUT', 'ECONNRESET']);
@@ -334,7 +335,13 @@ export function makeShippingChain(engine, queueShipBoot) {
     workDir: path.join(engine.workDir, 'ship'),
     docDir: engine.docDir,
     overlayDir: engine.overlayDir,
-    checkpointBudget: () => Math.max(1, engine.maxCheckpoints * 2 - engine.checkpoints.size),
+    checkpointBudget: () => sharedCheckpointBudget({
+      maxCheckpoints: engine.maxCheckpoints,
+      checkpoints: engine.checkpoints,
+      shippingEnabled: true,
+      currentJob: engine.currentJob,
+      activeResidentRenders: engine.activeResidentRenderCheckpoints,
+    }).shippingLimit,
   });
   chain.onWave = (wave) => {
     if (engine.shipStale || chain !== engine.shipping ||

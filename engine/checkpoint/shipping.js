@@ -26,6 +26,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { segmentBody } from '../segmenter.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
 import { ensureShim } from './forkshim.js';
+import { distinctCheckpointPeerCount } from './checkpoint-retirement.js';
 
 const execFileP = promisify(execFile);
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -999,7 +1000,7 @@ export class ShippingChain {
     // Sample the known tail within its available budget before forking.
     // Creating and then immediately retiring every page checkpoint forces
     // the replay root to copy the same font heap over and over.
-    const slots = Math.max(0, this.checkpointLimit() - this.checkpoints.size);
+    const slots = Math.max(0, this.checkpointLimit() - distinctCheckpointPeerCount(this.checkpoints));
     const stride = slots > 0 ? Math.max(1, Math.ceil((this.baselinePages - best.page) / slots)) : 0;
     peer.send(`RESUME ${this.gen} ${stride}\n`);
     const cutoffMs = Math.max(1, Number(process.env.TDOM_SHIP_WAVE_CUTOFF ?? 700));
@@ -1074,7 +1075,17 @@ export class ShippingChain {
 
   checkpointLimit() {
     const budget = Number(this.checkpointBudget?.() ?? this.maxCheckpoints);
-    return Math.max(1, Math.min(this.maxCheckpoints, Number.isFinite(budget) ? Math.floor(budget) : this.maxCheckpoints));
+    const configured = Math.max(
+      1,
+      Math.min(this.maxCheckpoints, Number.isFinite(budget) ? Math.floor(budget) : this.maxCheckpoints)
+    );
+    // A resumed generation cannot release either its root escape hatch or
+    // the certified prefix it forked from.  Temporary resident render pins
+    // may reduce the shared allowance below two; preserve correctness and
+    // give up the speculative local frontier instead.
+    const bases = new Set([0, this.wavePrefixPage]
+      .map(page => this.checkpoints.get(page)).filter(Boolean));
+    return Math.max(configured, bases.size);
   }
 
   trimCheckpoints() {
@@ -1082,19 +1093,31 @@ export class ShippingChain {
       if (peer.alive === false) this.checkpoints.delete(page);
     }
     const limit = this.checkpointLimit();
-    while (this.checkpoints.size > limit) {
+    while (distinctCheckpointPeerCount(this.checkpoints) > limit) {
       const pages = [...this.checkpoints.keys()].sort((a, b) => a - b);
-      // Keep the root and the latest frontier. Remove the most redundant
-      // interior snapshot so older pages retain sparse coverage in a fixed
-      // budget, instead of keeping every eighth page without an upper bound.
-      let victim = pages.at(-1);
+      // Root and the last certified prefix base survive until a newer replay
+      // has an actual local frontier.  This prevents a keystroke during that
+      // handover from falling all the way back to page zero.
+      const priority = [...new Set([0, this.wavePrefixPage, pages.at(-1)])]
+        .filter(page => this.checkpoints.has(page));
+      const protectedPeers = new Set();
+      for (const page of priority) {
+        if (protectedPeers.size >= limit) break;
+        protectedPeers.add(this.checkpoints.get(page));
+      }
+      const candidates = pages.filter(page => !protectedPeers.has(this.checkpoints.get(page)));
+      let victim = candidates.at(-1);
       let smallest = Infinity;
       for (let i = 1; i + 1 < pages.length; i++) {
+        if (protectedPeers.has(this.checkpoints.get(pages[i]))) continue;
         const gap = pages[i + 1] - pages[i - 1];
         if (gap < smallest) { smallest = gap; victim = pages[i]; }
       }
+      if (victim === undefined) break;
       const peer = this.checkpoints.get(victim);
-      this.checkpoints.delete(victim);
+      for (const [page, candidate] of [...this.checkpoints]) {
+        if (candidate === peer) this.checkpoints.delete(page);
+      }
       peer.send('DIE\n');
       if (Number.isInteger(peer.pid) && peer.pid > 0) {
         try { process.kill(peer.pid, 'SIGKILL'); } catch { /* retired child already exited */ }
@@ -1107,7 +1130,7 @@ export class ShippingChain {
     return {
       gen: this.gen,
       pages: this.ships.length,
-      checkpointCount: this.checkpoints.size,
+      checkpointCount: distinctCheckpointPeerCount(this.checkpoints),
       checkpointLimit: this.checkpointLimit(),
       inputSnapshotId: this.acceptedSnapshotId,
       shipped: [...new Set(this.ships.map((ship) => ship.page))].sort((a, b) => a - b),

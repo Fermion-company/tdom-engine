@@ -44,7 +44,6 @@ export function handlePeerMessage(engine, peer, msg) {
           }
         }
         engine.checkpoints.set(msg.idx, peer);
-        engine.shipping?.trimCheckpoints?.();
         engine._fulfill('ckpt:' + msg.idx, peer);
       } else {
         peer.send('DIE\n');

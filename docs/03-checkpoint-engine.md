@@ -24,7 +24,7 @@ ShippingChain は root bytes に加えて、現在の静的 expander が実際�
 
 ## 3.2 プロセスモデル
 
-Shipping の checkpoint も `TDOM_MAX_CHECKPOINTS` を上限とする。併用時の枠は、基準上限の2倍から現在の resident 数を差し引いて制限する（再開用 root は1個保持）。root・最新ページを優先し、古いページは間隔が最も狭い境界から間引く。resident の checkpoint 増加時にも Shipping を即時整理する。再開時は保持済み prefix を除いた残枠から tail の保存間隔を決め、最終 `\end{document}` の後には新しい checkpoint を作らない。編集中・描画中に保持する resident の一時枠は別途存続する。
+Resident と Shipping は `TDOM_MAX_CHECKPOINTS` の2倍を論理目標として共有する。Shipping は page checkpoint 3個（root・直前の certified prefix base・現在の局所 frontier）と feeder/生成中 continuation 1個を先に予約し、resident は checkpoint coverage を先に間引く。resident root、実行中 JOB の入力と未 materialize continuation、実行中 RENDER/CAPTURE の所有者、edit/render hold は回収しないため、それらが多い間だけ Shipping の frontier 枠を減らす。小さい枠や一時 pin の集中で root と certified base まで目標内に収まらない場合は、正しさを優先して目標を超える。root と certified base は新しい再開 base が実在するまで残す。同じ process が複数 boundary に現れても1個と数え、DIE 済み PID は保持数ではなく reap queue で別に観測する。再開時は保持済み prefix を除いた残枠から tail の保存間隔を決め、最終 `\end{document}` の後には新しい checkpoint を作らない。
 
 root は `lualatex --shell-escape -interaction=nonstopmode driver.tex` として起動される。`--shell-escape` は `tdomfork.c` の共有ライブラリを `package.loadlib` するために使われる。
 

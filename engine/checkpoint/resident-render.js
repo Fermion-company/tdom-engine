@@ -11,13 +11,16 @@ async function runShipCommand(engine, {
   requestId,
   command,
   body,
+  checkpointIndex,
   awaitRender,
   renderIsolated,
 }) {
   // Renders are latency work, not correctness work (canonical always wins):
   // give up quickly on a spinning child rather than parking a pump lane.
   engine.renderPids ??= new Map();
+  engine.activeResidentRenderCheckpoints ??= new Map();
   engine.renderPids.set(requestId, 0); // armed: FORKED will fill the pid
+  engine.activeResidentRenderCheckpoints.set(requestId, { peer: ck, index: checkpointIndex });
   const done = awaitRender('render:' + requestId, Number(process.env.TDOM_RENDER_TIMEOUT || 20_000));
   ck.send(command);
   if (body) ck.sendRaw(body);
@@ -37,6 +40,7 @@ async function runShipCommand(engine, {
     throw err;
   } finally {
     engine.renderPids.delete(requestId);
+    engine.activeResidentRenderCheckpoints.delete(requestId);
   }
 }
 
@@ -72,6 +76,7 @@ export async function renderResidentBlock(
           command:
             `CAPTURE ${block.id} ${captureToken} ${encodeURIComponent(jobdir)} ${requestId}\n`,
           body: null,
+          checkpointIndex: idx + 1,
           awaitRender,
           renderIsolated,
         });
@@ -108,6 +113,7 @@ export async function renderResidentBlock(
         requestId,
         command: `RENDER ${block.id} ${encodeURIComponent(jobdir)} ${body.length} ${requestId}\n`,
         body,
+        checkpointIndex: idx,
         awaitRender,
         renderIsolated,
       });

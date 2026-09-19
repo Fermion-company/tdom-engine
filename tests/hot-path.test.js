@@ -51,6 +51,7 @@ import {
   warmCanonicalProofOutcome,
 } from '../engine/checkpoint/canonical-anchor.js';
 import { singleLiteralChildReadProof } from '../engine/checkpoint/dependency-read-proof.js';
+import { distinctCheckpointPeerCount } from '../engine/checkpoint/checkpoint-retirement.js';
 import {
   buildPdfPaintPage,
   certifyCanonicalBlock,
@@ -435,7 +436,8 @@ test('document switches bind replacement shipping to the new project and overlay
     const initial = engine.shipping;
     const checkpoints = engine.checkpoints;
     engine.checkpoints = new Map(Array.from({ length: engine.maxCheckpoints * 2 - 2 }, (_, i) => [i, {}]));
-    assert.equal(initial.checkpointLimit(), 2, 'the resident tree reduces the actual shipping chain budget');
+    assert.equal(initial.checkpointLimit(), 1,
+      'the resident tree leaves one shipping checkpoint after reserving its feeder continuation');
     engine.checkpoints = checkpoints;
     await engine.setDocumentContext({ docDir: second, overlayDir: overlay });
     assert.notEqual(engine.shipping, initial);
@@ -3290,16 +3292,51 @@ TARGET${index} uses \VisibleWord. Ordinary text continues with the inherited def
 `).join('') + '\\end{document}';
   let finalSource, expected;
   let checkpointExcess = 0;
+  let checkpointExcessState = null;
   const onMessage = e._onMessage.bind(e);
   e._onMessage = (peer, message) => {
     const result = onMessage(peer, message);
-    checkpointExcess = Math.max(checkpointExcess,
-      e.checkpoints.size - e.maxCheckpoints - e.editHold.length - e.renderHold.size - 2);
+    const temporaryOwnerPeers = new Set([
+      ...e.editHold.map(index => e.checkpoints.get(index)),
+      ...[...e.renderHold.keys()].map(index => e.checkpoints.get(index)),
+      ...[...(e.activeResidentRenderCheckpoints?.values() ?? [])].map(owner => owner.peer),
+    ].filter(Boolean));
+    // The previous cap preserves the JOB input and generated continuation.
+    // CKPT is observed here before the current job's cap retires that carry,
+    // so one newly materialized continuation may exist for this callback.
+    const incoming = message.kind === 'CKPT' ? 1 : 0;
+    const excess = distinctCheckpointPeerCount(e.checkpoints) -
+      e.maxCheckpoints - temporaryOwnerPeers.size - 2 - incoming;
+    if (excess > checkpointExcess) {
+      checkpointExcess = excess;
+      checkpointExcessState = {
+        checkpoints: distinctCheckpointPeerCount(e.checkpoints),
+        checkpointIndices: [...e.checkpoints.keys()],
+        keep: [...(e.checkpointKeepCache ?? [])],
+        temporaryOwners: temporaryOwnerPeers.size,
+        incoming,
+        editHold: [...e.editHold],
+        renderHold: [...e.renderHold.keys()],
+        activeRender: [...(e.activeResidentRenderCheckpoints?.values() ?? [])].map(owner => owner.index),
+        jobInput: [...e.checkpoints].filter(([, candidate]) => candidate === e.jobInput).map(([index]) => index),
+        continuation: e.currentJob?.ckptIdx ?? null,
+      };
+    }
     return result;
   };
   try {
     await e.open(source);
-    assert.equal(checkpointExcess, 0, 'checkpoint count stays bounded during every boot step');
+    assert.equal(checkpointExcess, 0,
+      `checkpoint count stays bounded during every boot step: ${JSON.stringify(checkpointExcessState)}`);
+    const settledOwnerPeers = new Set([
+      ...e.editHold.map(index => e.checkpoints.get(index)),
+      ...[...e.renderHold.keys()].map(index => e.checkpoints.get(index)),
+      ...[...(e.activeResidentRenderCheckpoints?.values() ?? [])].map(owner => owner.peer),
+    ].filter(Boolean));
+    assert.ok(
+      distinctCheckpointPeerCount(e.checkpoints) <= e.maxCheckpoints + settledOwnerPeers.size + 2,
+      'after the callback cap, only coverage, temporary owners, JOB input, and continuation remain'
+    );
     assert.equal(e.calibrateInitialHeap, false, 'initial body fonts have a completed heap calibration');
     const liveFloor = e.confirmedLiveHeapKb;
     assert.ok(liveFloor > 0, 'the native collector reported a live heap baseline');

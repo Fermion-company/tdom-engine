@@ -195,6 +195,7 @@ export function initializeEngineState(
   // still settling finite work.
   engine.buildLeasePreviewJobs = new Set();
   engine.renderSeq = 0; // unique protocol ids keep render forks distinct from foreground JOBs
+  engine.activeResidentRenderCheckpoints = new Map(); // request id -> {peer, index} RENDER/CAPTURE owner
   engine.cancelledRenderIds = new Set(); // late FORKED replies are killed after edit preemption
   engine.captureSeq = 0; // monotonic generation token for retained JOB node lists
   engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };

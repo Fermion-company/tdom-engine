@@ -70,7 +70,8 @@ shipping chain は page PDF と page SVG cache を持つ。
 - page PDF は `ship-g<gen>-p<page>/driver-ship.pdf` に置かれる。
 - `pageSVG(page)` は `pdftocairo -svg` で lazy 変換する。
 - SVG cache key は `gen:page` である。
-- checkpoint process は直近 `TDOM_SHIP_RECENT` page と、`TDOM_SHIP_GRID` の倍数 page を残す。
+- checkpoint process は resident と共有する論理上限の中で最大3個を使い、root・直前の certified prefix base・現在の局所 frontier を優先する。余裕がある場合だけ、直近 `TDOM_SHIP_RECENT` page と `TDOM_SHIP_GRID` の倍数 page から疎な coverage を残す。
+- feeder または生成中 continuation のために checkpoint 外の1枠を予約する。同じ peer の複数 boundary は1枠として数え、DIE 後の PID は reap 側で追う。
 
 ## 11.8 無効化される場合
 
