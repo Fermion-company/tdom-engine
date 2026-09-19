@@ -56,7 +56,15 @@ Build 直後に別章を編集して元に戻す往復はこれで recompile を
 ディレクトリへ `canon.*` として配置し、Build に無い拡張子の古いファイルは消す。Build 後の最初の canonical
 compile は Build が収束させた aux 群から始まるので、本文編集なら 1 pass で fixpoint に達する。
 
-### 8.2c pass 間の譲り渡し
+### 8.2c Build lease と resident bootstrap
+
+`POST /canonical/build-lease/acquire` は `pendingDocumentReset`（/open の resident 起動中）・`shipBooting`・
+`warming` の間は 409 `resident-bootstrap-active` を返し、`blockedBy` にどの段階かを載せる。`warming`
+だけが理由なら、先に `engine.yieldWarmForBuild()` でキャレット warm walk を次のブロック境界で止めてから
+判定する（到達境界は pin され、次の warm はそこから再開する）。/open の resident 起動そのものは中断しない
+（設計案は issue #52 の引き継ぎ §4A）。
+
+### 8.2d pass 間の譲り渡し
 
 `#drain` が起動した scheduled compile は、各 LuaLaTeX pass の正常終了時に「より新しい rev の pending job
 がある」か「再束縛で `last.rev` が自分の rev を追い越した」場合、追加 pass と publish を中止して最新へ進む

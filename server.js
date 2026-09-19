@@ -1500,6 +1500,12 @@ const server = http.createServer(async (req, res) => {
       // already entered its resident bootstrap. The host retries this explicit
       // busy response before spawning TeX; old/unreachable engines remain its
       // separate compatibility fallback.
+      if (!pendingDocumentReset && !engine.shipBooting && engine.warming) {
+        // A caret warm walk (up to tens of seconds on a long document) is
+        // resumable: let it stop at its next block boundary instead of
+        // making the explicit Build retry until the whole walk finishes.
+        await engine.yieldWarmForBuild?.({ timeoutMs: 3000 });
+      }
       if (pendingDocumentReset || engine.shipBooting || engine.warming) {
         // Name the phase so a slow Build can be attributed to the exact
         // bootstrap stage that held its lease.

@@ -382,6 +382,28 @@ export class CheckpointEngine {
     return run;
   }
 
+  /**
+   * An explicit Build outranks a caret warm walk. Stop the walk at its next
+   * block boundary (the boundary it reached is pinned, so the next warm
+   * resumes there) and report whether the resident is quiet enough for the
+   * Build lease. Never touches an edit, the resident boot or a shipping boot.
+   */
+  async yieldWarmForBuild({ timeoutMs = 3000 } = {}) {
+    if (!this.warming) return { yielded: false, warming: false };
+    this.bgAbort = true;
+    const walk = this.bgTask.catch(() => {}).then(() => 'done');
+    const outcome = await Promise.race([
+      walk,
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), timeoutMs)),
+    ]);
+    // The superseded walk leaves the abort flag set (warmEditOffset and
+    // #update reset it for their own runs). Clear it here as they do, so the
+    // deferred chain is not stalled until the next edit; an update that set
+    // it meanwhile resets it again inside its own lock.
+    if (outcome === 'done' && !this.warming && !this.updating) this.bgAbort = false;
+    return { yielded: outcome === 'done', warming: this.warming };
+  }
+
   async close() {
     return closeEngine(this);
   }

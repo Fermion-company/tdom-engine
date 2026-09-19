@@ -215,3 +215,44 @@ test('label renames propagate backwards to earlier referencing blocks', opts, as
   const rb2 = eng.blocks.find((b) => b.text.includes('is a genuine float'));
   assert.ok(!JSON.stringify(rb2.galley.items).includes('??'), 'restored and resolved');
 });
+
+
+// ------------------------------------------------ Build lease vs caret warm
+
+test('a caret warm walk yields to a Build lease at its next block boundary and resumes later', async () => {
+  const work = WORK + '-warm-yield';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the warm yield fixture keeps the resident chain walking for a while.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  try {
+    await e.open(doc);
+    const offset = doc.indexOf('Paragraph 150 ');
+    assert.ok(offset > 0);
+    const warm = e.warmEditOffset(offset);
+    const deadline = Date.now() + 20_000;
+    while (!e.warming && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1));
+    if (!e.warming) {
+      // the walk finished before it could be observed: nothing to yield
+      assert.deepEqual(await e.yieldWarmForBuild(), { yielded: false, warming: false });
+      await warm;
+      return;
+    }
+    const yielded = await e.yieldWarmForBuild({ timeoutMs: 15_000 });
+    assert.equal(yielded.warming, false, 'the walk stopped so a Build lease can be granted');
+    assert.equal(yielded.yielded, true);
+    assert.equal(e.bgAbort, false, 'the abort flag is cleared for the deferred chain');
+    const first = await warm;
+    assert.equal(first.status, 'superseded');
+    // the same caret warms again and reaches ready
+    const second = await e.warmEditOffset(offset);
+    assert.equal(second.status, 'ready');
+  } finally {
+    await e.close();
+  }
+});
