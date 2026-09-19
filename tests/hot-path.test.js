@@ -1371,7 +1371,7 @@ test('a prose line inside a mixed block anchors only while everything else is un
   const acceptedAt = performance.now() - 900;
   const proofStartedAt = performance.now();
   const slowResidentPlan = plan({}, 0, { acceptedAt, proofStartedAt });
-  assert.equal(slowResidentPlan.proofDeadline - proofStartedAt, 700,
+  assert.equal(slowResidentPlan.proofDeadline, proofStartedAt + 700,
     'proof owns its bounded window after resident typesetting is ready');
   assert.equal(slowResidentPlan.publishDeadline, proofStartedAt + 850,
     'publication remains bounded from proof readiness');
