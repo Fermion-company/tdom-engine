@@ -2290,12 +2290,15 @@ const server = http.createServer(async (req, res) => {
         terminalAnchorLineage = null;
       }
       if (anchorDiagnostics.inputTransition || anchorDiagnostics.reason) {
-        // Bounded provenance only: enough to diagnose overlay lifecycle races
-        // without exposing source text or file names in the report/SSE stream.
+        // Bounded provenance and structural field paths only: enough to
+        // diagnose lifecycle/frame refusals without exposing source text,
+        // changed values or file names in the report/SSE stream.
         lastReport.canonicalAnchorInputDiagnostic = {
           transition: anchorDiagnostics.inputTransition ?? null,
           readPathRole: anchorDiagnostics.readPathRole ?? null,
           guardReason: anchorDiagnostics.reason ?? null,
+          mixedFrameDifference: anchorDiagnostics.mixedFrameDifference ?? null,
+          mixedFrameDumped: anchorDiagnostics.mixedFrameDumped ?? false,
           acceptedSrcRev: lastReport.srcRev,
           inputEpoch: engine.canonical.inputEpoch,
         };

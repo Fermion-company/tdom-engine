@@ -57,6 +57,7 @@ import {
   certifyCanonicalBlock,
   galleyMixedLineWitnesses,
   mixedGalleyFrame,
+  mixedGalleyFrameDifference,
 } from '../engine/checkpoint/canonical-paint-index.js';
 
 const TEST_WORK_ROOT = process.env.TDOM_TEST_WORK_ROOT;
@@ -987,6 +988,45 @@ test('anchor candidate ranges reject sparse deadline-stopped results', () => {
   assert.equal(flattenCompleteAnchorCandidateGroups(complete, 19).length, 19);
 });
 
+test('mixed frame diagnostics report paths without values and stay bounded', () => {
+  const frame = (items, height = 120) => JSON.stringify([
+    null, true, 400, height, items, [], [], [], [], [], 'trail',
+  ]);
+  const before = Array.from({ length: 20 }, (_, index) => ({ k: 'box', h: index }));
+  const after = before.map((item) => ({ ...item, h: item.h + 1 }));
+  const difference = mixedGalleyFrameDifference(frame(before), frame(after));
+  assert.equal(difference.changedFieldCount, 20);
+  assert.equal(difference.changedFieldPaths.length, 12);
+  assert.deepEqual(difference.changedFieldPaths.slice(0, 2), ['items[0].h', 'items[1].h']);
+  assert.equal(difference.unexaminedFieldPath, null);
+  assert.equal(difference.serializationOnly, false);
+  assert.equal(difference.truncated, true);
+  assert.equal(JSON.stringify(difference).includes('"h":'), false,
+    'diagnostics include field paths, never changed values');
+  const opaqueRuns = Array.from({ length: 1000 }, (_, index) => ({
+    t: `opaque-${index}`, x: index, w: 5, s: 10, f: 'body', c: '#000000',
+  }));
+  const skippedBefore = [{ k: 'box', h: 40, d: 0, runs: opaqueRuns }, { k: 'box', h: 8, d: 2 }];
+  const skippedAfter = structuredClone(skippedBefore);
+  skippedAfter[1].h = 9;
+  const skipped = mixedGalleyFrameDifference(frame(skippedBefore), frame(skippedAfter, 121));
+  assert.deepEqual(skipped.changedFieldPaths.slice(0, 2), ['height', 'items[1].h'],
+    'top-level and line geometry survive a huge unchanged opaque prefix');
+  assert.equal(skipped.unexaminedFieldPath, null);
+  const largeBefore = Array.from({ length: 9000 }, () => ({ k: 'box', h: 8, d: 2 }));
+  const largeAfter = structuredClone(largeBefore);
+  largeAfter.at(-1).h = 9;
+  const capped = mixedGalleyFrameDifference(frame(largeBefore), frame(largeAfter));
+  assert.equal(capped.changedFieldCount, 0);
+  assert.match(capped.unexaminedFieldPath, /^items\[\d+\]/,
+    'the traversal cap records where comparison stopped');
+  assert.equal(capped.truncated, true);
+  assert.equal(mixedGalleyFrameDifference(
+    frame([{ k: 'box', h: 8 }]),
+    frame([{ h: 8, k: 'box' }])
+  ).serializationOnly, true, 'key-order-only serialization changes remain explicit');
+});
+
 test('caret readiness requires complete canonical candidates and paint', () => {
   assert.deepEqual(warmCanonicalProofOutcome(null, null),
     { status: 'proof-unavailable', reason: 'sync-prefetch-incomplete' });
@@ -1460,14 +1500,31 @@ test('a prose line inside a mixed block anchors only while everything else is un
   const refusal = (changes = {}, flags = 0, context = {}) => {
     const diagnostics = {};
     assert.equal(plan(changes, flags, { ...context, diagnostics }), null);
-    return diagnostics.reason;
+    return diagnostics;
   };
-  assert.equal(refusal({ frame: 'Framed!' }), 'mixed-frame-changed');
-  assert.equal(refusal({ trail: 'other' }), 'mixed-frame-changed');
-  assert.equal(refusal({}, 1), 'mixed-line-flags');
-  assert.equal(refusal({ alphaFx: 'f00d' }, 0, { base: fxBase({ alphaFx: 'f00d' }) }), 'edited-contribution-paint');
-  assert.equal(refusal({ paintLate: { pre_shipout_filter: ['late.paint'] } }), 'paint-callbacks');
-  assert.equal(refusal({}, 0, { base: { ...base, blockId: 'other' } }), 'base-mismatch');
+  const changedFrame = refusal({ frame: 'Framed!' });
+  assert.equal(changedFrame.reason, 'mixed-frame-changed');
+  assert.deepEqual(changedFrame.mixedFrameDifference, {
+    changedFieldCount: 2,
+    changedFieldPaths: ['items[6].runs[0].t', 'items[6].runs[1].t'],
+    unexaminedFieldPath: null,
+    serializationOnly: false,
+    truncated: false,
+  });
+  assert.deepEqual(refusal({ trail: 'other' }).mixedFrameDifference, {
+    changedFieldCount: 1,
+    changedFieldPaths: ['trail'],
+    unexaminedFieldPath: null,
+    serializationOnly: false,
+    truncated: false,
+  });
+  assert.equal(refusal({ active: ':' }).reason, 'mixed-active-chars',
+    'an unavailable current frame retains its specific refusal reason');
+  assert.equal(refusal({}, 1).reason, 'mixed-line-flags');
+  assert.equal(refusal({ alphaFx: 'f00d' }, 0, { base: fxBase({ alphaFx: 'f00d' }) }).reason,
+    'edited-contribution-paint');
+  assert.equal(refusal({ paintLate: { pre_shipout_filter: ['late.paint'] } }).reason, 'paint-callbacks');
+  assert.equal(refusal({}, 0, { base: { ...base, blockId: 'other' } }).reason, 'base-mismatch');
   const captureRefusal = {};
   assert.equal(captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, galley: galley({ active: ':' }) }],
     domBlocks: [dom], edit, certificate, diagnostics: captureRefusal }), null);

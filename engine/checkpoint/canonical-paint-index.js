@@ -130,6 +130,194 @@ export function mixedGalleyFrame(galley, witnesses) {
   ]);
 }
 
+const MIXED_FRAME_FIELDS = [
+  'backend', 'gfx', 'width', 'height', 'items', 'floats',
+  'labels', 'refs', 'toclines', 'events', 'trail',
+];
+const MIXED_FRAME_DIFF_PATHS = 12;
+const MIXED_FRAME_DIFF_VISITS = 4096;
+const MIXED_FRAME_DIFF_DEPTH = 16;
+const MIXED_FRAME_DIFF_PATH_LENGTH = 160;
+const MIXED_FRAME_PARSE_UNITS = 16 * 1024 * 1024;
+const MIXED_FRAME_GEOMETRY_ITEMS = 8192;
+const MIXED_FRAME_EQUALITY_VISITS = 131_072;
+const MIXED_FRAME_EQUALITY_LOCAL_VISITS = 16_384;
+const MIXED_FRAME_EQUALITY_STRING_UNITS = 1024 * 1024;
+const MIXED_FRAME_EQUALITY_MS = 25;
+
+function parsedMixedFrame(serialized) {
+  if (typeof serialized !== 'string' || serialized.length > MIXED_FRAME_PARSE_UNITS) return null;
+  try {
+    const value = JSON.parse(serialized);
+    if (!Array.isArray(value) || value.length !== MIXED_FRAME_FIELDS.length) return null;
+    return Object.fromEntries(MIXED_FRAME_FIELDS.map((field, index) => [field, value[index]]));
+  } catch {
+    return null;
+  }
+}
+
+/** Bounded, value-free diagnostics for two serialized mixed frames. Paths
+ * identify which structural fields changed without exposing source text or
+ * retaining either potentially large frame in the report/SSE stream. */
+export function mixedGalleyFrameDifference(beforeFrame, afterFrame) {
+  const before = parsedMixedFrame(beforeFrame);
+  const after = parsedMixedFrame(afterFrame);
+  if (!before || !after) return null;
+  const paths = [];
+  let changedFieldCount = 0;
+  let visits = 0;
+  let truncated = false;
+  let unexaminedFieldPath = null;
+  const recorded = new Set();
+  const equalityBudget = {
+    visits: MIXED_FRAME_EQUALITY_VISITS,
+    stringUnits: MIXED_FRAME_EQUALITY_STRING_UNITS,
+    deadline: Date.now() + MIXED_FRAME_EQUALITY_MS,
+  };
+  const boundedPath = (fieldPath) => {
+    if (fieldPath.length <= MIXED_FRAME_DIFF_PATH_LENGTH) return fieldPath;
+    truncated = true;
+    return `${fieldPath.slice(0, MIXED_FRAME_DIFF_PATH_LENGTH - 3)}...`;
+  };
+  const record = (fieldPath) => {
+    if (recorded.has(fieldPath)) return;
+    recorded.add(fieldPath);
+    changedFieldCount++;
+    if (paths.length < MIXED_FRAME_DIFF_PATHS) paths.push(boundedPath(fieldPath));
+    else truncated = true;
+  };
+  const childPath = (fieldPath, key, array) => {
+    if (array) return `${fieldPath}[${key}]`;
+    const field = /^[A-Za-z_$][\w$-]*$/.test(key) ? key : '<field>';
+    return fieldPath ? `${fieldPath}.${field}` : field;
+  };
+  // A large unchanged opaque box can contain thousands of run fields. Probe
+  // equality with independent, deterministic work/string budgets so one such
+  // subtree costs one diagnostic visit when it fits, but never makes the SSE
+  // diagnostic itself unbounded.
+  const boundedEqual = (left, right) => {
+    let localVisits = MIXED_FRAME_EQUALITY_LOCAL_VISITS;
+    const stack = [[left, right]];
+    while (stack.length) {
+      if (--localVisits < 0 || --equalityBudget.visits < 0 || Date.now() > equalityBudget.deadline) return null;
+      const [a, b] = stack.pop();
+      if (typeof a === 'string' || typeof b === 'string') {
+        if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+        const units = a.length + b.length;
+        if (units > equalityBudget.stringUnits) return null;
+        equalityBudget.stringUnits -= units;
+        if (a !== b) return false;
+        continue;
+      }
+      if (Object.is(a, b)) continue;
+      const aObject = a !== null && typeof a === 'object';
+      const bObject = b !== null && typeof b === 'object';
+      if (!aObject || !bObject || Array.isArray(a) !== Array.isArray(b)) return false;
+      if (Array.isArray(a)) {
+        if (a.length !== b.length) return false;
+        if (a.length > localVisits || a.length > equalityBudget.visits) return null;
+        for (let index = a.length - 1; index >= 0; index--) stack.push([a[index], b[index]]);
+        continue;
+      }
+      const aKeys = Object.keys(a).sort();
+      const bKeys = Object.keys(b).sort();
+      if (aKeys.length !== bKeys.length) return false;
+      if (aKeys.length > localVisits || aKeys.length > equalityBudget.visits) return null;
+      for (let index = aKeys.length - 1; index >= 0; index--) {
+        if (aKeys[index] !== bKeys[index]) return false;
+        equalityBudget.stringUnits -= aKeys[index].length * 2;
+        if (equalityBudget.stringUnits < 0) return null;
+        stack.push([a[aKeys[index]], b[bKeys[index]]]);
+      }
+    }
+    return true;
+  };
+  const visit = (left, right, fieldPath, depth) => {
+    if (++visits > MIXED_FRAME_DIFF_VISITS) {
+      truncated = true;
+      unexaminedFieldPath ??= boundedPath(fieldPath);
+      return;
+    }
+    if (typeof left === 'string' || typeof right === 'string') {
+      const equal = boundedEqual(left, right);
+      if (equal === true) return;
+      if (equal === null) {
+        truncated = true;
+        unexaminedFieldPath ??= boundedPath(fieldPath);
+        return;
+      }
+      record(fieldPath);
+      return;
+    }
+    if (Object.is(left, right)) return;
+    if (depth >= MIXED_FRAME_DIFF_DEPTH) {
+      record(fieldPath);
+      truncated = true;
+      return;
+    }
+    const leftObject = left !== null && typeof left === 'object';
+    const rightObject = right !== null && typeof right === 'object';
+    if (!leftObject || !rightObject || Array.isArray(left) !== Array.isArray(right)) {
+      record(fieldPath);
+      return;
+    }
+    // Root/items ordering is diagnostically significant. Below an item,
+    // bounded equality lets large unchanged opaque boxes/runs be skipped.
+    if (depth >= 2 && boundedEqual(left, right) === true) return;
+    if (Array.isArray(left)) {
+      if (left.length !== right.length) record(`${fieldPath}.length`);
+      const length = Math.min(left.length, right.length);
+      for (let index = 0; index < length && visits <= MIXED_FRAME_DIFF_VISITS; index++) {
+        visit(left[index], right[index], childPath(fieldPath, index, true), depth + 1);
+      }
+      return;
+    }
+    const keys = [...new Set([...Object.keys(left), ...Object.keys(right)])].sort();
+    for (const key of keys) {
+      if (visits > MIXED_FRAME_DIFF_VISITS) break;
+      const path = childPath(fieldPath, key, false);
+      if (!Object.hasOwn(left, key) || !Object.hasOwn(right, key)) record(path);
+      else visit(left[key], right[key], path, depth + 1);
+    }
+  };
+  // Reserve useful geometry before descending into arbitrary opaque payload.
+  // In particular, a huge unchanged `runs` array must not hide a changed
+  // plain-line height/depth later in `items`.
+  for (const field of ['height', 'width', 'backend', 'gfx']) {
+    visit(before[field], after[field], field, 1);
+  }
+  const beforeItems = before.items;
+  const afterItems = after.items;
+  if (Array.isArray(beforeItems) && Array.isArray(afterItems)) {
+    const length = Math.min(beforeItems.length, afterItems.length, MIXED_FRAME_GEOMETRY_ITEMS);
+    for (let index = 0; index < length; index++) {
+      const left = beforeItems[index];
+      const right = afterItems[index];
+      if (left?.k !== 'box' || right?.k !== 'box') continue;
+      for (const field of ['h', 'd']) {
+        if (!Object.is(left[field], right[field])) {
+          visit(left[field], right[field], `items[${index}].${field}`, 3);
+        }
+      }
+    }
+    if (Math.min(beforeItems.length, afterItems.length) > MIXED_FRAME_GEOMETRY_ITEMS) {
+      truncated = true;
+      unexaminedFieldPath ??= `items[${MIXED_FRAME_GEOMETRY_ITEMS}]`;
+    }
+  }
+  for (const field of MIXED_FRAME_FIELDS) {
+    if (['height', 'width', 'backend', 'gfx'].includes(field)) continue;
+    visit(before[field], after[field], field, 1);
+  }
+  return {
+    changedFieldCount,
+    changedFieldPaths: paths,
+    unexaminedFieldPath,
+    serializationOnly: changedFieldCount === 0 && !truncated,
+    truncated,
+  };
+}
+
 /** Mixed counterpart of changedGalleyLines: opaque boxes stay opaque and
  * unchanged (the caller compares frames), and only plain lines may change. */
 export function changedMixedGalleyLines(baseLines, currentLines) {

@@ -7,7 +7,9 @@ import {
   galleyMixedLineWitnesses,
   identicalGalleyLines,
   mixedGalleyFrame,
+  mixedGalleyFrameDifference,
 } from './canonical-paint-index.js';
+import { chmodSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const PLAIN_FLOW_UNSAFE = /[\\$%{}&#^_~]/;
@@ -18,6 +20,23 @@ const ANCHOR_BLEED_BP = 2;
 export const ANCHOR_PROOF_BUDGET_MS = 700;
 export const ANCHOR_PUBLISH_BUDGET_MS = 850;
 const SP_PER_BP = 65781.76;
+
+/** Explicit diagnostic escape hatch for a frozen native run. The normal SSE
+ * remains value-free; only an absolute operator-supplied path receives the
+ * latest complete base/current frames, in one mode-0600 file. */
+function dumpMixedFrameMismatch(baseFrame, currentFrame, { srcRev, blockId } = {}) {
+  const output = process.env.TDOM_MIXED_FRAME_DUMP_FILE;
+  if (typeof output !== 'string' || !path.isAbsolute(output)) return false;
+  try {
+    writeFileSync(output, `{"schemaVersion":1,"recordedAt":${JSON.stringify(new Date().toISOString())},` +
+      `"srcRev":${JSON.stringify(srcRev ?? null)},"blockId":${JSON.stringify(blockId ?? null)},` +
+      `"baseFrame":${baseFrame},"currentFrame":${currentFrame}}\n`, { mode: 0o600 });
+    chmodSync(output, 0o600);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** A deadline-stopped concurrent range must never masquerade as a complete
  * candidate set: Array#every skips holes in sparse arrays. */
@@ -411,8 +430,19 @@ export function planTerminalCanonicalAnchor({
   if (mixed) {
     // The resident's exact chunk is irrelevant here: only plain lines are
     // repainted, and everything else must be the same TeX output as the base.
-    const frame = mixedAnchorFrame(block);
-    if (!frame || frame.frame !== base.frame) return reject('mixed-frame-changed');
+    const frameDiagnostics = {};
+    const frame = mixedAnchorFrame(block, frameDiagnostics);
+    if (!frame) return reject(frameDiagnostics.reason ?? 'mixed-unavailable');
+    if (frame.frame !== base.frame) {
+      if (diagnostics) {
+        diagnostics.mixedFrameDifference = mixedGalleyFrameDifference(base.frame, frame.frame);
+        diagnostics.mixedFrameDumped = dumpMixedFrameMismatch(base.frame, frame.frame, {
+          srcRev: report.srcRev,
+          blockId,
+        });
+      }
+      return reject('mixed-frame-changed');
+    }
   } else {
     if (block.fidelity?.level !== SAFE_GLYPH || block.needsRender) return reject('not-safe-glyph');
     if (hasGalleySideEffects(block.galley)) return reject('side-effects');
