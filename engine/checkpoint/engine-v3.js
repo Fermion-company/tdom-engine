@@ -73,6 +73,7 @@ import {
 import { applyFidelity, sourceRequiresCanonicalOnly } from './fidelity-gate.js';
 import { indexBlock, unindexBlock } from './block-index.js';
 import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
+import { IsoDiskCache } from './iso-disk-cache.js';
 import { brokenBlockGalley as brokenBlockGalleyHelper } from './broken-galley.js';
 import { sourceClosure } from './closure.js';
 import { mayCaptureNativeBlock, mayNeedRender, releaseRenderHold } from './render-hold.js';
@@ -849,12 +850,26 @@ export class CheckpointEngine {
     return collectFrozenBlocks(this.blocks, this.isoFailCache, (block, idx) => this.#rescueCacheKey(block, idx));
   }
 
+  #isoDiskCache() {
+    if (this.isoDiskCache === null && this.workDir) {
+      try { this.isoDiskCache = new IsoDiskCache(this.workDir); } catch { this.isoDiskCache = false; }
+    }
+    return this.isoDiskCache || null;
+  }
+
   #isoCacheGet(key) {
-    return isoCacheGet(this.isoCache, key);
+    const hit = isoCacheGet(this.isoCache, key);
+    if (hit !== undefined) return hit;
+    // A result from an earlier session with the same inputs: adopt it inline
+    // (the boot walk in particular) instead of queueing a cold compile.
+    const stored = this.#isoDiskCache()?.get(key);
+    if (stored !== undefined) isoCacheSet(this.isoCache, key, stored);
+    return stored;
   }
 
   #isoCacheSet(key, iso) {
     isoCacheSet(this.isoCache, key, iso);
+    this.#isoDiskCache()?.set(key, iso);
   }
 
   async #rescueBlock(idx, why) {
@@ -1655,8 +1670,13 @@ export class CheckpointEngine {
       this.rescueQueue.set(bid, nowKey);
       return;
     }
+    const rescueStartedAt = performance.now();
+    let rescueCompileMs = 0;
+    let rescueCached = true;
     if (this.#isoCacheGet(key) === undefined) {
+      rescueCached = false;
       const iso = await this.#isoCompile(block, idx, 'async exact rescue');
+      rescueCompileMs = performance.now() - rescueStartedAt;
       this.#isoCacheSet(key, iso);
     }
     const outcome = await this.#locked(async () => {
@@ -1719,6 +1739,17 @@ export class CheckpointEngine {
       this.#enforceCheckpointCap();
       return 'done';
     });
+    this.rescueLog.push({
+      id: bid,
+      cached: rescueCached,
+      mode: rescueCached ? null : this.isoModeOf.get(bid) ?? null,
+      compileMs: Math.round(rescueCompileMs),
+      totalMs: Math.round(performance.now() - rescueStartedAt),
+      outcome,
+      at: Date.now(),
+      queued: this.rescueQueue.size,
+    });
+    if (this.rescueLog.length > 200) this.rescueLog.splice(0, this.rescueLog.length - 200);
     if (outcome === 'aborted') {
       // resume after the edit that pre-empted us (waiting OUTSIDE the lock
       // — the edit needs it); the queue entry revalidates on retry

@@ -31,6 +31,7 @@ export async function isoCompile(
       needsRescue,
       breakableRe: () => engine._breakableRe,
     });
+  engine.isoModeOf?.set(block.id, ck0 ? 'fork' : 'cold');
   mkdirSync(jobdir, { recursive: true });
   rmSync(pdf, { force: true });
   rmSync(statePath, { force: true });

@@ -64,6 +64,7 @@ export function initializeEngineState(
   engine.pages = [];
   engine.chunks = makeChunkMap(); // chunkKey -> {svg, wBp, hBp, v} exact renders
   engine.isoCache = new Map(); // rescue key -> isolated compile result
+  engine.isoDiskCache = null; // IsoDiskCache under workDir, created lazily (docs/08 §8.5)
   engine.isoFailCache = new Map(); // rescue key -> error message (doomed compiles: same inputs fail the same way — don't pay the preamble again on every chain pass over a frozen block)
   engine.isoForkBroken = new Set(); // block ids whose iso fork children die (tcolorbox-class fork/dormant incompatibility) — go straight to cold
   engine.dyingPids = new Set(); // DIE'd checkpoint pids not yet exited — #reapDying backpressure
@@ -202,6 +203,10 @@ export function initializeEngineState(
   engine.cancelledRenderIds = new Set(); // late FORKED replies are killed after edit preemption
   engine.captureSeq = 0; // monotonic generation token for retained JOB node lists
   engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };
+  // Per-rescue timeline for /status (block, fork/cold, compile and adopt
+  // time): the boot drain of a long document is invisible otherwise.
+  engine.rescueLog = [];
+  engine.isoModeOf = new Map(); // block.id -> 'fork' | 'cold' of the last isolated compile
   engine.renderHold = new Map(); // ckpt idx kept alive for a pending render -> block.id
   engine.foregroundRenderIds = null;
   // Edit-locus pinning: the checkpoints at (and right after) the block the

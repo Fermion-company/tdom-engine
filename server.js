@@ -1658,6 +1658,12 @@ const server = http.createServer(async (req, res) => {
           pids: Object.fromEntries(engine.renderPids ?? []),
           stats: engine.renderStats,
         },
+        rescue: {
+          queued: engine.rescueQueue?.size ?? 0,
+          pumping: !!engine.rescuePumping,
+          disk: engine.isoDiskCache?.stats ?? null,
+          log: (engine.rescueLog ?? []).slice(-60),
+        },
         shipping: engine.shipping?.info?.() ?? null,
         shippingPresentation: lastShipPresentation,
         canonicalAnchorPresentation: lastAnchorPresentation,

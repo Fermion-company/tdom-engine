@@ -504,3 +504,47 @@ test('a keystroke at the block a caret warm is walking toward resumes from the b
     await e.close();
   }
 });
+
+test('a reopened document adopts its cached isolated rescues during the boot walk', async () => {
+  const work = WORK + '-iso-disk-cache';
+  rmSync(work, { recursive: true, force: true });
+  const doc = [
+    '\\documentclass{article}', '\\usepackage{multicol}', '\\begin{document}',
+    'Plain paragraph before the columns with ordinary prose on the page.', '',
+    '\\begin{multicols}{2}',
+    'Left column text explains the idea in the first column with several plain sentences.',
+    'It continues with another sentence so the column has a few lines of text.', '',
+    '\\columnbreak',
+    'Right column text compares the idea with another one in the second column.',
+    '\\end{multicols}', '',
+    'Plain paragraph after the columns. Closing prose for the page.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  const first = new CheckpointEngine({ workDir: work });
+  try {
+    await first.open(doc);
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      const block = first.blocks.find((b) => /begin\{multicols\}/.test(b.text));
+      if (block?.rescued && !first.rescueQueue.size && !first.rescuePumping) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const block = first.blocks.find((b) => /begin\{multicols\}/.test(b.text));
+    assert.ok(block?.rescued, 'the multicols block was rescued by the isolated compile');
+    assert.ok(first.isoDiskCache?.stats.writes >= 1, JSON.stringify(first.isoDiskCache?.stats));
+  } finally {
+    await first.close();
+  }
+  const second = new CheckpointEngine({ workDir: work });
+  try {
+    const report = await second.open(doc);
+    const block = second.blocks.find((b) => /begin\{multicols\}/.test(b.text));
+    assert.ok(block?.rescued, 'the boot walk adopted the cached rescue inline');
+    assert.equal(second.rescueQueue.size, 0, 'nothing left for the async pump');
+    assert.ok(second.isoDiskCache?.stats.hits >= 1, JSON.stringify(second.isoDiskCache?.stats));
+    assert.ok(second.chunks.size >= 1, 'the cached chunk svg is registered');
+    assert.ok(report.stats.pageCount >= 1);
+  } finally {
+    await second.close();
+  }
+});

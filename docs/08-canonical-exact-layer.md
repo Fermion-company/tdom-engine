@@ -99,6 +99,8 @@ compile は Build が収束させた aux 群から始まるので、本文編集
 
 rescue block は stale-first で表示される。前回の galley/chunk があればそれを保持し、isolated exact compile は async queue で進む。
 
+isolated compile の結果はプロセスを跨いで保持する（`iso-disk-cache.js`、`<workDir>/iso-cache/<epoch>/<key>.json` + chunk の PDF）。rescue key は compile が依存する入力（block text・入口 state・preamble・参照 label の値・page offset）をすべて含むので、同じ入力なら後のエンジンが結果を再利用できる。再オープン時は boot walk がその block を inline で adopt し（`rescueBlock` の cache hit 経路 = state job 1 本）、cold compile の drain を待たずに resident のページ数が canonical と揃う（316 ページの実文書では multicols 31 block × cold 5.4 s + adopt walk ≈ 5 分が消える）。名前空間 `epoch` は daemon.lua / shipd.lua のハッシュ・engine version・`lualatex --version` を含み、toolchain 更新後は古い結果を使わない。`TDOM_ISO_DISK_CACHE=0` で無効、既定の上限は 512 entry（mtime の古い順に削除）。
+
 ## 8.6 verification
 
 fresh canonical が現 source rev に追いついたとき、`#verifyAgainstCanonical()` が structured page text と canonical page text を照合する。
