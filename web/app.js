@@ -6885,8 +6885,14 @@ function receivePreviewEvent(msg) {
     if (msg.kind === 'canonical') {
       // a real-lualatex compile landed: converge every covered page to it
       const activeAnchor = canonicalAnchorPendingPatch ?? canonicalAnchorPreview;
+      // Retire the overlay when the landed generation covers its revision,
+      // and when it is a different base altogether (a stale base landing
+      // for an older revision, docs/08 §8.2c): its lines were certified
+      // against the previous generation's frames.
       if (activeAnchor && (
-        msg.canonical?.rev >= Number(activeAnchor.targetSrcRev ?? activeAnchor.srcRev)
+        msg.canonical?.rev >= Number(activeAnchor.targetSrcRev ?? activeAnchor.srcRev) ||
+        (msg.canonical?.id != null && activeAnchor.baseGeneration != null &&
+          Number(activeAnchor.baseGeneration) !== Number(msg.canonical.id))
       )) {
         // Retire the overlay when a covering page replaces its base image,
         // not now: until that image decodes and commits, removing the delta

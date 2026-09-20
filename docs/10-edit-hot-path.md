@@ -128,6 +128,7 @@ foreground walk は、まだ source-dirty block が先にある状態で clean b
 - 打鍵が resume より先に chain lock に入った場合、その打鍵が block を組版し、resume は dirty なしで `null` を返す（何も公開しない）。
 - cold resume の report には `stats.coldWalk`（再生の from/target/歩いた block 数/ms/block ごとの ms と、予算停止からの gate・lock・walk 完了・resume 開始・publish までの `timeline`）が載る。実測（316 ページ、上限 12、warm なし）: 応答 1.7–1.9 s、overlay 8.5–9.8 s のうち walk が 6.3 s（27 block、うち 1 block がメモリ圧で 4.1 s）。walk の長さは keep set の境界に checkpoint 実体が無いことが原因だったので、docs/03 の grid 充填 pass で埋める。cold 打鍵の待ち時間の理論値は「最寄り境界から dirty block までの再生コスト」で、grid が埋まっていれば平均で区間コストの半分、最悪で区間 1 つ分（上限 12・この文書で ≈ 3 s / 6 s）。
 - cold pass の idle gate は shipping 優先窓（900 ms）を待たず 300 ms。isolated rescue の adopt walk（`#asyncRescueOne`、chain lock を数秒保持）は `coldDirty` / pending `cold` / `editPending` の間は開始せず、走行中なら block 境界で譲って queue に戻る（実測: cold stop の 0.8 s 後に gate を過ぎた cold pass が rescue の walk に lock を取られ 8 s 待った）。
+- 著者が打ち続けると canonical が着地せず anchor の base が無くなる問題は docs/08 §8.2c（着地の保護と古い base の系譜合成）。
 - 打鍵は chain lock を待つ前に `editPending` を立てる。caret warm と chain pass はこれが立っている間は開始せず、走行中なら次の block 境界で譲る（warm が先に lock を取り `bgAbort` を消してしまい、打鍵が prefix 全体の再生を待たされた: 実測 56 s）。
 - caret warm（ホストは打鍵直後にも `/warm` を送る）は deferred chain を先取りして止める。warm walk が完了・中断したら `pendingChain` が残っていれば scheduler に返す（`#kickPendingChain`）。warm がその block を組版済みなら cold pass は再生なしで `resume` に進み、`coldIds` に残した block を（今度は hot に）組み直して report と anchor を出す。
 

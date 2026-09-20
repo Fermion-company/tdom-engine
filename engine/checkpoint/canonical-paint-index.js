@@ -838,3 +838,37 @@ function sameNumber(left, right, tolerance) {
   return Number.isFinite(Number(left)) && Number.isFinite(Number(right)) &&
     Math.abs(Number(left) - Number(right)) <= tolerance;
 }
+
+/**
+ * Why certifyCanonicalBlock found no matching for these inputs: per witness
+ * line, the closest candidate and the first check it failed. Diagnostic only
+ * (TDOM_TRACE_ANCHOR); never used for a decision.
+ */
+export function explainCertificationFailure({ witnesses, candidates, paintPages }) {
+  const pageItems = new Map((paintPages ?? []).filter(Boolean).map((page) => [Number(page.page), page.items ?? []]));
+  const physical = dedupeCandidates(Array.isArray(candidates) ? candidates : []);
+  return (Array.isArray(witnesses) ? witnesses : []).map((witness, lineIndex) => {
+    let best = null;
+    for (const candidate of physical) {
+      const items = pageItems.get(Number(candidate.page)) ?? [];
+      const box = candidate?.box;
+      const baseline = Number(candidate?.y);
+      const why = (() => {
+        if (!validBox(box) || !Number.isFinite(baseline)) return 'no-box';
+        if (!sameNumber(box.right - box.left, witness.lineWidth, BOX_TOLERANCE_BP)) return `width ${(box.right - box.left).toFixed(2)} vs ${Number(witness.lineWidth).toFixed(2)}`;
+        const inside = items.filter((item) => item?.safe && Math.abs(Number(item.baseline) - baseline) <= BASELINE_TOLERANCE_BP &&
+          Number(item.left) >= box.left - BOX_TOLERANCE_BP && Number(item.right) <= box.right + BOX_TOLERANCE_BP)
+          .sort((a, b) => a.left - b.left);
+        if (!inside.length) return 'no-paint-items';
+        const paintText = inside.map((item) => item.paintText).join('');
+        if (paintText !== witness.paintText) return `text ${JSON.stringify(paintText).slice(0, 60)} vs ${JSON.stringify(witness.paintText).slice(0, 60)}`;
+        const glyphSizes = inside.flatMap((item) => item.glyphSizes);
+        if (glyphSizes.length !== witness.glyphCount) return `glyphs ${glyphSizes.length} vs ${witness.glyphCount}`;
+        return candidateMatchesWitness(candidate, items, witness) ? 'match' : 'geometry/color';
+      })();
+      const score = why === 'match' ? 0 : why === 'geometry/color' ? 1 : why.startsWith('glyphs') ? 2 : why.startsWith('text') ? 3 : why === 'no-paint-items' ? 4 : 5;
+      if (!best || score < best.score) best = { score, why, page: candidate.page, y: candidate.y };
+    }
+    return { lineIndex, paintText: String(witness.paintText ?? '').slice(0, 40), best };
+  });
+}

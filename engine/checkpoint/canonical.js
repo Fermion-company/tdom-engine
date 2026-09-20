@@ -141,10 +141,20 @@ export class CanonicalRenderer {
     // display mode recompiled long documents nearly back-to-back.
     this.pressure = 'authority'; // 'authority' | 'display'
     this.lastEndAt = 0;
+    this.lastBaseAt = 0; // when the current base last changed (a landing, not a superseded attempt)
     this.cooldownFactor = Number(process.env.TDOM_CANON_COOLDOWN ?? 2);
     this.cooldownCapMs = Number(process.env.TDOM_CANON_COOLDOWN_CAP ?? 600_000);
     this.displayCooldownFactor = Number(process.env.TDOM_CANON_DISPLAY_COOLDOWN ?? 1);
     this.displayCooldownCapMs = Number(process.env.TDOM_CANON_DISPLAY_COOLDOWN_CAP ?? 60_000);
+    // Base refresh window (docs/08 §8.2c): a scheduled compile yields to a
+    // newer edit between passes only while the last landed generation is
+    // younger than this. Past it the running snapshot lands even though
+    // edits keep arriving, so an author who never stops typing still gets
+    // a fresh base every window plus one compile.
+    this.baseRefreshMs = Number(process.env.TDOM_CANON_BASE_REFRESH_MS ?? 60_000);
+    // The window never drops below one compile's own duration, so refreshing
+    // the base of a long document stays at or under half duty on its core.
+    this.baseRefreshFactor = Number(process.env.TDOM_CANON_BASE_REFRESH_FACTOR ?? 1);
     this.generations = new Map(); // id -> retained canonical record, oldest first
     this.svgCache = new Map(); // `${id}:${page}` -> svg string (LRU)
     this.svgInFlight = new Map(); // `${id}:${page}` -> shared conversion promise
@@ -363,10 +373,29 @@ export class CanonicalRenderer {
 
   /** A compile whose result nobody wants any more: a rebind already made a
    * newer revision current, or (for scheduled work) a newer edit is queued. */
-  #compileObsolete(rev, { pending = false } = {}) {
+  compileObsolete(rev, { pending = false } = {}) {
     if (!this.last) return false; // the first baseline always lands
     if (this.last.rev > rev) return true;
-    return pending && !!this.pendingJob && this.pendingJob.rev > rev;
+    if (!pending || !this.pendingJob || this.pendingJob.rev <= rev) return false;
+    // A newer edit is queued. Yield only while the paper still has a fresh
+    // base; once the last landing is older than the refresh window this
+    // snapshot lands a few revisions behind rather than never.
+    return !this.baseRefreshDue();
+  }
+
+  /** The refresh window (docs/08 §8.2c) has passed since the last landing. */
+  baseRefreshWindowMs() {
+    return Math.max(this.baseRefreshMs, (Number(this.last?.ms) || 0) * this.baseRefreshFactor);
+  }
+
+  baseRefreshDue() {
+    if (!this.last) return false;
+    // Keyed on the last landing: a superseded attempt also ends a compile
+    // (lastEndAt) but leaves the paper on the old base, and must not restart
+    // the window (measured: every compile yielded at its first pass
+    // boundary, forever, because each yield refreshed lastEndAt).
+    // (A base set without a landing, as tests do, counts from lastEndAt.)
+    return Date.now() - (this.lastBaseAt || this.lastEndAt) >= this.baseRefreshWindowMs();
   }
 
   ownsBuildLease(requestId, token) {
@@ -455,7 +484,10 @@ export class CanonicalRenderer {
     this.generations.set(generation.id, generation);
     // An export snapshot that a rebind overtook is retained for its caller
     // but never promoted: canonical must not move to an older revision.
-    if (promote) this.last = generation;
+    if (promote) {
+      this.last = generation;
+      this.lastBaseAt = Date.now();
+    }
     while (this.generations.size > GENERATION_MAX) {
       const oldestId = this.generations.keys().next().value;
       const oldest = this.generations.get(oldestId);
@@ -963,6 +995,7 @@ export class CanonicalRenderer {
       displayDemandRev: this.displayDemand?.rev ?? null,
       error: this.lastError?.message ?? null,
       errorRev: this.lastError?.rev ?? 0,
+      paintIndexError: this.lastPaintIndexError ?? null,
       syncWarnings: this.last?.syncWarnings ?? [],
       authorityPaused: this.authorityPausedPids.size > 0,
       authorityChildren: this.authorityChildren.size,
@@ -1122,6 +1155,10 @@ export class CanonicalRenderer {
     // baseline's result broadcast so a viewer's soft demand can escalate.
     if (this.#hasColdBaselineCatchup(job) && this.#hasDisplayDemand(job) &&
         this.residentImpossibleDemandIds.size) return this.displayDebounceMs;
+    // Base refresh (docs/08 §8.2c): an author who never pauses long enough
+    // for the idle cadence still gets a compile started once per window,
+    // and compileObsolete lets that compile land.
+    if (this.baseRefreshDue()) return this.displayDebounceMs;
     if (this.pressure !== 'authority' || job?.fallbackReason || this.#hasDisplayDemand(job)) {
       // canonical is needed for display — stay responsive on small
       // documents, but never let a long document compile back-to-back
@@ -1331,13 +1368,13 @@ export class CanonicalRenderer {
       before = after;
       if (!changed) break;
       // Another pass of an obsolete snapshot only delays the revision the
-      // viewer is waiting for. The first baseline is exempt (#compileObsolete).
-      if (superseding && this.#compileObsolete(rev, { pending: true })) throw superseded();
+      // viewer is waiting for. The first baseline is exempt (compileObsolete).
+      if (superseding && this.compileObsolete(rev, { pending: true })) throw superseded();
     }
     // A rebind made a newer revision current while this snapshot compiled:
     // publishing it would move canonical backwards. Scheduled work stops
     // here; an export keeps its bytes without promotion.
-    const obsolete = this.#compileObsolete(rev);
+    const obsolete = this.compileObsolete(rev);
     if (obsolete && superseding) throw superseded();
     const pdf = path.join(this.workDir, 'canon.pdf');
     const pageCount = pageCountFrom(log);
@@ -1859,7 +1896,10 @@ export class CanonicalRenderer {
       }
       this.pdfDocumentCache.set(generation.id, document);
       return document;
-    })().catch(() => null).finally(() => {
+    })().catch((err) => {
+      this.lastPaintIndexError = { id: generation.id, page: null, message: String(err?.message ?? err), at: Date.now() };
+      return null;
+    }).finally(() => {
       if (this.pdfDocumentInFlight.get(generation.id) === job) {
         this.pdfDocumentInFlight.delete(generation.id);
       }
@@ -1895,7 +1935,10 @@ export class CanonicalRenderer {
       if (result && this.#resolveGeneration(generation.id)) this.paintPageCache.set(key, result);
       page.cleanup?.();
       return result;
-    })().catch(() => null).finally(() => {
+    })().catch((err) => {
+      this.lastPaintIndexError = { id: generation.id, page: pageNumber, message: String(err?.message ?? err), at: Date.now() };
+      return null;
+    }).finally(() => {
       if (this.paintPageInFlight.get(key) === job) this.paintPageInFlight.delete(key);
     });
     this.paintPageInFlight.set(key, job);
@@ -2126,6 +2169,7 @@ export class CanonicalRenderer {
       this.#clearGenerations();
       this.lastError = null;
       this.lastEndAt = 0;
+      this.lastBaseAt = 0;
       this.inputEpoch++;
       this.inputInvalidations.clear();
       this.inputHashCache.clear();

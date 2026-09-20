@@ -56,7 +56,19 @@ Build 直後に別章を編集して元に戻す往復はこれで recompile を
 ディレクトリへ `canon.*` として配置し、Build に無い拡張子の古いファイルは消す。Build 後の最初の canonical
 compile は Build が収束させた aux 群から始まるので、本文編集なら 1 pass で fixpoint に達する。
 
-### 8.2c Build lease と resident bootstrap
+### 8.2c 古い base の定期差し替え（stale base）
+
+著者が打ち続けている間は canonical が現在の srcRev の exact compile になる瞬間が来ない。従来は (a) canonical-current の瞬間、または (b) そこから途切れない系譜（連続 srcRev・同一 base 世代）だけが anchor の base で、系譜が一度切れると次の canonical 着地まで overlay を出せず、さらに canonical は編集のたびに pass 境界で追い越されて着地しなかった（著者セッション実走: Build 後 4 分間の全打鍵が `base-generation` / `cold-prefix` のまま画面に出ず）。つぎはぎになっても新鮮な base を定期的に入れる方が良いので、2 つの仕組みを足した。
+
+1. **着地の保護（`baseRefreshMs`、`TDOM_CANON_BASE_REFRESH_MS`、既定 60 s）:** scheduled compile が pass 境界で新しい編集に譲る（`tdomSuperseded`）のは、最後に着地した世代が `baseRefreshMs` より若い間だけ。窓を過ぎたら走行中の snapshot は数 rev 遅れでも着地する（`compileObsolete`）。rebind で新しい rev が current になった場合は従来どおり捨てる。着地の周期は「窓 + コンパイル 1 回分」。
+
+2. **古い base の系譜合成（server、`canonical-anchor-stale.js`）:** server は編集ごとに、その srcRev で resident が組んだ全 block の識別（`captureCanonicalAnchorLedger`、cold pending の block は無効化）を `anchorLedgerRing` に、live base が無いのに anchorable な編集（plain text、child 入力一致）については編集直前の block の witness（`captureCanonicalAnchorBase`、certificate は仮）を `preEditWitnessRing` に残す（各 64 rev）。rev R（< srcRev）の世代が着地したら `buildStaleBaseLineage` が系譜を作る: base = その世代、`lastSrcRev = 現在の srcRev`、ledger = R の ledger、blocks = R 以降に最初に編集された各 block の witness（R 時点の識別と一致するものだけ、certificate を着地世代に差し替え）。次の打鍵は、未編集 block なら ledger 経由で join、R 以降に編集済みの block なら witness からの継続として plan され、R 以降に変わった行が全部 overlay される。witness が無い／一致しない block（カット・貼り付け、cold 中の block）は次の着地まで R 時点の見た目のまま。cold resume が同じ srcRev を公開したら ledger を取り直す。`/status.anchorLineage`（`stale.prepared` / `skipped`）と `canonical` SSE の `staleBase` で観測できる。
+
+client は着地した世代が overlay の base と異なれば overlay を退役させる（前世代のフレームで証明した行を新世代の上に重ねない）。次の打鍵が新しい base で anchor し直す。
+
+実測（316 ページ、5 秒ごとに ch16/ch29 へ打鍵を続ける API シナリオ `TYPING=1`、窓 30 s・係数 0.2、別エンジンが動く負荷下）: 着地は t=127 / 230 / 358 s（rev 13 / 34 / 54、srcRev はそれぞれ 27 / 47 / 71）で、毎回 `staleBase.prepared` に両 block が入り、系譜は次の打鍵以降も維持される（着地と編集が競合しても `adoptStaleBaseIfNeeded` が編集後に取り直す）。窓は「最後の着地」基準（`lastBaseAt`）でなければならない: 追い越された試行の終了で窓を測ると、通常 cadence が始めたコンパイルが最初の pass 境界で毎回譲り、永久に着地しなかった。**残る限界（2026-09-21 時点）:** (1) 編集し続けている block の古い base 上の anchor は、ch16（段落＋箱の mixed block）では段落が 1 行伸びた時点で `mixed-frame-changed`（visual cut は galley item 数の一致が前提）、ch29 では `AMBIGUOUS_OR_MISMATCHED_ANCHOR`（`TDOM_TRACE_ANCHOR=1` の出力では段落 2 行目の witness に一致する synctex 候補が無く、最寄り候補は直上の箱の最終行）。着地直後には `PDF_PAINT_INDEX_UNAVAILABLE` も出る（新世代の paint index 構築中／失敗、`canonical.info().paintIndexError`）。つまり現状で確実に効くのは「着地で紙面全体が rev R まで進む」ことと「R 以降に触っていない block の打鍵が新 base で anchor する」ことで、打ち続けている block の overlay は次の着地までその block だけ R 時点の見た目になる。
+
+### 8.2d Build lease と resident bootstrap
 
 `POST /canonical/build-lease/acquire` は `pendingDocumentReset`（/open の resident 起動中）・`shipBooting`・
 `warming` の間は 409 `resident-bootstrap-active` を返し、`blockedBy` にどの段階かを載せる。`warming`
@@ -64,7 +76,7 @@ compile は Build が収束させた aux 群から始まるので、本文編集
 判定する（到達境界は pin され、次の warm はそこから再開する）。/open の resident 起動そのものは中断しない
 （設計案は issue #52 の引き継ぎ §4A）。
 
-### 8.2d pass 間の譲り渡し
+### 8.2e pass 間の譲り渡し
 
 `#drain` が起動した scheduled compile は、各 LuaLaTeX pass の正常終了時に「より新しい rev の pending job
 がある」か「再束縛で `last.rev` が自分の rev を追い越した」場合、追加 pass と publish を中止して最新へ進む

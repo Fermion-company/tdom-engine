@@ -558,6 +558,35 @@ async function assertDisplayedWordClicks(canonicalRenderer, generation, source, 
   return checked;
 }
 
+test('a scheduled compile yields to a newer edit only while the last base is younger than the refresh window', () => {
+  const c = new CanonicalRenderer({ workDir: WORK + '-base-refresh' });
+  try {
+    c.baseRefreshMs = 60_000;
+    assert.equal(c.compileObsolete(3, { pending: true }), false, 'the first baseline always lands');
+    c.last = { rev: 2 };
+    c.pendingJob = { rev: 5 };
+    c.lastBaseAt = Date.now();
+    assert.equal(c.compileObsolete(3, { pending: true }), true, 'a fresh base: yield to the newer edit');
+    c.lastEndAt = Date.now(); // a yielded attempt just ended: the window still counts from the landing
+    c.lastBaseAt = Date.now() - 61_000;
+    assert.equal(c.compileObsolete(3, { pending: true }), false, 'past the window the running snapshot lands');
+    assert.equal(c.baseRefreshDue(), true);
+    assert.ok(c.delayFor({ rev: 5, scheduledAt: Date.now() }) <= c.displayDebounceMs, 'a due refresh starts at the short debounce despite continuous edits');
+    c.last = { rev: 2, ms: 150_000 };
+    assert.equal(c.baseRefreshWindowMs(), 150_000, 'the window is at least one compile long');
+    assert.equal(c.baseRefreshDue(), false, 'a 150 s compile is not refreshed 61 s after it landed');
+    c.lastBaseAt = Date.now() - 151_000;
+    assert.equal(c.baseRefreshDue(), true);
+    c.last = { rev: 2 };
+    c.lastBaseAt = Date.now() - 61_000;
+    assert.equal(c.compileObsolete(3), false, 'the final check ignores pending edits');
+    c.last = { rev: 4 };
+    assert.equal(c.compileObsolete(3), true, 'a rebind made a newer revision current');
+  } finally {
+    c.dispose();
+  }
+});
+
 test('real /Rotate 0/90/180/270 pages synchronize displayed corner clicks', coordinateOpts, async () => {
   const work = WORK + '-rotated-sync';
   rmSync(work, { recursive: true, force: true });

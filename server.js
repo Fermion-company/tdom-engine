@@ -38,7 +38,8 @@ import {
   singlePlainTextDelta,
   warmCanonicalProofOutcome,
 } from './engine/checkpoint/canonical-anchor.js';
-import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
+import { buildStaleBaseLineage, ringSet } from './engine/checkpoint/canonical-anchor-stale.js';
+import { certifyCanonicalBlock, explainCertificationFailure } from './engine/checkpoint/canonical-paint-index.js';
 import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read-proof.js';
 import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
 import { buildLeasePreviewSettlement } from './engine/checkpoint/build-lease-preview.js';
@@ -951,6 +952,11 @@ engine.onDeferredUpdate = (report) => {
   // published a newer display revision: this one is stale for every client.
   if (Number(report.rev) <= Number(lastReport?.rev ?? -1)) return;
   lastReport = report;
+  // the resume typeset blocks of this revision: refresh their identities
+  if (ENABLE_CANONICAL_ANCHOR && anchorLedgerRing.has(report.srcRev)) {
+    const kept = anchorLedgerRing.get(report.srcRev);
+    ringSet(anchorLedgerRing, report.srcRev, { ...kept, ledger: ledgerWithoutCold(report), documentEpoch });
+  }
   if (Number(lastAnchorPresentation?.srcRev) !== Number(report.srcRev)) lastAnchorPresentation = null;
   report.previewFallback = dirtyWithoutPatchFallback(report);
   const usable = ENABLE_CANONICAL_ANCHOR && !!stash && stash.srcRev === report.srcRev &&
@@ -999,7 +1005,10 @@ engine.onCanonical = (info) => {
   if (terminalAnchorLineage && info.id !== terminalAnchorLineage.baseGeneration) {
     terminalAnchorLineage = null;
   }
-  broadcast({ kind: 'canonical', canonical: info, mode: engine.mode });
+  // A generation for an older revision (docs/08 §8.2c): make it the base of
+  // the next keystroke through the ledger and witnesses kept for that revision.
+  const staleBase = adoptStaleBaseIfNeeded();
+  broadcast({ kind: 'canonical', canonical: info, mode: engine.mode, ...(staleBase ? { staleBase } : {}) });
 };
 // Incremental authority (TDOM_SHIP=1): one complete replay PDF reached
 // normal document end. The client atomically swaps its visible pages and
@@ -1423,6 +1432,54 @@ function prefetchWarmAnchorProof(offset, filePath, diagnostics = null) {
 // revision; a newer keystroke, reset or canonical generation retires it.
 let pendingColdAnchor = null;
 
+// Stale-base anchoring (docs/08 §8.2c): per source revision, the identity
+// of every block as the resident typeset it (cold blocks excluded), and per
+// anchorable edit made without a live base, the edited block's resident
+// witness from just before that edit. A canonical generation landing for an
+// older revision R turns these into a lineage the next keystroke continues.
+const anchorLedgerRing = new Map(); // srcRev -> { ledger, documentEpoch }
+const preEditWitnessRing = new Map(); // srcRev produced by the edit -> { blockId, snapshot, documentEpoch }
+/**
+ * Make the landed generation the base of the next keystroke when the live
+ * lineage is not on it (docs/08 §8.2c). Idempotent; called when a generation
+ * lands and again after every edit, because a landing that races an edit is
+ * otherwise overwritten by that edit's own lineage bookkeeping.
+ */
+function adoptStaleBaseIfNeeded() {
+  if (!ENABLE_CANONICAL_ANCHOR || pendingDocumentReset) return null;
+  const info = engine.canonical.info();
+  if (!info?.id || info.error || !Number.isInteger(info.rev) || info.rev >= engine.srcRev) return null;
+  if (terminalAnchorLineage && terminalAnchorLineage.baseGeneration === info.id &&
+      terminalAnchorLineage.lastSrcRev === engine.srcRev) return null;
+  const kept = anchorLedgerRing.get(info.rev);
+  const certificate = engine.canonical.generationCertificate(info.id);
+  // The generation must be the compile of the inputs the ledger saw at that
+  // revision; the edits since then are exactly what the ledger and
+  // witnesses account for (the current input epoch is ahead by design).
+  if (!kept || kept.documentEpoch !== documentEpoch || !certificate || certificate.rev !== info.rev ||
+      (kept.inputEpoch !== undefined && certificate.inputEpoch !== kept.inputEpoch)) return null;
+  const lineage = buildStaleBaseLineage({
+    certificate,
+    ledger: kept.ledger,
+    witnesses: [...preEditWitnessRing.entries()].map(([srcRev, witness]) => ({ srcRev, ...witness })),
+    srcRev: engine.srcRev,
+    documentEpoch,
+  });
+  if (!lineage) return null;
+  terminalAnchorLineage = lineage;
+  return lineage.stale;
+}
+
+function ledgerWithoutCold(report) {
+  const ledger = captureCanonicalAnchorLedger(engine.blocks);
+  const cold = new Set([...(report?.stats?.coldPending ?? []), ...(engine.coldDirty ?? [])].map(String));
+  for (const id of cold) {
+    const entry = ledger.get(id);
+    if (entry) entry.structuralStateVec = null;
+  }
+  return ledger;
+}
+
 function anchorLineageEntry(lineage, blockId) {
   if (!lineage || !blockId) return null;
   if (lineage.blocks instanceof Map) return lineage.blocks.get(blockId) ?? null;
@@ -1561,7 +1618,16 @@ async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch
         paintPages,
       })
     : null;
-  if (!rejectReason && !matching) rejectReason = 'AMBIGUOUS_OR_MISMATCHED_ANCHOR';
+  if (!rejectReason && !matching) {
+    rejectReason = 'AMBIGUOUS_OR_MISMATCHED_ANCHOR';
+    if (process.env.TDOM_TRACE_ANCHOR) {
+      console.error('[anchor] mismatch', JSON.stringify({
+        srcRev: plan.srcRev, blockId: plan.blockId, base: plan.baseGeneration, baseRev: plan.baseRev,
+        candidates: candidates.length,
+        lines: explainCertificationFailure({ witnesses: plan.baseLineWitnesses, candidates, paintPages }),
+      }));
+    }
+  }
   if (!rejectReason && performance.now() >= plan.publishDeadline) rejectReason = 'PUBLISH_DEADLINE_EXCEEDED';
   let patch = matching && !rejectReason
     ? buildTerminalCanonicalPatch(plan, matching)
@@ -1679,6 +1745,17 @@ const server = http.createServer(async (req, res) => {
           : null,
         foregroundLeaseMs: engine.foregroundLeaseMs ?? 0,
         authorityDeferred: engine.authorityDeferred ?? false,
+        anchorLineage: terminalAnchorLineage
+          ? {
+              baseGeneration: terminalAnchorLineage.baseGeneration,
+              baseRev: terminalAnchorLineage.baseRev,
+              lastSrcRev: terminalAnchorLineage.lastSrcRev,
+              blocks: terminalAnchorLineage.blocks instanceof Map
+                ? [...terminalAnchorLineage.blocks.keys()]
+                : terminalAnchorLineage.blockId ? [terminalAnchorLineage.blockId] : [],
+              stale: terminalAnchorLineage.stale ?? null,
+            }
+          : null,
         canonical: engine.canonical.info(),
         grid: url.searchParams.has('grid') ? engine.gridInfo?.() ?? null : undefined,
       });
@@ -2273,6 +2350,7 @@ const server = http.createServer(async (req, res) => {
       let anchorPriorLineage = null;
       let inputUnchanged = false;
       let anchorProofPrefetch = null;
+      let staleWitness = null;
       const anchorDiagnostics = {};
       const anchorAcceptedAt = performance.now();
       const nowEpoch = Date.now();
@@ -2393,6 +2471,21 @@ const server = http.createServer(async (req, res) => {
               : childInputMatches
           );
           if (!anchorInputSafe) anchorBaseSnapshot = null;
+          if (ENABLE_CANONICAL_ANCHOR && anchorInputSafe && anchorEdit) {
+            // Keep the block's resident witness as it is right now, live
+            // base or not: a generation landing later for this revision
+            // makes it the block's base on that generation (docs/08 §8.2c).
+            const snapshot = anchorBaseSnapshot ?? captureCanonicalAnchorBase({
+              blocks: engine.blocks,
+              domBlocks: engine.getDOM().blocks,
+              edit: anchorEdit,
+              certificate: { id: 'stale', rev: engine.srcRev },
+              diagnostics: {},
+            });
+            if (snapshot && !engine.coldDirty?.has(snapshot.blockId)) {
+              staleWitness = { blockId: snapshot.blockId, snapshot, fromSrcRev: engine.srcRev, documentEpoch };
+            }
+          }
           if (anchorBaseSnapshot) {
             anchorProofPrefetch = prefetchCanonicalAnchorProof(
               anchorBaseSnapshot,
@@ -2498,6 +2591,15 @@ const server = http.createServer(async (req, res) => {
       // previous galley until the engine's deferred update. Nothing can be
       // planned yet; the context waits for that update of this revision.
       const coldEdit = (lastReport.stats?.coldPending?.length ?? 0) > 0;
+      if (ENABLE_CANONICAL_ANCHOR && lastReport.rebooted !== true && resetEpoch === null && anchorMutation) {
+        ringSet(anchorLedgerRing, lastReport.srcRev, {
+          ledger: ledgerWithoutCold(lastReport),
+          documentEpoch,
+          // the input state the compile of this revision will carry
+          inputEpoch: engine.canonical.inputEpoch,
+        });
+        if (staleWitness) ringSet(preEditWitnessRing, lastReport.srcRev, staleWitness);
+      }
       // Why the base capture refused wins over the plan's resulting no-base.
       const baseRefusal = anchorDiagnostics.reason ?? null;
       const anchorPlan = ENABLE_CANONICAL_ANCHOR && !coldEdit && anchorInputSafe && lastReport.rebooted !== true
@@ -2591,6 +2693,12 @@ const server = http.createServer(async (req, res) => {
           engine.canonical.info().id === prior.baseGeneration;
         terminalAnchorLineage = survives ? { ...prior, lastSrcRev: lastReport.srcRev } : null;
         if (survives) lastReport.canonicalAnchorLineageKept = [...(prior.blocks?.keys?.() ?? [prior.blockId])];
+      }
+      // A generation that landed during this edit (or whose lineage this
+      // edit could not continue) becomes the base of the next keystroke.
+      if (ENABLE_CANONICAL_ANCHOR && !coldEdit) {
+        const staleBase = adoptStaleBaseIfNeeded();
+        if (staleBase) lastReport.canonicalAnchorStaleBase = staleBase;
       }
       if (anchorDiagnostics.inputTransition || anchorDiagnostics.reason) {
         // Bounded provenance and structural field paths only: enough to
