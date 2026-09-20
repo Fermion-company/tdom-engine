@@ -1,8 +1,11 @@
 export async function rescueBlock(engine, idx, why, callbacks) {
-  const { rescueCacheKey, isoCacheGet, jobBlock, stateJobBody, pumpRescues, brokenBlockGalley } = callbacks;
+  const { rescueCacheKey, isoCacheGet, isoBaseGet, jobBlock, stateJobBody, pumpRescues, brokenBlockGalley } = callbacks;
   const block = engine.blocks[idx];
   const cacheKey = rescueCacheKey(block, idx);
   let iso = isoCacheGet(cacheKey);
+  // A previous session's result for this block (docs/08 §8.5): adopt it now
+  // rather than holding an empty placeholder until a cold compile lands.
+  if (!iso && !block.galley?.state) iso = isoBaseGet?.(block, idx) ?? null;
   if (!iso) {
     if (block.galley?.state) {
       // STALE-FIRST: an isolated compile takes seconds and must never sit

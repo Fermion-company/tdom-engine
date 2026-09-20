@@ -72,7 +72,7 @@ import {
 } from './font-registry.js';
 import { applyFidelity, sourceRequiresCanonicalOnly } from './fidelity-gate.js';
 import { indexBlock, unindexBlock } from './block-index.js';
-import { rescueCacheKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
+import { rescueCacheKey, rescueBaseKey, isoCacheGet, isoCacheSet } from './rescue-cache.js';
 import { IsoDiskCache } from './iso-disk-cache.js';
 import { brokenBlockGalley as brokenBlockGalleyHelper } from './broken-galley.js';
 import { sourceClosure } from './closure.js';
@@ -867,15 +867,36 @@ export class CheckpointEngine {
     return stored;
   }
 
-  #isoCacheSet(key, iso) {
+  #isoCacheSet(key, iso, baseKey = null) {
     isoCacheSet(this.isoCache, key, iso);
-    this.#isoDiskCache()?.set(key, iso);
+    this.#isoDiskCache()?.set(key, iso, baseKey);
+  }
+
+  /**
+   * First-ever rescue of a block with no galley (a boot walk): a stored
+   * result for the same text, entry state and preamble, compiled at some
+   * page offset, is adopted inline as if it were this walk's own compile.
+   * Referenced labels must still hold the values it was compiled with; the
+   * moved-offset pass re-rescues it if the offset it lands on differs.
+   */
+  #isoBaseGet(block, idx) {
+    const disk = this.#isoDiskCache();
+    if (!disk) return undefined;
+    const found = disk.getBase(rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash }));
+    if (!found) return undefined;
+    const { key, iso } = found;
+    for (const [label, value] of Object.entries(iso.refVals ?? {})) {
+      if (this.labelTable.has(label) && this.labelTable.get(label) !== value) return undefined;
+    }
+    isoCacheSet(this.isoCache, key, iso);
+    return iso;
   }
 
   async #rescueBlock(idx, why) {
     return rescueBlockHelper(this, idx, why, {
       rescueCacheKey: (block, blockIdx) => this.#rescueCacheKey(block, blockIdx),
       isoCacheGet: (cacheKey) => this.#isoCacheGet(cacheKey),
+      isoBaseGet: (targetBlock, blockIdx) => this.#isoBaseGet(targetBlock, blockIdx),
       jobBlock: (blockIdx, override) => this.#jobBlock(blockIdx, override),
       stateJobBody: (iso) => this.#stateJobBody(iso),
       pumpRescues: () => this.#pumpRescues(),
@@ -1677,7 +1698,7 @@ export class CheckpointEngine {
       rescueCached = false;
       const iso = await this.#isoCompile(block, idx, 'async exact rescue');
       rescueCompileMs = performance.now() - rescueStartedAt;
-      this.#isoCacheSet(key, iso);
+      this.#isoCacheSet(key, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash }));
     }
     const outcome = await this.#locked(async () => {
       if (this.mode !== 'structured') return 'done';

@@ -39,18 +39,43 @@ export class IsoDiskCache {
     return { json: path.join(this.dir, `${key}.json`), pdf: path.join(this.dir, `${key}.pdf`) };
   }
 
+  #attachPdf(iso, pdf) {
+    if (!iso?.chunks?.length) return iso;
+    const editPdf = existsSync(pdf) ? readFileSync(pdf) : null;
+    if (!editPdf) throw new Error('cached iso without its pdf');
+    for (const chunk of iso.chunks) chunk.editPdf = editPdf;
+    return iso;
+  }
+
+  /**
+   * The latest result stored for an offset-free base key. Its compiledOff
+   * says which page offset it was compiled at; the caller adopts it and lets
+   * the moved-offset pass decide whether that offset still holds.
+   */
+  getBase(baseKey) {
+    if (this.disabled) return undefined;
+    const link = path.join(this.dir, `base-${baseKey}.json`);
+    if (!existsSync(link)) { this.stats.misses++; return undefined; }
+    try {
+      const { key } = JSON.parse(readFileSync(link, 'utf8'));
+      const { json, pdf } = this.#paths(key);
+      const iso = this.#attachPdf(JSON.parse(readFileSync(json, 'utf8')), pdf);
+      this.stats.hits++;
+      return { key, iso };
+    } catch {
+      rmSync(link, { force: true });
+      this.stats.misses++;
+      return undefined;
+    }
+  }
+
   /** Synchronous: the boot walk asks for a rescue result inline. */
   get(key) {
     if (this.disabled) return undefined;
     const { json, pdf } = this.#paths(key);
     if (!existsSync(json)) { this.stats.misses++; return undefined; }
     try {
-      const iso = JSON.parse(readFileSync(json, 'utf8'));
-      if (iso?.chunks?.length) {
-        const editPdf = existsSync(pdf) ? readFileSync(pdf) : null;
-        if (!editPdf) throw new Error('cached iso without its pdf');
-        for (const chunk of iso.chunks) chunk.editPdf = editPdf;
-      }
+      const iso = this.#attachPdf(JSON.parse(readFileSync(json, 'utf8')), pdf);
       this.stats.hits++;
       return iso;
     } catch {
@@ -61,7 +86,7 @@ export class IsoDiskCache {
     }
   }
 
-  set(key, iso) {
+  set(key, iso, baseKey = null) {
     if (this.disabled || !iso || typeof iso !== 'object') return;
     try {
       mkdirSync(this.dir, { recursive: true });
@@ -72,6 +97,7 @@ export class IsoDiskCache {
       writeFileSync(tmp, JSON.stringify({ ...iso, chunks }));
       if (editPdf) writeFileSync(pdf, editPdf);
       renameSync(tmp, json);
+      if (baseKey) writeFileSync(path.join(this.dir, `base-${baseKey}.json`), JSON.stringify({ key }));
       this.stats.writes++;
       this.#trim();
     } catch { /* a cache miss next time is the only consequence */ }
@@ -79,7 +105,7 @@ export class IsoDiskCache {
 
   #trim() {
     let entries;
-    try { entries = readdirSync(this.dir).filter((name) => name.endsWith('.json')); } catch { return; }
+    try { entries = readdirSync(this.dir).filter((name) => name.endsWith('.json') && !name.startsWith('base-')); } catch { return; }
     if (entries.length <= this.maxEntries) return;
     const dated = entries.map((name) => {
       try { return { name, mtime: statSync(path.join(this.dir, name)).mtimeMs }; } catch { return { name, mtime: 0 }; }

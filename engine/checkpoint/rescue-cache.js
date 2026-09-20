@@ -19,6 +19,16 @@ export function rescueCacheKey(block, idx, { blocks, labelTable, preHash }) {
   );
 }
 
+/**
+ * The offset-free part of the rescue key. A boot walk computes keys before
+ * any pagination (offset 0, no galley yet), so a result stored under its
+ * real page offset can only be found by this base; the moved-offset pass
+ * then re-rescues the block if the offset it lands on differs.
+ */
+export function rescueBaseKey(block, idx, { blocks, preHash }) {
+  return fnv1a(JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash]));
+}
+
 export function isoCacheGet(isoCache, key) {
   const hit = isoCache.get(key);
   if (hit !== undefined) {
