@@ -542,6 +542,7 @@ export class CheckpointEngine {
       port: this.port,
       workDir: this.workDir,
       counters: this.counters,
+      realRoot: this.isoRealFork,
       labelTable: this.labelTable,
       hrefTable: this.hrefTable,
       geometry: this.geometry,
@@ -932,6 +933,19 @@ export class CheckpointEngine {
       counters: this.counters,
       hyperref: this.geometry?.hyperref === 1,
     });
+  }
+
+  /**
+   * Compile one block in isolation and return the rescue result without
+   * adopting it. Differential suite / measurement entry point: the same
+   * block compiled cold and in a fork child (absorb or real-output root)
+   * must agree on state, items, chunks and pixels.
+   */
+  async compileIsolatedBlock(idx, { forceCold = false, why = 'differential' } = {}) {
+    const block = this.blocks[idx];
+    if (!block) throw new Error(`no block at ${idx}`);
+    const iso = await this.#isoCompile(block, idx, why, forceCold);
+    return { runner: this.isoModeOf.get(block.id) ?? null, iso };
   }
 
   async #isoCompile(block, idx, why, forceCold = false) {

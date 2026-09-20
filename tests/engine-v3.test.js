@@ -3,7 +3,9 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, rmSync } from 'node:fs';
+import { readFileSync, rmSync, mkdtempSync, writeFileSync, readdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -547,4 +549,105 @@ test('a reopened document adopts its cached isolated rescues during the boot wal
   } finally {
     await second.close();
   }
+});
+
+// --- real-output rescue root (TDOM_ISO_REAL_FORK) -------------------------
+//
+// Splitting environments used to be rescued COLD (a standalone lualatex,
+// the whole preamble again). The real-output root is a pre-dormant sibling
+// of checkpoint 0; its ISO children run LaTeX's real \output with the
+// preamble COW-shared. The contract: same block, same offset — cold and
+// fork-real agree on state, items, labels, chunk geometry and pixels.
+
+const SPLIT_LOREM = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ';
+const SPLIT_DOC = [
+  '\\documentclass{article}', '\\usepackage{multicol,longtable,mdframed}', '\\usepackage[most]{tcolorbox}', '\\begin{document}',
+  'Plain paragraph before the columns with ordinary prose on the page.', '',
+  '\\begin{multicols}{2}', SPLIT_LOREM.repeat(6), '\\columnbreak', SPLIT_LOREM.repeat(3), '\\end{multicols}', '',
+  'Plain paragraph between.', '',
+  '\\begin{multicols*}{2}', SPLIT_LOREM.repeat(4), '\\end{multicols*}', '',
+  'Plain paragraph between two.', '',
+  '\\begin{longtable}{ll}', ...Array.from({ length: 12 }, (_, i) => `row ${i} & value ${i} \\\\`), '\\end{longtable}', '',
+  'Plain paragraph between three.', '',
+  '\\begin{mdframed}', SPLIT_LOREM.repeat(8), '\\end{mdframed}', '',
+  'Plain paragraph between four.', '',
+  '\\begin{tcolorbox}[breakable]', SPLIT_LOREM.repeat(8), '\\end{tcolorbox}', '',
+  'Plain paragraph after.', '',
+  '\\end{document}', '',
+].join('\n');
+
+const sortedKeys = (o) => Object.fromEntries(Object.keys(o ?? {}).sort().map((k) => [k, o[k]]));
+const isoShape = (iso) => ({
+  w: iso.w, h: iso.h, d: iso.d, items: iso.items, labels: iso.labels, toclines: iso.toclines,
+  state: sortedKeys(iso.state),
+  chunks: iso.chunks.map((c) => ({ key: c.key, wBp: c.wBp, hBp: c.hBp, editPage: c.editPage, svg: c.svg })),
+});
+async function rasterPages(pdfBuf, tag) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tdom-realfork-'));
+  try {
+    writeFileSync(path.join(dir, 'x.pdf'), pdfBuf);
+    await promisify(execFile)('pdftocairo', ['-png', '-r', '72', path.join(dir, 'x.pdf'), path.join(dir, tag)], { timeout: 30_000 });
+    return readdirSync(dir).filter((f) => f.startsWith(tag) && f.endsWith('.png')).sort().map((f) => readFileSync(path.join(dir, f)));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+test('the real-output root is opt-in: without the flag splitting rescues stay cold', opts, () => {
+  assert.equal(eng.isoRealFork, false);
+  assert.equal(eng.realRoot, null);
+});
+
+test('fork-real rescues from the real-output root match the cold compile bit for bit', opts, async () => {
+  const work = WORK + '-real-fork';
+  rmSync(work, { recursive: true, force: true });
+  process.env.TDOM_ISO_REAL_FORK = '1';
+  let e;
+  try {
+    e = new CheckpointEngine({ workDir: work });
+  } finally {
+    delete process.env.TDOM_ISO_REAL_FORK;
+  }
+  let realRootPid = 0;
+  try {
+    await e.open(SPLIT_DOC);
+    // the boot walk's async pump rescues these blocks into the same job
+    // directories the differential compiles use — let it drain first
+    const drained = Date.now() + 120_000;
+    while (Date.now() < drained && (e.rescueQueue.size || e.rescuePumping)) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(e.rescueQueue.size + (e.rescuePumping ? 1 : 0), 0, 'boot rescues drained');
+    assert.ok(e.realRoot?.pid > 0, 'the driver forked the real-output root before the dormant setup');
+    realRootPid = e.realRoot.pid;
+    assert.ok(alive(realRootPid));
+    const targets = e.blocks.map((b, i) => [b, i]).filter(([b]) => /\\begin\{(multicols\*?|longtable|mdframed|tcolorbox)/.test(b.text));
+    assert.equal(targets.length, 5, targets.map(([b]) => b.text.slice(0, 30)).join(' | '));
+    const textheight = e.geometry?.textheight ?? 550;
+    // page offsets: top of page, mid-page, near the bottom (forces a split)
+    const offsets = [0, Math.round(textheight * 0.55), Math.round(textheight * 0.95)];
+    let splitSeen = 0;
+    for (const [block, idx] of targets) {
+      for (const off of offsets) {
+        block.pageOffset = off;
+        const cold = await e.compileIsolatedBlock(idx, { forceCold: true });
+        const fork = await e.compileIsolatedBlock(idx, { forceCold: false });
+        const env = block.text.match(/\\begin\{([^}]*)\}/)[1];
+        assert.equal(cold.runner, 'cold', env);
+        assert.equal(fork.runner, 'fork-real', `${env}@${off}: ${JSON.stringify(e.diagnostics.slice(-3))}`);
+        assert.deepEqual(isoShape(fork.iso), isoShape(cold.iso), `${env}@${off}: state/items/chunks differ`);
+        if (cold.iso.chunks.length > 1) splitSeen++;
+        // pixels: the first chunk's PDF holds every shipped page of the run
+        const a = await rasterPages(cold.iso.chunks[0].editPdf, 'c');
+        const b = await rasterPages(fork.iso.chunks[0].editPdf, 'f');
+        assert.equal(b.length, a.length, `${env}@${off}: page count`);
+        a.forEach((png, k) => assert.ok(png.equals(b[k]), `${env}@${off}: page ${k + 1} pixels differ`));
+      }
+    }
+    assert.ok(splitSeen >= 1, 'at least one offset made an environment split across pages');
+    assert.ok(!e.isoForkBroken.size, [...e.isoForkBroken].join());
+  } finally {
+    if (e) await e.close();
+  }
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(!alive(realRootPid), 'close retires the real-output root with the rest of the tree');
 });

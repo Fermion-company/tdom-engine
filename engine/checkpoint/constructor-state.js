@@ -206,7 +206,13 @@ export function initializeEngineState(
   // Per-rescue timeline for /status (block, fork/cold, compile and adopt
   // time): the boot drain of a long document is invisible otherwise.
   engine.rescueLog = [];
-  engine.isoModeOf = new Map(); // block.id -> 'fork' | 'cold' of the last isolated compile
+  engine.isoModeOf = new Map(); // block.id -> 'fork-absorb' | 'fork-real' | 'cold' of the last isolated compile
+  // real-output rescue root (daemon.lua tdom_real_root): a pre-dormant
+  // sibling of checkpoint 0 that forks splitting/page-emitting rescues
+  // under LaTeX's real \output. Opt-in until the cold-vs-fork-real
+  // differential suite and the RSS measurement make it the default.
+  engine.isoRealFork = !!process.env.TDOM_ISO_REAL_FORK && process.env.TDOM_ISO_REAL_FORK !== '0';
+  engine.realRoot = null; // its Peer once it says HELLO realroot
   engine.renderHold = new Map(); // ckpt idx kept alive for a pending render -> block.id
   engine.foregroundRenderIds = null;
   // Edit-locus pinning: the checkpoints at (and right after) the block the

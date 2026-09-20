@@ -1665,6 +1665,8 @@ const server = http.createServer(async (req, res) => {
           queued: engine.rescueQueue?.size ?? 0,
           pumping: !!engine.rescuePumping,
           disk: engine.isoDiskCache?.stats ?? null,
+          realRoot: engine.realRoot?.pid ?? null,
+          rootPid: engine.root?.pid ?? null,
           log: (engine.rescueLog ?? []).slice(-60),
         },
         shipping: engine.shipping?.info?.() ?? null,

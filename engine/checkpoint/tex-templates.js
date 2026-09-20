@@ -23,6 +23,7 @@ export function buildDriverSource({
   labelTable,
   hrefTable,
   geometry,
+  realRoot = false,
 }) {
   const L = [];
   // Log every callback registration from the first line on, before any
@@ -281,6 +282,13 @@ export function buildDriverSource({
   // never discards inter-block glue. tdom_report() harvests the nodes.
   // The output routine only ever fires on force-ejects (\newpage & co);
   // tdom_absorb_output puts the material back and plants a break marker.
+  // Real-output root (daemon.lua tdom_real_root): a sibling of checkpoint 0
+  // forked HERE, before anything below touches the page builder, so its
+  // ISO children run splitting environments under LaTeX's real \output
+  // and \vsize exactly like a cold lualatex — with the preamble already
+  // loaded and COW-shared. Gated (TDOM_ISO_REAL_FORK) until the
+  // differential suite and the RSS measurement make it the default.
+  if (realRoot) L.push('\\directlua{tdom_real_root()}');
   L.push('\\vsize=\\maxdimen');
   L.push('\\holdinginserts=1');
   L.push('\\maxdeadcycles=200');
@@ -362,12 +370,13 @@ export function buildIsoCompileSource({
   prevLastskip,
   realOutput,
   strut,
+  runner = ck0 ? 'fork-absorb' : 'cold',
 }) {
   const L = [];
-  if (!ck0) {
+  if (runner === 'cold') {
     L.push(preamble.trimEnd());
     L.push('\\begin{document}');
-  } else {
+  } else if (runner === 'fork-absorb') {
     // the fork inherits the root's DORMANT regime (ckpt:0 is frozen right
     // after the dormant setup — \pagegoal=\maxdimen, seed material on the
     // page). Reset to the REAL height with TeX's own machinery: fire ONE
@@ -378,13 +387,29 @@ export function buildIsoCompileSource({
     // didn't use all of \box255".
     L.push(`\\vsize=${Math.max(1, geometry?.textheight ?? 550).toFixed(4)}bp`);
   }
+  // fork-real: the real-output root was forked BEFORE the dormant setup —
+  // real \output, real \vsize, empty page — so nothing needs resetting;
+  // the program below is exactly the cold one minus the preamble.
   L.push('\\makeatletter\\pagestyle{empty}\\hoffset=-1in\\voffset=-1in');
-  if (ck0) {
+  if (runner !== 'cold') {
     // A real-height isolated child must use LaTeX's real output semantics,
     // not the marker-only enlargement inherited from the dormant driver.
     L.push('\\let\\enlargethispage\\TDOMenlarge');
-    L.push('\\output={\\global\\setbox\\voidb@x\\box255}');
-    L.push('\\hbox to0pt{}\\penalty-10000');
+    if (runner === 'fork-absorb') {
+      L.push('\\output={\\global\\setbox\\voidb@x\\box255}');
+      L.push('\\hbox to0pt{}\\penalty-10000');
+    } else {
+      // the driver's float capture (figure/table → \TDOMfloatbox +
+      // tdom_float) belongs to the resident's own float protocol; an
+      // isolated real-output run must place floats like the cold compile
+      // does, through LaTeX's original environments
+      for (const env of ['figure', 'table']) {
+        L.push(
+          `\\expandafter\\let\\csname ${env}\\expandafter\\endcsname\\csname TDOMorig${env}\\endcsname` +
+            `\\expandafter\\let\\csname end${env}\\endcsname\\end@float`
+        );
+      }
+    }
     // re-assert the job cwd right before the ship: package code in the
     // block body can wander the process cwd, and the PDF output file
     // opens wherever the FIRST \shipout finds it (observed: child PDFs
