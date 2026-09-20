@@ -1,4 +1,20 @@
 import { fnv1a } from '../hash.js';
+import { trailingGlueSpec } from './util/galley.js';
+
+/**
+ * The glue the isolated compile re-creates before the block (iso-context.js
+ * prevLastskip): its width is in the previous block's exit state, but its
+ * stretch/shrink and their orders come from that block's galley and change
+ * an \addvspace merge without moving the state vector.
+ */
+function trailingGlueKey(blocks, idx) {
+  if (idx <= 0) return '';
+  const prev = blocks[idx - 1];
+  let widthSp = 0;
+  try { const vec = JSON.parse(prev?.stateVec ?? '[]'); widthSp = vec.at?.(-1) ?? 0; } catch { widthSp = 0; }
+  const g = trailingGlueSpec(prev?.galley, widthSp);
+  return `${g.widthSp}/${g.stretchSp}/${g.shrinkSp}/${g.stretchOrder}/${g.shrinkOrder}`;
+}
 
 /**
  * The rescue cache key carries every input the isolated compile depends
@@ -15,7 +31,7 @@ export function rescueCacheKey(block, idx, { blocks, labelTable, preHash }) {
   // same 0.25bp quantum as the iso strut — see #isoCompile
   const pageOff = Math.round((block.pageOffset ?? 0) * 4) / 4;
   return fnv1a(
-    JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, refVals, pageOff])
+    JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, refVals, pageOff, trailingGlueKey(blocks, idx)])
   );
 }
 
@@ -26,7 +42,7 @@ export function rescueCacheKey(block, idx, { blocks, labelTable, preHash }) {
  * then re-rescues the block if the offset it lands on differs.
  */
 export function rescueBaseKey(block, idx, { blocks, preHash }) {
-  return fnv1a(JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash]));
+  return fnv1a(JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, trailingGlueKey(blocks, idx)]));
 }
 
 export function isoCacheGet(isoCache, key) {

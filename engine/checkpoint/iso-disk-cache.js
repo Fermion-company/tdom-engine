@@ -19,7 +19,12 @@ const DIR = path.dirname(fileURLToPath(import.meta.url));
  */
 export function isoCacheEpoch() {
   const parts = [];
-  for (const name of ['daemon.lua', 'shipd.lua']) {
+  // Everything that decides what an isolated compile produces or how its
+  // result is read: the Lua daemons and the JS that builds the job, runs
+  // it and reads it back. A change to any of them must not reuse results.
+  const semantic = ['daemon.lua', 'shipd.lua', 'iso-context.js', 'isolated-render-source.js', 'iso-runner.js',
+    'iso-compile.js', 'iso-result.js', 'rescue-block.js', 'rescue-cache.js', 'iso-disk-cache.js'];
+  for (const name of semantic) {
     try { parts.push(fnv1a(readFileSync(path.join(DIR, name), 'utf8'))); } catch { parts.push('-'); }
   }
   try { parts.push(JSON.parse(readFileSync(path.join(DIR, '..', '..', 'package.json'), 'utf8')).version ?? '0'); } catch { parts.push('0'); }
