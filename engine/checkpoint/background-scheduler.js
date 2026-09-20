@@ -12,12 +12,12 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
   engine.bgTask = (async () => {
     if (!engine.pendingChain) return;
     while (
-      !engine.bgAbort &&
+      !engine.bgAbort && !engine.editPending &&
       Date.now() - (engine.lastEditAt ?? 0) < shippingPriorityQuietMs(engine, 300)
     ) {
       await new Promise((r) => setTimeout(r, 25));
     }
-    if (engine.bgAbort || !engine.pendingChain) return;
+    if (engine.bgAbort || engine.editPending || !engine.pendingChain) return;
     await locked(() => runChainPass());
     // A cold walk that reached its block hands the rest to a full update.
     // That update takes the chain lock itself and waits for bgTask, so it

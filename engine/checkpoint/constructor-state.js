@@ -92,7 +92,10 @@ export function initializeEngineState(
   // took down the server AND the editor session). Audit tools run with a
   // reduced budget via this env; the measured-cost skeleton avoids
   // replaying the most expensive skipped blocks.
-  engine.maxCheckpoints = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
+  // TDOM_MAX_CHECKPOINTS is the ceiling; the budget in force is fixed per
+  // source generation from the block count (checkpointBudgetFor).
+  engine.checkpointCeiling = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
+  engine.maxCheckpoints = engine.checkpointCeiling;
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
   engine.confirmedLiveHeapKb = 0;
@@ -223,5 +226,9 @@ export function initializeEngineState(
   engine.coldPrefixBudgetMs = Math.max(0, Number(process.env.TDOM_COLD_PREFIX_MS ?? 1500) || 0);
   engine.coldDirty = new Set(); // block ids whose galley predates their source text
   engine.coldWalking = false; // a cold chain pass is replaying with STEP right now
+  // Edits waiting for the chain lock. A caret warm or a deferred chain pass
+  // must not start (or clear the abort flag) while one is pending: the
+  // walk would take the lock first and the keystroke would wait it out.
+  engine.editPending = 0;
   engine.onDeferredUpdate = null; // callback(report) when a cold resume publishes
 }

@@ -303,13 +303,17 @@ export class CheckpointEngine {
     // one region each restarted from the same distant checkpoint).
     if (!this.warming && !this.coldWalking) abortBackgroundJob(this, 'background pass pre-empted by edit-locus warming');
     await this.bgTask.catch(() => {});
-    if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev) {
+    // A keystroke that arrived meanwhile owns the next turn of the lock: it
+    // set bgAbort and is waiting for the same task this warm waited for.
+    // Starting here would clear its flag and walk the whole prefix ahead of
+    // it (measured: a keystroke behind the host's warm waited 56 s).
+    if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev || this.editPending > 0) {
       return { status: 'superseded', sourceRev, target };
     }
     this.bgAbort = false;
     const startedAt = performance.now();
     const run = this.#locked(async () => {
-      if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev) {
+      if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev || this.editPending > 0) {
         return { status: 'superseded', sourceRev, target };
       }
       this.warmInfo = { status: 'running', sourceRev, target, offset: numericOffset, file: sourceFile };
@@ -347,7 +351,7 @@ export class CheckpointEngine {
             const block = this.blocks[idx];
             if (pageIds.has(block.id) && block.needsRender) this.#queueRender(block.id, { interactiveRev: sourceRev });
           },
-          () => this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev
+          () => this.bgAbort || this.editPending > 0 || request !== this.warmSeq || sourceRev !== this.srcRev
         );
       } finally {
         this.bgActive = false;
@@ -1163,11 +1167,15 @@ export class CheckpointEngine {
     // from an older checkpoint before this edit can run (measured: a
     // keystroke waiting 25 s behind the host's own warm on the 316-page
     // fixture). Let such a walk stop at its next block boundary instead.
+    this.editPending++;
+    let lockHeld = false;
     if (this.coldWalking || this.warming) this.bgAbort = true;
     else abortBackgroundJob(this);
     await this.bgTask.catch(() => {});
     try {
       const report = await this.#locked(async () => {
+        lockHeld = true;
+        this.editPending--;
         // serialize async header-job arrivals against updates: an hf apply
         // between an update's prevHashes capture and its patch computation
         // would mark unrelated pages dirty
@@ -1187,6 +1195,8 @@ export class CheckpointEngine {
     } catch (error) {
       if (documentResetPending) this.onDocumentResetComplete?.({ error });
       throw error;
+    } finally {
+      if (!lockHeld) this.editPending--;
     }
   }
 

@@ -3,6 +3,7 @@ import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch } from './safety.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
 import { firstDirtyIndex, nextEditHold, editPageRenderIds } from './update-helpers.js';
+import { checkpointBudgetFor } from './checkpoint-selection.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { sourceClosure } from './closure.js';
 
@@ -92,6 +93,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   // sparse resident skeleton once for this source generation; subsequent
   // JOBs reuse it unless a genuinely hotter block changes the top set.
   engine.checkpointKeepCache = null;
+  engine.maxCheckpoints = checkpointBudgetFor(engine.blocks.length, { ceiling: engine.checkpointCeiling });
   if (shippingExactUses.length) {
     engine.previewPolicy = 'shipping-exact';
     engine.previewReasons = [...new Set(shippingExactUses.flatMap((use) =>

@@ -56,7 +56,7 @@ export async function runChainPass(engine, callbacks) {
               from,
               target - 1,
               (j) => { engine.progress = { phase: 'cold', at: j + 2, total: target }; },
-              () => engine.bgAbort
+              () => engine.bgAbort || engine.editPending > 0
             );
           } finally {
             engine.coldWalking = false;

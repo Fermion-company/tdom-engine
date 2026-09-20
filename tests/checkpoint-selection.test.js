@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { checkpointKeepSet } from '../engine/checkpoint/checkpoint-selection.js';
+import { checkpointBudgetFor, checkpointKeepSet } from '../engine/checkpoint/checkpoint-selection.js';
 import {
   checkpointIndicesForPeers,
   distinctCheckpointPeerCount,
@@ -303,4 +303,17 @@ test('shipping keeps root, certified base, then the local frontier as its budget
     await chain.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('the resident budget scales with the document up to the ceiling', () => {
+  // a short note keeps every boundary
+  assert.equal(checkpointBudgetFor(10, { ceiling: 32 }), 11);
+  // ~20 pages: still every boundary while the ceiling allows
+  assert.equal(checkpointBudgetFor(31, { ceiling: 32 }), 32);
+  assert.equal(checkpointBudgetFor(40, { ceiling: 32 }), 32);
+  // a 316-page book: the host ceiling is the memory knob
+  assert.equal(checkpointBudgetFor(640, { ceiling: 32 }), 32);
+  assert.equal(checkpointBudgetFor(640, { ceiling: 64 }), 64);
+  assert.equal(checkpointBudgetFor(640, { ceiling: 2 }), 2);
+  assert.equal(checkpointBudgetFor(0, { ceiling: 8 }), 1);
 });

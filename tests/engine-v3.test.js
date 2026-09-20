@@ -268,7 +268,7 @@ test('a keystroke far from every checkpoint returns within its cold budget and t
   }
   const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
   const e = new CheckpointEngine({ workDir: work });
-  e.maxCheckpoints = 4; // a sparse skeleton: paragraph 150 is far from its nearest boundary
+  e.checkpointCeiling = 4; // a sparse skeleton: paragraph 150 is far from its nearest boundary
   try {
     await e.open(doc);
     e.coldPrefixBudgetMs = 1; // stop after the first replayed clean block
@@ -318,7 +318,7 @@ test('a caret warm that reaches the block of a budgeted keystroke hands over to 
   }
   const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
   const e = new CheckpointEngine({ workDir: work });
-  e.maxCheckpoints = 4;
+  e.checkpointCeiling = 4;
   try {
     await e.open(doc);
     e.coldPrefixBudgetMs = 1;
@@ -356,7 +356,7 @@ test('a keystroke during the cold walk stops it at a live boundary instead of re
   }
   const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
   const e = new CheckpointEngine({ workDir: work });
-  e.maxCheckpoints = 4;
+  e.checkpointCeiling = 4;
   try {
     await e.open(doc);
     e.coldPrefixBudgetMs = 1;
@@ -379,6 +379,42 @@ test('a keystroke during the cold walk stops it at a live boundary instead of re
     const third = await e.edit(at, at + 'Chapter'.length, 'Part');
     assert.notEqual(third.stats.chainVerdict, 'cold');
     assert.ok(third.stats.blocksTypeset <= 3, `after the walk the block is hot (got ${third.stats.blocksTypeset}${interrupted ? ', interrupted' : ''})`);
+  } finally {
+    await e.close();
+  }
+});
+
+test('a keystroke during a caret warm walk takes the lock at the next block boundary', async () => {
+  const work = WORK + '-warm-edit-priority';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the warm priority fixture keeps the resident chain walking for a while.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  try {
+    await e.open(doc);
+    const far = doc.indexOf('Paragraph 150 ');
+    const near = doc.indexOf('Paragraph 2 ');
+    // two warms in a row, as a host does (viewer page, then caret): the
+    // second waits for the first to stop and then restarts the walk
+    const first = e.warmEditOffset(far);
+    const second = e.warmEditOffset(far);
+    const deadline = Date.now() + 20_000;
+    while (!e.warming && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1));
+    if (!e.warming) { await first; await second; return; }
+    const t0 = performance.now();
+    const r = await e.edit(near, near + 'Paragraph'.length, 'Section');
+    const wall = performance.now() - t0;
+    assert.ok(wall < 4_000, `keystroke waited ${wall.toFixed(0)}ms behind the warm walk`);
+    assert.ok(r.stats.blocksTypeset <= 3);
+    const results = await Promise.all([first, second]);
+    assert.ok(results.some((w) => w.status === 'superseded'), JSON.stringify(results));
+    assert.equal(e.editPending, 0);
   } finally {
     await e.close();
   }
