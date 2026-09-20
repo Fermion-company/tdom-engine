@@ -1669,6 +1669,7 @@ const server = http.createServer(async (req, res) => {
         foregroundLeaseMs: engine.foregroundLeaseMs ?? 0,
         authorityDeferred: engine.authorityDeferred ?? false,
         canonical: engine.canonical.info(),
+        grid: url.searchParams.has('grid') ? engine.gridInfo?.() ?? null : undefined,
       });
     }
     if (req.method === 'POST' && url.pathname === '/canonical/build-lease/acquire') {

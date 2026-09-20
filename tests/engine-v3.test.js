@@ -234,9 +234,12 @@ test('a caret warm walk yields to a Build lease at its next block boundary and r
     await e.open(doc);
     const offset = doc.indexOf('Paragraph 150 ');
     assert.ok(offset > 0);
-    const warm = e.warmEditOffset(offset);
+    let settled = false;
+    const warm = e.warmEditOffset(offset).finally(() => { settled = true; });
     const deadline = Date.now() + 20_000;
-    while (!e.warming && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1));
+    // the walk can also be instantly ready (both boundaries resident): stop
+    // polling as soon as the warm settles instead of waiting out the deadline
+    while (!e.warming && !settled && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1));
     if (!e.warming) {
       // the walk finished before it could be observed: nothing to yield
       assert.deepEqual(await e.yieldWarmForBuild(), { yielded: false, warming: false });
@@ -415,6 +418,54 @@ test('a keystroke during a caret warm walk takes the lock at the next block boun
     const results = await Promise.all([first, second]);
     assert.ok(results.some((w) => w.status === 'superseded'), JSON.stringify(results));
     assert.equal(e.editPending, 0);
+  } finally {
+    await e.close();
+  }
+});
+
+test('a keep-set boundary without a continuation is materialized by the idle grid pass', opts, async () => {
+  const work = WORK + '-grid-fill';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 120; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the grid fill fixture keeps the resident chain walking for a while.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  try {
+    await e.open(doc);
+    await e.bgTask.catch(() => {});
+    const settle = Date.now() + 20_000;
+    while (e.gridMissing().length && Date.now() < settle) await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(e.gridMissing(), [], 'after boot every keep boundary holds a continuation');
+    // Lose an interior keep boundary the way memory pressure or a killed
+    // walk would: the keep set still wants it, no process holds it.
+    const keep = e.gridInfo().keep.filter((idx) => idx > 0 && idx < e.blocks.length && e.checkpoints.has(idx));
+    assert.ok(keep.length >= 1, 'an interior keep boundary exists');
+    const lost = keep[keep.length - 1];
+    const peer = e.checkpoints.get(lost);
+    peer.send('DIE\n');
+    if (peer.pid) e.dyingPids.add(peer.pid);
+    for (const [idx, candidate] of [...e.checkpoints]) if (candidate === peer) e.checkpoints.delete(idx);
+    assert.deepEqual(e.gridMissing(), [lost]);
+    const t0 = performance.now();
+    const ran = await e.maintainGrid();
+    assert.equal(ran, true);
+    const deadline = Date.now() + 30_000;
+    while (e.gridMissing().length && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(e.checkpoints.has(lost), `boundary ${lost} was materialized again (${(performance.now() - t0).toFixed(0)}ms)`);
+    assert.deepEqual(e.gridMissing(), []);
+    assert.ok(e.gridInfo().fill.materialized >= 1);
+    assert.ok(e.checkpoints.size <= e.maxCheckpoints + 2, `resident set stays near budget: ${e.checkpoints.size}`);
+    // a keystroke at the block right after the restored boundary is hot
+    const at = e.getSource().indexOf(e.blocks[lost].text.slice(0, 20));
+    assert.ok(at > 0);
+    const hot = await e.edit(at, at + 'Paragraph'.length, 'Section');
+    assert.notEqual(hot.stats.chainVerdict, 'cold');
+    assert.ok(hot.stats.blocksTypeset <= 3, `keystroke after the restored boundary replayed ${hot.stats.blocksTypeset} blocks`);
   } finally {
     await e.close();
   }

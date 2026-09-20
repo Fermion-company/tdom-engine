@@ -21,6 +21,7 @@ export function buildUpdateResponse({
   checkpoints,
   verdict,
   cold = null,
+  coldWalk = null,
   pendingChain,
   reused,
   rebuilt,
@@ -67,6 +68,9 @@ export function buildUpdateResponse({
       // Source-dirty blocks a cold stop left with a galley older than their
       // text: their pages show the previous typeset until the resume lands.
       coldPending: cold?.pending ?? [],
+      // The cold resume's own replay: checkpoint it started from, the
+      // block it walked to, blocks and ms spent across its passes.
+      coldWalk,
       chainPending: pendingChain
         ? { kind: pendingChain.kind, from: pendingChain.from }
         : null,

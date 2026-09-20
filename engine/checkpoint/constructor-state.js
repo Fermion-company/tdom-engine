@@ -226,6 +226,14 @@ export function initializeEngineState(
   engine.coldPrefixBudgetMs = Math.max(0, Number(process.env.TDOM_COLD_PREFIX_MS ?? 1500) || 0);
   engine.coldDirty = new Set(); // block ids whose galley predates their source text
   engine.coldWalking = false; // a cold chain pass is replaying with STEP right now
+  engine.coldWalk = null; // telemetry of the last cold replay (from/target/walked/ms/perBlockMs)
+  engine.coldTrace = null; // timestamps of the current cold keystroke's deferred path
+  // Grid materialization (docs/03): the keep set is computed from measured
+  // block costs, but a boot walk only retains the boundaries the partial
+  // costs asked for at the time. The lowest-priority chain pass replays
+  // from the nearest resident boundary to each keep boundary that has no
+  // continuation, so caret warms and cold keystrokes pay one segment at most.
+  engine.gridFill = { materialized: 0, ms: 0, passes: 0, last: null, given: new Set(), stalled: false };
   // Edits waiting for the chain lock. A caret warm or a deferred chain pass
   // must not start (or clear the abort flag) while one is pending: the
   // walk would take the lock first and the keystroke would wait it out.

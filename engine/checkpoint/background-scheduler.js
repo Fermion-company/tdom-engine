@@ -1,7 +1,8 @@
+import { performance } from 'node:perf_hooks';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 
 export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive = false, pageRenderIds = [] } = {}) {
-  const { locked, runChainPass, chunkTargets, queueRender, enforceCheckpointCap, coldResume } = callbacks;
+  const { locked, runChainPass, chunkTargets, queueRender, enforceCheckpointCap, coldResume, queueGrid, gridWanted } = callbacks;
   // Deferred chain work is the ONLY background chain activity (docs/10
   // §I3): nothing runs while the user is typing. The pass starts after a
   // short idle gate, aborts between blocks on the next edit (#update sets
@@ -10,23 +11,42 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
   // keystrokes. Graphics renders stay fire-and-forget — an edit never
   // waits on pdftocairo.
   engine.bgTask = (async () => {
-    if (!engine.pendingChain) return;
-    while (
-      !engine.bgAbort && !engine.editPending &&
-      Date.now() - (engine.lastEditAt ?? 0) < shippingPriorityQuietMs(engine, 300)
-    ) {
-      await new Promise((r) => setTimeout(r, 25));
-    }
-    if (engine.bgAbort || engine.editPending || !engine.pendingChain) return;
-    await locked(() => runChainPass());
-    // A cold walk that reached its block hands the rest to a full update.
-    // That update takes the chain lock itself and waits for bgTask, so it
-    // must not be part of this promise: return the work and let the
-    // detached continuation below run it.
-    const work = engine.pendingChain;
-    if (work?.kind === 'cold' && work.phase === 'resume' && !engine.bgAbort) {
-      engine.pendingChain = null;
-      return work;
+    // Nothing queued and no grid boundary to fill: settle at once, so the
+    // header pass and everything else that waits for this task is not
+    // held behind the idle gate (the engine is completely idle then).
+    if (!engine.pendingChain && !gridWanted?.()) return null;
+    // Two rounds at most: the queued work, then — once the queue drained
+    // and behind the same idle gate — the grid pass (docs/03) that fills
+    // keep-set boundaries lacking a continuation. A cold hand-off leaves
+    // instead.
+    for (let round = 0; round < 2; round++) {
+      // The task is created inside the update that scheduled it: wait for
+      // that update (and any caret warm) to leave before deciding anything.
+      while (
+        !engine.bgAbort && !engine.editPending &&
+        (engine.updating || engine.warming ||
+          // the cold resume is owed to the keystroke: it does not wait out
+          // the shipping priority window like deferred settle work does
+          Date.now() - (engine.lastEditAt ?? 0) <
+            (engine.pendingChain?.kind === 'cold' ? 300 : shippingPriorityQuietMs(engine, 300)))
+      ) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      if (engine.bgAbort || engine.editPending) return null;
+      if (!engine.pendingChain && !queueGrid?.()) return null;
+      if (process.env.TDOM_TRACE_GRID) console.error('[grid] sched', JSON.stringify({ round, kind: engine.pendingChain?.kind, t: Math.round(performance.now()) }));
+      if (engine.pendingChain.kind === 'cold' && engine.coldTrace) engine.coldTrace.gateAt = performance.now();
+      await locked(() => runChainPass());
+      // A cold walk that reached its block hands the rest to a full update.
+      // That update takes the chain lock itself and waits for bgTask, so it
+      // must not be part of this promise: return the work and let the
+      // detached continuation below run it.
+      const work = engine.pendingChain;
+      if (work?.kind === 'cold' && work.phase === 'resume' && !engine.bgAbort) {
+        engine.pendingChain = null;
+        return work;
+      }
+      if (engine.pendingChain || engine.bgAbort || !queueGrid?.()) return null;
     }
     return null;
   })().catch((err) => {

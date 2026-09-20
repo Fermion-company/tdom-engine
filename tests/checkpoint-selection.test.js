@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { checkpointBudgetFor, checkpointKeepSet } from '../engine/checkpoint/checkpoint-selection.js';
+import { checkpointBudgetFor, checkpointKeepSet, nextTypesetCost, gridMissingBoundaries } from '../engine/checkpoint/checkpoint-selection.js';
 import {
   checkpointIndicesForPeers,
   distinctCheckpointPeerCount,
@@ -329,4 +329,29 @@ test('a larger budget spreads coverage over the whole document instead of bracke
     const bound = Math.ceil(640 / (limit / 2)) + 8;
     assert.ok(Math.max(...gaps) <= bound, `limit ${limit}: widest gap ${Math.max(...gaps)} > ${bound} (${keep.join(',')})`);
   }
+});
+
+test('the skeleton cost of a block is its minimum sample: slow outliers change nothing', () => {
+  assert.equal(nextTypesetCost(0, 180), 180, 'first sample is stored');
+  assert.equal(nextTypesetCost(undefined, 180), 180);
+  assert.equal(nextTypesetCost(180, 6700), null, 'a swap or fork stall is not a cost');
+  assert.equal(nextTypesetCost(180, 180), null);
+  assert.equal(nextTypesetCost(180, 120), 120, 'a cheaper sample refines the estimate');
+  assert.equal(nextTypesetCost(180, NaN), null);
+  assert.equal(nextTypesetCost(180, -1), null);
+});
+
+test('the grid pass only chases boundaries whose nearest resident replay is a real share of a segment', () => {
+  const blocks = Array.from({ length: 120 }, (_, i) => ({ id: 'b' + i, typesetCostMs: i === 60 ? 3000 : 100 }));
+  const keep = new Set([0, 30, 60, 61, 90, 119]);
+  const held = (ids) => new Map(ids.map((idx) => [idx, { pid: idx }]));
+  // every boundary held: nothing to do
+  assert.deepEqual(gridMissingBoundaries(blocks, keep, held([0, 30, 60, 61, 90, 119]), 6), []);
+  // one block of drift (100 ms against a ~2.4 s segment) is served by the neighbour, on either side
+  assert.deepEqual(gridMissingBoundaries(blocks, keep, held([0, 29, 60, 61, 89, 119]), 6), []);
+  assert.deepEqual(gridMissingBoundaries(blocks, keep, held([0, 32, 60, 61, 92, 119]), 6), []);
+  // the output boundary of the hot block is not served by its input boundary
+  assert.deepEqual(gridMissingBoundaries(blocks, keep, held([0, 30, 60, 90, 119]), 6), [61]);
+  // a boundary far from any resident one is missing; root and the end never are
+  assert.deepEqual(gridMissingBoundaries(blocks, new Set([0, 30, 90, 120]), held([0, 90]), 4), [30]);
 });

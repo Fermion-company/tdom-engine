@@ -101,7 +101,10 @@ import {
 } from './canonical-arrival.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
 import { adoptGalleyBlock } from './galley-adoption.js';
-import { checkpointKeepSet, nearestCheckpoint } from './checkpoint-selection.js';
+import { checkpointKeepSet, nearestCheckpoint,
+  nextTypesetCost,
+  gridMissingBoundaries,
+} from './checkpoint-selection.js';
 import { reapDyingPids } from './dying-pids.js';
 import {
   checkpointIndicesForPeers,
@@ -902,26 +905,74 @@ export class CheckpointEngine {
   #recordTypesetCost(block, elapsedMs) {
     if (!block || !Number.isFinite(elapsedMs)) return;
     const previous = Number(block.typesetCostMs) || 0;
-    // Warming reopens cached font faces from an older snapshot. That
-    // one-time cost must not displace distant coverage for unchanged source.
+    // Warming reopens cached font faces from an older snapshot: neither a
+    // slow nor a fast sample from it should move the coverage plan of
+    // unchanged source.
     if (this.warming && previous) return;
-    if (elapsedMs <= previous) return;
-    block.typesetCostMs = elapsedMs;
+    // The skeleton uses the intrinsic cost: the minimum sample (docs/03).
+    // A later slower sample (fork stall, swap) is noise and changes
+    // nothing; a cheaper one refines the estimate.
+    const next = nextTypesetCost(previous, elapsedMs);
+    if (next == null) return;
+    block.typesetCostMs = next;
     // Avoid an O(blocks log blocks) sort after every cheap JOB in a long
-    // boot. Refresh only when this measurement can materially enter the hot
-    // set; the first few samples establish its floor, then a 1.5x hysteresis
-    // prevents near-equal costs from churning the plan.
+    // boot: refresh on the first samples in strides, and when a block the
+    // plan treats as hot turns out materially cheaper (1.5x hysteresis).
     if (!previous) this.checkpointCostSamples = (this.checkpointCostSamples ?? 0) + 1;
     const stride = Math.max(1, Math.ceil(this.blocks.length / this.maxCheckpoints));
-    if (!this.checkpointKeepCache || elapsedMs > this.checkpointHotFloorMs * 1.5 ||
+    const wasHot = previous >= this.checkpointHotFloorMs;
+    if (!this.checkpointKeepCache || (wasHot && next < previous / 1.5) ||
         (!previous && this.checkpointCostSamples % stride === 0)) {
       this.#checkpointKeepSet(true);
     }
   }
 
+  /**
+   * Diagnostic view of the checkpoint grid: the boundaries the keep set
+   * wants, the ones that actually hold a resident continuation, and the
+   * blocks whose measured cost shapes the partition (docs/03).
+   */
+  gridInfo({ top = 12 } = {}) {
+    const keep = [...this.#checkpointKeepSet()].sort((a, b) => a - b);
+    const checkpoints = [...this.checkpoints.keys()].sort((a, b) => a - b);
+    const topCosts = this.blocks
+      .map((block, idx) => ({
+        idx,
+        id: block.id,
+        ms: Math.round(Number(block.typesetCostMs) || 0),
+        file: block.file ?? null,
+        head: String(block.text ?? '').slice(0, 72),
+      }))
+      .sort((a, b) => b.ms - a.ms)
+      .slice(0, top);
+    return {
+      maxCheckpoints: this.maxCheckpoints,
+      ceiling: this.checkpointCeiling,
+      blocks: this.blocks.length,
+      checkpoints,
+      keep,
+      unheld: keep.filter((idx) => idx > 0 && idx < this.blocks.length && !this.checkpoints.has(idx)),
+      missing: this.gridMissing(),
+      fill: {
+        materialized: this.gridFill.materialized,
+        ms: this.gridFill.ms,
+        passes: this.gridFill.passes,
+        stalled: this.gridFill.stalled,
+        given: [...this.gridFill.given],
+        last: this.gridFill.last,
+      },
+      topCosts,
+    };
+  }
+
   #checkpointKeepSet(refresh = false) {
     if (!refresh && this.checkpointKeepCache) return this.checkpointKeepCache;
     this.checkpointKeepCache = checkpointKeepSet(this.blocks, this.maxCheckpoints);
+    // a new plan: the grid pass may try its boundaries again
+    if (this.gridFill) {
+      this.gridFill.given.clear();
+      this.gridFill.stalled = false;
+    }
     const hotCount = Math.max(1, Math.ceil(Math.max(0, this.maxCheckpoints - 2) / 2));
     const topCosts = this.blocks
       .map((block) => Math.max(0.1, Number(block.typesetCostMs) || 1))
@@ -1544,9 +1595,13 @@ export class CheckpointEngine {
       try {
         while (!this.closed && this.rescueQueue.size) {
           const [bid] = this.rescueQueue.entries().next().value;
+          // A cold keystroke's resume (docs/10 §10.4a) outranks isolated
+          // rescue adoption: the adopt walk holds the chain lock for seconds
+          // and the keystroke's page is not on screen until the resume runs.
           while (
             !this.closed &&
-            Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800)
+            (this.editPending > 0 || this.coldDirty.size > 0 || this.pendingChain?.kind === 'cold' ||
+              Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800))
           ) {
             await new Promise((r) => setTimeout(r, 200));
           }
@@ -1625,7 +1680,9 @@ export class CheckpointEngine {
             const successor = this.blocks[index];
             if (changed && successor.needsRender) this.#queueRender(successor.id);
           },
-          () => this.bgAbort
+          // yield to a keystroke waiting for the lock and to a cold resume
+          // it owes (the queue entry retries after them)
+          () => this.bgAbort || this.editPending > 0 || this.pendingChain?.kind === 'cold'
         );
       } catch (err) {
         if (this.bgAbort) return 'aborted';
@@ -1688,7 +1745,14 @@ export class CheckpointEngine {
    * subsumes settle; overlapping requests keep the earliest start.
    */
   #queueChainWork(kind, from, labels) {
-    const cur = this.pendingChain;
+    let cur = this.pendingChain;
+    // Grid materialization is the lowest priority: any other chain work
+    // replaces it (the scheduler re-queues it once the queue drains).
+    if (cur?.kind === 'grid') cur = null;
+    if (kind === 'grid') {
+      if (!cur) this.pendingChain = { kind: 'grid', from: 0, phase: 'blocks', labels: new Set(), budget: 16 };
+      return;
+    }
     if (kind === 'cold') {
       // The cold walk outranks deferred chain work: its resume update
       // re-queues whatever settle/rebuild was pending (carry).
@@ -1738,13 +1802,37 @@ export class CheckpointEngine {
    */
   async #coldResume(work) {
     if (this.closed) return;
+    if (this.coldTrace) this.coldTrace.resumeAt = performance.now();
     const report = await this.#update({
       editLabel: 'cold-resume',
       coldResume: true,
       coldIds: work.coldIds ?? null,
       chainCarry: work.carry ?? null,
     });
+    this.coldWalk = null;
+    this.coldTrace = null;
     if (report && !this.closed) this.onDeferredUpdate?.(report);
+  }
+
+  /**
+   * Keep-set boundaries without a resident continuation, in document order
+   * (docs/03). Root and the end of the document never count.
+   */
+  gridMissing() {
+    if (this.closed || !this.blocks.length) return [];
+    return gridMissingBoundaries(this.blocks, this.#checkpointKeepSet(), this.checkpoints, this.maxCheckpoints);
+  }
+
+  /**
+   * Queue the grid materialization pass behind any pending chain work and
+   * wake the scheduler. The host calls this after a Build; tests and the
+   * scheduler use it directly. Resolves when the background task settles.
+   */
+  maintainGrid() {
+    if (this.closed || !this.gridMissing().length) return Promise.resolve(false);
+    this.#queueChainWork('grid', 0, []);
+    this.#kickPendingChain();
+    return this.bgTask.then(() => true, () => false);
   }
 
   #scheduleBackground(fromIdx, dirtyBlocks, options) {
@@ -1755,6 +1843,16 @@ export class CheckpointEngine {
       queueRender: (id, renderOptions) => this.#queueRender(id, renderOptions),
       enforceCheckpointCap: () => this.#enforceCheckpointCap(),
       coldResume: (work) => this.#coldResume(work),
+      gridWanted: () =>
+        process.env.TDOM_GRID_FILL !== '0' && !this.closed && !this.gridFill.stalled &&
+        this.gridMissing().length > 0,
+      queueGrid: () => {
+        if (process.env.TDOM_GRID_FILL === '0') return false;
+        if (this.shipBooting || this.warming || this.updating || this.pendingChain) return false;
+        if (this.gridFill.stalled || !this.gridMissing().length) return false;
+        this.#queueChainWork('grid', 0, []);
+        return true;
+      },
     }, options);
   }
 
@@ -1773,6 +1871,7 @@ export class CheckpointEngine {
         if (!this.checkpoints.has(idx)) return;
         this.editHold = [...new Set([idx, ...this.editHold])].slice(0, 8);
       },
+      gridMissing: () => this.gridMissing(),
     });
   }
 
