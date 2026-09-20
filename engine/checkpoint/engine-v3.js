@@ -184,7 +184,7 @@ export class CheckpointEngine {
     const nextOverlay = overlayDir ? path.resolve(overlayDir) : null;
     if (!force && nextDir === this.docDir && nextOverlay === this.overlayDir) return false;
     this.bgAbort = true;
-    if (this.bgActive) {
+    if (this.bgActive && !this.coldWalking) {
       abortBackgroundJob(this, 'background pass pre-empted by a document switch');
     }
     await this.bgTask.catch(() => {});
@@ -301,7 +301,7 @@ export class CheckpointEngine {
     // its in-flight STEP child is the walk's only continuation, and killing
     // it threw the replay away (viewer page, file focus and caret warms for
     // one region each restarted from the same distant checkpoint).
-    if (!this.warming) abortBackgroundJob(this, 'background pass pre-empted by edit-locus warming');
+    if (!this.warming && !this.coldWalking) abortBackgroundJob(this, 'background pass pre-empted by edit-locus warming');
     await this.bgTask.catch(() => {});
     if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev) {
       return { status: 'superseded', sourceRev, target };
@@ -360,6 +360,7 @@ export class CheckpointEngine {
         if (sourceRev === this.srcRev && this.checkpoints.has(reached)) {
           this.editHold = [...new Set([reached, ...this.editHold])].slice(0, 8);
         }
+        this.#kickPendingChain();
         return { status: 'superseded', sourceRev, target };
       }
       this.editHold = [...new Set([target, target + 1, from + replayed, ...this.editHold])].slice(0, 8);
@@ -367,6 +368,7 @@ export class CheckpointEngine {
       // A cached rescue can replace its PDF chunk without changing any
       // measured boxes or exit state. Its new version must reach page DLs.
       if (changed || this.chunks.rev !== beforeChunksRev) this.#asyncRepaginate();
+      this.#kickPendingChain();
       const result = {
         status: this.checkpoints.has(target) && this.checkpoints.has(target + 1) ? 'ready' : 'incomplete',
         sourceRev,
@@ -380,6 +382,17 @@ export class CheckpointEngine {
     });
     this.bgTask = run.then(() => {}, () => {});
     return run;
+  }
+
+  /**
+   * A caret warm pre-empts the deferred chain (including a cold walk) and
+   * nothing re-arms it until the next edit. The host warms right after a
+   * keystroke, so a budgeted keystroke whose block the warm then typeset
+   * would never publish: hand whatever is pending back to the scheduler.
+   */
+  #kickPendingChain() {
+    if (this.closed || !this.pendingChain) return;
+    this.#scheduleBackground(0, [], { interactive: false, pageRenderIds: [] });
   }
 
   /**
@@ -1144,7 +1157,14 @@ export class CheckpointEngine {
     // is not an abort there: kill the in-flight background job outright
     // (#typesetBlock sees bgAbort and neither poisons the block nor runs
     // its follow-up jobs — the next rebuild simply retries it).
-    abortBackgroundJob(this);
+    // A caret warm and a cold walk (docs/10 §10.4a) consume their own
+    // continuations with STEP: killing the in-flight child throws the
+    // replay away, and the consumed boundary is then rebuilt with JOB forks
+    // from an older checkpoint before this edit can run (measured: a
+    // keystroke waiting 25 s behind the host's own warm on the 316-page
+    // fixture). Let such a walk stop at its next block boundary instead.
+    if (this.coldWalking || this.warming) this.bgAbort = true;
+    else abortBackgroundJob(this);
     await this.bgTask.catch(() => {});
     try {
       const report = await this.#locked(async () => {
@@ -1176,6 +1196,7 @@ export class CheckpointEngine {
     projectInputChanges = null,
     retry = false,
     coldResume = false,
+    coldIds = null,
     chainCarry = null,
     announceDocumentReset,
   }) {
@@ -1183,6 +1204,7 @@ export class CheckpointEngine {
     const prepared = await prepareUpdate(this, {
       editLabel,
       editContext,
+      coldIds,
       timer: t,
       callbacks: {
         deferClosureUpdate: (label, timer, closure) => {
@@ -1337,6 +1359,7 @@ export class CheckpointEngine {
           projectInputChanges,
           retry: true,
           coldResume,
+          coldIds,
           chainCarry,
           announceDocumentReset,
         });
@@ -1661,6 +1684,7 @@ export class CheckpointEngine {
       // re-queues whatever settle/rebuild was pending (carry).
       if (cur?.kind === 'cold') {
         cur.phase = 'blocks';
+        for (const id of this.coldDirty) cur.coldIds.add(id);
         return;
       }
       this.pendingChain = {
@@ -1668,6 +1692,7 @@ export class CheckpointEngine {
         from,
         phase: 'blocks',
         labels: new Set(),
+        coldIds: new Set(this.coldDirty),
         carry: cur ? { kind: cur.kind, from: cur.from, labels: new Set(cur.labels) } : null,
       };
       return;
@@ -1703,7 +1728,12 @@ export class CheckpointEngine {
    */
   async #coldResume(work) {
     if (this.closed) return;
-    const report = await this.#update({ editLabel: 'cold-resume', coldResume: true, chainCarry: work.carry ?? null });
+    const report = await this.#update({
+      editLabel: 'cold-resume',
+      coldResume: true,
+      coldIds: work.coldIds ?? null,
+      chainCarry: work.carry ?? null,
+    });
     if (report && !this.closed) this.onDeferredUpdate?.(report);
   }
 

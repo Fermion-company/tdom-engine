@@ -6,7 +6,7 @@ import { firstDirtyIndex, nextEditHold, editPageRenderIds } from './update-helpe
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { sourceClosure } from './closure.js';
 
-export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
+export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, callbacks }) {
   const { opaqueUpdate, deferClosureUpdate, bootRoot, scheduleStructuredReprobe, expandIncludes, unindexBlock } = callbacks;
   const text = engine.store.get(engine.file);
   const diagnostics = [];
@@ -122,10 +122,11 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   if (editLabel === 'cold-resume') {
     // The resume re-runs the update for the source as it is now: the blocks
     // a cold stop left un-typeset are its dirty set. An ordinary keystroke
-    // elsewhere does not chase them (its own hot path stays hot); a walk
-    // that happens to pass over one re-typesets it anyway.
+    // elsewhere does not chase them (its own hot path stays hot). A walk
+    // that passed over one (a caret warm, typically) already typeset it;
+    // it is still re-run here, cheaply, so the keystroke gets its report.
     for (const block of engine.blocks) {
-      if (engine.coldDirty?.has(block.id)) dirtySource.add(block.id);
+      if (engine.coldDirty?.has(block.id) || coldIds?.has(block.id)) dirtySource.add(block.id);
     }
   }
 

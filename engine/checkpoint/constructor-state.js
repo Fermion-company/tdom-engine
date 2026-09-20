@@ -222,5 +222,6 @@ export function initializeEngineState(
   // pass finishes the replay and re-runs the update off the hot path.
   engine.coldPrefixBudgetMs = Math.max(0, Number(process.env.TDOM_COLD_PREFIX_MS ?? 1500) || 0);
   engine.coldDirty = new Set(); // block ids whose galley predates their source text
+  engine.coldWalking = false; // a cold chain pass is replaying with STEP right now
   engine.onDeferredUpdate = null; // callback(report) when a cold resume publishes
 }

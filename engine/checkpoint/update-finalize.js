@@ -27,6 +27,19 @@ export function finalizeUpdate(engine, {
   const prevPageCount = engine.pages.length;
   const { pages, reused, rebuilt } = reconcile(pagesRaw, engine.pages);
   const { patches, dirtyPages } = buildPagePatches(pages, engine.pages, engine.hfSig, displayList);
+  if (!advanceSrcRev) {
+    // A cold resume owes the keystroke its page: when another walk already
+    // typeset the block and published the page through the async channel,
+    // the identity diff is empty, but the anchor plan reads the block's
+    // lines from this report's patches. Re-send those pages as they are.
+    const patched = new Set(patches.filter((patch) => patch.type === 'replace-page').map((patch) => patch.page));
+    for (const page of pages) {
+      if (patched.has(page.number)) continue;
+      if (!page.dl?.commands?.some((command) => dirtySource.has(command.src))) continue;
+      patches.push({ type: 'replace-page', page: page.number, displayList: page.dl });
+      dirtyPages.push(page.number);
+    }
+  }
   engine.pages = pages;
   // header/footer respecification walks every page and hashes the result —
   // only worth it when the page composition actually moved (folio values,

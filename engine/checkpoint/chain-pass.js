@@ -40,20 +40,27 @@ export async function runChainPass(engine, callbacks) {
       // update outside this lock ('resume'); a pending settle/rebuild that
       // was queued before is carried through and re-queued by that update.
       if (work.phase === 'blocks') {
+        // Every block is typeset already when another walk (a caret warm)
+        // passed over it: nothing to replay, but the keystroke still owes
+        // its report and anchor — go straight to the resume.
         const target = engine.blocks.findIndex((block) => engine.coldDirty?.has(block.id));
-        if (target < 0) {
-          engine.pendingChain = work.carry ? { ...work.carry, phase: 'blocks' } : null;
-          return;
-        }
-        const from = nearestCheckpoint(target);
-        if (from < target) {
+        const from = target < 0 ? -1 : nearestCheckpoint(target);
+        if (target >= 0 && from < target) {
           engine.progress = { phase: 'cold', at: from + 1, total: target };
-          const n = await retypesetChain(
-            from,
-            target - 1,
-            (j) => { engine.progress = { phase: 'cold', at: j + 2, total: target }; },
-            () => engine.bgAbort
-          );
+          // Never killed mid-block (see #update): an edit sets bgAbort and
+          // the walk returns at its next boundary, which stays live.
+          engine.coldWalking = true;
+          let n;
+          try {
+            n = await retypesetChain(
+              from,
+              target - 1,
+              (j) => { engine.progress = { phase: 'cold', at: j + 2, total: target }; },
+              () => engine.bgAbort
+            );
+          } finally {
+            engine.coldWalking = false;
+          }
           const reached = from + (n < 0 ? -n - 1 : n);
           pinBoundary(reached);
           if (n < 0 || engine.bgAbort) return;
