@@ -110,9 +110,24 @@ foreground は nearest checkpoint から始まる。各 block について `#typ
 | `clean` | clean block を組み直して `galleyHash` と `stateVec` が一致した |
 | `counters` | galley は同じで counter などが動いた |
 | `leak` | galley divergence が budget を超えた、または definition edit で suffix を信用できない |
+| `cold` | dirty block に届く前の clean prefix 再生が時間予算を超えた（§10.4a） |
 | `walked` | 文書末尾まで必要な foreground walk をした |
 
 現在の budget は、layout-coupled galley divergence が 8、local state ripple が 4 である。budget を超えた伝播は hot path で文書末尾まで追わず、`pendingChain` に入る。
+
+## 10.4a cold prefix の時間予算
+
+nearest checkpoint が編集 block から遠い（caret warm が間に合わなかった、あるいは骨格の外の場所へ飛んだ）打鍵は、dirty block に届くまで clean block を順に再生する。316 ページの文書で 250 block を超えると 1 打鍵が 50 秒以上 HTTP を塞ぎ、その間の打鍵も同じ walk を最初からやり直していた。
+
+foreground walk は、まだ source-dirty block が先にある状態で clean block を再生している間だけ、`TDOM_COLD_PREFIX_MS`（既定 1500、`0` で無効）を経過した時点で完了済み block 境界で止まり、verdict を `cold` にする。boot・reboot・retry の walk は対象外である。
+
+- 止めた境界は `editHold` に pin する。到達済み prefix は次の walk が再利用する。
+- 届かなかった source-dirty block は `coldDirty`（`stats.coldPending`）に記録する。その galley は text より古い。通常の打鍵はこれを追わない（自分の hot path を保つ）が、どの walk でもその block を再組版した時点で記録は消える（`#adoptGalley`）。
+- `pendingChain` に `cold` を積む。chain pass は idle gate の後、`coldDirty` の先頭 block の nearest checkpoint から `#retypesetChain` で（STEP を使って）その block の入口まで進む。打鍵で中断したら到達境界を pin して次の pass で続きから進む。
+- 入口に着いたら chain pass は `resume` を返し、scheduler が chain lock の外で `#update({ editLabel: 'cold-resume' })` を走らせる。prepare は `coldDirty` を dirtySource に合流させ、通常の foreground（今度は hot）・finalize を行う。`srcRev` は進めず（canonical / shipping の generation は元の打鍵が予約済み）、`rev` だけ進めて `onDeferredUpdate(report)` で公開する。cold 中に積まれた settle/rebuild は `carry` として resume の verdict の後に再登録する。
+- 打鍵が resume より先に chain lock に入った場合、その打鍵が block を組版し、resume は dirty なしで `null` を返す（何も公開しない）。
+
+server は cold な編集応答に `canonicalAnchorRefused: 'cold-prefix'` を付け、anchor の文脈（edit・base snapshot・lineage・accept 時刻）を `pendingColdAnchor` に置く。同じ block への続く cold 打鍵が lineage を継げるよう、base があれば `coldPending` の lineage entry（pages なし）を残す。deferred update が同じ `srcRev`・documentEpoch・anchorEpoch で届いたら、その文脈で `planTerminalCanonicalAnchor` → 通常の lineage 登録 → `resolveTerminalCanonicalAnchor` を行い、`update` を broadcast する。先に新しい打鍵が公開していた（`rev` が古い）deferred report は捨てる。`/status` の `cold` に未組版 block と walk の進捗が出る。
 
 ## 10.5 definition edit
 

@@ -215,4 +215,12 @@ export function initializeEngineState(
   // re-typesets the suffix serially (definition edits, untracked-state
   // leaks). Idle-gated, preemptible, resumable — see #runChainPass.
   engine.pendingChain = null; // {kind:'rebuild', from, phase:'blocks'|'after', labels:Set}
+  // Cold-prefix budget (docs/10 §10.4a): a keystroke whose nearest resident
+  // checkpoint is far away replays clean blocks for at most this long on the
+  // hot path. Past it the walk stops at a completed block boundary, the
+  // un-typeset edited blocks are remembered here, and the idle-gated chain
+  // pass finishes the replay and re-runs the update off the hot path.
+  engine.coldPrefixBudgetMs = Math.max(0, Number(process.env.TDOM_COLD_PREFIX_MS ?? 1500) || 0);
+  engine.coldDirty = new Set(); // block ids whose galley predates their source text
+  engine.onDeferredUpdate = null; // callback(report) when a cold resume publishes
 }

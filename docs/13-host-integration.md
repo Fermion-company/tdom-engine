@@ -58,7 +58,7 @@ host.stop();                                     // SIGTERM。常駐 TeX ツリ�
 
 `EngineHost` が spawn 時に固定する環境変数は、いずれも**ホストと同居するために必要**な値である。
 
-- `TDOM_MAX_CHECKPOINTS`（既定 `8`）: checkpoint 1 個が常駐 lualatex 1 個（100–300MB）。エンジン既定の 64 は専有マシン向けで、エディタや LSP と同居するホストでは踏めない。
+- `TDOM_MAX_CHECKPOINTS`（既定 `8`）: checkpoint 1 個が常駐 lualatex 1 個（100–300MB）。エンジン既定の 64 は専有マシン向けで、エディタや LSP と同居するホストでは踏めない。骨格が疎な分、遠くへ飛んだ打鍵の clean prefix 再生は `TDOM_COLD_PREFIX_MS`（エンジン既定 1500）で hot path から切り離され、残りは chain pass が続けて `update` を後から broadcast する（docs/10 §10.4a）。
 - `TDOM_SAMPLE`: boot 用に `samples/` に実在する小さいファイルを選ぶ（`pickBootSample()`）。既定の stress-test 文書は起動に数分かかる。実文書は起動直後の `POST /open` で入れ替わる。
 - `TDOM_WORKDIR`: 絶対パスの作業ディレクトリ。vendored な（書き込めない）checkout の中にスクラッチを作らせない。
 - `TDOM_SHIP` / `TDOM_SHIP_PRIVATE_PDF` / `TDOM_CANONICAL_ANCHOR`（既定すべて `1`）: いずれも打鍵経路の外で動き、対応できない preamble では通常の canonical コンパイルに fail close する。

@@ -12,12 +12,13 @@ export function finalizeUpdate(engine, {
   diagnostics,
   projectInputChanges = null,
   residentEditCandidate = false,
+  advanceSrcRev = true,
   timer,
   callbacks,
 }) {
   const { paginateNow, displayList, scheduleHeaders, enforceCheckpointCap, scheduleBackground, shipUpdate, fidelitySummary } =
     callbacks;
-  const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict } = typesetResult;
+  const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict, cold = null } = typesetResult;
   // pin the edit locus so the next keystroke is fork-once, typeset-once
   engine.editHold = rebooted ? [] : nextEditHold(fgStop, dirtySource, engine.blocks, engine.editHold);
 
@@ -41,15 +42,19 @@ export function finalizeUpdate(engine, {
   enforceCheckpointCap();
 
   engine.rev++;
-  engine.srcRev++;
-  // Bind shipping and the foreground exact-render cohort to the same source
-  // revision. Cold work keeps the shipping priority window; edited blocks
-  // and their changed neighbors may supply an earlier complete preview.
-  shipUpdate(text, projectInputChanges);
-  // converge to exact: the canonical compile of THIS source is scheduled
-  // off the hot path; when it lands the client swaps every clean page to
-  // LuaLaTeX's own pixels
-  engine.canonical.schedule(text, engine.srcRev);
+  if (advanceSrcRev) {
+    engine.srcRev++;
+    // Bind shipping and the foreground exact-render cohort to the same source
+    // revision. Cold work keeps the shipping priority window; edited blocks
+    // and their changed neighbors may supply an earlier complete preview.
+    shipUpdate(text, projectInputChanges);
+    // converge to exact: the canonical compile of THIS source is scheduled
+    // off the hot path; when it lands the client swaps every clean page to
+    // LuaLaTeX's own pixels
+    engine.canonical.schedule(text, engine.srcRev);
+  }
+  // A cold resume publishes the typeset of a source revision that already
+  // has its shipping generation and canonical compile scheduled.
   scheduleBackground(fgStop, dirtyBlocks, {
     interactive: !rebooted,
     pageRenderIds: rebooted ? [] : editPageRenderIds(engine.blocks, engine.pages, dirtySource),
@@ -77,6 +82,7 @@ export function finalizeUpdate(engine, {
     rebooted,
     checkpoints: engine.checkpoints,
     verdict,
+    cold,
     pendingChain: engine.pendingChain,
     reused,
     rebuilt,

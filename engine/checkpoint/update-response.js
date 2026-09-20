@@ -20,6 +20,7 @@ export function buildUpdateResponse({
   rebooted,
   checkpoints,
   verdict,
+  cold = null,
   pendingChain,
   reused,
   rebuilt,
@@ -63,6 +64,9 @@ export function buildUpdateResponse({
       rebooted,
       checkpoints: checkpoints.size,
       chainVerdict: verdict ?? 'walked',
+      // Source-dirty blocks a cold stop left with a galley older than their
+      // text: their pages show the previous typeset until the resume lands.
+      coldPending: cold?.pending ?? [],
       chainPending: pendingChain
         ? { kind: pendingChain.kind, from: pendingChain.from }
         : null,

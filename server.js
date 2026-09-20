@@ -939,6 +939,60 @@ engine.onExternalChange = (changedInput) => {
     console.warn('[tdom] project input refresh failed:', error?.message || error);
   });
 };
+// The engine finished the replay a budgeted keystroke deferred and typeset
+// its block: a new display revision of the same source revision. Publish it
+// like the edit response would have, including the anchor the keystroke
+// could not plan at the time (its context waited in pendingColdAnchor).
+engine.onDeferredUpdate = (report) => {
+  const stash = pendingColdAnchor;
+  pendingColdAnchor = null;
+  if (pendingDocumentReset || !report) return;
+  // A keystroke that entered the chain lock right after the resume already
+  // published a newer display revision: this one is stale for every client.
+  if (Number(report.rev) <= Number(lastReport?.rev ?? -1)) return;
+  lastReport = report;
+  if (Number(lastAnchorPresentation?.srcRev) !== Number(report.srcRev)) lastAnchorPresentation = null;
+  report.previewFallback = dirtyWithoutPatchFallback(report);
+  const usable = ENABLE_CANONICAL_ANCHOR && !!stash && stash.srcRev === report.srcRev &&
+    stash.documentEpoch === documentEpoch && stash.anchorEpoch === terminalAnchorEpoch &&
+    report.rebooted !== true && !(report.stats?.coldPending?.length);
+  // The publication promise to the client starts now, not at the keystroke:
+  // proof budgets and the client's publish deadline count from this report.
+  const resumeAcceptedAt = performance.now();
+  const anchorPlan = usable
+    ? planTerminalCanonicalAnchor({
+        blocks: engine.blocks,
+        domBlocks: engine.getDOM().blocks,
+        report,
+        geometry: engine.getGeometry(),
+        lineage: stash.anchorPriorLineage,
+        edit: stash.anchorEdit,
+        baseSnapshot: stash.anchorBaseSnapshot,
+        inputEpoch: engine.canonical.inputEpoch,
+        acceptedAt: resumeAcceptedAt,
+        proofStartedAt: resumeAcceptedAt,
+        clientEditAtEpochMs: stash.anchorClientEditAt,
+        paintContext: { fonts: engine.fonts, twinMetrics: engine.twinMetrics },
+        diagnostics: stash.anchorDiagnostics,
+      })
+    : null;
+  if (anchorPlan) {
+    anchorPlan.public.acceptedElapsedMs = performance.now() - resumeAcceptedAt;
+    anchorPlan.public.coldResumeMs = performance.now() - stash.anchorAcceptedAt;
+    adoptAnchorPlanLineage(anchorPlan, stash.anchorPriorLineage, stash.anchorLedger);
+    report.canonicalAnchor = anchorPlan.public;
+  } else if (ENABLE_CANONICAL_ANCHOR) {
+    report.canonicalAnchorRefused = !stash ? 'cold-resume-unanchored'
+      : !usable ? 'cold-resume-superseded'
+      : stash.anchorDiagnostics?.reason ?? 'unknown';
+    // The unproved lineage kept for this revision has no proof to wait for.
+    if (usable && terminalAnchorLineage?.coldPending && terminalAnchorLineage.lastSrcRev === report.srcRev) {
+      terminalAnchorLineage = null;
+    }
+  }
+  broadcast({ kind: 'update', report });
+  if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, stash.anchorEpoch, stash.anchorProofPrefetch);
+};
 // canonical compiles land asynchronously: tell every client so it can
 // converge its pages to the exact LuaLaTeX render
 engine.onCanonical = (info) => {
@@ -1364,6 +1418,97 @@ function prefetchWarmAnchorProof(offset, filePath, diagnostics = null) {
     : null;
 }
 
+// A budgeted (cold) keystroke returns before its block is typeset. Its anchor
+// context waits here for the engine's deferred update of the same source
+// revision; a newer keystroke, reset or canonical generation retires it.
+let pendingColdAnchor = null;
+
+function anchorLineageEntry(lineage, blockId) {
+  if (!lineage || !blockId) return null;
+  if (lineage.blocks instanceof Map) return lineage.blocks.get(blockId) ?? null;
+  return lineage.blockId === blockId ? lineage : null;
+}
+
+/** Record a certified plan as the current lineage (one entry per block edited since the base). */
+function adoptAnchorPlanLineage(anchorPlan, anchorPriorLineage, anchorLedger) {
+  const prior = anchorPriorLineage &&
+    anchorPriorLineage.baseGeneration === anchorPlan.baseGeneration &&
+    anchorPriorLineage.baseRev === anchorPlan.baseRev &&
+    anchorPriorLineage.lastSrcRev === anchorPlan.srcRev - 1
+    ? anchorPriorLineage
+    : null;
+  const blocks = new Map();
+  if (prior?.blocks instanceof Map) {
+    for (const [id, entry] of prior.blocks) blocks.set(id, entry);
+  } else if (prior) {
+    blocks.set(prior.blockId, {
+      baseSnapshot: prior.baseSnapshot,
+      changedLines: [...(prior.changedLines ?? [])],
+      pages: prior.pages ?? null,
+      visualCut: Boolean(prior.visualCut),
+    });
+  }
+  // Until this keystroke's proof lands, the block keeps the pages its
+  // previous proof certified: that is what the paper still shows.
+  const previous = blocks.get(anchorPlan.blockId);
+  blocks.set(anchorPlan.blockId, {
+    baseSnapshot: anchorPlan.baseSnapshot,
+    changedLines: [...anchorPlan.changedLines],
+    pages: previous?.pages ?? null,
+    visualCut: previous?.pages ? Boolean(previous.visualCut) : Boolean(anchorPlan.visualCut),
+  });
+  anchorPlan.public.blockIds = [...blocks.keys()];
+  terminalAnchorLineage = {
+    blockId: anchorPlan.blockId,
+    baseGeneration: anchorPlan.baseGeneration,
+    baseRev: anchorPlan.baseRev,
+    lastSrcRev: anchorPlan.srcRev,
+    baseSnapshot: anchorPlan.baseSnapshot,
+    changedLines: [...anchorPlan.changedLines],
+    ledger: prior?.ledger instanceof Map ? prior.ledger : anchorLedger,
+    blocks,
+  };
+}
+
+/**
+ * A cold keystroke has a base (captured now, or carried by the lineage it
+ * continues) but no galley to plan against yet. Keep the lineage alive at
+ * this source revision with an unproved entry, so the next keystroke in the
+ * same block continues it and the deferred plan finds its base.
+ */
+function pendingAnchorLineage({ blockId, baseSnapshot, baseGeneration, baseRev, srcRev, prior, ledger }) {
+  const continues = prior && prior.baseGeneration === baseGeneration && prior.baseRev === baseRev &&
+    prior.lastSrcRev === srcRev - 1
+    ? prior
+    : null;
+  const blocks = new Map();
+  if (continues?.blocks instanceof Map) {
+    for (const [id, entry] of continues.blocks) blocks.set(id, entry);
+  } else if (continues) {
+    blocks.set(continues.blockId, {
+      baseSnapshot: continues.baseSnapshot,
+      changedLines: [...(continues.changedLines ?? [])],
+      pages: continues.pages ?? null,
+      visualCut: Boolean(continues.visualCut),
+    });
+  }
+  const previous = blocks.get(blockId);
+  const base = previous?.baseSnapshot ?? baseSnapshot;
+  if (!base) return null;
+  if (!previous) blocks.set(blockId, { baseSnapshot: base, changedLines: [], pages: null, visualCut: false });
+  return {
+    blockId,
+    baseGeneration,
+    baseRev,
+    lastSrcRev: srcRev,
+    baseSnapshot: base,
+    changedLines: [...(previous?.changedLines ?? [])],
+    ledger: continues?.ledger instanceof Map ? continues.ledger : ledger,
+    blocks,
+    coldPending: true,
+  };
+}
+
 async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch = null) {
   const stillCurrent = () => {
     if (documentEpoch !== epoch || terminalAnchorEpoch !== anchorEpoch ||
@@ -1518,6 +1663,9 @@ const server = http.createServer(async (req, res) => {
         canonicalAnchorPresentation: lastAnchorPresentation,
         canonicalAnchorInputDiagnostic: lastReport?.canonicalAnchorInputDiagnostic ?? null,
         warm: engine.warmInfo ?? null,
+        cold: engine.coldDirty?.size
+          ? { pending: [...engine.coldDirty], walk: engine.progress?.phase === 'cold' ? engine.progress : null }
+          : null,
         foregroundLeaseMs: engine.foregroundLeaseMs ?? 0,
         authorityDeferred: engine.authorityDeferred ?? false,
         canonical: engine.canonical.info(),
@@ -2106,6 +2254,7 @@ const server = http.createServer(async (req, res) => {
       let resetEpoch = null;
       let anchorInputSafe = false;
       let anchorBaseSnapshot = null;
+      let anchorBaseCertificate = null;
       let anchorLedger = null;
       let anchorEdit = null;
       let anchorMutation = false;
@@ -2160,7 +2309,10 @@ const server = http.createServer(async (req, res) => {
               // The generation is the exact compile of every block right now:
               // remember each block's identity so a later edit in another
               // block can prove it still is what this generation typeset.
-              if (anchorBaseSnapshot) anchorLedger = anchorLedgerFor(certificate);
+              if (anchorBaseSnapshot) {
+                anchorLedger = anchorLedgerFor(certificate);
+                anchorBaseCertificate = { id: certificate.id, rev: certificate.rev };
+              }
             } else if (certificate && terminalAnchorLineage &&
                 terminalAnchorLineage.baseGeneration === certificate.id &&
                 terminalAnchorLineage.baseRev === certificate.rev &&
@@ -2182,6 +2334,7 @@ const server = http.createServer(async (req, res) => {
               if (candidate && ledgerAdmitsBlock(terminalAnchorLineage.ledger, block)) {
                 anchorBaseSnapshot = candidate;
                 anchorLedger = terminalAnchorLineage.ledger;
+                anchorBaseCertificate = { id: certificate.id, rev: certificate.rev };
               } else {
                 anchorDiagnostics.reason = candidate ? 'ledger-mismatch' : joinDiagnostics.reason ?? 'canonical-behind';
               }
@@ -2329,9 +2482,13 @@ const server = http.createServer(async (req, res) => {
         lastAnchorPresentation = null;
       }
       lastReport.previewFallback = dirtyWithoutPatchFallback(lastReport);
+      // A budgeted keystroke (docs/10 §10.4a): the edited block keeps its
+      // previous galley until the engine's deferred update. Nothing can be
+      // planned yet; the context waits for that update of this revision.
+      const coldEdit = (lastReport.stats?.coldPending?.length ?? 0) > 0;
       // Why the base capture refused wins over the plan's resulting no-base.
       const baseRefusal = anchorDiagnostics.reason ?? null;
-      const anchorPlan = ENABLE_CANONICAL_ANCHOR && anchorInputSafe && lastReport.rebooted !== true
+      const anchorPlan = ENABLE_CANONICAL_ANCHOR && !coldEdit && anchorInputSafe && lastReport.rebooted !== true
         ? planTerminalCanonicalAnchor({
             blocks: engine.blocks,
             domBlocks: engine.getDOM().blocks,
@@ -2348,7 +2505,46 @@ const server = http.createServer(async (req, res) => {
             diagnostics: anchorDiagnostics,
           })
         : null;
-      if (!anchorPlan && ENABLE_CANONICAL_ANCHOR && anchorMutation) {
+      if (coldEdit && ENABLE_CANONICAL_ANCHOR) {
+        lastReport.canonicalAnchorRefused = 'cold-prefix';
+        const coldBlockId = lastReport.dirtySourceNodes?.length === 1
+          ? String(lastReport.dirtySourceNodes[0]).replace(/^src-/, '')
+          : null;
+        pendingColdAnchor = anchorMutation && anchorInputSafe && coldBlockId ? {
+          srcRev: lastReport.srcRev,
+          documentEpoch,
+          anchorEpoch,
+          anchorEdit,
+          anchorBaseSnapshot,
+          anchorLedger,
+          anchorPriorLineage,
+          anchorAcceptedAt,
+          anchorClientEditAt,
+          anchorProofPrefetch,
+          anchorDiagnostics,
+        } : null;
+        if (anchorMutation) {
+          // Keep the lineage alive for the deferred plan and for the next
+          // keystroke in this block: either the base captured now or the
+          // entry the continued lineage already holds for the block.
+          const priorEntry = anchorPriorLineage && anchorPriorLineage.lastSrcRev === lastReport.srcRev - 1
+            ? anchorLineageEntry(anchorPriorLineage, coldBlockId)
+            : null;
+          const pending = anchorInputSafe && coldBlockId &&
+            (anchorBaseSnapshot?.blockId === coldBlockId && anchorBaseCertificate || priorEntry?.baseSnapshot)
+            ? pendingAnchorLineage({
+                blockId: coldBlockId,
+                baseSnapshot: anchorBaseSnapshot?.blockId === coldBlockId ? anchorBaseSnapshot : null,
+                baseGeneration: anchorBaseCertificate?.id ?? anchorPriorLineage.baseGeneration,
+                baseRev: anchorBaseCertificate?.rev ?? anchorPriorLineage.baseRev,
+                srcRev: lastReport.srcRev,
+                prior: anchorPriorLineage,
+                ledger: anchorLedger,
+              })
+            : null;
+          terminalAnchorLineage = pending;
+        }
+      } else if (!anchorPlan && ENABLE_CANONICAL_ANCHOR && anchorMutation) {
         // Not a state the client acts on: the only record of why this edit
         // waits for the canonical build instead of a certified overlay.
         const planRefusal = anchorDiagnostics.reason;
@@ -2362,45 +2558,9 @@ const server = http.createServer(async (req, res) => {
         anchorPlan.public.acceptedElapsedMs = performance.now() - anchorAcceptedAt;
         // A cumulative lineage: one entry per block edited since the base
         // generation. Only an unbroken chain of anchored edits continues it.
-        const prior = anchorPriorLineage &&
-          anchorPriorLineage.baseGeneration === anchorPlan.baseGeneration &&
-          anchorPriorLineage.baseRev === anchorPlan.baseRev &&
-          anchorPriorLineage.lastSrcRev === anchorPlan.srcRev - 1
-          ? anchorPriorLineage
-          : null;
-        const blocks = new Map();
-        if (prior?.blocks instanceof Map) {
-          for (const [id, entry] of prior.blocks) blocks.set(id, entry);
-        } else if (prior) {
-          blocks.set(prior.blockId, {
-            baseSnapshot: prior.baseSnapshot,
-            changedLines: [...(prior.changedLines ?? [])],
-            pages: prior.pages ?? null,
-            visualCut: Boolean(prior.visualCut),
-          });
-        }
-        // Until this keystroke's proof lands, the block keeps the pages its
-        // previous proof certified: that is what the paper still shows.
-        const previous = blocks.get(anchorPlan.blockId);
-        blocks.set(anchorPlan.blockId, {
-          baseSnapshot: anchorPlan.baseSnapshot,
-          changedLines: [...anchorPlan.changedLines],
-          pages: previous?.pages ?? null,
-          visualCut: previous?.pages ? Boolean(previous.visualCut) : Boolean(anchorPlan.visualCut),
-        });
-        anchorPlan.public.blockIds = [...blocks.keys()];
+        adoptAnchorPlanLineage(anchorPlan, anchorPriorLineage, anchorLedger);
         lastReport.canonicalAnchor = anchorPlan.public;
-        terminalAnchorLineage = {
-          blockId: anchorPlan.blockId,
-          baseGeneration: anchorPlan.baseGeneration,
-          baseRev: anchorPlan.baseRev,
-          lastSrcRev: anchorPlan.srcRev,
-          baseSnapshot: anchorPlan.baseSnapshot,
-          changedLines: [...anchorPlan.changedLines],
-          ledger: prior?.ledger instanceof Map ? prior.ledger : anchorLedger,
-          blocks,
-        };
-      } else if (anchorMutation || lastReport.dirtySourceNodes?.length) {
+      } else if (!coldEdit && (anchorMutation || lastReport.dirtySourceNodes?.length)) {
         terminalAnchorLineage = null;
       }
       if (anchorDiagnostics.inputTransition || anchorDiagnostics.reason) {

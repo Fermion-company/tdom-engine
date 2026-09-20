@@ -15,6 +15,7 @@ export async function runUpdateTypesetPhase(engine, {
   timer,
   defRe,
   plainPreviewAdmission = null,
+  coldBudgetMs = 0,
   callbacks,
 }) {
   const {
@@ -83,6 +84,7 @@ export async function runUpdateTypesetPhase(engine, {
   }
   const replayToken = {};
   let i = nearestCheckpoint(Math.min(firstDisplay, engine.blocks.length));
+  const walkStartedAt = performance.now();
   while (i < engine.blocks.length) {
     // /status liveness marker: which block the foreground pass is on —
     // a long boot walk shows movement instead of silence
@@ -116,6 +118,15 @@ export async function runUpdateTypesetPhase(engine, {
       }
     }
     i++;
+    // Cold prefix (docs/10 §10.4a): this block was a clean replay on the way
+    // to a source-dirty block that is still ahead. Past the budget, stop at
+    // this completed boundary instead of holding the keystroke for the whole
+    // sparse replay; the chain pass resumes from here and re-runs the update.
+    if (coldBudgetMs > 0 && wasClean && !changed && i <= lastDirty &&
+        performance.now() - walkStartedAt > coldBudgetMs) {
+      verdict = 'cold';
+      break;
+    }
     // External project updates can dirty disjoint blocks in one source
     // snapshot (for example an included chapter plus the generated .bbl at
     // the end). Never accept an intermediate clean block as convergence
@@ -167,6 +178,21 @@ export async function runUpdateTypesetPhase(engine, {
   }
   if (defEdit && verdict) verdict = 'leak';
   const fgStop = i;
+
+  // A cold stop leaves every source-dirty block at or past the boundary with
+  // a galley older than its text. Remember them: the resume walk targets the
+  // first one, and any walk that re-typesets one drops it again (adoptGalley).
+  let cold = null;
+  if (verdict === 'cold') {
+    const pending = [];
+    for (let k = fgStop; k < engine.blocks.length; k++) {
+      const block = engine.blocks[k];
+      if (dirtySource.has(block.id) || !block.galley) pending.push(block.id);
+    }
+    for (const id of pending) engine.coldDirty.add(id);
+    cold = { pending, from: fgStop };
+    queueChainWork('cold', fgStop, changedLabels);
+  }
 
   // verdict dispatch: anything beyond the foreground bound is DEFERRED
   if (verdict === 'counters' || verdict === 'leak' || verdict === 'verify') {
@@ -268,5 +294,5 @@ export async function runUpdateTypesetPhase(engine, {
   // screen meanwhile, and canonical guarantees the final pixels.
   queueMovedOffsets();
   timer.lap('pagectx');
-  engine._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict };
+  engine._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict, cold };
 }

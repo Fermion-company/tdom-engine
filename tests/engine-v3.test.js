@@ -256,3 +256,53 @@ test('a caret warm walk yields to a Build lease at its next block boundary and r
     await e.close();
   }
 });
+
+test('a keystroke far from every checkpoint returns within its cold budget and the resume publishes the typeset', async () => {
+  const work = WORK + '-cold-budget';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the cold budget fixture keeps the resident chain walking for a while.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.maxCheckpoints = 4; // a sparse skeleton: paragraph 150 is far from its nearest boundary
+  try {
+    await e.open(doc);
+    e.coldPrefixBudgetMs = 1; // stop after the first replayed clean block
+    const deferred = new Promise((resolve) => { e.onDeferredUpdate = resolve; });
+    const at = e.getSource().indexOf('Paragraph 150 ');
+    assert.ok(at > 0);
+    const t0 = performance.now();
+    const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
+    const wall = performance.now() - t0;
+    assert.equal(cold.stats.chainVerdict, 'cold');
+    assert.equal(cold.stats.coldPending.length, 1, 'the edited block waits for the resume');
+    assert.equal(cold.dirtySourceNodes.length, 1);
+    assert.ok(cold.stats.blocksTypeset < 20, `the hot path replayed ${cold.stats.blocksTypeset} blocks past its budget`);
+    assert.ok(wall < 5_000, `cold keystroke took ${wall.toFixed(0)}ms`);
+    assert.equal(e.coldDirty.size, 1);
+    const resumed = await Promise.race([
+      deferred,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('cold resume never published')), 90_000)),
+    ]);
+    assert.equal(resumed.srcRev, cold.srcRev, 'the resume is a display revision of the same source revision');
+    assert.ok(resumed.rev > cold.rev);
+    assert.equal(resumed.edit, 'cold-resume');
+    assert.equal(e.coldDirty.size, 0);
+    assert.notEqual(resumed.stats.chainVerdict, 'cold');
+    assert.ok(resumed.patches.length >= 1, 'the resume carries the page of the edited block');
+    assert.deepEqual(resumed.dirtySourceNodes, cold.dirtySourceNodes);
+    const block = e.blocks.find((b) => b.id === String(cold.dirtySourceNodes[0]).replace(/^src-/, ''));
+    assert.ok(block?.galley && block.text.startsWith('Section 150'), 'the galley now belongs to the edited text');
+    // the boundary the walk reached is pinned: the next keystroke there is hot
+    const hot = await e.edit(at, at + 'Section'.length, 'Chapter');
+    assert.notEqual(hot.stats.chainVerdict, 'cold');
+    assert.ok(hot.stats.blocksTypeset <= 3, `follow-up keystroke replayed ${hot.stats.blocksTypeset} blocks`);
+    assert.equal(hot.srcRev, cold.srcRev + 1);
+  } finally {
+    await e.close();
+  }
+});

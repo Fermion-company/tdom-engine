@@ -118,6 +118,16 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
     }
   }
   const dirtySource = new Set(diff.dirty);
+  for (const id of diff.removed) engine.coldDirty?.delete(id);
+  if (editLabel === 'cold-resume') {
+    // The resume re-runs the update for the source as it is now: the blocks
+    // a cold stop left un-typeset are its dirty set. An ordinary keystroke
+    // elsewhere does not chase them (its own hot path stays hot); a walk
+    // that happens to pass over one re-typesets it anyway.
+    for (const block of engine.blocks) {
+      if (engine.coldDirty?.has(block.id)) dirtySource.add(block.id);
+    }
+  }
 
   if (!engine.preGate.gate.safe) {
     return {

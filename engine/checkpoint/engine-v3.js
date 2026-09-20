@@ -1057,6 +1057,7 @@ export class CheckpointEngine {
   }
 
   #adoptGalley(block, galley) {
+    this.coldDirty?.delete(block.id);
     this.#normalizeGalleyFonts(galley);
     this.#indexBlock(
       block.id,
@@ -1125,12 +1126,14 @@ export class CheckpointEngine {
       documentResetPending = true;
       this.onDocumentResetPending?.(event);
     };
-    this.lastEditAt = Date.now(); // pauses the idle-gated isolated renders
-    const foregroundLeaseMs = shippingPriorityQuietMs(this, 0);
-    this.foregroundLeaseMs = foregroundLeaseMs;
-    this.authorityDeferred = foregroundLeaseMs > 0
-      ? this.canonical.deferAuthority(foregroundLeaseMs)
-      : false;
+    if (!args.coldResume) {
+      this.lastEditAt = Date.now(); // pauses the idle-gated isolated renders
+      const foregroundLeaseMs = shippingPriorityQuietMs(this, 0);
+      this.foregroundLeaseMs = foregroundLeaseMs;
+      this.authorityDeferred = foregroundLeaseMs > 0
+        ? this.canonical.deferAuthority(foregroundLeaseMs)
+        : false;
+    }
     // Stop the in-flight background chain rebuild BEFORE taking the chain
     // lock (it holds the lock while running; aborting it first avoids a
     // lock-order deadlock). With stale-first rescues the background task
@@ -1172,6 +1175,8 @@ export class CheckpointEngine {
     editContext = null,
     projectInputChanges = null,
     retry = false,
+    coldResume = false,
+    chainCarry = null,
     announceDocumentReset,
   }) {
     const t = new Timer();
@@ -1244,6 +1249,9 @@ export class CheckpointEngine {
     });
     if (prepared.response) return prepared.response;
     const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
+    // Every cold block was re-typeset by a walk that passed over it (or a
+    // keystroke landed there first): nothing is left for this resume.
+    if (coldResume && !dirtySource.size) return null;
     const plainPreviewAdmission = classifyPlainPreviewEdit(this, {
       text, editContext, oldBlocks, dirtySource, rebooted,
     });
@@ -1297,6 +1305,9 @@ export class CheckpointEngine {
         timer: t,
         defRe: DEF_RE,
         plainPreviewAdmission,
+        // A boot, reboot or retry fills every galley from block zero: that
+        // walk has no prefix to defer.
+        coldBudgetMs: rebooted || retry || editLabel === 'open' ? 0 : this.coldPrefixBudgetMs,
         callbacks: {
           nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
           typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),
@@ -1325,6 +1336,8 @@ export class CheckpointEngine {
           editContext,
           projectInputChanges,
           retry: true,
+          coldResume,
+          chainCarry,
           announceDocumentReset,
         });
       }
@@ -1338,6 +1351,9 @@ export class CheckpointEngine {
         projectInputChanges
       );
     }
+    // The settle/rebuild a cold walk carried through its resume is queued
+    // again behind this update's own verdict (docs/10 §10.6 merging).
+    if (chainCarry?.kind) this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels);
     return finalizeUpdate(this, {
       text,
       editLabel,
@@ -1347,6 +1363,7 @@ export class CheckpointEngine {
       diagnostics,
       projectInputChanges,
       residentEditCandidate: residentAdmission.kind === 'probe',
+      advanceSrcRev: !coldResume,
       timer: t,
       callbacks: {
         paginateNow: () => this.#paginateNow(),
@@ -1639,8 +1656,35 @@ export class CheckpointEngine {
    */
   #queueChainWork(kind, from, labels) {
     const cur = this.pendingChain;
+    if (kind === 'cold') {
+      // The cold walk outranks deferred chain work: its resume update
+      // re-queues whatever settle/rebuild was pending (carry).
+      if (cur?.kind === 'cold') {
+        cur.phase = 'blocks';
+        return;
+      }
+      this.pendingChain = {
+        kind: 'cold',
+        from,
+        phase: 'blocks',
+        labels: new Set(),
+        carry: cur ? { kind: cur.kind, from: cur.from, labels: new Set(cur.labels) } : null,
+      };
+      return;
+    }
     if (!cur) {
       this.pendingChain = { kind, from, phase: 'blocks', labels: new Set(labels) };
+      return;
+    }
+    if (cur.kind === 'cold') {
+      const carry = cur.carry;
+      cur.carry = carry
+        ? {
+            kind: carry.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle',
+            from: Math.min(carry.from, from),
+            labels: new Set([...carry.labels, ...(labels ?? [])]),
+          }
+        : { kind, from, labels: new Set(labels) };
       return;
     }
     cur.kind = cur.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle';
@@ -1650,6 +1694,19 @@ export class CheckpointEngine {
     for (const k of labels ?? []) cur.labels.add(k);
   }
 
+  /**
+   * The cold walk reached the input boundary of the first block a budgeted
+   * keystroke left un-typeset: run the update for the current source again,
+   * off the hot path. It publishes a display revision for the same source
+   * revision (no new canonical or shipping generation) through
+   * onDeferredUpdate; null when a keystroke got there first.
+   */
+  async #coldResume(work) {
+    if (this.closed) return;
+    const report = await this.#update({ editLabel: 'cold-resume', coldResume: true, chainCarry: work.carry ?? null });
+    if (report && !this.closed) this.onDeferredUpdate?.(report);
+  }
+
   #scheduleBackground(fromIdx, dirtyBlocks, options) {
     scheduleBackgroundHelper(this, dirtyBlocks, {
       locked: (fn) => this.#locked(fn),
@@ -1657,6 +1714,7 @@ export class CheckpointEngine {
       chunkTargets: (block) => this.#chunkTargets(block),
       queueRender: (id, renderOptions) => this.#queueRender(id, renderOptions),
       enforceCheckpointCap: () => this.#enforceCheckpointCap(),
+      coldResume: (work) => this.#coldResume(work),
     }, options);
   }
 
@@ -1669,6 +1727,12 @@ export class CheckpointEngine {
       asyncRepaginate: () => this.#asyncRepaginate(),
       chainAfterPass: (work) => this.#chainAfterPass(work),
       enforceCheckpointCap: () => this.#enforceCheckpointCap(),
+      retypesetChain: (from, target, onBlock, shouldAbort) =>
+        this.#retypesetChain(from, target, onBlock, shouldAbort),
+      pinBoundary: (idx) => {
+        if (!this.checkpoints.has(idx)) return;
+        this.editHold = [...new Set([idx, ...this.editHold])].slice(0, 8);
+      },
     });
   }
 
