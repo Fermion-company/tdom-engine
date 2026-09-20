@@ -1651,6 +1651,9 @@ const server = http.createServer(async (req, res) => {
         srcRev: engine.srcRev,
         documentEpoch,
         progress: engine.progress ?? null,
+        // pages the resident layout has right now (async rescues and
+        // repaginations move it between edit reports)
+        residentPages: engine.pages?.length ?? null,
         render: {
           queued: [...engine.renderWant.keys()],
           pumping: engine.renderPumping,
