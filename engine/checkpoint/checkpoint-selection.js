@@ -48,70 +48,96 @@ export function checkpointKeepSet(blocks, maxCheckpoints) {
   const count = blocks.length;
   const limit = Math.max(1, Math.floor(Number(maxCheckpoints) || 1));
   if (count + 1 <= limit) return new Set(Array.from({ length: count + 1 }, (_, i) => i));
+  if (limit === 1) return new Set([0]);
 
-  const keep = new Set([0]);
   const measured = blocks.map(block => Number(block.typesetCostMs))
     .filter(value => Number.isFinite(value) && value > 0).sort((a, b) => a - b);
   const median = measured[Math.floor(measured.length / 2)] ?? 1;
   const cost = blocks.map((block) => Math.max(0.1, Number(block.typesetCostMs) || median));
   const total = cost.reduce((sum, value) => sum + value, 0);
-  const hotThreshold = Math.max(median * 8, total / limit / 2);
-  const ranked = cost
-    .map((value, index) => ({ value, index }))
-    .sort((a, b) => b.value - a.value || a.index - b.index);
-
-  // Reserve at least one slot for broad document coverage. Each hot block
-  // wants its input boundary (editing the block) and output boundary
-  // (editing ordinary prose after it).
-  const hotSlots = Math.max(0, limit - 2);
-  for (const { value, index } of ranked) {
-    if (value < hotThreshold) break;
-    if (keep.size >= 1 + hotSlots) break;
-    for (const boundary of [index, index + 1]) {
-      if (boundary > 0 && boundary <= count && keep.size < 1 + hotSlots) keep.add(boundary);
+  // The replay a caret (or a cold keystroke) pays is the cost of the blocks
+  // between its nearest kept boundary and itself. Cut the document into
+  // segments of equal replay cost, and bracket a block that is expensive on
+  // its own (a TikZ picture, a heavy user macro) with its input and output
+  // boundary so neither editing it nor editing the prose after it replays
+  // it. This is measured cost, not names such as tikzpicture or tcolorbox.
+  const target = total / (limit - 1);
+  const hotThreshold = Math.max(median * 8, target / 2);
+  const keep = new Set([0]);
+  let acc = 0;
+  for (let i = 0; i < count; i++) {
+    if (cost[i] >= hotThreshold) {
+      if (i > 0) keep.add(i);
+      keep.add(Math.min(count, i + 1));
+      acc = 0;
+      continue;
+    }
+    acc += cost[i];
+    if (acc >= target) {
+      keep.add(Math.min(count, i + 1));
+      acc = 0;
     }
   }
+  // The tail slot goes before the final visible material and its nearby
+  // page context, not after it at a terminal page flush.
+  const tail = count > 1 ? tailCheckpoint(blocks, limit) : count;
+  keep.add(tail);
 
-  // Spend the reserved tail slot before the final visible material and its
-  // nearby page context, rather than after it at a terminal page flush.
-  // If a hot block already selected it, the quantile fill below uses the
-  // remaining slot instead.
-  if (keep.size < limit && count > 1) keep.add(tailCheckpoint(blocks, limit));
-
-  // Fill the remaining budget at weighted quantiles. This preserves useful
-  // reachability through long all-prose regions and naturally shifts the
-  // skeleton toward moderately expensive areas.
-  let ordinal = 0;
-  while (keep.size < limit) {
-    const target = total * ++ordinal / Math.max(1, limit - 1);
+  const segmentCost = (from, to) => {
     let sum = 0;
-    let boundary = count;
-    for (let i = 0; i < cost.length; i++) {
+    for (let i = from; i < to; i++) sum += cost[i];
+    return sum;
+  };
+  // Over budget: merge the two cheapest adjacent segments by dropping the
+  // boundary between them (root and tail stay). Ties drop the later one, so
+  // an expensive block keeps its input boundary longest.
+  while (keep.size > limit) {
+    const sorted = [...keep].sort((a, b) => a - b);
+    let victim = null;
+    let victimCost = Infinity;
+    for (let k = 1; k < sorted.length; k++) {
+      const boundary = sorted[k];
+      if (boundary === tail) continue;
+      const before = sorted[k - 1];
+      const after = k + 1 < sorted.length ? sorted[k + 1] : count;
+      const merged = segmentCost(before, after);
+      if (merged <= victimCost) {
+        victim = boundary;
+        victimCost = merged;
+      }
+    }
+    if (victim == null) break;
+    keep.delete(victim);
+  }
+  // Under budget: split the most expensive segment at its cost midpoint.
+  while (keep.size < limit) {
+    const sorted = [...keep].sort((a, b) => a - b);
+    let bestFrom = -1;
+    let bestTo = -1;
+    let bestCost = -1;
+    for (let k = 0; k < sorted.length; k++) {
+      const from = sorted[k];
+      const to = k + 1 < sorted.length ? sorted[k + 1] : count;
+      if (to - from < 2) continue;
+      const value = segmentCost(from, to);
+      if (value > bestCost) {
+        bestCost = value;
+        bestFrom = from;
+        bestTo = to;
+      }
+    }
+    if (bestFrom < 0) break;
+    let sum = 0;
+    let split = bestFrom + 1;
+    for (let i = bestFrom; i < bestTo; i++) {
       sum += cost[i];
-      if (sum >= target) {
-        boundary = Math.min(count, i + 1);
+      if (sum >= bestCost / 2) {
+        split = Math.min(bestTo - 1, Math.max(bestFrom + 1, i + 1));
         break;
       }
     }
-    if (!keep.has(boundary)) {
-      keep.add(boundary);
-      continue;
-    }
-    // Quantiles can collapse onto one dominant block. Choose the boundary
-    // farthest from an existing checkpoint so the loop always progresses.
-    let best = null;
-    let bestDistance = -1;
-    for (let candidate = 1; candidate <= count; candidate++) {
-      if (keep.has(candidate)) continue;
-      let distance = Infinity;
-      for (const existing of keep) distance = Math.min(distance, Math.abs(candidate - existing));
-      if (distance > bestDistance) {
-        best = candidate;
-        bestDistance = distance;
-      }
-    }
-    if (best == null) break;
-    keep.add(best);
+    if (keep.has(split)) break;
+    keep.add(split);
   }
   return keep;
 }

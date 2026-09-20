@@ -1077,10 +1077,27 @@ function applyReport(report) {
   const intentBlocks = anchorIntent
     ? (Array.isArray(anchorIntent.blockIds) ? anchorIntent.blockIds : [anchorIntent.blockId])
     : [];
+  // A keystroke in a covered block got no anchor (its proof lineage was
+  // retired by a canonical build, or the change cannot be an overlay: a box
+  // shifted, a line reflowed). The overlay on paper is still that block's
+  // certified rendering over the same base page, one keystroke behind:
+  // keep it as the last good presentation rather than exposing the older
+  // base page. A restore that made the canonical current and a reboot
+  // retire it as before.
+  const canonicalCurrent = Boolean(report.canonical?.id) && report.canonical.rev >= (report.srcRev ?? 0);
   const leased = !anchorIntent && canonicalAnchorPreview && !canonicalAnchorPreview.retiring &&
-    (report.canonicalAnchorRefused === 'base-generation' ||
-      report.canonicalAnchorRefused === 'canonical-behind') &&
-    previewBlocks.includes(dirtyBlock);
+    !!dirtyBlock && previewBlocks.includes(dirtyBlock) && report.rebooted !== true &&
+    report.canonicalAnchorRefused !== 'canonical-current' && !canonicalCurrent;
+  // An edit in a block the overlay does not cover got no anchor (a box, a
+  // reflowing line, a cold keystroke). The overlay is still the certified
+  // rendering of its own blocks over the same base page: keep it as the
+  // last good presentation instead of exposing the older base page. The
+  // overlay's own pages stay frozen while other pages may still take this
+  // edit's provisional patches.
+  const leasedOther = !leased && !anchorIntent && canonicalAnchorPreview && !canonicalAnchorPreview.retiring &&
+    !!dirtyBlock && !previewBlocks.includes(dirtyBlock) && report.rebooted !== true &&
+    report.canonicalAnchorRefused !== 'canonical-current' && !canonicalCurrent;
+  const overlayPages = new Set((canonicalAnchorPreview?.pages ?? []).map((entry) => Number(entry.page)));
   if (canonicalAnchorPreview?.retiring) {
     // A covering canonical is on its way to this page. Until that image
     // commits (or a new anchor replaces the delta atomically), no report may
@@ -1091,7 +1108,7 @@ function applyReport(report) {
     // the last successful pixels. Keep that exact previous overlay eligible
     // for the new revision; it will be replaced when native closure succeeds.
     canonicalAnchorPreview.targetSrcRev = appliedSrcRev;
-  } else if (leased) {
+  } else if (leased || leasedOther) {
     // Ownership, not currency: presentation stays pending (the overlay's own
     // srcRev is older than appliedSrcRev) until a new anchor or a canonical
     // page covering this revision is on paper.
@@ -1115,6 +1132,7 @@ function applyReport(report) {
     // sits on its base image: publishing any provisional page beside either
     // could compose no real revision.
     if (frozen) continue;
+    if (leasedOther && patch.type === 'replace-page' && overlayPages.has(Number(patch.displayList?.page))) continue;
     if (patch.type === 'replace-page') {
       const dl = patch.displayList;
       if (anchorIntent && (anchorIntent.provisionalPages ?? [anchorIntent.provisionalPage]).includes(dl.page) &&

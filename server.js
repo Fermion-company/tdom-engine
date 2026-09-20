@@ -2561,7 +2561,24 @@ const server = http.createServer(async (req, res) => {
         adoptAnchorPlanLineage(anchorPlan, anchorPriorLineage, anchorLedger);
         lastReport.canonicalAnchor = anchorPlan.public;
       } else if (!coldEdit && (anchorMutation || lastReport.dirtySourceNodes?.length)) {
-        terminalAnchorLineage = null;
+        // A refused edit (a box shifted by the keystroke, a reflowing line,
+        // an edit in an uncovered block, a cold walk elsewhere) leaves every
+        // certified overlay as true as it was: each is a proof against the
+        // same unchanged base page, and every later plan compares the block
+        // against that base again (changedMixedVisualCutLines), never against
+        // an intermediate keystroke. Keep the lineage at this revision so the
+        // next keystroke can continue it (an undo of the refused change, or a
+        // keystroke in another covered block) instead of dropping every
+        // overlay to the older base page until the next canonical build. A
+        // restore that rebinds the canonical (canonical-current), a reboot,
+        // or a new canonical generation retires it as before.
+        const refusal = lastReport.canonicalAnchorRefused;
+        const prior = anchorPriorLineage;
+        const survives = Boolean(prior) && anchorMutation && lastReport.rebooted !== true &&
+          refusal !== 'canonical-current' && prior.lastSrcRev === lastReport.srcRev - 1 &&
+          engine.canonical.info().id === prior.baseGeneration;
+        terminalAnchorLineage = survives ? { ...prior, lastSrcRev: lastReport.srcRev } : null;
+        if (survives) lastReport.canonicalAnchorLineageKept = [...(prior.blocks?.keys?.() ?? [prior.blockId])];
       }
       if (anchorDiagnostics.inputTransition || anchorDiagnostics.reason) {
         // Bounded provenance and structural field paths only: enough to

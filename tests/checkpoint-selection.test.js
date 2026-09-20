@@ -317,3 +317,16 @@ test('the resident budget scales with the document up to the ceiling', () => {
   assert.equal(checkpointBudgetFor(640, { ceiling: 2 }), 2);
   assert.equal(checkpointBudgetFor(0, { ceiling: 8 }), 1);
 });
+
+test('a larger budget spreads coverage over the whole document instead of bracketing every hot block', () => {
+  // a jlreq-like book: prose with a boxed exercise every few blocks
+  const blocks = Array.from({ length: 640 }, (_, index) => ({ typesetCostMs: index % 7 === 3 ? 400 : 120 }));
+  for (const limit of [12, 16, 32]) {
+    const keep = [...checkpointKeepSet(blocks, limit)].sort((a, b) => a - b);
+    assert.equal(keep.length, limit);
+    const gaps = keep.slice(1).map((boundary, index) => boundary - keep[index]);
+    gaps.push(640 - keep.at(-1));
+    const bound = Math.ceil(640 / (limit / 2)) + 8;
+    assert.ok(Math.max(...gaps) <= bound, `limit ${limit}: widest gap ${Math.max(...gaps)} > ${bound} (${keep.join(',')})`);
+  }
+});

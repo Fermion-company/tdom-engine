@@ -3039,7 +3039,7 @@ test('a superseding warm resumes from the boundary the earlier walk reached', op
   eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-warm-resume-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
-  e.maxCheckpoints = 3;
+  e.checkpointCeiling = 3;
   const slow = String.raw`\count255=0 \loop\advance\count255 by 1 \ifnum\count255<3000000 \repeat`;
   try {
     await e.open(`\\documentclass{article}\n\\begin{document}\n${
@@ -3311,7 +3311,7 @@ test('a cold page edit retains its native owners and prepares unchanged exact ne
   eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-cold-edit-page-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
-  e.maxCheckpoints = 4;
+  e.checkpointCeiling = 4;
   const previousHot = process.env.TDOM_RENDER_HOT_MAX;
   process.env.TDOM_RENDER_HOT_MAX = '1';
   const missing = page => e.getDisplayLists().find(item => item.page === page)?.commands.filter(command =>
@@ -3375,7 +3375,7 @@ test('a word edit does not replay cold exact neighbors with retained native owne
   eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-retained-page-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
-  e.maxCheckpoints = 8;
+  e.checkpointCeiling = 8;
   e.canonical.schedule = () => {};
   const previousHot = process.env.TDOM_RENDER_HOT_MAX;
   process.env.TDOM_RENDER_HOT_MAX = '1';
@@ -3415,7 +3415,7 @@ test('a cold upper-page box edit prepares the exact material below its convergen
   eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-cold-upper-page-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
-  e.maxCheckpoints = 4;
+  e.checkpointCeiling = 4;
   e.canonical.schedule = () => {};
   const previousHot = process.env.TDOM_RENDER_HOT_MAX;
   process.env.TDOM_RENDER_HOT_MAX = '1';
@@ -3517,7 +3517,7 @@ test('cold native prefix replay advances only its fresh continuation and preserv
   eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-prefix-continuation-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
-  e.maxCheckpoints = Math.min(e.maxCheckpoints, 8);
+  e.checkpointCeiling = Math.min(e.checkpointCeiling, 8);
   const source = String.raw`\documentclass{article}
 \newcommand{\VisibleWord}{seed}
 \begin{document}
@@ -3632,7 +3632,7 @@ test('a failed prefix STEP restores its input and a known native hold is replaye
   eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-prefix-step-recovery-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
-  e.maxCheckpoints = Math.min(e.maxCheckpoints, 4);
+  e.checkpointCeiling = Math.min(e.checkpointCeiling, 4);
   e.canonical.schedule = () => {};
   const source = String.raw`\documentclass{article}
 \newcommand{\VisibleWord}{seed}
