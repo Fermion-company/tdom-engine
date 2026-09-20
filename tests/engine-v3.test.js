@@ -470,3 +470,37 @@ test('a keep-set boundary without a continuation is materialized by the idle gri
     await e.close();
   }
 });
+
+test('a keystroke at the block a caret warm is walking toward resumes from the boundary it reached', async () => {
+  const work = WORK + '-warm-frontier-edit';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the warm frontier fixture keeps the resident chain walking for a while.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4; // the budget in force is derived per document from the ceiling
+  try {
+    await e.open(doc);
+    const far = doc.indexOf('Paragraph 150 ');
+    const warm = e.warmEditOffset(far);
+    const deadline = Date.now() + 20_000;
+    while (!e.warming && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1));
+    if (!e.warming) { await warm; return; }
+    await new Promise((r) => setTimeout(r, 300)); // let the STEP walk advance a few blocks
+    const t0 = performance.now();
+    const r = await e.edit(far, far + 'Paragraph'.length, 'Section');
+    const wall = performance.now() - t0;
+    assert.ok(r.stats.typesetMs < 8_000, `a job at the warm's frontier stalled: ${r.stats.typesetMs}ms (${JSON.stringify(r.stats.diagnostics)})`);
+    assert.ok(!r.stats.diagnostics.some((d) => /timed out|failed/.test(d)), JSON.stringify(r.stats.diagnostics));
+    assert.ok(wall < 20_000, `keystroke took ${wall.toFixed(0)}ms`);
+    const w = await warm;
+    // on a fast machine the walk can finish before the keystroke enters
+    assert.ok(['superseded', 'ready'].includes(w.status), w.status);
+  } finally {
+    await e.close();
+  }
+});

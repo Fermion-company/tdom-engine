@@ -652,6 +652,14 @@ export class CheckpointEngine {
       const pid = this.currentJob?.pid;
       if (pid && pid > 0) {
         try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        // never leave the killed child selectable as a boundary (its CKPT
+        // may have been registered before the galley failed)
+        for (const [index, peer] of [...this.checkpoints]) {
+          if (peer?.pid === pid && !(advance && index === idx)) {
+            this.checkpoints.delete(index);
+            this.dyingPids?.add(pid);
+          }
+        }
       }
       if (err?.tdomTimeout || err?.tdomInfra) {
         // forensics: a wedge here is an infrastructure event, not a content

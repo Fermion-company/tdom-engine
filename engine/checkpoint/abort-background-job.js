@@ -21,6 +21,17 @@ export function abortBackgroundJob(
   const pid = job.pid;
   if (pid && pid > 0) {
     try { killProcess(pid, 'SIGKILL'); } catch { /* already gone */ }
+    // A forked child announces its CKPT boundary before its galley: it can
+    // already sit in the checkpoint map when it is killed here. Its socket
+    // close removes it later, but the edit this abort makes room for takes
+    // the chain lock first and would pick the dead peer as its nearest
+    // boundary (measured: a 12 s job timeout, then a retry reboot).
+    for (const [idx, peer] of [...(engine.checkpoints ?? [])]) {
+      if (peer?.pid === pid) {
+        engine.checkpoints.delete(idx);
+        engine.dyingPids?.add(pid);
+      }
+    }
   } else {
     // FORKED can be queued behind this edit. Remember the request id so the
     // late announcement is killed before it can become an untracked spinner.
