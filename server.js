@@ -1445,6 +1445,7 @@ const preEditWitnessRing = new Map(); // srcRev produced by the edit -> { blockI
  * lands and again after every edit, because a landing that races an edit is
  * otherwise overwritten by that edit's own lineage bookkeeping.
  */
+let staleBaseSkip = null; // why the last landing could not become a base (diagnostic)
 function adoptStaleBaseIfNeeded() {
   if (!ENABLE_CANONICAL_ANCHOR || pendingDocumentReset) return null;
   const info = engine.canonical.info();
@@ -1456,8 +1457,14 @@ function adoptStaleBaseIfNeeded() {
   // The generation must be the compile of the inputs the ledger saw at that
   // revision; the edits since then are exactly what the ledger and
   // witnesses account for (the current input epoch is ahead by design).
-  if (!kept || kept.documentEpoch !== documentEpoch || !certificate || certificate.rev !== info.rev ||
-      (kept.inputEpoch !== undefined && certificate.inputEpoch !== kept.inputEpoch)) return null;
+  const skip = !kept ? 'no-ledger' : kept.documentEpoch !== documentEpoch ? 'document-epoch'
+    : !certificate ? 'no-certificate' : certificate.rev !== info.rev ? 'certificate-rev'
+    : kept.inputEpoch !== undefined && certificate.inputEpoch !== kept.inputEpoch
+      ? `input-epoch ${certificate.inputEpoch} vs ${kept.inputEpoch}` : null;
+  if (skip) {
+    staleBaseSkip = { rev: info.rev, id: info.id, srcRev: engine.srcRev, reason: skip, at: Date.now() };
+    return null;
+  }
   const lineage = buildStaleBaseLineage({
     certificate,
     ledger: kept.ledger,
@@ -1756,6 +1763,7 @@ const server = http.createServer(async (req, res) => {
               stale: terminalAnchorLineage.stale ?? null,
             }
           : null,
+        staleBaseSkip,
         canonical: engine.canonical.info(),
         grid: url.searchParams.has('grid') ? engine.gridInfo?.() ?? null : undefined,
       });
@@ -2592,11 +2600,14 @@ const server = http.createServer(async (req, res) => {
       // planned yet; the context waits for that update of this revision.
       const coldEdit = (lastReport.stats?.coldPending?.length ?? 0) > 0;
       if (ENABLE_CANONICAL_ANCHOR && lastReport.rebooted !== true && resetEpoch === null && anchorMutation) {
+        // The input epoch the compile of this revision will carry is the
+        // one its scheduled job captured; a disk sync of the same bytes
+        // arriving during the update must not make the landing unusable.
+        const scheduled = engine.canonical.pendingJob;
         ringSet(anchorLedgerRing, lastReport.srcRev, {
           ledger: ledgerWithoutCold(lastReport),
           documentEpoch,
-          // the input state the compile of this revision will carry
-          inputEpoch: engine.canonical.inputEpoch,
+          inputEpoch: scheduled && scheduled.rev === lastReport.srcRev ? scheduled.inputEpoch : engine.canonical.inputEpoch,
         });
         if (staleWitness) ringSet(preEditWitnessRing, lastReport.srcRev, staleWitness);
       }
