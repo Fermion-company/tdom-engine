@@ -29,7 +29,9 @@ export function isoCacheEpoch() {
 
 export class IsoDiskCache {
   constructor(root, { epoch = isoCacheEpoch(), maxEntries = Number(process.env.TDOM_ISO_DISK_CACHE || 512) } = {}) {
-    this.dir = path.join(root, 'iso-cache', epoch);
+    // Not 'iso-cache': the server sweeps every render-/rescue-/iso- prefixed
+    // directory of the work dir at start-up as a stale per-job artifact.
+    this.dir = path.join(root, 'isocache', epoch);
     this.maxEntries = Math.max(16, maxEntries);
     this.disabled = process.env.TDOM_ISO_DISK_CACHE === '0';
     this.stats = { hits: 0, misses: 0, writes: 0 };
@@ -62,7 +64,8 @@ export class IsoDiskCache {
       const iso = this.#attachPdf(JSON.parse(readFileSync(json, 'utf8')), pdf);
       this.stats.hits++;
       return { key, iso };
-    } catch {
+    } catch (err) {
+      if (process.env.TDOM_TRACE_ISO_CACHE) console.error('[iso-cache] getBase failed', baseKey, err?.message);
       rmSync(link, { force: true });
       this.stats.misses++;
       return undefined;
@@ -78,7 +81,8 @@ export class IsoDiskCache {
       const iso = this.#attachPdf(JSON.parse(readFileSync(json, 'utf8')), pdf);
       this.stats.hits++;
       return iso;
-    } catch {
+    } catch (err) {
+      if (process.env.TDOM_TRACE_ISO_CACHE) console.error('[iso-cache] get failed', key, err?.message);
       rmSync(json, { force: true });
       rmSync(pdf, { force: true });
       this.stats.misses++;

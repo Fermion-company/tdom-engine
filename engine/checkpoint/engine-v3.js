@@ -882,7 +882,12 @@ export class CheckpointEngine {
   #isoBaseGet(block, idx) {
     const disk = this.#isoDiskCache();
     if (!disk) return undefined;
-    const found = disk.getBase(rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash }));
+    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash });
+    const found = disk.getBase(baseKey);
+    if (process.env.TDOM_TRACE_ISO_CACHE) {
+      console.error('[iso-cache] lookup', block.id, 'idx', idx, 'base', baseKey, 'prev', this.blocks[idx - 1]?.id,
+        'state', this.blocks[idx - 1]?.stateVec, 'pre', this.preHash, 'hit', !!found);
+    }
     if (!found) return undefined;
     const { key, iso } = found;
     for (const [label, value] of Object.entries(iso.refVals ?? {})) {
@@ -1698,7 +1703,12 @@ export class CheckpointEngine {
       rescueCached = false;
       const iso = await this.#isoCompile(block, idx, 'async exact rescue');
       rescueCompileMs = performance.now() - rescueStartedAt;
-      this.#isoCacheSet(key, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash }));
+      const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash });
+      if (process.env.TDOM_TRACE_ISO_CACHE) {
+        console.error('[iso-cache] set', bid, 'idx', idx, 'base', baseKey, 'key', key, 'prev', this.blocks[idx - 1]?.id,
+          'state', this.blocks[idx - 1]?.stateVec, 'pre', this.preHash);
+      }
+      this.#isoCacheSet(key, iso, baseKey);
     }
     const outcome = await this.#locked(async () => {
       if (this.mode !== 'structured') return 'done';
