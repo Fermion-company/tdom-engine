@@ -1232,3 +1232,34 @@ test('Build seeds let the first post-Build canonical reach its fixpoint in one p
     c.dispose();
   }
 });
+
+test('canonical runs makeindex between passes, as the Build does (tex64-internal #68)', opts, async () => {
+  const work = `${WORK}-index`;
+  rmSync(work, { recursive: true, force: true });
+  const doc = (word) => [
+    '\\documentclass{article}',
+    '\\usepackage{makeidx}',
+    '\\makeindex',
+    '\\begin{document}',
+    `${word}\\index{alpha}`,
+    '\\clearpage',
+    'Beta\\index{beta}',
+    '\\printindex',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const c = new CanonicalRenderer({ workDir: work, debounceMs: 0 });
+  try {
+    const first = await c.ensure(doc('Alpha'), 1);
+    assert.equal(first.pageCount, 3, 'the index page is part of the output');
+    assert.match(first.seedFiles.ind, /\\item alpha, 1/);
+    // A body edit that leaves every \index entry alone reuses the index:
+    // one pass, no makeindex.
+    const second = await c.ensure(doc('Alpha edited'), 2);
+    assert.equal(second.pageCount, 3);
+    assert.equal(second.passes, 1);
+  } finally {
+    await c.dispose?.();
+    rmSync(work, { recursive: true, force: true });
+  }
+});

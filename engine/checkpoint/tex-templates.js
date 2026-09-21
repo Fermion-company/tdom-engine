@@ -14,6 +14,15 @@ function appendColumnState(L, state) {
   );
 }
 
+// imakeidx runs makeindex itself at \printindex when shell escape allows
+// it, and the resident and shipping drivers run with --shell-escape (the
+// fork shim needs it). Their own .idx is partial (checkpoint forks, pages
+// that never ship), so that run would overwrite the index the engine copied
+// from canonical's makeindex with a wrong one. Make \printindex just read
+// \jobname.ind, as it does without shell escape.
+export const IMAKEIDX_READ_ONLY =
+  '\\makeatletter\\@ifpackageloaded{imakeidx}{\\chardef\\imki@shellescape=\\z@}{}\\makeatother';
+
 export function buildDriverSource({
   preamble,
   daemonPath,
@@ -44,6 +53,7 @@ export function buildDriverSource({
   // it keeps identical text/boxes without opening the shared PDF. Canonical
   // compiles the untouched source and therefore retains the real links.
   L.push('\\makeatletter\\@ifpackageloaded{hyperref}{\\Hy@drafttrue}{}\\makeatother');
+  L.push(IMAKEIDX_READ_ONLY);
   L.push('\\begin{document}');
   L.push(`\\directlua{dofile('${luaStr(daemonPath)}')}`);
   L.push('\\makeatletter');

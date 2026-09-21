@@ -24,12 +24,17 @@ import path from 'node:path';
 import { withProjectInputs } from '../project-inputs.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { segmentBody, documentBounds } from '../segmenter.js';
+import { IMAKEIDX_READ_ONLY } from './tex-templates.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
 import { ensureShim } from './forkshim.js';
 import { distinctCheckpointPeerCount } from './checkpoint-retirement.js';
 
 const execFileP = promisify(execFile);
 const DIR = path.dirname(fileURLToPath(import.meta.url));
+// Converged canonical files the chain reads under its own jobname. The index
+// (.ind, made by canonical's makeindex) keeps \printindex pages identical to
+// canonical; without it the baseline would end short of the index.
+const SHIP_SEED_EXTENSIONS = ['aux', 'toc', 'lof', 'lot', 'out', 'ind'];
 const luaStr = (s) => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 const PLAIN_EDIT_UNSAFE = /[\\{}$%&#^_\r\n]/;
 const DOCUMENT_EFFECT_UNSAFE = /\\(?:catcode|every(?:par|job|cr|math|display)|output|directlua|latelua|newwrite|openout|write|immediate|special|pdfextension|shipout)\b/;
@@ -706,6 +711,7 @@ export class ShippingChain {
   #driverSource(preamble, labelSeed, hasCanonicalAux = false) {
     const L = [];
     L.push(preamble.trimEnd());
+    L.push(IMAKEIDX_READ_ONLY);
     L.push('\\newcount\\TDOMdiscard');
     L.push(
       '\\AddToHook{shipout/before}{\\directlua{tdom_ship_before()}' +
@@ -798,7 +804,7 @@ export class ShippingChain {
       path.join(this.workDir, 'driver-ship.tex'),
       this.#driverSource(preamble, labelSeed, seedFiles?.aux !== undefined)
     );
-    for (const ext of ['aux', 'toc', 'lof', 'lot', 'out']) {
+    for (const ext of SHIP_SEED_EXTENSIONS) {
       rmSync(path.join(this.workDir, `driver-ship.${ext}`), { force: true });
     }
     // Prefer the converged canonical files verbatim. In particular,
@@ -806,7 +812,7 @@ export class ShippingChain {
     // fields of \newlabel; synthesizing only value/page silently changes the
     // painted color/link state even when extracted text is identical.
     for (const [ext, content] of Object.entries(seedFiles ?? {})) {
-      if (!['aux', 'toc', 'lof', 'lot', 'out'].includes(ext)) continue;
+      if (!SHIP_SEED_EXTENSIONS.includes(ext)) continue;
       writeFileSync(path.join(this.workDir, `driver-ship.${ext}`), content);
     }
     // contents seeds: \tableofcontents & friends read these ONCE at their

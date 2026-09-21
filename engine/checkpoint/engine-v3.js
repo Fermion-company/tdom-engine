@@ -44,7 +44,7 @@
 // into an SVG chunk, swapped in asynchronously.
 
 import net from 'node:net';
-import { readFileSync } from 'node:fs';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureShim } from './forkshim.js';
@@ -1606,6 +1606,7 @@ export class CheckpointEngine {
       cropCanonicalChunks: (canonicalInfo) => this.#cropCanonicalChunks(canonicalInfo),
       teardownTree: () => this.#teardownTree(),
     });
+    if (!info?.error) this.#syncResidentIndex();
     // Canonical convergence supplies the exact checkpoint authority whenever
     // the current lineage cannot represent the source (initial boot,
     // structural edit, divergence, or failed chain). A healthy plain-edit
@@ -1627,6 +1628,25 @@ export class CheckpointEngine {
         this.#queueShipBoot();
       }
     }
+  }
+
+  // The resident job is `driver`: give its \printindex the index canonical's
+  // makeindex produced. The index block's resource signature (see
+  // decorateExternalResources) then dirties it on the next update. A
+  // generation without an index (a Build import carries only the aux family)
+  // leaves the last one in place; nothing reads it once \printindex is gone.
+  #syncResidentIndex() {
+    const next = this.canonical.last?.seedFiles?.ind;
+    if (typeof next !== 'string') return;
+    const target = path.join(this.workDir, 'driver.ind');
+    let current = null;
+    try { current = readFileSync(target, 'utf8'); } catch { /* no index yet */ }
+    if (next === current) return;
+    try {
+      const staged = `${target}.${process.pid}.tmp`;
+      writeFileSync(staged, next, 'utf8');
+      renameSync(staged, target);
+    } catch { /* the resident keeps its last index; canonical still shows the right one */ }
   }
 
   async #cropCanonicalChunks(info) {

@@ -211,6 +211,17 @@ function decorateExternalResources(seg, context) {
     }
   };
   scan(seg.text, seg.resourceBaseDir ?? context.docDir ?? context.workDir);
+  // \printindex reads \jobname.ind, which the engine copies from canonical's
+  // makeindex run. Its signature makes the index block dirty when the index
+  // arrives or changes, so the resident retypesets it on the next update.
+  if (context.workDir && /\\printindex\b/.test(stripTexComments(seg.text))) {
+    try {
+      const st = statSync(path.join(context.workDir, 'driver.ind'));
+      specs.push(`index:${st.mtimeMs}:${st.size}`);
+    } catch {
+      specs.push('index:none');
+    }
+  }
   if (!specs.length && !externalGraphics) return seg;
   return {
     ...seg,
