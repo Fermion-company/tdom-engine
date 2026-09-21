@@ -19,7 +19,7 @@ export function expandInputParagraphs(segs, context) {
     length += text.length;
   };
   const expand = (source, file, start, end, depth, structuralEvents = [], inheritedRootUnit = null) => {
-    const local = segmentBody(source.slice(start, end), start, { structuralEvents });
+    const local = segmentBody(source.slice(start, end), start, { structuralEvents, literalEnvs: context.literalEnvs });
     let cursor = start;
     const literal = stop => {
       const base = length;
@@ -75,7 +75,7 @@ export function expandInputParagraphs(segs, context) {
   const text = pieces.map(piece => piece.text).join('');
   const lineIndexes = new Map();
   let firstPiece = 0;
-  return segmentBody(text, 0, { structuralEvents: events }).flatMap(seg => {
+  return segmentBody(text, 0, { structuralEvents: events, literalEnvs: context.literalEnvs }).flatMap(seg => {
     while (firstPiece < pieces.length && pieces[firstPiece].at + pieces[firstPiece].text.length <= seg.start) firstPiece++;
     const parts = [];
     for (let index = firstPiece; index < pieces.length && pieces[index].at < seg.end; index++) {

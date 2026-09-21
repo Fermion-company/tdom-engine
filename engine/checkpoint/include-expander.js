@@ -100,7 +100,7 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
     context.includes.set(full, { mtime: st.mtimeMs, readPath, text });
     context.watchInclude(readPath);
     const subs = expandIncludes(
-      expandInputParagraphs(segmentBody(text, 0), {
+      expandInputParagraphs(segmentBody(text, 0, { literalEnvs: context.literalEnvs }), {
         ...context,
         source: text,
         file: full,

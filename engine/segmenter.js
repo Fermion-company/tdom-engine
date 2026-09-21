@@ -46,7 +46,32 @@ const STANDALONE_LINE =
 const VERBATIM_BEGIN_RE =
   /\\begin\{(verbatim\*?|lstlisting|minted|alltt|filecontents\*?|[BLV]erbatim\*?)\}/;
 
-export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
+// Preamble declarations that make a literal environment under the user's
+// own name (listings, fancyvrb, minted, tcolorbox listings, comment). A
+// `TeXBlock` listing is as literal as `lstlisting`, so both the segmenter
+// and the document bounds must know its name.
+const LITERAL_ENV_DECL_RE =
+  /\\(?:lstnewenvironment|DefineVerbatimEnvironment|(?:re)?newtcblisting|(?:Declare|New|Renew|Provide)TCBListing|excludecomment)\s*(?:\[[^\]]*\]\s*)?\{\s*([^{}\s]+)\s*\}/g;
+const NEWMINTED_RE = /\\newminted\s*(?:\[\s*([^\]\s]+)\s*\])?\s*\{\s*([^{}\s]+)\s*\}/g;
+
+export function literalEnvironmentNames(text) {
+  const names = new Set();
+  for (const m of text.matchAll(LITERAL_ENV_DECL_RE)) names.add(m[1]);
+  for (const m of text.matchAll(NEWMINTED_RE)) names.add(m[1] ?? `${m[2]}code`);
+  return names;
+}
+
+function literalBegin(stripped, literalEnvs) {
+  const builtin = VERBATIM_BEGIN_RE.exec(stripped);
+  if (!literalEnvs?.size) return builtin;
+  for (const m of stripped.matchAll(/\\begin\{([^{}]*)\}/g)) {
+    if (builtin && m.index >= builtin.index) break;
+    if (literalEnvs.has(m[1])) return m;
+  }
+  return builtin;
+}
+
+export function segmentBody(text, baseOffset, { structuralEvents = [], literalEnvs = null } = {}) {
   const segs = [];
   const lines = splitLines(text);
   const aliasEvents = [...structuralEvents].sort((a, b) => a.at - b.at);
@@ -103,7 +128,7 @@ export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
       continue;
     }
 
-    const verb = VERBATIM_BEGIN_RE.exec(stripped);
+    const verb = literalBegin(stripped, literalEnvs);
     if (verb) {
       // enter literal mode unless the same line also closes it; the
       // verbatim env itself contributes nothing to envDepth (its \begin
@@ -151,20 +176,126 @@ export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
   return segs;
 }
 
+// Environments TeX reads as literal characters, for the document bounds.
+// Unlike VERBATIM_BEGIN_RE this leaves out alltt: \, { and } keep their
+// meaning there, so an \end{document} inside alltt really ends the run.
+const LITERAL_BOUNDARY_ENVS = new Set([
+  'verbatim', 'verbatim*', 'Verbatim', 'Verbatim*', 'BVerbatim', 'BVerbatim*',
+  'LVerbatim', 'LVerbatim*', 'SaveVerbatim', 'VerbatimOut', 'lstlisting', 'minted',
+  'filecontents', 'filecontents*', 'comment', 'tcblisting', 'luacode', 'luacode*',
+]);
+const MARKER_RE = /\\(begin|end)\{([^{}]*)\}/g;
+const INLINE_VERB_RE =
+  /(\\(?:verb\*?|lstinline(?:\[[^\]]*\])?|mintinline(?:\[[^\]]*\])?\{[^{}]*\})([^A-Za-z\s{*]))(.*?)\2/g;
+const INLINE_BRACED_RE =
+  /(\\(?:lstinline(?:\[[^\]]*\])?|mintinline(?:\[[^\]]*\])?\{[^{}]*\})\{)((?:[^{}]|\{[^{}]*\})*)\}/g;
+
+const LITERAL_OR_INLINE_RE = new RegExp(
+  `\\\\(?:verb|lstinline|mintinline)|\\\\begin\\{(?:${[...LITERAL_BOUNDARY_ENVS].map((name) => name.replace('*', '\\*')).join('|')})\\}`
+);
+
+let boundsMemo = { text: null, value: null };
+
 /**
  * Locate the preamble/body split. Returns
- * { preamble:{start,end}, body:{start,end} }. If \begin{document} is missing
- * the whole file is treated as body (keeps the engine alive mid-edit).
+ * { preamble:{start,end}, body:{start,end}, hasBegin, literalEnvs }. If
+ * \begin{document} is missing the whole file is treated as body (keeps the
+ * engine alive mid-edit).
+ *
+ * The markers are the first ACTIVE \begin{document} and the first active
+ * \end{document} after it: not in a comment, not in a verbatim/listing
+ * environment, not in \verb. Manuals and LaTeX tutorials quote
+ * \end{document} in listings; taking the first string match cut the body
+ * there, and the resident dropped every page after the listing.
  */
 export function documentBounds(text) {
-  const b = text.indexOf('\\begin{document}');
-  if (b < 0) {
-    return { preamble: { start: 0, end: 0 }, body: { start: 0, end: text.length } };
+  if (boundsMemo.text !== text) boundsMemo = { text, value: scanDocumentBounds(text) };
+  const { preamble, body, hasBegin, literalEnvs } = boundsMemo.value;
+  return { preamble: { ...preamble }, body: { ...body }, hasBegin, literalEnvs };
+}
+
+function scanDocumentBounds(text) {
+  const literalEnvs = literalEnvironmentNames(text);
+  const { begin, end } = plainDocumentMarkers(text, literalEnvs) ?? findDocumentMarkers(text, literalEnvs);
+  if (begin < 0) {
+    return { preamble: { start: 0, end: 0 }, body: { start: 0, end: text.length }, hasBegin: false, literalEnvs };
   }
-  const bodyStart = b + '\\begin{document}'.length;
-  const e = text.indexOf('\\end{document}', bodyStart);
-  const bodyEnd = e < 0 ? text.length : e;
-  return { preamble: { start: 0, end: b }, body: { start: bodyStart, end: bodyEnd } };
+  const bodyStart = begin + '\\begin{document}'.length;
+  const bodyEnd = end < 0 ? text.length : end;
+  return { preamble: { start: 0, end: begin }, body: { start: bodyStart, end: bodyEnd }, hasBegin: true, literalEnvs };
+}
+
+// The common case without a line scan: each marker occurs once, on an
+// uncommented line, and nothing literal could be quoting it.
+function plainDocumentMarkers(text, literalEnvs) {
+  const begin = text.indexOf('\\begin{document}');
+  const end = text.indexOf('\\end{document}');
+  if (begin < 0 || end < begin) return null;
+  if (text.indexOf('\\begin{document}', begin + 1) >= 0 || text.indexOf('\\end{document}', end + 1) >= 0) return null;
+  if (literalEnvs.size || LITERAL_OR_INLINE_RE.test(text)) return null;
+  if (commentedAt(text, begin) || commentedAt(text, end)) return null;
+  return { begin, end };
+}
+
+function commentedAt(text, offset) {
+  const lineStart = text.lastIndexOf('\n', offset - 1) + 1;
+  const before = text.slice(lineStart, offset);
+  return commentStart(before) < before.length;
+}
+
+function findDocumentMarkers(text, literalEnvs) {
+  let begin = -1;
+  let inLiteral = null;
+  for (let pos = 0; pos <= text.length;) {
+    let eol = text.indexOf('\n', pos);
+    if (eol < 0) eol = text.length;
+    const line = text.slice(pos, eol);
+    let col = 0;
+    scan: while (col <= line.length) {
+      if (inLiteral) {
+        const close = line.indexOf(`\\end{${inLiteral}}`, col);
+        if (close < 0) break;
+        col = close + `\\end{${inLiteral}}`.length;
+        inLiteral = null;
+      }
+      const active = maskInlineVerbatim(line.slice(col));
+      const code = active.slice(0, commentStart(active));
+      MARKER_RE.lastIndex = 0;
+      for (let m; (m = MARKER_RE.exec(code));) {
+        const [, kind, name] = m;
+        if (kind === 'begin' && (LITERAL_BOUNDARY_ENVS.has(name) || literalEnvs.has(name))) {
+          inLiteral = name;
+          col += m.index + m[0].length;
+          continue scan;
+        }
+        if (name !== 'document') continue;
+        if (kind === 'begin' && begin < 0) begin = pos + col + m.index;
+        else if (kind === 'end' && begin >= 0) return { begin, end: pos + col + m.index };
+      }
+      break;
+    }
+    pos = eol + 1;
+  }
+  return { begin, end: -1 };
+}
+
+// Blank out inline verbatim payloads, keeping every offset in place.
+function maskInlineVerbatim(s) {
+  if (!/\\(?:verb|lstinline|mintinline)/.test(s)) return s;
+  return s
+    .replace(INLINE_VERB_RE, (_, head, delim, payload) => `${head}${' '.repeat(payload.length)}${delim}`)
+    .replace(INLINE_BRACED_RE, (_, head, payload) => `${head}${' '.repeat(payload.length)}}`);
+}
+
+// Offset of the first `%` that starts a comment: one preceded by an even
+// run of backslashes (`\\%` is a line break and then a comment).
+function commentStart(s) {
+  for (let i = s.indexOf('%'); i >= 0; i = s.indexOf('%', i + 1)) {
+    let slashes = 0;
+    for (let j = i - 1; j >= 0 && s[j] === '\\'; j--) slashes++;
+    if (slashes % 2 === 0) return i;
+  }
+  return s.length;
 }
 
 /**

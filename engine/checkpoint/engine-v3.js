@@ -2082,6 +2082,7 @@ export class CheckpointEngine {
       source,
       file: this.file,
       structuralEvents: options.structuralEvents,
+      literalEnvs: options.literalEnvs,
       docDir: this.docDir,
       overlayDir: this.overlayDir,
       workDir: this.workDir,

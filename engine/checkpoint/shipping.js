@@ -23,7 +23,7 @@ import {
 import path from 'node:path';
 import { withProjectInputs } from '../project-inputs.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { segmentBody } from '../segmenter.js';
+import { segmentBody, documentBounds } from '../segmenter.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
 import { ensureShim } from './forkshim.js';
 import { distinctCheckpointPeerCount } from './checkpoint-retirement.js';
@@ -567,12 +567,13 @@ export class ShippingChain {
 
   /** \par-complete feed units: segmenter blocks, then \end{document}. */
   #unitsOf(source) {
-    const b = source.indexOf('\\begin{document}');
-    const e = source.indexOf('\\end{document}', b);
-    const bodyStart = b + '\\begin{document}'.length;
-    const body = source.slice(bodyStart, e < 0 ? source.length : e);
-    const structural = classifyStructuralAliases(source.slice(0, b), body);
-    const segments = segmentBody(body, 0, { structuralEvents: structural.segmentEvents });
+    const bounds = documentBounds(source);
+    const body = source.slice(bounds.body.start, bounds.body.end);
+    const structural = classifyStructuralAliases(source.slice(0, bounds.preamble.end), body);
+    const segments = segmentBody(body, 0, {
+      structuralEvents: structural.segmentEvents,
+      literalEnvs: bounds.literalEnvs,
+    });
     // Preserve every source byte, including the blank lines that terminate
     // paragraphs. The segmenter's `text` intentionally excludes separators;
     // rebuilding from those strings and adding an artificial `\\par` is not
@@ -666,8 +667,7 @@ export class ShippingChain {
     const candidates = path.extname(raw) ? [raw] : [raw, `${raw}.tex`];
     if (!candidates.includes(changedPath)) return null;
     const alias = changedPath.replace(/\.tex$/i, '');
-    const bodyAt = newSource.indexOf('\\begin{document}');
-    const preamble = newSource.slice(0, Math.max(0, bodyAt));
+    const preamble = newSource.slice(0, documentBounds(newSource).preamble.end);
     const earlierUnits = this.#unitsOf(newSource).slice(0, read.rootUnit - 1);
     const earlier = earlierUnits.join('');
     if (preamble.includes(changedPath) || preamble.includes(alias) ||
@@ -764,9 +764,9 @@ export class ShippingChain {
     await ensureShim(this.workDir);
     await this.#ensureServer();
     if (inputState) this.#commitInputStage(this.#stageInputState(inputState));
-    const b = source.indexOf('\\begin{document}');
-    if (b < 0) throw new Error('shipping chain needs \\begin{document}');
-    const preamble = source.slice(0, b);
+    const bounds = documentBounds(source);
+    if (!bounds.hasBegin) throw new Error('shipping chain needs \\begin{document}');
+    const preamble = source.slice(0, bounds.preamble.end);
     // Units are \par-complete blocks (the segmenter's invariant): an
     // environment never straddles a feeder-loop iteration, which keeps
     // \halign-style parsers (align, tabular) away from the loop macro.
