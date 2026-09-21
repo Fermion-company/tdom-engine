@@ -45,3 +45,12 @@ test('fancyvrb and declared listing environments are literal', () => {
   assert.equal(sourceClosure(listing).closed, false);
   assert.equal(sourceClosure(listing, { literalEnvs: new Set(['TeXBlock']) }).closed, true);
 });
+
+test('\\string quotes \\verb and inline listings are literal payloads', () => {
+  assert.equal(closed('a replacement for \\texttt{\\string\\verb}.'), true);
+  assert.equal(closed('handled by listings: \\lstinline!\\end{document}! and more'), true);
+  assert.equal(closed('\\lstinline[language=TeX]|{|'), true);
+  assert.equal(closed('\\lstinline{\\end{document}}'), true);
+  assert.equal(closed('\\mintinline{latex}|\\begin{x}|'), true);
+  assert.equal(closed('\\lstinline!unfinished'), false);
+});
