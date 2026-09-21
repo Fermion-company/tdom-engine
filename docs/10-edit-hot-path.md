@@ -81,8 +81,11 @@ last-known-good を保持する。
 
 現行 ShippingChain は `\begin{document}` hook 完了後、最初の user source unit を読む直前に page 0 の
 body-root checkpoint を作る。first page の plain edit は preamble を再実行せず、この root から全 body を
-exact replay する。700ms の replay deadline を越えた edit は exact tree を昇格せず、Phase B の
-`VisualCut` が入るまでは旧 exact pixels を保持する。source acceptance と新しい文字の即時描画は同義ではない。
+exact replay する。replay deadline は 700ms を下限とし、直近の canonical 組版より 500ms 以上早く終われる
+範囲だけ最大3000msまで延長する。延長中は表示要求の canonical を開始せず、重い TeX 処理を並走させない。
+replay が拒否された時点で待機を解除し、完成した complete PDF は別の表示期限内に全ページを読み込んでから
+原子的に昇格する。期限を越えた edit は exact tree を昇格せず、Phase B の `VisualCut` が入るまでは旧 exact
+pixels を保持する。source acceptance と新しい文字の即時描画は同義ではない。
 
 ## 10.3 diff と checkpoint rekey
 

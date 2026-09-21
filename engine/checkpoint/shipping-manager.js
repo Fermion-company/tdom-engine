@@ -10,6 +10,14 @@ const TRANSIENT_CODES = new Set(['EAGAIN', 'ENOMEM', 'EMFILE', 'ENFILE', 'ETIMED
 const digest = (value) => createHash('sha256').update(String(value)).digest('hex');
 const digestBytes = (value) => createHash('sha256').update(value).digest('hex');
 
+export function usefulShippingCutoffMs(canonicalMs) {
+  const measured = Number(canonicalMs);
+  if (!Number.isFinite(measured) || measured <= 0) return 700;
+  // A late replay is useful only while it still leaves a meaningful lead
+  // over the last full compile. Bound the extra CPU even on very slow docs.
+  return Math.max(700, Math.min(3000, measured - 500));
+}
+
 function relativeProjectPath(root, candidate) {
   if (!root || !candidate) return null;
   const rel = path.relative(path.resolve(root), path.resolve(candidate));
@@ -342,6 +350,7 @@ export function makeShippingChain(engine, queueShipBoot) {
       currentJob: engine.currentJob,
       activeResidentRenders: engine.activeResidentRenderCheckpoints,
     }).shippingLimit,
+    waveCutoffMs: () => usefulShippingCutoffMs(engine.canonical?.info?.().ms),
   });
   chain.onWave = (wave) => {
     if (engine.shipStale || chain !== engine.shipping ||
@@ -370,6 +379,11 @@ export function makeShippingChain(engine, queueShipBoot) {
     } else if (seeded === undefined) {
       engine.shipLabelOverrides.set(key, val);
     }
+  };
+  chain.onWaveOutcome = ({ gen, outcome }) => {
+    if (outcome !== 'rejected' || chain !== engine.shipping ||
+        engine.shipGenRev.get(gen) !== engine.srcRev) return;
+    engine.canonical?.releaseAuthorityDeferral?.();
   };
   chain.retryState = engine.shipRetry;
   chain.onBaselineOutcome = (event) => {
@@ -516,6 +530,7 @@ export function shipUpdate(engine, text, projectInputChanges, queueShipBoot) {
     const inputState = shippingInputState(engine, projectInputChanges);
     engine.shipDesiredInputSnapshot = inputState.identity.snapshotId;
     engine.shipPendingInputChanges = { text, projectInputChanges };
+    engine.canonical?.releaseAuthorityDeferral?.();
     return;
   }
   if (
@@ -532,6 +547,7 @@ export function shipUpdate(engine, text, projectInputChanges, queueShipBoot) {
   if (engine.shipDisabledFor === engine.preHash) return;
   if (engine.shipBootedFor !== engine.preHash || engine.shipStale || engine.shipping.err) {
     queueShipBoot();
+    engine.canonical?.releaseAuthorityDeferral?.();
     return;
   }
   const inputState = shippingInputState(engine, projectInputChanges);
@@ -546,7 +562,9 @@ export function shipUpdate(engine, text, projectInputChanges, queueShipBoot) {
   } else if (r.mode === 'unchanged') {
     engine.shipGenRev.set(engine.shipping.gen, engine.srcRev);
     engine.shipGenSnapshot?.set(engine.shipping.gen, inputState.identity.snapshotId);
+    engine.canonical?.releaseAuthorityDeferral?.();
   } else if (r.mode === 'reboot-needed') {
     queueShipBoot();
+    engine.canonical?.releaseAuthorityDeferral?.();
   }
 }

@@ -151,7 +151,7 @@ class Peer {
 }
 
 export class ShippingChain {
-  constructor({ workDir, docDir, overlayDir = null, checkpointBudget = null }) {
+  constructor({ workDir, docDir, overlayDir = null, checkpointBudget = null, waveCutoffMs = null }) {
     this.workDir = path.resolve(workDir);
     this.docDir = docDir ? path.resolve(docDir) : this.workDir;
     this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
@@ -171,6 +171,7 @@ export class ShippingChain {
     this.checkpoints = new Map(); // page -> Peer (state after that page)
     this.maxCheckpoints = Math.max(1, Math.floor(Number(process.env.TDOM_MAX_CHECKPOINTS) || 64));
     this.checkpointBudget = checkpointBudget;
+    this.dynamicWaveCutoffMs = waveCutoffMs;
     this.labels = new Map(); // key -> {val, page} captured this lineage
     this.pagePdf = new Map(); // page -> pdf path (current generation wins)
     this.pageGen = new Map(); // page -> generation owning pagePdf
@@ -181,6 +182,7 @@ export class ShippingChain {
     this.onWave = null; // callback({pages, gen, fromPage, elapsedMs}) — closure-ready set
     this.onLabel = null; // callback({key, val, page})
     this.onDone = null; // callback({pages, gen})
+    this.onWaveOutcome = null; // callback({gen, outcome, reason, elapsedMs})
     this.onBaselineOutcome = null; // one-shot callback after terminal gen-0 validation
     this.chainId = randomUUID();
     this.baselineIdentity = null;
@@ -204,6 +206,37 @@ export class ShippingChain {
     // a private clone of LuaTeX's already-open PDF descriptor. Kept behind a
     // flag until byte/raster stress tests prove it against cold canonical.
     this.privatePdf = process.env.TDOM_SHIP_PRIVATE_PDF !== '0';
+  }
+
+  waveCutoffMs() {
+    const configured = Number(process.env.TDOM_SHIP_WAVE_CUTOFF);
+    if (Number.isFinite(configured) && configured > 0) return Math.max(1, configured);
+    const dynamic = Number(this.dynamicWaveCutoffMs?.());
+    return Number.isFinite(dynamic) && dynamic > 0 ? Math.max(1, dynamic) : 700;
+  }
+
+  visibleCutoffMs() {
+    const configured = Number(process.env.TDOM_SHIP_VISIBLE_CUTOFF);
+    if (Number.isFinite(configured) && configured > 0) return Math.max(1, configured);
+    // Preserve the legacy one-second presentation contract for explicit
+    // stress overrides. Production's adaptive replay budget supplies its
+    // own matching presentation window below.
+    const configuredWave = Number(process.env.TDOM_SHIP_WAVE_CUTOFF);
+    if (Number.isFinite(configuredWave) && configuredWave > 0) return 1000;
+    return Math.max(1000, this.waveCutoffMs() + 300);
+  }
+
+  #reportWaveOutcome(outcome, reason = null) {
+    try {
+      this.onWaveOutcome?.({
+        gen: this.gen,
+        outcome,
+        reason,
+        elapsedMs: Math.max(0, Date.now() - this.waveStartedAt),
+      });
+    } catch {
+      /* diagnostics must not interrupt replay cleanup */
+    }
   }
 
   async #ensureServer() {
@@ -490,6 +523,7 @@ export class ShippingChain {
       this.waveDeadlineTimer = null;
       this.lastRejectReason = 'page-count-changed';
       this.wavePublishedGen = this.gen; // fail closed for this generation
+      this.#reportWaveOutcome('rejected', this.lastRejectReason);
       return;
     }
     if (this.gen !== 0 &&
@@ -498,11 +532,12 @@ export class ShippingChain {
       this.waveDeadlineTimer = null;
       this.lastRejectReason = 'output-manifest-changed';
       this.wavePublishedGen = this.gen; // fail closed for this generation
+      this.#reportWaveOutcome('rejected', this.lastRejectReason);
       return;
     }
     const expected = [];
     for (let page = this.waveFromPage; page <= pageCount; page++) expected.push(page);
-    const cutoffMs = Number(process.env.TDOM_SHIP_WAVE_CUTOFF ?? 700);
+    const cutoffMs = this.waveCutoffMs();
     const validatingGen = this.gen;
     const validatingSnapshotId = this.acceptedSnapshotId;
     if (this.waveValidatingGen === validatingGen) return;
@@ -520,6 +555,8 @@ export class ShippingChain {
             outcome: 'FAILED_INVARIANT',
             failureClass: 'complete-pdf-invalid',
           });
+        } else {
+          this.#reportWaveOutcome('rejected', this.lastRejectReason);
         }
         return;
       }
@@ -543,15 +580,13 @@ export class ShippingChain {
       const elapsedMs = Date.now() - this.waveStartedAt;
       if (elapsedMs >= cutoffMs) {
         this.lastRejectReason = 'deadline-exceeded';
+        this.#reportWaveOutcome('rejected', this.lastRejectReason);
         return; // never land a late "fast" result
       }
-      // Native replay must certify within the tighter engine budget, while
-      // the user-facing contract includes fetching/decoding every visible
-      // SVG and one atomic browser commit.  Sharing the 700ms engine cutoff
-      // left only ~150ms for a 21-page stress document and cancelled an
-      // otherwise valid 552ms wave.  Keep the proof budget strict but give
-      // the renderer the remainder of the one-second input-to-pixels SLA.
-      const visibleCutoffMs = Number(process.env.TDOM_SHIP_VISIBLE_CUTOFF ?? 1000);
+      // Native replay and browser presentation have separate budgets. The
+      // renderer still needs time to fetch/decode every visible SVG and make
+      // one atomic commit after the complete PDF has been certified.
+      const visibleCutoffMs = this.visibleCutoffMs();
       // The generation authority is the replay root's one complete PDF,
       // never a tail-page pager artifact. Prefix pages may reference objects
       // finalized after the checkpoint (fonts, links, destinations).
@@ -1009,7 +1044,7 @@ export class ShippingChain {
     const slots = Math.max(0, this.checkpointLimit() - distinctCheckpointPeerCount(this.checkpoints));
     const stride = slots > 0 ? Math.max(1, Math.ceil((this.baselinePages - best.page) / slots)) : 0;
     peer.send(`RESUME ${this.gen} ${stride}\n`);
-    const cutoffMs = Math.max(1, Number(process.env.TDOM_SHIP_WAVE_CUTOFF ?? 700));
+    const cutoffMs = this.waveCutoffMs();
     const deadlineGen = this.gen;
     this.waveDeadlineTimer = setTimeout(() => {
       if (
@@ -1024,6 +1059,7 @@ export class ShippingChain {
       this.lastRejectReason = 'deadline-exceeded';
       this.wavePublishedGen = deadlineGen;
       this.done = true;
+      this.#reportWaveOutcome('rejected', this.lastRejectReason);
       const root = this.rootPeer;
       this.rootPeer = null;
       if (root?.alive) {
@@ -1147,6 +1183,8 @@ export class ShippingChain {
       baselineReady: this.baselinePages !== null,
       completePdf: this.publishedPdf,
       rejectReason: this.lastRejectReason,
+      waveCutoffMs: this.waveCutoffMs(),
+      visibleCutoffMs: this.visibleCutoffMs(),
       retry: retry ? {
         state: retry.state,
         activeAttemptId: retry.activeAttemptId,

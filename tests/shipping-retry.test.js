@@ -12,6 +12,7 @@ import {
   shippingInputState,
   shippingInputSnapshot,
   shipUpdate,
+  usefulShippingCutoffMs,
 } from '../engine/checkpoint/shipping-manager.js';
 
 function retryState() {
@@ -88,6 +89,33 @@ async function cleanup(engine, ...chains) {
   for (const chain of chains) await chain.close().catch(() => {});
   rmSync(engine.workDir, { recursive: true, force: true });
 }
+
+test('late shipping budget stays below the last canonical and has a hard cap', () => {
+  assert.equal(usefulShippingCutoffMs(0), 700);
+  assert.equal(usefulShippingCutoffMs(900), 700);
+  assert.equal(usefulShippingCutoffMs(1500), 1000);
+  assert.equal(usefulShippingCutoffMs(3000), 2500);
+  assert.equal(usefulShippingCutoffMs(30_000), 3000);
+});
+
+test('a rejected current wave releases the canonical display fallback', async () => {
+  const engine = fakeEngine();
+  let released = 0;
+  engine.canonical = {
+    info: () => ({ ms: 3000 }),
+    releaseAuthorityDeferral: () => { released++; },
+  };
+  const chain = attachChain(engine);
+  engine.shipGenRev.set(chain.gen, engine.srcRev);
+  try {
+    chain.onWaveOutcome({ gen: chain.gen, outcome: 'rejected' });
+    assert.equal(released, 1);
+    chain.onWaveOutcome({ gen: chain.gen, outcome: 'published' });
+    assert.equal(released, 1);
+  } finally {
+    await cleanup(engine, chain);
+  }
+});
 
 test('boot start is neutral and a current certified baseline resets prior failures', async () => {
   const engine = fakeEngine();
@@ -226,6 +254,8 @@ test('shipping boot rejects a canonical seed from an older project-input epoch',
 
 test('unsupported dependency refresh never retags the old shipping generation', async () => {
   const engine = fakeEngine('same root bytes');
+  let released = 0;
+  engine.canonical = { releaseAuthorityDeferral: () => { released++; } };
   engine.mode = 'structured';
   engine.shipBootedFor = engine.preHash;
   engine.shipDisabledFor = null;
@@ -243,6 +273,7 @@ test('unsupported dependency refresh never retags the old shipping generation', 
     }, () => queued++);
     assert.equal(engine.shipGenRev.get(0), 1);
     assert.equal(queued, 1);
+    assert.equal(released, 1);
     assert.ok(engine.shipDesiredInputSnapshot, 'latest unsupported snapshot still blocks an older wave');
   } finally {
     await cleanup(engine);

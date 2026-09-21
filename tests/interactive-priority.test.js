@@ -53,6 +53,16 @@ test('priority window remains configurable for timing stress tests', () => {
   }
 });
 
+test('a real shipping chain can extend the exclusive window through browser presentation', () => {
+  assert.equal(shippingPriorityQuietMs(engine({
+    shipping: {
+      baselineReady: true,
+      disposed: false,
+      visibleCutoffMs: () => 2500,
+    },
+  }), 120), 2550);
+});
+
 test('authority foreground lease is bounded and never applies to opaque display work', async () => {
   const workDir = mkdtempSync(path.join(os.tmpdir(), 'tdom-authority-lease-'));
   const renderer = new CanonicalRenderer({ workDir });
@@ -66,6 +76,50 @@ test('authority foreground lease is bounded and never applies to opaque display 
   } finally {
     renderer.dispose();
     rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
+test('display-demand canonical waits for an active shipping lease and starts when replay rejects', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tdom-display-lease-'));
+  const bin = path.join(root, 'bin');
+  const workDir = path.join(root, 'work');
+  const started = path.join(root, 'started');
+  mkdirSync(bin);
+  mkdirSync(workDir);
+  const fake = path.join(bin, 'lualatex');
+  writeFileSync(fake, `#!/usr/bin/env node
+require('node:fs').writeFileSync(${JSON.stringify(started)}, 'started');
+setTimeout(() => process.exit(1), 100);
+`);
+  chmodSync(fake, 0o755);
+  const priorPath = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${priorPath || ''}`;
+  const renderer = new CanonicalRenderer({
+    workDir,
+    docDir: workDir,
+    debounceMs: 60_000,
+    displayDebounceMs: 0,
+  });
+  try {
+    renderer.schedule('source', 1);
+    assert.equal(renderer.deferAuthority(1000), true);
+    assert.equal(renderer.requestDisplay(1, 1, {
+      demandId: 'viewer',
+      residentImpossible: true,
+    }).accepted, true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(existsSync(started), false, 'demanded canonical did not overlap exact replay');
+
+    assert.equal(renderer.releaseAuthorityDeferral(), true);
+    const deadline = Date.now() + 1000;
+    while (!existsSync(started) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(existsSync(started), true, 'rejected replay released canonical immediately');
+  } finally {
+    renderer.dispose();
+    process.env.PATH = priorPath;
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

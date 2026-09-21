@@ -629,6 +629,18 @@ export class CanonicalRenderer {
     return true;
   }
 
+  /** Release a shipping foreground lease after replay rejects the revision. */
+  releaseAuthorityDeferral() {
+    if (this.disposed || this.pressure !== 'authority') return false;
+    const deferred = this.authorityPausedUntil > Date.now() || this.authorityPausedPids.size > 0;
+    this.authorityPausedUntil = 0;
+    this.#resumeAuthority();
+    if (this.pendingJob && !this.running && !this.buildLease && this.#hasDisplayDemand(this.pendingJob)) {
+      this.#armPending(0, { keepEarlier: true });
+    }
+    return deferred;
+  }
+
   acquireBuildLease(requestId, ttlMs = BUILD_LEASE_DEFAULT_MS) {
     if (this.disposed || this.resetting || typeof requestId !== 'string' ||
         !/^[A-Za-z0-9:_-]{1,128}$/.test(requestId)) {
@@ -1213,6 +1225,11 @@ export class CanonicalRenderer {
     if (!this.pendingJob) return;
     if (this.buildLease) return;
     const job = this.pendingJob;
+    if (this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
+        Date.now() < this.authorityPausedUntil) {
+      this.#armPending(this.authorityPausedUntil - Date.now());
+      return;
+    }
     if (waitForResident && !job.fallbackReason && this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
         !this.residentImpossibleDemandIds.size && typeof this.residentDisplayState === 'function') {
       const state = this.residentDisplayState(job.rev);
