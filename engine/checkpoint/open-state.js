@@ -69,6 +69,10 @@ export function resetOpenState(engine, text, file) {
   engine.hfQueuedSig = null;
   engine.diagnostics.length = 0;
   engine.includes.clear();
+  engine.shippingIncludeTrace = [];
+  engine.shipPendingInputChanges = null;
+  engine.shipGenSnapshot?.clear();
+  engine.shipDesiredInputSnapshot = null;
   for (const w of engine.watchers.values()) {
     try {
       w.close();

@@ -81,7 +81,7 @@ export function buildStream(block, chunks) {
       const wantExact = !canonicalOnly && !!ifid?.exact;
       const chunkRef =
         wantExact && ic
-          ? { key: chunkKey, w: ic.wBp, stale: ic.forGalley === block.galleyHash ? undefined : 1 }
+          ? { key: chunkKey, w: ic.logicalWBp ?? ic.wBp, stale: ic.forGalley === block.galleyHash ? undefined : 1 }
           : null;
       const suppress = canonicalOnly || (wantExact && !ic && !!ifid?.noBridge);
       stream.push({

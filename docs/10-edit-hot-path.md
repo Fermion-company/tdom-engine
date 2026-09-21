@@ -101,6 +101,8 @@ body は `segmentBody()` と `#expandIncludes()` で block 列になる。`diffB
 
 foreground は nearest checkpoint から始まる。各 block について `#typesetBlock()` を呼び、`#adoptGalley()` で galley、font、label/ref、state を採用する。
 
+同じ cold prefix walk が作った一時 continuation は、前回の native 成功証明があり、deferred・frozen・rescue 状態でない block に限って `STEP` で直接消費する。`STEP` 中に今回初めて native error や timeout が起きた場合、失敗した continuation は捨て、通常予算で残る最寄りの正しい checkpoint から通常 `JOB` でその input を一度だけ復元する。その後に last-good exit state を入れる既存 fallback を行うため、壊れた TeX 状態を後続 block の入口として採用しない。
+
 停止判定は次を見る。
 
 | 判定 | 意味 |
@@ -108,9 +110,26 @@ foreground は nearest checkpoint から始まる。各 block について `#typ
 | `clean` | clean block を組み直して `galleyHash` と `stateVec` が一致した |
 | `counters` | galley は同じで counter などが動いた |
 | `leak` | galley divergence が budget を超えた、または definition edit で suffix を信用できない |
+| `cold` | dirty block に届く前の clean prefix 再生が時間予算を超えた（§10.4a） |
 | `walked` | 文書末尾まで必要な foreground walk をした |
 
 現在の budget は、layout-coupled galley divergence が 8、local state ripple が 4 である。budget を超えた伝播は hot path で文書末尾まで追わず、`pendingChain` に入る。
+
+## 10.4a cold prefix の時間予算
+
+nearest checkpoint が編集 block から遠い（caret warm が間に合わなかった、あるいは骨格の外の場所へ飛んだ）打鍵は、dirty block に届くまで clean block を順に再生する。316 ページの文書で 250 block を超えると 1 打鍵が 50 秒以上 HTTP を塞ぎ、その間の打鍵も同じ walk を最初からやり直していた。
+
+foreground walk は、まだ source-dirty block が先にある状態で clean block を再生している間だけ、`TDOM_COLD_PREFIX_MS`（既定 1500、`0` で無効）を経過した時点で完了済み block 境界で止まり、verdict を `cold` にする。boot・reboot・retry の walk は対象外である。
+
+- 止めた境界は `editHold` に pin する。到達済み prefix は次の walk が再利用する。
+- 届かなかった source-dirty block は `coldDirty`（`stats.coldPending`）に記録する。その galley は text より古い。通常の打鍵はこれを追わない（自分の hot path を保つ）が、どの walk でもその block を再組版した時点で記録は消える（`#adoptGalley`）。
+- `pendingChain` に `cold` を積む。chain pass は idle gate の後、`coldDirty` の先頭 block の nearest checkpoint から `#retypesetChain` で（STEP を使って）その block の入口まで進む。STEP は入力 checkpoint を消費するので、打鍵はこの walk の子を kill しない（`coldWalking` 中は `bgAbort` を立てるだけで、caret warm と同じく次の block 境界で止まる）。到達境界を pin して次の pass で続きから進む。kill すると到達済み prefix が全部失われ、登録直後に死んだ peer を次の JOB が掴んで typeset 失敗 → 全 reboot（107 s）になった。打鍵が caret warm を kill する経路も同じ理由で境界停止に変えた（kill 後の `restoreReplayInput` が JOB で prefix を組み直す間、打鍵が 25 s 待たされていた）。さらに打鍵は lock を取るまで `editPending` を立てる。warm はこれが立っている間は開始せず `bgAbort` も戻さない（打鍵の直前に届いた warm が同じ bgTask 待ちから先に起き、flag を消して lock を取り、194 block を歩き切るまで打鍵が 56 s 待った）。cold pass と deferred chain の idle gate も `editPending` で止まる。
+- 入口に着いたら chain pass は `resume` を返し、scheduler が chain lock の外で `#update({ editLabel: 'cold-resume' })` を走らせる。prepare は `coldDirty` を dirtySource に合流させ、通常の foreground（今度は hot）・finalize を行う。`srcRev` は進めず（canonical / shipping の generation は元の打鍵が予約済み）、`rev` だけ進めて `onDeferredUpdate(report)` で公開する。cold 中に積まれた settle/rebuild は `carry` として resume の verdict の後に再登録する。
+- 打鍵が resume より先に chain lock に入った場合、その打鍵が block を組版し、resume は dirty なしで `null` を返す（何も公開しない）。
+- 打鍵は chain lock を待つ前に `editPending` を立てる。caret warm と chain pass はこれが立っている間は開始せず、走行中なら次の block 境界で譲る（warm が先に lock を取り `bgAbort` を消してしまい、打鍵が prefix 全体の再生を待たされた: 実測 56 s）。
+- caret warm（ホストは打鍵直後にも `/warm` を送る）は deferred chain を先取りして止める。warm walk が完了・中断したら `pendingChain` が残っていれば scheduler に返す（`#kickPendingChain`）。warm がその block を組版済みなら cold pass は再生なしで `resume` に進み、`coldIds` に残した block を（今度は hot に）組み直して report と anchor を出す。
+
+server は cold な編集応答に `canonicalAnchorRefused: 'cold-prefix'` を付け、anchor の文脈（edit・base snapshot・lineage・accept 時刻）を `pendingColdAnchor` に置く。同じ block への続く cold 打鍵が lineage を継げるよう、base があれば `coldPending` の lineage entry（pages なし）を残す。deferred update が同じ `srcRev`・documentEpoch・anchorEpoch で届いたら、その文脈で `planTerminalCanonicalAnchor` → 通常の lineage 登録 → `resolveTerminalCanonicalAnchor` を行い、`update` を broadcast する。先に新しい打鍵が公開していた（`rev` が古い）deferred report は捨てる。`/status` の `cold` に未組版 block と walk の進捗が出る。
 
 ## 10.5 definition edit
 
@@ -137,6 +156,8 @@ label が動いたとき、後方で定義された label を前方 block が参
 
 ## 10.8 page-context rescue
 
+非同期 rescue の採択で後続の galley が変わった場合、その block の exact render も再予約する。旧 galley の描画が先に完了していても、修正された段落・数式・脚注の chunk を現在の galley 世代で作り直す。
+
 `mdframed` や breakable `tcolorbox` のような block は、page 上の offset によって分割結果が変わることがある。
 
 現行実装は foreground で長い re-rescue chain を走らせない。`#queueMovedOffsets()` が offset 差分を見て rescue queue に積み、exact pipeline が async に fixed point へ近づける。表示中は stale galley/chunk と canonical overlay が残る。
@@ -158,11 +179,14 @@ isolated compile の dormant absorb には暴走上限（fires > 50）があり�
 
 ## 10.10 render、shipping、canonical
 
+`sourceClosure()` は `\loop\if...\repeat` の条件終端を認識する。字句的に閉じていないソースは `closure-deferred` として resident のブロック・紙面を保持するが、最新 `srcRev` の canonical を display cadence で必ず予約する。これには `external-include` も含む。字句解析ではマクロ定義と実行を完全に区別できないため、正否とエラーは LuaLaTeX が決める。保留中の旧ブロック範囲は直接編集へ渡さず、旧紙面を現在のソースとして検証・cropしない。canonical の `runningRev`・`scheduledRev`・`fallbackReason` で予約と実行の対象を確認できる。エラー終了時の部分PDFは採用せず、最後に成功したPDFと世代を保持する。
+
 hot path の最後に `#shipUpdate(source)`、`canonical.schedule(source, srcRev)`、`#scheduleBackground(fgStop, dirtyBlocks, options)` が呼ばれる。
 
 `#scheduleBackground()` は chain と resident render を予約する。
 
 - pending chain があれば idle 後に chain pass を走らせる。
+- 編集した source block と同じページの exact block は、foreground walk の前に input/capture 境界を最大8個保持する。walk 後にも未変更の exact neighbor を描画 queue に加える。boot で queue に入らなかった render hold と、描画済みの hold は通常の checkpoint 上限へ戻し、保持を再作成しない。
 - dirty block 数が `TDOM_RENDER_HOT_MAX` 以下なら、needsRender な hot block を resident exact-render queue に積む。display math と native closure 済みの graphics（float/insert/eject を含まないもの）は foreground JOB の node list を post-block checkpoint に世代付きで保持し、queue 側は CAPTURE を先に試す。これにより block source の二重組版を避ける。保持 list が退役・世代不一致なら、pre-block checkpoint の従来 RENDER へ自動 fallback する。
 - resident の PDF descriptor は boot で読み書き可能にし、各 JOB/CAPTURE/RENDER/ISO fork の直前に現在の bytes と位置を匿名ファイルへ複製する。子だけが複製先を継続し、出力時に専用 job directory へ移す。TikZ/hyperref が先に PDF object を作っていても cold compile は不要。装飾は過去画像を再利用せず、その編集で組版した node list を ship する。graphics の chunk identity には source hash も含め、寸法を変えない色・underlay 編集でも再描画する。エラーで凍結した galley は以前の paint identity を維持する。
 - exact chunk の ship は、galley 抽出と同じく前ブロックの lastskip primer と最上位 topskip を除く。RENDER と isolated fallback も前ブロックの lastskip を復元してから組版するため、余白の max-merge と SVG の原点・高さが foreground JOB に一致する。
@@ -181,12 +205,34 @@ display list は本文 glyph と行単位の exact chunk を別素材として�
 
 ## 10.10b checkpoint 予算の硬い上限
 
+structured page の差し替えには、その page の未変更部分も含む exact chunk が必要になる。foreground walk は source-dirty block の後で galley が収束しても、同じ既存 page の未準備 exact block までは続ける。前方の未準備 block も再開位置に含める。ただし入力 checkpoint が editHold / renderHold または全境界を収める通常予算で保持される block は、既存の RENDER から準備できるため walk を延長しない。renderHold の枠はこの page 群を優先し、そこへ到達するためだけに再実行した無関係な prefix の描画で埋めない。保持数の上限は変えず、準備済み chunk がある page の通常の収束停止は維持する。
+
 `maxCheckpoints`（既定は env、主サーバは 8）は通常の常駐 checkpoint 骨格の予算である。骨格を block 数の等間隔にすると、編集点との間に巨大な TikZ / user macro block が一つあるだけで、無関係な地の文の毎打鍵がその block を再実行する（実測: 160 回の複合 macro 展開を跨いだ日本語 1 文字が 4.4 秒）。そこで各 block の cold typeset 高水位時間を記録し、最も高価な block の入力・出力境界を優先して残し、余りを重み付き分位へ配る。これは `tikzpicture` や `tcolorbox` の名前を判定する局所対応ではなく、未知 package / macro にも同じ実測原理で働く。上記 fixture では同じ編集が fresh-open 直後でも 15ms になった。
-最終 block には収束確認用の後続 block がないため、その入力境界は計測途中でも変わらない固定 coverage anchor として同じ予算内に確保する。選択順は root、高コスト block の入力・出力境界、末尾 anchor、残枠の重み付き分位である。予算内に全候補が収まらない場合は末尾の予測可能性を優先するため、予算値によらず分位境界や最後の高コスト block の出力境界が外れ、末尾以外の編集が追加 block を再実行する場合がある。
+末尾用の保存枠は、終端の `\par`・skip・改ページだけの block より前に置く。通常の保存間隔内に明示的な改ページがあればその直後を選び、最後の本文と未変更の見出しを同じ短い walk で用意する。このソース上の手掛かりは保存位置にのみ使い、組版する token は省略しない。選択順は root、高コスト block の入力・出力境界、末尾 anchor、残枠の重み付き分位である。予算内に全候補が収まらない場合は末尾の予測可能性を優先するため、予算値によらず分位境界や最後の高コスト block の出力境界が外れ、末尾以外の編集が追加 block を再実行する場合がある。
 
 ただし骨格選択だけでは生存 checkpoint 数の上限にならない。`#retireOffGrid(idx)` は「その JOB が処理した 1 index」しか退役させないので、mid-document から resume する pass（rescue pump・settle・chain・backward-ref）は各停止点に orphan checkpoint を残し、誰も retire しないまま生存集合が creep する（実測: budget 8 指定でも 25 個生存、boot 時 55 個超で 16GB 機が窒息）。`#enforceCheckpointCap()` が「ckpt0 ＋実測コスト骨格 ＋ editHold ＋ renderHold だけ残し、他は DIE」で畳み直す。`#updateInner()` 末（boot/edit walk 後）・`#asyncRescueOne` 後・`#runChainPass` の finally で呼ぶ。各 checkpoint は累積 dormant page を保持する常駐 lualatex なので、これは実メモリの上限である。
 
-`#shipUpdate()` は `TDOM_SHIP=1` のときだけ意味を持つ。現在の source を shipping chain に渡し、unit diff から resume できるかを判定する。実際の page ship と SVG 化は非同期で、`onShipPage` と SSE `ship` として着地する。
+`#shipUpdate()` は `TDOM_SHIP=1` のときだけ意味を持つ。現在の root source と、実際に展開した project input bytes の immutable snapshot を shipping chain に渡し、unit diff から resume できるかを判定する。child-only refresh は root が同一でも `unchanged` ではない。単一の既知 literal `\input` だけを最初の reader より前から replay し、未知・複数・`\include` の変更は新しい canonical seed を待って baseline を作り直す。snapshot を受理していない generation は新 `srcRev` に対応付けず、後着 wave も current revision/snapshot の一致を満たさなければ公開しない。実際の page ship と SVG 化は非同期で、`onShipPage` と SSE `ship` として着地する。
+
+canonical anchor は root 内の plain text に加え、既に読まれた単一 child file の単一 plain-text 差分を扱う。child の公開 DOM span は引き続き `null` とし、編集前の include bytes から差分を算出して、物理 `readPath`、child-local block span、galley witness を非公開 snapshot に固定する。対象は root からの単一 literal `\input` とし、現在の read trace に到達した root/child ごとに字句上の reader 数と trace 数が一致しない場合は採用しない。同じ child が複数 block instance に所有される場合、`sourceParts` を持つ場合、別 input の変更が同居する場合も anchor を作らない。連続入力は最初の canonical snapshot を継承し、input epoch・source revision・canonical generation・PDF/SyncTeX hash のいずれかが変わった後着 proof は公開しない。
+
+block 全体が safe-glyph・副作用なし・全 box が単一行 witness、という条件を満たさない block（見出し box、tcolorbox などの枠つき box、graphics、toc line・label を持つ block）でも、編集がその中の plain な 1 行に閉じていれば anchor できる。box ごとに witness を取り、単一の plain glyph 行でない box は不透明として扱う。編集前に、plain 行の glyph run だけを除いた block の frame（不透明 box の全内容、glue・penalty・marker、plain 行の box 寸法と flag、gfx・float・label・ref・toc line・event、backend profile）を固定し、編集後の frame が完全に一致すること、変わった行が plain 行だけでその fidelity flag が 0 であること、structural state が一致することを要求する。証明は plain 行すべての一意な canonical 対応で行い、不透明 box は照合しない（再描画しないため）。graphics を含む block は全行が exact chunk へ回り表示リストに glyph を出さないので、変わった行は source hit box の位置から、その行の run を表示リストと同じ規則で描く。
+
+frame が「変わっていない」ことの根拠は次のとおり。(1) resident の収穫は box ごとに描画系 whatsit（pdf literal・color stack・matrix・save/restore・special・late_lua）の種類・mode・順序と文字列 payload を `fx` として記録する（LuaTeX 1.24 は TeX が作った pdf literal の token list の中身を Lua に出さないので、その中身は種類と順序でのみ区別する。読めない中身が編集で変わらないことは (6)(7) で示す）。(2) block 本文に通常文字に見える active character（babel shorthand や独自の `\catcode 13`）がある場合は対象外にする（`tdomActive`）。TeX の特殊文字は編集側で既に拒否しているので、残る編集は文字の組版だけで、macro を実行しない。(3) resident 以外で作った galley（rescue）は `fx` も `tdomActive` も持たないので対象外。(4) resident の収穫より後に描画を足す shipout filter と、組版中の node list を見る filter は、callback 名と description の組がすべて既知の集合（LuaTeX-ja・luaotfload・luacolor・lua-ul の underline が実際に登録する組だけ。名前の接頭辞では認めない）に入る場合だけ許す。照合する登録は、`GEO` の `paintCallbacks`（前文での登録）と、計画時点の全 block の galley の `paintLate`（GEO より後にその lineage で登録されたもの）を合わせたもの。resident は driver の最初の行（前文より前）で `luatexbase.add_to_callback` を包んですべての登録を記録する（どの package も包む前の関数を持てないので、同じ block の中で登録して外したものも残る）。block の終わりには registry も読み直す。後の block で登録された shipout filter も同じページに効くので、編集した block だけでなく全 block を見る。galley のない block がある場合、報告がない場合、未知の組がある場合は対象外。(5) luacolor は属性に置いた色を shipout 時に書き込むので、resident の run の色には出ない。黒以外の属性値を持つ glyph・rule を含む box を `ca` として記録し（黒の値は root で luacolor に既登録の黒の値を問い合わせて得る）、変わった行が `ca` を持つときは（plain block でも）anchor しない。(6) 編集より後にある編集していない macro は、編集で変わった TeX の状態（`\badness`、`\prevgraf`・`\prevdepth`、ページの累計、最後の node の値）を読んで、収穫では中身を読めない literal を作れる。resident は main vertical list への移し替え（build_page）のたびにこれらを標本化し、block の state trail（hash）として frame に含める。trail が一致すれば、編集した段落より後のコードは同じ状態から走っているので、中身を読めない literal まで出力が同じになる。(7) 段落の途中（水平モード）の状態は標本化しないので、変わった行を含む移し替え（その段落と、段落が動かした display・`\vadjust`・insert）には、収穫で読める描画しか許さない（`fx`・`ca`・float・insert を持つ項目がないこと）。各 top-level 項目がどの build_page で移されたかは、標本化の時に node に付けた属性から取る（`epochs`）。証明の出所について: SyncTeX は段落の行 box とその中の glue/kern に段落を閉じた行（次の環境の行など）を付けるため、SyncTeX の行番号では prose 行と枠内の行を区別できない。そこで内容で区別する。不透明 box の glyph 列が plain 行の glyph 列を含むときは anchor しない。frame が不透明 box を固定しているので、canonical 上の枠内の行が plain 行の文面と一致することはない。この比較は resident の run の文字列で行い、証明は canonical の ToUnicode 文字列で行うので、不透明 box の文字が native の font file で、remap・math・PUA・U+FFFD を含まない場合に限る。
+
+末尾 glyph の descender だけで plain 行の `h`/`d`、galley の合計高、最終 trail が変わる場合は、上の exact frame と混ぜず、旧レイアウト上の非権威 `VisualCut` を別に判定する。`epochs` は全項目で同一、変更行は 1 本、他の plain 行・不透明項目・副作用・構造状態は同一でなければならない。resident は build_page 標本ごとの `trailMarks` も返し、変更行の contribution epoch より前の mark をすべて照合する。galley の合計高の差が変更行の `(h+d)` 差と一致しない場合も拒否する。変更 epoch 以後の現世代 suffix は正確だと主張せず、旧 canonical pixels をそのまま残す。
+
+VisualCut patch は旧 canonical generation/revision を保持し、通常の行消去範囲 `baseMask` と深い glyph まで含む `mask` を併記する。現在行は旧行の水平 slot 内に収め、複数 mask は重ねない。client は既存 canonical raster の `mask - baseMask` に触れる全 pixel を上限付きで検査し、背景色以外が 1 pixel でもあれば公開しない。イベントは `canonical-visual-cut` として通常の `canonical-anchor` から分離し、この raster 検査を持たない旧 client は未知イベントとして無視する。source revision、input epoch、base generation/revision、表示中 image、700/850ms の proof/publish deadline は従来どおりである。
+
+canonical の行の証明（plain・mixed 共通、同じ証明を使う canonical crop も同じ）は、witness の glyph ごとに文字・大きさ・位置に加えて塗り色を照合する。resident の収穫は color stack を hbox の中（`walk_h`）でしか追わないので、縦モードの push（段落の前や前の block の `\color`）は canonical の行を塗っても run の色に出ない。luacolor を使わない xcolor 文書では、赤い canonical の行を黒の run で描き直し得た。paint index は pdf.js の operator list から glyph ごとの fill color を記録する（pdf.js はどの色空間の fill も `setFillRGBColor` の hex 文字列で渡す。ページの初期値は黒、save/restore と form の終わりで戻す。pattern・透明などそれ以外の fill は不明として、どの witness とも一致させない）。witness は run の色（色のない run は表示リストと同じく黒）を glyph ごとに持つ。黒の表現は揃える: resident はどの色モデルの黒も `#000000` にし、pdf.js は DeviceCMYK の `0 0 0 1 k` を多項式で `#2c2e35` にするので、後者を `#000000` として扱う。すべての glyph で一致しない行は証明しない。
+
+**累積 lineage（複数ブロック）。** anchor は base generation G に対する「G 以降の全編集の delta」を 1 つの patch で公開する。server の `terminalAnchorLineage` は G に対して編集されたブロックごとに entry（base witness、変わった行、証明済み page patch）を持ち、`ledger`（G が resident の exact compile だった時点の全ブロックの source hash・galleyHash・構造的 exit state）を保持する。別ブロック Y の編集は、(1) lineage が途切れていない（G 以降の全打鍵が anchor された）、(2) Y のブロックが ledger と一致する（G が組んだままである）、の両方が成り立つときだけ、その時点で捕捉した Y の resident witness を G の base witness として `planTerminalCanonicalAnchor` に渡せる（`joinedBase`）。証明は Y の行だけを行い、`resolveTerminalCanonicalAnchor` は他ブロックの証明済み page patch と結合して 1 つの patch（`blockIds`）にする。ブロック間で mask が重なる場合は fallback にする。raster 証明の種類が混在する場合は patch 全体を VisualCut として送り、exact-frame のページは `baseMask = mask`（追加リングなし）で client の raster 検査を通す。client は patch 適用時に全 delta を原子的に置き換えるので、複数ページの overlay を同時に持つ。lease と provisional 抑止は `blockIds` で判定する。covering canonical が着地すれば全 delta が退役する。
+
+anchor を作らなかった編集でも lineage は捨てない（`canonicalAnchorLineageKept`）。証明はつねに base 世代の witness と現在の galley の比較なので、拒否された中間打鍵があっても次の plan は完全な差分を持つ。捨てるのは canonical が現行になった復元（`canonical-current`）、reboot、base 世代が変わったときだけ。client も同様に、intent の無い report で既存 overlay を消さず last-good として保持する（同じ block なら 1 打鍵遅れの証明済み表示、別 block なら overlay のページだけ凍結して他ページの provisional は通す）。以前はどちらも overlay を消して古い base ページを露出し、続く打鍵も次の canonical まで anchor が付かなかった。
+
+anchor を作らなかった編集の report には `canonicalAnchorRefused` に理由を入れる（`canonical-behind`・`base-generation`・`ledger-mismatch`・`mixed-frame-changed`・`edited-contribution-paint`・`paint-callbacks`・`mixed-active-chars` など、capture と plan の各条件に 1 つずつ）。client はこの項目を使わない。条件は fail-closed で数が多く、1 つ外れると表示は canonical を待つだけなので、TeX Live の更新で callback の description が変わった場合などに原因を追う手がかりはこれしかない。証明（SyncTeX・paint index の照合と予算）での失敗は従来どおり `canonical-anchor` の patch の status に出る。
+
+canonical anchor（plain・mixed 共通）の契約の前提（信頼境界）: 既知の callback 集合（上の (4)）の外にある Lua・package のコード、任意の `\directlua`、canonical だけが走らせる実際の `\output` と shipout hook は、既に組まれた node list を読んで、その内容に応じて resident が観測しない描画（TeX が作る literal の中身など）を生成しない、と仮定する。この前提を満たさない文書では anchor の正しさを保証しない。これは resident の galley 再利用（block の出力は source と入口の状態で決まる）と同じ前提で、LuaTeX 1.24 では一般には検査できない。TeX が作った literal の中身は読めず、`\directlua` の実行を捕まえる hook も `debug.getinfo` もない。luatexja 自身が TeX macro から `tex.nest` を読む（`\ltj@@getparam@one{direction}` など）ので、list を読むコードの有無で文書を分けることもできない。block を分けても、後の block が前の block の page list を読めば同じことが起きるので、この前提は block 境界にも block 内にも同じようにかかる。
 
 ## 10.11 hot path から外れているもの
 

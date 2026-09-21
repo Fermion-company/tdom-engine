@@ -2,14 +2,16 @@ import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch } from './safety.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
-import { firstDirtyIndex } from './update-helpers.js';
+import { firstDirtyIndex, nextEditHold, editPageRenderIds } from './update-helpers.js';
+import { checkpointBudgetFor } from './checkpoint-selection.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { sourceClosure } from './closure.js';
 
-export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
+export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, callbacks }) {
   const { opaqueUpdate, deferClosureUpdate, bootRoot, scheduleStructuredReprobe, expandIncludes, unindexBlock } = callbacks;
   const text = engine.store.get(engine.file);
   const diagnostics = [];
+  engine.closureDeferred = null;
 
   const bounds = documentBounds(text);
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
@@ -20,7 +22,9 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   // environment makes the segmenter absorb every following paragraph; if
   // that temporary segmentation were committed, "hold last good" would
   // still make the document tail disappear. The source store advances, but
-  // no TeX path or layout identity advances until the closing syntax lands.
+  // no resident layout identity advances until the closing syntax lands.
+  // The lexical gate is not a TeX parser: canonical must still compile the
+  // current input, either proving it valid or reporting the actual error.
   if (engine.blocks.length) {
     const preClosure = sourceClosure(preamble);
     if (!preClosure.closed) {
@@ -51,7 +55,7 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   let segs = segmentBody(bodyText, bounds.body.start, {
     structuralEvents: rawStructuralGate.segmentEvents,
   });
-  segs = expandIncludes(segs, 0);
+  segs = expandIncludes(segs, 0, { structuralEvents: rawStructuralGate.segmentEvents });
   // Macro wrappers can hide output-routine environments from both the raw
   // segmenter and block rescue classifier. Analyse the expanded project body
   // before granting structured display; an exact canonical page is the only
@@ -89,6 +93,7 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   // sparse resident skeleton once for this source generation; subsequent
   // JOBs reuse it unless a genuinely hotter block changes the top set.
   engine.checkpointKeepCache = null;
+  engine.maxCheckpoints = checkpointBudgetFor(engine.blocks.length, { ceiling: engine.checkpointCeiling });
   if (shippingExactUses.length) {
     engine.previewPolicy = 'shipping-exact';
     engine.previewReasons = [...new Set(shippingExactUses.flatMap((use) =>
@@ -115,6 +120,17 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
     }
   }
   const dirtySource = new Set(diff.dirty);
+  for (const id of diff.removed) engine.coldDirty?.delete(id);
+  if (editLabel === 'cold-resume') {
+    // The resume re-runs the update for the source as it is now: the blocks
+    // a cold stop left un-typeset are its dirty set. An ordinary keystroke
+    // elsewhere does not chase them (its own hot path stays hot). A walk
+    // that passed over one (a caret warm, typically) already typeset it;
+    // it is still re-run here, cheaply, so the keystroke gets its report.
+    for (const block of engine.blocks) {
+      if (engine.coldDirty?.has(block.id) || coldIds?.has(block.id)) dirtySource.add(block.id);
+    }
+  }
 
   if (!engine.preGate.gate.safe) {
     return {
@@ -222,6 +238,18 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
     bounds: diff.bounds,
     dyingPids: engine.dyingPids,
   }));
+
+  // Pin before the walk can retire a newly materialized input or capture
+  // owner. Finalization cannot recover a checkpoint that has already died.
+  const pageRenderIds = editPageRenderIds(engine.blocks, engine.pages, dirtySource);
+  engine.foregroundRenderIds = rebooted || !dirtySource.size ? null : new Set([...dirtySource, ...pageRenderIds]);
+  if (engine.foregroundRenderIds) {
+    for (const [index, id] of engine.renderHold) {
+      if (!engine.foregroundRenderIds.has(id)) engine.renderHold.delete(index);
+    }
+  }
+  engine.editHold = rebooted ? [] : nextEditHold(firstDirty,
+    [...dirtySource, ...pageRenderIds], engine.blocks, engine.editHold);
 
   return { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted };
 }

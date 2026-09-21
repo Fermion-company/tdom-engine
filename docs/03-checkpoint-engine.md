@@ -16,10 +16,23 @@
 | `engine/checkpoint/safety.js` | structured path に入れてよい文書かを判定する |
 | `engine/checkpoint/fidelity.js` | glyph 表示と exact chunk の切り替え判定 |
 | `engine/checkpoint/mathmap.js` | legacy math font の twin font mapping |
+| `engine/checkpoint/mapped-inputs.js` | `\input` を展開してから段落を分割し、複数ファイルにまたがる block の元ソース位置を保持する |
+
+`\input` の前後には段落境界を追加しない。空行・明示的な `\par`・sectioning が block の境界になる。複数ファイルを含む block の `sourceParts` は各テキスト範囲と元ファイル位置を持ち、DOM の `sourceRanges` と個々の `editRegions.source` に変換される。カーソル位置の warming もこの対応で対象 block を解決する。
+
+ShippingChain は root bytes に加えて、現在の静的 expander が実際に読んだ project input の logical path・bytes・read order を revision snapshot に固定する。過去の include cache は snapshot/mirror に持ち込まない。既知の単一 brace-literal `\input` の plain-text 変更だけは、その input を読む root feed unit より前の page checkpoint から再開する。chain 専用 mirror が同じ logical path を immutable bytes で shadow し、変更前 child の input buffer を持つ unit 内 checkpoint は再利用しない。root と child の両方に既存の replay safety profile を適用する。未知 reader、`\include`、複数・削除・構造変更は baseline/canonical へ戻し、旧 shipping generation を新 `srcRev` に付け替えない。
 
 ## 3.2 プロセスモデル
 
+常駐 checkpoint の予算は文書の大きさに追従する。`TDOM_MAX_CHECKPOINTS` は上限で、各 source generation の segmentation 時に `checkpointBudgetFor(blocks, {ceiling})` = `min(ceiling, blocks + 1)` が `maxCheckpoints` になる。短い文書は全 block 境界を保持し（どこを打鍵しても fork 1 回・組版 1 block）、長い文書はメモリ上限まで持って実測コストで配る。休眠 fork の実コストは fork 以降に活動中 process が書き換えたページ分だけなので、上限はメモリの knob である。骨格の選び方も上限に応じて変わる: 上限 8 までは従来どおり `limit-2` 枠を高コスト block の入出力境界に使うが、それを超える上限では高コスト枠を半分までに抑え、残りは文書全体の cost 加重分位に**残枠数で**均等に配る（以前は分位の序数を `limit-1` 分母で 1 から使っていたため、高コスト枠が多いと残枠が文書前半に固まり、上限 32 でも後半の章で 271 block の再生が起きた）。
+
+Resident と Shipping は `maxCheckpoints` の2倍を論理目標として共有する。Shipping は page checkpoint 3個（root・直前の certified prefix base・現在の局所 frontier）と feeder/生成中 continuation 1個を先に予約し、resident は checkpoint coverage を先に間引く。resident root、実行中 JOB の入力と未 materialize continuation、実行中 RENDER/CAPTURE の所有者、edit/render hold は回収しないため、それらが多い間だけ Shipping の frontier 枠を減らす。小さい枠や一時 pin の集中で root と certified base まで目標内に収まらない場合は、正しさを優先して目標を超える。root と certified base は新しい再開 base が実在するまで残す。同じ process が複数 boundary に現れても1個と数え、DIE 済み PID は保持数ではなく reap queue で別に観測する。再開時は保持済み prefix を除いた残枠から tail の保存間隔を決め、最終 `\end{document}` の後には新しい checkpoint を作らない。
+
 root は `lualatex --shell-escape -interaction=nonstopmode driver.tex` として起動される。`--shell-escape` は `tdomfork.c` の共有ライブラリを `package.loadlib` するために使われる。
+
+checkpoint 0 の準備完了は font warmup と初期 GC の後に通知する。background JOB の末尾では Lua の incremental GC を 2048KB 分進め、完了した cycle の使用量を基準にする。初期本文の最終 JOB で一度回収を完了させ、本文フォントを含む live heap を記録する。foreground は同じ root のどの block で確認した live heap も基準にし、そこから64MB以内なら collector を止めて atomic scan を延期する。font cache の再読込を毎回未回収ゴミと数えない。未回収分が基準から64MB増えた場合は full GC を行う。毎回同じ checkpoint から編集しても、8MBの増加ごとに日本語フォントを含む heap 全体を2回走査することはない。
+
+macOS の foreground JOB と Shipping の編集継続は、その worker thread に `QOS_CLASS_USER_INITIATED` を設定する。非対話 JOB と Shipping の保存用待機では default に戻す。親アプリや起動方法の実行優先度に編集応答が左右されるのを抑え、他 OS のスケジューリングは変更しない。
 
 ```text
 Node.js engine
@@ -33,6 +46,12 @@ Node.js engine
 ```
 
 checkpoint は「ある block 境界まで処理済みの TeX プロセス」である。OS の copy-on-write `fork()` が TeX 状態の snapshot になるため、マクロ、catcode、counter、font、box register などを JavaScript 側で保存・復元しない。
+
+cold prefix の walk は、直前に自身が作った未保持の continuation に限り `STEP` で進める。さらに、その block が直前の実行で native 成功済みで、deferred・frozen・rescue 中ではないことを必要とする。今回の `STEP` が新たに失敗した場合は、失敗後の TeX 状態を採用せず、残っている最寄りの祖先 checkpoint から通常の `JOB` だけで入力境界を一度再構築してから既存の state fallback を行う。ブロックごとの native 組版、galley/state 検証は従来と同じで、既存の保存状態・編集中の input・描画中の所有者では必ず fork する。保存対象の境界では直前の JOB node list も保持し、未変更の exact neighbor を再組版せず描画できる。
+
+checkpoint の配置は、回収処理を除いた再組版時間で選ぶ。平均的な block に保存枠を集中させず、中央値の8倍かつ全体の再実行費用に対して十分重い block だけ両側を優先し、残りを費用の分位点へ配置する。末尾用の枠は終端の空白・改ページ処理より前、近い明示改ページがある場合は最後の本文ページの冒頭に置く。未測定 block には測定済み中央値を使い、boot の測定進行に応じて配置を更新する。新しい保存先がまだ存在しない間は、近い既存 checkpoint を枠内で残す。各 JOB の完了時に、次の処理に必要な continuation を残して保持数を整理する。
+
+未作成の保存先を既存 checkpoint で代替する際、edit/render 用に別枠で保持する checkpoint は後回しにする。編集中の局所的な保存状態が文書全体の到達性を奪わない。page warming の完了地点も既存の editHold 上限内に残す。既に費用を計測した block の warming は配置費用を更新しないため、古い snapshot からの一時的な font 再読込で大域的な配置が変わらない。
 
 ## 3.3 driver.tex の注入内容
 
@@ -58,7 +77,8 @@ checkpoint は「ある block 境界まで処理済みの TeX プロセス」で
 
 | command | 内容 |
 | --- | --- |
-| `JOB <blockId> <newCkptIdx> <len> <captureToken\|->` | block を組版し、結果を返して次 checkpoint になる。display math の hot job は node list を世代付きで保持する |
+| `JOB <blockId> <newCkptIdx> <len> <captureToken\|-> <F\|B\|C> <liveFloorKb>` | block を組版し、結果を返して次 checkpoint になる。display math の hot job は node list を世代付きで保持する |
+| `STEP` | 同じ walk が作った一時 continuation を次の block へ進める。JOB と同じ引数・結果で、保存用 checkpoint は消費しない |
 | `CAPTURE <blockId> <token> <jobDir> <requestId>` | post-block checkpoint が保持する JOB node list を再組版せず shipout する |
 | `RENDER <blockId> <jobDir> <len> <requestId>` | block を tight PDF として shipout する |
 | `DROP_CAPTURE <blockId> <token>` | exact pixel が不要だった保持 node list を解放する |
@@ -73,7 +93,7 @@ checkpoint は「ある block 境界まで処理済みの TeX プロセス」で
 | `GEO` | paper/text/float/footnote などの geometry |
 | `TWIN` | twin math font の glyph metrics |
 | `GALLEY` | block の node-list 抽出結果 |
-| `CKPT` | checkpoint 昇格通知 |
+| `CKPT` | checkpoint 昇格通知と回収済み live heap の基準 |
 | `FORKED` | 子 process pid 通知 |
 | `DONE` | RENDER PDF 完了通知 |
 | `CAPTUREMISS` | capture が無い、または編集世代が一致しないため fallback を要求 |
@@ -88,6 +108,8 @@ daemon は block を real main vertical list 上で組み、その結果を JSON
 glyph run は同一 font/size/color/baseline shift の連続として送られる。ただし kern/glue で必ず分割されるため、run 内の描画位置は font advance の積み上げで確定する。
 
 large math glyph、OpenType math、PUA/unencoded glyph、PDF literal などは daemon 側で flag され、`fidelity.js` が glyph 表示か exact chunk かを決める。
+
+resident RENDER / CAPTURE と isolated RENDER の PDF は、TeX の論理幅の左右に元の用紙幅だけ余白を持つ。`render-padding.txt` の実測余白を chunk の `xBp` と画像幅へ反映し、文字原点と sourcebox の論理幅を保つ。負の x 座標に描く枠線も PDF 化の時点で失われず、最終的な表示範囲は物理ページが切り取る。
 
 ## 3.6 `#updateInner()` の現行順序
 
@@ -147,6 +169,10 @@ foreground verification の現在の初期 budget は、galley divergence 用が
 
 warm/rescue の組版結果が同一でも、chunkの版が変わった場合は表示リストを再生成し、画像と入力座標が参照する版を揃える。
 
+`/warm` は `offset` と任意の `filePath` を受け取り、そのソースファイルに属する block の前後を保持する。子ファイルの offset は子ファイルの本文長と照合し、親ファイルの同じ数値の位置へ置き換えない。`filePath` 省略時は従来どおり root を対象にする。offset 指定の warm が `ready` になり canonical がその時点のソースと一致していれば、サーバはキャレットの block の canonical-anchor 証明材料（ソース行ごとの SyncTeX 候補とページの paint index）を先に取得する。どちらも canonical generation ごとの cache に入り（SyncTeX は `synctex view` の呼び出し 1 回ずつがファイル全体を読み直すため、行数の多い block は編集後の予算内に取れない）、最初の打鍵の証明はそこから読む。
+
+同じページに欠けている exact chunk があれば、その block まで同じ中断可能な chain を準備し、既存の並列数制限付き render pump へ渡す。`/warm` の `page` 指定はそのページの先頭 block を起点にする。viewer は canonical の表示確定後とスクロール停止後に表示中のページを準備する。入力や文書切替による世代変更は既存の abort 経路で優先される。新しい warm が実行中の warm walk を置き換えるときは、実行中の子を kill せず次の block 境界で止める（replay の STEP 子は walk の唯一の続きで、kill すると再実行分が全部失われる）。止まった walk は到達した境界を editHold に固定し、新しい warm はそこから再開する。
+
 標準 class option の二段組と本文中の `\onecolumn` / `\twocolumn` は、page builder の結果を表示せず、resident LuaLaTeX の実定義・実列幅による行組みだけを canonical-addressed overlay に使う。列切替時の `\box255` はTeXプリミティブで通常boxへ移してから dormant pageへ戻し、active column mode / width を exit state vector に含める。overlay は編集位置が可視本文 region 内であることと、内部段落なら行数が変わらないことを確認し、TeXのline boxが変化したsuffixだけを物理列上で差し替える。mid-document geometry change と `\balance` は `safety.js` 側で structured path から外れる。margin note は canonical-only block である。footnote は扱うが、TeX と同じ page-spanning split を完全再現する実装ではない。
 
 ## 3.9 exact chunk の経路
@@ -167,7 +193,9 @@ render lane の終了時にも queue を再確認する。全 lane が終了判�
 
 CAPTURE の初期対象は `\[...\]`、`$$...$$`、equation/align/gather/multline 等の display math に限定する。token は source edit ごとに単調増加し、block id と token の両方が一致した場合だけ shipout する。capture child を fork した直後に checkpoint 親の list を解放し、次の JOB child は継承した古い list を組版前に破棄する。graphics、float、breakable box は backend/output-routine state の所有境界が異なるため、従来の RENDER/isolated 経路を使う。
 
-通常driverとisolated rescueの吸収用output routineは、TeXの `\global\setbox...=\box255\relax` で出力boxを専用boxへ移してからLuaで回収する。`\relax` はbox番号の読み取りを終え、代入前に後続の `\directlua` が展開されることを防ぐ。isolated rescueの最終回収はpage listとcontribution listの両方を連結し、改ページ直後にcontribution側へ戻った本文も保持する。
+通常driverとisolated rescueの吸収用output routineは、TeXの `\global\setbox...=\box255\relax` で出力boxを専用boxへ移してからLuaで回収する。`\relax` はbox番号の読み取りを終え、代入前に後続の `\directlua` が展開されることを防ぐ。吸収は ship しないので毎回 dead cycle になるが、LuaTeX は `tex.deadcycles` への代入を無視する。回収関数は `tex.sprint('\\deadcycles=0\\relax')` で TeX 自身に戻させ（output routine の中で Lua 呼び出しの直後に実行される）、fork の系列に沿って `\maxdeadcycles` へ積み上がらないようにする。暴走上限（fires > 50）に達した発火では戻さない。isolated rescueの最終回収はpage listとcontribution listの両方を連結し、改ページ直後にcontribution側へ戻った本文も保持する。
+
+通常の `\newpage`・`\clearpage`・`\cleardoublepage` は native の吸収処理で前後の素材と eject marker を保持し、命令名だけでは isolated rescue にしない。`\maketitle` の class 固有出力と、独自 output routine を使う環境は rescue 判定を維持する。
 
 isolated render は idle-gated の低優先度経路である。`rescueQueue` が空、canonical が compile 中でない、直近編集から一定時間が経過、などの条件を見て動く。
 

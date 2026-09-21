@@ -83,6 +83,11 @@ end
 --            pieces) — not even a glyph bridge is presentable
 local line_x = false
 local line_xb = false
+-- paint-state whatsits (literals, color stack, matrices, specials) met in
+-- the current top-level box; hashed onto the item so a galley records the
+-- graphics it draws, not just that it draws some
+local line_fx = nil
+local line_ca = false
 
 local SP2BP = 65781.76
 -- 6 decimals: page assembly sums hundreds of these; 3 decimals accumulated
@@ -91,6 +96,44 @@ local function bp(sp) return math.floor(((sp or 0) / SP2BP) * 1000000 + 0.5) / 1
 
 local DUMMY_ATTR = 8123
 local LASTSKIP_ATTR = 8124 -- marks the \lastskip primer glue (see tdom_prime_lastskip)
+-- The build_page call that moved a top-level node (see note_trail). The
+-- canonical-anchor proof reads it, so it takes an allocated attribute rather
+-- than a fixed number a document could also set; the daemon loads after the
+-- preamble, so no package's attribute moves. Without one, nothing is stamped:
+-- every epoch reads 0 and the mixed anchor refuses (fail-closed).
+local EPOCH_ATTR = (function()
+  local ok, attr = pcall(function() return luatexbase.new_attribute('tdom@epoch') end)
+  return ok and tonumber(attr) or nil
+end)()
+
+-- The state trail. A plain-text edit reaches later, unedited code in its
+-- block only through what TeX keeps between contributions to the main
+-- vertical list: the nest's \prevgraf/\prevdepth, \badness, the page totals
+-- and the last-node quantities. Every build_page samples them; equal trails
+-- mean everything after the edited paragraph ran from the same state, so its
+-- output is the same even where the harvest cannot read it (a TeX-built
+-- pdf_literal's token list). Each sample also stamps the nodes it is about
+-- to move, so the harvest knows which contribution a top-level item was.
+local blk_trail = nil -- per job; nil outside one
+local function note_trail(info)
+  if not blk_trail then return end
+  local epoch = #blk_trail + 1
+  local n = EPOCH_ATTR and tex.lists.contrib_head
+  while n do
+    if not node.has_attribute(n, EPOCH_ATTR) then node.set_attribute(n, EPOCH_ATTR, epoch) end
+    n = n.next
+  end
+  local nest = tex.nest[0]
+  local function get(name)
+    local ok, value = pcall(tex.get, name)
+    return ok and type(value) == 'number' and value or '?'
+  end
+  blk_trail[epoch] = table.concat({ tostring(info), nest.prevgraf or '?', nest.prevdepth or '?',
+    get('badness'), get('inputlineno'), tex.pagetotal or '?', tex.pagegoal or '?', tex.pagedepth or '?',
+    tex.pagestretch or '?', tex.pagefilstretch or '?', tex.pagefillstretch or '?',
+    tex.pagefilllstretch or '?', tex.pageshrink or '?', get('insertpenalties'),
+    tostring(tex.lastpenalty), tostring(tex.lastkern), tostring(tex.lastnodetype) }, ':')
+end
 
 -- A block is harvested on a freshly-seeded page, so \lastskip is 0 when it
 -- starts — but in a continuous run the previous block's trailing \addvspace
@@ -183,8 +226,6 @@ function tdom_boot(port, workdir, counters)
   sock = require('socket')
   conn = assert(sock.connect('127.0.0.1', PORT))
   conn:setoption('tcp-nodelay', true)
-  conn:send('HELLO ckpt 0 ' .. fk.getpid() .. '\n')
-  texio.write_nl('tdom: daemon resident, checkpoint 0, pid ' .. fk.getpid())
   -- A recovered TeX error may still reach the injected tdom_report().  That
   -- output is not a successful preview generation: mark the JOB so the host
   -- can discard its child checkpoint and keep the previous good galley.
@@ -199,6 +240,51 @@ function tdom_boot(port, workdir, counters)
         texio.write_nl('term and log', tostring(status.lasterrorcontext or ''))
       end
     end, 'tdom-closure-certificate')
+  end
+end
+
+-- Paint added after the resident's harvest (shipout filters) and node-list
+-- filters that see typed text: canonical-anchor repaints a resident line
+-- over canonical pixels only when it recognizes every one of them. GEO
+-- reports the preamble's registrations; each galley then reports every one
+-- made after that snapshot along its lineage (paint_late is inherited by
+-- forks), including one a block adds and removes again: the driver's first
+-- line logs each add_to_callback call (TDOM_CALLBACK_LOG, tex-templates.js),
+-- and every report also re-reads the registry.
+local PAINT_CALLBACKS = { 'pre_shipout_filter', 'pre_linebreak_filter', 'post_linebreak_filter',
+  'hpack_filter', 'vpack_filter', 'buildpage_filter', 'pre_output_filter', 'contribute_filter',
+  'append_to_vlist_filter', 'hyphenate', 'ligaturing', 'kerning', 'linebreak_filter',
+  'mlist_to_hlist', 'process_rule' }
+local PAINT_WATCH = {}
+for _, name in ipairs(PAINT_CALLBACKS) do PAINT_WATCH[name] = true end
+local TRAIL_CALLBACK = 'tdom.state-trail' -- the resident's own instrument (below)
+local paint_seen = {}
+local paint_late = nil
+
+local function note_paint_callback(name, description, late)
+  if not PAINT_WATCH[name] or description == TRAIL_CALLBACK then return end
+  local key = name .. '\0' .. tostring(description)
+  if paint_seen[key] then return end
+  paint_seen[key] = true
+  if late then
+    paint_late = paint_late or {}
+    paint_late[name] = paint_late[name] or {}
+    table.insert(paint_late[name], tostring(description))
+  end
+end
+
+local paint_logged = 0 -- TDOM_CALLBACK_LOG entries already read
+local function scan_paint_callbacks(late)
+  local log = TDOM_CALLBACK_LOG or {}
+  if late then
+    for i = paint_logged + 1, #log do note_paint_callback(log[i][1], log[i][2], true) end
+  end
+  paint_logged = #log
+  for _, name in ipairs(PAINT_CALLBACKS) do
+    local ok, desc = pcall(function() return luatexbase.callback_descriptions(name) end)
+    if ok and type(desc) == 'table' then
+      for _, description in ipairs(desc) do note_paint_callback(name, description, late) end
+    end
   end
 end
 
@@ -242,6 +328,13 @@ function tdom_geo()
     lineskipsh = bp(tex.lineskip.shrink or 0),
     lineskipsho = tex.lineskip.shrink_order or 0,
   }
+  local callbacks = {}
+  for _, name in ipairs(PAINT_CALLBACKS) do
+    local ok, desc = pcall(function() return luatexbase.callback_descriptions(name) end)
+    if ok and type(desc) == 'table' and #desc > 0 then callbacks[name] = desc end
+  end
+  scan_paint_callbacks(false)
+  geo.paintCallbacks = next(callbacks) and callbacks or 'none'
   for k, v in pairs(geo_extra) do geo[k] = v end
   local payload = jenc(geo)
   conn:send('GEO ' .. #payload .. '\n')
@@ -447,6 +540,57 @@ end
 local LIT_SUB = node.subtype and node.subtype('pdf_literal')
 local COL_SUB = node.subtype and node.subtype('pdf_colorstack')
 local SPECIAL_SUB = node.subtype and node.subtype('special')
+local FX_KIND = {}
+for _, name in ipairs({ 'pdf_literal', 'pdf_colorstack', 'pdf_setmatrix', 'pdf_save', 'pdf_restore', 'special', 'late_lua' }) do
+  local subtype = node.subtype and node.subtype(name)
+  if subtype then FX_KIND[subtype] = name end
+end
+
+-- luacolor keeps colors in an attribute and writes them into the page only
+-- at shipout (pre_shipout_filter), after this harvest: a box whose glyphs or
+-- rules carry that attribute paints a color the resident runs do not show.
+local LUACOLOR_ATTR = nil -- resolved once: the preamble has run before any harvest
+local function luacolor_attribute()
+  if LUACOLOR_ATTR == nil then
+    local ok, attr = pcall(function() return oberdiek.luacolor.getattribute() end)
+    LUACOLOR_ATTR = ok and tonumber(attr) or false
+  end
+  return LUACOLOR_ATTR or nil
+end
+
+-- Black is the one color the resident runs already paint. luacolor's value
+-- table is private, but getvalue() answers an already registered color with
+-- its value (a new one only adds an unused entry); ask once, in the root, so
+-- every fork inherits the same answer.
+local LUACOLOR_BLACK = nil
+local function luacolor_black()
+  if LUACOLOR_BLACK == nil then
+    LUACOLOR_BLACK = {}
+    pcall(function()
+      for _, color in ipairs({ '0 g 0 G', '0 0 0 rg 0 0 0 RG', '0 0 0 1 k 0 0 0 1 K' }) do
+        LUACOLOR_BLACK[oberdiek.luacolor.getvalue(color)] = true
+      end
+    end)
+  end
+  return LUACOLOR_BLACK
+end
+
+local function note_shipout_color(n)
+  if line_fx == nil or line_ca then return end
+  local attr = luacolor_attribute()
+  local value = attr and node.has_attribute(n, attr)
+  if value and not luacolor_black()[value] then line_ca = true end
+end
+
+local function note_fx(n)
+  local kind = line_fx and FX_KIND[n.subtype]
+  if not kind then return end
+  -- A late_lua payload may be a Lua function: its tostring() is a heap
+  -- address, and galley hashes must stay a pure function of TeX's output.
+  local payload = n.data or n.token or ''
+  line_fx[#line_fx + 1] = kind .. ':' .. tostring(n.mode or '') .. ':' .. tostring(n.stack or '') .. ':' ..
+    tostring(n.command or n.cmd or '') .. ':' .. (type(payload) == 'string' and payload or type(payload))
+end
 
 local function check_special(n)
   if SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data then
@@ -593,6 +737,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
   local n = head
   while n do
     local id = n.id
+    if id == GLYPH or id == RULE then note_shipout_color(n) end
     if id == GLYPH then
       note_font(n.font)
       local fi = seen_fonts[n.font]
@@ -696,6 +841,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
         node.free(fake)
       end
     elseif id == WHATSIT then
+      note_fx(n)
       if COL_SUB and n.subtype == COL_SUB then
         flush()
         local cmd = n.command or n.cmd
@@ -732,6 +878,7 @@ walk_v = function(box, x0, baseline_dy, out, math_mode)
       walk_v(n, x0 + bp(n.shift or 0), y + bp(n.height or 0), out, math_mode)
       y = y + bp(n.height or 0) + bp(n.depth or 0)
     elseif id == RULE then
+      note_shipout_color(n)
       local h = n.height
       local d = n.depth
       local w = n.width
@@ -745,6 +892,7 @@ walk_v = function(box, x0, baseline_dy, out, math_mode)
     elseif id == KERN then
       y = y + bp(n.kern or 0)
     elseif id == WHATSIT then
+      note_fx(n)
       if LIT_SUB and n.subtype == LIT_SUB then blk_gfx = true end
     end
     n = n.next
@@ -771,11 +919,13 @@ end
 -- builder runs TeX's own break-cost arithmetic over these values.
 -- `parentBox` is nil for the top-level MVL harvest (glue there is unset, so
 -- natural width IS the effective width).
+local top_epochs = {} -- per top-level item: the EPOCH_ATTR stamp of its node
 local function extract_items(head, parentBox)
   local items = {}
   local n = head
   while n do
     local id = n.id
+    local before = #items
     if is_dummy(n) then
       -- the page-keeper box: not document content
     elseif not parentBox and node.has_attribute(n, LASTSKIP_ATTR) then
@@ -795,6 +945,8 @@ local function extract_items(head, parentBox)
       -- walk of this one top-level line box
       line_x = false
       line_xb = false
+      line_fx = {}
+      line_ca = false
       if id == HLIST then
         -- shift_amount is how TeX indents \parshape/\hangindent lines —
         -- LaTeX lists live on it. The nested walks (519/587) honored it;
@@ -804,11 +956,16 @@ local function extract_items(head, parentBox)
       elseif id == VLIST then
         walk_v(n, bp(n.shift or 0), bp(h), runs)
       else
+        note_shipout_color(n)
         runs[1] = rule_run(n, 0, -bp(h), w, h, d, '#000000')
       end
       local item = { k = 'box', h = bp(h), d = bp(d), w = bp(w), runs = runs }
       if line_x then item.x = 1 end
       if line_xb then item.xb = 1 end
+      if #line_fx > 0 then item.fx = md5.sumhexa(table.concat(line_fx, '\n')) end
+      if line_ca then item.ca = 1 end
+      line_fx = nil
+      line_ca = false
       if #pending_fmarks > 0 then
         item.fm = pending_fmarks
         pending_fmarks = {}
@@ -892,6 +1049,10 @@ local function extract_items(head, parentBox)
         blk_gfx = true
       end
     end
+    if not parentBox and #items > before then
+      local epoch = EPOCH_ATTR and node.has_attribute(n, EPOCH_ATTR) or 0
+      for i = before + 1, #items do top_epochs[i] = epoch end
+    end
     n = n.next
   end
   return items
@@ -955,7 +1116,39 @@ local function reseed_page()
   end)
 end
 
+local function checkpoint_gc(initial, interactive)
+  if os.getenv('TDOM_NO_CKPT_GC') then return end
+  if initial or not TDOM_GC_FLOOR then
+    collectgarbage('collect')
+    collectgarbage('collect')
+    TDOM_GC_FLOOR = collectgarbage('count')
+    return
+  end
+  -- Advance the inherited incremental collector instead of sweeping the
+  -- entire Japanese font heap twice on each fork from the same boundary.
+  -- A hard garbage allowance still bounds deep lineages when a block
+  -- allocates faster than these incremental steps can reclaim it.
+  local kb = collectgarbage('count')
+  -- A collector step may enter an atomic scan of the entire font heap.
+  -- Foreground forks defer it while remaining inside the garbage allowance.
+  if interactive and kb <= TDOM_GC_FLOOR + 65536 then return end
+  local completed = collectgarbage('step', 2048)
+  kb = collectgarbage('count')
+  if completed then
+    TDOM_GC_FLOOR = kb
+  elseif kb > TDOM_GC_FLOOR + 65536 then
+    collectgarbage('collect')
+    collectgarbage('collect')
+    TDOM_GC_FLOOR = collectgarbage('count')
+  end
+end
+
 function tdom_seed()
+  luacolor_black() -- once in the root, before any fork
+  scan_paint_callbacks(true) -- anything the boot template added after GEO
+  if luatexbase and luatexbase.add_to_callback then
+    pcall(luatexbase.add_to_callback, 'buildpage_filter', note_trail, TRAIL_CALLBACK)
+  end
   pcall(function() tex.triggerbuildpage() end)
   local old = tex.lists.page_head
   local oldc = tex.lists.contrib_head
@@ -966,6 +1159,11 @@ function tdom_seed()
   reseed_page()
   -- fresh document start: no interline glue above the first line
   tex.nest[0].prevdepth = -65536000
+  checkpoint_gc(true)
+  -- Readiness includes the font warmup and heap cleanup. A JOB measured
+  -- before this point would charge preamble work to its source block.
+  conn:send('HELLO ckpt 0 ' .. fk.getpid() .. '\n')
+  texio.write_nl('tdom: daemon resident, checkpoint 0, pid ' .. fk.getpid())
 end
 
 -- Collect the freshly typeset MVL nodes (page list + any contributions the
@@ -1008,7 +1206,11 @@ function tdom_absorb_output(boxnum)
       ' times in one block — page-builder cycle, bailing out of this fork')
     fk._exit(3)
   end
-  tex.deadcycles = 0
+  -- LuaTeX ignores a tex.deadcycles assignment. Queue TeX's own reset to
+  -- run inside \output after this call; without it every absorbed fire
+  -- (two per \clearpage) accumulated along the fork lineage, and ~100 pages
+  -- in each later eject died with "Output loop" and a forced \shipout.
+  tex.sprint('\\deadcycles=0\\relax')
   local pen = tex.outputpenalty or -10000
   if os.getenv('TDOM_TRACE_OUTPUT') then
     local jid = JOB and JOB.id or '?'
@@ -1199,7 +1401,11 @@ function tdom_report()
   local head = harvest_nodes()
   colstack = {}
   pending_fmarks = {}
+  top_epochs = {}
   local items = extract_items(head, nil)
+  local epochs = {}
+  for i = 1, #items do epochs[i] = top_epochs[i] or 0 end
+  scan_paint_callbacks(true)
   local w, hsum = 0, 0
   for _, it in ipairs(items) do
     if it.k == 'box' then
@@ -1211,6 +1417,8 @@ function tdom_report()
   end
   encode_runs(items)
   for _, f in ipairs(blk_floats) do encode_runs(f.items) end
+  local trail_marks = {}
+  for i, sample in ipairs(blk_trail or {}) do trail_marks[i] = md5.sumhexa(sample) end
   -- complete font table for THIS galley: every id its runs reference
   local fonts = {}
   for fid in pairs(blk_fonts) do
@@ -1225,6 +1433,9 @@ function tdom_report()
     tm = {
       typeset = math.floor((TR0 - (T_JOB or TR0)) * 100000 + 0.5) / 100,
       harvest = math.floor((TR1 - TR0) * 100000 + 0.5) / 100,
+      heapKb = collectgarbage('count'),
+      gcFloorKb = TDOM_GC_FLOOR,
+      interactive = JOB.interactive,
     }
   end
   local capture = nil
@@ -1258,32 +1469,37 @@ function tdom_report()
     closure = JOB.had_error and 'error' or 'native',
     closure_error = JOB.error,
     tdomSourceCatcodesSafe = JOB.sourceCatcodesSafe == true,
+    tdomActive = JOB.activeChars ~= '' and JOB.activeChars or nil,
+    trail = md5.sumhexa(table.concat(blk_trail or {}, '\n')),
+    trailMarks = trail_marks,
+    epochs = epochs,
+    paintLate = paint_late,
     backend = resident_backend_profile(),
   })
   if head and not capture then node.flush_list(head) end
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
   conn:send(payload)
-  -- Collect BEFORE this process becomes a long-lived checkpoint: the fork
-  -- chain inherits the whole Lua heap, so uncollected per-job garbage
-  -- (luatexja's per-paragraph tables, payload strings) compounds across
-  -- generations — on Japanese documents the per-block cost was measured
-  -- growing from ~1ms to ~11s along a 450-block chain without this.
-  -- Thresholded so clean-heap blocks don't pay a full GC sweep each.
-  if not os.getenv('TDOM_NO_CKPT_GC') then
-    local kb = collectgarbage('count')
-    if kb > (TDOM_GC_FLOOR or 0) + 8192 then
-      collectgarbage('collect')
-      collectgarbage('collect')
-      TDOM_GC_FLOOR = collectgarbage('count')
-    end
-  end
+  local gc_started = os.gettimeofday and os.gettimeofday() or os.clock()
+  checkpoint_gc(JOB.calibrate, JOB.interactive)
+  local gc_ms = ((os.gettimeofday and os.gettimeofday() or os.clock()) - gc_started) * 1000
   -- this child now becomes the next checkpoint in the chain
   CKPT = JOB.ckpt
-  conn:send('CKPT ' .. CKPT .. ' ' .. fk.getpid() .. '\n')
+  conn:send('CKPT ' .. CKPT .. ' ' .. fk.getpid() .. ' ' .. (TDOM_GC_FLOOR or 0) .. ' ' .. gc_ms .. '\n')
   JOB = nil
 end
 
 -- ------------------------------------------------------------ shipping
+
+-- Graphics may paint outside their logical TeX box. Preserve a physical
+-- page's horizontal overhang; the host still clips at the document page.
+local function render_horizontal_padding()
+  local pad = math.max(tex.dimen.paperwidth or tex.pagewidth or 0, 65536)
+  tex.hoffset = pad - tex.sp('1in')
+  local file = assert(io.open('render-padding.txt', 'w'))
+  file:write(string.format('%.8f', bp(pad)))
+  file:close()
+  return pad
+end
 
 -- Vpack an owned MVL node list and install it as one tight PDF page.
 -- Both paths call this exact routine: legacy RENDER harvests a second
@@ -1329,7 +1545,7 @@ local function ship_node_list(head)
   local w = math.max(b.width or 0, 65536)
   local total = math.max((b.height or 0) + (b.depth or 0), 65536)
   tex.box[255] = b
-  tex.pagewidth = w
+  tex.pagewidth = w + 2 * render_horizontal_padding()
   tex.pageheight = total
 end
 
@@ -1380,7 +1596,7 @@ local function load_ship_box(b)
   local w = math.max(b.width or 0, 65536)
   local total = math.max((b.height or 0) + (b.depth or 0), 65536)
   tex.box[255] = b
-  tex.pagewidth = w
+  tex.pagewidth = w + 2 * render_horizontal_padding()
   tex.pageheight = total
 end
 
@@ -1467,7 +1683,7 @@ function tdom_wait()
     if not line then
       fk._exit(0) -- orchestrator went away
     end
-    local cmd, a, b, c, d = line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)')
+    local cmd, a, b, c, d, mode, live_floor = line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)')
     if cmd == 'DIE' then
       fk._exit(0)
     elseif cmd == 'PING' then
@@ -1481,8 +1697,8 @@ function tdom_wait()
       elseif a == 'SILENT' then
         FAULT_SILENT = tonumber(b) or 0
       end
-    elseif cmd == 'JOB' then
-      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|->
+    elseif cmd == 'JOB' or cmd == 'STEP' then
+      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B|C> <liveFloorKb>
       local id = a
       local newckpt = tonumber(b) or (CKPT + 1)
       local len = tonumber(c) or 0
@@ -1494,7 +1710,7 @@ function tdom_wait()
         texio.write_nl('term and log', 'TDOMFAULT silent job=' .. tostring(id))
       else
       local wedge = take_wedge_fault()
-      local pid = fork_for(id)
+      local pid = cmd == 'STEP' and 0 or fork_for(id)
       if pid == 0 then
         if wedge then
           os.execute('/bin/sleep 30')
@@ -1504,7 +1720,14 @@ function tdom_wait()
         -- checkpoint generation. The parent keeps its own COW copy until
         -- CAPTURE or checkpoint retirement.
         drop_capture()
-        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil }
+        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F', calibrate = mode == 'C' }
+        fk.set_interactive(JOB.interactive and 1 or 0)
+        -- Re-loading a font already measured in this document is live growth,
+        -- not another 64MB of garbage to sweep on every fork from its input.
+        if JOB.interactive then
+          TDOM_GC_FLOOR = math.max(TDOM_GC_FLOOR or 0, tonumber(live_floor) or 0)
+        end
+        collectgarbage(JOB.interactive and 'stop' or 'restart')
         T_JOB = os.gettimeofday and os.gettimeofday() or os.clock()
         blk_labels = {}
         blk_refs = {}
@@ -1514,10 +1737,15 @@ function tdom_wait()
         blk_gfx = false
         blk_floats = {}
         blk_fonts = {}
+        blk_trail = {}
         pending_fmarks = {}
         tdom_absorb_reset()
         RENDER_MODE = false
-        reconnect('job', newckpt)
+        if cmd == 'STEP' then
+          conn:send('FORKED ' .. id .. ' ' .. fk.getpid() .. '\n')
+        else
+          reconnect('job', newckpt)
+        end
         if os.getenv('TDOM_TRACE_HANG') then
           -- hang forensics: if this job burns absurd Lua instruction counts,
           -- dump WHERE and bail — a silent C-side spin never trips this hook
@@ -1697,11 +1925,32 @@ local function native_source_catcodes_safe(body)
   return ok and safe == true
 end
 
+-- Ordinary-looking characters that are active at the block's entry (babel
+-- shorthands, a document's own \catcode 13): typing one runs a macro, so an
+-- edit made of them is not plain paint. TeX's own specials are excluded:
+-- canonical-anchor already refuses edits that contain them.
+local function source_active_chars(body)
+  local ok, found = pcall(function()
+    local special = { [92]=true, [36]=true, [37]=true, [123]=true, [125]=true,
+      [35]=true, [38]=true, [94]=true, [95]=true, [126]=true }
+    local seen, out = {}, {}
+    for _, cp in utf8.codes(body) do
+      if cp >= 32 and not special[cp] and not seen[cp] and tex.getcatcode(cp) == 13 then
+        seen[cp] = true
+        out[#out + 1] = utf8.char(cp)
+      end
+    end
+    return table.concat(out)
+  end)
+  return ok and found or '?'
+end
+
 function inject_job(body, ship)
   -- Typeset ON the main vertical list — full state continuity with the
   -- previous blocks (prevdepth, \everypar, spacefactor, open counters...).
   -- The dormant page collects the nodes; tdom_report harvests them.
   JOB.sourceCatcodesSafe = native_source_catcodes_safe(body)
+  JOB.activeChars = source_active_chars(body)
   local lines = {}
   for l in (body .. '\n'):gmatch('(.-)\n') do
     lines[#lines + 1] = l

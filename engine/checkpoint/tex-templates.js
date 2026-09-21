@@ -25,6 +25,14 @@ export function buildDriverSource({
   geometry,
 }) {
   const L = [];
+  // Log every callback registration from the first line on, before any
+  // package can keep its own reference to add_to_callback: canonical-anchor
+  // needs every paint filter the document adds, even one it removes again
+  // (daemon.lua, scan_paint_callbacks).
+  L.push('\\directlua{if luatexbase and luatexbase.add_to_callback then ' +
+    'local add = luatexbase.add_to_callback TDOM_CALLBACK_LOG = {} ' +
+    'luatexbase.add_to_callback = function(name, func, description, ...) ' +
+    'table.insert(TDOM_CALLBACK_LOG, { name, description }) return add(name, func, description, ...) end end}');
   L.push(preamble.trimEnd());
   // hyperref writes PDF catalog/anchor objects from its begin-document
   // hook, opening driver.pdf in checkpoint 0. Every fork then inherits the
@@ -491,7 +499,9 @@ export function buildIsoCompileSource({
       // bogus page context): material is DISCARDED, so the harvest must
       // not be trusted — count it and let the node side fail the compile
       'if tdom_iso.fires > 50 then tdom_iso.discarded = (tdom_iso.discarded or 0) + 1 tex.box[boxnum] = nil return end ' +
-      'tex.deadcycles = 0 ' +
+      // LuaTeX ignores a tex.deadcycles assignment: hand the reset to TeX
+      // (runs inside \output, right after this call)
+      'tex.sprint(string.char(92) .. "deadcycles=0" .. string.char(92) .. "relax") ' +
       'if tdom_iso.ships == 0 then tdom_iso.preabsorbs = (tdom_iso.preabsorbs or 0) + 1 end ' +
       'local b = tex.box[boxnum] ' +
       'local list = nil ' +

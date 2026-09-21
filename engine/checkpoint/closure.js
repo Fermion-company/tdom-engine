@@ -3,8 +3,9 @@
 // A positive result is deliberately modest: it only says that the source is
 // not *obviously* waiting for more input.  The resident LuaLaTeX JOB is the
 // semantic authority and supplies the second half of the certificate.  A
-// negative result is conclusive enough to avoid feeding invented closing
-// tokens to TeX while the user is still typing.
+// negative result holds the resident tree instead of feeding invented
+// closing tokens to TeX. Only canonical compilation can distinguish an
+// unfinished document from syntax hidden behind macro expansion.
 
 const LITERAL_ENVS = new Set([
   'verbatim',
@@ -76,6 +77,7 @@ function bracedArgument(text, at) {
 export function sourceClosure(text) {
   const envs = [];
   const conditionals = [];
+  const loops = [];
   const customConditionals = new Set();
   const math = [];
   let groups = 0;
@@ -182,7 +184,14 @@ export function sourceClosure(text) {
         continue;
       }
     }
-    if (CONDITIONALS.has(name) || customConditionals.has(name)) conditionals.push(name);
+    // Plain TeX's \repeat supplies the closing \fi for the loop test.
+    // Track the entry depth so nested loops cannot consume an outer test.
+    if (name === 'loop') loops.push(conditionals.length);
+    else if (name === 'repeat') {
+      if (!loops.length || conditionals.length !== loops.at(-1) + 1) return fail('loop-test', i);
+      loops.pop();
+      conditionals.pop();
+    } else if (CONDITIONALS.has(name) || customConditionals.has(name)) conditionals.push(name);
     else if (name === 'fi') {
       if (!conditionals.length) return fail('unexpected:fi', i);
       conditionals.pop();
@@ -194,6 +203,7 @@ export function sourceClosure(text) {
   if (envs.length) return fail(`environment:${envs.at(-1)}`, text.length);
   if (groups) return fail('group', text.length);
   if (math.length) return fail(`math:${math.at(-1)}`, text.length);
+  if (loops.length) return fail('loop', text.length);
   if (conditionals.length) return fail(`conditional:${conditionals.at(-1)}`, text.length);
   return { closed: true, reason: null, at: text.length };
 }

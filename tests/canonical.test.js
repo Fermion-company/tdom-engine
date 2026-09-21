@@ -3,11 +3,13 @@
 //   2. unknown/unsafe structure demotes to opaque instead of breaking.
 
 import { test } from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import {
   rmSync,
   mkdirSync,
   writeFileSync,
+  readFileSync,
   existsSync,
   realpathSync,
   symlinkSync,
@@ -248,6 +250,31 @@ test('authority pressure: fast baseline, then deep idle + cost cooldown', () => 
       c.delayFor() >= 8000 * c.displayCooldownFactor - 100,
       `display pacing scales with compile cost (got ${c.delayFor()})`
     );
+    // The first baseline can finish behind an edit for which the viewer has
+    // no resident pixels. #drain grants exactly this immediate successor one
+    // short-debounce catch-up instead of another long-document cooldown.
+    c.pressure = 'authority';
+    c.last.id = 1;
+    c.pendingJob = { source: 'new', rev: 2, inputEpoch: c.inputEpoch, scheduledAt: Date.now() };
+    c.coldBaselineCatchup = {
+      baselineId: 1,
+      rev: 2,
+      inputEpoch: c.inputEpoch,
+      source: 'new',
+    };
+    c.displayDemand = { rev: 2, inputEpoch: c.inputEpoch };
+    c.activeDisplayDemandIds.add('viewer');
+    c.residentImpossibleDemandIds.add('viewer');
+    assert.equal(
+      c.delayFor(c.pendingJob),
+      c.displayDebounceMs,
+      'a resident-impossible edit immediately behind the first baseline uses the short debounce'
+    );
+    c.residentImpossibleDemandIds.clear();
+    assert.ok(
+      c.delayFor(c.pendingJob) >= 8000 * c.displayCooldownFactor - 100,
+      'the allowance does not bypass pacing while resident pixels can still arrive'
+    );
   } finally {
     c.dispose();
   }
@@ -335,6 +362,53 @@ const DOC1 = [
   '\\end{document}',
   '',
 ].join('\n');
+
+test('first baseline credit survives a soft demand until the viewer escalates it', opts, async () => {
+  const work = WORK + '-cold-baseline-escalation';
+  rmSync(work, { recursive: true, force: true });
+  const c = new CanonicalRenderer({
+    workDir: work,
+    debounceMs: 0,
+    displayDebounceMs: 100,
+  });
+  const waitFor = async (predicate, label, timeoutMs = 15_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, `timed out waiting for ${label}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+  try {
+    c.schedule(DOC1, 1);
+    await waitFor(() => c.info().runningRev === 1, 'the first baseline to start');
+
+    const next = DOC1.replace('Page one canonical test.', 'Page one edited while baseline compiles.');
+    c.schedule(next, 2);
+    assert.deepEqual(
+      c.requestDisplay(2, 0, { demandId: 'viewer', residentImpossible: false }),
+      { accepted: true, duplicate: false }
+    );
+
+    await waitFor(
+      () => c.info().id === 1 && c.info().runningRev === null && c.info().scheduledRev === 2,
+      'the first baseline to land behind the pending edit'
+    );
+    assert.equal(c.coldBaselineCatchup?.rev, 2,
+      'the actual drain grants its immediate pending successor one catch-up credit');
+    assert.ok(c.info().scheduledInMs > c.displayDebounceMs,
+      'a soft demand alone retains the normal cost cooldown');
+
+    assert.deepEqual(
+      c.requestDisplay(2, 0, { demandId: 'viewer', residentImpossible: true }),
+      { accepted: false, duplicate: true }
+    );
+    assert.ok(c.info().scheduledInMs <= c.displayDebounceMs,
+      'the late hard escalation re-arms the credited job at the short debounce');
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
+  }
+});
 
 const MIXED_PAPER_DOC = [
   '\\documentclass{article}',
@@ -950,5 +1024,211 @@ test('incremental pagination matches a from-scratch build after edits', opts, as
     }
   } finally {
     await eng.close();
+  }
+});
+
+// ------------------------------------------ content identity (issue #52, D)
+//
+// A child-file edit advances the canonical input epoch. Restoring the child to
+// the bytes the last generation was compiled from must rebind that generation
+// to the current revision at once (so the next anchor anywhere in the document
+// has canonical.rev === srcRev) instead of waiting for a full recompile.
+
+const IDENTITY_ROOT = [
+  '\\documentclass{article}',
+  '\\begin{document}',
+  'Root paragraph.',
+  '',
+  '\\input{chapter}',
+  '\\end{document}',
+  '',
+].join('\n');
+
+function identityFixture(name) {
+  const work = WORK + name;
+  rmSync(work, { recursive: true, force: true });
+  const docDir = path.join(work, 'doc');
+  const overlayDir = path.join(work, 'overlay');
+  const canonDir = path.join(work, 'canon');
+  for (const dir of [docDir, overlayDir, canonDir]) mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(docDir, 'chapter.tex'), 'Chapter text A.\n');
+  return { work, docDir, overlayDir, canonDir };
+}
+
+async function untilRunning(c, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!c.running) {
+    if (Date.now() > deadline) throw new Error('compile did not start');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+test('content identity: a child restored to its compiled bytes rebinds the last generation', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-identity');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  const results = [];
+  c.onResult = (info) => results.push({ id: info.id, rev: info.rev, rebound: info.rebound });
+  try {
+    const gen = await c.ensure(IDENTITY_ROOT, 1);
+    const child = path.join(c.docDir, 'chapter.tex');
+    const overlay = path.join(c.overlayDir, 'chapter.tex');
+    assert.ok(gen.inputManifest instanceof Map, 'the recorder file list yields an input manifest');
+    assert.equal(gen.inputManifest.get(child), createHash('sha256').update('Chapter text A.\n').digest('hex'),
+      'the manifest hashes the child bytes LuaLaTeX read');
+    assert.ok(![...gen.inputManifest.keys()].some((file) => file.endsWith('canon.tex')), 'the root is not an input');
+    assert.ok(![...gen.inputManifest.keys()].some((file) => /texmf/.test(file)), 'system files are not tracked');
+
+    // an unsaved child edit: not the compiled content, a compile is queued
+    writeFileSync(overlay, 'Chapter text AQ.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false);
+    c.schedule(IDENTITY_ROOT, 2);
+    assert.equal(c.pendingJob?.rev, 2);
+    assert.equal(c.info().rev, 1);
+
+    // the edit is undone: the generation is the exact compile of revision 3
+    writeFileSync(overlay, 'Chapter text A.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), true, 'restored bytes match the manifest');
+    results.length = 0;
+    c.schedule(IDENTITY_ROOT, 3);
+    assert.equal(c.pendingJob, null, 'no compile is queued for compiled content');
+    assert.equal(c.timer, null);
+    assert.equal(c.info().id, gen.id);
+    assert.equal(c.info().rev, 3, 'rebound synchronously to the current revision');
+    assert.equal(c.info().rebound, 1);
+    assert.equal(gen.inputEpoch, c.inputEpoch, 'the generation now owns the current input epoch');
+    assert.deepEqual(results, [{ id: gen.id, rev: 3, rebound: 1 }], 'observers see the rebound revision');
+    const certificate = c.generationCertificate();
+    assert.equal(certificate.rev, 3);
+    assert.equal(certificate.inputEpoch, c.inputEpoch);
+    await c.settle();
+    assert.equal(c.info().rev, 3);
+    assert.equal(c.info().error, null);
+    assert.equal(c.generations.size, 1, 'nothing was compiled');
+
+    // effective bytes follow TeX's search order: overlay first, then disk
+    writeFileSync(child, 'Chapter text B.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), true, 'disk is shadowed by the overlay');
+    rmSync(overlay);
+    c.invalidateInputs({ removed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false, 'without the overlay TeX would read B');
+    writeFileSync(child, 'Chapter text A.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), true);
+
+    // fail closed: a change outside the compile's inputs, or an unknown set
+    c.invalidateInputs({ changed: [path.join(c.docDir, 'never-read.tex')] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false, 'a path this compile never read is unprovable');
+    c.schedule(IDENTITY_ROOT, 4);
+    assert.equal(c.pendingJob?.rev, 4, 'unprovable inputs compile again');
+    await c.settle();
+    assert.equal(c.info().rev, 4);
+    assert.notEqual(c.info().id, gen.id, 'a real compile produced the next generation');
+    c.invalidateInputs({ unknown: true });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false, 'an unknown change set is unprovable');
+    c.invalidateInputs();
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false);
+  } finally {
+    c.dispose();
+  }
+});
+
+test('content identity: a root round-trip during a compile rebinds and retires the stale compile', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-identity-stale');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    const gen = await c.ensure(IDENTITY_ROOT, 1);
+    const edited = IDENTITY_ROOT.replace('Root paragraph.', 'Root paragraph edited.');
+    c.schedule(edited, 2);
+    const settled = c.settle();
+    await untilRunning(c);
+    assert.equal(c.runningJob?.rev, 2);
+    // the edit is undone while revision 2 compiles: revision 3 is compiled
+    // content, and the running compile's result must not move canonical back
+    c.schedule(IDENTITY_ROOT, 3);
+    assert.equal(c.info().id, gen.id);
+    assert.equal(c.info().rev, 3);
+    await settled;
+    assert.equal(c.info().id, gen.id, 'the stale compile did not replace the rebound generation');
+    assert.equal(c.info().rev, 3);
+    assert.equal(c.info().error, null, 'a retired compile is not an error');
+    assert.deepEqual([...c.generations.values()].map((g) => g.rev), [3], 'revision 2 never registered');
+  } finally {
+    c.dispose();
+  }
+});
+
+const MULTI_PASS_ROOT = [
+  '\\documentclass{article}',
+  '\\begin{document}',
+  '\\tableofcontents',
+  '\\section{First}',
+  'Body one.',
+  '\\newpage',
+  '\\section{Second}',
+  'Body two.',
+  '\\end{document}',
+  '',
+].join('\n');
+
+test('scheduled compiles yield between passes to a newer revision', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-passes');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    const gen = await c.ensure(MULTI_PASS_ROOT, 1);
+    assert.ok(gen.passes >= 2, `table of contents needs a second pass (got ${gen.passes})`);
+    // a heading edit rewrites the table of contents: revision 2 needs a
+    // second pass, and a fixpoint reached in one pass is published as usual
+    c.schedule(MULTI_PASS_ROOT.replace('\\section{First}', '\\section{First, revised}'), 2);
+    const settled = c.settle();
+    await untilRunning(c);
+    assert.equal(c.runningJob?.rev, 2);
+    // a newer edit lands during pass one of revision 2
+    const newest = MULTI_PASS_ROOT.replace('Body two.', 'Body two, newest.');
+    c.schedule(newest, 3);
+    await settled;
+    assert.equal(c.info().rev, 3, 'converged on the newest revision');
+    assert.equal(c.info().error, null);
+    assert.deepEqual([...c.generations.values()].map((g) => g.rev), [1, 3],
+      'the superseded revision 2 was abandoned after its pass instead of published');
+    const texts = await c.pageTexts();
+    if (texts) assert.match(texts.join('\n'), /Body two, newest/);
+  } finally {
+    c.dispose();
+  }
+});
+
+test('Build seeds let the first post-Build canonical reach its fixpoint in one pass', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-build-seeds');
+  writeFileSync(path.join(docDir, 'main.tex'), MULTI_PASS_ROOT);
+  // a real Build of the same source: converged aux/toc plus PDF and SyncTeX
+  await promisify(execFile)('lualatex', ['-synctex=1', '-interaction=nonstopmode', 'main.tex'], { cwd: docDir, timeout: 120_000 });
+  await promisify(execFile)('lualatex', ['-synctex=1', '-interaction=nonstopmode', 'main.tex'], { cwd: docDir, timeout: 120_000 });
+  const sha = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
+  const seedFiles = { aux: readFileSync(path.join(docDir, 'main.aux'), 'utf8'), toc: readFileSync(path.join(docDir, 'main.toc'), 'utf8') };
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    const lease = c.acquireBuildLease('build:seed', 60_000);
+    c.schedule(MULTI_PASS_ROOT, 1);
+    const prepared = await c.prepareBuildGeneration({
+      requestId: 'build:seed', token: lease.token, source: MULTI_PASS_ROOT, rev: 1,
+      pdf: path.join(docDir, 'main.pdf'), pdfHash: sha(path.join(docDir, 'main.pdf')),
+      synctex: path.join(docDir, 'main.synctex.gz'), synctexHash: sha(path.join(docDir, 'main.synctex.gz')),
+      syncInputMap: [{ logicalPath: path.join(c.workDir, 'canon.tex'), recordedPath: path.join(docDir, 'main.tex') }],
+      seedFiles,
+    });
+    const build = await c.commitBuildGeneration(prepared, MULTI_PASS_ROOT, 1);
+    c.releaseBuildLease('build:seed', lease.token);
+    assert.equal(c.info().id, build.id);
+    // a body edit after the Build: the seeded toc is already right
+    c.schedule(MULTI_PASS_ROOT.replace('Body one.', 'Body one, revised.'), 2);
+    await c.settle();
+    assert.equal(c.info().rev, 2);
+    assert.equal(c.info().error, null);
+    assert.equal(c.info().passes, 1, 'the seeded aux family is the fixpoint of a body edit');
+  } finally {
+    c.dispose();
   }
 });

@@ -92,9 +92,14 @@ export function initializeEngineState(
   // took down the server AND the editor session). Audit tools run with a
   // reduced budget via this env; the measured-cost skeleton avoids
   // replaying the most expensive skipped blocks.
-  engine.maxCheckpoints = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
+  // TDOM_MAX_CHECKPOINTS is the ceiling; the budget in force is fixed per
+  // source generation from the block count (checkpointBudgetFor).
+  engine.checkpointCeiling = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
+  engine.maxCheckpoints = engine.checkpointCeiling;
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
+  engine.confirmedLiveHeapKb = 0;
+  engine.calibrateInitialHeap = false;
 
   // canonical layer: the exact-output authority (see file header)
   engine.canonical = new CanonicalRenderer({
@@ -117,6 +122,10 @@ export function initializeEngineState(
   engine.onShipPage = null; // legacy callback retained for embedders
   engine.onShipWave = null; // callback({pages, gen, srcRev}) after end/closure
   engine.shipGenRev = new Map(); // wave generation -> srcRev it converges to
+  engine.shipGenSnapshot = new Map(); // wave generation -> immutable input snapshot
+  engine.shipDesiredInputSnapshot = null;
+  engine.shippingIncludeTrace = []; // static read order for certified literal child replay
+  engine.shipPendingInputChanges = null;
   engine.shipBootedFor = null; // preamble hash the chain booted with
   // A replay lineage is authoritative only when it starts from the aux
   // family of a converged production compile.  Provisional TOC/label seeds
@@ -184,11 +193,17 @@ export function initializeEngineState(
   engine.interactiveRenderCohort = null; // only the current edit's resident-capable exact work
   engine.renderPumping = 0;
   engine.renderTask = Promise.resolve();
+  // Aggregate pump promises may themselves wait for a Build lease. Track
+  // only jobs that already passed the gate when deciding whether acquire is
+  // still settling finite work.
+  engine.buildLeasePreviewJobs = new Set();
   engine.renderSeq = 0; // unique protocol ids keep render forks distinct from foreground JOBs
+  engine.activeResidentRenderCheckpoints = new Map(); // request id -> {peer, index} RENDER/CAPTURE owner
   engine.cancelledRenderIds = new Set(); // late FORKED replies are killed after edit preemption
   engine.captureSeq = 0; // monotonic generation token for retained JOB node lists
   engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };
   engine.renderHold = new Map(); // ckpt idx kept alive for a pending render -> block.id
+  engine.foregroundRenderIds = null;
   // Edit-locus pinning: the checkpoints at (and right after) the block the
   // user is typing in are exempt from grid retirement, so a keystroke burst
   // is always "fork once + typeset one block", never a grid replay.
@@ -203,4 +218,17 @@ export function initializeEngineState(
   // re-typesets the suffix serially (definition edits, untracked-state
   // leaks). Idle-gated, preemptible, resumable — see #runChainPass.
   engine.pendingChain = null; // {kind:'rebuild', from, phase:'blocks'|'after', labels:Set}
+  // Cold-prefix budget (docs/10 §10.4a): a keystroke whose nearest resident
+  // checkpoint is far away replays clean blocks for at most this long on the
+  // hot path. Past it the walk stops at a completed block boundary, the
+  // un-typeset edited blocks are remembered here, and the idle-gated chain
+  // pass finishes the replay and re-runs the update off the hot path.
+  engine.coldPrefixBudgetMs = Math.max(0, Number(process.env.TDOM_COLD_PREFIX_MS ?? 1500) || 0);
+  engine.coldDirty = new Set(); // block ids whose galley predates their source text
+  engine.coldWalking = false; // a cold chain pass is replaying with STEP right now
+  // Edits waiting for the chain lock. A caret warm or a deferred chain pass
+  // must not start (or clear the abort flag) while one is pending: the
+  // walk would take the lock first and the keystroke would wait it out.
+  engine.editPending = 0;
+  engine.onDeferredUpdate = null; // callback(report) when a cold resume publishes
 }

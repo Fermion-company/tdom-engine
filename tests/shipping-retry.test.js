@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -9,7 +9,9 @@ import {
   makeShippingChain,
   settleShippingBaseline,
   shippingBootDelay,
+  shippingInputState,
   shippingInputSnapshot,
+  shipUpdate,
 } from '../engine/checkpoint/shipping-manager.js';
 
 function retryState() {
@@ -46,6 +48,12 @@ function fakeEngine(initial = 'alpha prose') {
     shipStale: false,
     diagnostics: [],
     includes: new Map(),
+    shippingIncludeTrace: [],
+    checkpoints: new Map(),
+    maxCheckpoints: 8,
+    shipGenRev: new Map(),
+    shipGenSnapshot: new Map(),
+    shipDesiredInputSnapshot: null,
     store: { get: () => source },
     setSource(next) {
       source = next;
@@ -187,6 +195,162 @@ test('shipping waits for a converged production seed instead of certifying infer
     assert.equal(engine.shipRetry.consecutiveFailures, 0, 'waiting is not a failed boot');
     assert.equal(engine.shipBootedFor, null);
   } finally {
+    await cleanup(engine);
+  }
+});
+
+test('shipping boot rejects a canonical seed from an older project-input epoch', async () => {
+  const engine = fakeEngine('unchanged root with changed child');
+  engine.mode = 'structured';
+  engine.shipping = {};
+  engine.shipBooting = false;
+  engine.shipBootedFor = null;
+  engine.canonical = {
+    inputEpoch: 2,
+    sourceMatches: () => true,
+    last: { id: 1, inputEpoch: 1, seedFiles: { aux: '' } },
+  };
+  try {
+    await bootShipping(engine, {
+      makeShipping: () => { throw new Error('stale canonical seed must not boot shipping'); },
+      paginateNow: () => { throw new Error('stale canonical seed must not paginate'); },
+      computeToc: () => { throw new Error('stale canonical seed must not seed contents'); },
+      shipUpdate: () => {},
+    });
+    assert.equal(engine.shipRetry.state, 'waiting-canonical');
+    assert.equal(engine.shipBootedFor, null);
+  } finally {
+    await cleanup(engine);
+  }
+});
+
+test('unsupported dependency refresh never retags the old shipping generation', async () => {
+  const engine = fakeEngine('same root bytes');
+  engine.mode = 'structured';
+  engine.shipBootedFor = engine.preHash;
+  engine.shipDisabledFor = null;
+  engine.shipGenRev.set(0, 1);
+  engine.shipping = {
+    gen: 0,
+    err: null,
+    resume: () => ({ mode: 'reboot-needed', reason: 'dependency-change-unobserved' }),
+  };
+  engine.srcRev = 2;
+  let queued = 0;
+  try {
+    shipUpdate(engine, engine.store.get(engine.file), {
+      changed: [], removed: [], unknown: true,
+    }, () => queued++);
+    assert.equal(engine.shipGenRev.get(0), 1);
+    assert.equal(queued, 1);
+    assert.ok(engine.shipDesiredInputSnapshot, 'latest unsupported snapshot still blocks an older wave');
+  } finally {
+    await cleanup(engine);
+  }
+});
+
+test('shipping boot keeps one immutable input epoch across deferred close and open', async () => {
+  const source = String.raw`\documentclass{article}
+\begin{document}
+\input{child.tex}
+\end{document}`;
+  const engine = fakeEngine(source);
+  const child = path.join(engine.docDir, 'child.tex');
+  writeFileSync(child, 'B\n');
+  engine.mode = 'structured';
+  engine.shipBootedFor = engine.preHash;
+  engine.shipDisabledFor = null;
+  engine.pages = [];
+  engine.blockLabelIdx = new Map();
+  engine.labelTable = new Map();
+  engine.shipLabelOverrides = new Map();
+  engine.canonical = {
+    inputEpoch: 1,
+    sourceMatches: () => true,
+    last: { id: 11, inputEpoch: 1, pdfHash: 'canonical-B', seedFiles: { aux: 'B' } },
+  };
+  const setChild = (text, mtime) => {
+    writeFileSync(child, text);
+    engine.includes.set(child, { mtime, readPath: child, text });
+    engine.shippingIncludeTrace = [{
+      actualPath: child,
+      readPath: child,
+      command: 'input',
+      raw: 'child.tex',
+      depth: 0,
+      parentFile: path.join(engine.docDir, engine.file),
+      rootUnit: 1,
+    }];
+  };
+  setChild('B\n', 1);
+
+  let releaseClose;
+  let releaseOpen;
+  const closeGate = new Promise((resolve) => { releaseClose = resolve; });
+  const openGate = new Promise((resolve) => { releaseOpen = resolve; });
+  engine.shipping = {
+    rootPeer: { alive: true },
+    disposed: false,
+    close: () => closeGate,
+  };
+  const opened = [];
+  const resumed = [];
+  const replacement = {
+    gen: 0,
+    err: null,
+    rootPeer: null,
+    disposed: false,
+    open: (text, options) => {
+      opened.push({ text, options });
+      return openGate;
+    },
+    resume: (text, inputState) => {
+      replacement.gen++;
+      resumed.push({ text, inputState });
+      return { mode: 'resumed' };
+    },
+  };
+  let queued = 0;
+  let boot;
+  try {
+    boot = bootShipping(engine, {
+      makeShipping: () => replacement,
+      paginateNow: () => [],
+      computeToc: () => ({ contents: {} }),
+      shipUpdate: (text, changes) => shipUpdate(engine, text, changes, () => queued++),
+    });
+    await Promise.resolve();
+    assert.equal(engine.shipBooting, true);
+
+    setChild('C\n', 2);
+    engine.srcRev = 2;
+    engine.canonical.inputEpoch = 2;
+    shipUpdate(engine, source, { changed: [child], removed: [] }, () => queued++);
+    const pendingC = shippingInputState(engine, { changed: [child], removed: [] });
+    assert.equal(engine.shipDesiredInputSnapshot, pendingC.identity.snapshotId,
+      'the latest child universe blocks the boot snapshot during close');
+
+    releaseClose();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(opened.length, 1);
+    assert.equal(opened[0].text, source);
+    assert.equal(opened[0].options.inputState.dependencies[0].bytes.toString('utf8'), 'B\n');
+    const bootSnapshot = opened[0].options.inputState.identity.snapshotId;
+    assert.notEqual(bootSnapshot, engine.shipDesiredInputSnapshot,
+      'the B boot cannot be presented as the accepted C revision');
+    assert.equal(engine.shipGenRev.get(0), 1, 'generation zero keeps its captured revision');
+
+    releaseOpen();
+    await boot;
+    assert.equal(resumed.length, 1);
+    assert.equal(resumed[0].inputState.dependencies[0].bytes.toString('utf8'), 'C\n');
+    assert.equal(engine.shipGenRev.get(1), 2);
+    assert.equal(engine.shipDesiredInputSnapshot, resumed[0].inputState.identity.snapshotId);
+    assert.equal(queued, 0);
+  } finally {
+    releaseClose?.();
+    releaseOpen?.();
+    await boot?.catch(() => {});
     await cleanup(engine);
   }
 });

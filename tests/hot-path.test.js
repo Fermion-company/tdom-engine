@@ -4,7 +4,7 @@
 // engine computes from the final source". These fork real lualatex processes;
 // skipped without a TeX installation.
 
-import { test, before, after } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,15 +14,23 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
+import { CanonicalRenderer } from '../engine/checkpoint/canonical.js';
 import { buildDisplayList } from '../engine/checkpoint/display-list.js';
 import { buildStream } from '../engine/checkpoint/stream.js';
 import { handlePeerMessage } from '../engine/checkpoint/peer-message.js';
 import { mayCaptureDisplayMath } from '../engine/checkpoint/render-hold.js';
 import { preemptResidentRenders } from '../engine/checkpoint/render-pump.js';
+import {
+  buildLeasePreviewSettlement,
+  claimReplaceablePreviewJob,
+  withReplaceablePreviewJob,
+} from '../engine/checkpoint/build-lease-preview.js';
+import { abortBackgroundJob } from '../engine/checkpoint/abort-background-job.js';
 import { classifyDocument } from '../engine/checkpoint/safety.js';
 import { sourceClosure } from '../engine/checkpoint/closure.js';
 import { classifyStructuralAliases } from '../engine/checkpoint/structural-aliases.js';
 import { ShippingChain } from '../engine/checkpoint/shipping.js';
+import { makeShippingChain, shippingInputState } from '../engine/checkpoint/shipping-manager.js';
 import { renderIsolatedBlock } from '../engine/checkpoint/isolated-render.js';
 import { isoCompile } from '../engine/checkpoint/iso-compile.js';
 import { segmentBody } from '../engine/segmenter.js';
@@ -30,9 +38,30 @@ import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finaliz
 import { classifyResidentEdit } from '../engine/checkpoint/resident-edit-admission.js';
 import { plainPreviewWitness, canDeferPlainVerification } from '../engine/checkpoint/plain-preview.js';
 import {
+  buildTerminalCanonicalPatch,
+  canonicalAnchorClientEditTimestamp,
+  captureCanonicalAnchorBase,
+  captureCanonicalAnchorLedger,
+  ledgerAdmitsBlock,
+  mergeCumulativeAnchorPatch,
+  classifyChildInputMutation,
+  flattenCompleteAnchorCandidateGroups,
   dirtyWithoutPatchFallback,
   planTerminalCanonicalAnchor,
+  isOwnAutosavePlainInput,
+  removedOverlayPlainTextDelta,
+  singlePlainTextDelta,
+  warmCanonicalProofOutcome,
 } from '../engine/checkpoint/canonical-anchor.js';
+import { singleLiteralChildReadProof } from '../engine/checkpoint/dependency-read-proof.js';
+import { distinctCheckpointPeerCount } from '../engine/checkpoint/checkpoint-retirement.js';
+import {
+  buildPdfPaintPage,
+  certifyCanonicalBlock,
+  galleyMixedLineWitnesses,
+  mixedGalleyFrame,
+  mixedGalleyFrameDifference,
+} from '../engine/checkpoint/canonical-paint-index.js';
 
 const TEST_WORK_ROOT = process.env.TDOM_TEST_WORK_ROOT;
 const workDir = (name) => TEST_WORK_ROOT
@@ -48,6 +77,354 @@ const available = await promisify(execFile)('lualatex', ['--version'], { timeout
 );
 const opts = available ? {} : { skip: 'lualatex not installed' };
 
+const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+test('Build lease settles active preview jobs and gates queued replacements', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-preview-build-lease-'));
+  const canonical = new CanonicalRenderer({ workDir: root });
+  const engine = { closed: false, canonical, buildLeasePreviewJobs: new Set() };
+  let finishActive;
+  try {
+    const active = withReplaceablePreviewJob(engine, 'isolated-render', () =>
+      new Promise((resolve) => { finishActive = resolve; }));
+    await nextTurn();
+    assert.equal(engine.buildLeasePreviewJobs.size, 1);
+
+    const acquired = canonical.acquireBuildLease('build:preview', 10_000);
+    const settling = buildLeasePreviewSettlement(acquired, engine.buildLeasePreviewJobs);
+    assert.equal(settling.reason, 'preview-work-settling');
+    assert.equal(settling.requestId, 'build:preview');
+    assert.equal(settling.token, acquired.token);
+    assert.equal(settling.activePreviewJobs, 1);
+    assert.deepEqual(settling.activePreviewWork.map((job) => job.kind), ['isolated-render']);
+    assert.equal(settling.activePreviewWork[0].activeMs >= 0, true);
+
+    const retried = canonical.acquireBuildLease('build:preview', 10_000);
+    assert.equal(retried.idempotent, true);
+    assert.equal(buildLeasePreviewSettlement(retried, engine.buildLeasePreviewJobs)?.reason,
+      'preview-work-settling');
+
+    const queue = new Map([['block', true]]);
+    let queuedStarted = false;
+    const queued = withReplaceablePreviewJob(engine, 'resident-render', async () => {
+      queuedStarted = true;
+      queue.delete('block');
+    });
+    await nextTurn();
+    assert.equal(queuedStarted, false);
+    assert.equal(queue.has('block'), true, 'the latest-wins entry remains while the lease is active');
+
+    finishActive();
+    await active;
+    assert.equal(engine.buildLeasePreviewJobs.size, 0);
+    assert.equal(buildLeasePreviewSettlement(
+      canonical.acquireBuildLease('build:preview', 10_000),
+      engine.buildLeasePreviewJobs
+    ), null, 'the same request receives its token as soon as finite work settles');
+
+    canonical.releaseBuildLease('build:preview', acquired.token);
+    await queued;
+    assert.equal(queuedStarted, true);
+    assert.equal(queue.has('block'), false);
+
+    await assert.rejects(
+      withReplaceablePreviewJob(engine, 'header-render', async () => {
+        throw new Error('injected preview failure');
+      }),
+      /injected preview failure/
+    );
+    assert.equal(engine.buildLeasePreviewJobs.size, 0, 'failed jobs release their active claim');
+    const claim = await claimReplaceablePreviewJob(engine, 'async-rescue');
+    assert.equal(claim.finish(), true);
+    assert.equal(claim.finish(), false, 'finishing a claim twice is harmless');
+  } finally {
+    canonical.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Build lease release, expiry, and close wake preview gate waiters', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-preview-build-wake-'));
+  const canonical = new CanonicalRenderer({ workDir: root });
+  const engine = { closed: false, canonical, buildLeasePreviewJobs: new Set() };
+  try {
+    const releasedLease = canonical.acquireBuildLease('build:release', 10_000);
+    let releasedStarted = false;
+    const afterRelease = withReplaceablePreviewJob(engine, 'resident-render', async () => {
+      releasedStarted = true;
+    });
+    await nextTurn();
+    assert.equal(releasedStarted, false);
+    canonical.releaseBuildLease('build:release', releasedLease.token);
+    await afterRelease;
+    assert.equal(releasedStarted, true);
+
+    canonical.acquireBuildLease('build:expiry', 1_000);
+    let expiryStarted = false;
+    let expiryDeadline;
+    try {
+      await Promise.race([
+        withReplaceablePreviewJob(engine, 'isolated-render', async () => {
+          expiryStarted = true;
+        }),
+        new Promise((_, reject) => {
+          expiryDeadline = setTimeout(() => reject(new Error('lease expiry did not wake')), 2_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(expiryDeadline);
+    }
+    assert.equal(expiryStarted, true);
+
+    canonical.acquireBuildLease('build:close', 10_000);
+    let closeStarted = false;
+    const afterClose = withReplaceablePreviewJob(engine, 'header-render', async () => {
+      closeStarted = true;
+    });
+    await nextTurn();
+    engine.closed = true;
+    canonical.dispose();
+    assert.equal(await afterClose, undefined);
+    assert.equal(closeStarted, false);
+    assert.equal(engine.buildLeasePreviewJobs.size, 0);
+  } finally {
+    canonical.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('shipping checkpoints stay bounded across long documents and resident budget changes', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-shipping-cap-'));
+  let budget = 8;
+  const chain = new ShippingChain({ workDir: root, checkpointBudget: () => budget });
+  const retired = [];
+  const peer = page => ({ alive: true, pid: 0, send: message => {
+    assert.equal(message, 'DIE\n');
+    retired.push(page);
+  } });
+  try {
+    for (let page = 0; page <= 316; page++) {
+      chain.checkpoints.set(page, peer(page));
+      chain.trimCheckpoints();
+      assert.ok(chain.checkpoints.size <= 8);
+      assert.ok(chain.checkpoints.has(0), 'the root remains a replay frontier');
+      assert.ok(chain.checkpoints.has(page), 'recent page stays warm');
+    }
+    assert.ok(retired.length >= 309);
+    assert.ok([...chain.checkpoints.keys()].some(page => page > 0 && page < 160), 'sparse earlier coverage survives');
+    budget = 2;
+    chain.trimCheckpoints();
+    assert.deepEqual([...chain.checkpoints.keys()], [0, 316]);
+    budget = 1;
+    chain.trimCheckpoints();
+    assert.deepEqual([...chain.checkpoints.keys()], [0]);
+    assert.equal(chain.info().checkpointLimit, 1);
+    assert.equal(chain.info().checkpointCount, 1);
+  } finally {
+    await chain.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('shipping treats one known literal child edit as a real immutable replay unit', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-shipping-child-input-'));
+  const docDir = path.join(root, 'project');
+  const overlayDir = path.join(root, 'overlay');
+  const workDir = path.join(root, 'ship');
+  const child = path.join(docDir, 'content', 'child.tex');
+  const overlayChild = path.join(overlayDir, 'content', 'child.tex');
+  mkdirSync(path.dirname(child), { recursive: true });
+  mkdirSync(path.dirname(overlayChild), { recursive: true });
+  mkdirSync(workDir, { recursive: true });
+  writeFileSync(child, 'disk fallback\n');
+  const source = String.raw`\documentclass{article}
+\begin{document}
+prefix\newpage
+
+\input{content/child.tex}
+
+tail
+\end{document}
+`;
+  const unitsOf = (text) => {
+    const begin = text.indexOf('\\begin{document}') + '\\begin{document}'.length;
+    const end = text.indexOf('\\end{document}', begin);
+    const body = text.slice(begin, end);
+    const segments = segmentBody(body, 0);
+    const units = segments.map((segment, index) =>
+      body.slice(index === 0 ? 0 : segment.start, segments[index + 1]?.start ?? body.length));
+    units.push('\\end{document}');
+    return units;
+  };
+  const targetUnit = unitsOf(source).findIndex((unit) => unit.includes('\\input{content/child.tex}')) + 1;
+  assert.ok(targetUnit > 1);
+  let revision = 1;
+  let currentChild = '観測値はAです。\n';
+  const engine = {
+    workDir,
+    docDir,
+    overlayDir,
+    file: 'main.tex',
+    preHash: 'pre',
+    srcRev: revision,
+    shipSessionId: 'child-session',
+    shipDocumentEpoch: 1,
+    shipDesiredCanonicalId: 1,
+    shipDesiredCanonicalHash: 'canon',
+    includes: new Map(),
+    shippingIncludeTrace: [],
+    store: { get: () => source },
+  };
+  const state = (value, changes = null, { command = 'input', sourceText = source } = {}) => {
+    currentChild = value;
+    writeFileSync(overlayChild, value);
+    engine.srcRev = revision++;
+    engine.store = { get: () => sourceText };
+    engine.includes.set(child, { mtime: engine.srcRev, readPath: overlayChild, text: value });
+    const rootUnit = unitsOf(sourceText).findIndex((unit) =>
+      unit.includes(`\\${command}{content/child.tex}`)) + 1;
+    engine.shippingIncludeTrace = [{
+      actualPath: child,
+      readPath: overlayChild,
+      command,
+      raw: 'content/child.tex',
+      depth: 0,
+      parentFile: path.join(docDir, 'main.tex'),
+      rootUnit,
+    }];
+    return shippingInputState(engine, changes);
+  };
+  const unreachable = path.join(docDir, 'content', 'no-longer-read.tex');
+  writeFileSync(unreachable, 'current disk bytes\n');
+  engine.includes.set(unreachable, {
+    mtime: 1,
+    readPath: unreachable,
+    text: 'stale cached bytes\n',
+  });
+  const stateA = state(currentChild);
+  assert.equal(stateA.dependencies.some((entry) => entry.actualPath === unreachable), false,
+    'a no-longer-reached include cache entry is outside the input snapshot');
+  assert.equal(stateA.mirrorEntries.some((entry) => entry.projectPath === 'content/no-longer-read.tex'), false,
+    'stale cached bytes cannot shadow the current disk fallback');
+  const chain = new ShippingChain({ workDir, docDir, overlayDir });
+  const sent = new Map();
+  const peer = (page) => ({ alive: true, pid: 0, gen: 0, send: (message) => {
+    if (!sent.has(page)) sent.set(page, []);
+    sent.get(page).push(message);
+  } });
+  chain.source = source;
+  chain.lines = unitsOf(source);
+  chain.inputState = stateA;
+  chain.acceptedSnapshotId = stateA.identity.snapshotId;
+  chain.baselinePages = 8;
+  chain.baselineManifest = {};
+  chain.checkpoints.set(0, peer(0));
+  chain.checkpoints.set(4, peer(4));
+  chain.checkpoints.set(5, peer(5));
+  chain.ships = [
+    { page: 4, nline: targetUnit - 1, gen: 0 },
+    { page: 5, nline: targetUnit, gen: 0 },
+  ];
+  try {
+    const stateB = state('観測値はBです。\n', { changed: [child], removed: [] });
+    const b = chain.resume(source, stateB);
+    assert.deepEqual(b, { mode: 'resumed', fromPage: 5, firstChanged: targetUnit });
+    assert.deepEqual(sent.get(5), ['DIE\n'], 'checkpoint inside the old child input is retired');
+    assert.match(readFileSync(path.join(chain.inputMirrorDir, 'content', 'child.tex'), 'utf8'), /B/);
+    assert.equal(chain.acceptedSnapshotId, stateB.identity.snapshotId);
+
+    const bGeneration = chain.gen;
+    const stateC = state('観測値はCです。\n', { changed: [child], removed: [] });
+    const c = chain.resume(source, stateC);
+    assert.equal(c.mode, 'resumed');
+    assert.ok(chain.gen > bGeneration, 'a rapid child edit supersedes the B lineage');
+    assert.match(readFileSync(path.join(chain.inputMirrorDir, 'content', 'child.tex'), 'utf8'), /C/);
+    assert.equal(chain.acceptedSnapshotId, stateC.identity.snapshotId);
+
+    const acceptedGeneration = chain.gen;
+    const acceptedSnapshot = chain.acceptedSnapshotId;
+    const unknown = state('観測値はCです。\n', { changed: [], removed: [], unknown: true });
+    assert.deepEqual(chain.resume(source, unknown), {
+      mode: 'reboot-needed', reason: 'dependency-change-unobserved',
+    });
+    assert.equal(chain.gen, acceptedGeneration);
+    assert.equal(chain.acceptedSnapshotId, acceptedSnapshot, 'unknown refresh cannot retag old pixels');
+
+    const mixedSource = source.replace('tail', 'tail changed');
+    const mixed = state('観測値はCです。\n', { changed: [], removed: [], unknown: true }, {
+      sourceText: mixedSource,
+    });
+    assert.deepEqual(chain.resume(mixedSource, mixed), {
+      mode: 'reboot-needed', reason: 'mixed-source-dependency-edit',
+    });
+
+    const dynamicSource = source.replace('prefix\\newpage', String.raw`\def\p{content/}
+\input{\p child.tex}
+prefix\newpage`);
+    const dynamicOld = state('観測値はCです。\n', null, { sourceText: dynamicSource });
+    const dynamicNew = state('観測値はDです。\n', { changed: [child], removed: [] }, {
+      sourceText: dynamicSource,
+    });
+    chain.source = dynamicSource;
+    chain.lines = unitsOf(dynamicSource);
+    chain.inputState = dynamicOld;
+    chain.acceptedSnapshotId = dynamicOld.identity.snapshotId;
+    chain.ships = [{ page: 4, nline: dynamicNew.dependencies[0].reads[0].rootUnit - 1, gen: chain.gen }];
+    chain.checkpoints.set(4, peer(4));
+    assert.deepEqual(chain.resume(dynamicSource, dynamicNew), {
+      mode: 'reboot-needed', reason: 'dependency-reboot-required',
+    }, 'an unresolved earlier reader prevents child-local replay');
+
+    const unsafeRoot = source.replace('prefix\\newpage', String.raw`\directlua{texio.write('stateful')}
+prefix\newpage`);
+    const unsafeOld = state('観測値はCです。\n', null, { sourceText: unsafeRoot });
+    const unsafeNew = state('観測値はDです。\n', { changed: [child], removed: [] }, {
+      sourceText: unsafeRoot,
+    });
+    chain.source = unsafeRoot;
+    chain.lines = unitsOf(unsafeRoot);
+    chain.inputState = unsafeOld;
+    chain.acceptedSnapshotId = unsafeOld.identity.snapshotId;
+    assert.deepEqual(chain.resume(unsafeRoot, unsafeNew), {
+      mode: 'reboot-needed', reason: 'dependency-reboot-required',
+    }, 'child replay keeps the root document-effect safety profile');
+
+    const includeSource = source.replace('\\input{content/child.tex}', '\\include{content/child.tex}');
+    const includeOld = state('観測値はCです。\n', null, { command: 'include', sourceText: includeSource });
+    const includeNew = state('観測値はDです。\n', { changed: [child], removed: [] }, {
+      command: 'include', sourceText: includeSource,
+    });
+    chain.source = includeSource;
+    chain.lines = unitsOf(includeSource);
+    chain.inputState = includeOld;
+    chain.acceptedSnapshotId = includeOld.identity.snapshotId;
+    assert.deepEqual(chain.resume(includeSource, includeNew), {
+      mode: 'reboot-needed', reason: 'dependency-reboot-required',
+    }, '\\include keeps its conservative aux/clearpage path');
+
+    const delayed = [];
+    const guardEngine = {
+      ...engine,
+      maxCheckpoints: 8,
+      checkpoints: new Map(),
+      shipStale: false,
+      shipGenRev: new Map([[7, 2]]),
+      shipGenSnapshot: new Map([[7, stateB.identity.snapshotId]]),
+      shipDesiredInputSnapshot: stateC.identity.snapshotId,
+      srcRev: 3,
+      onShipWave: (wave) => delayed.push(wave),
+    };
+    const guardedChain = makeShippingChain(guardEngine, () => {});
+    guardEngine.shipping = guardedChain;
+    guardedChain.onWave({ gen: 7, snapshotId: stateB.identity.snapshotId });
+    assert.deepEqual(delayed, [], 'an unsupported C revision blocks a delayed B wave');
+    await guardedChain.close();
+  } finally {
+    await chain.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('document switches bind replacement shipping to the new project and overlay', async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-document-context-'));
   const first = path.join(root, 'first');
@@ -61,6 +438,11 @@ test('document switches bind replacement shipping to the new project and overlay
   else process.env.TDOM_SHIP = previousShip;
   try {
     const initial = engine.shipping;
+    const checkpoints = engine.checkpoints;
+    engine.checkpoints = new Map(Array.from({ length: engine.maxCheckpoints * 2 - 2 }, (_, i) => [i, {}]));
+    assert.equal(initial.checkpointLimit(), 1,
+      'the resident tree leaves one shipping checkpoint after reserving its feeder continuation');
+    engine.checkpoints = checkpoints;
     await engine.setDocumentContext({ docDir: second, overlayDir: overlay });
     assert.notEqual(engine.shipping, initial);
     assert.equal(engine.shipping.docDir, second);
@@ -88,7 +470,8 @@ test('isolated exact chunks resolve project classes and prefer unsaved inputs', 
   const engine = {
     workDir: path.join(root, 'work'), docDir, overlayDir,
     blocks: [block], counters: [], chunks: new Map(), isoChildren: new Set(),
-    rescueQueue: new Map(), canonical: { info: () => ({ inFlight: false }) },
+    rescueQueue: new Map(), buildLeasePreviewJobs: new Set(),
+    canonical: { buildLease: null, info: () => ({ inFlight: false }), waitForBuildLease: async () => {} },
     labelTable: new Map(), hrefTable: new Map(), geometry: {}, file: 'main.tex',
     store: { get: () => String.raw`\documentclass{tdomlocal}\begin{document}\input{content.tex}\end{document}` },
   };
@@ -488,6 +871,15 @@ test('newif-created conditionals close without weakening package-macro conservat
   assert.equal(sourceClosure(String.raw`\ifnum 1=1 unfinished`).closed, false);
 });
 
+test('loop repeat closes only its own pending conditional', () => {
+  assert.equal(sourceClosure(String.raw`\newcommand{\lines}[1]{\loop\ifnum\count0<#1 x\repeat}`).closed, true);
+  assert.equal(sourceClosure(String.raw`\iftrue\loop\ifnum1<2 {\loop\ifnum2<3 x\repeat}\repeat\fi`).closed, true);
+  for (const text of [String.raw`\loop\ifnum1<2 x`, String.raw`\loop x\repeat`,
+    String.raw`\iftrue\loop x\repeat`, String.raw`\loop\iftrue\iftrue x\repeat`]) {
+    assert.equal(sourceClosure(text).closed, false, text);
+  }
+});
+
 const para = (s) =>
   `${s} paragraph with enough plain words to make a couple of real lines ` +
   `of typeset material for the measurement to mean something at all.`;
@@ -589,6 +981,755 @@ async function drain(eng, timeoutMs = 120_000) {
 
 /** Lineage-independent identity of the whole document state. */
 const signature = (eng) => eng.blocks.map((b) => `${b.galleyHash}|${b.stateVec}`);
+
+test('anchor candidate ranges reject sparse deadline-stopped results', () => {
+  const partial = Array(19);
+  for (let index = 0; index < 8; index++) partial[index] = [{ line: index + 28 }];
+  assert.equal(flattenCompleteAnchorCandidateGroups(partial, 19), null,
+    'sparse holes are missing queries, not a complete eight-line result');
+  const complete = Array.from({ length: 19 }, (_, index) => [{ line: index + 28 }]);
+  assert.equal(flattenCompleteAnchorCandidateGroups(complete, 19).length, 19);
+});
+
+test('mixed frame diagnostics report paths without values and stay bounded', () => {
+  const frame = (items, height = 120) => JSON.stringify([
+    null, true, 400, height, items, [], [], [], [], [], 'trail',
+  ]);
+  const before = Array.from({ length: 20 }, (_, index) => ({ k: 'box', h: index }));
+  const after = before.map((item) => ({ ...item, h: item.h + 1 }));
+  const difference = mixedGalleyFrameDifference(frame(before), frame(after));
+  assert.equal(difference.changedFieldCount, 20);
+  assert.equal(difference.changedFieldPaths.length, 12);
+  assert.deepEqual(difference.changedFieldPaths.slice(0, 2), ['items[0].h', 'items[1].h']);
+  assert.equal(difference.unexaminedFieldPath, null);
+  assert.equal(difference.serializationOnly, false);
+  assert.equal(difference.truncated, true);
+  assert.equal(JSON.stringify(difference).includes('"h":'), false,
+    'diagnostics include field paths, never changed values');
+  const opaqueRuns = Array.from({ length: 1000 }, (_, index) => ({
+    t: `opaque-${index}`, x: index, w: 5, s: 10, f: 'body', c: '#000000',
+  }));
+  const skippedBefore = [{ k: 'box', h: 40, d: 0, runs: opaqueRuns }, { k: 'box', h: 8, d: 2 }];
+  const skippedAfter = structuredClone(skippedBefore);
+  skippedAfter[1].h = 9;
+  const skipped = mixedGalleyFrameDifference(frame(skippedBefore), frame(skippedAfter, 121));
+  assert.deepEqual(skipped.changedFieldPaths.slice(0, 2), ['height', 'items[1].h'],
+    'top-level and line geometry survive a huge unchanged opaque prefix');
+  assert.equal(skipped.unexaminedFieldPath, null);
+  const largeBefore = Array.from({ length: 9000 }, () => ({ k: 'box', h: 8, d: 2 }));
+  const largeAfter = structuredClone(largeBefore);
+  largeAfter.at(-1).h = 9;
+  const capped = mixedGalleyFrameDifference(frame(largeBefore), frame(largeAfter));
+  assert.equal(capped.changedFieldCount, 0);
+  assert.match(capped.unexaminedFieldPath, /^items\[\d+\]/,
+    'the traversal cap records where comparison stopped');
+  assert.equal(capped.truncated, true);
+  assert.equal(mixedGalleyFrameDifference(
+    frame([{ k: 'box', h: 8 }]),
+    frame([{ h: 8, k: 'box' }])
+  ).serializationOnly, true, 'key-order-only serialization changes remain explicit');
+});
+
+test('caret readiness requires complete canonical candidates and paint', () => {
+  assert.deepEqual(warmCanonicalProofOutcome(null, null),
+    { status: 'proof-unavailable', reason: 'sync-prefetch-incomplete' });
+  assert.deepEqual(warmCanonicalProofOutcome([], []),
+    { status: 'proof-unavailable', reason: 'no-sync-candidates' });
+  assert.deepEqual(warmCanonicalProofOutcome([{ page: 1 }], null),
+    { status: 'proof-unavailable', reason: 'paint-prefetch-incomplete' });
+  assert.deepEqual(warmCanonicalProofOutcome([{ page: 1 }], [{ page: 1 }]),
+    { status: 'ready', reason: null });
+});
+
+test('child anchor read proof rejects aliases and untracked project readers', () => {
+  const root = path.resolve('/project/main.tex');
+  const child = path.resolve('/project/content/chapter.tex');
+  const stale = path.resolve('/project/content/old.tex');
+  const source = String.raw`\documentclass{article}
+\begin{document}
+\input{content/chapter}
+\end{document}`;
+  const read = {
+    actualPath: child, readPath: child, command: 'input', raw: 'content/chapter',
+    depth: 0, parentFile: root, rootUnit: 1,
+  };
+  const includes = new Map([
+    [child, { text: 'Visible child prose.\n' }],
+    [stale, { text: String.raw`\input{\dynamic}` }],
+  ]);
+  const proof = singleLiteralChildReadProof({
+    source, sourceFile: root, targetFile: child, trace: [read], includes, inputEpoch: 9,
+  });
+  assert.equal(proof?.targetFile, child);
+  assert.equal(proof?.inputEpoch, 9);
+  assert.equal(proof?.source, source);
+
+  const dynamicBefore = source.replace('\\input{content/chapter}',
+    String.raw`\input{\dynamic}
+\input{content/chapter}`);
+  const dynamicAfter = source.replace('\\input{content/chapter}',
+    String.raw`\input{content/chapter}
+\input{\dynamic}`);
+  for (const unsafeSource of [dynamicBefore, dynamicAfter]) {
+    assert.equal(singleLiteralChildReadProof({
+      source: unsafeSource, sourceFile: root, targetFile: child,
+      trace: [read], includes, inputEpoch: 9,
+    }), null, 'a dynamic reader before or after the target is not accounted');
+  }
+
+  assert.equal(singleLiteralChildReadProof({
+    source, sourceFile: root, targetFile: child,
+    trace: [read], includes: new Map([[child, { text: String.raw`\input{\dynamic}` }]]),
+    inputEpoch: 9,
+  }), null, 'a dynamic reader inside a reached child is not accounted');
+  assert.equal(singleLiteralChildReadProof({
+    source: source.replace('\\end{document}', '\\input{content/../content/chapter}\n\\end{document}'),
+    sourceFile: root,
+    targetFile: child,
+    trace: [read, { ...read, raw: 'content/../content/chapter', rootUnit: 2 }],
+    includes,
+    inputEpoch: 9,
+  }), null, 'a second alias to the same child is ambiguous');
+});
+
+test('a saved child overlay removal retains only one proven plain edit', () => {
+  const child = path.resolve('/project/content/chapter.tex');
+  const before = 'Alpha reference prose';
+  const edited = 'Alpha evidence prose';
+  const overlay = { filePath: child, text: edited };
+  assert.deepEqual(classifyChildInputMutation({ overlays: [overlay] }), {
+    mutation: { kind: 'overlay', filePath: child, text: edited },
+    reason: null,
+  });
+  const removed = classifyChildInputMutation({ removeOverlays: [child] });
+  assert.deepEqual(removed, {
+    mutation: { kind: 'remove-overlay', filePath: child },
+    reason: null,
+  });
+  const now = 10_000_000;
+  assert.equal(canonicalAnchorClientEditTimestamp(now - 500, now), now - 500);
+  assert.equal(canonicalAnchorClientEditTimestamp(null, now), null,
+    'a missing timestamp is never coerced to the Unix epoch');
+  assert.equal(canonicalAnchorClientEditTimestamp(now - 60_001, now), null,
+    'an old client timestamp cannot authorize an autosave exception');
+  assert.equal(canonicalAnchorClientEditTimestamp(now + 1_001, now), null,
+    'a future client timestamp cannot authorize an autosave exception');
+  assert.equal(isOwnAutosavePlainInput({
+    readPathIsLogical: true,
+    diskText: edited,
+    requestedText: edited,
+    diskMtimeMs: now,
+    clientEditAtEpochMs: null,
+  }), false, 'the existing-overlay autosave exception requires an explicit finite timestamp');
+  assert.equal(isOwnAutosavePlainInput({
+    readPathIsLogical: true,
+    diskText: edited,
+    requestedText: edited,
+    diskMtimeMs: now,
+    clientEditAtEpochMs: now - 500,
+  }), true, 'the existing-overlay exception accepts matching bytes saved after the edit');
+  assert.deepEqual(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: before,
+    priorReadText: before,
+    diskText: edited,
+    diskMtimeMs: 1_010,
+    clientEditAtEpochMs: 1_000,
+  }), {
+    delta: singlePlainTextDelta(before, edited),
+    reason: null,
+  });
+
+  // Returning to the canonical base and redoing the same replacement are
+  // both ordinary plain deltas; lineage decides which frozen base to reuse.
+  assert.ok(removedOverlayPlainTextDelta({
+    priorText: edited,
+    activeOverlayText: edited,
+    priorReadText: edited,
+    diskText: before,
+    diskMtimeMs: 2_010,
+    clientEditAtEpochMs: 2_000,
+  }).delta);
+  assert.ok(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: before,
+    priorReadText: before,
+    diskText: edited,
+    diskMtimeMs: 3_010,
+    clientEditAtEpochMs: 3_000,
+  }).delta);
+
+  assert.equal(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: before,
+    priorReadText: before,
+    diskText: String.raw`Alpha \\write evidence`,
+    diskMtimeMs: 1_010,
+    clientEditAtEpochMs: 1_000,
+  }).delta, null, 'unsafe TeX is not a plain anchor edit');
+  assert.equal(classifyChildInputMutation({ removeOverlays: [child, '/project/other.tex'] }).mutation, null,
+    'multiple removals are never one witnessed child edit');
+  assert.equal(classifyChildInputMutation({ rootChanged: true, removeOverlays: [child] }).mutation, null,
+    'a root edit cannot be combined with a child removal anchor');
+  assert.equal(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: before,
+    priorReadText: before,
+    diskText: edited,
+    diskMtimeMs: 999,
+    clientEditAtEpochMs: 1_000,
+  }).delta, null, 'disk bytes older than the keystroke are rejected');
+  assert.equal(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: 'other prior bytes',
+    priorReadText: before,
+    diskText: edited,
+    diskMtimeMs: 1_010,
+    clientEditAtEpochMs: 1_000,
+  }).delta, null, 'the removed overlay must equal the resident prior input');
+  assert.equal(removedOverlayPlainTextDelta({
+    priorText: before,
+    activeOverlayText: before,
+    priorReadText: 'stale physical overlay bytes',
+    diskText: edited,
+    diskMtimeMs: 1_010,
+    clientEditAtEpochMs: 1_000,
+  }).delta, null, 'the physical pre-removal input must equal the resident prior bytes');
+});
+
+test('one wholly-owned child prose edit keeps a frozen canonical input lineage', () => {
+  const child = path.resolve('/project/content/chapter.tex');
+  const diskInput = path.resolve('/project/content/chapter.tex');
+  const line = (text) => ({
+    k: 'box', w: 100, h: 8, d: 2,
+    runs: [{ t: text, x: 0, w: 60, s: 10, f: 'body', dy: 0 }],
+  });
+  const galley = (text) => ({
+    items: [line(text)], floats: [], events: [], labels: [], refs: [], toclines: [],
+  });
+  const oldBlock = {
+    id: 'child-prose', file: child, start: 0, end: 11, text: 'Alpha prose',
+    sourceStart: { line: 31, column: 1 }, sourceEnd: { line: 31, column: 12 },
+    fidelity: { level: 'safe-glyph' }, stateVec: '[1,2,3,4,5,6,7,8]',
+    editRegions: [{ kind: 'text', contentStart: 0, contentEnd: 11 }],
+    galley: galley('Alpha'),
+  };
+  const dom = {
+    id: oldBlock.id, file: child, span: null,
+    source: { file: child, start: oldBlock.sourceStart, end: oldBlock.sourceEnd },
+  };
+  const certificate = {
+    id: 7, rev: 10, inputEpoch: 4, pdfHash: 'pdf-a', synctexHash: 'sync-a',
+  };
+  const firstEdit = { ...singlePlainTextDelta('Alpha prose', 'Alpha prose B'),
+    file: child, canonicalInputPath: diskInput };
+  const baseSnapshot = captureCanonicalAnchorBase({
+    blocks: [oldBlock], domBlocks: [dom], edit: firstEdit, certificate,
+  });
+  assert.deepEqual(baseSnapshot?.span, { start: 0, end: 11 },
+    'the child-local range stays private while the public DOM span remains null');
+  assert.equal(dom.span, null);
+  assert.equal(baseSnapshot?.canonicalInputPath, diskInput,
+    'SyncTeX queries retain the pre-overlay physical input name');
+
+  const report = (srcRev, text) => ({
+    mode: 'structured', previewPolicy: 'canonical-anchor', srcRev,
+    canonical: { id: 7, rev: 10, pageCount: 316 }, stats: { pageCount: 134 },
+    dirtySourceNodes: ['src-child-prose'],
+    patches: [{ type: 'replace-page', page: 52, displayList: { commands: [
+      { op: 'glyphs', src: 'child-prose', line: 0, x: 72, y: 600, w: 60,
+        gh: 8, gd: 2, size: 10, text },
+    ] } }],
+  });
+  const current = (text) => ({
+    ...oldBlock, end: text.length, text,
+    editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length }],
+    galley: galley(text.endsWith('B') ? 'Bravo' : text.endsWith('C') ? 'Charlie' : 'Alpha'),
+  });
+  const firstPlan = planTerminalCanonicalAnchor({
+    blocks: [current('Alpha prose B')], domBlocks: [dom], report: report(11, 'Bravo'),
+    geometry: { textheight: 680 }, edit: firstEdit, baseSnapshot, inputEpoch: 5,
+  });
+  assert.equal(firstPlan?.baseSnapshot, baseSnapshot);
+  assert.equal(firstPlan?.inputEpoch, 5);
+
+  // Content identity rebound the generation to this very revision (the edit
+  // restored compiled bytes): the exact pages already cover the source.
+  const currentDiagnostics = {};
+  const currentPlan = planTerminalCanonicalAnchor({
+    blocks: [current('Alpha prose B')], domBlocks: [dom],
+    report: { ...report(11, 'Bravo'), canonical: { id: 7, rev: 11, pageCount: 316 } },
+    geometry: { textheight: 680 }, edit: firstEdit, baseSnapshot, inputEpoch: 5,
+    diagnostics: currentDiagnostics,
+  });
+  assert.equal(currentPlan, null);
+  assert.equal(currentDiagnostics.reason, 'canonical-current');
+
+  const secondEdit = { ...singlePlainTextDelta('Alpha prose B', 'Alpha prose C'), file: child };
+  const secondPlan = planTerminalCanonicalAnchor({
+    blocks: [current('Alpha prose C')], domBlocks: [dom], report: report(12, 'Charlie'),
+    geometry: { textheight: 680 }, edit: secondEdit, inputEpoch: 6,
+    lineage: {
+      blockId: firstPlan.blockId, baseGeneration: firstPlan.baseGeneration,
+      baseRev: firstPlan.baseRev, lastSrcRev: firstPlan.srcRev, baseSnapshot,
+    },
+  });
+  assert.equal(secondPlan?.baseSnapshot, baseSnapshot,
+    'rapid B→C continues from immutable A rather than treating B as canonical');
+  assert.equal(secondPlan?.baseSnapshot.canonicalInputPath, diskInput);
+
+  const restoredEdit = {
+    ...singlePlainTextDelta('Alpha prose B', 'Alpha prose'),
+    file: child,
+    inputTransition: 'remove-overlay',
+  };
+  const restoredPlan = planTerminalCanonicalAnchor({
+    blocks: [current('Alpha prose')], domBlocks: [dom], report: report(12, 'Alpha'),
+    geometry: { textheight: 680 }, edit: restoredEdit, inputEpoch: 6,
+    lineage: {
+      blockId: firstPlan.blockId, baseGeneration: firstPlan.baseGeneration,
+      baseRev: firstPlan.baseRev, lastSrcRev: firstPlan.srcRev, baseSnapshot,
+      changedLines: firstPlan.changedLines,
+    },
+  });
+  assert.ok(restoredPlan, 'autosave/removal can restore the exact frozen child base');
+  const redoEdit = {
+    ...singlePlainTextDelta('Alpha prose', 'Alpha prose B'),
+    file: child,
+    inputTransition: 'remove-overlay',
+  };
+  const redoPlan = planTerminalCanonicalAnchor({
+    blocks: [current('Alpha prose B')], domBlocks: [dom], report: report(13, 'Bravo'),
+    geometry: { textheight: 680 }, edit: redoEdit, inputEpoch: 7,
+    lineage: {
+      blockId: restoredPlan.blockId, baseGeneration: restoredPlan.baseGeneration,
+      baseRev: restoredPlan.baseRev, lastSrcRev: restoredPlan.srcRev, baseSnapshot,
+      changedLines: restoredPlan.changedLines,
+    },
+  });
+  assert.ok(redoPlan, 'redo after an exact-base removal keeps the same child lineage');
+
+  assert.equal(captureCanonicalAnchorBase({
+    blocks: [oldBlock, { ...oldBlock, id: 'duplicate-instance' }],
+    domBlocks: [dom], edit: firstEdit, certificate,
+  }), null, 'repeated child ownership is ambiguous');
+  assert.equal(captureCanonicalAnchorBase({
+    blocks: [oldBlock, { ...oldBlock, id: 'mixed-owner',
+      sourceParts: [{ file: child, at: 0, to: 11, start: 0, end: 11 }] }],
+    domBlocks: [dom], edit: firstEdit, certificate,
+  }), null, 'mixed sourceParts never acquire a private anchor span');
+  assert.equal(captureCanonicalAnchorBase({
+    blocks: [oldBlock], domBlocks: [dom],
+    edit: { ...firstEdit, file: path.resolve('/project/content/sibling.tex') }, certificate,
+  }), null, 'an unrelated child cannot reuse this resident witness');
+  assert.equal(singlePlainTextDelta('plain prose', 'plain \\write prose'), null);
+});
+
+test('a prose line inside a mixed block anchors only while everything else is unchanged', () => {
+  // heading box, two prose lines, a toc marker and a framed box, as a
+  // \subsection + paragraph + tcolorbox block harvests
+  const prose = (text, h = 8, ca, d = 2) => ({ k: 'box', w: 400, h, d, ...(ca ? { ca: 1 } : {}),
+    runs: [{ t: text, x: 0, w: 10 * text.length, s: 10, f: 'body', dy: 0 }] });
+  const opaque = (text) => ({ k: 'box', w: 400, h: 40, d: 0, runs: [
+    { t: text, x: 10, w: 60, s: 10, f: 'body', dy: 0 },
+    { t: `${text} inside`, x: 10, w: 80, s: 10, f: 'body', dy: 14 },
+  ] });
+  // epochs: the heading, then the paragraph (its glue and both lines), then
+  // the toc marker and the frame, each moved by its own build_page
+  const baseTrailMarks = ['a'.repeat(32), 'b'.repeat(32), 'c'.repeat(32)];
+  const galley = ({ second = 'Bravo', frame = 'Framed', toc = 'Heading', h, d, height = 120,
+    alpha = 'Alpha', alphaH, active, ca, trail = 'trail', trailMarks = baseTrailMarks,
+    epochs = [1, 2, 2, 2, 2, 3, 3], alphaFx, frameFx, paintLate } = {}) => ({
+    gfx: true, w: 400, h: height, closure: 'native', ...(active ? { tdomActive: active } : {}),
+    items: [opaque('Heading'), { k: 'glue', a: 4 }, { ...prose(alpha, alphaH), ...(alphaFx ? { fx: alphaFx } : {}) },
+      { k: 'glue', a: 3 }, prose(second, h, ca, d), { k: 'tl', n: 0 },
+      { ...opaque(frame), ...(frameFx ? { fx: frameFx } : {}) }],
+    epochs, trail, trailMarks, ...(paintLate ? { paintLate } : {}),
+    floats: [], events: [], labels: [], refs: [],
+    toclines: [['toc', 'subsection', toc]],
+  });
+  const fidelity = (flags = 0) => ({ level: 'exact-preview-required', itemFlags: [1, 0, 0, 0, flags, 0, 1] });
+  const text = 'Alpha prose Bravo';
+  const oldBlock = {
+    id: 'mixed', start: 0, end: text.length, text, stateVec: '[1,2,3,4,5,6,7,8]',
+    needsRender: true, fidelity: fidelity(), galley: galley(),
+    editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length }],
+  };
+  const dom = { id: 'mixed', span: { start: 0, end: text.length },
+    source: { file: 'main.tex', start: { line: 20, column: 1 }, end: { line: 22, column: 1 } } };
+  const certificate = { id: 3, rev: 5, inputEpoch: 1, pdfHash: 'pdf', synctexHash: 'sync' };
+  const known = { pre_shipout_filter: ['ltj.direction', 'luacolor.process'],
+    hpack_filter: ['luaotfload.node_processor', 'ltj.main', 'add underlines to list'] };
+  const geometry = { textheight: 680, paintCallbacks: known };
+  const paintContext = { fonts: new Map([['body', { tier: 'native', family: 'f-body' }]]) };
+  const edit = singlePlainTextDelta(text, `${text}X`);
+  const base = captureCanonicalAnchorBase({ blocks: [oldBlock], domBlocks: [dom], edit, certificate });
+  assert.equal(typeof base?.frame, 'string', 'a mixed block freezes its opaque frame');
+  assert.deepEqual(base.lineWitnesses.map((line) => line?.index ?? null), [null, 1, 2, null]);
+
+  const report = { mode: 'structured', srcRev: 6, canonical: { id: 3, rev: 5, pageCount: 40 },
+    stats: { pageCount: 38 }, dirtySourceNodes: ['src-mixed'],
+    patches: [{ type: 'replace-page', page: 12, displayList: { commands: [
+      { op: 'glyphs', src: 'mixed', line: 2, x: 72, y: 300, w: 60, gh: 8, gd: 2, size: 10, text: 'BravoX' },
+    ] } }] };
+  const plan = (changes = {}, flags = 0, context = {}) => planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}X`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      fidelity: fidelity(flags), galley: galley({ second: 'BravoX', ...changes }) }],
+    domBlocks: [dom], report: context.report ?? report, geometry: context.geometry ?? geometry, edit,
+    baseSnapshot: context.base ?? base, paintContext: context.paintContext ?? paintContext,
+    acceptedAt: context.acceptedAt, proofStartedAt: context.proofStartedAt,
+    diagnostics: context.diagnostics ?? null,
+  });
+  const ok = plan();
+  assert.equal(ok?.visualCut, false, 'the byte-identical mixed frame keeps the exact path');
+  const acceptedAt = performance.now() - 900;
+  const proofStartedAt = performance.now();
+  const slowResidentPlan = plan({}, 0, { acceptedAt, proofStartedAt });
+  assert.equal(slowResidentPlan.proofDeadline, proofStartedAt + 700,
+    'proof owns its bounded window after resident typesetting is ready');
+  assert.equal(slowResidentPlan.publishDeadline, proofStartedAt + 850,
+    'publication remains bounded from proof readiness');
+  assert.deepEqual(ok?.changedLines, [2], 'only the edited prose line is repainted');
+  const restoredEdit = singlePlainTextDelta(`${text}X`, text);
+  const restored = planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, fidelity: fidelity(), galley: galley() }],
+    domBlocks: [dom], geometry, edit: restoredEdit, paintContext,
+    report: {
+      ...report,
+      srcRev: 7,
+      patches: [{ type: 'replace-page', page: 12, displayList: { commands: [
+        { op: 'glyphs', src: 'mixed', line: 2, x: 72, y: 300, w: 50,
+          gh: 8, gd: 2, size: 10, text: 'Bravo' },
+      ] } }],
+    },
+    lineage: {
+      blockId: ok.blockId, baseGeneration: ok.baseGeneration, baseRev: ok.baseRev,
+      lastSrcRev: ok.srcRev, baseSnapshot: base, changedLines: ok.changedLines,
+    },
+  });
+  assert.deepEqual(restored?.changedLines, [2],
+    'returning exactly to the base repaints the previous delta line');
+  const nextEdit = singlePlainTextDelta(text, `${text}Y`);
+  const afterRestore = planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}Y`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      fidelity: fidelity(), galley: galley({ second: 'BravoY' }) }],
+    domBlocks: [dom], geometry, edit: nextEdit, paintContext,
+    report: {
+      ...report,
+      srcRev: 8,
+      patches: [{ type: 'replace-page', page: 12, displayList: { commands: [
+        { op: 'glyphs', src: 'mixed', line: 2, x: 72, y: 300, w: 60,
+          gh: 8, gd: 2, size: 10, text: 'BravoY' },
+      ] } }],
+    },
+    lineage: {
+      blockId: restored.blockId, baseGeneration: restored.baseGeneration,
+      baseRev: restored.baseRev, lastSrcRev: restored.srcRev,
+      baseSnapshot: base, changedLines: restored.changedLines,
+    },
+  });
+  assert.deepEqual(afterRestore?.changedLines, [2],
+    'the edit after a full restoration continues from the immutable base');
+  // with graphics in the block its exact chunk owns every line, so the page
+  // carries only the line's source hit box; the safe runs paint from there
+  const hitOnly = planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}X`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      fidelity: fidelity(), galley: galley({ second: 'BravoX' }) }],
+    domBlocks: [dom], geometry, edit, baseSnapshot: base,
+    report: { ...report, patches: [{ type: 'replace-page', page: 12, displayList: { commands: [
+      { op: 'pending-exact', src: 'mixed', x: 72, y: 292, w: 400, h: 10 },
+      { op: 'sourcebox', src: 'mixed', line: 2, x: 72, y: 292, w: 60, h: 10, ink: 1 },
+    ] } }] },
+    paintContext,
+  });
+  assert.deepEqual(hitOnly?.linePlans?.[0]?.commands.map((command) =>
+    [command.op, command.fam, command.text, command.x, command.y]), [['glyphs', 'f-body', 'BravoX', 72, 300]]);
+  assert.deepEqual(ok.baseLineWitnesses.map((line) => line.index), [1, 2],
+    'the proof matches every prose line and no opaque box');
+  assert.equal(plan({ frame: 'Framed!' }), null, 'an opaque box that changed fails closed');
+  assert.equal(plan({ toc: 'Heading!' }), null, 'a changed side effect fails closed');
+  assert.equal(plan({ h: 9 }), null, 'a metric change without a matching block-height delta fails closed');
+  assert.equal(plan({}, 1), null, 'an edited line that needs exact paint fails closed');
+  assert.equal(plan({ active: ':' }), null, 'an active character can run a macro: not plain paint');
+  // SyncTeX tags a prose line with its paragraph's closing line, so the
+  // proof cannot tell prose from framed text by source line: framed text
+  // that paints a prose line's glyphs could stand in for it
+  const framedBase = captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, galley: galley({ frame: 'Framed Alpha' }) }],
+    domBlocks: [dom], edit, certificate });
+  assert.equal(typeof framedBase?.frame, 'string');
+  assert.equal(planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}X`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      fidelity: fidelity(), galley: galley({ second: 'BravoX', frame: 'Framed Alpha' }) }],
+    domBlocks: [dom], report, geometry, edit, baseSnapshot: framedBase, paintContext,
+  }), null, 'framed text that paints a prose line fails closed');
+  assert.equal(plan({}, 0, { geometry: { textheight: 680 } }), null, 'no callback report: fail closed');
+  assert.equal(plan({}, 0, { geometry: { textheight: 680, paintCallbacks: { ...known, pre_shipout_filter: ['mystery.paint'] } } }),
+    null, 'an unknown shipout filter may add paint the resident never saw');
+  assert.equal(plan({}, 0, { paintContext: { fonts: new Map([['body', { tier: 'twin', family: 'f-body' }]]) } }), null,
+    'framed text in a substituted font is not comparable with canonical ToUnicode text');
+  assert.equal(plan({ frame: 'Framed\uE001' }, 0, { base: captureCanonicalAnchorBase({
+    blocks: [{ ...oldBlock, galley: galley({ frame: 'Framed\uE001' }) }], domBlocks: [dom], edit, certificate }) }),
+  null, 'framed PUA text is not comparable');
+  assert.equal(plan({ ca: true }, 0, { base: captureCanonicalAnchorBase({
+    blocks: [{ ...oldBlock, galley: galley({ ca: true }) }], domBlocks: [dom], edit, certificate }) }),
+  null, 'luacolor colors this line at shipout: its resident runs do not show the color');
+  assert.equal(captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, rescued: true }], domBlocks: [dom], edit, certificate }),
+    null, 'a rescued galley carries no paint fingerprints');
+  assert.equal(captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, galley: { ...galley(), trail: undefined } }],
+    domBlocks: [dom], edit, certificate }), null, 'no state trail, no proof about the code after the edit');
+
+  // The trail samples TeX's state at every build_page: a later macro that
+  // reads what the edit changed can emit a literal the harvest cannot read.
+  const trailOnly = plan({ trail: 'other' });
+  assert.equal(trailOnly?.visualCut, true,
+    'a changed final trail uses the explicitly non-authoritative old-layout path');
+  const descenderDelta = 1.006236;
+  const descenderReport = {
+    ...report,
+    patches: [{ ...report.patches[0], displayList: { commands: [
+      { ...report.patches[0].displayList.commands[0], gd: 2 + descenderDelta },
+    ] } }],
+  };
+  const visual = plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+    trailMarks: [baseTrailMarks[0], 'd'.repeat(32), 'e'.repeat(32)],
+  }, 0, { report: descenderReport });
+  assert.equal(visual?.visualCut, true, 'one descender metric delta admits a VisualCut');
+  assert.deepEqual(visual?.changedLines, [2]);
+  assert.equal(visual?.public.presentation, 'visual-cut');
+  assert.equal(visual?.public.authoritative, false);
+
+  const compensationMarks = ['1'.repeat(32), '2'.repeat(32), '3'.repeat(32),
+    '4'.repeat(32), '5'.repeat(32)];
+  const compensatedGalley = ({
+    second = 'Bravo',
+    d = 2,
+    lineHeight = 8,
+    baselineAmount = 15,
+    baselineSubtype = 2,
+    baselineStretch,
+    leadingAmount = 4,
+    nextHeight = 0,
+    nextRuns = [],
+    nextExtra = {},
+    skeletonGlueExtra = {},
+    swapBreak = false,
+    extraGlue = false,
+    trail = 'trail',
+  } = {}) => {
+    const middle = swapBreak
+      ? [{ k: 'pen', v: 10000 }, { k: 'eject', v: -10000 }]
+      : [{ k: 'eject', v: -10000 }, { k: 'pen', v: 10000 }];
+    const items = [opaque('Heading'), { k: 'glue', a: leadingAmount }, prose('Alpha'),
+      { k: 'glue', a: 3 }, prose(second, lineHeight, false, d),
+      { k: 'glue', sub: 0, a: 0, st: 1, sto: 2, ...skeletonGlueExtra }, ...middle];
+    if (extraGlue) items.push({ k: 'glue', sub: 0, a: 0 });
+    items.push({ k: 'glue', sub: baselineSubtype, a: baselineAmount,
+      ...(baselineStretch == null ? {} : { st: baselineStretch }) },
+    { k: 'box', h: nextHeight, d: 0, w: 0, runs: nextRuns, ...nextExtra });
+    return {
+      gfx: true,
+      w: 400,
+      h: 120,
+      closure: 'native',
+      items,
+      epochs: extraGlue
+        ? [1, 2, 2, 2, 2, 3, 4, 3, 4, 5, 5]
+        : [1, 2, 2, 2, 2, 3, 4, 3, 5, 5],
+      trail,
+      trailMarks: compensationMarks,
+      floats: [], events: [], labels: [], refs: [], toclines: [],
+    };
+  };
+  const compensatedFidelity = {
+    level: 'exact-preview-required',
+    itemFlags: [1, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+  };
+  const compensatedBaseBlock = {
+    ...oldBlock,
+    galley: compensatedGalley(),
+    fidelity: compensatedFidelity,
+  };
+  const compensatedBase = captureCanonicalAnchorBase({
+    blocks: [compensatedBaseBlock], domBlocks: [dom], edit, certificate,
+  });
+  const compensatedPlan = (changes = {}, context = {}) => planTerminalCanonicalAnchor({
+    blocks: [{ ...compensatedBaseBlock, end: text.length + 1, text: `${text}X`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      galley: compensatedGalley({ second: 'BravoX', d: 2 + descenderDelta,
+        baselineAmount: 15 - descenderDelta, trail: 'other', ...changes }) }],
+    domBlocks: [dom], report: context.report ?? descenderReport, geometry, edit,
+    baseSnapshot: compensatedBase, paintContext,
+  });
+  const compensated = compensatedPlan();
+  assert.equal(compensated?.visualCut, true,
+    'a single baselineskip exactly compensating the changed depth admits the old-layout cut');
+  assert.deepEqual(compensated?.changedLines, [2]);
+  assert.equal(compensatedPlan({ leadingAmount: 4.25 }), null,
+    'an unrelated glue change stays outside the compensation');
+  assert.equal(compensatedPlan({ baselineStretch: 1 }), null,
+    'changed baselineskip stretch stays outside the compensation');
+  assert.equal(compensatedPlan({ baselineSubtype: 3 }), null,
+    'a non-baselineskip subtype cannot compensate line depth');
+  assert.equal(compensatedPlan({ nextHeight: 1 }), null,
+    'the box following the baselineskip must remain the same empty box');
+  assert.equal(compensatedPlan({ nextRuns: [{ text: 'paint' }] }), null,
+    'the clearpage sentinel box must not contain paint runs');
+  assert.equal(compensatedPlan({ nextExtra: { fx: true } }), null,
+    'the clearpage sentinel box has an exact paint-empty shape');
+  assert.equal(compensatedPlan({ skeletonGlueExtra: { unknown: 1 } }), null,
+    'the zero-natural clearpage glue accepts only harvested glue fields');
+  assert.equal(compensatedPlan({ swapBreak: true }), null,
+    'the bounded clearpage item order is exact');
+  assert.equal(compensatedPlan({ lineHeight: 9 }), null,
+    'the compensation covers depth only');
+  assert.equal(compensatedPlan({ extraGlue: true }), null,
+    'a second intervening glue is not admitted');
+  assert.equal(compensatedPlan({ baselineAmount: 15 - descenderDelta + 0.25 }), null,
+    'the baselineskip amount must exactly negate the depth delta');
+  assert.equal(compensatedPlan({ d: 2, baselineAmount: 15, trail: 'trail' }, { report })?.visualCut, false,
+    'a byte-identical exact mixed frame continues to use the exact path');
+  assert.equal(plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+    trailMarks: ['f'.repeat(32), 'd'.repeat(32), 'e'.repeat(32)],
+  }), null, 'a state change before the edited contribution fails closed');
+  assert.equal(plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+    trailMarks: undefined,
+  }, 0, { base: { ...base, trailMarks: null } }), null,
+  'missing per-epoch marks fail closed');
+  assert.equal(plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+    trailMarks: ['bad', 'd'.repeat(32), 'e'.repeat(32)],
+  }), null, 'malformed per-epoch marks fail closed');
+  assert.equal(plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta + 0.25,
+    trail: 'other',
+  }), null, 'the aggregate height must equal the edited line metric delta');
+  assert.equal(plan({
+    alphaH: 9,
+    d: 2 + descenderDelta,
+    height: 121 + descenderDelta,
+    trail: 'other',
+  }), null, 'another plain line metric cannot change');
+  assert.equal(plan({
+    alpha: 'AlphaX',
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+  }), null, 'two changed plain signatures cannot share one cut');
+  assert.equal(plan({
+    d: 2 + descenderDelta,
+    height: 120 + descenderDelta,
+    trail: 'other',
+    epochs: [1, 2, 2, 2, 3, 3, 3],
+  }), null, 'a contribution epoch change fails closed');
+  // Inside the edited paragraph no sample sees horizontal-mode state, so its
+  // contribution may carry only paint the harvest reads.
+  const fxBase = (changes) => captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, galley: galley(changes) }],
+    domBlocks: [dom], edit, certificate });
+  assert.equal(plan({ alphaFx: 'f00d' }, 0, { base: fxBase({ alphaFx: 'f00d' }) }), null,
+    'a paint whatsit in the edited paragraph fails closed');
+  assert.deepEqual(plan({ frameFx: 'f00d' }, 0, { base: fxBase({ frameFx: 'f00d' }) })?.changedLines, [2],
+    'an unchanged frame after the paragraph keeps its unreadable literal: the trail proves its inputs');
+
+  // Paint callbacks are known by exact name and description, and include any
+  // registered after the preamble, in any block of the document.
+  assert.equal(plan({}, 0, { geometry: { textheight: 680, paintCallbacks: { ...known,
+    hpack_filter: [...known.hpack_filter, 'ltj.mystery'] } } }), null, 'a name prefix is not a known callback');
+  assert.equal(plan({ paintLate: { pre_shipout_filter: ['late.paint'] } }), null,
+    'a filter the document registered after the preamble fails closed');
+  assert.deepEqual(plan({ paintLate: { vpack_filter: ['add underlines to list'] } })?.changedLines, [2],
+    'a late registration of a known filter is still known');
+  const withNeighbour = (neighbour) => planTerminalCanonicalAnchor({
+    blocks: [{ ...oldBlock, end: text.length + 1, text: `${text}X`,
+      editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length + 1 }],
+      fidelity: fidelity(), galley: galley({ second: 'BravoX' }) }, neighbour],
+    domBlocks: [dom], report, geometry, edit, baseSnapshot: base, paintContext,
+  });
+  assert.deepEqual(withNeighbour({ id: 'later', galley: { items: [] } })?.changedLines, [2]);
+  assert.equal(withNeighbour({ id: 'later', galley: { items: [], paintLate: { pre_shipout_filter: ['late.paint'] } } }),
+    null, 'a later block on the same page may register a shipout filter');
+  assert.equal(withNeighbour({ id: 'later' }), null, 'a block the resident has not typeset: registrations unknown');
+
+  // A refusal leaves the preview on the canonical build; its reason is the
+  // only trace of which check it was.
+  const refusal = (changes = {}, flags = 0, context = {}) => {
+    const diagnostics = {};
+    assert.equal(plan(changes, flags, { ...context, diagnostics }), null);
+    return diagnostics;
+  };
+  const changedFrame = refusal({ frame: 'Framed!' });
+  assert.equal(changedFrame.reason, 'mixed-frame-changed');
+  assert.equal(changedFrame.visualCutRefusal, 'frame');
+  assert.deepEqual(changedFrame.mixedFrameDifference, {
+    changedFieldCount: 2,
+    changedFieldPaths: ['items[6].runs[0].t', 'items[6].runs[1].t'],
+    unexaminedFieldPath: null,
+    serializationOnly: false,
+    truncated: false,
+  });
+  const trailDiagnostics = {};
+  assert.equal(plan({ trail: 'other' }, 0, { diagnostics: trailDiagnostics })?.visualCut, true);
+  assert.deepEqual(trailDiagnostics.mixedFrameDifference, {
+    changedFieldCount: 1,
+    changedFieldPaths: ['trail'],
+    unexaminedFieldPath: null,
+    serializationOnly: false,
+    truncated: false,
+  });
+  assert.equal(refusal({ active: ':' }).reason, 'mixed-active-chars',
+    'an unavailable current frame retains its specific refusal reason');
+  assert.equal(refusal({}, 1).reason, 'mixed-line-flags');
+  assert.equal(refusal({ alphaFx: 'f00d' }, 0, { base: fxBase({ alphaFx: 'f00d' }) }).reason,
+    'edited-contribution-paint');
+  assert.equal(refusal({ paintLate: { pre_shipout_filter: ['late.paint'] } }).reason, 'paint-callbacks');
+  assert.equal(refusal({}, 0, { base: { ...base, blockId: 'other' } }).reason, 'base-mismatch');
+  const captureRefusal = {};
+  assert.equal(captureCanonicalAnchorBase({ blocks: [{ ...oldBlock, galley: galley({ active: ':' }) }],
+    domBlocks: [dom], edit, certificate, diagnostics: captureRefusal }), null);
+  assert.equal(captureRefusal.reason, 'mixed-active-chars');
+
+  const pageGeometry = { oddsidemargin: 0, textwidth: 450, topmargin: 0, headheight: 12, headsep: 18,
+    textheight: 680 };
+  const line = (y) => ({ page: 12, y, box: { left: 72, top: y - 8, right: 472, bottom: y + 2 } });
+  const restoredPatch = buildTerminalCanonicalPatch({ ...restored, geometry: pageGeometry },
+    [{ lineIndex: 0, candidate: line(150) }, { lineIndex: 1, candidate: line(163) }]);
+  assert.deepEqual(restoredPatch?.commands?.filter((command) => command.op === 'glyphs')
+    .map((command) => command.text), ['Bravo'],
+  'base restoration uses the ordinary certified repaint transaction');
+  const patch = buildTerminalCanonicalPatch({ ...ok, geometry: pageGeometry },
+    [{ lineIndex: 0, candidate: line(150) }, { lineIndex: 1, candidate: line(163) }]);
+  assert.deepEqual(patch?.pages?.map((page) => page.page), [12]);
+  assert.equal(patch.pages[0].commands[0].y, 163,
+    'positional matches map back to the witness box ordinal, not the first prose line');
+  const visualPatch = buildTerminalCanonicalPatch({ ...visual, geometry: pageGeometry },
+    [{ lineIndex: 0, candidate: line(150) }, { lineIndex: 1, candidate: line(163) }]);
+  assert.equal(visualPatch?.visualCut, true);
+  assert.equal(visualPatch?.authoritative, false);
+  assert.equal(visualPatch?.pages?.[0]?.baseMasks?.length, 1);
+  assert.ok(visualPatch.pages[0].masks[0].bottom > visualPatch.pages[0].baseMasks[0].bottom,
+    'the descender adds a raster-checked ring below the ordinary mask');
+  const slowResidentPatch = buildTerminalCanonicalPatch(
+    { ...slowResidentPlan, geometry: pageGeometry },
+    [{ lineIndex: 0, candidate: line(150) }, { lineIndex: 1, candidate: line(163) }]
+  );
+  assert.equal(slowResidentPatch.publishWithinMs, slowResidentPlan.publishDeadline - acceptedAt,
+    'the renderer deadline includes resident typesetting plus the bounded proof/paint window');
+});
 
 test('terminal prose without a frozen canonical line proof fails closed', () => {
   const block = {
@@ -937,16 +2078,20 @@ test('fresh partial-exact pixels replace only contiguous math lines', () => {
 
 let eng;
 let openReport;
-before(async () => {
-  if (!available) return;
-  rmSync(WORK, { recursive: true, force: true });
-  rmSync(WORK2, { recursive: true, force: true });
-  eng = new CheckpointEngine({ workDir: WORK });
-  openReport = await eng.open(makeDoc());
-  await drain(eng);
-});
+function sharedTest(name, options, body) {
+  test(name, options, async (context) => {
+    if (!eng) {
+      rmSync(WORK, { recursive: true, force: true });
+      rmSync(WORK2, { recursive: true, force: true });
+      eng = new CheckpointEngine({ workDir: WORK });
+      openReport = await eng.open(makeDoc());
+      await drain(eng);
+    }
+    await body(context);
+  });
+}
 
-test('edit reports atomically carry newly registered texttt and textit faces', opts, async () => {
+sharedTest('edit reports atomically carry newly registered texttt and textit faces', opts, async () => {
   assert.deepEqual(new Set(openReport.fonts), new Set(eng.getFontManifest()));
   const anchor = 'Opening alpha';
   const insert = '\\texttt{aaaa}\\textit{BBBB}';
@@ -967,7 +2112,7 @@ after(async () => {
   if (eng) await eng.close();
 });
 
-test('display-math exact render reuses the foreground JOB node list', opts, async () => {
+sharedTest('display-math exact render reuses the foreground JOB node list', opts, async () => {
   await eng.renderTask.catch(() => {});
   const beforeHits = eng.renderStats.captureHits;
   const at = eng.getSource().indexOf('a^2');
@@ -994,7 +2139,7 @@ test('display-math exact render reuses the foreground JOB node list', opts, asyn
   await drain(eng);
 });
 
-test('mixed prose and display math reaches fresh exact pixels without canonical compile', opts, async () => {
+sharedTest('mixed prose and display math reaches fresh exact pixels without canonical compile', opts, async () => {
   await eng.renderTask.catch(() => {});
   const beforeHits = eng.renderStats.captureHits;
   const source = eng.getSource();
@@ -1029,7 +2174,7 @@ test('mixed prose and display math reaches fresh exact pixels without canonical 
   await drain(eng);
 });
 
-test('steady-state keystrokes stay fork-once (edit-locus pin)', opts, async () => {
+sharedTest('steady-state keystrokes stay fork-once (edit-locus pin)', opts, async () => {
   const src = () => eng.getSource();
   let worstBlocks = 0;
   let worstWall = 0;
@@ -1049,7 +2194,7 @@ test('steady-state keystrokes stay fork-once (edit-locus pin)', opts, async () =
   await drain(eng);
 });
 
-test('a tail edit right after a mid edit is NOT charged the distance', opts, async () => {
+sharedTest('a tail edit right after a mid edit is NOT charged the distance', opts, async () => {
   if (process.env.TDOM_EXPECT_MAX_CHECKPOINTS !== undefined) {
     assert.equal(
       eng.maxCheckpoints,
@@ -1091,7 +2236,7 @@ test('a tail edit right after a mid edit is NOT charged the distance', opts, asy
   await drain(eng);
 });
 
-test('a null edit pair leaves the document identity untouched', opts, async () => {
+sharedTest('a null edit pair leaves the document identity untouched', opts, async () => {
   const before = signature(eng);
   const pos = eng.getSource().indexOf('Delta filler 3');
   await eng.edit(pos, pos, 'Z');
@@ -1100,7 +2245,7 @@ test('a null edit pair leaves the document identity untouched', opts, async () =
   assert.deepEqual(signature(eng), before, 'insert+revert must be a no-op');
 });
 
-test('section insert: fast response, async renumbering to convergence', opts, async () => {
+sharedTest('section insert: fast response, async renumbering to convergence', opts, async () => {
   const pos = eng.getSource().indexOf('\\section{Gamma}');
   const t0 = performance.now();
   const r = await eng.edit(pos, pos, '\\section{Inserted}\\label{sec:ins}\n\n' + para('Inserted body') + '\n\n');
@@ -1118,7 +2263,7 @@ test('section insert: fast response, async renumbering to convergence', opts, as
   assert.equal(labels['sec:eps'], '6');
 });
 
-test('definition edit: suffix rebuilt off the hot path', opts, async () => {
+sharedTest('definition edit: suffix rebuilt off the hot path', opts, async () => {
   const src = eng.getSource();
   const pos = src.indexOf('alpha-value');
   const t0 = performance.now();
@@ -1138,28 +2283,7 @@ test('definition edit: suffix rebuilt off the hot path', opts, async () => {
   assert.match(text, /beta/, 'downstream block reflects the new definition');
 });
 
-test('THE defining equation: incremental result equals a fresh engine', opts, async () => {
-  await drain(eng);
-  const finalSrc = eng.getSource();
-  const scratch = new CheckpointEngine({ workDir: WORK2 });
-  try {
-    await scratch.open(finalSrc);
-    await drain(scratch);
-    assert.equal(eng.blocks.length, scratch.blocks.length, 'same segmentation');
-    const a = signature(eng);
-    const b = signature(scratch);
-    const mismatches = [];
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] !== b[i]) mismatches.push(`#${i} ${eng.blocks[i].id}`);
-    }
-    assert.deepEqual(mismatches, [], 'every block identical to from-scratch');
-    assert.equal(eng.pages.length, scratch.pages.length, 'same page count');
-  } finally {
-    await scratch.close();
-  }
-});
-
-test('idle engine holds no deferred work and a bounded process set', opts, async () => {
+sharedTest('idle engine holds no deferred work and a bounded process set', opts, async () => {
   await drain(eng);
   assert.equal(eng.pendingChain, null);
   assert.equal(eng.bgActive, false);
@@ -1168,6 +2292,31 @@ test('idle engine holds no deferred work and a bounded process set', opts, async
     eng.checkpoints.size <= eng.maxCheckpoints + 16,
     `checkpoint processes bounded (${eng.checkpoints.size})`
   );
+});
+
+sharedTest('THE defining equation: incremental result equals a fresh engine', opts, async () => {
+  await drain(eng);
+  const finalSrc = eng.getSource();
+  const incremental = { signature: signature(eng), pages: eng.pages.length,
+    ids: eng.blocks.map(block => block.id) };
+  await eng?.close();
+  eng = null;
+  const scratch = new CheckpointEngine({ workDir: WORK2 });
+  try {
+    await scratch.open(finalSrc);
+    await drain(scratch);
+    assert.equal(incremental.ids.length, scratch.blocks.length, 'same segmentation');
+    const a = incremental.signature;
+    const b = signature(scratch);
+    const mismatches = [];
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) mismatches.push(`#${i} ${incremental.ids[i]}`);
+    }
+    assert.deepEqual(mismatches, [], 'every block identical to from-scratch');
+    assert.equal(incremental.pages, scratch.pages.length, 'same page count');
+  } finally {
+    await scratch.close();
+  }
 });
 
 // Broken-TeX freeze semantics (docs/10 §10.9). The breakage class that
@@ -1202,6 +2351,8 @@ const tikzDoc = (fill) =>
 // where they were — zero churn while the user is mid-edit — and the block
 // heals on the next edit that fixes it.
 test('broken block freezes at its last good galley, downstream untouched, heals on fix', opts, async () => {
+  await eng?.close();
+  eng = null;
   rmSync(WORK2, { recursive: true, force: true });
   const e = new CheckpointEngine({ workDir: WORK2 });
   try {
@@ -1240,6 +2391,8 @@ test('broken block freezes at its last good galley, downstream untouched, heals 
 // skips and reverts when it sees tdomFrozen). This test pins the fresh-boot
 // half: empty freeze, engine alive, state passthrough.
 test('fresh boot on a broken source: empty freeze, engine alive', opts, async () => {
+  await eng?.close();
+  eng = null;
   rmSync(WORK2, { recursive: true, force: true });
   const scratch = new CheckpointEngine({ workDir: WORK2 });
   try {
@@ -1259,12 +2412,250 @@ test('fresh boot on a broken source: empty freeze, engine alive', opts, async ()
   }
 });
 
+// A galley used to record only THAT a block draws (gfx), never WHAT: a
+// changed literal inside an otherwise identical box was invisible to the
+// mixed-block canonical-anchor frame.
+test('each galley box fingerprints the paint whatsits it draws', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  const fingerprints = (marker) => e.blocks.find((b) => b.text.includes(marker))
+    ?.galley?.items?.filter((item) => item.k === 'box').map((item) => item.fx ?? null);
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage{tikz}
+\begin{document}
+Plain prose line.
+
+Drawn \tikz\draw (0,0) -- (1,0); here.
+\end{document}
+`);
+    await drain(e);
+    assert.deepEqual(fingerprints('Plain prose'), [null], 'plain prose draws nothing');
+    const drawn = fingerprints('Drawn');
+    assert.equal(drawn.length, 1);
+    assert.match(drawn[0] ?? '', /^[0-9a-f]{32}$/);
+    // LuaTeX exposes no payload for token-list literals, so the fingerprint
+    // records each paint whatsit's kind and order; a second drawing counts
+    const at = e.getSource().indexOf(' here.');
+    await e.edit(at, at, String.raw` \tikz\fill (0,0) circle (1pt);`);
+    await drain(e);
+    assert.notEqual(fingerprints('Drawn')[0], drawn[0], 'more drawing is a different box');
+  } finally {
+    await e.close();
+  }
+});
+
+// luacolor keeps colors in an attribute and writes them only at shipout:
+// the resident runs of a colored line stay black, so canonical-anchor must
+// know which lines carry a color other than black.
+test('boxes whose glyphs luacolor colors at shipout are marked', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  const marks = (marker) => e.blocks.find((b) => b.text.includes(marker))
+    ?.galley?.items?.filter((item) => item.k === 'box').map((item) => item.ca ?? 0);
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage{xcolor}
+\usepackage{luacolor}
+\begin{document}
+\color{black}Black prose line.
+
+{\color{red}Red prose line.}
+\end{document}
+`);
+    await drain(e);
+    assert.deepEqual(marks('Black prose'), [0], 'black is what the resident runs already paint');
+    assert.deepEqual(marks('Red prose'), [1]);
+    assert.ok(e.getGeometry().paintCallbacks?.pre_shipout_filter?.includes('luacolor.process'),
+      'the resident reports the shipout filter that paints these colors');
+  } finally {
+    await e.close();
+  }
+});
+
+// Without luacolor, \color is a color-stack whatsit. Before a paragraph it
+// sits in vertical mode, where the harvest does not follow the stack: the
+// red paragraph's runs stay black, and only the canonical fill color keeps
+// canonical-anchor from repainting the edited line black.
+test('a line the canonical page fills in a color its runs lack neither certifies nor anchors', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  const planEdit = async (marker) => {
+    const at = e.getSource().indexOf(marker) + marker.length;
+    const edit = { start: at, end: at, text: 'X' };
+    const certificate = { id: 1, rev: e.srcRev, inputEpoch: 0, pdfHash: 'pdf', synctexHash: 'sync' };
+    const baseSnapshot = captureCanonicalAnchorBase({ blocks: e.blocks, domBlocks: e.getDOM().blocks, edit, certificate });
+    const report = await e.edit(at, at, 'X');
+    const plan = planTerminalCanonicalAnchor({
+      blocks: e.blocks, domBlocks: e.getDOM().blocks, geometry: e.getGeometry(), edit, baseSnapshot,
+      report: { ...report, previewPolicy: 'canonical-anchor', canonical: { id: 1, rev: report.srcRev - 1, pageCount: 1 } },
+      paintContext: { fonts: e.fonts, twinMetrics: e.twinMetrics },
+    });
+    await drain(e);
+    assert.equal(plan?.baseLineWitnesses?.length, 1, `${marker}: one prose line to prove`);
+    assert.deepEqual(plan.changedLines, [0]);
+    return plan;
+  };
+  // The base line on its canonical page, as pdf.js reports it: every fill
+  // is setFillRGBColor with a hex string (a vertical-mode \color{red} shows
+  // as #ff0000 just before the paragraph's text).
+  const certify = (plan, fill) => {
+    const [witness] = plan.baseLineWitnesses;
+    const { lineBoxLeft: left, baseline } = plan.linePlans[0];
+    const glyphs = Array.from(witness.paintText);
+    const OPS = { setFont: 1, showText: 2, setFillRGBColor: 3 };
+    const paint = buildPdfPaintPage({
+      pageNumber: 1,
+      viewport: { transform: [1, 0, 0, -1, 0, 792], rotation: 0 },
+      OPS,
+      Util: { transform: (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1],
+        m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3],
+        m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]] },
+      textContent: { items: [{ str: witness.paintText, dir: 'ltr', width: witness.contentWidth,
+        height: witness.glyphSizes[0], transform: [witness.glyphSizes[0], 0, 0, witness.glyphSizes[0],
+          left + witness.contentLeft, 792 - baseline] }] },
+      operatorList: {
+        fnArray: [OPS.setFillRGBColor, ...glyphs.flatMap(() => [OPS.setFont, OPS.showText])],
+        argsArray: [[fill], ...glyphs.flatMap((unicode, index) => [['f', witness.glyphSizes[index]],
+          [[{ unicode, isSpace: false, isInFont: true, accent: null }]]])],
+      },
+    });
+    const candidate = { page: 1, x: left, y: baseline,
+      box: { left, top: baseline - witness.height, right: left + witness.lineWidth, bottom: baseline + witness.depth } };
+    return certifyCanonicalBlock({ witnesses: plan.baseLineWitnesses, candidates: [candidate], paintPages: [paint] });
+  };
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage{xcolor}
+\begin{document}
+Black prose line.
+
+\color{red}
+Red prose line.
+\end{document}
+`);
+    await drain(e);
+    const black = await planEdit('Black prose line');
+    assert.equal(buildTerminalCanonicalPatch(black, certify(black, '#000000'))?.status, 'ready',
+      'a black line over black canonical paint anchors');
+    assert.ok(certify(black, '#2c2e35'), "pdf.js's DeviceCMYK black is black too");
+
+    const red = await planEdit('Red prose line');
+    assert.ok(certify(red, '#000000'), 'text and geometry alone cannot tell the lines apart');
+    assert.equal(certify(red, '#ff0000'), null, 'the canonical line is red: no proof, no black repaint');
+    assert.deepEqual([...new Set(red.baseLineWitnesses[0].glyphColors)], ['#000000'],
+      'the harvest does not see the color-stack push in vertical mode');
+  } finally {
+    await e.close();
+  }
+});
+
+// LuaTeX exposes no payload for a pdf_literal TeX built, so a galley cannot
+// show that a later, unedited macro wrote a different one. It can show the
+// state that macro read: the trail samples it at every build_page.
+test('the state trail records what later code can read after an edit', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  const galley = () => e.blocks.find((b) => b.text.includes('Stretchy'))?.galley;
+  const frame = (g) => mixedGalleyFrame({ ...g, trail: null }, galleyMixedLineWitnesses(g));
+  try {
+    await e.open(String.raw`\documentclass{article}
+\begin{document}
+{\parfillskip=0pt plus 300pt Stretchy prose line.\par}
+\hbox{\pdfextension literal{\the\badness\space w}}
+\end{document}
+`);
+    await drain(e);
+    const before = galley();
+    assert.equal(typeof before?.trail, 'string');
+    assert.equal(before.epochs?.length, before.items.length, 'every top-level item knows its build_page');
+    const at = e.getSource().indexOf(' line.');
+    await e.edit(at, at, 'X');
+    await drain(e);
+    const after = galley();
+    assert.equal(frame(after), frame(before), 'the literal box looks the same to the harvest');
+    assert.notEqual(after.trail, before.trail, 'but the badness it was built from changed');
+  } finally {
+    await e.close();
+  }
+});
+
+// A package can register a paint filter from the document body, even
+// through its own saved reference to add_to_callback, and drop it again
+// within the block: GEO's preamble snapshot misses all of that.
+test('paint callbacks registered after the preamble reach every later galley', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  const late = (marker) => e.blocks.find((b) => b.text.includes(marker))?.galley?.paintLate ?? null;
+  try {
+    await e.open(String.raw`\documentclass{article}
+\directlua{tdomtest_add = luatexbase.add_to_callback}
+\begin{document}
+First prose.
+
+\directlua{tdomtest_add('pre_shipout_filter', function() return true end, 'late.paint')
+luatexbase.remove_from_callback('pre_shipout_filter', 'late.paint')}Second prose.
+
+Third prose.
+\end{document}
+`);
+    await drain(e);
+    assert.equal(late('First'), null, "the resident's own trail hook is not document paint");
+    assert.deepEqual(late('Second'), { pre_shipout_filter: ['late.paint'] }, 'added and removed inside one block');
+    assert.deepEqual(late('Third'), { pre_shipout_filter: ['late.paint'] }, 'the lineage keeps it');
+  } finally {
+    await e.close();
+  }
+});
+
+// The dormant absorb never ships, so every fire is a dead cycle, and LuaTeX
+// ignores a tex.deadcycles assignment. Without TeX's own reset each
+// \clearpage (two fires) counted toward \maxdeadcycles=200 across the fork
+// lineage, and past ~100 pages every later eject died with "Output loop".
+// A small \maxdeadcycles reproduces that within a few pages.
+test('absorbed page ejects do not accumulate dead cycles along the lineage', opts, async () => {
+  await eng?.close();
+  eng = null;
+  rmSync(WORK2, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: WORK2 });
+  try {
+    const pages = Array.from({ length: 6 }, (_, i) => `Page ${i + 1}.\n\\clearpage`).join('\n\n');
+    await e.open(`\\documentclass{article}\n\\begin{document}\n\\maxdeadcycles=5\n\n${pages}\n\\end{document}\n`);
+    await drain(e);
+    const pageBlocks = e.blocks.filter((b) => /^Page \d/.test(b.text));
+    assert.equal(pageBlocks.length, 6);
+    for (const b of pageBlocks) {
+      assert.equal(b.closure?.native, true, `${b.text.split('\n')[0]} certifies natively`);
+      assert.equal(b.galley?.tdomDeferred, undefined);
+    }
+    const at = e.getSource().indexOf('Page 6.') + 'Page 6'.length;
+    await e.edit(at, at, ' again');
+    await drain(e);
+    const edited = e.blocks.find((b) => b.text.startsWith('Page 6 again.'));
+    assert.equal(edited?.closure?.native, true, 'an edit deep in the lineage still certifies natively');
+  } finally {
+    await e.close();
+  }
+});
+
 // Margin-bearing blocks (\marginpar / todonotes' \todo — the paper-draft
 // review-mark workflow) must NOT demote the document: the block typesets
 // in-chain for its body text, its fidelity is CANONICAL_ONLY (the canonical
 // page supplies the margin pixels through the 'canon' display band), and
 // keystrokes inside it stay on the fast path.
 test('margin marks stay structured as canonical-only blocks', opts, async () => {
+  await eng?.close();
+  eng = null;
   rmSync(WORK2, { recursive: true, force: true });
   const e = new CheckpointEngine({ workDir: WORK2 });
   try {
@@ -1315,6 +2706,8 @@ test('margin marks stay structured as canonical-only blocks', opts, async () => 
 // (found by the fuzzer: corpus/06 seed 1, burst 2). resolvedInGalley now
 // compares the exact values injected at typeset time (galley.tdomRefVals).
 test('backward ref updates when the label moves to a value already visible in the block', opts, async () => {
+  await eng?.close();
+  eng = null;
   const refsDoc = readFileSync(
     fileURLToPath(new URL('../corpus/06-refs-heavy.tex', import.meta.url)),
     'utf8'
@@ -1331,16 +2724,19 @@ test('backward ref updates when the label moves to a value already visible in th
     const at = e.getSource().indexOf(anchor) + anchor.length;
     await e.edit(at, at, '\n\n\\begin{equation}\n  q^2 = p\n\\end{equation}\n');
     await drain(e);
+    const incremental = { signature: signature(e), ids: e.blocks.map(block => block.id) };
+    const finalSrc = e.getSource();
+    await e.close();
     const scratch = new CheckpointEngine({ workDir: WORK2 + '-scratch' });
     try {
-      await scratch.open(e.getSource());
+      await scratch.open(finalSrc);
       await drain(scratch);
-      assert.equal(e.blocks.length, scratch.blocks.length, 'same segmentation');
-      const a = signature(e);
+      assert.equal(incremental.ids.length, scratch.blocks.length, 'same segmentation');
+      const a = incremental.signature;
       const b = signature(scratch);
       const mismatches = [];
       for (let i = 0; i < a.length; i++) {
-        if (a[i] !== b[i]) mismatches.push(`#${i} ${e.blocks[i].id}`);
+        if (a[i] !== b[i]) mismatches.push(`#${i} ${incremental.ids[i]}`);
       }
       assert.deepEqual(mismatches, [], 'every block identical to from-scratch');
     } finally {
@@ -1352,7 +2748,7 @@ test('backward ref updates when the label moves to a value already visible in th
   }
 });
 
-test('forced-break rescue consumes the TeX output box and supplies exact page material', opts, async () => {
+sharedTest('native forced breaks retain adjacent material without phantom pages or rescue work', opts, async () => {
   await eng.open(String.raw`\documentclass{article}
 \begin{document}
 Ordinary prose before the rescued material.
@@ -1361,20 +2757,21 @@ Ordinary prose before the rescued material.
 \newpage
 
 Ordinary prose after the rescued material.
+\clearpage
+
+Ordinary prose on the third page.
 \end{document}`);
   await drain(eng);
-  const rescued = eng.blocks.find(block => block.text.includes('\\newpage'));
-  assert.ok(rescued?.rescued, 'the forced-break block completes its rescue');
-  assert.equal(rescued.galley.tdomPendingPaint, undefined, 'no page-wide pending marker remains');
-  assert.ok([...eng.chunks.keys()].some(key => key === rescued.id || key.startsWith(rescued.id + '@')),
-    `the rescued text has exact pixels: ${JSON.stringify({ items: rescued.galley.items, keys: [...eng.chunks.keys()], diagnostics: eng.diagnostics })}`);
-  const chunk = [...eng.chunks.entries()].find(([key]) => key === rescued.id || key.startsWith(rescued.id + '@'))[1];
-  const pdf = path.join(WORK, 'forced-break-rescue.pdf');
-  writeFileSync(pdf, chunk.editPdf);
-  const { stdout } = await promisify(execFile)('pdftotext', [pdf, '-']);
-  assert.match(stdout, /Rescued material with a forced break/, 'the exact PDF retains the rescued text');
+  assert.equal(eng.blocks.some(block => block.rescued || block.galley?.tdomPendingPaint), false);
+  assert.equal(eng.rescueQueue.size, 0);
+  assert.equal(eng.pages.length, 3);
+  const text = eng.getDisplayLists().map(page => page.commands
+    .filter(command => command.op === 'glyphs').map(command => command.text).join('').replace(/\s/g, ''));
+  assert.match(text[0], /Rescuedmaterialwithaforcedbreak/);
+  assert.match(text[1], /Ordinaryproseafter/);
+  assert.match(text[2], /Ordinaryproseonthethirdpage/);
   assert.doesNotMatch(eng.rootLogRef?.() ?? '', /Output routine didn't use all of/,
-    'the forked rescue must consume box255 through TeX');
+    'the native output routine must consume box255 through TeX');
   const at = eng.getSource().indexOf('Ordinary prose before') + 'Ordinary prose'.length;
   const report = await eng.edit(at, at, ' edited');
   assert.ok(report.stats.blocksTypeset <= 2, 'adjacent prose stays bounded');
@@ -1383,7 +2780,7 @@ Ordinary prose after the rescued material.
 });
 
 
-test('resident forced output retains material before and after a page break', opts, async () => {
+sharedTest('resident forced output retains material before and after a page break', opts, async () => {
   await eng.open(String.raw`\documentclass{article}
 \begin{document}
 Before forced output.\par
@@ -1400,7 +2797,8 @@ After forced output.\par
 });
 
 test('decorated boxes retain private PDF resources across capture, resize, and sibling edits', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-private-pdf-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
   const source = String.raw`\documentclass{article}
@@ -1445,7 +2843,8 @@ SiblingResource.
       assert.deepEqual(readFileSync(path.join(e.workDir, 'driver.pdf')), rootPdf, 'sibling output cannot mutate root resources');
       const chunks = new Map();
       await renderIsolatedBlock({ ...e, chunks, lastEditAt: 0,
-        rescueQueue: new Map(), canonical: { info: () => ({ inFlight: false }) },
+        rescueQueue: new Map(),
+        canonical: { buildLease: null, info: () => ({ inFlight: false }), waitForBuildLease: async () => {} },
       }, { block, idx: e.blocks.indexOf(block),
         chunkTargets: () => [{ key: block.id, page: 1, w: chunk.wBp, h: chunk.hBp }],
         asyncRepaginate() {},
@@ -1477,7 +2876,8 @@ SiblingResource.
 });
 
 test('exact box pages exclude lastskip primer material from RENDER and CAPTURE', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-primer-crop-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
   try {
@@ -1514,7 +2914,8 @@ After.
       if (editIndex) assert.ok(e.renderStats.captureHits > 0);
       const chunks = new Map();
       await renderIsolatedBlock({ ...e, chunks, lastEditAt: 0,
-        rescueQueue: new Map(), canonical: { info: () => ({ inFlight: false }) },
+        rescueQueue: new Map(),
+        canonical: { buildLease: null, info: () => ({ inFlight: false }), waitForBuildLease: async () => {} },
       }, { block, idx,
         chunkTargets: () => [{ key: block.id, page: 1, w: chunk.wBp, h: chunk.hBp }],
         asyncRepaginate() {},
@@ -1536,7 +2937,8 @@ After.
 });
 
 test('stable native prose paints before graphics verification and retains burst work', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-plain-preview-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
   const source = String.raw`\documentclass{article}
@@ -1603,7 +3005,8 @@ Tail.
 });
 
 test('active ordinary-looking source characters cannot grant a native plain preview', opts, async () => {
-  await eng.close();
+  await eng?.close();
+  eng = null;
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-active-source-'));
   const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
   try {
@@ -1626,4 +3029,855 @@ ActiveMarker !abcd.
     await e.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// A newer warm for the same region used to SIGKILL the running warm walk's
+// in-flight STEP child, the walk's only continuation, so viewer, file-focus
+// and caret warms for one region each restarted from one distant checkpoint.
+test('a superseding warm resumes from the boundary the earlier walk reached', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-warm-resume-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.checkpointCeiling = 3;
+  const slow = String.raw`\count255=0 \loop\advance\count255 by 1 \ifnum\count255<3000000 \repeat`;
+  try {
+    await e.open(`\\documentclass{article}\n\\begin{document}\n${
+      Array.from({ length: 40 }, (_, i) => `Paragraph${i} ${slow}.`).join('\n\n')}\n\\end{document}\n`);
+    const nearest = (i) => Math.max(0, ...[...e.checkpoints.keys()].filter((k) => k <= i));
+    let target = 1;
+    for (let i = 1; i < e.blocks.length - 1; i++) if (i - nearest(i) > target - nearest(target)) target = i;
+    const from = nearest(target);
+    assert.ok(target - from >= 8, 'the target starts far from every resident checkpoint');
+    // A STEP walk's frontier lives only between blocks; count re-adopted
+    // galleys to know the first walk is well past its starting checkpoint.
+    const galleys = e.blocks.map((block) => block.galley);
+    const replayed = () => e.blocks.slice(from, target).filter((block, i) => block.galley !== galleys[from + i]).length;
+    const first = e.warmEditOffset(e.blocks[target].start);
+    for (let i = 0; i < 6000 && replayed() < 3; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(replayed() >= 3 && replayed() < target - from, 'the first walk is mid-region');
+    // the caret settles one block earlier: only the reached boundary is closer than `from`
+    const second = await e.warmEditOffset(e.blocks[target - 1].start);
+    assert.equal((await first).status, 'superseded');
+    assert.equal(second.status, 'ready');
+    assert.ok(second.from > from + 1, `resumed at ${second.from}, not at the first walk's start ${from}`);
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('warming a cold page supplies every exact neighbor before an included box edit', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-warm-page-'));
+  const child = path.join(root, 'child.tex');
+  writeFileSync(child, String.raw`\begin{tcolorbox}[enhanced,title=Target]
+TargetWitness $x^2$.
+\end{tcolorbox}`);
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const previousHot = process.env.TDOM_RENDER_HOT_MAX;
+  process.env.TDOM_RENDER_HOT_MAX = '1';
+  const missing = page => e.getDisplayLists().find(item => item.page === page)?.commands.filter(command =>
+    command.op === 'pending-exact' || command.op === 'chunk' && command.st);
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage[most]{tcolorbox}
+\begin{document}
+First page.
+\newpage
+
+\begin{tcolorbox}[enhanced,title=Neighbor]
+NeighborWitness.
+\end{tcolorbox}
+
+\input{child.tex}
+\end{document}`);
+    assert.ok(missing(2).length > 0, 'cold page starts without exact graphics');
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    const warmed = await e.warmPage(2);
+    assert.equal(warmed.status, 'ready');
+    await e.renderTask;
+    assert.deepEqual(missing(2), [], 'unchanged neighbor cannot block the next atomic page paint');
+    writeFileSync(child, readFileSync(child, 'utf8').replace('x^2', 'x^3'));
+    const report = await e.refresh();
+    assert.ok(report.stats.blocksTypeset <= 2, 'child uses the warmed page checkpoint');
+    await e.renderTask;
+    assert.deepEqual(missing(2), []);
+    assert.equal(e.pages.length, 2);
+    assert.equal(e.rescueQueue.size, 0);
+  } finally {
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('input preserves attached paragraph geometry and child editing addresses', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-input-paragraph-'));
+  const child = path.join(root, 'child.tex');
+  const childText = String.raw`\begin{tcolorbox}
+AttachedWitness $x^2$.
+\end{tcolorbox}`;
+  writeFileSync(child, childText);
+  const prefix = String.raw`\documentclass{article}
+\usepackage{tcolorbox}
+\begin{document}
+\par\medskip\noindent\textbf{(1)}\quad
+`;
+  const suffix = '\n\\par\\medskip\nTailWitness.\n\\end{document}';
+  const geometry = e => e.pages.map(page => page.draw.map(draw =>
+    [draw.y, draw.u.h, draw.u.d]));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'mapped'), docDir: root });
+  let expected;
+  try {
+    await e.open(prefix + '\\input{child.tex}' + suffix);
+    await drain(e);
+    expected = geometry(e);
+    const block = e.blocks.find(b => b.text.includes('AttachedWitness'));
+    assert.ok(block.text.includes('\\textbf{(1)}'), 'the open parent paragraph stays with its box');
+    const regions = e.getDOM().blocks.flatMap(b => b.editRegions);
+    const math = regions.find(region => region.value === 'x^2');
+    assert.equal(math.source.file, child);
+    assert.equal(math.source.start.line, 2);
+    assert.equal(math.source.start.column, childText.split('\n')[1].indexOf('x^2') + 1);
+    assert.equal((await e.warmEditOffset(childText.indexOf('x^2'), child)).status, 'ready');
+  } finally { await e.close(); }
+  const continuous = new CheckpointEngine({ workDir: path.join(root, 'continuous'), docDir: root });
+  try {
+    await continuous.open(prefix + childText + suffix);
+    await drain(continuous);
+    assert.deepEqual(geometry(continuous), expected, 'input adds no paragraph or box spacing');
+  } finally {
+    await continuous.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('deferred root and include edits converge, report errors, and recover exact page counts', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-closure-convergence-'));
+  const child = path.join(root, 'child.tex');
+  writeFileSync(child, 'ChildWitnessA.\n');
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  e.canonical.displayDebounceMs = 10;
+  e.canonical.displayCooldownFactor = 0;
+  const replace = async (from, to) => {
+    const at = e.getSource().indexOf(from);
+    assert.ok(at >= 0, from);
+    return e.edit(at, at + from.length, to);
+  };
+  const exact = async (marker, pages) => {
+    await e.canonical.settle();
+    const info = e.canonical.info();
+    assert.equal(info.error, null);
+    assert.equal(info.rev, e.srcRev);
+    assert.equal(info.pageCount, pages);
+    assert.match((await e.canonical.pageTexts(info.id)).join('\n'), new RegExp(marker));
+  };
+  try {
+    await e.open(String.raw`\documentclass{article}
+\newcount\linecount
+\newcommand{\lines}[1]{\loop\ifnum\linecount<#1\advance\linecount by1 X\repeat}
+\newif\ifanswers\answerstrue
+\begin{document}
+RootWitnessA.
+
+\newpage
+\input{child.tex}
+
+\newpage AnswerWitness.
+\end{document}`);
+    await exact('RootWitnessA', 3);
+    const childBlock = e.blocks.findIndex(block => block.file === child || block.sourceParts?.some(part => part.file === child));
+    assert.ok(childBlock > 0);
+    const childWarm = await e.warmEditOffset(3, child);
+    assert.equal(childWarm.target, childBlock, 'child offsets must never warm a root block');
+    assert.equal(childWarm.status, 'ready');
+    const rootWarm = await e.warmEditOffset(e.getSource().indexOf('RootWitnessA'));
+    assert.equal(e.blocks[rootWarm.target].file ?? e.file, e.file);
+    assert.equal((await e.warmEditOffset(3, path.join(root, 'missing.tex'))).reason, 'unknown-source');
+    const rootEdit = await replace('RootWitnessA', 'RootWitnessB');
+    assert.notEqual(rootEdit.stats.chainVerdict, 'closure-deferred');
+    await exact('RootWitnessB', 3);
+    writeFileSync(child, 'ChildWitnessB.\n');
+    const childEdit = await e.refresh();
+    assert.notEqual(childEdit.stats.chainVerdict, 'closure-deferred');
+    await exact('ChildWitnessB', 3);
+
+    // An unused environment-opening macro is valid TeX but deliberately
+    // beyond the lexical gate. Exact convergence cannot need its approval.
+    const deferred = await replace('\\begin{document}', String.raw`\newcommand{\startquote}{\begin{quote}}
+\begin{document}`);
+    assert.equal(deferred.stats.chainVerdict, 'closure-deferred');
+    assert.equal(deferred.canonical.scheduledRev, deferred.srcRev);
+    assert.match(deferred.canonical.fallbackReason, /^closure-deferred:/);
+    assert.ok(deferred.canonical.scheduledInMs < 1000, 'display cadence without a viewer request');
+    await replace('RootWitnessB', 'RootWitnessC');
+    writeFileSync(child, 'ChildWitnessC.\n');
+    const newest = await e.refresh();
+    assert.equal(newest.canonical.scheduledRev, e.srcRev, 'latest included input owns fallback');
+    await exact('ChildWitnessC', 3);
+    assert.match((await e.canonical.pageTexts()).join('\n'), /RootWitnessC/);
+
+    const goodId = e.canonical.info().id;
+    await replace('\\end{document}', '\\begin{quote}\n\\end{document}');
+    await e.canonical.settle();
+    assert.ok(e.canonical.info().error);
+    assert.equal(e.canonical.info().errorRev, e.srcRev);
+    assert.equal(e.canonical.info().id, goodId, 'syntax failure retains last-good PDF');
+    await replace('\\begin{quote}\n\\end{document}', '\\end{document}');
+    await exact('RootWitnessC', 3);
+    await replace('\\newpage AnswerWitness.', '\\ifanswers\\newpage AnswerWitness.\\fi');
+    await exact('AnswerWitness', 3);
+    await replace('\\answerstrue', '\\answersfalse');
+    await exact('RootWitnessC', 2);
+    await replace('\\newpage\n\\input{child.tex}', '\\input{child.tex}');
+    await exact('ChildWitnessC', 1);
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an asynchronous title rescue regenerates downstream math and footnote chunks', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-rescue-exact-successor-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  let targetId, reports = 0, replayHeld = false, oldHash;
+  let rendered;
+  const oldRendered = new Promise(resolve => { rendered = resolve; });
+  const fulfill = e._fulfill.bind(e);
+  e._fulfill = (key, value) => {
+    if (key.startsWith('galley:') && value?.items?.some(item => item.k === 'ins')) {
+      targetId ??= key.slice('galley:'.length);
+      if (key === 'galley:' + targetId && ++reports === 1) {
+        const set = e.chunks.set.bind(e.chunks);
+        e.chunks.set = (chunkKey, chunk) => {
+          const result = set(chunkKey, chunk);
+          if (chunkKey === targetId + '@fn0') {
+            oldHash ??= chunk.forGalley;
+            rendered();
+          }
+          return result;
+        };
+      } else if (key === 'galley:' + targetId && reports === 2) {
+        // Make the old render win this race before the rescue adopts the
+        // corrected paragraph. The successor must then get a new render.
+        replayHeld = true;
+        oldRendered.then(() => fulfill(key, value));
+        return;
+      }
+    }
+    fulfill(key, value);
+  };
+  try {
+    await e.open(String.raw`\documentclass{article}
+\usepackage{amsmath}
+\title{A title}\author{Author}\date{}
+\begin{document}
+\maketitle
+
+\section{Text}
+A formula $x^2$ followed by a footnote.\footnote{FootnoteWitness.}
+
+Tail.
+\end{document}`);
+    await drain(e);
+    await e.renderTask;
+    const block = e.blocks.find(item => item.id === targetId);
+    assert.ok(replayHeld, 'the asynchronous rescue actually revisited the paragraph');
+    assert.notEqual(block.galleyHash, oldHash, 'the test crosses a real galley generation change');
+    for (const key of [targetId, targetId + '@fn0']) {
+      assert.equal(e.chunks.get(key)?.forGalley, block.galleyHash, key + ' must describe the corrected paragraph');
+    }
+    assert.ok(e.getDisplayLists().some(page => page.commands.some(command =>
+      command.op === 'chunk' && command.chunk === targetId + '@fn0' && !command.st)));
+  } finally {
+    rendered();
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a cold page edit retains its native owners and prepares unchanged exact neighbors', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-cold-edit-page-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.checkpointCeiling = 4;
+  const previousHot = process.env.TDOM_RENDER_HOT_MAX;
+  process.env.TDOM_RENDER_HOT_MAX = '1';
+  const missing = page => e.getDisplayLists().find(item => item.page === page)?.commands.filter(command =>
+    command.op === 'pending-exact' || command.op === 'chunk' && command.st);
+  const source = String.raw`\documentclass{article}
+\usepackage[most]{tcolorbox}
+\begin{document}
+` + Array.from({ length: 12 }, (_, index) => String.raw`
+\begin{tcolorbox}[enhanced,title=Neighbor]
+Neighbor ${index}.
+\end{tcolorbox}
+
+\begin{tcolorbox}[enhanced,title=Target]
+Target${index} $x^2$.
+\end{tcolorbox}
+
+\newpage
+
+`).join('') + '\\end{document}';
+  try {
+    await e.open(source);
+    assert.equal(e.renderHold.size, 0, 'unqueued cold work must not monopolize the render holds');
+    const target = e.blocks.findIndex((block, index) => {
+      const number = /Target(\d+) /.exec(block.text)?.[1];
+      return number != null && Number(number) > 0 && Number(number) < 11 && !e.checkpoints.has(index);
+    });
+    assert.ok(target >= 0, 'a target starts outside the resident budget');
+    const targetNumber = Number(/Target(\d+) /.exec(e.blocks[target].text)[1]);
+    const targetPage = targetNumber + 1;
+    assert.ok(missing(targetPage).length > 0);
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    const tailMarker = 'Target11 $x^';
+    const tailAt = e.getSource().indexOf(tailMarker) + tailMarker.length;
+    const tailReport = await e.edit(tailAt, tailAt + 1, '3');
+    assert.ok(tailReport.stats.blocksTypeset <= 3,
+      'a first edit on the final visible page starts with its unchanged neighbor');
+    await e.renderTask;
+    assert.deepEqual(missing(12), [], 'the final page has fresh exact neighbors before canonical');
+    for (const exponent of ['3', '4']) {
+      const marker = `Target${targetNumber} $x^`;
+      const at = e.getSource().indexOf(marker) + marker.length;
+      const report = await e.edit(at, at + 1, exponent);
+      assert.ok(e.checkpoints.has(target), 'the edit input remains available before async rendering');
+      assert.ok(e.checkpoints.has(target + 1), 'the current node capture remains available');
+      if (exponent === '4') assert.ok(report.stats.blocksTypeset <= 2, 'typing twice must not repeat a cold prefix walk');
+      await e.renderTask;
+      assert.deepEqual(missing(targetPage), [], 'unchanged neighbor and changed box are both paintable without canonical');
+      assert.equal(e.renderHold.size, 0, 'completed renders relinquish their temporary owners');
+    }
+  } finally {
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a word edit does not replay cold exact neighbors with retained native owners', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-retained-page-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.checkpointCeiling = 8;
+  e.canonical.schedule = () => {};
+  const previousHot = process.env.TDOM_RENDER_HOT_MAX;
+  process.env.TDOM_RENDER_HOT_MAX = '1';
+  try {
+    await e.open(String.raw`\documentclass{article}
+\begin{document}
+Watch the paragraph.
+
+Unchanged convergence paragraph.
+
+\[x^2\]
+
+\[y^2\]
+
+\[z^2\]
+\end{document}`);
+    assert.ok(e.blocks.length + 1 <= e.maxCheckpoints);
+    assert.ok(e.blocks.some(block => block.needsRender && e.chunks.get(block.id)?.forGalley !== block.galleyHash));
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    const at = e.getSource().indexOf('Watch');
+    const result = await e.edit(at, at + 5, 'Check');
+    assert.ok(result.stats.blocksTypeset <= 2, `edited + convergence probe only (got ${result.stats.blocksTypeset})`);
+    await e.renderTask;
+    assert.ok(e.getDisplayLists().every(page => page.commands.every(command =>
+      command.op !== 'pending-exact' && !(command.op === 'chunk' && command.st))));
+  } finally {
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a cold upper-page box edit prepares the exact material below its convergence point', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-cold-upper-page-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.checkpointCeiling = 4;
+  e.canonical.schedule = () => {};
+  const previousHot = process.env.TDOM_RENDER_HOT_MAX;
+  process.env.TDOM_RENDER_HOT_MAX = '1';
+  const missing = page => e.getDisplayLists().find(item => item.page === page)?.commands.filter(command =>
+    command.op === 'pending-exact' || command.op === 'chunk' && command.st);
+  const source = String.raw`\documentclass{article}
+\usepackage[most]{tcolorbox}
+\usepackage{amsmath}
+\begin{document}
+` + Array.from({ length: 12 }, (_, index) => String.raw`
+\begin{tcolorbox}[title=Heading${index}]Unchanged heading.\end{tcolorbox}
+
+\begin{tcolorbox}Upper${index} text is edited here.\end{tcolorbox}
+
+\begin{tcolorbox}Lower${index} text stays unchanged.\end{tcolorbox}
+
+\[\frac{x+1}{y+1}\]
+
+\begin{tcolorbox}Another${index} box stays unchanged.\end{tcolorbox}
+
+\[\sum_{k=1}^{n} k\]
+
+\[\int_0^1 x^2\,dx\]
+
+\newpage
+
+`).join('') + '\\end{document}';
+  try {
+    await e.open(source);
+    assert.equal(e.pages.length, 12);
+    assert.ok(missing(7).length >= 5, 'the target starts with cold exact neighbors');
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    const at = e.getSource().indexOf('Upper6') + 'Upper6'.length;
+    await e.edit(at, at, ' has more text which changes the height of this upper box. '.repeat(3));
+    await e.renderTask;
+    assert.deepEqual(missing(7), [], 'the lower equations must not wait for an isolated cold compile');
+    assert.equal(e.pages.length, 12);
+  } finally {
+    if (previousHot === undefined) delete process.env.TDOM_RENDER_HOT_MAX;
+    else process.env.TDOM_RENDER_HOT_MAX = previousHot;
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('native exact renders preserve decoration ink outside the logical box', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-overhanging-ink-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  const source = String.raw`\documentclass{article}
+\usepackage[most]{tcolorbox}
+\begin{document}
+\begin{tcolorbox}[enhanced,before skip=0pt,after skip=0pt,
+  overlay={\fill[black] ([xshift=-12bp]frame.north west)
+    rectangle ([xshift=-4bp,yshift=-10bp]frame.north west);}]
+Inside $x^2$.
+\end{tcolorbox}
+\end{document}`;
+  try {
+    await e.open(source);
+    for (const exponent of ['2', '3']) {
+      if (exponent !== '2') {
+        const at = e.getSource().indexOf('x^2') + 2;
+        await e.edit(at, at + 1, exponent);
+      }
+      await e.renderTask;
+      const block = e.blocks.find(item => item.text.includes('Inside'));
+      const chunk = e.chunks.get(block.id);
+      assert.equal(chunk?.forGalley, block.galleyHash);
+      const command = e.getDisplayLists().flatMap(page => page.commands)
+        .find(item => item.op === 'chunk' && item.chunk === block.id);
+      const textLeft = 72 + e.geometry.oddsidemargin;
+      assert.ok(Math.abs(command.x - chunk.xBp - textLeft) < 0.02,
+        'the padded image preserves the logical text origin');
+      const pdf = path.join(root, `ink-${exponent}.pdf`);
+      const raster = path.join(root, `ink-${exponent}`);
+      writeFileSync(pdf, chunk.editPdf);
+      await promisify(execFile)('pdftoppm', [
+        '-f', '1', '-singlefile', '-gray', '-r', '72',
+        '-x', String(Math.round(-chunk.xBp) - 10), '-y', '2',
+        '-W', '4', '-H', '4', pdf, raster,
+      ]);
+      const pgm = readFileSync(raster + '.pgm');
+      assert.match(pgm.subarray(0, 32).toString('latin1'), /^P5\s+4\s+4\s+255\s/);
+      assert.ok(pgm.subarray(-16).every(value => value < 16),
+        'the black decoration remains visible left of the TeX box in RENDER and CAPTURE');
+    }
+    assert.ok(e.renderStats.captureHits > 0);
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('cold native prefix replay advances only its fresh continuation and preserves TeX definitions', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-prefix-continuation-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.checkpointCeiling = Math.min(e.checkpointCeiling, 8);
+  const source = String.raw`\documentclass{article}
+\newcommand{\VisibleWord}{seed}
+\begin{document}
+` + Array.from({ length: 70 }, (_, index) => String.raw`
+\gdef\VisibleWord{word${index}}
+
+TARGET${index} uses \VisibleWord. Ordinary text continues with the inherited definition.
+
+`).join('') + '\\end{document}';
+  let finalSource, expected;
+  let checkpointExcess = 0;
+  let checkpointExcessState = null;
+  const onMessage = e._onMessage.bind(e);
+  e._onMessage = (peer, message) => {
+    const result = onMessage(peer, message);
+    const temporaryOwnerPeers = new Set([
+      ...e.editHold.map(index => e.checkpoints.get(index)),
+      ...[...e.renderHold.keys()].map(index => e.checkpoints.get(index)),
+      ...[...(e.activeResidentRenderCheckpoints?.values() ?? [])].map(owner => owner.peer),
+    ].filter(Boolean));
+    // The previous cap preserves the JOB input and generated continuation.
+    // CKPT is observed here before the current job's cap retires that carry,
+    // so one newly materialized continuation may exist for this callback.
+    const incoming = message.kind === 'CKPT' ? 1 : 0;
+    const excess = distinctCheckpointPeerCount(e.checkpoints) -
+      e.maxCheckpoints - temporaryOwnerPeers.size - 2 - incoming;
+    if (excess > checkpointExcess) {
+      checkpointExcess = excess;
+      checkpointExcessState = {
+        checkpoints: distinctCheckpointPeerCount(e.checkpoints),
+        checkpointIndices: [...e.checkpoints.keys()],
+        keep: [...(e.checkpointKeepCache ?? [])],
+        temporaryOwners: temporaryOwnerPeers.size,
+        incoming,
+        editHold: [...e.editHold],
+        renderHold: [...e.renderHold.keys()],
+        activeRender: [...(e.activeResidentRenderCheckpoints?.values() ?? [])].map(owner => owner.index),
+        jobInput: [...e.checkpoints].filter(([, candidate]) => candidate === e.jobInput).map(([index]) => index),
+        continuation: e.currentJob?.ckptIdx ?? null,
+      };
+    }
+    return result;
+  };
+  try {
+    await e.open(source);
+    assert.equal(checkpointExcess, 0,
+      `checkpoint count stays bounded during every boot step: ${JSON.stringify(checkpointExcessState)}`);
+    const settledOwnerPeers = new Set([
+      ...e.editHold.map(index => e.checkpoints.get(index)),
+      ...[...e.renderHold.keys()].map(index => e.checkpoints.get(index)),
+      ...[...(e.activeResidentRenderCheckpoints?.values() ?? [])].map(owner => owner.peer),
+    ].filter(Boolean));
+    assert.ok(
+      distinctCheckpointPeerCount(e.checkpoints) <= e.maxCheckpoints + settledOwnerPeers.size + 2,
+      'after the callback cap, only coverage, temporary owners, JOB input, and continuation remain'
+    );
+    assert.equal(e.calibrateInitialHeap, false, 'initial body fonts have a completed heap calibration');
+    const liveFloor = e.confirmedLiveHeapKb;
+    assert.ok(liveFloor > 0, 'the native collector reported a live heap baseline');
+    const coverage = [...e.checkpointKeepCache];
+    const firstParagraph = e.getSource().indexOf('TARGET0');
+    await e.warmEditOffset(firstParagraph);
+    assert.deepEqual([...e.checkpointKeepCache], coverage,
+      'warming unchanged text leaves the document coverage plan stable');
+    const candidates = e.blocks.map((block, index) => {
+      const marker = /TARGET\d+/.exec(block.text)?.[0];
+      const prefix = Math.max(...[...e.checkpoints.keys()].filter(boundary => boundary <= index));
+      return { index, marker, distance: index - prefix };
+    }).filter(item => item.marker && item.distance >= 5).sort((a, b) => b.distance - a.distance);
+    assert.ok(candidates.length > 0, 'a cold target spans multiple native definitions');
+    const target = candidates[0];
+    const rootPid = e.checkpoints.get(0).pid;
+    const announcements = [];
+    const recordMessage = e._onMessage.bind(e);
+    e._onMessage = (peer, message) => {
+      if (message.kind === 'FORKED') announcements.push({ pid: message.pid, parent: peer.pid });
+      return recordMessage(peer, message);
+    };
+    const input = e.checkpoints.get(target.index - target.distance);
+    const send = input.send.bind(input);
+    const jobHeaders = [];
+    input.send = message => {
+      if (message.startsWith('JOB ')) jobHeaders.push(message.trim().split(/\s+/));
+      return send(message);
+    };
+    const at = e.getSource().indexOf(target.marker) + target.marker.length;
+    const report = await e.edit(at, at, 'x');
+    assert.ok(report.stats.blocksTypeset >= 5);
+    assert.ok(jobHeaders.some(header => header[5] === 'F' && Number(header[6]) >= liveFloor),
+      'a cold prefix can reuse the confirmed heap of fonts loaded later in the document');
+    assert.ok(announcements.some(item => item.pid === item.parent), 'the prefix reuses a transient process');
+    assert.equal(e.checkpoints.get(0).pid, rootPid, 'the frozen root is never consumed');
+    await drain(e);
+    finalSource = e.getSource();
+    expected = signature(e);
+  } finally {
+    await e.close();
+  }
+  const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh') });
+  try {
+    await fresh.open(finalSource);
+    await drain(fresh);
+    assert.deepEqual(signature(fresh), expected, 'every native galley and exit state matches a fresh run');
+  } finally {
+    await fresh.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a failed prefix STEP restores its input and a known native hold is replayed by JOB', opts, async () => {
+  await eng?.close();
+  eng = null;
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-prefix-step-recovery-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  e.checkpointCeiling = Math.min(e.checkpointCeiling, 4);
+  e.canonical.schedule = () => {};
+  const source = String.raw`\documentclass{article}
+\newcommand{\VisibleWord}{seed}
+\begin{document}
+` + Array.from({ length: 90 }, (_, index) => String.raw`
+RECOVERY${index} uses \VisibleWord. Ordinary text keeps the inherited definition.
+
+`).join('') + '\\end{document}';
+  let injectedId = null;
+  let injectedStepIndex = null;
+  let injectedStepKeep = null;
+  let pendingStep = null;
+  let pendingStepIndex = null;
+  let pendingStepKeep = null;
+  let injectStepFailure = true;
+  const commands = [];
+  const wrapped = new WeakSet();
+  const wrapPeer = (peer) => {
+    if (wrapped.has(peer)) return;
+    wrapped.add(peer);
+    const send = peer.send.bind(peer);
+    peer.send = message => {
+      const header = /^(JOB|STEP)\s+(\S+)\s+(\d+)/.exec(message);
+      if (header) {
+        commands.push({ command: header[1], id: header[2], index: Number(header[3]) - 1 });
+        if (injectStepFailure && header[1] === 'STEP') {
+          pendingStep = header[2];
+          pendingStepIndex = Number(header[3]) - 1;
+          pendingStepKeep = new Set(e.checkpointKeepCache ?? []);
+        }
+      }
+      return send(message);
+    };
+  };
+  try {
+    await e.open(source);
+    await drain(e);
+    for (const peer of e.peers) wrapPeer(peer);
+    const onMessage = e._onMessage.bind(e);
+    e._onMessage = (peer, message) => {
+      wrapPeer(peer);
+      if (injectStepFailure && message.kind === 'GALLEY' && message.id === pendingStep) {
+        injectedId = message.id;
+        injectedStepIndex = pendingStepIndex;
+        injectedStepKeep = new Set(pendingStepKeep);
+        injectStepFailure = false;
+        pendingStep = null;
+        pendingStepIndex = null;
+        pendingStepKeep = null;
+        message = {
+          ...message,
+          json: { ...message.json, closure: 'error', closure_error: 'injected STEP native error' },
+        };
+      }
+      return onMessage(peer, message);
+    };
+    const candidates = e.blocks.map((block, index) => {
+      const marker = /RECOVERY\d+/.exec(block.text)?.[0];
+      const prefix = Math.max(...[...e.checkpoints.keys()].filter(boundary => boundary <= index));
+      return { index, marker, distance: index - prefix };
+    }).filter(item => item.marker && item.distance >= 8).sort((a, b) => b.distance - a.distance);
+    assert.ok(candidates.length > 0, 'the edit has a consumptive prefix continuation');
+    const target = candidates[0];
+    const at = e.getSource().indexOf(target.marker) + target.marker.length;
+    const first = await e.edit(at, at, 'x');
+    assert.ok(injectedId, 'one previously certified STEP was made to fail');
+    assert.equal(first.stats.rebooted, false, 'the consumed input is restored without a root reboot');
+    assert.equal(first.stats.diagnostics.some(line => line.includes('typeset phase failed')), false);
+    const held = e.blocks.find(block => block.id === injectedId);
+    assert.equal(held.closure?.reason, 'native-error');
+    assert.equal(held.galley?.tdomDeferred, true, 'the failed continuation itself was not adopted');
+
+    const heldIndex = e.blocks.indexOf(held);
+    assert.equal(injectedStepIndex, heldIndex);
+    assert.ok(injectedStepKeep instanceof Set && !injectedStepKeep.has(heldIndex),
+      'the injected input was outside the measured checkpoint skeleton when STEP consumed it');
+
+    // Cost measurements and edit holds legitimately move the sparse
+    // topology after the first recovery. Build the second, independent cold
+    // gap explicitly: keep the live root, retire every successor through a
+    // later target, and restore a COPY of the keep plan under which this
+    // exact boundary was previously STEP-eligible.
+    abortBackgroundJob(e, 'test prepares a deterministic known-hold replay gap');
+    await e.bgTask.catch(() => {});
+    e.bgAbort = false;
+    e.checkpointKeepCache = new Set(injectedStepKeep);
+    e.editHold = [];
+    e.renderHold.clear();
+    e.renderWant.clear();
+    const previousId = e.blocks[heldIndex - 1]?.id;
+    assert.equal(e.checkpointKeepCache.has(heldIndex), false);
+    assert.equal(e.editHold.includes(heldIndex), false);
+    assert.equal(e.renderHold.has(heldIndex), false);
+    assert.equal(previousId ? e.renderWant.has(previousId) : false, false);
+    assert.equal(previousId ? [...(e.rendering ?? [])].some(key => key.startsWith(previousId + ':')) : false, false,
+      'the known native hold, not a grid/edit/render owner, must force JOB');
+
+    const crossing = e.blocks.map((block, index) => ({
+      index,
+      marker: /RECOVERY\d+/.exec(block.text)?.[0],
+    })).filter(item => item.marker && item.index >= heldIndex + 4).at(-1);
+    assert.ok(crossing, 'the fixture has a distant block after STEP can resume beyond the known hold');
+    const rootCheckpoint = e.checkpoints.get(0);
+    assert.ok(rootCheckpoint && !rootCheckpoint.sock.destroyed,
+      'the root is a real live replay frontier');
+    for (const [index, peer] of [...e.checkpoints]) {
+      if (index === 0 || index > crossing.index) continue;
+      peer.send('DIE\n');
+      if (peer.pid) e.dyingPids.add(peer.pid);
+      e.checkpoints.delete(index);
+    }
+    assert.equal(Math.max(...[...e.checkpoints.keys()].filter(index => index <= crossing.index)), 0,
+      'the warm walk starts at root and must cross the known hold');
+    commands.length = 0;
+    await e.warmEditOffset(e.getSource().indexOf(crossing.marker));
+    const heldCommands = commands.filter(item => item.id === injectedId).map(item => item.command);
+    const commandTrace = JSON.stringify(commands);
+    assert.ok(commands.some(item => item.command === 'STEP' && item.index >= heldIndex + 2),
+      `the same warm walk resumes STEP after the known hold; trace=${commandTrace}`);
+    assert.ok(heldCommands.includes('JOB'),
+      `the known native hold retains its recovery input; trace=${commandTrace}`);
+    assert.equal(heldCommands.includes('STEP'), false,
+      `the known native hold is never consumed in place; trace=${commandTrace}`);
+    assert.equal(held.closure?.native, true, 'the valid block heals through real LuaLaTeX');
+    assert.equal(held.galley?.tdomDeferred, undefined);
+
+    const tailAt = e.getSource().indexOf(target.marker) + target.marker.length + 1;
+    const second = await e.edit(tailAt, tailAt, 'y');
+    assert.equal(second.stats.rebooted, false, 'normal editing continues after local recovery');
+    assert.equal(second.stats.diagnostics.some(line => line.includes('typeset phase failed')), false);
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+// ------------------------------------ cumulative multi-block anchor lineage
+
+test('another block joins an anchored lineage only while the ledger still admits it', () => {
+  // the exit state vector: structural values first, the three volatile
+  // paragraph-tail locals (prevdepth, nobreak, lastskip) last
+  const stateVec = '[1,2,3,4,5,6,7,8]';
+  const blocks = [
+    { id: 'alpha', hash: 'h-a', galleyHash: 'g-a', stateVec },
+    { id: 'beta', hash: 'h-b', galleyHash: 'g-b', stateVec },
+  ];
+  const ledger = captureCanonicalAnchorLedger(blocks);
+  assert.equal(ledger.size, 2);
+  assert.equal(ledgerAdmitsBlock(ledger, blocks[1]), true, 'an untouched block is what the base typeset');
+  assert.equal(ledgerAdmitsBlock(ledger, { ...blocks[1], galleyHash: 'g-b2' }), false, 'a retypeset galley is not');
+  assert.equal(ledgerAdmitsBlock(ledger, { ...blocks[1], hash: 'h-b2' }), false, 'nor edited source');
+  assert.equal(ledgerAdmitsBlock(ledger, { ...blocks[1], stateVec: '[1,9,3,4,5,6,7,8]' }), false,
+    'nor a moved structural exit state');
+  assert.equal(ledgerAdmitsBlock(ledger, { ...blocks[1], stateVec: '[1,2,3,4,5,6,7,99]' }), true,
+    'the volatile paragraph-tail locals stay excluded, as for the structural witness');
+  assert.equal(ledgerAdmitsBlock(ledger, { id: 'gamma', hash: 'x', galleyHash: 'y', stateVec }), false, 'unknown block');
+  assert.equal(ledgerAdmitsBlock(null, blocks[0]), false);
+});
+
+test('the plan accepts a joined base on an unbroken lineage and refuses it after a gap', () => {
+  const galley = (text) => ({ items: [
+    { k: 'box', w: 100, h: 8, d: 2, runs: [{ t: text, x: 0, w: 60, s: 10, f: 'body', dy: 0 }] },
+  ], floats: [], events: [], labels: [], refs: [], toclines: [] });
+  const stateVec = '[1,2,3,4,5,6,7,8]';
+  const make = (id, text) => ({
+    id, hash: `h-${id}`, galleyHash: `g-${id}`, start: 0, end: text.length, text, stateVec,
+    sourceStart: { line: 5, column: 1 }, sourceEnd: { line: 5, column: text.length + 1 },
+    fidelity: { level: 'safe-glyph' }, needsRender: false,
+    editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.length }],
+    galley: galley(text),
+  });
+  const domFor = (id) => ({ id, span: { start: 0, end: 10 }, source: { start: 0, end: 10 } });
+  const certificate = { id: 7, rev: 10, inputEpoch: 4, pdfHash: 'pdf-a', synctexHash: 'sync-a' };
+  const beta = make('beta', 'Betaprose');
+  const edit = singlePlainTextDelta('Betaprose', 'BetaproseZ');
+  const joinedBase = captureCanonicalAnchorBase({ blocks: [beta], domBlocks: [domFor('beta')], edit, certificate });
+  assert.ok(joinedBase, 'the untouched block yields a base witness against the same generation');
+  const report = (srcRev) => ({
+    mode: 'structured', previewPolicy: 'canonical-anchor', srcRev,
+    canonical: { id: 7, rev: 10, pageCount: 316 }, stats: { pageCount: 134 },
+    dirtySourceNodes: ['src-beta'],
+    patches: [{ type: 'replace-page', page: 60, displayList: { commands: [
+      { op: 'glyphs', src: 'beta', line: 0, x: 72, y: 600, w: 60, gh: 8, gd: 2, size: 10, text: 'BetaproseZ' },
+    ] } }],
+  });
+  const current = make('beta', 'BetaproseZ');
+  const lineage = (lastSrcRev) => ({
+    blockId: 'alpha', baseGeneration: 7, baseRev: 10, lastSrcRev,
+    baseSnapshot: { blockId: 'alpha' }, changedLines: [0],
+    blocks: new Map([['alpha', { baseSnapshot: { blockId: 'alpha' }, changedLines: [0], pages: null }]]),
+  });
+  // alpha was anchored at rev 11; beta joins at rev 12
+  const joined = planTerminalCanonicalAnchor({
+    blocks: [current], domBlocks: [domFor('beta')], report: report(12), geometry: { textheight: 680 },
+    edit, baseSnapshot: joinedBase, lineage: lineage(11), inputEpoch: 5,
+  });
+  assert.ok(joined, 'a second block anchors on the same base through the ledger-verified witness');
+  assert.equal(joined.joinedBase, true);
+  assert.equal(joined.baseSnapshot, joinedBase);
+  // a gap in the chain (rev 11 was not anchored) is not a lineage
+  const gap = {};
+  assert.equal(planTerminalCanonicalAnchor({
+    blocks: [current], domBlocks: [domFor('beta')], report: report(13), geometry: { textheight: 680 },
+    edit, baseSnapshot: joinedBase, lineage: lineage(11), inputEpoch: 5, diagnostics: gap,
+  }), null);
+  assert.equal(gap.reason, 'base-generation');
+  // without a fresh witness for the joining block there is nothing to prove against
+  const missing = {};
+  assert.equal(planTerminalCanonicalAnchor({
+    blocks: [current], domBlocks: [domFor('beta')], report: report(12), geometry: { textheight: 680 },
+    edit, baseSnapshot: null, lineage: lineage(11), inputEpoch: 5, diagnostics: missing,
+  }), null);
+  assert.equal(missing.reason, 'base-generation');
+});
+
+test('a cumulative patch carries every block of the lineage and refuses conflicts', () => {
+  const box = (left, top) => ({ left, top, right: left + 100, bottom: top + 12 });
+  const own = {
+    status: 'ready', blockId: 'beta', srcRev: 12, baseGeneration: 7, baseRev: 10, visualCut: false,
+    changedLines: [0], authoritative: false, publishWithinMs: 850, clientEditAtEpochMs: null,
+    pages: [{ page: 60, masks: [box(72, 600)], commands: [{ op: 'glyphs', text: 'Z' }] }],
+    page: 60, mask: box(72, 600), commands: [{ op: 'glyphs', text: 'Z' }],
+  };
+  const alphaPages = [{ page: 12, masks: [box(72, 100)], commands: [{ op: 'glyphs', text: 'A' }] }];
+  const merged = mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: alphaPages, visualCut: false }]);
+  assert.deepEqual(merged.blockIds, ['beta', 'alpha']);
+  assert.deepEqual(merged.pages.map((page) => page.page), [12, 60]);
+  assert.equal(merged.page, undefined, 'the single-line transitional fields are dropped');
+  assert.equal(merged.blockId, 'beta', 'the edited block stays the patch owner');
+  // same page, disjoint masks: both deltas share the page
+  const samePage = mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: [{ page: 60, masks: [box(72, 300)], commands: [] }], visualCut: false }]);
+  assert.equal(samePage.pages.length, 1);
+  assert.equal(samePage.pages[0].masks.length, 2);
+  // overlapping masks from two blocks cannot compose one page
+  assert.equal(mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: [{ page: 60, masks: [box(80, 605)], commands: [] }], visualCut: false }]), null);
+  // an exact-frame page joins a VisualCut lineage with an empty raster ring
+  const alphaCut = [{ page: 12, masks: [box(72, 100)], baseMasks: [box(72, 100)], commands: [] }];
+  const promoted = mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: alphaCut, visualCut: true }]);
+  assert.equal(promoted.visualCut, true, 'the merged patch travels as a VisualCut event');
+  assert.deepEqual(promoted.pages.find((page) => page.page === 60).baseMasks, [box(72, 600)],
+    'the exact page gets baseMask = mask');
+  assert.deepEqual(promoted.pages.find((page) => page.page === 12).baseMasks, [box(72, 100)]);
+  // a VisualCut page without its base mask cannot be promoted
+  assert.equal(mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: alphaPages, visualCut: true }]), null);
+  // nothing to merge keeps the patch untouched
+  assert.equal(mergeCumulativeAnchorPatch(own, []), own);
 });

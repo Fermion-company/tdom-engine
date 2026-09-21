@@ -58,7 +58,7 @@ host.stop();                                     // SIGTERM。常駐 TeX ツリ�
 
 `EngineHost` が spawn 時に固定する環境変数は、いずれも**ホストと同居するために必要**な値である。
 
-- `TDOM_MAX_CHECKPOINTS`（既定 `8`）: checkpoint 1 個が常駐 lualatex 1 個（100–300MB）。エンジン既定の 64 は専有マシン向けで、エディタや LSP と同居するホストでは踏めない。
+- `TDOM_MAX_CHECKPOINTS`（既定は搭載メモリで決める: 12 GB 未満 `8`、12 GB 以上 `12`、24 GB 以上 `24`、48 GB 以上 `48`）: 常駐 checkpoint 数の**上限**。実際の個数はエンジンが文書ごとに `min(上限, block 数 + 1)` で決める（`checkpointBudgetFor`）ので、短い文書は全境界を持ち、316 ページ（約 640 block）は上限になる。休眠 fork の実コストは「fork 以降に活動中の process が書き換えたページ」で、boot walk は fork 後にヒープのほぼ全体を書き換えるため 316 ページでは 1 個 100〜200 MB に育つ（macOS 実測: 上限 32 で常駐 32〜40 個・合計 7〜10 GB、16 GB 機が swap 7 GB）。以前の固定 8 は 316 ページで 80 block おきになり、カーソルを置いてから最初の打鍵が組版できるまで最大 30 s の warm を要した。それでも間に合わない打鍵は `TDOM_COLD_PREFIX_MS`（エンジン既定 1500）で hot path から切り離され、残りは chain pass が続けて `update` を後から broadcast する（docs/10 §10.4a）。
 - `TDOM_SAMPLE`: boot 用に `samples/` に実在する小さいファイルを選ぶ（`pickBootSample()`）。既定の stress-test 文書は起動に数分かかる。実文書は起動直後の `POST /open` で入れ替わる。
 - `TDOM_WORKDIR`: 絶対パスの作業ディレクトリ。vendored な（書き込めない）checkout の中にスクラッチを作らせない。
 - `TDOM_SHIP` / `TDOM_SHIP_PRIVATE_PDF` / `TDOM_CANONICAL_ANCHOR`（既定すべて `1`）: いずれも打鍵経路の外で動き、対応できない preamble では通常の canonical コンパイルに fail close する。
@@ -77,6 +77,8 @@ Electron ホストは `execPath: process.execPath` と `extraEnv: { ELECTRON_RUN
 
 - 組版対象は常に **root 文書**である。子ファイルのタブに切り替えただけで root が差し替わることはない。
 - 未保存の子バッファは **overlay** として渡り、変わったものだけが差分として送られる。閉じられた（または保存された）バッファは `removeOverlays` で外れる。
+- `removeOverlays` の時点でディスクが overlay と同じバイト列なら（保存）、エンジンは overlay ファイルを入力として残す（`savedOverlays`）。実効入力は変わらないので srcRev・anchor epoch・canonical の input epoch を進めず、その `/edit` は直前の report を返す。overlay が被さっているファイルへのディスク書込み（自動保存の fs.watch 通知を含む）も入力変化として扱わない。保存済み overlay と異なるバイト列がディスクに書かれたときだけ overlay を外し、通常の除去として refresh する。
+- 子ファイル anchor の直前入力の検証は、ディスクが直前に読んだ内容と同じか、この編集の要求内容と同じで mtime が打鍵時刻（`clientEditAtEpochMs`）以降の場合だけ通す（編集がエンジンへ届く前に自動保存が同じ内容を書いた場合）。
 - root が未変更で mtime も同じなら、ディスクを読み直さず保持中のソースを使う。無意味な全文 diff を避ける。
 - `workspaceRoot` の外へ出るパスは拒否される。
 
@@ -109,8 +111,8 @@ IME 変換中は snapshot に `deferred: true` を立てる。ドライバは pu
 
 `createEmbedClient()` はその postMessage 往復を包む。
 
-- ホスト → frame: `{ source: 'tdom-host', activationId, action, ... }` — `zoom-in` / `zoom-out` / `zoom-fit` / `goto-page` / `page-prev` / `page-next` / `goto-sync` / `search` / `reset-ack`
-- frame → ホスト: `{ source: 'tdom-embed', activationId, ... }` — 400ms 間隔のスナップショット（`ready` / `pageCount` / `zoom` / `page` / `status` / `search`）に加え、`reset-pending`（文書リセット開始）・`source`（クリック位置のソース逆引き）・`edit`（プレビュー直接編集）
+- ホスト → frame: `{ source: 'tdom-host', activationId, action, ... }` — `zoom-in` / `zoom-out` / `zoom-fit` / `goto-page` / `page-prev` / `page-next` / `goto-sync`（任意の `viewportToken` を付けると、そのページへスクロールした後のスナップショットが同じ token を返す）/ `search` / `reset-ack`
+- frame → ホスト: `{ source: 'tdom-embed', activationId, ... }` — 400ms 間隔のスナップショット（`ready` / `presentationPending` / `pageCount` / `zoom` / `page` / `srcRev`（適用済みの source revision）/ `viewportToken`（最後にスクロールした `goto-sync` の token）/ `status` / `search`）に加え、`reset-pending`（文書リセット開始）・`source`（クリック位置のソース逆引き）・`edit`（プレビュー直接編集）
 
 `activationId` は URL でホストが渡す。前の活性化から残った iframe が、すでに別の文書やエンジンへ移ったビューアを操作できないようにするためである。
 

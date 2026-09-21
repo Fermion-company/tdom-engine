@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { EngineHost } from '../host/engine-host.js';
+import { EngineHost, defaultCheckpointCeiling } from '../host/engine-host.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fakeEngineDir = path.join(here, 'fixtures', 'fake-engine');
@@ -33,7 +33,11 @@ test('the spawn environment pins the engine knobs a host must not inherit', () =
   assert.equal(env.TDOM_WORKDIR, '/tmp/tdom-work');
   assert.equal(env.TDOM_HOST_WEB_ROOT, '/tmp/host-web');
   assert.equal(env.TDOM_PDFJS_PATH, '/tmp/pdf.mjs');
-  assert.equal(env.TDOM_MAX_CHECKPOINTS, process.env.TDOM_MAX_CHECKPOINTS || '8');
+  assert.equal(env.TDOM_MAX_CHECKPOINTS, process.env.TDOM_MAX_CHECKPOINTS || defaultCheckpointCeiling());
+  assert.equal(defaultCheckpointCeiling(8 * 2 ** 30), '8');
+  assert.equal(defaultCheckpointCeiling(16 * 2 ** 30), '12');
+  assert.equal(defaultCheckpointCeiling(32 * 2 ** 30), '24');
+  assert.equal(defaultCheckpointCeiling(64 * 2 ** 30), '48');
   assert.equal(env.TDOM_SHIP, process.env.TDOM_SHIP ?? '1');
   assert.equal(env.TDOM_SHIP_PRIVATE_PDF, process.env.TDOM_SHIP_PRIVATE_PDF ?? '1');
   assert.equal(env.TDOM_CANONICAL_ANCHOR, process.env.TDOM_CANONICAL_ANCHOR ?? '1');

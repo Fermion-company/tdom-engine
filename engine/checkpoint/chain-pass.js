@@ -23,11 +23,52 @@ export async function runChainPass(engine, callbacks) {
     asyncRepaginate,
     chainAfterPass,
     enforceCheckpointCap,
+    retypesetChain,
+    pinBoundary,
   } = callbacks;
   const work = engine.pendingChain;
   if (!work) return;
   engine.bgActive = true;
   try {
+    if (work.kind === 'cold') {
+      // Cold resume (docs/10 §10.4a): finish the sparse replay a budgeted
+      // keystroke stopped, up to the first block whose galley predates its
+      // text. The replay consumes its own continuations (STEP) exactly like
+      // the foreground prefix walk; an edit aborts it between blocks and the
+      // boundary it reached is pinned so the next pass resumes there. When
+      // the input boundary of that block is live, the scheduler re-runs the
+      // update outside this lock ('resume'); a pending settle/rebuild that
+      // was queued before is carried through and re-queued by that update.
+      if (work.phase === 'blocks') {
+        // Every block is typeset already when another walk (a caret warm)
+        // passed over it: nothing to replay, but the keystroke still owes
+        // its report and anchor — go straight to the resume.
+        const target = engine.blocks.findIndex((block) => engine.coldDirty?.has(block.id));
+        const from = target < 0 ? -1 : nearestCheckpoint(target);
+        if (target >= 0 && from < target) {
+          engine.progress = { phase: 'cold', at: from + 1, total: target };
+          // Never killed mid-block (see #update): an edit sets bgAbort and
+          // the walk returns at its next boundary, which stays live.
+          engine.coldWalking = true;
+          let n;
+          try {
+            n = await retypesetChain(
+              from,
+              target - 1,
+              (j) => { engine.progress = { phase: 'cold', at: j + 2, total: target }; },
+              () => engine.bgAbort || engine.editPending > 0
+            );
+          } finally {
+            engine.coldWalking = false;
+          }
+          const reached = from + (n < 0 ? -n - 1 : n);
+          pinBoundary(reached);
+          if (n < 0 || engine.bgAbort) return;
+        }
+        work.phase = 'resume';
+      }
+      return;
+    }
     if (work.phase === 'blocks') {
       let sinceRepaint = 0;
       // highest galley-less index at pass start — the walk fills galleys at

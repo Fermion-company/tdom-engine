@@ -1,5 +1,6 @@
 import { renderResidentBlock } from './resident-render.js';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
+import { withReplaceablePreviewJob } from './build-lease-preview.js';
 
 /** Exact pixels are replaceable latency work. A new edit must not wait behind
  * boot/backlog renders that already occupy every pump lane. Cancel resident
@@ -89,34 +90,42 @@ function pumpRenders(engine, callbacks) {
           await new Promise((r) => setTimeout(r, Math.min(25, remaining)));
           continue;
         }
-        engine.renderWant.delete(id);
-        const cohort = interactive && engine.interactiveRenderCohort?.rev === engine.srcRev
-          ? engine.interactiveRenderCohort : null;
-        const activity = cohort ? {} : null;
-        if (cohort) {
-          cohort.queued.delete(id);
-          cohort.active.add(activity);
-        }
-        const block = engine.blocks.find((b) => b.id === id);
-        try {
-          if (!block || !block.galley) {
-            if (cohort) cohort.unavailable = true;
-            continue;
-          }
-          if (!block.needsRender) continue;
-          const ready = await renderBlock(engine, block, callbacks).catch((err) => {
-            if (!err?.tdomSuperseded) engine.diagnostics.push(`render ${id}: ${err?.message ?? err}`);
-            return false;
-          });
-          if (cohort && !ready) cohort.unavailable = true;
-        } finally {
+        await withReplaceablePreviewJob(engine, 'resident-render', async () => {
+          // The queue entry remains present while the Build gate is closed.
+          // Re-read it after waking because a newer edit may replace its tag.
+          const queued = engine.renderWant.get(id);
+          if (!queued) return;
+          interactive = Number.isSafeInteger(queued?.interactiveRev) && queued.interactiveRev > 0 &&
+            queued.interactiveRev === engine.srcRev;
+          engine.renderWant.delete(id);
+          const cohort = interactive && engine.interactiveRenderCohort?.rev === engine.srcRev
+            ? engine.interactiveRenderCohort : null;
+          const activity = cohort ? {} : null;
           if (cohort) {
-            // Keep ownership through PDF conversion/cropping, not only the
-            // resident TeX DONE reply. The viewer still needs the chunk bytes.
-            cohort.active.delete(activity);
-            if (!cohort.queued.size && !cohort.active.size) cohort.settledAt = Date.now();
+            cohort.queued.delete(id);
+            cohort.active.add(activity);
           }
-        }
+          const block = engine.blocks.find((b) => b.id === id);
+          try {
+            if (!block || !block.galley) {
+              if (cohort) cohort.unavailable = true;
+              return;
+            }
+            if (!block.needsRender) return;
+            const ready = await renderBlock(engine, block, callbacks).catch((err) => {
+              if (!err?.tdomSuperseded) engine.diagnostics.push(`render ${id}: ${err?.message ?? err}`);
+              return false;
+            });
+            if (cohort && !ready) cohort.unavailable = true;
+          } finally {
+            if (cohort) {
+              // Keep ownership through PDF conversion/cropping, not only the
+              // resident TeX DONE reply. The viewer still needs the chunk bytes.
+              cohort.active.delete(activity);
+              if (!cohort.queued.size && !cohort.active.size) cohort.settledAt = Date.now();
+            }
+          }
+        });
       }
     } finally {
       engine.renderPumping--;

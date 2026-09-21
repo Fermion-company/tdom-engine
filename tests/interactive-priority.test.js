@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { shippingPriorityQuietMs } from '../engine/checkpoint/interactive-priority.js';
 import { CanonicalRenderer } from '../engine/checkpoint/canonical.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -63,6 +63,109 @@ test('authority foreground lease is bounded and never applies to opaque display 
     assert.equal(renderer.info().authorityPaused, false);
     renderer.pressure = 'display';
     assert.equal(renderer.deferAuthority(20), false, 'opaque display compile remains foreground');
+  } finally {
+    renderer.dispose();
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
+test('manual Build lease holds the newest canonical job and releases it idempotently', async () => {
+  const workDir = mkdtempSync(path.join(os.tmpdir(), 'tdom-build-lease-'));
+  const renderer = new CanonicalRenderer({ workDir, debounceMs: 60_000 });
+  try {
+    renderer.schedule('first source', 1);
+    const acquired = renderer.acquireBuildLease('build:1', 10_000);
+    assert.equal(acquired.acquired, true);
+    assert.equal(renderer.info().scheduledInMs, null);
+    assert.equal(renderer.info().buildLease.requestId, 'build:1');
+
+    renderer.schedule('newest source', 2);
+    assert.equal(renderer.info().scheduledRev, 2);
+    assert.equal(renderer.info().scheduledInMs, null, 'no canonical child starts while Build owns heavy TeX');
+    assert.deepEqual(renderer.acquireBuildLease('build:1', 10_000), { ...acquired, idempotent: true });
+    assert.equal(renderer.acquireBuildLease('build:2', 10_000).reason, 'lease-busy');
+    assert.equal(renderer.releaseBuildLease('build:1', 'wrong').reason, 'lease-mismatch');
+
+    const released = renderer.releaseBuildLease('build:1', acquired.token);
+    assert.equal(released.released, true);
+    assert.ok(renderer.info().scheduledInMs >= 0, 'the retained newest job is rearmed');
+    assert.deepEqual(renderer.releaseBuildLease('build:1', acquired.token), {
+      released: true,
+      alreadyReleased: true,
+      reason: 'released',
+    });
+  } finally {
+    renderer.dispose();
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
+test('an interrupted canonical compile discards partial aux without deleting its source', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'tdom-canonical-partial-'));
+  const bin = path.join(root, 'bin');
+  const workDir = path.join(root, 'work');
+  mkdirSync(bin);
+  mkdirSync(workDir);
+  const fake = path.join(bin, 'lualatex');
+  writeFileSync(fake, `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const i = process.argv.indexOf('-output-directory');
+const out = process.argv[i + 1];
+fs.mkdirSync(path.join(out, 'chapter'), { recursive: true });
+fs.writeFileSync(path.join(out, 'canon.aux'), 'partial');
+fs.writeFileSync(path.join(out, 'chapter', 'one.aux'), 'partial');
+process.stderr.write('interrupted fake compiler');
+process.exit(1);
+`);
+  chmodSync(fake, 0o755);
+  const priorPath = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${priorPath || ''}`;
+  const renderer = new CanonicalRenderer({ workDir, docDir: workDir });
+  try {
+    await assert.rejects(renderer.ensure('source retained for diagnosis', 1), /interrupted fake compiler/);
+    assert.equal(existsSync(path.join(workDir, 'canon.aux')), false);
+    assert.equal(existsSync(path.join(workDir, 'chapter', 'one.aux')), false);
+    assert.equal(existsSync(path.join(workDir, 'canon.tex')), true);
+  } finally {
+    renderer.dispose();
+    process.env.PATH = priorPath;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('manual Build lease pauses a real canonical child and converges to an edit after release', {
+  timeout: 30_000,
+}, async () => {
+  const workDir = mkdtempSync(path.join(os.tmpdir(), 'tdom-build-lease-real-'));
+  const renderer = new CanonicalRenderer({ workDir, docDir: workDir, debounceMs: 0, idleMs: 0 });
+  const document = (marker) => [
+    '\\documentclass{article}',
+    '\\directlua{local until_time=os.clock()+0.5; while os.clock()<until_time do end}',
+    '\\begin{document}',
+    marker,
+    '\\end{document}',
+    '',
+  ].join('\n');
+  try {
+    renderer.schedule(document('before lease'), 1);
+    const deadline = Date.now() + 5_000;
+    while (renderer.info().authorityChildren === 0) {
+      assert.ok(Date.now() < deadline, 'canonical child did not start');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const lease = renderer.acquireBuildLease('build:real', 10_000);
+    assert.equal(lease.acquired, true);
+    assert.equal(renderer.info().authorityPaused, true);
+    renderer.schedule(document('edited while leased'), 2);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(renderer.info().id, 0, 'paused child cannot publish during Build');
+    assert.equal(renderer.info().scheduledRev, 2, 'the live edit remains queued');
+
+    assert.equal(renderer.releaseBuildLease('build:real', lease.token).released, true);
+    await renderer.settle();
+    assert.equal(renderer.info().rev, 2);
+    assert.match((await renderer.pageTexts()).join('\n'), /edited while leased/);
   } finally {
     renderer.dispose();
     rmSync(workDir, { recursive: true, force: true });

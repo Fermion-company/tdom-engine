@@ -65,7 +65,7 @@ export function onCanonicalResult(
   try {
     engine.onCanonical?.({ ...info, modeReasons: engine.modeReasons });
   } catch { /* observer errors are not ours */ }
-  if (info.error || process.env.TDOM_NO_VERIFY) return;
+  if (info.error || engine.closureDeferred || process.env.TDOM_NO_VERIFY) return;
   // verify only at convergence: the compile must be of the CURRENT source
   if (engine.mode !== 'structured' || info.rev !== engine.srcRev) return;
   // canonical-anchor deliberately does not claim that JS pagination maps
@@ -159,6 +159,7 @@ export async function cropCanonicalChunks(engine, info, { asyncRepaginate }) {
 }
 
 async function canonicalCropCandidates(engine, block, id) {
+  if (block.sourceParts) return null;
   const source = block.file ? block.sourceStart : engine.store.position(engine.file, block.start);
   const end = block.file ? block.sourceEnd : engine.store.position(engine.file, block.end);
   const first = Number(source?.line), last = Number(end?.line);
@@ -166,11 +167,15 @@ async function canonicalCropCandidates(engine, block, id) {
   const file = block.file
     ? engine.includes.get(block.file)?.readPath ?? block.file
     : path.join(engine.canonical.workDir, 'canon.tex');
-  const groups = [];
-  for (let line = first; line <= last; line++) {
-    if (engine.canonical.generationCertificate(id)?.rev !== engine.srcRev) return null;
-    groups.push(await engine.canonical.forwardSyncAll({ file, line, column: line === first ? source.column : 1, id }));
-  }
+  if (engine.canonical.generationCertificate(id)?.rev !== engine.srcRev) return null;
+  const groups = await engine.canonical.forwardSyncRange({
+    file,
+    firstLine: first,
+    lastLine: last,
+    firstColumn: Number.isInteger(source.column) && source.column > 0 ? source.column : 1,
+    id,
+  });
+  if (!groups || engine.canonical.generationCertificate(id)?.rev !== engine.srcRev) return null;
   return groups.flat();
 }
 

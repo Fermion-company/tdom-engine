@@ -5,6 +5,7 @@ import { hasDefinitionEdit } from './update-helpers.js';
 import { flushVanishedLabels, labelReferenceCandidates, pushLabelDependencies } from './reference-deps.js';
 import { push2, resolvedInGalley, vecLocalsEqual } from './util/galley.js';
 import { canDeferPlainVerification } from './plain-preview.js';
+import { chunkTargets } from './chunk-targets.js';
 
 export async function runUpdateTypesetPhase(engine, {
   oldBlocks,
@@ -14,6 +15,7 @@ export async function runUpdateTypesetPhase(engine, {
   timer,
   defRe,
   plainPreviewAdmission = null,
+  coldBudgetMs = 0,
   callbacks,
 }) {
   const {
@@ -63,7 +65,26 @@ export async function runUpdateTypesetPhase(engine, {
       break;
     }
   }
-  let i = nearestCheckpoint(Math.min(firstDirty, engine.blocks.length));
+  // The page swaps atomically. A clean galley below the edited box is not
+  // a usable stopping point while later exact pixels on that page are cold.
+  let firstDisplay = firstDirty;
+  let lastDisplay = lastDirty;
+  if (engine.previewPolicy === 'structured' && engine.foregroundRenderIds) {
+    for (let k = 0; k < engine.blocks.length; k++) {
+      const block = engine.blocks[k];
+      if (!engine.foregroundRenderIds.has(block.id) || !block.needsRender) continue;
+      if (!chunkTargets(block).some(target => engine.chunks.get(target.key)?.forGalley !== block.galleyHash)) continue;
+      // RENDER can use a retained input directly; it needs no foreground
+      // replay merely because its exact pixels have not been requested yet.
+      if (engine.checkpoints.has(k) && (engine.blocks.length + 1 <= engine.maxCheckpoints ||
+          engine.editHold.includes(k) || engine.renderHold.has(k))) continue;
+      firstDisplay = Math.min(firstDisplay, k);
+      lastDisplay = Math.max(lastDisplay, k);
+    }
+  }
+  const replayToken = {};
+  let i = nearestCheckpoint(Math.min(firstDisplay, engine.blocks.length));
+  const walkStartedAt = performance.now();
   while (i < engine.blocks.length) {
     // /status liveness marker: which block the foreground pass is on —
     // a long boot walk shows movement instead of silence
@@ -76,7 +97,7 @@ export async function runUpdateTypesetPhase(engine, {
       block.galley === plainPreviewAdmission.galley && block.stateVec === plainPreviewAdmission.stateVec
       ? plainPreviewAdmission.witness : null;
     const t0 = performance.now();
-    const galley = await typesetBlock(i);
+    const galley = await typesetBlock(i, i < firstDirty ? replayToken : null);
     forkMs += performance.now() - t0;
     typesetCount++;
     const wasClean = before.hadGalley && !dirtySource.has(block.id);
@@ -97,11 +118,20 @@ export async function runUpdateTypesetPhase(engine, {
       }
     }
     i++;
+    // Cold prefix (docs/10 §10.4a): this block was a clean replay on the way
+    // to a source-dirty block that is still ahead. Past the budget, stop at
+    // this completed boundary instead of holding the keystroke for the whole
+    // sparse replay; the chain pass resumes from here and re-runs the update.
+    if (coldBudgetMs > 0 && wasClean && !changed && i <= lastDirty &&
+        performance.now() - walkStartedAt > coldBudgetMs) {
+      verdict = 'cold';
+      break;
+    }
     // External project updates can dirty disjoint blocks in one source
     // snapshot (for example an included chapter plus the generated .bbl at
     // the end). Never accept an intermediate clean block as convergence
     // while a later source-dirty block is still waiting.
-    if (i <= lastDirty) continue;
+    if (i <= lastDisplay) continue;
     if (!wasClean) {
       if (!defEdit && changed && i > lastNoGalley && i < engine.blocks.length &&
           dirtyBlocks.length === 1 && dirtyBlocks[0] === block.id && !changedLabels.size &&
@@ -148,6 +178,21 @@ export async function runUpdateTypesetPhase(engine, {
   }
   if (defEdit && verdict) verdict = 'leak';
   const fgStop = i;
+
+  // A cold stop leaves every source-dirty block at or past the boundary with
+  // a galley older than its text. Remember them: the resume walk targets the
+  // first one, and any walk that re-typesets one drops it again (adoptGalley).
+  let cold = null;
+  if (verdict === 'cold') {
+    const pending = [];
+    for (let k = fgStop; k < engine.blocks.length; k++) {
+      const block = engine.blocks[k];
+      if (dirtySource.has(block.id) || !block.galley) pending.push(block.id);
+    }
+    for (const id of pending) engine.coldDirty.add(id);
+    cold = { pending, from: fgStop };
+    queueChainWork('cold', fgStop, changedLabels);
+  }
 
   // verdict dispatch: anything beyond the foreground bound is DEFERRED
   if (verdict === 'counters' || verdict === 'leak' || verdict === 'verify') {
@@ -249,5 +294,5 @@ export async function runUpdateTypesetPhase(engine, {
   // screen meanwhile, and canonical guarantees the final pixels.
   queueMovedOffsets();
   timer.lap('pagectx');
-  engine._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict };
+  engine._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict, cold };
 }
