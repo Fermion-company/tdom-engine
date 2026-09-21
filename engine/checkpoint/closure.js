@@ -15,12 +15,19 @@ const LITERAL_ENVS = new Set([
   'alltt',
   'filecontents',
   'filecontents*',
+  'Verbatim',
   'BVerbatim',
   'LVerbatim',
   'VVerbatim',
+  'Verbatim*',
   'BVerbatim*',
   'LVerbatim*',
   'VVerbatim*',
+  'SaveVerbatim',
+  'VerbatimOut',
+  'tcblisting',
+  'luacode',
+  'luacode*',
 ]);
 
 const CONDITIONALS = new Set([
@@ -74,7 +81,10 @@ function bracedArgument(text, at) {
   return null;
 }
 
-export function sourceClosure(text) {
+// `literalEnvs` names the literal environments the preamble declares
+// (\lstnewenvironment and friends, see literalEnvironmentNames): a
+// listing that quotes \end{document} or an unbalanced brace is closed.
+export function sourceClosure(text, { literalEnvs = null } = {}) {
   const envs = [];
   const conditionals = [];
   const loops = [];
@@ -164,7 +174,7 @@ export function sourceClosure(text) {
       if (!env) return fail(`${name}-environment`, i);
       if (name === 'begin') {
         envs.push(env);
-        if (LITERAL_ENVS.has(env)) literal = env;
+        if (LITERAL_ENVS.has(env) || literalEnvs?.has(env)) literal = env;
       } else {
         if (envs.at(-1) !== env) return fail(`unexpected:end:${env}`, i);
         envs.pop();

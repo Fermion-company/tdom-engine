@@ -38,3 +38,10 @@ test('a bare trailing escape waits, while an ordinary control word goes to nativ
   assert.equal(closed('text \\'), false);
   assert.equal(closed('text \\LaTeX'), true);
 });
+
+test('fancyvrb and declared listing environments are literal', () => {
+  assert.equal(sourceClosure('\\begin{Verbatim}\nfake closer: \\end{document}\n{\n\\end{Verbatim}').closed, true);
+  const listing = '\\begin{TeXBlock}\n\\end{document}\n\\end{TeXBlock}';
+  assert.equal(sourceClosure(listing).closed, false);
+  assert.equal(sourceClosure(listing, { literalEnvs: new Set(['TeXBlock']) }).closed, true);
+});

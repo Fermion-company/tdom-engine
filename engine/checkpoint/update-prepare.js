@@ -15,6 +15,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
 
   const bounds = documentBounds(text);
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
+  engine.literalEnvs = bounds.literalEnvs;
   const preHash = fnv1a(preamble);
 
   // Keep both the old page tree and its block boundaries while the user is
@@ -26,7 +27,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   // The lexical gate is not a TeX parser: canonical must still compile the
   // current input, either proving it valid or reporting the actual error.
   if (engine.blocks.length) {
-    const preClosure = sourceClosure(preamble);
+    const preClosure = sourceClosure(preamble, { literalEnvs: bounds.literalEnvs });
     if (!preClosure.closed) {
       timer.lap('closure');
       return { response: deferClosureUpdate(editLabel, timer, { ...preClosure, scope: 'preamble' }) };
@@ -78,7 +79,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   ];
   if (engine.blocks.length) {
     for (const seg of segs) {
-      const closure = sourceClosure(seg.text);
+      const closure = sourceClosure(seg.text, { literalEnvs: bounds.literalEnvs });
       if (!closure.closed) {
         timer.lap('closure');
         return {

@@ -43,7 +43,7 @@ export async function typesetBlock(engine, idx, callbacks) {
   const aborted = () => engine.bgAbort && engine.bgActive;
   const isInfra = (e) => e?.tdomInfra === true;
   const isTimeoutErr = (e) => e?.tdomTimeout === true;
-  const lexical = sourceClosure(block.text);
+  const lexical = sourceClosure(block.text, { literalEnvs: engine.literalEnvs });
   block.nativeClosureRequired = !sourceRequiresCanonicalOnly(block.text);
   block.closure = { ...lexical, native: false };
   if (!lexical.closed) {
