@@ -469,6 +469,8 @@ export async function bootShipping(engine, { makeShipping, paginateNow, computeT
     const pending = engine.shipPendingInputChanges;
     engine.shipPendingInputChanges = null;
     if (pending) shipUpdate(pending.text, pending.projectInputChanges);
+    // The grid pass (docs/03) waits out the bootstrap; wake it now.
+    void engine.maintainGrid?.();
   }
 }
 

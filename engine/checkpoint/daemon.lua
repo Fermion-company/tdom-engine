@@ -1159,7 +1159,9 @@ function tdom_seed()
   reseed_page()
   -- fresh document start: no interline glue above the first line
   tex.nest[0].prevdepth = -65536000
-  checkpoint_gc(true)
+  -- tdom_real_root already settled the heap right before its fork; a
+  -- second full cycle here would only re-dirty the pages that root shares
+  if not TDOM_GC_FLOOR then checkpoint_gc(true) end
   -- Readiness includes the font warmup and heap cleanup. A JOB measured
   -- before this point would charge preamble work to its source block.
   conn:send('HELLO ckpt 0 ' .. fk.getpid() .. '\n')
@@ -1854,34 +1856,118 @@ function tdom_wait()
       local jobdir = pctdecode(b)
       local len = tonumber(c) or 0
       local body = len > 0 and recv_exact(len) or ''
-      local wedge = take_wedge_fault()
-      local pid = fork_for(id)
-      if pid == 0 then
-        if wedge then
-          os.execute('/bin/sleep 30')
-          fk._exit(9)
-        end
-        drop_capture()
-        JOB = { id = id, ckpt = -1, body = body }
-        RENDER_MODE = false
-        reconnect('iso', 0)
-        assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish isolated PDF')
-        lfs.chdir(jobdir)
-        local notify = function()
-          pcall(function()
-            conn:send('DONE ' .. id .. '\n')
-          end)
-        end
-        if luatexbase and luatexbase.add_to_callback then
-          pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdom')
-        else
-          pcall(callback.register, 'finish_pdffile', notify)
-        end
-        inject_raw(body)
-        return
-      elseif pid then
-        conn:send('FORKED ' .. id .. ' ' .. pid .. '\n')
+      if iso_fork(id, jobdir, body) then
+        return -- the ISO child: TeX now runs the injected program
       end
+    end
+  end
+end
+
+-- ISO job fork shared by checkpoint 0 (dormant regime, iso absorb) and the
+-- real-output root (pre-dormant, real \output). Parent: announces FORKED
+-- and returns false. Child: reconnects as 'iso', privatizes its PDF,
+-- injects the program and returns true so the caller hands control back
+-- to TeX.
+function iso_fork(id, jobdir, body)
+  local wedge = take_wedge_fault()
+  local pid = fork_for(id)
+  if pid == 0 then
+    if wedge then
+      os.execute('/bin/sleep 30')
+      fk._exit(9)
+    end
+    -- a job child may collect normally again (the real root keeps the
+    -- collector stopped so the COW pages it shares stay untouched)
+    collectgarbage('restart')
+    drop_capture()
+    JOB = { id = id, ckpt = -1, body = body }
+    RENDER_MODE = false
+    reconnect('iso', 0)
+    assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish isolated PDF')
+    lfs.chdir(jobdir)
+    local notify = function()
+      pcall(function()
+        conn:send('DONE ' .. id .. '\n')
+      end)
+    end
+    if luatexbase and luatexbase.add_to_callback then
+      pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdom')
+    else
+      pcall(callback.register, 'finish_pdffile', notify)
+    end
+    inject_raw(body)
+    return true
+  elseif pid then
+    conn:send('FORKED ' .. id .. ' ' .. pid .. '\n')
+  end
+  return false
+end
+
+-- ---------------------------------------------------------- real root
+--
+-- Splitting environments (multicols, longtable, mdframed, breakable
+-- tcolorbox) and page-emitting blocks (\includepdf) only make progress
+-- inside TeX's REAL output routine. Checkpoint 0 is frozen inside the
+-- dormant regime (\vsize=\maxdimen, absorbing \output, seed box on the
+-- page), and a child forked from it could not be trusted to run the real
+-- routine (luatexja page state, tcolorbox waiting forever), so those
+-- rescues used to pay a cold lualatex — the whole preamble again, ~5s on a
+-- package-heavy book. The real-output root is a sibling of checkpoint 0,
+-- forked by the driver BEFORE the dormant setup: preamble loaded, real
+-- \output, real \vsize, empty page. It shares the preamble heap with
+-- checkpoint 0 copy-on-write and only ever forks ISO children; it keeps
+-- its collector stopped so it never dirties those shared pages while
+-- waiting (the same treatment an interactive JOB child gets).
+function tdom_real_root()
+  -- Settle the heap in the PARENT before forking: a full cycle rewrites
+  -- every object's mark byte, so a collect on either side after the fork
+  -- would copy the whole Lua heap. tdom_seed reuses this floor instead of
+  -- collecting again, and the child never collects at all.
+  checkpoint_gc(true)
+  local pid = fk.fork_pdf(PDF_FD)
+  if not pid or pid < 0 then
+    texio.write_nl('term and log', 'tdom: real-output root fork failed; splitting rescues stay cold')
+    return
+  end
+  if pid ~= 0 then
+    texio.write_nl('tdom: real-output root pid ' .. pid)
+    return
+  end
+  collectgarbage('stop')
+  reconnect('realroot', 0)
+  tdom_real_wait()
+  -- only an ISO child returns here: TeX resumes on the injected program
+end
+
+function tdom_real_wait()
+  while true do
+    local line, err = conn:receive('*l')
+    if not line then
+      fk._exit(0) -- orchestrator went away
+    end
+    local cmd, a, b, c = line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)')
+    if cmd == 'DIE' then
+      fk._exit(0)
+    elseif cmd == 'PING' then
+      conn:send('PONG realroot\n')
+    elseif cmd == 'FAULT' then
+      if a == 'FORKFAIL' then
+        FAULT_FORKFAIL = tonumber(b) or 0
+      elseif a == 'WEDGE' then
+        FAULT_WEDGE = tonumber(b) or 0
+      end
+    elseif cmd == 'ISO' then
+      local id = a
+      local jobdir = pctdecode(b)
+      local len = tonumber(c) or 0
+      local body = len > 0 and recv_exact(len) or ''
+      if iso_fork(id, jobdir, body) then
+        return
+      end
+    else
+      -- JOB/STEP/RENDER/CAPTURE never belong here: the real root holds no
+      -- checkpoint state and must never typeset in place
+      texio.write_nl('term and log', 'tdom: real root ignores ' .. tostring(cmd))
     end
   end
 end

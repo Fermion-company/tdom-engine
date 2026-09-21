@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { resolvedInGalley } from './util/galley.js';
@@ -25,12 +26,71 @@ export async function runChainPass(engine, callbacks) {
     enforceCheckpointCap,
     retypesetChain,
     pinBoundary,
+    gridMissing,
   } = callbacks;
   const work = engine.pendingChain;
   if (!work) return;
   engine.bgActive = true;
   try {
+    if (work.kind === 'grid') {
+      // Materialize keep-set boundaries that have no resident continuation
+      // (docs/03). Each target is reached by the same consuming STEP replay
+      // as the cold walk, from the nearest boundary below it; the fork at
+      // the target stays because the keep set holds it, and the cap then
+      // retires the near-miss neighbour the boot walk left instead. Lowest
+      // priority: any other chain work replaces it, an edit or a caret warm
+      // stops it at the next block boundary, and it resumes on the next
+      // idle gate. Bounded per pass so a keep set that keeps moving with
+      // fresh cost samples cannot spin.
+      let budget = work.budget ?? Infinity;
+      while (budget-- > 0) {
+        if (engine.bgAbort || engine.editPending > 0) return;
+        const missing = gridMissing();
+        if (!missing.length) break;
+        // A boundary this plan already materialized is missing again: the
+        // resident cap (shared with shipping) retired it, so filling would
+        // only churn forks. Stall until the plan changes.
+        if (missing.some((idx) => engine.gridFill.given.has(idx))) {
+          engine.gridFill.stalled = true;
+          break;
+        }
+        const target = missing[0];
+        const from = nearestCheckpoint(target);
+        if (from >= target) break;
+        const startedAt = performance.now();
+        if (process.env.TDOM_TRACE_GRID) console.error('[grid] walk', JSON.stringify({ from, target, missing: missing.length, t: Math.round(performance.now()) }));
+        engine.progress = { phase: 'grid', at: from + 1, total: target };
+        engine.coldWalking = true; // never killed mid-block (see #update)
+        let n;
+        try {
+          n = await retypesetChain(
+            from,
+            target - 1,
+            (j) => { engine.progress = { phase: 'grid', at: j + 2, total: target }; },
+            () => engine.bgAbort || engine.editPending > 0
+          );
+        } finally {
+          engine.coldWalking = false;
+        }
+        const reached = from + (n < 0 ? -n - 1 : n);
+        if (process.env.TDOM_TRACE_GRID) console.error('[grid] done', JSON.stringify({ from, target, reached, n, abort: engine.bgAbort, has: engine.checkpoints.has(target), t: Math.round(performance.now()) }));
+        engine.gridFill.passes++;
+        engine.gridFill.ms += Math.round(performance.now() - startedAt);
+        engine.gridFill.last = { from, target, reached, at: Date.now() };
+        if (n < 0 || engine.bgAbort) {
+          pinBoundary(reached);
+          return; // resumes from the pinned boundary on the next idle gate
+        }
+        if (!engine.checkpoints.has(target)) break; // refused or retired at once: stop the churn
+        engine.gridFill.materialized++;
+        engine.gridFill.given.add(target);
+        enforceCheckpointCap();
+      }
+      if (engine.pendingChain === work) engine.pendingChain = null;
+      return;
+    }
     if (work.kind === 'cold') {
+      if (engine.coldTrace) engine.coldTrace.passLockAt = performance.now();
       // Cold resume (docs/10 §10.4a): finish the sparse replay a budgeted
       // keystroke stopped, up to the first block whose galley predates its
       // text. The replay consumes its own continuations (STEP) exactly like
@@ -50,19 +110,39 @@ export async function runChainPass(engine, callbacks) {
           // Never killed mid-block (see #update): an edit sets bgAbort and
           // the walk returns at its next boundary, which stays live.
           engine.coldWalking = true;
+          // walk telemetry for the deferred report (docs/10 §10.4a): where
+          // the replay started, how far it got, and each block's cost
+          const walkStartedAt = performance.now();
+          let lastAt = walkStartedAt;
+          const perBlockMs = [];
           let n;
           try {
             n = await retypesetChain(
               from,
               target - 1,
-              (j) => { engine.progress = { phase: 'cold', at: j + 2, total: target }; },
+              (j) => {
+                engine.progress = { phase: 'cold', at: j + 2, total: target };
+                const now = performance.now();
+                perBlockMs.push(Math.round(now - lastAt));
+                lastAt = now;
+              },
               () => engine.bgAbort || engine.editPending > 0
             );
           } finally {
             engine.coldWalking = false;
           }
           const reached = from + (n < 0 ? -n - 1 : n);
+          const prev = engine.coldWalk?.target === target ? engine.coldWalk : null;
+          engine.coldWalk = {
+            from: prev?.from ?? from,
+            target,
+            walked: (prev?.walked ?? 0) + perBlockMs.length,
+            ms: (prev?.ms ?? 0) + Math.round(performance.now() - walkStartedAt),
+            passes: (prev?.passes ?? 0) + 1,
+            perBlockMs: [...(prev?.perBlockMs ?? []), ...perBlockMs].slice(-128),
+          };
           pinBoundary(reached);
+          if (engine.coldTrace) engine.coldTrace.walkDoneAt = performance.now();
           if (n < 0 || engine.bgAbort) return;
         }
         work.phase = 'resume';

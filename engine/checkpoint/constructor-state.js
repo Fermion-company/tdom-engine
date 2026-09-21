@@ -64,6 +64,7 @@ export function initializeEngineState(
   engine.pages = [];
   engine.chunks = makeChunkMap(); // chunkKey -> {svg, wBp, hBp, v} exact renders
   engine.isoCache = new Map(); // rescue key -> isolated compile result
+  engine.isoDiskCache = null; // IsoDiskCache under workDir, created lazily (docs/08 §8.5)
   engine.isoFailCache = new Map(); // rescue key -> error message (doomed compiles: same inputs fail the same way — don't pay the preamble again on every chain pass over a frozen block)
   engine.isoForkBroken = new Set(); // block ids whose iso fork children die (tcolorbox-class fork/dormant incompatibility) — go straight to cold
   engine.dyingPids = new Set(); // DIE'd checkpoint pids not yet exited — #reapDying backpressure
@@ -202,6 +203,16 @@ export function initializeEngineState(
   engine.cancelledRenderIds = new Set(); // late FORKED replies are killed after edit preemption
   engine.captureSeq = 0; // monotonic generation token for retained JOB node lists
   engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };
+  // Per-rescue timeline for /status (block, fork/cold, compile and adopt
+  // time): the boot drain of a long document is invisible otherwise.
+  engine.rescueLog = [];
+  engine.isoModeOf = new Map(); // block.id -> 'fork-absorb' | 'fork-real' | 'cold' of the last isolated compile
+  // real-output rescue root (daemon.lua tdom_real_root): a pre-dormant
+  // sibling of checkpoint 0 that forks splitting/page-emitting rescues
+  // under LaTeX's real \output. Opt-in until the cold-vs-fork-real
+  // differential suite and the RSS measurement make it the default.
+  engine.isoRealFork = !!process.env.TDOM_ISO_REAL_FORK && process.env.TDOM_ISO_REAL_FORK !== '0';
+  engine.realRoot = null; // its Peer once it says HELLO realroot
   engine.renderHold = new Map(); // ckpt idx kept alive for a pending render -> block.id
   engine.foregroundRenderIds = null;
   // Edit-locus pinning: the checkpoints at (and right after) the block the
@@ -226,6 +237,14 @@ export function initializeEngineState(
   engine.coldPrefixBudgetMs = Math.max(0, Number(process.env.TDOM_COLD_PREFIX_MS ?? 1500) || 0);
   engine.coldDirty = new Set(); // block ids whose galley predates their source text
   engine.coldWalking = false; // a cold chain pass is replaying with STEP right now
+  engine.coldWalk = null; // telemetry of the last cold replay (from/target/walked/ms/perBlockMs)
+  engine.coldTrace = null; // timestamps of the current cold keystroke's deferred path
+  // Grid materialization (docs/03): the keep set is computed from measured
+  // block costs, but a boot walk only retains the boundaries the partial
+  // costs asked for at the time. The lowest-priority chain pass replays
+  // from the nearest resident boundary to each keep boundary that has no
+  // continuation, so caret warms and cold keystrokes pay one segment at most.
+  engine.gridFill = { materialized: 0, ms: 0, passes: 0, last: null, given: new Set(), stalled: false };
   // Edits waiting for the chain lock. A caret warm or a deferred chain pass
   // must not start (or clear the abort flag) while one is pending: the
   // walk would take the lock first and the keystroke would wait it out.

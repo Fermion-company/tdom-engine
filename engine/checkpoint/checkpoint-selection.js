@@ -149,3 +149,58 @@ export function nearestCheckpoint(checkpoints, idx) {
   }
   return best;
 }
+
+/**
+ * The cost a block contributes to the skeleton is its intrinsic replay
+ * cost, estimated as the minimum measured so far: a sample inflated by a
+ * fork stall, swapping or a warm reopening fonts must never turn an
+ * ordinary paragraph into a "hot" block and move every boundary after it
+ * (measured: one 6.7 s spike on a 200 ms paragraph re-cut the whole grid).
+ * Returns the value to store, or null when the sample changes nothing.
+ */
+export function nextTypesetCost(previous, elapsedMs) {
+  const sample = Number(elapsedMs);
+  if (!Number.isFinite(sample) || sample < 0) return null;
+  const prior = Number(previous) || 0;
+  if (!prior) return sample;
+  return sample < prior ? sample : null;
+}
+
+/**
+ * Keep-set boundaries the grid pass should materialize (docs/03): those
+ * whose replay from the nearest resident boundary below them costs more
+ * than `tolerance` of one equal-cost segment, and that no resident
+ * boundary shortly after them covers either. A boundary a block or two
+ * away from a resident one is served well enough by it (the partition is
+ * merely shifted by those blocks) — chasing every drift of the plan, which
+ * moves whenever cost samples refine, would re-fork the document for
+ * nothing. Returned in document order; root and the end never count.
+ */
+export function gridMissingBoundaries(blocks, keep, checkpoints, maxCheckpoints, { tolerance = 0.15 } = {}) {
+  const count = blocks.length;
+  if (!count) return [];
+  const limit = Math.max(2, Math.floor(Number(maxCheckpoints) || 2));
+  const measured = blocks.map(block => Number(block.typesetCostMs))
+    .filter(value => Number.isFinite(value) && value > 0).sort((a, b) => a - b);
+  const median = measured[Math.floor(measured.length / 2)] ?? 1;
+  const cost = blocks.map((block) => Math.max(0.1, Number(block.typesetCostMs) || median));
+  const total = cost.reduce((sum, value) => sum + value, 0);
+  const allowance = (total / (limit - 1)) * tolerance;
+  const held = [...checkpoints.keys()].sort((a, b) => a - b);
+  const missing = [];
+  for (const idx of [...keep].sort((a, b) => a - b)) {
+    if (idx <= 0 || idx >= count || checkpoints.has(idx)) continue;
+    const below = nearestCheckpoint(checkpoints, idx);
+    let replay = 0;
+    for (let i = below; i < idx && replay <= allowance; i++) replay += cost[i];
+    if (replay <= allowance) continue;
+    const above = held.find((k) => k > idx);
+    if (above !== undefined) {
+      let ahead = 0;
+      for (let i = idx; i < above && ahead <= allowance; i++) ahead += cost[i];
+      if (ahead <= allowance) continue;
+    }
+    missing.push(idx);
+  }
+  return missing;
+}

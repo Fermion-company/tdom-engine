@@ -9,6 +9,7 @@ export function prepareIsoCompileJob({
   idx,
   forceCold,
   checkpoints,
+  realRoot = null,
   isoForkBroken,
   blocks,
   counters,
@@ -19,17 +20,11 @@ export function prepareIsoCompileJob({
   needsRescue,
   breakableRe,
 }) {
-  // Fork mode: rescue in a child forked from the pristine post-preamble
-  // checkpoint (ckpt:0) — the preamble (the 10-15s / 300-500MB part of a
-  // cold iso on package-heavy documents) is already loaded and COW-shared.
-  // Cold mode remains the fallback when no resident root exists (opaque
-  // mode, boot failure) or infra fails before the fork happens.
-  // Page-emitting/splitting blocks keep the REAL output routine. That
-  // cannot run in a fork child: the inherited dormant page state breaks
-  // it under luatexja, and tcolorbox can wait forever without producing
-  // either an artifact or the DISCARD signal. Compile those blocks cold
-  // immediately instead of first paying the 120s fork timeout. Ordinary
-  // non-splitting rescues still reuse ckpt0 and its loaded preamble.
+  // Fork mode: rescue in a child forked from a resident root — the
+  // preamble (the 10-15s / 300-500MB part of a cold iso on package-heavy
+  // documents) is already loaded and COW-shared. Cold mode remains the
+  // fallback when no resident root exists (opaque mode, boot failure) or
+  // infra fails before the fork happens.
   const includesPdf = /\\includepdf\b/.test(block.text);
   needsRescue(block.text, block.structuralSinks); // populate _breakableRe for this preamble
   const aliasSplitMode = (block.structuralSinks ?? []).some((sink) =>
@@ -41,14 +36,39 @@ export function prepareIsoCompileJob({
       block.text
     ) ||
       (breakableRe()?.test(block.text) ?? false));
-  const ck0 =
-    !forceCold &&
-    !process.env.TDOM_ISO_COLD &&
-    !isoForkBroken.has(block.id) &&
-    !includesPdf &&
-    !splitMode
-      ? checkpoints.get(0)
-      : null;
+  // Page-EMITTING blocks (\includepdf: whole foreign pages) keep the REAL
+  // output routine so every page ships and becomes a per-page chunk. The
+  // dormant absorb would hand their zero-dimension page paintings back to
+  // the galley as invisible material (pdfpages draws via a 0pt picture
+  // box). SPLITTING environments (mdframed / framed / breakable
+  // tcolorbox / multicols / longtable) also keep the real routine: their
+  // page-splitting machinery only runs inside \output, so under the
+  // dormant absorb a box that must break never makes progress (runaway →
+  // discard → failed compile). With the real routine the box splits
+  // exactly as in print: full pages ship as per-page chunks (page 1
+  // cropped below the entry strut), and the final partial page stays on
+  // the galley for the normal remainder harvest. A box that FITS never
+  // fires the routine, so its galley is byte-identical to the absorb path.
+  const realOutput = includesPdf || splitMode;
+  // Runner kinds:
+  //   fork-absorb — child of checkpoint 0 (dormant regime), iso absorb
+  //                 routine; galley-material rescues.
+  //   fork-real   — child of the real-output root (a pre-dormant sibling
+  //                 of checkpoint 0, daemon.lua tdom_real_root): LaTeX's
+  //                 real \output and \vsize, preamble COW-shared. Only
+  //                 exists under TDOM_ISO_REAL_FORK.
+  //   cold        — standalone lualatex (no resident root, opaque mode,
+  //                 fork infrastructure failure, or a block whose fork
+  //                 child already died once: isoForkBroken).
+  // Real-output work from checkpoint 0 itself is never attempted: its
+  // inherited dormant page state breaks the real routine under luatexja,
+  // and tcolorbox can wait forever without an artifact or DISCARD signal.
+  const forkAllowed = !forceCold && !process.env.TDOM_ISO_COLD && !isoForkBroken.has(block.id);
+  const forkPeer = !forkAllowed ? null : realOutput ? realRoot ?? null : checkpoints.get(0) ?? null;
+  const runner = forkPeer ? (realOutput ? 'fork-real' : 'fork-absorb') : 'cold';
+  // ck0 keeps its historical meaning downstream: "this compile runs in a
+  // fork child" (artifact names, cold retry on a dead fork)
+  const ck0 = forkPeer;
   // label values as injected into THIS run — recorded on the result so
   // resolvedInGalley can compare exactly (see #jobBlock's refSnapshot)
   const labelSnap = new Map(labelTable);
@@ -70,25 +90,6 @@ export function prepareIsoCompileJob({
   // absolute path injected into inline Lua (fork mode): single-quoted, so
   // escape the characters that would break the literal
   const jobdirForBody = jobdir.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-  // Page-EMITTING blocks (\includepdf: whole foreign pages) keep the REAL
-  // output routine so every page ships and becomes a per-page chunk. The
-  // dormant absorb would hand their zero-dimension page paintings back to
-  // the galley as invisible material (pdfpages draws via a 0pt picture
-  // box). Galley-material blocks keep the absorb as before.
-  //
-  // SPLITTING environments (mdframed / framed / breakable tcolorbox) also
-  // keep the real routine: their page-splitting machinery only runs
-  // inside \output, so under the dormant absorb a box that must break
-  // simply never makes progress (runaway → discard → failed compile).
-  // With the real routine the box splits exactly as in print: full pages
-  // ship as per-page chunks (page 1 cropped below the entry strut), and
-  // the final partial page stays on the galley for the normal remainder
-  // harvest. A box that FITS never fires the routine, so its galley is
-  // byte-identical to the absorb path.
-  // Fork children use the iso absorb only for non-splitting rescues. The
-  // splitting cases above intentionally have no ck0 and therefore run the
-  // real routine cold, where page output and progress are deterministic.
-  const realOutput = !ck0 && (includesPdf || splitMode);
   // page-context strut: reproduce the block's true on-page start position
   // so splitting environments (mdframed & co.) measure the same
   // \pagegoal-\pagetotal as in print. The iso page's own \topskip already
@@ -124,9 +125,11 @@ export function prepareIsoCompileJob({
     prevLastskip,
     realOutput,
     strut,
+    runner,
   });
   return {
     ck0,
+    runner,
     labelSnap,
     jobdir,
     pdf: path.join(jobdir, ck0 ? 'driver.pdf' : 'iso.pdf'),

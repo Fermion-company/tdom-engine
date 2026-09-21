@@ -1651,12 +1651,23 @@ const server = http.createServer(async (req, res) => {
         srcRev: engine.srcRev,
         documentEpoch,
         progress: engine.progress ?? null,
+        // pages the resident layout has right now (async rescues and
+        // repaginations move it between edit reports)
+        residentPages: engine.pages?.length ?? null,
         render: {
           queued: [...engine.renderWant.keys()],
           pumping: engine.renderPumping,
           active: [...(engine.rendering ?? [])],
           pids: Object.fromEntries(engine.renderPids ?? []),
           stats: engine.renderStats,
+        },
+        rescue: {
+          queued: engine.rescueQueue?.size ?? 0,
+          pumping: !!engine.rescuePumping,
+          disk: engine.isoDiskCache?.stats ?? null,
+          realRoot: engine.realRoot?.pid ?? null,
+          rootPid: engine.root?.pid ?? null,
+          log: (engine.rescueLog ?? []).slice(-60),
         },
         shipping: engine.shipping?.info?.() ?? null,
         shippingPresentation: lastShipPresentation,
@@ -1669,6 +1680,7 @@ const server = http.createServer(async (req, res) => {
         foregroundLeaseMs: engine.foregroundLeaseMs ?? 0,
         authorityDeferred: engine.authorityDeferred ?? false,
         canonical: engine.canonical.info(),
+        grid: url.searchParams.has('grid') ? engine.gridInfo?.() ?? null : undefined,
       });
     }
     if (req.method === 'POST' && url.pathname === '/canonical/build-lease/acquire') {

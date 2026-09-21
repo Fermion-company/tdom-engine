@@ -191,6 +191,7 @@ export async function runUpdateTypesetPhase(engine, {
     }
     for (const id of pending) engine.coldDirty.add(id);
     cold = { pending, from: fgStop };
+    engine.coldTrace = { stopAt: performance.now() };
     queueChainWork('cold', fgStop, changedLabels);
   }
 

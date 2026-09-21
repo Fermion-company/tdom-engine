@@ -3,7 +3,9 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, rmSync } from 'node:fs';
+import { readFileSync, rmSync, mkdtempSync, writeFileSync, readdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -234,9 +236,12 @@ test('a caret warm walk yields to a Build lease at its next block boundary and r
     await e.open(doc);
     const offset = doc.indexOf('Paragraph 150 ');
     assert.ok(offset > 0);
-    const warm = e.warmEditOffset(offset);
+    let settled = false;
+    const warm = e.warmEditOffset(offset).finally(() => { settled = true; });
     const deadline = Date.now() + 20_000;
-    while (!e.warming && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1));
+    // the walk can also be instantly ready (both boundaries resident): stop
+    // polling as soon as the warm settles instead of waiting out the deadline
+    while (!e.warming && !settled && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1));
     if (!e.warming) {
       // the walk finished before it could be observed: nothing to yield
       assert.deepEqual(await e.yieldWarmForBuild(), { yielded: false, warming: false });
@@ -418,4 +423,231 @@ test('a keystroke during a caret warm walk takes the lock at the next block boun
   } finally {
     await e.close();
   }
+});
+
+test('a keep-set boundary without a continuation is materialized by the idle grid pass', opts, async () => {
+  const work = WORK + '-grid-fill';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 120; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the grid fill fixture keeps the resident chain walking for a while.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  try {
+    await e.open(doc);
+    await e.bgTask.catch(() => {});
+    const settle = Date.now() + 20_000;
+    while (e.gridMissing().length && Date.now() < settle) await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(e.gridMissing(), [], 'after boot every keep boundary holds a continuation');
+    // Lose an interior keep boundary the way memory pressure or a killed
+    // walk would: the keep set still wants it, no process holds it.
+    const keep = e.gridInfo().keep.filter((idx) => idx > 0 && idx < e.blocks.length && e.checkpoints.has(idx));
+    assert.ok(keep.length >= 1, 'an interior keep boundary exists');
+    const lost = keep[keep.length - 1];
+    const peer = e.checkpoints.get(lost);
+    peer.send('DIE\n');
+    if (peer.pid) e.dyingPids.add(peer.pid);
+    for (const [idx, candidate] of [...e.checkpoints]) if (candidate === peer) e.checkpoints.delete(idx);
+    assert.deepEqual(e.gridMissing(), [lost]);
+    const t0 = performance.now();
+    const ran = await e.maintainGrid();
+    assert.equal(ran, true);
+    const deadline = Date.now() + 30_000;
+    while (e.gridMissing().length && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(e.checkpoints.has(lost), `boundary ${lost} was materialized again (${(performance.now() - t0).toFixed(0)}ms)`);
+    assert.deepEqual(e.gridMissing(), []);
+    assert.ok(e.gridInfo().fill.materialized >= 1);
+    assert.ok(e.checkpoints.size <= e.maxCheckpoints + 2, `resident set stays near budget: ${e.checkpoints.size}`);
+    // a keystroke at the block right after the restored boundary is hot
+    const at = e.getSource().indexOf(e.blocks[lost].text.slice(0, 20));
+    assert.ok(at > 0);
+    const hot = await e.edit(at, at + 'Paragraph'.length, 'Section');
+    assert.notEqual(hot.stats.chainVerdict, 'cold');
+    assert.ok(hot.stats.blocksTypeset <= 3, `keystroke after the restored boundary replayed ${hot.stats.blocksTypeset} blocks`);
+  } finally {
+    await e.close();
+  }
+});
+
+test('a keystroke at the block a caret warm is walking toward resumes from the boundary it reached', async () => {
+  const work = WORK + '-warm-frontier-edit';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the warm frontier fixture keeps the resident chain walking for a while.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4; // the budget in force is derived per document from the ceiling
+  try {
+    await e.open(doc);
+    const far = doc.indexOf('Paragraph 150 ');
+    const warm = e.warmEditOffset(far);
+    const deadline = Date.now() + 20_000;
+    while (!e.warming && Date.now() < deadline) await new Promise((r) => setTimeout(r, 1));
+    if (!e.warming) { await warm; return; }
+    await new Promise((r) => setTimeout(r, 300)); // let the STEP walk advance a few blocks
+    const t0 = performance.now();
+    const r = await e.edit(far, far + 'Paragraph'.length, 'Section');
+    const wall = performance.now() - t0;
+    assert.ok(r.stats.typesetMs < 8_000, `a job at the warm's frontier stalled: ${r.stats.typesetMs}ms (${JSON.stringify(r.stats.diagnostics)})`);
+    assert.ok(!r.stats.diagnostics.some((d) => /timed out|failed/.test(d)), JSON.stringify(r.stats.diagnostics));
+    assert.ok(wall < 20_000, `keystroke took ${wall.toFixed(0)}ms`);
+    const w = await warm;
+    // on a fast machine the walk can finish before the keystroke enters
+    assert.ok(['superseded', 'ready'].includes(w.status), w.status);
+  } finally {
+    await e.close();
+  }
+});
+
+test('a reopened document adopts its cached isolated rescues during the boot walk', async () => {
+  const work = WORK + '-iso-disk-cache';
+  rmSync(work, { recursive: true, force: true });
+  const doc = [
+    '\\documentclass{article}', '\\usepackage{multicol}', '\\begin{document}',
+    'Plain paragraph before the columns with ordinary prose on the page.', '',
+    '\\begin{multicols}{2}',
+    'Left column text explains the idea in the first column with several plain sentences.',
+    'It continues with another sentence so the column has a few lines of text.', '',
+    '\\columnbreak',
+    'Right column text compares the idea with another one in the second column.',
+    '\\end{multicols}', '',
+    'Plain paragraph after the columns. Closing prose for the page.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  const first = new CheckpointEngine({ workDir: work });
+  try {
+    await first.open(doc);
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      const block = first.blocks.find((b) => /begin\{multicols\}/.test(b.text));
+      if (block?.rescued && !first.rescueQueue.size && !first.rescuePumping) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const block = first.blocks.find((b) => /begin\{multicols\}/.test(b.text));
+    assert.ok(block?.rescued, 'the multicols block was rescued by the isolated compile');
+    assert.ok(first.isoDiskCache?.stats.writes >= 1, JSON.stringify(first.isoDiskCache?.stats));
+  } finally {
+    await first.close();
+  }
+  const second = new CheckpointEngine({ workDir: work });
+  try {
+    const report = await second.open(doc);
+    const block = second.blocks.find((b) => /begin\{multicols\}/.test(b.text));
+    assert.ok(block?.rescued, 'the boot walk adopted the cached rescue inline');
+    assert.equal(second.rescueQueue.size, 0, 'nothing left for the async pump');
+    assert.ok(second.isoDiskCache?.stats.hits >= 1, JSON.stringify(second.isoDiskCache?.stats));
+    assert.ok(second.chunks.size >= 1, 'the cached chunk svg is registered');
+    assert.ok(report.stats.pageCount >= 1);
+  } finally {
+    await second.close();
+  }
+});
+
+// --- real-output rescue root (TDOM_ISO_REAL_FORK) -------------------------
+//
+// Splitting environments used to be rescued COLD (a standalone lualatex,
+// the whole preamble again). The real-output root is a pre-dormant sibling
+// of checkpoint 0; its ISO children run LaTeX's real \output with the
+// preamble COW-shared. The contract: same block, same offset — cold and
+// fork-real agree on state, items, labels, chunk geometry and pixels.
+
+const SPLIT_LOREM = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ';
+const SPLIT_DOC = [
+  '\\documentclass{article}', '\\usepackage{multicol,longtable,mdframed}', '\\usepackage[most]{tcolorbox}', '\\begin{document}',
+  'Plain paragraph before the columns with ordinary prose on the page.', '',
+  '\\begin{multicols}{2}', SPLIT_LOREM.repeat(6), '\\columnbreak', SPLIT_LOREM.repeat(3), '\\end{multicols}', '',
+  'Plain paragraph between.', '',
+  '\\begin{multicols*}{2}', SPLIT_LOREM.repeat(4), '\\end{multicols*}', '',
+  'Plain paragraph between two.', '',
+  '\\begin{longtable}{ll}', ...Array.from({ length: 12 }, (_, i) => `row ${i} & value ${i} \\\\`), '\\end{longtable}', '',
+  'Plain paragraph between three.', '',
+  '\\begin{mdframed}', SPLIT_LOREM.repeat(8), '\\end{mdframed}', '',
+  'Plain paragraph between four.', '',
+  '\\begin{tcolorbox}[breakable]', SPLIT_LOREM.repeat(8), '\\end{tcolorbox}', '',
+  'Plain paragraph after.', '',
+  '\\end{document}', '',
+].join('\n');
+
+const sortedKeys = (o) => Object.fromEntries(Object.keys(o ?? {}).sort().map((k) => [k, o[k]]));
+const isoShape = (iso) => ({
+  w: iso.w, h: iso.h, d: iso.d, items: iso.items, labels: iso.labels, toclines: iso.toclines,
+  state: sortedKeys(iso.state),
+  chunks: iso.chunks.map((c) => ({ key: c.key, wBp: c.wBp, hBp: c.hBp, editPage: c.editPage, svg: c.svg })),
+});
+async function rasterPages(pdfBuf, tag) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tdom-realfork-'));
+  try {
+    writeFileSync(path.join(dir, 'x.pdf'), pdfBuf);
+    await promisify(execFile)('pdftocairo', ['-png', '-r', '72', path.join(dir, 'x.pdf'), path.join(dir, tag)], { timeout: 30_000 });
+    return readdirSync(dir).filter((f) => f.startsWith(tag) && f.endsWith('.png')).sort().map((f) => readFileSync(path.join(dir, f)));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+test('the real-output root is opt-in: without the flag splitting rescues stay cold', opts, () => {
+  assert.equal(eng.isoRealFork, false);
+  assert.equal(eng.realRoot, null);
+});
+
+test('fork-real rescues from the real-output root match the cold compile bit for bit', opts, async () => {
+  const work = WORK + '-real-fork';
+  rmSync(work, { recursive: true, force: true });
+  process.env.TDOM_ISO_REAL_FORK = '1';
+  let e;
+  try {
+    e = new CheckpointEngine({ workDir: work });
+  } finally {
+    delete process.env.TDOM_ISO_REAL_FORK;
+  }
+  let realRootPid = 0;
+  try {
+    await e.open(SPLIT_DOC);
+    // the boot walk's async pump rescues these blocks into the same job
+    // directories the differential compiles use — let it drain first
+    const drained = Date.now() + 120_000;
+    while (Date.now() < drained && (e.rescueQueue.size || e.rescuePumping)) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(e.rescueQueue.size + (e.rescuePumping ? 1 : 0), 0, 'boot rescues drained');
+    assert.ok(e.realRoot?.pid > 0, 'the driver forked the real-output root before the dormant setup');
+    realRootPid = e.realRoot.pid;
+    assert.ok(alive(realRootPid));
+    const targets = e.blocks.map((b, i) => [b, i]).filter(([b]) => /\\begin\{(multicols\*?|longtable|mdframed|tcolorbox)/.test(b.text));
+    assert.equal(targets.length, 5, targets.map(([b]) => b.text.slice(0, 30)).join(' | '));
+    const textheight = e.geometry?.textheight ?? 550;
+    // page offsets: top of page, mid-page, near the bottom (forces a split)
+    const offsets = [0, Math.round(textheight * 0.55), Math.round(textheight * 0.95)];
+    let splitSeen = 0;
+    for (const [block, idx] of targets) {
+      for (const off of offsets) {
+        block.pageOffset = off;
+        const cold = await e.compileIsolatedBlock(idx, { forceCold: true });
+        const fork = await e.compileIsolatedBlock(idx, { forceCold: false });
+        const env = block.text.match(/\\begin\{([^}]*)\}/)[1];
+        assert.equal(cold.runner, 'cold', env);
+        assert.equal(fork.runner, 'fork-real', `${env}@${off}: ${JSON.stringify(e.diagnostics.slice(-3))}`);
+        assert.deepEqual(isoShape(fork.iso), isoShape(cold.iso), `${env}@${off}: state/items/chunks differ`);
+        if (cold.iso.chunks.length > 1) splitSeen++;
+        // pixels: the first chunk's PDF holds every shipped page of the run
+        const a = await rasterPages(cold.iso.chunks[0].editPdf, 'c');
+        const b = await rasterPages(fork.iso.chunks[0].editPdf, 'f');
+        assert.equal(b.length, a.length, `${env}@${off}: page count`);
+        a.forEach((png, k) => assert.ok(png.equals(b[k]), `${env}@${off}: page ${k + 1} pixels differ`));
+      }
+    }
+    assert.ok(splitSeen >= 1, 'at least one offset made an environment split across pages');
+    assert.ok(!e.isoForkBroken.size, [...e.isoForkBroken].join());
+  } finally {
+    if (e) await e.close();
+  }
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(!alive(realRootPid), 'close retires the real-output root with the rest of the tree');
 });

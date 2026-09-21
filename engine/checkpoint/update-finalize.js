@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { reconcile } from './pagebuilder.js';
 import { nextEditHold, editPageRenderIds } from './update-helpers.js';
 import { buildPagePatches } from './page-patches.js';
@@ -96,6 +97,7 @@ export function finalizeUpdate(engine, {
     checkpoints: engine.checkpoints,
     verdict,
     cold,
+    coldWalk: editLabel === 'cold-resume' ? coldWalkReport(engine) : null,
     pendingChain: engine.pendingChain,
     reused,
     rebuilt,
@@ -179,4 +181,22 @@ export function finalizeShippingExactUpdate(engine, {
     diagnostics,
     engineDiagnostics: engine.diagnostics,
   });
+}
+
+/** The cold replay's telemetry plus its timeline, in ms since the budgeted stop. */
+function coldWalkReport(engine) {
+  const walk = engine.coldWalk ?? null;
+  const t = engine.coldTrace;
+  if (!t?.stopAt) return walk;
+  const rel = (v) => (v == null ? null : Math.round(v - t.stopAt));
+  return {
+    ...(walk ?? {}),
+    timeline: {
+      gateMs: rel(t.gateAt),
+      passLockMs: rel(t.passLockAt),
+      walkDoneMs: rel(t.walkDoneAt),
+      resumeMs: rel(t.resumeAt),
+      publishMs: rel(performance.now()),
+    },
+  };
 }

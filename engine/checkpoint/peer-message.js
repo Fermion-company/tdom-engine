@@ -8,6 +8,10 @@ export function handlePeerMessage(engine, peer, msg) {
         engine.checkpoints.set(0, peer);
         engine.shipping?.trimCheckpoints?.();
         engine._fulfill('ckpt:0', peer);
+      } else if (msg.role === 'realroot') {
+        // the pre-dormant real-output rescue root (one per resident tree)
+        engine.realRoot = peer;
+        engine._fulfill('realroot', peer);
       }
       break;
     case 'GEO':

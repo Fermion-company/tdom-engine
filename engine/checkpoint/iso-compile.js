@@ -15,12 +15,13 @@ export async function isoCompile(
   const neg = engine.isoFailCache.get(negKey);
   if (neg) throw new Error(neg);
   const text = engine.store.get(engine.file);
-  const { ck0, labelSnap, jobdir, pdf, statePath, splitMode, strut, entryOff, isoTex } =
+  const { ck0, runner, labelSnap, jobdir, pdf, statePath, splitMode, strut, entryOff, isoTex } =
     prepareIsoCompileJob({
       block,
       idx,
       forceCold,
       checkpoints: engine.checkpoints,
+      realRoot: engine.realRoot,
       isoForkBroken: engine.isoForkBroken,
       blocks: engine.blocks,
       counters: engine.counters,
@@ -31,6 +32,7 @@ export async function isoCompile(
       needsRescue,
       breakableRe: () => engine._breakableRe,
     });
+  engine.isoModeOf?.set(block.id, runner);
   mkdirSync(jobdir, { recursive: true });
   rmSync(pdf, { force: true });
   rmSync(statePath, { force: true });
@@ -54,6 +56,7 @@ export async function isoCompile(
     // dormant state in ways a cold compile is not — remember that for
     // this block and retry cold, whose verdict is final.
     engine.isoForkBroken.add(block.id);
+    engine.diagnostics?.push(`${runner} rescue of ${block.id} left no artifacts — retrying cold`);
     return isoCompileCold();
   }
   if (!existsSync(pdf) || !existsSync(statePath)) {
@@ -84,6 +87,7 @@ export async function isoCompile(
     // no chunks have been adopted until readIsoCompileResult returns.
     if (!ck0 || err?.code !== 1 || !String(err?.cmd ?? '').startsWith('pdftocairo ')) throw err;
     engine.isoForkBroken.add(block.id);
+    engine.diagnostics?.push(`${runner} rescue of ${block.id} produced an unreadable PDF — retrying cold`);
     if (!process.env.TDOM_ISO_KEEP) rmSync(jobdir, { recursive: true, force: true });
     return isoCompileCold();
   });
