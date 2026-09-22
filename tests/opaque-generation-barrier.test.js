@@ -11,6 +11,11 @@ const INDEX = readFileSync(fileURLToPath(new URL('../web/index.html', import.met
 const SERVER = readFileSync(fileURLToPath(new URL('../server.js', import.meta.url)), 'utf8');
 const STYLE = readFileSync(fileURLToPath(new URL('../web/style.css', import.meta.url)), 'utf8');
 
+const PAGE_COUNT_GATES = Function(`${APP.slice(
+  APP.indexOf('function currentCanonicalPageCount'),
+  APP.indexOf('function srcOf')
+)}; return { currentCanonicalPageCount, residentPageTransactionValid };`)();
+
 test('the VisualCut raster verifier is loaded and served by the preview origin', () => {
   assert.match(INDEX, /<script src="\/canonical-anchor-raster\.js"><\/script>/);
   assert.match(SERVER, /url\.pathname === '\/canonical-anchor-raster\.js'/);
@@ -121,6 +126,29 @@ test('embedded Shipping pixels are read-only and rechecked after decode', () => 
   assert.match(APP, /if \(embeddedHost && shippingPresentationBlocked\(\)\)/);
   assert.match(APP, /function presentedShippingPageState\(page\)[\s\S]*?startsWith\('\/ship\/'\)/);
   assert.match(APP, /shipping\?\.rev === Number\(appliedSrcRev\)/);
+});
+
+test('provisional page-count transactions fail closed on holes and delayed tail pages', () => {
+  const valid = PAGE_COUNT_GATES.residentPageTransactionValid;
+  assert.equal(valid(2, [1, 2], [1, 2], [3]), true, 'a complete shrink commits its new paper atomically');
+  assert.equal(valid(2, [1, 2], [1, 2, 3], []), false, 'a delayed stage cannot resurrect the removed tail');
+  assert.equal(valid(2, [1, 2], [1], [2, 3]), false, 'a surviving resident page cannot also be removed');
+  assert.equal(valid(2, [0, 2], [2], []), false, 'page zero cannot disguise a missing first page');
+  assert.equal(valid(3, [1, 3], [1, 3], []), false, 'a sparse address space is never published');
+});
+
+test('resident page counts become authoritative only for the current source generation', () => {
+  const count = PAGE_COUNT_GATES.currentCanonicalPageCount;
+  assert.equal(count({ rev: 7, pageCount: 11 }, null, 3, 7), 11);
+  assert.equal(count({ rev: 6, pageCount: 11 }, null, 3, 7), null, 'a stale canonical is not authority');
+  assert.equal(count(null, { rev: 7, pageCount: 11, epoch: 3 }, 3, 7), 11);
+  assert.equal(count(null, { rev: 7, pageCount: 11, epoch: 2 }, 3, 7), null, 'another document epoch is rejected');
+  assert.equal(
+    count({ rev: 7, pageCount: 11 }, { rev: 7, pageCount: 12, epoch: 3 }, 3, 7),
+    null,
+    'conflicting exact generations fail closed'
+  );
+  assert.match(APP, /let residentPageCountAuthoritative = false;/);
 });
 
 test('two-dimensional duplicate math tokens map by canonical reading order', () => {
