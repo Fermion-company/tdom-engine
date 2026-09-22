@@ -58,7 +58,7 @@ host.stop();                                     // SIGTERM。常駐 TeX ツリ�
 
 `EngineHost` が spawn 時に固定する環境変数は、いずれも**ホストと同居するために必要**な値である。
 
-- `TDOM_MAX_CHECKPOINTS`（既定は搭載メモリで決める: 12 GB 未満 `8`、12 GB 以上 `12`、24 GB 以上 `24`、48 GB 以上 `48`）: 常駐 checkpoint 数の**上限**。実際の個数はエンジンが文書ごとに `min(上限, block 数 + 1)` で決める（`checkpointBudgetFor`）ので、短い文書は全境界を持ち、316 ページ（約 640 block）は上限になる。休眠 fork の実コストは「fork 以降に活動中の process が書き換えたページ」で、boot walk は fork 後にヒープのほぼ全体を書き換えるため 316 ページでは 1 個 100〜200 MB に育つ（macOS 実測: 上限 32 で常駐 32〜40 個・合計 7〜10 GB、16 GB 機が swap 7 GB）。以前の固定 8 は 316 ページで 80 block おきになり、カーソルを置いてから最初の打鍵が組版できるまで最大 30 s の warm を要した。それでも間に合わない打鍵は `TDOM_COLD_PREFIX_MS`（エンジン既定 1500）で hot path から切り離され、残りは chain pass が続けて `update` を後から broadcast する（docs/10 §10.4a）。
+- `TDOM_MAX_CHECKPOINTS`（既定は搭載メモリで決める: 12 GB 未満 `8`、12 GB 以上 `12`、24 GB 以上 `24`、48 GB 以上 `48`）: 常駐 checkpoint 数の**上限**。初回は `min(上限, block 数 + 1)`、canonical の実ページ数を得た後は `min(上限, block 数 + 1, page 数 + 1)` になる。小文書は root と1ページあたり最大1本、316ページ（約640 block）は上限まで持つ。休眠 fork の実コストは「fork以降に活動中の process が書き換えたページ」で、boot walk は fork 後にヒープのほぼ全体を書き換えるため316ページでは1個100〜200MBに育つ（macOS実測: 上限32で常駐32〜40個・合計7〜10GB、16GB機がswap 7GB）。以前の固定8は316ページで80 blockおきになり、カーソルを置いてから最初の打鍵が組版できるまで最大30sのwarmを要した。それでも間に合わない打鍵は `TDOM_COLD_PREFIX_MS`（エンジン既定1500）でhot pathから切り離され、残りはchain passが続けて`update`を後からbroadcastする（docs/10 §10.4a）。
 - `TDOM_SAMPLE`: boot 用に `samples/` に実在する小さいファイルを選ぶ（`pickBootSample()`）。既定の stress-test 文書は起動に数分かかる。実文書は起動直後の `POST /open` で入れ替わる。
 - `TDOM_WORKDIR`: 絶対パスの作業ディレクトリ。vendored な（書き込めない）checkout の中にスクラッチを作らせない。
 - `TDOM_SHIP` / `TDOM_SHIP_PRIVATE_PDF` / `TDOM_CANONICAL_ANCHOR`（既定すべて `1`）: いずれも打鍵経路の外で動き、対応できない preamble では通常の canonical コンパイルに fail close する。

@@ -18,19 +18,24 @@ function tailCheckpoint(blocks, limit) {
 }
 
 /**
- * Resident checkpoints scale with the document. A small document keeps
- * every block boundary (a keystroke anywhere is fork-once, typeset-once);
- * a long one keeps as many as the host's memory ceiling allows, spread by
+ * Resident checkpoints scale with the document. Before the first canonical
+ * compile, a small document keeps every block boundary. Once canonical has
+ * proved the physical page count, at most one coverage checkpoint per page
+ * plus the root is retained; keeping fifteen forks for a three-page note
+ * spends memory without buying sub-page replay coverage. A long document
+ * still keeps as many as the host's memory ceiling allows, spread by
  * measured cost (checkpointKeepSet). A fixed budget of 8 made a 316-page
  * book keep one boundary per ~80 blocks, so a caret placed far from the
  * skeleton replayed up to 80 blocks (tens of seconds) before its first
  * keystroke could be typeset. Each dormant fork costs only the pages the
  * active process has dirtied since, so the ceiling is the memory knob.
  */
-export function checkpointBudgetFor(blockCount, { ceiling = 64 } = {}) {
+export function checkpointBudgetFor(blockCount, { ceiling = 64, pageCount = null } = {}) {
   const count = Math.max(0, Math.floor(Number(blockCount) || 0));
   const top = Math.max(1, Math.floor(Number(ceiling) || 1));
-  return Math.max(1, Math.min(top, count + 1));
+  const pages = Math.floor(Number(pageCount));
+  const pageBudget = Number.isFinite(pages) && pages > 0 ? pages + 1 : Infinity;
+  return Math.max(1, Math.min(top, count + 1, pageBudget));
 }
 
 export function checkpointGrid(blockCount, maxCheckpoints) {

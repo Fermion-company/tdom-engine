@@ -26,6 +26,7 @@ export function resetOpenState(engine, text, file) {
   engine.file = file;
   engine.store.open(file, text);
   engine.blocks = [];
+  engine.canonicalPageCount = null;
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
   engine.labelTable = new Map();
