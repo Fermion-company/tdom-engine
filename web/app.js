@@ -58,6 +58,7 @@ const pageDivs = new Map();
 const provisionalStages = new Map(); // latest unpublished display list per page
 const provisionalRemovedPages = new Set();
 const provisionalDisplayLists = new Map(); // complete resident page layout, including unchanged pages
+let residentPageCountAuthoritative = true;
 let committedCanonicalGeneration = null;
 let lastEngineStatus = null;
 let viewportWarmTimer = null;
@@ -566,6 +567,7 @@ function beginClientDocumentReset(epoch) {
   provisionalStages.clear();
   provisionalRemovedPages.clear();
   provisionalDisplayLists.clear();
+  residentPageCountAuthoritative = true;
   bootComplete = false;
   directEditClickEpoch++;
   cancelDirectOpenings();
@@ -613,6 +615,7 @@ function adoptDoc(doc) {
   previewReasons = doc.previewReasons ?? [];
   document.body.classList.toggle('is-opaque-document', usesCanonicalSurface());
   canonical = doc.canonical ?? null;
+  residentPageCountAuthoritative = !canonical || Number(canonical.pageCount) === doc.pages.length;
   if (shipWaveBatch) cancelShipWaveBatch(shipWaveBatch);
   shipPages.clear();
   appliedRev = doc.report.rev;
@@ -737,23 +740,29 @@ function flushDirectPresentationUpdates() {
 
 function tryCommitProvisionalStages() {
   if (directPresentationBlocked()) return;
-  // A provisional shrink cannot decide which printed page disappears. Hold
-  // its replacements too, so moved ink does not appear on both old and new
-  // pages while the definitive PDF establishes the page count.
   if (usesCanonicalSurface() || documentReset.pending) return;
-  if (provisionalRemovedPages.size) {
+  if (!provisionalStages.size && !provisionalRemovedPages.size) return;
+  const residentPageCount = provisionalDisplayLists.size;
+  const lastResidentPage = Math.max(0, ...provisionalDisplayLists.keys());
+  // A report is the resident generation boundary. Refuse a malformed or
+  // incomplete page address space rather than publishing a partial paper.
+  if (lastResidentPage !== residentPageCount) {
     requestCanonicalDisplay({ residentImpossible: true });
     return;
   }
-  if (!provisionalStages.size) return;
-  // Canonical can create pages the resident layout never had (for example
-  // an unbreakable display after a large fixed gap). Its old extra page has
-  // no resident remove-pages event. Never mix those two page address spaces.
-  if (committedCanonicalGeneration?.epoch === documentReset.adoptedEpoch &&
-      committedCanonicalGeneration.pageCount !== provisionalDisplayLists.size) {
+  // Removing the page that owns a live editor would disconnect its native
+  // focus/selection (and possibly an IME composition). Keep the exact path
+  // for that uncommon case; ordinary pagination changes remain provisional.
+  if (directEditor && provisionalRemovedPages.has(Number(directEditor.pageNumber))) {
     requestCanonicalDisplay({ residentImpossible: true });
     return;
   }
+  const canonicalPageCount = committedCanonicalGeneration?.epoch === documentReset.adoptedEpoch
+    ? Number(committedCanonicalGeneration.pageCount)
+    : Number(canonical?.pageCount);
+  const pageCountMismatch = Number.isInteger(canonicalPageCount) && canonicalPageCount >= 0 &&
+    canonicalPageCount !== residentPageCount;
+  if (pageCountMismatch) requestCanonicalDisplay();
   const stages = [...provisionalStages.values()].sort((a, b) => a.dl.page - b.dl.page);
   if (stages.some(stage => !stage.ready || stage.sourceRev !== appliedSrcRev ||
       stage.documentEpoch !== documentReset.adoptedEpoch ||
@@ -783,8 +792,14 @@ function tryCommitProvisionalStages() {
     delete div.dataset.provPending;
     div.classList.remove('awaiting-canonical');
   }
+  // Tail removal belongs to the same renderer transaction as the replacement
+  // pages above. The browser cannot paint old tail pages beside the new
+  // resident generation, even when its page count is only provisional.
+  if (provisionalRemovedPages.size) reconcilePageCount(residentPageCount);
+  provisionalRemovedPages.clear();
+  residentPageCountAuthoritative = !pageCountMismatch;
   for (const stage of stages) updateCanonState(stage.dl.page);
-  if (stages.every(stage => {
+  if (residentPageCountAuthoritative && stages.every(stage => {
     const page = pageDivs.get(stage.dl.page);
     return !page.classList.contains('is-final') || Number(page.dataset.canonPresentedRev) >= stage.sourceRev;
   })) fulfillCanonicalDisplay();
@@ -1001,8 +1016,8 @@ function svgFor(dl, className = '') {
 }
 
 function removePagesFrom(from) {
-  // Resident pagination is provisional. A shrink must not erase the last
-  // printed page before the definitive PDF (including any moved ink) lands.
+  // Stage a resident shrink until every replacement page is ready, so the
+  // old tail and the new generation disappear in one browser transaction.
   lastRemoveRev = appliedSrcRev;
   for (const n of provisionalStages.keys()) if (n >= from) provisionalStages.delete(n);
   for (const [n, div] of pageDivs) if (n >= from) {
@@ -2015,7 +2030,7 @@ function dropOpaqueCanonicalBatchPage(registration) {
   tryCommitOpaqueCanonicalBatch(batch);
 }
 
-function reconcileOpaquePageCount(pageCount) {
+function reconcilePageCount(pageCount) {
   if (!Number.isInteger(pageCount) || pageCount < 0) return;
   for (const [pageNumber, page] of [...pageDivs]) {
     if (pageNumber <= pageCount) continue;
@@ -2230,6 +2245,7 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch, pageCount: batch.pageCount };
   provisionalStages.clear();
   provisionalRemovedPages.clear();
+  residentPageCountAuthoritative = true;
   for (const [n, rev] of pageDirtyRev) if (rev <= batch.rev) pageDirtyRev.delete(n);
   directEditClickEpoch++;
   opaqueBatchCommitDepth++;
@@ -2243,7 +2259,7 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   applyStagedDirectEditor(batch.editorStage, batch, editorScrollAnchor);
   // The editor can move from a removed tail page to a surviving page.
   // Transfer it while both ancestors are still connected.
-  reconcileOpaquePageCount(batch.pageCount);
+  reconcilePageCount(batch.pageCount);
   scheduleViewportWarm();
   updateBadge();
 }
@@ -6530,6 +6546,7 @@ pagesEl.addEventListener('scroll', () => {
             ready: previewReady(visible.required),
             presentationPending: pending,
             pageCount: visible.entries.length,
+            pageCountAuthoritative: residentPageCountAuthoritative,
             zoom,
             page: visible.topPage,
             srcRev: appliedSrcRev,
