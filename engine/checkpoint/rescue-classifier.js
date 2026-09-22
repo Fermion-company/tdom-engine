@@ -27,6 +27,25 @@ const OUTPUT_HIJACK_RE =
 // turn clearpage's empty output into another printed page. Title machinery
 // still uses the isolated path for class-specific output and page styles.
 const TITLE_RE = /\\maketitle\b/;
+const RESCUE_STRUCTURAL_SINKS = new Set([
+  'includepdf',
+  'maketitle',
+  'multicols',
+  'multicols*',
+  'paracol',
+  'longtable',
+  'landscape',
+  'mdframed',
+  'framed',
+  'shaded',
+  'wrapfigure',
+  'wraptable',
+  'sidewaysfigure',
+  'sidewaystable',
+  'algorithm',
+  'algorithm*',
+  'tcolorbox',
+]);
 
 function skipSpace(source, at) {
   while (at < source.length && /\s/.test(source[at])) at++;
@@ -89,7 +108,8 @@ export function collectBreakableTcolorboxNames(preamble) {
  */
 export function needsRescue(text, { preHash, breakableFor, breakableRe, source, structuralSinks = [] }) {
   const live = stripComments(text); // `% \begin{longtable}` must not cost a rescue
-  if (structuralSinks.length || OUTPUT_HIJACK_RE.test(live) || TITLE_RE.test(live)) {
+  const aliasNeedsRescue = structuralSinks.some((sink) => RESCUE_STRUCTURAL_SINKS.has(sink));
+  if (aliasNeedsRescue || OUTPUT_HIJACK_RE.test(live) || TITLE_RE.test(live)) {
     return { needs: true, breakableFor, breakableRe };
   }
   if (breakableFor !== preHash) {
