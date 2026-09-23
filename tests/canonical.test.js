@@ -775,10 +775,6 @@ test('unsafe preamble demotes to opaque and still renders via canonical', opts, 
       ].join('\n')
     );
     assert.equal(r.mode, 'opaque');
-    // the baseline open scheduled before its gate still starts at the
-    // display cadence once the document turned out to be opaque
-    assert.ok(eng.canonical.running || eng.canonical.timerDueAt - Date.now() <= eng.canonical.displayDebounceMs + 50,
-      'the opaque display compile is not held for the structured baseline debounce');
     assert.ok(r.modeReasons.some((x) => x.includes('eso-pic')), 'reason names the package');
     assert.equal(eng.getDisplayLists().length, 0, 'no provisional pages in opaque mode');
     assert.ok(
@@ -1336,76 +1332,6 @@ test('an \\include project keeps no aux seeds', opts, async () => {
       'child aux files are outside the pass loop\'s fixpoint check');
   } finally {
     c.dispose();
-  }
-});
-
-test('schedule() of the revision already compiling adds no second compile, except for a Build lease', opts, async () => {
-  const { docDir, overlayDir, canonDir } = identityFixture('-same-rev');
-  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0, idleMs: 0 });
-  const results = [];
-  c.onResult = (info) => results.push(info.rev);
-  try {
-    c.schedule(MULTI_PASS_ROOT, 1);
-    await untilRunning(c);
-    c.schedule(MULTI_PASS_ROOT, 1);
-    assert.equal(c.pendingJob, null, 'the running compile covers the same revision and bytes');
-    await c.settle();
-    assert.equal(c.info().rev, 1);
-    assert.equal(c.generations.size, 1);
-    // the open's own schedule() after the baseline landed only rebinds, and
-    // announces the generation again for the arrival hooks at this revision
-    const announced = results.length;
-    c.schedule(MULTI_PASS_ROOT, 1);
-    assert.equal(c.pendingJob, null);
-    assert.equal(c.running, null);
-    assert.deepEqual(results.slice(announced), [1]);
-    // a Build import owns the pending job it schedules, even for a compiling revision
-    const edited = MULTI_PASS_ROOT.replace('Body one.', 'Body one, leased.');
-    c.schedule(edited, 2);
-    await untilRunning(c);
-    const lease = c.acquireBuildLease('build:same-rev', 60_000);
-    assert.ok(lease.acquired);
-    c.schedule(edited, 2);
-    assert.equal(c.pendingJob?.rev, 2, 'the Build import finds its pending job');
-    c.releaseBuildLease('build:same-rev', lease.token);
-    await c.settle();
-    assert.equal(c.info().rev, 2);
-    assert.equal(c.info().error, null);
-  } finally {
-    c.dispose();
-  }
-});
-
-test('open starts the canonical baseline beside the resident boot and compiles it once', opts, async () => {
-  const work = WORK + '-open-baseline';
-  rmSync(work, { recursive: true, force: true });
-  const eng = new CheckpointEngine({ workDir: work });
-  const arrivals = [];
-  eng.onCanonical = (info) => arrivals.push({ id: info.id, rev: info.rev });
-  try {
-    const source = [
-      '\\documentclass{article}',
-      '\\begin{document}',
-      'First paragraph of the opened document.',
-      '',
-      'Second paragraph.',
-      '\\end{document}',
-      '',
-    ].join('\n');
-    const opening = eng.open(source);
-    // scheduled before the boot walk runs, for the revision open publishes
-    assert.equal(eng.canonical.pendingJob?.rev, eng.srcRev + 1);
-    const report = await opening;
-    assert.equal(report.mode, 'structured');
-    await eng.canonical.settle();
-    const info = eng.canonical.info();
-    assert.equal(info.error, null);
-    assert.equal(info.rev, eng.srcRev);
-    assert.equal(eng.canonical.generations.size, 1, 'the walk\'s own schedule() added no second compile');
-    assert.ok(arrivals.some((arrival) => arrival.rev === eng.srcRev),
-      'the arrival hooks (verification, crop, checkpoint budget) saw the current revision');
-  } finally {
-    await eng.close();
   }
 });
 

@@ -26,8 +26,6 @@ canonical scheduling は latest-wins である。compile 中に新しい source 
 
 structured mode では `pressure = 'authority'` で、基本 debounce に加えて前回 compile time に比例した cooldown を持つ。opaque mode では `pressure = 'display'` になり、canonical compile 自体が表示更新なので debounce 中心で動く。
 
-最初の baseline は resident の boot walk を待たない。`engine.open()` は walk の前に、open が公開する revision（`srcRev + 1`）でその source を予約する。canonical は resident tree を使わないので、walk と並んで走る（316 ページの実文書では walk 76 s と 3 pass の baseline 125 s が直列で、どちらも終わるまで打鍵を anchor できなかった）。walk の最後の `schedule()` は同じ revision・同じ bytes なので、走行中ならそのまま、着地済みなら `#reconcile` で終わり、2 本目の compile も待機中の debounce のやり直しも作らない（同じ bytes で失敗済みの revision も組み直さない）。walk より先に着地した世代は、その `#reconcile` が arrival hook（検証・crop・checkpoint 予算）を現行 revision で呼び直す。Build lease 中の `schedule()` はこの省略をせず、Build 取り込みが所有する pending job を必ず作る。Build を取り込む open では先行させない。open が例外で終わった場合は予約した revision を消費済みにし、後の編集が同じ revision 番号で別の source を公開しないようにする。
-
 `GET /pdf` は `engine.exportPDF()` 経由で `canonical.ensure()` を呼ぶ。表示用 checkpoint state から PDF を作る経路はない。
 
 ### 8.2a content identity（世代の再束縛）
