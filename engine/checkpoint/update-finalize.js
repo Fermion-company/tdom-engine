@@ -1,6 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import { reconcile } from './pagebuilder.js';
-import { nextEditHold, editPageRenderIds } from './update-helpers.js';
+import { nextEditHold, editPageRenderIds, focusRescueIds } from './update-helpers.js';
 import { buildPagePatches } from './page-patches.js';
 import { buildUpdateResponse } from './update-response.js';
 import { residentPaintable } from './ship-pacing.js';
@@ -45,6 +45,8 @@ export function finalizeUpdate(engine, {
     }
   }
   engine.pages = pages;
+  // the edited pages' own rescues go first (engine #pumpRescues)
+  if (!rebooted && dirtySource.size) engine.rescueFocus = focusRescueIds(pages, dirtySource, engine.rescueQueue);
   // header/footer respecification walks every page and hashes the result —
   // only worth it when the page composition actually moved (folio values,
   // marks and styles all ride on galley changes, which show up as rebuilt

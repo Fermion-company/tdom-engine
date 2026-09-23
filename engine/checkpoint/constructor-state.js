@@ -179,6 +179,11 @@ export function initializeEngineState(
   // rebuild, async rescue adoption)
   engine.chainLock = Promise.resolve();
   engine.rescueQueue = new Map(); // block.id -> cacheKey at queue time
+  engine.rescueFocus = new Set(); // queued rescues on the edited / caret page, served first
+  // compile time a boot walk may spend on first-ever rescues inline (#bootIsoCompile), and what is left of it
+  engine.bootRescueMs = Math.max(0, Number(process.env.TDOM_BOOT_RESCUE_MS ?? 45_000) || 0);
+  engine.bootRescueBudgetMs = 0;
+  engine.rescueAdoptWaiting = 0; // rescue adoptions queued on the chain lock (a grid pass yields to them)
   engine.rescuePumping = false;
   engine.isoChildren = new Set(); // in-flight isolated lualatex processes
 

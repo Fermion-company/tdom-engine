@@ -67,6 +67,7 @@ export function resetOpenState(engine, text, file) {
   engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };
   engine.renderHold = new Map();
   engine.rescueQueue = new Map();
+  engine.rescueFocus = new Set();
   engine.tocHash = null;
   engine.hf = new Map();
   engine.hfSig = null;

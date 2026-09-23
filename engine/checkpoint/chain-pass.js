@@ -42,9 +42,13 @@ export async function runChainPass(engine, callbacks) {
       // stops it at the next block boundary, and it resumes on the next
       // idle gate. Bounded per pass so a keep set that keeps moving with
       // fresh cost samples cannot spin.
+      // A queued rescue waiting to adopt (engine #asyncRescueOne) fixes a
+      // page on screen now; a grid boundary only speeds up a later cold
+      // edit. Yield to it at the next block boundary as to an edit.
+      const yieldGrid = () => engine.bgAbort || engine.editPending > 0 || engine.rescueAdoptWaiting > 0;
       let budget = work.budget ?? Infinity;
       while (budget-- > 0) {
-        if (engine.bgAbort || engine.editPending > 0) return;
+        if (yieldGrid()) return;
         const missing = gridMissing();
         if (!missing.length) break;
         // A boundary this plan already materialized is missing again: the
@@ -67,7 +71,7 @@ export async function runChainPass(engine, callbacks) {
             from,
             target - 1,
             (j) => { engine.progress = { phase: 'grid', at: j + 2, total: target }; },
-            () => engine.bgAbort || engine.editPending > 0
+            yieldGrid
           );
         } finally {
           engine.coldWalking = false;
@@ -77,7 +81,7 @@ export async function runChainPass(engine, callbacks) {
         engine.gridFill.passes++;
         engine.gridFill.ms += Math.round(performance.now() - startedAt);
         engine.gridFill.last = { from, target, reached, at: Date.now() };
-        if (n < 0 || engine.bgAbort) {
+        if (n < 0 || yieldGrid()) {
           pinBoundary(reached);
           return; // resumes from the pinned boundary on the next idle gate
         }

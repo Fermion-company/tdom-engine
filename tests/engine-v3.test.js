@@ -551,6 +551,57 @@ test('a reopened document adopts its cached isolated rescues during the boot wal
   }
 });
 
+test('a boot walk with the fork runners up measures first-ever rescues before /open returns', opts, async () => {
+  const doc = [
+    '\\documentclass{article}', '\\usepackage{multicol}', '\\begin{document}',
+    'Plain paragraph before the columns with ordinary prose on the page.', '',
+    '\\begin{multicols}{2}',
+    'Left column text explains the idea in the first column with several plain sentences.',
+    'It continues with another sentence so the column has a few lines of text.', '',
+    '\\columnbreak',
+    'Right column text compares the idea with another one in the second column.',
+    '\\end{multicols}', '',
+    'Plain paragraph after the columns. Closing prose for the page.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  // a placeholder (no measured box) holds every assembled page: count the
+  // page-wide pending markers in the report /open publishes
+  const pagesHeld = (report) => report.patches
+    .filter((patch) => patch.type === 'replace-page')
+    .filter((patch) => patch.displayList.commands.some((cmd) => cmd.op === 'pending-exact' && cmd.wholePage)).length;
+  const boot = async (name, budgetMs) => {
+    const work = WORK + name;
+    rmSync(work, { recursive: true, force: true });
+    process.env.TDOM_ISO_REAL_FORK = '1';
+    if (budgetMs != null) process.env.TDOM_BOOT_RESCUE_MS = String(budgetMs);
+    try {
+      return new CheckpointEngine({ workDir: work });
+    } finally {
+      delete process.env.TDOM_ISO_REAL_FORK;
+      delete process.env.TDOM_BOOT_RESCUE_MS;
+    }
+  };
+  const inline = await boot('-boot-rescue', null);
+  try {
+    const report = await inline.open(doc);
+    const block = inline.blocks.find((b) => /begin\{multicols\}/.test(b.text));
+    assert.ok(inline.realRoot?.pid > 0);
+    assert.equal(pagesHeld(report), 0, 'no placeholder holds the opened pages');
+    assert.ok(block?.galley && !block.galley.tdomPendingPaint, 'the boot walk adopted a measured galley');
+    assert.equal(inline.isoModeOf.get(block.id), 'fork-real');
+    assert.equal(inline.bootRescueBudgetMs, 0, 'the budget ends with the boot walk');
+  } finally {
+    await inline.close();
+  }
+  const deferred = await boot('-boot-rescue-off', 0);
+  try {
+    const report = await deferred.open(doc);
+    assert.ok(pagesHeld(report) > 0, 'without a budget the first rescue is a placeholder for the async pump');
+  } finally {
+    await deferred.close();
+  }
+});
+
 // --- real-output rescue root (TDOM_ISO_REAL_FORK) -------------------------
 //
 // Splitting environments used to be rescued COLD (a standalone lualatex,

@@ -61,6 +61,7 @@ import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
 import { computeToc, pageSpecs, hfJobBody } from './page-metadata.js';
 import { chunkTargets } from './chunk-targets.js';
+import { focusRescueIds } from './update-helpers.js';
 import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, includeOnlyFromSource, watchInclude } from './include-expander.js';
 import { needsRescue } from './rescue-classifier.js';
@@ -322,6 +323,9 @@ export class CheckpointEngine {
     // A page is published atomically. Warm its missing exact neighbors too;
     // a fast edited chunk alone cannot replace an otherwise unpaintable page.
     const targetId = this.blocks[target].id;
+    // and bring the caret page's queued rescues to the front of the pump
+    const focus = focusRescueIds(this.pages, new Set([targetId]), this.rescueQueue);
+    if (focus.size) this.rescueFocus = focus;
     const pageIds = new Set(this.pages.filter(page => page.draw?.some(draw => draw.u?.blockId === targetId))
       .flatMap(page => page.draw.map(draw => draw.u?.blockId)));
     const missing = this.blocks.map((block, index) => ({ block, index })).filter(({ block }) =>
@@ -907,6 +911,29 @@ export class CheckpointEngine {
   }
 
   /**
+   * First-ever rescue during a boot walk: compile it on the walk while the
+   * walk's rescue budget (TDOM_BOOT_RESCUE_MS of compile time, default 45 s)
+   * lasts and both fork peers are up, so /open publishes measured pages
+   * instead of placeholders, any one of which holds every page (pagebuilder
+   * buildPages). A cold compile (5+ s per block) is never paid here. The
+   * result is cached like an async rescue's; the boot walk runs before
+   * pagination (page offset 0), and the moved-offset pass re-rescues the
+   * block at its real offset, exactly as for a result adopted from disk.
+   */
+  async #bootIsoCompile(idx, cacheKey) {
+    if (!(this.bootRescueBudgetMs > 0) || !this.realRoot?.pid || !this.checkpoints.get(0)) return null;
+    const block = this.blocks[idx];
+    const started = performance.now();
+    try {
+      const iso = await this.#isoCompile(block, idx, 'boot rescue');
+      this.#isoCacheSet(cacheKey, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash }));
+      return iso;
+    } finally {
+      this.bootRescueBudgetMs -= performance.now() - started;
+    }
+  }
+
+  /**
    * First-ever rescue of a block with no galley (a boot walk): a stored
    * result for the same text, entry state and preamble, compiled at some
    * page offset, is adopted inline as if it were this walk's own compile.
@@ -936,6 +963,7 @@ export class CheckpointEngine {
       rescueCacheKey: (block, blockIdx) => this.#rescueCacheKey(block, blockIdx),
       isoCacheGet: (cacheKey) => this.#isoCacheGet(cacheKey),
       isoBaseGet: (targetBlock, blockIdx) => this.#isoBaseGet(targetBlock, blockIdx),
+      bootIsoCompile: (blockIdx, cacheKey) => this.#bootIsoCompile(blockIdx, cacheKey),
       jobBlock: (blockIdx, override) => this.#jobBlock(blockIdx, override),
       stateJobBody: (iso) => this.#stateJobBody(iso),
       pumpRescues: () => this.#pumpRescues(),
@@ -1476,6 +1504,9 @@ export class CheckpointEngine {
     // stop, protocol timeout) triggers ONE full rebuild retry; if that
     // also fails the error surfaces to the client while the last good
     // pages keep being served.
+    // A boot (or reboot) walk may compile first-ever rescues inline
+    // (#bootIsoCompile) for this much compile time in total.
+    this.bootRescueBudgetMs = rebooted || editLabel === 'open' ? this.bootRescueMs : 0;
     try {
       await runUpdateTypesetPhase(this, {
         oldBlocks,
@@ -1501,6 +1532,7 @@ export class CheckpointEngine {
         },
       });
     } catch (err) {
+      this.bootRescueBudgetMs = 0;
       if (this.closed) throw err; // shutting down — no rebuild, no opaque demotion
       if (!retry) {
         this.diagnostics.push('typeset phase failed (' + err.message + ') — full rebuild');
@@ -1532,6 +1564,7 @@ export class CheckpointEngine {
         projectInputChanges
       );
     }
+    this.bootRescueBudgetMs = 0;
     // The settle/rebuild a cold walk carried through its resume is queued
     // again behind this update's own verdict (docs/10 §10.6 merging).
     if (chainCarry?.kind) this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels);
@@ -1765,18 +1798,26 @@ export class CheckpointEngine {
     (async () => {
       try {
         while (!this.closed && this.rescueQueue.size) {
-          const [bid] = this.rescueQueue.entries().next().value;
-          // A cold keystroke's resume (docs/10 §10.4a) outranks isolated
-          // rescue adoption: the adopt walk holds the chain lock for seconds
-          // and the keystroke's page is not on screen until the resume runs.
-          while (
-            !this.closed &&
-            (this.editPending > 0 || this.coldDirty.size > 0 || this.pendingChain?.kind === 'cold' ||
-              Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800))
-          ) {
+          // The edited / caret page's own rescues first (rescueFocus): until
+          // they land, that page carries a page-wide pending-exact marker and
+          // nothing the user types there can be painted, while the backlog
+          // behind them only fixes pages nobody is looking at. They skip the
+          // typing quiet window too: the isolated compile runs off the lock,
+          // and the adopt walk still yields to every keystroke at a block
+          // boundary (an aborted focus rescue is picked again at once).
+          let bid;
+          for (;;) {
+            if (this.closed || !this.rescueQueue.size) return;
+            bid = [...this.rescueFocus].find((id) => this.rescueQueue.has(id)) ??
+              this.rescueQueue.keys().next().value;
+            // A cold keystroke's resume (docs/10 §10.4a) outranks isolated
+            // rescue adoption: the adopt walk holds the chain lock for seconds
+            // and the keystroke's page is not on screen until the resume runs.
+            const waiting = this.editPending > 0 || this.coldDirty.size > 0 || this.pendingChain?.kind === 'cold' ||
+              !this.rescueFocus.has(bid) && Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800);
+            if (!waiting) break;
             await new Promise((r) => setTimeout(r, 200));
           }
-          if (this.closed) return;
           await withReplaceablePreviewJob(this, 'async-rescue', async () => {
             // Keep the latest-wins entry while the Build gate is closed. A
             // newer edit may replace its cache key before this job starts.
@@ -1832,7 +1873,15 @@ export class CheckpointEngine {
       }
       this.#isoCacheSet(key, iso, baseKey);
     }
+    // a grid pass holding the lock yields at its next block boundary
+    this.rescueAdoptWaiting++;
+    let waiting = true;
+    const stopWaiting = () => {
+      if (waiting) this.rescueAdoptWaiting--;
+      waiting = false;
+    };
     const outcome = await this.#locked(async () => {
+      stopWaiting();
       if (this.mode !== 'structured') return 'done';
       idx = this.blocks.findIndex((b) => b.id === bid);
       if (idx < 0) return 'done';
@@ -1891,7 +1940,7 @@ export class CheckpointEngine {
       // back to the grid so the boot rescue storm can't creep the live set
       this.#enforceCheckpointCap();
       return 'done';
-    });
+    }).finally(stopWaiting);
     this.rescueLog.push({
       id: bid,
       cached: rescueCached,
