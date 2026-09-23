@@ -16,7 +16,7 @@
 
 import http from 'node:http';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -570,6 +570,22 @@ function buildLeaseBinding(projectRoot, mainFile) {
   return { root, file, bound };
 }
 
+// An overlay is rewritten on every keystroke while a canonical compile, the
+// ShippingChain or an isolated rescue may be reading it. An in-place write
+// lets such a reader splice the old head onto the new tail ("String contains
+// an invalid utf-8 sequence" in the middle of an unedited line). A rename
+// swaps the whole file: an open reader keeps the bytes it started with.
+function writeOverlayFile(target, text) {
+  const tmp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.tmp`);
+  try {
+    writeFileSync(tmp, text, 'utf8');
+    renameSync(tmp, target);
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
+}
+
 function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = {}, replace = false) {
   if (!context.overlayDir) return { changed: [], removed: [], saved: [] };
   context.savedOverlays ??= new Map();
@@ -604,7 +620,7 @@ function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = 
     const rel = path.relative(context.docDir, filePath);
     const target = path.join(context.overlayDir, rel);
     mkdirSync(path.dirname(target), { recursive: true });
-    writeFileSync(target, text, 'utf8');
+    writeOverlayFile(target, text);
     context.overlays.set(filePath, text);
     changed.push(filePath);
   }
