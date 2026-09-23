@@ -534,6 +534,26 @@ export function changedGalleyLines(baseLines, currentLines) {
  * glyph identity, fill color and safety; TextContent owns the final
  * page-space geometry.
  * They must agree glyph-for-glyph after excluding non-painted TeX glue. */
+const REALIGN_WINDOW = 8;
+const REALIGN_RUN = 4;
+
+/** Smallest skip on either side after which REALIGN_RUN glyphs agree
+ * again (or both sequences end together), or null. */
+function realignGlyphs(painted, extracted, p, e) {
+  let best = null;
+  for (let dp = 0; dp <= REALIGN_WINDOW; dp++) {
+    for (let de = 0; de <= REALIGN_WINDOW; de++) {
+      if (dp + de === 0 || (best && dp + de >= best.painted + best.extracted)) continue;
+      let run = 0;
+      while (run < REALIGN_RUN && p + dp + run < painted.length && e + de + run < extracted.length &&
+             painted[p + dp + run].char === extracted[e + de + run].char) run++;
+      const bothEnd = p + dp + run === painted.length && e + de + run === extracted.length;
+      if (run === REALIGN_RUN || bothEnd) best = { painted: dp, extracted: de };
+    }
+  }
+  return best;
+}
+
 export function buildPdfPaintPage({ pageNumber, textContent, operatorList, viewport, OPS, Util }) {
   if (!Number.isInteger(pageNumber) || pageNumber < 1 || !OPS || !Util ||
       !Array.isArray(operatorList?.fnArray) || !Array.isArray(operatorList?.argsArray) ||
@@ -567,15 +587,41 @@ export function buildPdfPaintPage({ pageNumber, textContent, operatorList, viewp
     items.push(record);
     for (const char of chars) extractedGlyphs.push({ char, item: record });
   }
-  if (painted.length !== extractedGlyphs.length) return null;
-  for (let index = 0; index < painted.length; index++) {
-    const paint = painted[index];
-    const extracted = extractedGlyphs[index];
-    if (paint.char !== extracted.char) return null;
-    extracted.item.glyphSizes.push(paint.size);
-    extracted.item.glyphColors.push(paint.color);
-    extracted.item.safe &&= paint.safe;
+  // Pair painted glyphs with extracted text. A glyph that only one side
+  // reports (a math font's extensible delimiter: extracted as `(`, painted
+  // without a Unicode mapping) used to discard the whole page, so no line on
+  // it could ever anchor (tex64-internal #66). Realign within a short window
+  // instead; every item the disagreement touches is unsafe and carries no
+  // size, so it can never certify.
+  const unpaired = (extracted) => {
+    extracted.item.glyphSizes.push(NaN);
+    extracted.item.glyphColors.push(null);
+    extracted.item.safe = false;
+  };
+  let p = 0;
+  let e = 0;
+  while (p < painted.length && e < extractedGlyphs.length) {
+    const paint = painted[p];
+    const extracted = extractedGlyphs[e];
+    if (paint.char === extracted.char) {
+      extracted.item.glyphSizes.push(paint.size);
+      extracted.item.glyphColors.push(paint.color);
+      extracted.item.safe &&= paint.safe;
+      p++;
+      e++;
+      continue;
+    }
+    const skip = realignGlyphs(painted, extractedGlyphs, p, e);
+    if (!skip) return null;
+    if (e > 0) extractedGlyphs[e - 1].item.safe = false;
+    extracted.item.safe = false;
+    for (let k = 0; k < skip.extracted; k++) unpaired(extractedGlyphs[e + k]);
+    if (e + skip.extracted < extractedGlyphs.length) extractedGlyphs[e + skip.extracted].item.safe = false;
+    p += skip.painted;
+    e += skip.extracted;
   }
+  if (p < painted.length && extractedGlyphs.length) extractedGlyphs.at(-1).item.safe = false;
+  while (e < extractedGlyphs.length) unpaired(extractedGlyphs[e++]);
   if (items.some((item) => item.glyphSizes.length !== Array.from(item.paintText).length)) return null;
   return {
     page: pageNumber,

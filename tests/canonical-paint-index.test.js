@@ -278,10 +278,32 @@ test('operator-list glyph identity and TextContent geometry must agree exactly',
   assert.equal(page?.items[0].baseline, 77);
   assert.equal(page?.items[0].paintText, 'AB');
   assert.deepEqual(page?.items[0].glyphSizes, [9.2, 9.2]);
-  assert.equal(buildPdfPaintPage({
+  // tex64-internal #66: a disagreement costs the items it touches, not the
+  // whole page. They carry no size and are never certified.
+  const disagreed = buildPdfPaintPage({
     ...base,
     operatorList: { ...base.operatorList, argsArray: [['body', 9.2], [[glyph('A'), glyph('C')]]] },
-  }), null, 'text extraction disagreement rejects the entire page index');
+  });
+  assert.equal(disagreed.items[0].safe, false, 'a glyph text extraction disagrees with is never certified');
+  assert.ok(disagreed.items[0].glyphSizes.some(Number.isNaN));
+  const line = (str, y) => ({ str, dir: 'ltr', width: 9.2 * str.length, height: 9.2, transform: [9.2, 0, 0, 9.2, 48, y] });
+  const delimiter = buildPdfPaintPage({
+    ...base,
+    textContent: { items: [line('max(0,R', 765), line('next line', 750)] },
+    operatorList: {
+      fnArray: [OPS.setFont, OPS.showText],
+      // an extensible delimiter painted without a Unicode mapping
+      argsArray: [['body', 9.2], [[...'max0,Rnextline'].map(glyph)]],
+    },
+  });
+  assert.ok(delimiter, 'one unmapped delimiter keeps the page index');
+  assert.equal(delimiter.items[0].safe, false);
+  assert.equal(delimiter.items[1].safe, true, 'the next line still certifies');
+  assert.deepEqual(delimiter.items[1].glyphSizes, Array(8).fill(9.2));
+  assert.equal(buildPdfPaintPage({
+    ...base,
+    operatorList: { ...base.operatorList, argsArray: [['body', 9.2], [[...'QRSTUVWXYZQRSTUVWXYZ'].map(glyph)]] },
+  }), null, 'text that never realigns still rejects the entire page index');
   const marked = buildPdfPaintPage({
     ...base,
     operatorList: {
