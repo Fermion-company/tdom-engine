@@ -196,6 +196,10 @@ export class ShippingChain {
     // it into the resident viewport (tex64-internal #64).
     this.pageGeometry = pageGeometry;
     this.wavePapers = null;
+    // TikZ positions this lineage read back (\pgfsys@getposition) and the
+    // baseline aux they are compared against (tex64-internal #64).
+    this.positionReads = new Set();
+    this.baselineAux = null;
     this.labels = new Map(); // key -> {val, page} captured this lineage
     this.pagePdf = new Map(); // page -> pdf path (current generation wins)
     this.pageGen = new Map(); // page -> generation owning pagePdf
@@ -456,6 +460,10 @@ export class ShippingChain {
       this.onShip?.({ page, nline, gen });
       return;
     }
+    if (kind === 'SPOS') {
+      if (parts[1]) this.positionReads.add(parts[1]);
+      return;
+    }
     if (kind === 'SPDFROOT') {
       this.err = new Error('pdf-opened-at-root (hyperref-class document)');
       this.done = true;
@@ -533,6 +541,39 @@ export class ShippingChain {
     return out;
   }
 
+  /**
+   * The replay's outputs differ from the baseline only in TikZ position
+   * marks nobody in this lineage read back. mdframed's tikz frames and
+   * other `remember picture` drawings record every picture's position, so
+   * any edit above them moves these marks; the pages depend on a mark only
+   * when a cross-picture reference (or current page) reads it, and each
+   * such read is reported (SPOS). Any other byte still rejects the wave.
+   */
+  #onlyUnreadPositionDrift(manifest) {
+    const base = this.baselineManifest ?? {};
+    const names = new Set([...Object.keys(base), ...Object.keys(manifest)]);
+    const differing = [...names].filter((name) => base[name] !== manifest[name]);
+    if (differing.length !== 1 || differing[0] !== 'driver-ship.aux' ||
+        !base['driver-ship.aux'] || !manifest['driver-ship.aux'] || typeof this.baselineAux !== 'string') return false;
+    let current;
+    try {
+      current = readFileSync(path.join(this.rootOutputDir, 'driver-ship.aux'), 'utf8');
+    } catch {
+      return false;
+    }
+    const before = this.baselineAux.split('\n');
+    const after = current.split('\n');
+    if (before.length !== after.length) return false;
+    const MARK = /^\\pgfsyspdfmark \{([^{}\s]+)\}\{-?\d+\}\{-?\d+\}$/;
+    for (let index = 0; index < before.length; index++) {
+      if (before[index] === after[index]) continue;
+      const was = MARK.exec(before[index]);
+      const now = MARK.exec(after[index]);
+      if (!was || !now || was[1] !== now[1] || this.positionReads.has(was[1])) return false;
+    }
+    return true;
+  }
+
   #maybeWaveReady() {
     if (!this.done || this.wavePublishedGen === this.gen) return;
     const waveShips = this.ships.filter((ship) => ship.gen === this.gen);
@@ -552,7 +593,8 @@ export class ShippingChain {
       return;
     }
     if (this.gen !== 0 &&
-        JSON.stringify(manifest) !== JSON.stringify(this.baselineManifest)) {
+        JSON.stringify(manifest) !== JSON.stringify(this.baselineManifest) &&
+        !this.#onlyUnreadPositionDrift(manifest)) {
       clearTimeout(this.waveDeadlineTimer);
       this.waveDeadlineTimer = null;
       this.lastRejectReason = 'output-manifest-changed';
@@ -588,6 +630,11 @@ export class ShippingChain {
       if (validatingGen === 0) {
         this.baselinePages = pageCount;
         this.baselineManifest = manifest;
+        try {
+          this.baselineAux = readFileSync(path.join(this.rootOutputDir, 'driver-ship.aux'), 'utf8');
+        } catch {
+          this.baselineAux = null;
+        }
         this.publishedPdf = completePdf;
         const pdfHash = createHash('sha256').update(readFileSync(completePdf)).digest('hex');
         const manifestHash = createHash('sha256')
@@ -791,6 +838,11 @@ export class ShippingChain {
       L.push(`\\directlua{tdom_ship_boot(${this.port}, '${luaStr(this.workDir)}', 0)}`);
     }
     L.push('\\makeatletter');
+    // report every saved TikZ position the document reads back
+    L.push(
+      "\\ifdefined\\pgfsys@getposition\\let\\TDOMshipgetpos\\pgfsys@getposition" +
+        "\\def\\pgfsys@getposition#1{\\directlua{tdom_ship_posread('\\luaescapestring{#1}')}\\TDOMshipgetpos{#1}}\\fi"
+    );
     if (!hasCanonicalAux) {
       for (const [key, val] of labelSeed ?? []) {
         if (key.startsWith('cite:')) {

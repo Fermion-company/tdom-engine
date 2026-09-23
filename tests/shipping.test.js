@@ -604,6 +604,68 @@ test('pdflscape pages stay structured and ship in their own geometry (tex64-inte
   }
 });
 
+async function shipEditOutcome(work, doc, marker) {
+  rmSync(work, { recursive: true, force: true });
+  const chain = new ShippingChain({ workDir: work, docDir: path.dirname(DOC) });
+  const waves = [];
+  chain.onWave = (wave) => waves.push(wave);
+  try {
+    await chain.open(doc);
+    const t0 = Date.now();
+    while ((!chain.info().baselineReady || !chain.info().done) && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(chain.info().baselineReady, true);
+    const next = doc.replace(marker, `${marker} with a longer sentence that wraps onto one more line of the text block`);
+    assert.equal(chain.resume(next).mode, 'resumed');
+    const generation = chain.info().gen;
+    const t1 = Date.now();
+    while (!waves.some((wave) => wave.gen === generation) && !chain.info().rejectReason && Date.now() - t1 < 10_000) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return { wave: waves.find((wave) => wave.gen === generation), reject: chain.info().rejectReason };
+  } finally {
+    await chain.close();
+  }
+}
+
+test('unread TikZ position marks may drift under a replay (tex64-internal #64)', opts, async () => {
+  // mdframed's tikz frames are `remember picture`: every edit above them
+  // moves their \pgfsyspdfmark lines, but the frames never read them back.
+  const doc = [
+    '\\documentclass{article}',
+    '\\usepackage[framemethod=tikz]{mdframed}',
+    '\\begin{document}',
+    'Opening paragraph MOVEMARK before the framed material.',
+    '',
+    '\\begin{mdframed}Framed text inside a tikz frame.\\end{mdframed}',
+    '',
+    'Closing paragraph.',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const { wave, reject } = await shipEditOutcome(path.join(WORK, 'tikz-marks'), doc, 'MOVEMARK');
+  assert.ok(wave, `an unread mark does not reject the wave (${reject})`);
+});
+
+test('a TikZ position the document reads back still rejects a drifted replay', opts, async () => {
+  const doc = [
+    '\\documentclass{article}',
+    '\\usepackage{tikz}',
+    '\\begin{document}',
+    'Opening paragraph MOVEMARK before the overlay.',
+    '',
+    'Anchor text \\tikz[remember picture,overlay]\\node at (current page.north) {X};',
+    '',
+    'Closing paragraph.',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const { wave, reject } = await shipEditOutcome(path.join(WORK, 'tikz-read'), doc, 'MOVEMARK');
+  assert.equal(wave, undefined, 'a moved mark the page read keeps the wave out');
+  assert.equal(reject, 'output-manifest-changed');
+});
+
 test('four healthy structural rebaselines do not exhaust shipping recovery', opts, async () => {
   process.env.TDOM_SHIP = '1';
   const previousCanonicalIdle = process.env.TDOM_CANON_IDLE;

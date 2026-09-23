@@ -223,6 +223,14 @@ function tdom_ship_label(key, val)
   send(val)
 end
 
+-- A saved TikZ position (\pgfsyspdfmark) was read back: this lineage's pages
+-- depend on it (pgf reads positions only for cross-picture references,
+-- including current page). The orchestrator lets an unread mark drift.
+function tdom_ship_posread(id)
+  if ROLE == 'pager' or not id or id == '' or id:find('%s') then return end
+  send('SPOS ' .. id .. '\n')
+end
+
 -- ---------------------------------------------------------------- shipout
 
 -- Inside shipout/before. ALL bookkeeping lives here: \DiscardShipoutBox
