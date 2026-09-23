@@ -407,6 +407,57 @@ test('beamer overlay labels and \\againframe certify the ship baseline (tex64-in
   }
 });
 
+test('a replay keeps canonical\'s index: first-page edits do not lose \\printindex (tex64-internal #77)', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  const work = path.join(WORK, 'index');
+  rmSync(work, { recursive: true, force: true });
+  const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
+  const doc = [
+    '\\documentclass{article}',
+    '\\usepackage{makeidx}',
+    '\\makeindex',
+    '\\begin{document}',
+    'Opening paragraph on the first page.\\index{opening}',
+    '',
+    '\\clearpage',
+    'Second page body.\\index{second}',
+    '',
+    '\\printindex',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  try {
+    const arrivals = [];
+    eng.onShipWave = (info) => arrivals.push(info);
+    await eng.open(doc);
+    const t0 = Date.now();
+    while ((eng.shipRetry?.state !== 'ready' || eng.shipBooting) && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(eng.shipping?.info?.().baselineReady, true);
+    const baselinePages = eng.shipping.info().pages;
+    assert.equal(baselinePages, 3, 'the baseline carries the index page');
+
+    const src = eng.getSource();
+    const at = src.indexOf('first page') + 'first page'.length;
+    await eng.edit(at, at, 'X');
+    const rev = eng.srcRev;
+    const t1 = Date.now();
+    while (!arrivals.some((a) => a.srcRev === rev) &&
+           eng.shipping?.lastRejectReason !== 'page-count-changed' && Date.now() - t1 < 30_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.notEqual(eng.shipping?.lastRejectReason, 'page-count-changed', 'the replay found the index');
+    const hit = arrivals.find((a) => a.srcRev === rev);
+    assert.ok(hit, 'the first-page edit lands a ship wave');
+    assert.equal(hit.pages.length, baselinePages);
+    assert.match(await pageText(eng.shipping.publishedPdf, 3), /opening, 1/);
+  } finally {
+    delete process.env.TDOM_SHIP;
+    await eng.close();
+  }
+});
+
 test('four healthy structural rebaselines do not exhaust shipping recovery', opts, async () => {
   process.env.TDOM_SHIP = '1';
   const previousCanonicalIdle = process.env.TDOM_CANON_IDLE;

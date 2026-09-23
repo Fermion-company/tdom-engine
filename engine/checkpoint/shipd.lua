@@ -89,6 +89,12 @@ local OUTPUT_EXTS = {
   'idx', 'glo', 'gls', 'nav', 'snm'
 }
 
+-- Converged inputs the run only READS: canonical's makeindex output. The
+-- orchestrator seeds them into the root directory; every branch is a fresh
+-- directory, so without its own copy a replay's \printindex finds nothing
+-- and ends a page short of the baseline (tex64-internal #77).
+local INPUT_EXTS = { 'ind' }
+
 local function prepare_branch(dir)
   lfs.mkdir(dir)
   local mappings = {}
@@ -98,6 +104,10 @@ local function prepare_branch(dir)
     local cloned = fk.copy_open_fd(source, target)
     if not cloned and lfs.attributes(source) then copy_file(source, target) end
     mappings[#mappings + 1] = {source = source, target = target, cloned = cloned, ext = ext}
+  end
+  for _, ext in ipairs(INPUT_EXTS) do
+    local source = BRANCHDIR .. '/driver-ship.' .. ext
+    if lfs.attributes(source) then copy_file(source, dir .. '/driver-ship.' .. ext) end
   end
   if not lfs.attributes(dir .. '/driver-ship.aux') then
     local aux = io.open(dir .. '/driver-ship.aux', 'w')
