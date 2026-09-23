@@ -137,10 +137,15 @@ test('provisional page-count transactions fail closed on holes and delayed tail 
   assert.equal(valid(3, [1, 3], [1, 3], []), false, 'a sparse address space is never published');
 });
 
-test('resident page counts become authoritative only for the current source generation', () => {
+test('resident page counts are checked against the newest canonical generation', () => {
   const count = PAGE_COUNT_GATES.currentCanonicalPageCount;
   assert.equal(count({ rev: 7, pageCount: 11 }, null, 3, 7), 11);
-  assert.equal(count({ rev: 6, pageCount: 11 }, null, 3, 7), null, 'a stale canonical is not authority');
+  // tex64-internal #72: requiring the current revision turned every
+  // keystroke into a canonical display demand and a "/ —" toolbar.
+  assert.equal(count({ rev: 6, pageCount: 11 }, null, 3, 7), 11, 'the newest canonical is the reference while typing');
+  assert.equal(count({ rev: 0, pageCount: 0 }, null, 3, 7), null, 'no canonical yet is unknown');
+  assert.equal(count({ rev: 8, pageCount: 11 }, null, 3, 7), null, 'a generation ahead of the source is ignored');
+  assert.equal(count({ rev: 5, pageCount: 11 }, { rev: 6, pageCount: 12, epoch: 3 }, 3, 7), 12, 'the newer generation wins');
   assert.equal(count(null, { rev: 7, pageCount: 11, epoch: 3 }, 3, 7), 11);
   assert.equal(count(null, { rev: 7, pageCount: 11, epoch: 2 }, 3, 7), null, 'another document epoch is rejected');
   assert.equal(

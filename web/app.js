@@ -635,18 +635,26 @@ function adoptDoc(doc) {
 
 // ---------------------------------------------------------------- pages
 
+// The newest exact generation of this document is the page-count reference.
+// Requiring one for the CURRENT revision made every keystroke's count
+// unknown until canonical caught up: the toolbar flickered to "/ —" and each
+// keystroke demanded a full canonical compile (tex64-internal #72). A
+// resident count that matches the newest canonical stays authoritative; a
+// mismatch still demands canonical and shows "/ —" (#67).
 function currentCanonicalPageCount(reported, committed, documentEpoch, srcRev) {
-  const counts = [];
-  if (Number(reported?.rev) === Number(srcRev) &&
-      Number.isSafeInteger(Number(reported?.pageCount)) && Number(reported.pageCount) >= 0) {
-    counts.push(Number(reported.pageCount));
+  const generations = [];
+  const count = (value) => Number.isSafeInteger(Number(value)) && Number(value) >= 0;
+  if (Number(reported?.rev) > 0 && Number(reported.rev) <= Number(srcRev) && count(reported.pageCount)) {
+    generations.push({ rev: Number(reported.rev), pageCount: Number(reported.pageCount) });
   }
   if (Number(committed?.epoch) === Number(documentEpoch) &&
-      Number(committed?.rev) === Number(srcRev) &&
-      Number.isSafeInteger(Number(committed?.pageCount)) && Number(committed.pageCount) >= 0) {
-    counts.push(Number(committed.pageCount));
+      Number(committed?.rev) > 0 && Number(committed.rev) <= Number(srcRev) && count(committed.pageCount)) {
+    generations.push({ rev: Number(committed.rev), pageCount: Number(committed.pageCount) });
   }
-  return counts.length && counts.every(count => count === counts[0]) ? counts[0] : null;
+  if (!generations.length) return null;
+  const newest = Math.max(...generations.map(generation => generation.rev));
+  const counts = generations.filter(generation => generation.rev === newest).map(generation => generation.pageCount);
+  return counts.every(value => value === counts[0]) ? counts[0] : null;
 }
 
 function residentPageTransactionValid(pageCount, residentPages, stagePages, removedPages) {
