@@ -7,7 +7,7 @@ import { readFileSync, rmSync, mkdtempSync, writeFileSync, readdirSync } from 'n
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 
@@ -644,6 +644,22 @@ async function rasterPages(pdfBuf, tag) {
   }
 }
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+// Process state letter (R, S, Z, ...) or null once the pid is gone.
+const processState = (pid) => {
+  try { return readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]?.[0] ?? null; } catch { /* not Linux */ }
+  try { return execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim()[0] || null; } catch { return null; }
+};
+// A SIGKILLed process whose parent died with it stays a zombie until
+// something reaps it; in a container whose pid 1 is not an init that can
+// outlast the check. Dead is dead: only a process still running counts.
+const retired = async (pid, ms = 5000) => {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    if (!alive(pid) || processState(pid) === 'Z') return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+};
 
 test('the real-output root is opt-in: without the flag splitting rescues stay cold', opts, () => {
   assert.equal(eng.isoRealFork, false);
@@ -699,8 +715,8 @@ test('fork-real rescues from the real-output root match the cold compile bit for
   } finally {
     if (e) await e.close();
   }
-  await new Promise((r) => setTimeout(r, 300));
-  assert.ok(!alive(realRootPid), 'close retires the real-output root with the rest of the tree');
+  assert.ok(await retired(realRootPid),
+    `close retires the real-output root with the rest of the tree (state ${processState(realRootPid)})`);
 });
 
 test('microtype expansion and protrusion keep resident glyphs where the PDF paints them (tex64-internal #66)', opts, async () => {
