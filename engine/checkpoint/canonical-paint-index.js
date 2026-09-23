@@ -679,12 +679,31 @@ export function certifyCanonicalBlock({ witnesses, candidates, paintPages }) {
     .filter((entry) => candidateMatchesWitness(entry.candidate, entry.pageItems, witness))
     .map((entry) => entry.candidateIndex));
   if (edges.some((options) => !options.length)) return null;
-  const matching = uniquePerfectMatching(edges, physical.length);
+  // SyncTeX reports one line through several enclosing boxes that differ
+  // only vertically; a matched line keeps its page, baseline and horizontal
+  // extent and takes its height from the witness, so those are one slot.
+  // Uniqueness is decided between slots, not between their reports.
+  const slotIds = new Map();
+  const slotOf = physical.map((entry) => {
+    const key = lineSlotKey(entry.candidate);
+    if (!slotIds.has(key)) slotIds.set(key, slotIds.size);
+    return slotIds.get(key);
+  });
+  const slotEdges = edges.map((options) => [...new Set(options.map((index) => slotOf[index]))]);
+  const matching = uniquePerfectMatching(slotEdges, slotIds.size);
   if (!matching) return null;
-  return matching.map((candidateIndex, lineIndex) => ({
+  return matching.map((slot, lineIndex) => ({
     lineIndex,
-    candidate: canonicalLineCandidate(physical[candidateIndex].candidate, witnesses[lineIndex]),
+    candidate: canonicalLineCandidate(
+      physical[edges[lineIndex].find((index) => slotOf[index] === slot)].candidate,
+      witnesses[lineIndex]
+    ),
   }));
+}
+
+function lineSlotKey(candidate) {
+  return [candidate.page, candidate.y, candidate.box.left, candidate.box.right]
+    .map((value) => Number(value).toFixed(3)).join(':');
 }
 
 export function candidateMatchesWitness(candidate, pageItems, witness) {

@@ -652,6 +652,48 @@ test('fork-real rescues from the real-output root match the cold compile bit for
   assert.ok(!alive(realRootPid), 'close retires the real-output root with the rest of the tree');
 });
 
+test('microtype expansion and protrusion keep resident glyphs where the PDF paints them (tex64-internal #66)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-microtype-'));
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  const prose = 'Resumable typesetting means that a checkpoint taken before an edited block ' +
+    'reproduces the complete output once only the following blocks are processed again, ' +
+    'which is exactly the property the live preview relies on for every keystroke it shows ' +
+    'while the full compilation of the document is still running in the background.';
+  try {
+    await eng.open([
+      '\\documentclass{article}',
+      '\\usepackage{microtype}',
+      '\\hyphenpenalty=10000 \\emergencystretch=3em',
+      '\\begin{document}',
+      `\\noindent\`\`Quoted opening'' of a paragraph that protrudes into the margin. ${prose}`,
+      '',
+      '\\microtypesetup{protrusion=false}',
+      prose,
+      '\\end{document}',
+      '',
+    ].join('\n'));
+    const lines = (text, not = null) => {
+      const block = eng.blocks.find((item) => item.text.includes(text) && !(not && item.text.includes(not)));
+      return (block?.galley?.items ?? []).filter((item) => item.k === 'box' && item.runs?.length);
+    };
+    const quoted = lines('Quoted opening');
+    assert.ok(quoted.length >= 3);
+    assert.ok(Math.min(...quoted[0].runs.map((run) => run.x)) < -0.1,
+      'the opening quote hangs into the left margin as the PDF paints it');
+    // without protrusion every justified line fills its box exactly, but
+    // only if each glyph and font kern advances by its expanded width
+    const plain = lines('Resumable typesetting', 'Quoted opening');
+    assert.ok(plain.length >= 3);
+    for (const item of plain.slice(0, -1)) {
+      const right = Math.max(...item.runs.map((run) => run.x + run.w));
+      assert.ok(Math.abs(right - item.w) < 0.05, `line content ends at the box edge (${right} vs ${item.w})`);
+    }
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a forward \\cref under hyperref typesets in the resident chain (tex64-internal #66)', opts, async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-forward-cref-'));
   const eng = new CheckpointEngine({ workDir: path.join(root, 'work') });

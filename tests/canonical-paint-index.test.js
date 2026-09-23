@@ -233,6 +233,28 @@ test('duplicate raw nodes for one exact hbox are deduplicated, not treated as tw
   assert.equal(result?.length, 1);
 });
 
+test('one line reported through several enclosing boxes is one slot, not an ambiguity (tex64-internal #66)', () => {
+  // two-column SyncTeX: each source line of a paragraph returns the line's
+  // baseline and horizontal extent through the column vbox and its parents
+  const texts = ['前方参照は番号', '後段処理に依存', '浮動体位置Q'];
+  const witnesses = texts.map((text) => witnessFor(text));
+  const candidates = texts.flatMap((text, index) => [700, 60, 48].map((top) => {
+    const candidate = candidateFor({ page: 6, left: 307, baseline: 324 + index * 16 });
+    candidate.box.top = top;
+    candidate.box.bottom = 794 - top / 4;
+    return candidate;
+  })).filter((candidate) => candidate.box.top <= candidate.y);
+  const paint = {
+    page: 6,
+    items: texts.flatMap((text, index) => paintFor(text, { page: 6, left: 307, baseline: 324 + index * 16 }).items),
+  };
+  const result = certifyCanonicalBlock({ witnesses, candidates, paintPages: [paint] });
+  assert.equal(result?.length, 3);
+  assert.deepEqual(result.map((entry) => entry.candidate.y), [324, 340, 356]);
+  assert.ok(result.every((entry) => entry.candidate.box.bottom - entry.candidate.box.top < 12),
+    'the certified slot takes its height from the witness, whichever report it came through');
+});
+
 test('the base-to-current effect set includes every changed visual line', () => {
   const base = galleyLineWitnesses({ items: ['a', 'b', 'c', 'd', 'e', 'f'].map((text) => lineBox(text)) });
   const current = galleyLineWitnesses({ items: ['a', 'B', 'c', 'd', 'e', 'F'].map((text) => lineBox(text)) });

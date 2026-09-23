@@ -535,6 +535,7 @@ local INS = node.id('ins')
 local MARK = node.id('mark')
 local MATH = node.id('math')
 local ATTRIBUTE = node.id('attribute')
+local MARGIN_KERN = node.id('margin_kern')
 
 local EMPTY_RULE_SUBTYPE = nil
 do
@@ -801,10 +802,18 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
         if bp(cinfo.height or 0) > run.gh then run.gh = bp(cinfo.height or 0) end
         if bp(cinfo.depth or 0) > run.gd then run.gd = bp(cinfo.depth or 0) end
       end
-      x = x + bp(n.width or 0)
+      -- font expansion (microtype): the paragraph builder scales each
+      -- glyph by expansion_factor millionths; font kerns carry the added
+      -- amount itself. Without it every later glyph on the line drifts.
+      local w = n.width or 0
+      x = x + bp(w + w * (n.expansion_factor or 0) / 1000000)
     elseif id == KERN then
       flush()
-      x = x + bp(n.kern or 0)
+      x = x + bp((n.kern or 0) + (n.expansion_factor or 0))
+    elseif id == MARGIN_KERN then
+      -- character protrusion shifts the line's glyphs into the margin
+      flush()
+      x = x + bp(n.width or 0)
     elseif id == GLUE then
       flush()
       emit_leader_rule(n, parent, x, dy0, out)
