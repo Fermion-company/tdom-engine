@@ -91,9 +91,14 @@ function plainReplayEdit(before, after) {
   // NOT an admission boundary: a checkpoint preceding the complete source
   // unit re-reads the opening brace, scans the argument again, and closes it
   // before the next unit.  resume() proves that whole-unit replay below.
-  // Math/comments and a control-word splice remain unsafe because the changed
+  // Math is no exception: the replay re-reads the whole unit from a
+  // checkpoint before it, so a letter typed inside \[...\] or $...$ is as
+  // exact as one typed in prose. Environment math (equation, align) was
+  // never tracked here and always replayed; display/inline math went to a
+  // full reboot on every keystroke (tex64-internal #64, 04 textbook). The
+  // delimiters themselves stay out through PLAIN_EDIT_UNSAFE.
+  // Comments and a control-word splice remain unsafe because the changed
   // bytes are not ordinary visible character tokens.
-  let math = null;
   let comment = false;
   for (let index = 0; index < start; index++) {
     const char = before[index];
@@ -103,15 +108,11 @@ function plainReplayEdit(before, after) {
     }
     if (char === '%') { comment = true; continue; }
     if (char === '\\') {
-      const symbol = before[index + 1];
-      if (symbol === '(' || symbol === '[') math = symbol;
-      else if ((symbol === ')' && math === '(') || (symbol === ']' && math === '[')) math = null;
       index++;
       continue;
     }
-    if (char === '$') math = math ? null : '$';
   }
-  return !comment && math === null &&
+  return !comment &&
     !/\\[A-Za-z@]*$/.test(before.slice(0, start));
 }
 

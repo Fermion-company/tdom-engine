@@ -193,6 +193,7 @@ test('unsafe syntax edits fail closed before a replay generation is forked', opt
   const gen = chain.gen;
   const at = current.indexOf('very rapid live citations');
   assert.ok(at > 0);
+  // Typing the math delimiters themselves changes the unit's syntax.
   const mathEdit = current.slice(0, at) + '$x$' + current.slice(at);
   assert.deepEqual(chain.resume(mathEdit), { mode: 'reboot-needed', reason: 'non-plain-edit' });
   assert.equal(chain.gen, gen, 'no speculative generation was created');
