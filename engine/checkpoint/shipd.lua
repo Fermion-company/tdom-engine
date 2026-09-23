@@ -89,25 +89,38 @@ local OUTPUT_EXTS = {
   'idx', 'glo', 'gls', 'nav', 'snm'
 }
 
--- Converged inputs the run only READS: canonical's makeindex output. The
--- orchestrator seeds them into the root directory; every branch is a fresh
--- directory, so without its own copy a replay's \printindex finds nothing
--- and ends a page short of the baseline (tex64-internal #77).
-local INPUT_EXTS = { 'ind' }
+-- Every other job file of the branch travels too. Converged inputs the run
+-- only reads (canonical's makeindex .ind) would otherwise be missing, so a
+-- replay's \printindex ended a page short (tex64-internal #77); package
+-- "list of" files (bclogo's .bcl, algorithm .loa, listings .lol ...) would be
+-- missing from the replay's output manifest and reject every wave, while the
+-- replay kept writing into its parent's file through the inherited
+-- descriptor (#64). The job's own source, log and pages are not outputs.
+local NOT_JOB_OUTPUT = { tex = true, log = true, pdf = true, svg = true }
+
+local function job_extensions()
+  local exts, seen = {}, {}
+  for _, ext in ipairs(OUTPUT_EXTS) do exts[#exts + 1] = ext; seen[ext] = true end
+  for name in lfs.dir(BRANCHDIR) do
+    local ext = name:match('^driver%-ship%.([%w%.]+)$')
+    if ext and not seen[ext] and not NOT_JOB_OUTPUT[ext] and not ext:match('^synctex') and
+        lfs.attributes(BRANCHDIR .. '/' .. name, 'mode') == 'file' then
+      exts[#exts + 1] = ext
+      seen[ext] = true
+    end
+  end
+  return exts
+end
 
 local function prepare_branch(dir)
   lfs.mkdir(dir)
   local mappings = {}
-  for _, ext in ipairs(OUTPUT_EXTS) do
+  for _, ext in ipairs(job_extensions()) do
     local source = BRANCHDIR .. '/driver-ship.' .. ext
     local target = dir .. '/driver-ship.' .. ext
     local cloned = fk.copy_open_fd(source, target)
     if not cloned and lfs.attributes(source) then copy_file(source, target) end
     mappings[#mappings + 1] = {source = source, target = target, cloned = cloned, ext = ext}
-  end
-  for _, ext in ipairs(INPUT_EXTS) do
-    local source = BRANCHDIR .. '/driver-ship.' .. ext
-    if lfs.attributes(source) then copy_file(source, dir .. '/driver-ship.' .. ext) end
   end
   if not lfs.attributes(dir .. '/driver-ship.aux') then
     local aux = io.open(dir .. '/driver-ship.aux', 'w')
