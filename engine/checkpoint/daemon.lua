@@ -409,9 +409,18 @@ end
 -- is the placeholder cleveref's parser expects (pages are the orchestrator's).
 function tdom_label_cref(key, value)
   key = unbrace(key)
-  blk_labels[#blk_labels + 1] = { k = key .. '@cref', v = value }
+  local entry = { k = key .. '@cref', v = value }
+  blk_labels[#blk_labels + 1] = entry
   pcall(function()
-    token.set_macro('r@' .. key .. '@cref', '{' .. value .. '}{[1][1][]1}', 'global')
+    -- Under hyperref the companion has the plain label's five fields
+    -- (\@firstoffive reads it); two groups broke every later \cref.
+    local href = token.get_macro('@currentHref')
+    local body = '{' .. value .. '}{[1][1][]1}'
+    if href ~= nil then
+      entry.h = href
+      body = body .. '{}{' .. href .. '}{}'
+    end
+    token.set_macro('r@' .. key .. '@cref', body, 'global')
   end)
 end
 

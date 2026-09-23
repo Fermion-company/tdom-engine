@@ -651,3 +651,40 @@ test('fork-real rescues from the real-output root match the cold compile bit for
   await new Promise((r) => setTimeout(r, 300));
   assert.ok(!alive(realRootPid), 'close retires the real-output root with the rest of the tree');
 });
+
+test('a forward \\cref under hyperref typesets in the resident chain (tex64-internal #66)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-forward-cref-'));
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  try {
+    await eng.open([
+      '\\documentclass{article}',
+      '\\usepackage{hyperref}',
+      '\\usepackage{cleveref}',
+      '\\begin{document}',
+      'First paragraph refers ahead to \\cref{tab:cost} and \\ref{tab:cost}.',
+      '',
+      'Second paragraph of ordinary prose.',
+      '',
+      '\\begin{table}[b]',
+      '\\centering',
+      '\\begin{tabular}{ll} a & b \\\\ \\end{tabular}',
+      '\\caption{Cost}\\label{tab:cost}',
+      '\\end{table}',
+      '',
+      'Closing paragraph.',
+      '\\end{document}',
+      '',
+    ].join('\n'));
+    await eng.canonical.settle();
+    // the cleveref companion used to get two groups where hyperref reads
+    // five: LuaLaTeX rejected the block and it fell to an isolated rescue
+    const block = eng.blocks.find((item) => item.text.includes('refers ahead'));
+    assert.equal(block.rescued, false, 'the referring paragraph is typeset in-chain');
+    assert.notEqual(block.galley?.tdomDeferred, true);
+    assert.ok(block.galley.items.length > 0);
+    assert.equal(eng.labelTable.get('tab:cost'), '1');
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
