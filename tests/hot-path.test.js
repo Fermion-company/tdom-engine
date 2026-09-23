@@ -640,10 +640,14 @@ second paragraph
     \expandafter\textbf\expandafter{\csname deep@#1\endcsname}}
   \expandafter\def\csname deep@one\endcsname{Generated heading}`;
   const dynamicTextGate = classifyStructuralAliases(dynamicText, String.raw`\DeepMacro{one}`);
-  assert.equal(dynamicTextGate.safe, false, 'dynamic command lookup cannot prove that page APIs are unreachable');
+  assert.equal(dynamicTextGate.safe, true, 'a name registry whose entries reach no page sink is ordinary text');
   assert.equal(dynamicTextGate.requiresShippingExact, false);
-  assert.equal(dynamicTextGate.scopes[0]?.scope, 'suffix');
-  assert.equal(dynamicTextGate.scopes[0]?.authority, 'canonical');
+
+  const dynamicDoor = String.raw`\NewDocumentCommand\UseDoor{m}{\csname door@#1\endcsname}
+  \expandafter\def\csname door@one\endcsname{\clearpage Chapter}`;
+  const dynamicDoorGate = classifyStructuralAliases(dynamicDoor, String.raw`\UseDoor{one}`);
+  assert.equal(dynamicDoorGate.safe, false, 'a registry entry that breaks the page taints every lookup');
+  assert.ok(dynamicDoorGate.reasons.some((reason) => /forced-page-break/.test(reason)));
 
   const hostileKnownEnvironment = String.raw`\renewenvironment{tcolorbox}
     {\global\output={\shipout\box255}}{}

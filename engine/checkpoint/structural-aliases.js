@@ -53,7 +53,6 @@ const STRUCTURAL_COMMANDS = new Map([
   ['latelua', 'dynamic-output-code'],
   ['luafunction', 'dynamic-output-code'],
   ['lateluafunction', 'dynamic-output-code'],
-  ['csname', 'dynamic-control-sequence'],
   ['pdfpagewidth', 'page-geometry-change'],
   ['pdfpageheight', 'page-geometry-change'],
   ['pagewidth', 'page-geometry-change'],
@@ -168,7 +167,6 @@ const SHIPPING_EXACT_SINKS = new Set([
 const SUFFIX_SCOPED_SINKS = new Set([
   'column-layout-change',
   'forced-page-break',
-  'dynamic-control-sequence',
 ]);
 
 const RESCUE_REQUIRED_SINKS = new Set([
@@ -281,7 +279,12 @@ function readControl(source, at) {
   // ExplSyntaxOn is active.  Recognise that spelling for source analysis,
   // but never let it swallow a suffix after a known primitive/page command.
   if (!STRUCTURAL_COMMANDS.has(base) && /[_:]/.test(source[end] ?? '')) {
-    while (end < source.length && /[A-Za-z@_:]/.test(source[end])) end++;
+    let expl = end;
+    while (expl < source.length && /[A-Za-z@_:]/.test(source[expl])) expl++;
+    // `Demo~\theboxdemo: #3` is a counter followed by prose, not an expl3
+    // name: a bare trailing colon needs an argument signature or a `_`.
+    const name = source.slice(at + 1, expl);
+    if (name.includes('_') || /:[A-Za-z]+$/.test(name)) end = expl;
   }
   return { name: source.slice(at + 1, end), start: at, end };
 }
@@ -516,15 +519,17 @@ function documentGlobalSinksIn(body) {
       /\\setlength\s*\{\s*\\(?:paperwidth|paperheight|pagewidth|pageheight|pdfpagewidth|pdfpageheight|textwidth|textheight)\s*\}/.test(body)) {
     sinks.add('page-geometry-change');
   }
-  if (/\\csname\s*(?:output|shipout|directlua|latelua)\s*\\endcsname/.test(body)) {
+  if (/\\csname\s*(?:output|shipout|RawShipout|directlua|latelua)\s*\\endcsname/.test(body)) {
     sinks.add('output-routine-change');
-  } else if (/\\csname\b/.test(body)) {
-    // A dynamically-computed control sequence cannot be resolved by this
-    // static graph. Keep the uncertainty explicit instead of silently
-    // treating it as an effect-free helper.
-    sinks.add('dynamic-control-sequence');
   }
-  if (/\\(?:catcode|scantokens|globaldefs)\b/.test(body)) {
+  // Other \csname lookups are name registries (\csname badge@#1\endcsname)
+  // in almost every real document. `\expandafter\def\csname ...` bodies are
+  // collected under the key \csname, so a registry entry that does reach a
+  // page sink still propagates to every lookup. Treating the lookup itself
+  // as a sink demoted 13 of the 20 stress documents to opaque. Catcode
+  // changes are likewise ordinary in verbatim-like helpers; the segmenter's
+  // literal-environment and closure gates own that risk.
+  if (/\\globaldefs\b/.test(body)) {
     sinks.add('tokenization-change');
   }
   return sinks;
@@ -685,11 +690,6 @@ function exactCommandEffect(
     }
     const commandSink = defs.has(`\\${control.name}`) ? null : STRUCTURAL_COMMANDS.get(control.name);
     if (commandSink) {
-      if (commandSink === 'dynamic-control-sequence') {
-        active.delete(key);
-        memo.set(key, null);
-        return null;
-      }
       effects.push({ kind: 'command', sink: commandSink });
       covered.add(commandSink);
       i = control.end;
@@ -892,7 +892,9 @@ function usedStructuralAliases(bodyInfo, defs) {
           const unresolved = unresolvedDefinitionCommands(key, defs, unresolvedMemo);
           // The custom environment's own literal begin/end already gives the
           // raw segmenter an exact nesting boundary. It only needs to carry
-          // the hidden sink to the rescue classifier.
+          // the hidden sink to the rescue classifier. Unresolved commands in
+          // its halves do not make that boundary uncertain; they only leave
+          // the physical pages to ShippingChain (see shippingExactUses).
           found.push({
             key,
             at: i,
@@ -900,7 +902,7 @@ function usedStructuralAliases(bodyInfo, defs) {
             effects: control.name === 'begin'
               ? [{ kind: 'rescue', sinks: [...record.may] }]
               : [],
-            exact: record.definitionKind === 'environment' && unresolved.length === 0,
+            exact: record.definitionKind === 'environment',
             scoped: record.definitionKind === 'environment' && unresolved.length > 0,
             unresolved,
           });

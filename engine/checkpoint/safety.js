@@ -57,7 +57,7 @@ const UNSAFE_PREAMBLE = [
   [/\\(?:shipout|RawShipout)\b/, 'raw \\shipout'],
   [/\\(?:AddToHook|AddToHookNext)\s*\{\s*shipout/, 'shipout hook'],
   [/\\At(?:BeginShipout(?:Next)?|EndShipout|BeginDvi|EndDvi)\b/, 'shipout hook (compatibility API)'],
-  [/\\csname\b/, 'dynamic control-sequence access in the preamble'],
+  [/\\csname\s*(?:output|shipout|RawShipout)\s*\\endcsname/, 'custom \\output routine'],
   [/\\twocolumn\b/, '\\twocolumn'],
   [/\\(?:documentclass|LoadClass)\s*\[[^\]]*\blandscape\b[^\]]*\]/, 'landscape class option'],
 ];
@@ -91,7 +91,7 @@ const UNSAFE_BODY = [
   [/\\(?:shipout|RawShipout)\b/, 'raw \\shipout'],
   [/\\(?:AddToHook|AddToHookNext)\s*\{\s*shipout/, 'shipout hook'],
   [/\\At(?:BeginShipout(?:Next)?|EndShipout|BeginDvi|EndDvi)\b/, 'shipout hook (compatibility API)'],
-  [/\\csname\b/, 'dynamic control-sequence access'],
+  [/\\csname\s*(?:output|shipout|RawShipout)\s*\\endcsname/, 'custom \\output routine'],
   // NOT \includepdf: block-level rescue ships its foreign pages exactly
   // (see OUTPUT_HIJACK_RE in engine-v3.js).
   [/\\balance\b/, 'column balancing'],

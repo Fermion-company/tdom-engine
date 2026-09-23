@@ -344,7 +344,10 @@ test('slice 3: engine integration — an edit lands a ship page event', opts, as
     assert.ok(Number.isFinite(hit.acceptedAt), 'renderer receives wave acceptance time');
     assert.ok(Number.isFinite(hit.deadlineAt), 'renderer receives the hard display deadline');
     assert.ok(hit.deadlineAt > hit.acceptedAt);
-    assert.equal(hit.deadlineAt - hit.acceptedAt, 1000, 'visible commit owns the full one-second SLA');
+    // #63: the presentation window follows the adaptive replay budget
+    // (at least the legacy one second, longer when canonical is slow).
+    assert.equal(hit.deadlineAt - hit.acceptedAt, eng.shipping.visibleCutoffMs(), 'visible commit owns the replay SLA');
+    assert.ok(hit.deadlineAt - hit.acceptedAt >= 1000);
     assert.ok(Array.isArray(hit.changedPages) && hit.changedPages.length > 0);
     console.log(`    engine wave: pages ${hit.pages.join(',')} in ${Date.now() - t1}ms after edit`);
     const svg = await eng.shipping.pageSVG(2);
