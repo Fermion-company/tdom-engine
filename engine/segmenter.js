@@ -44,7 +44,7 @@ const STANDALONE_LINE =
 // counters and merged the entire remaining document into one block — every
 // keystroke anywhere in the tail then re-typeset the whole remainder.
 const VERBATIM_BEGIN_RE =
-  /\\begin\{(verbatim\*?|lstlisting|minted|alltt|filecontents\*?|[BLV]erbatim\*?)\}/;
+  /\\begin\{(verbatim\*?|lstlisting|minted|filecontents\*?|[BLV]erbatim\*?)\}/;
 
 // Preamble declarations that make a literal environment under the user's
 // own name (listings, fancyvrb, minted, tcolorbox listings, comment). A
@@ -80,6 +80,7 @@ export function segmentBody(text, baseOffset, { structuralEvents = [], literalEn
   let braceDepth = 0;
   let inDisplay = false;
   let inVerbatim = null; // env name while inside a literal environment
+  let inAlltt = false; // commands/braces execute; unlike normal TeX, % is data
   let cur = null; // { start, end }
   let curStructuralSinks = new Set();
 
@@ -107,9 +108,14 @@ export function segmentBody(text, baseOffset, { structuralEvents = [], literalEn
       if (ln.text.includes(`\\end{${inVerbatim}}`)) inVerbatim = null;
       continue;
     }
-    let stripped = stripComment(ln.text);
-    // neutralize inline \verb payloads before counting braces/comments
-    stripped = stripped.replace(/\\verb\*?([^A-Za-z\s])(.*?)\1/g, '\\verb$1v$1');
+    // Neutralize inline \verb before comments: its delimiter may contain a
+    // literal `%`, which must not hide executable text later on the line.
+    let stripped = ln.text.replace(
+      /\\verb\*?([^A-Za-z\s])(.*?)\1/g,
+      (match) => ' '.repeat(match.length)
+    );
+    if (!inAlltt) stripped = stripComment(stripped);
+    if (!inAlltt && /\\begin\{alltt\}/.test(stripped)) inAlltt = true;
     const blank = stripped.trim().length === 0 && ln.text.trim().length === 0;
     const atTop = envDepth === 0 && braceDepth <= 0 && !inDisplay;
 
@@ -157,6 +163,7 @@ export function segmentBody(text, baseOffset, { structuralEvents = [], literalEn
       }
     }
     if (envDepth < 0) envDepth = 0;
+    if (inAlltt && /\\end\{alltt\}/.test(stripped)) inAlltt = false;
     // `\\[2mm]` in align/tabular is a row break with optional spacing, not
     // the display opener `\[`.  A substring regex sees the second slash of
     // `\\[` and poisons inDisplay for the whole remaining document, merging

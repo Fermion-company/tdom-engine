@@ -221,7 +221,7 @@ test('label renames propagate backwards to earlier referencing blocks', opts, as
 
 // ------------------------------------------------ Build lease vs caret warm
 
-test('a caret warm walk yields to a Build lease at its next block boundary and resumes later', async () => {
+test('a caret warm walk yields to a Build lease at its next block boundary and resumes later', opts, async () => {
   const work = WORK + '-warm-yield';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -262,7 +262,7 @@ test('a caret warm walk yields to a Build lease at its next block boundary and r
   }
 });
 
-test('a keystroke far from every checkpoint returns within its cold budget and the resume publishes the typeset', async () => {
+test('a keystroke far from every checkpoint returns within its cold budget and the resume publishes the typeset', opts, async () => {
   const work = WORK + '-cold-budget';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -312,7 +312,7 @@ test('a keystroke far from every checkpoint returns within its cold budget and t
   }
 });
 
-test('a caret warm that reaches the block of a budgeted keystroke hands over to the resume', async () => {
+test('a caret warm that reaches the block of a budgeted keystroke hands over to the resume', opts, async () => {
   const work = WORK + '-cold-warm';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -350,7 +350,7 @@ test('a caret warm that reaches the block of a budgeted keystroke hands over to 
   }
 });
 
-test('a keystroke during the cold walk stops it at a live boundary instead of rebooting', async () => {
+test('a keystroke during the cold walk stops it at a live boundary instead of rebooting', opts, async () => {
   const work = WORK + '-cold-interrupt';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -389,7 +389,7 @@ test('a keystroke during the cold walk stops it at a live boundary instead of re
   }
 });
 
-test('a keystroke during a caret warm walk takes the lock at the next block boundary', async () => {
+test('a keystroke during a caret warm walk takes the lock at the next block boundary', opts, async () => {
   const work = WORK + '-warm-edit-priority';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -473,7 +473,7 @@ test('a keep-set boundary without a continuation is materialized by the idle gri
   }
 });
 
-test('a keystroke at the block a caret warm is walking toward resumes from the boundary it reached', async () => {
+test('a keystroke at the block a caret warm is walking toward resumes from the boundary it reached', opts, async () => {
   const work = WORK + '-warm-frontier-edit';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -507,7 +507,7 @@ test('a keystroke at the block a caret warm is walking toward resumes from the b
   }
 });
 
-test('a reopened document adopts its cached isolated rescues during the boot walk', async () => {
+test('a reopened document adopts its cached isolated rescues during the boot walk', opts, async () => {
   const work = WORK + '-iso-disk-cache';
   rmSync(work, { recursive: true, force: true });
   const doc = [

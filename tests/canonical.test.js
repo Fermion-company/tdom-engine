@@ -301,6 +301,13 @@ test('safety gate: clean documents pass, page-mechanism hazards demote', () => {
   assert.deepEqual(switchedColumns.previewReasons, ['body column switch']);
   assert.equal(classifyDocument('\\documentclass[landscape]{article}', '').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}\\AtBeginShipout{x}', '').safe, false);
+  assert.equal(classifyDocument('\\documentclass{article}', '\\output={\\shipout\\box255}').safe, false);
+  assert.equal(classifyDocument('\\documentclass{article}', '\\AddToHook{shipout/before}{x}').safe, false);
+  assert.equal(
+    classifyDocument('\\documentclass{article}', '\\begin{verbatim}\\output={x}\\end{verbatim}').safe,
+    true,
+    'literal examples do not acquire primitive access'
+  );
   assert.equal(classifyDocument('\\documentclass{article}\\usepackage{pdflscape}', 'body').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}', '\\pagewidth=420pt body').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}', '\\pdfvariable pageattr{/Rotate 90} body').safe, false);
