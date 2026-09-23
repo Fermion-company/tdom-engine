@@ -181,14 +181,31 @@ export class CheckpointEngine {
 
   // ------------------------------------------------------------ lifecycle
 
-  async open(text, file = 'main.tex', { projectSeeds = true } = {}) {
+  async open(text, file = 'main.tex', { canonicalBaseline = true, projectSeeds = true } = {}) {
     resetOpenState(this, text, file);
-    // The first canonical compile of this open may start from the aux the
-    // project's last compile converged on (docs/08 §8.2b'). An open that
-    // adopts a Build places the Build's aux instead, and a reopen for a
-    // changed bibliography or preamble input starts from nothing.
-    this.canonical.restoreProjectSeeds(file, this.store.get(file), { place: projectSeeds });
-    return this.#update({ editLabel: 'open' });
+    // The canonical baseline compiles the opened source by itself and needs
+    // nothing from the resident tree: start it beside the boot walk instead
+    // of after it. On the 316-page book the walk (76 s) and the 3-pass
+    // baseline (125 s) ran in series, and no keystroke could be anchored
+    // until both had finished. Every open path ends with exactly one srcRev
+    // increment and schedule() of this same text; that call finds this job
+    // running, or its generation current (#reconcile), and adds no compile.
+    // An open that adopts a Build generation right after skips it (and
+    // places that Build's aux family instead of the project's last one); a
+    // reopen for a changed bibliography or preamble input starts its aux
+    // from nothing, as before.
+    const source = this.store.get(file);
+    const reserved = this.srcRev + 1;
+    this.canonical.restoreProjectSeeds(file, source, { place: canonicalBaseline && projectSeeds });
+    if (canonicalBaseline && process.env.TDOM_CANON_EARLY_BASELINE !== '0') this.canonical.schedule(source, reserved);
+    try {
+      return await this.#update({ editLabel: 'open' });
+    } catch (error) {
+      // The baseline may still land as `reserved`: never publish another
+      // source under that revision.
+      if (canonicalBaseline && this.srcRev < reserved) this.srcRev = reserved;
+      throw error;
+    }
   }
 
   /**

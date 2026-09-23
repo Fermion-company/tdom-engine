@@ -2755,7 +2755,7 @@ const server = http.createServer(async (req, res) => {
           }
           let openCompleted = false;
           try {
-            lastReport = await engine.open(text, context.file, { projectSeeds: !preparedImport });
+            lastReport = await engine.open(text, context.file, { canonicalBaseline: !preparedImport });
             openCompleted = true;
             if (preparedImport) {
               if (engine.srcRev !== expectedSrcRev || engine.getSource() !== text ||

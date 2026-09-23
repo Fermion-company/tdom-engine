@@ -1120,6 +1120,28 @@ export class CanonicalRenderer {
     // exact compile of this revision and is rebound to it right here, so the
     // edit response and the next anchor see canonical.rev === srcRev.
     if (!this.buildLease && this.#reconcile(source, rev)) return;
+    // engine.open() schedules the opened source before its boot walk, and the
+    // walk ends by scheduling the same revision again. That second call must
+    // neither queue a second compile of the same bytes behind the running
+    // one (it would sit out the cost cooldown as a phantom pending job) nor
+    // restart the debounce of the one still waiting. It may only bring the
+    // start forward: an opaque document (display pressure) or a closure
+    // fallback starts sooner than the structured baseline debounce.
+    // A Build lease is exempt: the Build import owns the pending job it
+    // creates here (commitBuildGeneration), whatever is already running.
+    // A baseline that already failed for these bytes is not compiled again.
+    const srcHash = this.#sourceHash(source);
+    if (!this.buildLease && !this.pendingJob && (
+      this.runningJob?.rev === rev && this.runningJob.srcHash === srcHash ||
+      !this.running && this.lastError?.rev === rev && this.lastError.srcHash === srcHash
+    )) return;
+    const waiting = this.pendingJob;
+    if (!this.buildLease && waiting && this.timer && waiting.rev === rev && waiting.inputEpoch === this.inputEpoch &&
+        waiting.source === source) {
+      if (fallbackReason && !waiting.fallbackReason) waiting.fallbackReason = fallbackReason;
+      this.#armPending(this.delayFor(waiting), { keepEarlier: true });
+      return;
+    }
     this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now(), fallbackReason };
     if (this.coldBaselineCatchup && !this.#hasColdBaselineCatchup(this.pendingJob)) {
       this.coldBaselineCatchup = null;
@@ -1371,7 +1393,12 @@ export class CanonicalRenderer {
     }
     const startedWithoutCanonical = !this.last;
     const compileEpoch = this.compileEpoch;
-    this.runningJob = { rev: job.rev, inputEpoch: job.inputEpoch, fallbackReason: job.fallbackReason };
+    this.runningJob = {
+      rev: job.rev,
+      inputEpoch: job.inputEpoch,
+      fallbackReason: job.fallbackReason,
+      srcHash: this.#sourceHash(job.source, job.inputEpoch),
+    };
     this.running = this.#compile({
       ...job,
       compileEpoch,
@@ -1385,7 +1412,11 @@ export class CanonicalRenderer {
     })
       .catch((err) => {
         if (compileEpoch !== this.compileEpoch || err?.tdomSuperseded) return;
-        this.lastError = { rev: job.rev, message: String(err?.message || err) };
+        this.lastError = {
+          rev: job.rev,
+          message: String(err?.message || err),
+          srcHash: this.#sourceHash(job.source, job.inputEpoch),
+        };
         // execFile's wall timeout keeps advancing while SIGSTOP holds a
         // pre-existing compile. Preserve that exact job for one normal
         // post-Build retry; a newer edit remains latest-wins.
