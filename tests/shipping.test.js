@@ -359,6 +359,54 @@ test('slice 3: engine integration — an edit lands a ship page event', opts, as
   }
 });
 
+test('beamer overlay labels and \\againframe certify the ship baseline (tex64-internal #76)', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  const work = path.join(WORK, 'beamer');
+  rmSync(work, { recursive: true, force: true });
+  const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
+  const deck = [
+    '\\documentclass{beamer}',
+    '\\begin{document}',
+    '\\begin{frame}{Opening}First slide body.\\end{frame}',
+    '\\begin{frame}[label=replay]{Replay}',
+    '\\only<1>{Overlay one text.}',
+    '\\only<2>{Overlay two text.}',
+    '\\end{frame}',
+    '\\begin{frame}{Plain}See frame \\ref{replay} and plain text here.\\label{plain}\\end{frame}',
+    '\\againframe<2>{replay}',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  try {
+    const arrivals = [];
+    eng.onShipWave = (info) => arrivals.push(info);
+    await eng.open(deck);
+    const t0 = Date.now();
+    while ((eng.shipRetry?.state !== 'ready' || eng.shipBooting) && Date.now() - t0 < 120_000) {
+      if (eng.shipRetry?.state === 'blocked-same-input') break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(!eng.diagnostics.some((d) => /label .* (diverged|left its written values)/.test(d)),
+      `no label reseed: ${eng.diagnostics.filter((d) => /shipping/.test(d)).join(' | ')}`);
+    assert.equal(eng.shipping?.info?.().baselineReady, true, 'the overlay deck certifies on the first boot');
+    const text = await pageText(eng.shipping.publishedPdf, 3);
+    assert.ok(!/2>|replay/.test(text), `overlay label syntax is not typeset: ${text}`);
+
+    const src = eng.getSource();
+    const at = src.indexOf('plain text here') + 'plain text'.length;
+    await eng.edit(at, at, 'X');
+    const rev = eng.srcRev;
+    const t1 = Date.now();
+    while (!arrivals.some((a) => a.srcRev === rev) && Date.now() - t1 < 30_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(arrivals.some((a) => a.srcRev === rev), 'an edit in the deck lands a ship wave');
+  } finally {
+    delete process.env.TDOM_SHIP;
+    await eng.close();
+  }
+});
+
 test('four healthy structural rebaselines do not exhaust shipping recovery', opts, async () => {
   process.env.TDOM_SHIP = '1';
   const previousCanonicalIdle = process.env.TDOM_CANON_IDLE;

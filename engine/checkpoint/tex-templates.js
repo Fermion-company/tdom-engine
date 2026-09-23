@@ -23,6 +23,56 @@ function appendColumnState(L, state) {
 export const IMAKEIDX_READ_ONLY =
   '\\makeatletter\\@ifpackageloaded{imakeidx}{\\chardef\\imki@shellescape=\\z@}{}\\makeatother';
 
+/**
+ * \label capture that keeps the document's own \label syntax. The old
+ * `\renewcommand\label[1]` wrappers read beamer's \label<2>{key} as the key
+ * `<` and typeset `2>{key}` on the slide, so ShippingChain's pages never
+ * matched canonical (tex64-internal #76). Overlay (<...>) and cleveref
+ * ([type]) forms now reach the saved original untouched.
+ *
+ * Where the kernel's \label runs the `label` hook (LaTeX 2023-06+), the
+ * capture lives in that hook: it records exactly the labels the original
+ * really defines (beamer defines \label<2> on slide 2 only, and \againframe
+ * re-defines it). A \label that bypasses the hook still gets the wrapper's
+ * capture, so older kernels and foreign \label implementations keep the
+ * previous behaviour.
+ *
+ *   save    name for the saved original (no @: callers differ in catcodes)
+ *   capture (param) => TeX recording key `param` with \@currentlabel
+ *   after   (param) => TeX run after every call (cleveref companion)
+ *   ltx     name for amsmath's saved \ltx@label, or null
+ */
+export function labelCaptureShim({ save, capture, after = () => '', ltx = null }) {
+  const hit = `${save}hit`;
+  const seen = `${save}hookseen`;
+  const L = [];
+  L.push(`\\let\\${save}\\label`);
+  L.push(`\\newif\\if${hit}\\newif\\if${seen}`);
+  L.push(
+    `\\ifdefined\\AddToHookWithArguments\\AddToHookWithArguments{label}` +
+      `{\\global\\${hit}true\\global\\${seen}true${capture('#1')}}\\fi`
+  );
+  L.push(`\\def\\label{\\@ifnextchar<{\\${save}Overlay}{\\@ifnextchar[{\\${save}Typed}{\\${save}One}}}`);
+  L.push(`\\long\\def\\${save}One#1{\\global\\${hit}false\\${save}{#1}\\if${hit}\\else${capture('#1')}\\fi${after('#1')}}`);
+  L.push(`\\long\\def\\${save}Typed[#1]#2{\\global\\${hit}false\\${save}[#1]{#2}\\if${hit}\\else${capture('#2')}\\fi${after('#2')}}`);
+  // An overlay label that did not define anything this slide is silent;
+  // only a kernel whose \label never ran the hook falls back to capturing.
+  L.push(
+    `\\long\\def\\${save}Overlay<#1>#2{\\global\\${hit}false\\${save}<#1>{#2}` +
+      `\\if${hit}\\else\\if${seen}\\else${capture('#2')}\\fi\\fi${after('#2')}}`
+  );
+  if (ltx) {
+    // amsmath routes display-math labels through \ltx@label, saved at
+    // package load before this shim; it calls the kernel \label, whose
+    // hook already captured the key.
+    L.push(`\\ifdefined\\ltx@label\\let\\${ltx}\\ltx@label`);
+    L.push(
+      `\\def\\ltx@label#1{\\global\\${hit}false\\${ltx}{#1}\\if${hit}\\else${capture('#1')}\\fi${after('#1')}}\\fi`
+    );
+  }
+  return L;
+}
+
 export function buildDriverSource({
   preamble,
   daemonPath,
@@ -85,18 +135,12 @@ export function buildDriverSource({
         '\\endgroup\\@esphack}'
     );
   }
-  L.push('\\let\\TDOMlabel\\label');
-  L.push(
-    "\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}" +
-      crefCapture + '}'
-  );
-  // amsmath routes display-math labels through \ltx@label (captured at
-  // package load, before our shim) — intercept that path too
-  L.push('\\ifdefined\\ltx@label\\let\\TDOMltxlabel\\ltx@label');
-  L.push(
-    "\\def\\ltx@label#1{\\TDOMltxlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}" +
-      crefCapture + '}\\fi'
-  );
+  L.push(...labelCaptureShim({
+    save: 'TDOMlabel',
+    ltx: 'TDOMltxlabel',
+    capture: (key) => `\\directlua{tdom_label('\\luaescapestring{${key}}','\\luaescapestring{\\@currentlabel}')}`,
+    after: (key) => crefCapture.replaceAll('#1', key),
+  }));
   L.push('\\let\\TDOMref\\ref');
   L.push("\\renewcommand\\ref[1]{\\directlua{tdom_ref('\\luaescapestring{#1}')}\\TDOMref{#1}}");
   L.push('\\let\\TDOMpageref\\pageref');
@@ -448,16 +492,12 @@ export function buildIsoCompileSource({
   // shims (\TDOMlabel & co, boot driver): a fork-mode iso inherits those
   // wrappers, and \let\TDOMlabel\label would overwrite the root's saved
   // original with the wrapper itself — infinite recursion on first \label
-  L.push('\\let\\TDOMisolabel\\label');
-  L.push(
-    "\\renewcommand\\label[1]{\\TDOMisolabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}'," + isoHref + ')}' +
-      isoCrefCapture + '}'
-  );
-  L.push('\\ifdefined\\ltx@label\\let\\TDOMisoltxlabel\\ltx@label');
-  L.push(
-    "\\def\\ltx@label#1{\\TDOMisoltxlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}'," + isoHref + ')}' +
-      isoCrefCapture + '}\\fi'
-  );
+  L.push(...labelCaptureShim({
+    save: 'TDOMisolabel',
+    ltx: 'TDOMisoltxlabel',
+    capture: (key) => `\\directlua{tdom_iso_label('\\luaescapestring{${key}}','\\luaescapestring{\\@currentlabel}',${isoHref})}`,
+    after: (key) => isoCrefCapture.replaceAll('#1', key),
+  }));
   // ref-use recording: a rescued block that references a label must be
   // re-rescued when that label's value changes (the cache key carries the
   // referenced values — see #rescueBlock)

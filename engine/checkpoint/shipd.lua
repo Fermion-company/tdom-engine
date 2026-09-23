@@ -192,6 +192,9 @@ end
 
 function tdom_ship_label(key, val)
   if ROLE == 'pager' then return end
+  -- amsmath hands \ltx@label (and so the kernel label hook) the key WITH
+  -- its braces ({eq:x}); strip one pair like the resident daemon does
+  if key:sub(1, 1) == '{' and key:sub(-1) == '}' then key = key:sub(2, -2) end
   send('SLABEL ' .. (PAGE + 1) .. ' ' .. #key .. ' ' .. #val .. '\n')
   send(key)
   send(val)

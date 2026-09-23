@@ -2,7 +2,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { ShippingChain } from './shipping.js';
-import { shippingLabelSeed } from './shipping-seeds.js';
+import { auxLabelValues, shippingLabelSeed } from './shipping-seeds.js';
 import { sharedCheckpointBudget } from './checkpoint-retirement.js';
 
 const RETRY_LIMIT = 3;
@@ -364,18 +364,35 @@ export function makeShippingChain(engine, queueShipBoot) {
     engine.onShipWave?.({ ...wave, srcRev: engine.shipGenRev.get(wave.gen) ?? 0 });
   };
   chain.onLabel = ({ key, val }) => {
+    const written = engine.shipAuxLabelValues?.get(key);
+    if (written?.length > 1) {
+      // A label the production aux defines several times (beamer overlays,
+      // \againframe) is reported once per definition. Any value that
+      // production also wrote is expected; comparing each report with one
+      // seed made the reseed oscillate between them (#76).
+      if (!written.includes(String(val)) && !engine.shipStale) {
+        engine.shipStale = true;
+        engine.diagnostics.push(`shipping: label ${key} left its written values (${val}) — reseeding`);
+        queueShipBoot();
+      }
+      return;
+    }
     const known = engine.labelTable.get(key);
     const seeded = engine.shipLabelOverrides.get(key) ?? known;
-    if (seeded !== undefined && String(seeded) !== String(val) && !engine.shipStale) {
+    if (seeded !== undefined && String(seeded) !== String(val)) {
       // backward effect: a label value the seeds promised has moved —
       // EARLIER pages may print stale numbers. Record the SHIP-observed
       // truth and reboot with corrected seeds (bounded: a divergence the
       // reseed cannot absorb must not loop). Until then the cold
-      // canonical owns the display truth.
-      engine.shipStale = true;
+      // canonical owns the display truth. The stale run keeps harvesting:
+      // every later divergence lands in the overrides too, so one reboot
+      // converges instead of relearning one label per boot.
       engine.shipLabelOverrides.set(key, val);
-      engine.diagnostics.push(`shipping: label ${key} diverged (${seeded} -> ${val}) — reseeding`);
-      queueShipBoot();
+      if (!engine.shipStale) {
+        engine.shipStale = true;
+        engine.diagnostics.push(`shipping: label ${key} diverged (${seeded} -> ${val}) — reseeding`);
+        queueShipBoot();
+      }
     } else if (seeded === undefined) {
       engine.shipLabelOverrides.set(key, val);
     }
@@ -439,6 +456,7 @@ export async function bootShipping(engine, { makeShipping, paginateNow, computeT
     );
     const toc = computeToc(prov);
     const seedFiles = canonicalGeneration.seedFiles;
+    engine.shipAuxLabelValues = auxLabelValues(seedFiles.aux);
     engine.shipDesiredInputSnapshot = snapshot.snapshotId;
     if (engine.shipBootedFor !== null || engine.shipping.rootPeer || engine.shipping.disposed) {
       // a previous run exists: replace the whole instance (its net server

@@ -24,7 +24,7 @@ import path from 'node:path';
 import { withProjectInputs } from '../project-inputs.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { segmentBody, documentBounds } from '../segmenter.js';
-import { IMAKEIDX_READ_ONLY } from './tex-templates.js';
+import { IMAKEIDX_READ_ONLY, labelCaptureShim } from './tex-templates.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
 import { ensureShim } from './forkshim.js';
 import { distinctCheckpointPeerCount } from './checkpoint-retirement.js';
@@ -776,10 +776,11 @@ export class ShippingChain {
       }
     }
     // capture labels at definition time (the aux is never read back)
-    L.push('\\let\\TDOMshiplabel\\label');
-    L.push(
-      "\\renewcommand\\label[1]{\\TDOMshiplabel{#1}\\directlua{tdom_ship_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}}"
-    );
+    L.push(...labelCaptureShim({
+      save: 'TDOMshiplabel',
+      ltx: 'TDOMshipltxlabel',
+      capture: (key) => `\\directlua{tdom_ship_label('\\luaescapestring{${key}}','\\luaescapestring{\\@currentlabel}')}`,
+    }));
     L.push('\\makeatother');
     // TeX-side tail loop: one input level per fed line (see tdom_ship_feed)
     L.push('\\def\\TDOMshiploop{\\directlua{tdom_ship_feed()}\\TDOMshiploop}');
