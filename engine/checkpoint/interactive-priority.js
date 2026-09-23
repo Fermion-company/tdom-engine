@@ -22,7 +22,9 @@ export function shippingPriorityQuietMs(engine, fallbackMs = 0) {
     engine.shipDisabledFor !== engine.preHash;
   if (!eligible) return fallback;
 
-  const cutoff = finiteNonNegative(process.env.TDOM_SHIP_WAVE_CUTOFF, 700);
+  const cutoff = typeof chain.visibleCutoffMs === 'function'
+    ? finiteNonNegative(chain.visibleCutoffMs(), 1000)
+    : finiteNonNegative(process.env.TDOM_SHIP_WAVE_CUTOFF, 700);
   const configured = process.env.TDOM_SHIP_PRIORITY_QUIET_MS;
   const defaultPriority = Math.max(900, cutoff + 50);
   const priority = configured == null

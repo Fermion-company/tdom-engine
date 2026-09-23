@@ -15,6 +15,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
 
   const bounds = documentBounds(text);
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
+  engine.literalEnvs = bounds.literalEnvs;
   const preHash = fnv1a(preamble);
 
   // Keep both the old page tree and its block boundaries while the user is
@@ -26,7 +27,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   // The lexical gate is not a TeX parser: canonical must still compile the
   // current input, either proving it valid or reporting the actual error.
   if (engine.blocks.length) {
-    const preClosure = sourceClosure(preamble);
+    const preClosure = sourceClosure(preamble, { literalEnvs: bounds.literalEnvs });
     if (!preClosure.closed) {
       timer.lap('closure');
       return { response: deferClosureUpdate(editLabel, timer, { ...preClosure, scope: 'preamble' }) };
@@ -54,8 +55,12 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   const rawStructuralGate = classifyStructuralAliases(preamble, bodyText);
   let segs = segmentBody(bodyText, bounds.body.start, {
     structuralEvents: rawStructuralGate.segmentEvents,
+    literalEnvs: bounds.literalEnvs,
   });
-  segs = expandIncludes(segs, 0, { structuralEvents: rawStructuralGate.segmentEvents });
+  segs = expandIncludes(segs, 0, {
+    structuralEvents: rawStructuralGate.segmentEvents,
+    literalEnvs: bounds.literalEnvs,
+  });
   // Macro wrappers can hide output-routine environments from both the raw
   // segmenter and block rescue classifier. Analyse the expanded project body
   // before granting structured display; an exact canonical page is the only
@@ -74,7 +79,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   ];
   if (engine.blocks.length) {
     for (const seg of segs) {
-      const closure = sourceClosure(seg.text);
+      const closure = sourceClosure(seg.text, { literalEnvs: bounds.literalEnvs });
       if (!closure.closed) {
         timer.lap('closure');
         return {
@@ -93,7 +98,10 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   // sparse resident skeleton once for this source generation; subsequent
   // JOBs reuse it unless a genuinely hotter block changes the top set.
   engine.checkpointKeepCache = null;
-  engine.maxCheckpoints = checkpointBudgetFor(engine.blocks.length, { ceiling: engine.checkpointCeiling });
+  engine.maxCheckpoints = checkpointBudgetFor(engine.blocks.length, {
+    ceiling: engine.checkpointCeiling,
+    pageCount: engine.canonicalPageCount,
+  });
   if (shippingExactUses.length) {
     engine.previewPolicy = 'shipping-exact';
     engine.previewReasons = [...new Set(shippingExactUses.flatMap((use) =>

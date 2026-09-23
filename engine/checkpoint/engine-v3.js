@@ -44,7 +44,7 @@
 // into an SVG chunk, swapped in asynchronously.
 
 import net from 'node:net';
-import { readFileSync } from 'node:fs';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureShim } from './forkshim.js';
@@ -102,7 +102,7 @@ import {
 } from './canonical-arrival.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
 import { adoptGalleyBlock } from './galley-adoption.js';
-import { checkpointKeepSet, nearestCheckpoint,
+import { checkpointBudgetFor, checkpointKeepSet, nearestCheckpoint,
   nextTypesetCost,
   gridMissingBoundaries,
 } from './checkpoint-selection.js';
@@ -117,9 +117,17 @@ import {
   bootShipping as bootShippingHelper,
   makeShippingChain,
   queueShipBoot as queueShipBootHelper,
+  shippingBaselineInFlight,
   shipUpdate as shipUpdateHelper,
 } from './shipping-manager.js';
 import { opaqueUpdate as opaqueUpdateHelper } from './opaque-mode.js';
+import {
+  clearShipPacing,
+  deferShipUpdate,
+  immediateShipUpdate,
+  noteDisplayDemand as noteDisplayDemandHelper,
+  noteShipActivity,
+} from './ship-pacing.js';
 import { scheduleStructuredReprobe as scheduleStructuredReprobeHelper } from './structured-reprobe.js';
 import { teardownResidentTree } from './teardown-tree.js';
 import {
@@ -200,6 +208,7 @@ export class CheckpointEngine {
       this.overlayDir = nextOverlay;
       clearTimeout(this.shipBootTimer);
       this.shipBootTimer = null;
+      clearShipPacing(this);
       if (this.shipping) {
         await this.shipping.close().catch(() => {});
         this.shipping = this.#makeShipping();
@@ -263,6 +272,8 @@ export class CheckpointEngine {
   }
 
   async warmEditOffset(offset, file = this.file) {
+    // A caret move is the earliest sign of editing: it boots a retired chain.
+    if (!this.closed) this.#noteShipActivity();
     const sourceFile = path.resolve(this.docDir, file);
     const rootFile = path.resolve(this.docDir, this.file);
     const source = sourceFile === rootFile ? this.getSource() : this.includes.get(sourceFile)?.text;
@@ -1258,6 +1269,7 @@ export class CheckpointEngine {
       this.onDocumentResetPending?.(event);
     };
     if (!args.coldResume) {
+      this.#noteShipActivity();
       this.lastEditAt = Date.now(); // pauses the idle-gated isolated renders
       const foregroundLeaseMs = shippingPriorityQuietMs(this, 0);
       this.foregroundLeaseMs = foregroundLeaseMs;
@@ -1430,7 +1442,7 @@ export class CheckpointEngine {
         timer: t,
         callbacks: {
           queueChainWork: (kind, from, labels) => this.#queueChainWork(kind, from, labels),
-          shipUpdate: (sourceText, changes) => this.#shipUpdate(sourceText, changes),
+          shipUpdate: (sourceText, changes) => this.#shipNow(sourceText, changes),
           scheduleBackground: (from, dirtyBlocks) => this.#scheduleBackground(from, dirtyBlocks),
           fidelitySummary: () => this.#fidelitySummary(),
         },
@@ -1518,7 +1530,8 @@ export class CheckpointEngine {
         scheduleHeaders: () => this.#scheduleHeaders(),
         enforceCheckpointCap: () => this.#enforceCheckpointCap(),
         scheduleBackground: (fgStop, dirtyBlocks, options) => this.#scheduleBackground(fgStop, dirtyBlocks, options),
-        shipUpdate: (sourceText, changes) => this.#shipUpdate(sourceText, changes),
+        shipUpdate: (sourceText, changes) => this.#shipNow(sourceText, changes),
+        deferShipUpdate: (sourceText, changes) => this.#shipLater(sourceText, changes),
         fidelitySummary: () => this.#fidelitySummary(),
       },
     });
@@ -1573,6 +1586,42 @@ export class CheckpointEngine {
     shipUpdateHelper(this, text, projectInputChanges, () => this.#queueShipBoot());
   }
 
+  // tex64-internal #72: see ship-pacing.js. A keystroke the viewer cannot
+  // paint from resident pages reaches the chain now; a paintable one waits
+  // for typing to pause.
+  #shipNow(text, projectInputChanges = null) {
+    immediateShipUpdate(this, text, projectInputChanges, (t, c) => this.#shipUpdate(t, c));
+  }
+
+  #shipLater(text, projectInputChanges = null) {
+    deferShipUpdate(this, text, projectInputChanges, (t, c) => this.#shipUpdate(t, c));
+  }
+
+  /** The viewer asked for canonical pixels of the current revision. */
+  noteDisplayDemand() {
+    return noteDisplayDemandHelper(this, (t, c) => this.#shipUpdate(t, c));
+  }
+
+  #noteShipActivity() {
+    noteShipActivity(this, {
+      retire: () => this.#retireShipping(),
+      reboot: () => this.#queueShipBoot(),
+    });
+  }
+
+  /** Free an idle chain's process tree; the next caret move or edit boots it. */
+  async #retireShipping() {
+    const previous = this.shipping;
+    if (!previous) return;
+    clearTimeout(this.shipBootTimer);
+    this.shipBootTimer = null;
+    this.shipping = this.#makeShipping();
+    this.shipBootedFor = null;
+    this.shipDesiredCanonicalId = null;
+    this.shipDesiredCanonicalHash = null;
+    await previous.close().catch(() => {});
+  }
+
   #opaqueUpdate(editLabel, t, reasons, projectInputChanges = null) {
     return opaqueUpdateHelper(this, editLabel, t, reasons, {
       teardownTree: () => this.#teardownTree(),
@@ -1606,6 +1655,20 @@ export class CheckpointEngine {
       cropCanonicalChunks: (canonicalInfo) => this.#cropCanonicalChunks(canonicalInfo),
       teardownTree: () => this.#teardownTree(),
     });
+    if (!info?.error && info.rev === this.srcRev && this.mode === 'structured') {
+      const prior = this.maxCheckpoints;
+      this.canonicalPageCount = Math.max(1, Math.floor(Number(info.pageCount) || 1));
+      this.maxCheckpoints = checkpointBudgetFor(this.blocks.length, {
+        ceiling: this.checkpointCeiling,
+        pageCount: this.canonicalPageCount,
+      });
+      if (this.maxCheckpoints !== prior) {
+        this.checkpointKeepCache = null;
+        if (this.maxCheckpoints < prior) this.#enforceCheckpointCap();
+        else void this.maintainGrid();
+      }
+    }
+    if (!info?.error) this.#syncResidentIndex();
     // Canonical convergence supplies the exact checkpoint authority whenever
     // the current lineage cannot represent the source (initial boot,
     // structural edit, divergence, or failed chain). A healthy plain-edit
@@ -1615,11 +1678,15 @@ export class CheckpointEngine {
     if (!info?.error && info.rev === this.srcRev) {
       const source = this.store.get(this.file);
       const generation = this.canonical.sourceMatches(source) ? this.canonical.last : null;
-      const needsBaseline = this.shipBootedFor === null ||
+      // A baseline still being built settles and replays forward; a ready
+      // chain that is only behind (a held or rejected replay) replays
+      // forward on its next update. Neither needs a new baseline.
+      const needsBaseline = !shippingBaselineInFlight(this) && (
+        this.shipBootedFor === null ||
         !this.shipping?.info?.().baselineReady ||
         this.shipStale || !!this.shipping?.err ||
-        this.shipping?.source !== source;
-      if (needsBaseline && generation?.id === info.id && generation.seedFiles &&
+        (this.shipping?.source !== source && !this.shipping?.replayableFrom?.(source)));
+      if (needsBaseline && !this.shipIdleRetired && generation?.id === info.id && generation.seedFiles &&
           this.shipDesiredCanonicalId !== generation.id) {
         this.shipDesiredCanonicalId = generation.id;
         this.shipDesiredCanonicalHash = generation.pdfHash ?? null;
@@ -1627,6 +1694,25 @@ export class CheckpointEngine {
         this.#queueShipBoot();
       }
     }
+  }
+
+  // The resident job is `driver`: give its \printindex the index canonical's
+  // makeindex produced. The index block's resource signature (see
+  // decorateExternalResources) then dirties it on the next update. A
+  // generation without an index (a Build import carries only the aux family)
+  // leaves the last one in place; nothing reads it once \printindex is gone.
+  #syncResidentIndex() {
+    const next = this.canonical.last?.seedFiles?.ind;
+    if (typeof next !== 'string') return;
+    const target = path.join(this.workDir, 'driver.ind');
+    let current = null;
+    try { current = readFileSync(target, 'utf8'); } catch { /* no index yet */ }
+    if (next === current) return;
+    try {
+      const staged = `${target}.${process.pid}.tmp`;
+      writeFileSync(staged, next, 'utf8');
+      renameSync(staged, target);
+    } catch { /* the resident keeps its last index; canonical still shows the right one */ }
   }
 
   async #cropCanonicalChunks(info) {
@@ -2082,6 +2168,7 @@ export class CheckpointEngine {
       source,
       file: this.file,
       structuralEvents: options.structuralEvents,
+      literalEnvs: options.literalEnvs,
       docDir: this.docDir,
       overlayDir: this.overlayDir,
       workDir: this.workDir,

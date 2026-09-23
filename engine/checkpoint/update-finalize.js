@@ -3,6 +3,7 @@ import { reconcile } from './pagebuilder.js';
 import { nextEditHold, editPageRenderIds } from './update-helpers.js';
 import { buildPagePatches } from './page-patches.js';
 import { buildUpdateResponse } from './update-response.js';
+import { residentPaintable } from './ship-pacing.js';
 
 export function finalizeUpdate(engine, {
   text,
@@ -17,8 +18,10 @@ export function finalizeUpdate(engine, {
   timer,
   callbacks,
 }) {
-  const { paginateNow, displayList, scheduleHeaders, enforceCheckpointCap, scheduleBackground, shipUpdate, fidelitySummary } =
-    callbacks;
+  const {
+    paginateNow, displayList, scheduleHeaders, enforceCheckpointCap, scheduleBackground,
+    shipUpdate, deferShipUpdate = shipUpdate, fidelitySummary,
+  } = callbacks;
   const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict, cold = null } = typesetResult;
   // pin the edit locus so the next keystroke is fork-once, typeset-once
   engine.editHold = rebooted ? [] : nextEditHold(fgStop, dirtySource, engine.blocks, engine.editHold);
@@ -61,7 +64,14 @@ export function finalizeUpdate(engine, {
     // Bind shipping and the foreground exact-render cohort to the same source
     // revision. Cold work keeps the shipping priority window; edited blocks
     // and their changed neighbors may supply an earlier complete preview.
-    shipUpdate(text, projectInputChanges);
+    // A keystroke the viewer paints from these resident patches only needs
+    // the replay to upgrade its pages later: hold it until typing pauses
+    // (tex64-internal #72, ship-pacing.js).
+    if (residentPaintable(engine, pages, patches, projectInputChanges)) {
+      deferShipUpdate(text, projectInputChanges);
+    } else {
+      shipUpdate(text, projectInputChanges);
+    }
     // converge to exact: the canonical compile of THIS source is scheduled
     // off the hot path; when it lands the client swaps every clean page to
     // LuaLaTeX's own pixels

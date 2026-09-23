@@ -995,11 +995,21 @@ engine.onDeferredUpdate = (report) => {
 };
 // canonical compiles land asynchronously: tell every client so it can
 // converge its pages to the exact LuaLaTeX render
+// Where the user is editing (last keystroke or caret warm). The proof
+// inputs of the NEXT keystroke there depend on the canonical generation
+// that lands meanwhile: without a refetch, every keystroke after the first
+// spent its proof budget extracting a fresh generation's paint index and
+// fell back (tex64-internal #66: PDF_PAINT_INDEX_UNAVAILABLE).
+let anchorFocus = null;
+
 engine.onCanonical = (info) => {
   if (terminalAnchorLineage && info.id !== terminalAnchorLineage.baseGeneration) {
     terminalAnchorLineage = null;
   }
   broadcast({ kind: 'canonical', canonical: info, mode: engine.mode });
+  if (anchorFocus && !info.error && info.rev === engine.srcRev) {
+    try { prefetchWarmAnchorProof(anchorFocus.offset, anchorFocus.filePath); } catch { /* best effort */ }
+  }
 };
 // Incremental authority (TDOM_SHIP=1): one complete replay PDF reached
 // normal document end. The client atomically swaps its visible pages and
@@ -1829,6 +1839,9 @@ const server = http.createServer(async (req, res) => {
             demandId: body.demandId ?? null,
             residentImpossible: body.residentImpossible ?? false,
           });
+      // A held ShippingChain replay is the fastest exact answer to a viewer
+      // that could not paint the resident pages (tex64-internal #72).
+      if (body.fulfilled !== true) engine.noteDisplayDemand?.();
       return json(res, { ok: true, ...result, documentEpoch, srcRev: body.srcRev,
         demandId: body.demandId ?? null, scheduledInMs: engine.canonical.info().scheduledInMs });
     }
@@ -1904,6 +1917,7 @@ const server = http.createServer(async (req, res) => {
       }
       const filePath = typeof body.filePath === 'string' ? body.filePath : engine.file;
       const requestedFile = path.resolve(activeProject.docDir, filePath);
+      if (Number.isFinite(offset)) anchorFocus = { offset, filePath };
       const warmProofRequest = ++warmProofRequestSeq;
       const warming = engine.canonical.waitForBuildLease().then(() => {
         if (warmProofRequest !== warmProofRequestSeq) return { status: 'stale' };
@@ -2262,6 +2276,7 @@ const server = http.createServer(async (req, res) => {
       if (typeof start !== 'number' || typeof end !== 'number' || typeof text !== 'string') {
         return json(res, { error: 'edit requires {start, end, text}' }, 400);
       }
+      anchorFocus = { offset: start + text.length, filePath: typeof body.filePath === 'string' ? body.filePath : null };
       let anchorEpoch = null;
       let resetEpoch = null;
       let anchorInputSafe = false;

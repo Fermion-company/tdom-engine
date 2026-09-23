@@ -301,10 +301,23 @@ test('safety gate: clean documents pass, page-mechanism hazards demote', () => {
   assert.deepEqual(switchedColumns.previewReasons, ['body column switch']);
   assert.equal(classifyDocument('\\documentclass[landscape]{article}', '').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}\\AtBeginShipout{x}', '').safe, false);
-  assert.equal(classifyDocument('\\documentclass{article}\\usepackage{pdflscape}', 'body').safe, false);
+  assert.equal(classifyDocument('\\documentclass{article}', '\\output={\\shipout\\box255}').safe, false);
+  assert.equal(classifyDocument('\\documentclass{article}', '\\AddToHook{shipout/before}{x}').safe, false);
+  assert.equal(
+    classifyDocument('\\documentclass{article}', '\\begin{verbatim}\\output={x}\\end{verbatim}').safe,
+    true,
+    'literal examples do not acquire primitive access'
+  );
+  // tex64-internal #64: rotated pages keep the document structured; the
+  // canonical/ShippingChain surface shows them in their own geometry.
+  const landscapePackage = classifyDocument('\\documentclass{article}\\usepackage{pdflscape}', 'body');
+  assert.equal(landscapePackage.safe, true);
+  assert.equal(landscapePackage.previewPolicy, 'shipping-exact');
   assert.equal(classifyDocument('\\documentclass{article}', '\\pagewidth=420pt body').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}', '\\pdfvariable pageattr{/Rotate 90} body').safe, false);
-  assert.equal(classifyDocument('\\documentclass{article}', '\\begin{landscape}body\\end{landscape}').safe, false);
+  const landscapeBody = classifyDocument('\\documentclass{article}', '\\begin{landscape}body\\end{landscape}');
+  assert.equal(landscapeBody.safe, true);
+  assert.equal(landscapeBody.previewPolicy, 'shipping-exact');
   // \marginpar stays STRUCTURED since the canonical-only block tier
   // (paper drafts carry \todo marks routinely): the block's body typesets
   // in-chain, the margin pixels come from the canonical layer
@@ -1230,5 +1243,36 @@ test('Build seeds let the first post-Build canonical reach its fixpoint in one p
     assert.equal(c.info().passes, 1, 'the seeded aux family is the fixpoint of a body edit');
   } finally {
     c.dispose();
+  }
+});
+
+test('canonical runs makeindex between passes, as the Build does (tex64-internal #68)', opts, async () => {
+  const work = `${WORK}-index`;
+  rmSync(work, { recursive: true, force: true });
+  const doc = (word) => [
+    '\\documentclass{article}',
+    '\\usepackage{makeidx}',
+    '\\makeindex',
+    '\\begin{document}',
+    `${word}\\index{alpha}`,
+    '\\clearpage',
+    'Beta\\index{beta}',
+    '\\printindex',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const c = new CanonicalRenderer({ workDir: work, debounceMs: 0 });
+  try {
+    const first = await c.ensure(doc('Alpha'), 1);
+    assert.equal(first.pageCount, 3, 'the index page is part of the output');
+    assert.match(first.seedFiles.ind, /\\item alpha, 1/);
+    // A body edit that leaves every \index entry alone reuses the index:
+    // one pass, no makeindex.
+    const second = await c.ensure(doc('Alpha edited'), 2);
+    assert.equal(second.pageCount, 3);
+    assert.equal(second.passes, 1);
+  } finally {
+    await c.dispose?.();
+    rmSync(work, { recursive: true, force: true });
   }
 });

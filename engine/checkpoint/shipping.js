@@ -23,13 +23,18 @@ import {
 import path from 'node:path';
 import { withProjectInputs } from '../project-inputs.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { segmentBody } from '../segmenter.js';
+import { segmentBody, documentBounds } from '../segmenter.js';
+import { IMAKEIDX_READ_ONLY, labelCaptureShim } from './tex-templates.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
 import { ensureShim } from './forkshim.js';
 import { distinctCheckpointPeerCount } from './checkpoint-retirement.js';
 
 const execFileP = promisify(execFile);
 const DIR = path.dirname(fileURLToPath(import.meta.url));
+// Converged canonical files the chain reads under its own jobname. The index
+// (.ind, made by canonical's makeindex) keeps \printindex pages identical to
+// canonical; without it the baseline would end short of the index.
+const SHIP_SEED_EXTENSIONS = ['aux', 'toc', 'lof', 'lot', 'out', 'ind'];
 const luaStr = (s) => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 const PLAIN_EDIT_UNSAFE = /[\\{}$%&#^_\r\n]/;
 const DOCUMENT_EFFECT_UNSAFE = /\\(?:catcode|every(?:par|job|cr|math|display)|output|directlua|latelua|newwrite|openout|write|immediate|special|pdfextension|shipout)\b/;
@@ -86,9 +91,14 @@ function plainReplayEdit(before, after) {
   // NOT an admission boundary: a checkpoint preceding the complete source
   // unit re-reads the opening brace, scans the argument again, and closes it
   // before the next unit.  resume() proves that whole-unit replay below.
-  // Math/comments and a control-word splice remain unsafe because the changed
+  // Math is no exception: the replay re-reads the whole unit from a
+  // checkpoint before it, so a letter typed inside \[...\] or $...$ is as
+  // exact as one typed in prose. Environment math (equation, align) was
+  // never tracked here and always replayed; display/inline math went to a
+  // full reboot on every keystroke (tex64-internal #64, 04 textbook). The
+  // delimiters themselves stay out through PLAIN_EDIT_UNSAFE.
+  // Comments and a control-word splice remain unsafe because the changed
   // bytes are not ordinary visible character tokens.
-  let math = null;
   let comment = false;
   for (let index = 0; index < start; index++) {
     const char = before[index];
@@ -98,15 +108,11 @@ function plainReplayEdit(before, after) {
     }
     if (char === '%') { comment = true; continue; }
     if (char === '\\') {
-      const symbol = before[index + 1];
-      if (symbol === '(' || symbol === '[') math = symbol;
-      else if ((symbol === ')' && math === '(') || (symbol === ']' && math === '[')) math = null;
       index++;
       continue;
     }
-    if (char === '$') math = math ? null : '$';
   }
-  return !comment && math === null &&
+  return !comment &&
     !/\\[A-Za-z@]*$/.test(before.slice(0, start));
 }
 
@@ -128,6 +134,22 @@ function singleReplayUnit(oldUnits, newUnits) {
   return changed;
 }
 
+/** Displayed box of every page, as the canonical renderer reports it:
+ * width/height after /Rotate, in bp. */
+async function pdfPapers(document) {
+  const papers = [];
+  for (let index = 1; index <= document.numPages; index++) {
+    const page = await document.getPage(index);
+    const [x1, y1, x2, y2] = page.view;
+    const rotation = ((Math.round(Number(page.rotate) || 0) % 360) + 360) % 360;
+    const quarterTurn = rotation === 90 || rotation === 270;
+    const w = Math.abs(x2 - x1);
+    const h = Math.abs(y2 - y1);
+    papers.push({ w: quarterTurn ? h : w, h: quarterTurn ? w : h, rotation });
+  }
+  return papers;
+}
+
 class Peer {
   constructor(socket) {
     socket.setNoDelay(true);
@@ -145,8 +167,72 @@ class Peer {
   }
 }
 
+// \include writes <file>.aux relative to the working directory of whichever
+// process reaches it: the root, a replay branch or a page child. Each of
+// them needs the include's directories, or TeX stops with "I can't write on
+// file `chapters/ch1.aux'" and the chain never boots (tex64-internal #62).
+export function includeDirectories(source) {
+  const dirs = new Set();
+  for (const match of String(source ?? '').matchAll(/\\include\s*\{([^{}]+)\}/g)) {
+    const dir = path.posix.dirname(match[1].trim());
+    if (dir === '.' || path.posix.isAbsolute(dir) || dir.split('/').includes('..')) continue;
+    dirs.add(dir);
+  }
+  return [...dirs];
+}
+
+// Each unit is its own input file, and TeX cannot scan a macro argument
+// across the end of one ("File ended while scanning use of \@topnewpage").
+// The segmenter keeps braces balanced but may cut inside a bracket argument
+// that spans lines, such as `\twocolumn[` \maketitle ... `]`. Join units
+// until every bracket argument a control word opened is closed again. A
+// bracket that stays open that long is literal text (verbatim), not an
+// argument, and must not fold the rest of the body into one unit.
+const MAX_JOINED_UNITS = 32;
+
+export function joinOpenBracketArguments(units) {
+  const joined = [];
+  let pending = '';
+  let count = 0;
+  for (const unit of units) {
+    pending += unit;
+    count++;
+    if (count < MAX_JOINED_UNITS && endsInsideBracketArgument(pending)) continue;
+    joined.push(pending);
+    pending = '';
+    count = 0;
+  }
+  if (pending) joined.push(pending);
+  return joined;
+}
+
+function endsInsideBracketArgument(text) {
+  const open = []; // brace depth at which each bracket argument opened
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '%') {
+      const newline = text.indexOf('\n', i);
+      if (newline < 0) break;
+      i = newline;
+    } else if (ch === '\\') {
+      const word = /^[A-Za-z@]+/.exec(text.slice(i + 1, i + 65));
+      if (!word) { i++; continue; }
+      i += word[0].length;
+      let next = i + 1;
+      while (text[next] === ' ' || text[next] === '\t') next++;
+      if (text[next] === '[') { open.push(depth); i = next; }
+    } else if (ch === '{') depth++;
+    else if (ch === '}') depth = Math.max(0, depth - 1);
+    else if (ch === ']' && open.length && open.at(-1) === depth) open.pop();
+  }
+  return open.length > 0;
+}
+
 export class ShippingChain {
-  constructor({ workDir, docDir, overlayDir = null, checkpointBudget = null }) {
+  constructor({
+    workDir, docDir, overlayDir = null, checkpointBudget = null, waveCutoffMs = null, pageGeometry = null,
+  }) {
     this.workDir = path.resolve(workDir);
     this.docDir = docDir ? path.resolve(docDir) : this.workDir;
     this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
@@ -166,6 +252,16 @@ export class ShippingChain {
     this.checkpoints = new Map(); // page -> Peer (state after that page)
     this.maxCheckpoints = Math.max(1, Math.floor(Number(process.env.TDOM_MAX_CHECKPOINTS) || 64));
     this.checkpointBudget = checkpointBudget;
+    this.dynamicWaveCutoffMs = waveCutoffMs;
+    // Documents whose canonical pages differ in size or /Rotate (pdflscape)
+    // need each wave page's own displayed box; the viewer otherwise draws
+    // it into the resident viewport (tex64-internal #64).
+    this.pageGeometry = pageGeometry;
+    this.wavePapers = null;
+    // TikZ positions this lineage read back (\pgfsys@getposition) and the
+    // baseline aux they are compared against (tex64-internal #64).
+    this.positionReads = new Set();
+    this.baselineAux = null;
     this.labels = new Map(); // key -> {val, page} captured this lineage
     this.pagePdf = new Map(); // page -> pdf path (current generation wins)
     this.pageGen = new Map(); // page -> generation owning pagePdf
@@ -176,6 +272,7 @@ export class ShippingChain {
     this.onWave = null; // callback({pages, gen, fromPage, elapsedMs}) — closure-ready set
     this.onLabel = null; // callback({key, val, page})
     this.onDone = null; // callback({pages, gen})
+    this.onWaveOutcome = null; // callback({gen, outcome, reason, elapsedMs})
     this.onBaselineOutcome = null; // one-shot callback after terminal gen-0 validation
     this.chainId = randomUUID();
     this.baselineIdentity = null;
@@ -199,6 +296,37 @@ export class ShippingChain {
     // a private clone of LuaTeX's already-open PDF descriptor. Kept behind a
     // flag until byte/raster stress tests prove it against cold canonical.
     this.privatePdf = process.env.TDOM_SHIP_PRIVATE_PDF !== '0';
+  }
+
+  waveCutoffMs() {
+    const configured = Number(process.env.TDOM_SHIP_WAVE_CUTOFF);
+    if (Number.isFinite(configured) && configured > 0) return Math.max(1, configured);
+    const dynamic = Number(this.dynamicWaveCutoffMs?.());
+    return Number.isFinite(dynamic) && dynamic > 0 ? Math.max(1, dynamic) : 700;
+  }
+
+  visibleCutoffMs() {
+    const configured = Number(process.env.TDOM_SHIP_VISIBLE_CUTOFF);
+    if (Number.isFinite(configured) && configured > 0) return Math.max(1, configured);
+    // Preserve the legacy one-second presentation contract for explicit
+    // stress overrides. Production's adaptive replay budget supplies its
+    // own matching presentation window below.
+    const configuredWave = Number(process.env.TDOM_SHIP_WAVE_CUTOFF);
+    if (Number.isFinite(configuredWave) && configuredWave > 0) return 1000;
+    return Math.max(1000, this.waveCutoffMs() + 300);
+  }
+
+  #reportWaveOutcome(outcome, reason = null) {
+    try {
+      this.onWaveOutcome?.({
+        gen: this.gen,
+        outcome,
+        reason,
+        elapsedMs: Math.max(0, Date.now() - this.waveStartedAt),
+      });
+    } catch {
+      /* diagnostics must not interrupt replay cleanup */
+    }
   }
 
   async #ensureServer() {
@@ -394,6 +522,10 @@ export class ShippingChain {
       this.onShip?.({ page, nline, gen });
       return;
     }
+    if (kind === 'SPOS') {
+      if (parts[1]) this.positionReads.add(parts[1]);
+      return;
+    }
     if (kind === 'SPDFROOT') {
       this.err = new Error('pdf-opened-at-root (hyperref-class document)');
       this.done = true;
@@ -445,6 +577,7 @@ export class ShippingChain {
       });
       const document = await task.promise;
       const valid = document.numPages === expectedPages;
+      this.wavePapers = valid && this.pageGeometry?.() ? await pdfPapers(document) : null;
       await document.destroy().catch(() => {});
       return valid;
     } catch {
@@ -470,6 +603,39 @@ export class ShippingChain {
     return out;
   }
 
+  /**
+   * The replay's outputs differ from the baseline only in TikZ position
+   * marks nobody in this lineage read back. mdframed's tikz frames and
+   * other `remember picture` drawings record every picture's position, so
+   * any edit above them moves these marks; the pages depend on a mark only
+   * when a cross-picture reference (or current page) reads it, and each
+   * such read is reported (SPOS). Any other byte still rejects the wave.
+   */
+  #onlyUnreadPositionDrift(manifest) {
+    const base = this.baselineManifest ?? {};
+    const names = new Set([...Object.keys(base), ...Object.keys(manifest)]);
+    const differing = [...names].filter((name) => base[name] !== manifest[name]);
+    if (differing.length !== 1 || differing[0] !== 'driver-ship.aux' ||
+        !base['driver-ship.aux'] || !manifest['driver-ship.aux'] || typeof this.baselineAux !== 'string') return false;
+    let current;
+    try {
+      current = readFileSync(path.join(this.rootOutputDir, 'driver-ship.aux'), 'utf8');
+    } catch {
+      return false;
+    }
+    const before = this.baselineAux.split('\n');
+    const after = current.split('\n');
+    if (before.length !== after.length) return false;
+    const MARK = /^\\pgfsyspdfmark \{([^{}\s]+)\}\{-?\d+\}\{-?\d+\}$/;
+    for (let index = 0; index < before.length; index++) {
+      if (before[index] === after[index]) continue;
+      const was = MARK.exec(before[index]);
+      const now = MARK.exec(after[index]);
+      if (!was || !now || was[1] !== now[1] || this.positionReads.has(was[1])) return false;
+    }
+    return true;
+  }
+
   #maybeWaveReady() {
     if (!this.done || this.wavePublishedGen === this.gen) return;
     const waveShips = this.ships.filter((ship) => ship.gen === this.gen);
@@ -485,19 +651,22 @@ export class ShippingChain {
       this.waveDeadlineTimer = null;
       this.lastRejectReason = 'page-count-changed';
       this.wavePublishedGen = this.gen; // fail closed for this generation
+      this.#reportWaveOutcome('rejected', this.lastRejectReason);
       return;
     }
     if (this.gen !== 0 &&
-        JSON.stringify(manifest) !== JSON.stringify(this.baselineManifest)) {
+        JSON.stringify(manifest) !== JSON.stringify(this.baselineManifest) &&
+        !this.#onlyUnreadPositionDrift(manifest)) {
       clearTimeout(this.waveDeadlineTimer);
       this.waveDeadlineTimer = null;
       this.lastRejectReason = 'output-manifest-changed';
       this.wavePublishedGen = this.gen; // fail closed for this generation
+      this.#reportWaveOutcome('rejected', this.lastRejectReason);
       return;
     }
     const expected = [];
     for (let page = this.waveFromPage; page <= pageCount; page++) expected.push(page);
-    const cutoffMs = Number(process.env.TDOM_SHIP_WAVE_CUTOFF ?? 700);
+    const cutoffMs = this.waveCutoffMs();
     const validatingGen = this.gen;
     const validatingSnapshotId = this.acceptedSnapshotId;
     if (this.waveValidatingGen === validatingGen) return;
@@ -515,12 +684,19 @@ export class ShippingChain {
             outcome: 'FAILED_INVARIANT',
             failureClass: 'complete-pdf-invalid',
           });
+        } else {
+          this.#reportWaveOutcome('rejected', this.lastRejectReason);
         }
         return;
       }
       if (validatingGen === 0) {
         this.baselinePages = pageCount;
         this.baselineManifest = manifest;
+        try {
+          this.baselineAux = readFileSync(path.join(this.rootOutputDir, 'driver-ship.aux'), 'utf8');
+        } catch {
+          this.baselineAux = null;
+        }
         this.publishedPdf = completePdf;
         const pdfHash = createHash('sha256').update(readFileSync(completePdf)).digest('hex');
         const manifestHash = createHash('sha256')
@@ -538,15 +714,13 @@ export class ShippingChain {
       const elapsedMs = Date.now() - this.waveStartedAt;
       if (elapsedMs >= cutoffMs) {
         this.lastRejectReason = 'deadline-exceeded';
+        this.#reportWaveOutcome('rejected', this.lastRejectReason);
         return; // never land a late "fast" result
       }
-      // Native replay must certify within the tighter engine budget, while
-      // the user-facing contract includes fetching/decoding every visible
-      // SVG and one atomic browser commit.  Sharing the 700ms engine cutoff
-      // left only ~150ms for a 21-page stress document and cancelled an
-      // otherwise valid 552ms wave.  Keep the proof budget strict but give
-      // the renderer the remainder of the one-second input-to-pixels SLA.
-      const visibleCutoffMs = Number(process.env.TDOM_SHIP_VISIBLE_CUTOFF ?? 1000);
+      // Native replay and browser presentation have separate budgets. The
+      // renderer still needs time to fetch/decode every visible SVG and make
+      // one atomic commit after the complete PDF has been certified.
+      const visibleCutoffMs = this.visibleCutoffMs();
       // The generation authority is the replay root's one complete PDF,
       // never a tail-page pager artifact. Prefix pages may reference objects
       // finalized after the checkpoint (fonts, links, destinations).
@@ -554,6 +728,7 @@ export class ShippingChain {
       this.svgCache.clear();
       this.onWave?.({
         pages: Array.from({ length: pageCount }, (_, index) => index + 1),
+        ...(this.wavePapers ? { papers: this.wavePapers } : {}),
         changedPages: expected,
         gen: validatingGen,
         snapshotId: validatingSnapshotId,
@@ -567,23 +742,25 @@ export class ShippingChain {
 
   /** \par-complete feed units: segmenter blocks, then \end{document}. */
   #unitsOf(source) {
-    const b = source.indexOf('\\begin{document}');
-    const e = source.indexOf('\\end{document}', b);
-    const bodyStart = b + '\\begin{document}'.length;
-    const body = source.slice(bodyStart, e < 0 ? source.length : e);
-    const structural = classifyStructuralAliases(source.slice(0, b), body);
-    const segments = segmentBody(body, 0, { structuralEvents: structural.segmentEvents });
+    const bounds = documentBounds(source);
+    const body = source.slice(bounds.body.start, bounds.body.end);
+    const structural = classifyStructuralAliases(source.slice(0, bounds.preamble.end), body);
+    const segments = segmentBody(body, 0, {
+      structuralEvents: structural.segmentEvents,
+      literalEnvs: bounds.literalEnvs,
+    });
     // Preserve every source byte, including the blank lines that terminate
     // paragraphs. The segmenter's `text` intentionally excludes separators;
     // rebuilding from those strings and adding an artificial `\\par` is not
     // equivalent for input-buffer callbacks such as LuaTeX-ja. Slice at the
     // same safe boundaries instead, so concatenating the units reconstructs
     // the original body exactly.
-    const units = segments.map((segment, index) => {
+    const sliced = segments.map((segment, index) => {
       const start = index === 0 ? 0 : segment.start;
       const end = segments[index + 1]?.start ?? body.length;
       return body.slice(start, end);
     });
+    const units = joinOpenBracketArguments(sliced);
     units.push('\\end{document}');
     return units;
   }
@@ -666,8 +843,7 @@ export class ShippingChain {
     const candidates = path.extname(raw) ? [raw] : [raw, `${raw}.tex`];
     if (!candidates.includes(changedPath)) return null;
     const alias = changedPath.replace(/\.tex$/i, '');
-    const bodyAt = newSource.indexOf('\\begin{document}');
-    const preamble = newSource.slice(0, Math.max(0, bodyAt));
+    const preamble = newSource.slice(0, documentBounds(newSource).preamble.end);
     const earlierUnits = this.#unitsOf(newSource).slice(0, read.rootUnit - 1);
     const earlier = earlierUnits.join('');
     if (preamble.includes(changedPath) || preamble.includes(alias) ||
@@ -706,6 +882,7 @@ export class ShippingChain {
   #driverSource(preamble, labelSeed, hasCanonicalAux = false) {
     const L = [];
     L.push(preamble.trimEnd());
+    L.push(IMAKEIDX_READ_ONLY);
     L.push('\\newcount\\TDOMdiscard');
     L.push(
       '\\AddToHook{shipout/before}{\\directlua{tdom_ship_before()}' +
@@ -724,6 +901,11 @@ export class ShippingChain {
       L.push(`\\directlua{tdom_ship_boot(${this.port}, '${luaStr(this.workDir)}', 0)}`);
     }
     L.push('\\makeatletter');
+    // report every saved TikZ position the document reads back
+    L.push(
+      "\\ifdefined\\pgfsys@getposition\\let\\TDOMshipgetpos\\pgfsys@getposition" +
+        "\\def\\pgfsys@getposition#1{\\directlua{tdom_ship_posread('\\luaescapestring{#1}')}\\TDOMshipgetpos{#1}}\\fi"
+    );
     if (!hasCanonicalAux) {
       for (const [key, val] of labelSeed ?? []) {
         if (key.startsWith('cite:')) {
@@ -735,10 +917,11 @@ export class ShippingChain {
       }
     }
     // capture labels at definition time (the aux is never read back)
-    L.push('\\let\\TDOMshiplabel\\label');
-    L.push(
-      "\\renewcommand\\label[1]{\\TDOMshiplabel{#1}\\directlua{tdom_ship_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}}"
-    );
+    L.push(...labelCaptureShim({
+      save: 'TDOMshiplabel',
+      ltx: 'TDOMshipltxlabel',
+      capture: (key) => `\\directlua{tdom_ship_label('\\luaescapestring{${key}}','\\luaescapestring{\\@currentlabel}')}`,
+    }));
     L.push('\\makeatother');
     // TeX-side tail loop: one input level per fed line (see tdom_ship_feed)
     L.push('\\def\\TDOMshiploop{\\directlua{tdom_ship_feed()}\\TDOMshiploop}');
@@ -764,9 +947,9 @@ export class ShippingChain {
     await ensureShim(this.workDir);
     await this.#ensureServer();
     if (inputState) this.#commitInputStage(this.#stageInputState(inputState));
-    const b = source.indexOf('\\begin{document}');
-    if (b < 0) throw new Error('shipping chain needs \\begin{document}');
-    const preamble = source.slice(0, b);
+    const bounds = documentBounds(source);
+    if (!bounds.hasBegin) throw new Error('shipping chain needs \\begin{document}');
+    const preamble = source.slice(0, bounds.preamble.end);
     // Units are \par-complete blocks (the segmenter's invariant): an
     // environment never straddles a feeder-loop iteration, which keeps
     // \halign-style parsers (align, tabular) away from the loop macro.
@@ -798,7 +981,7 @@ export class ShippingChain {
       path.join(this.workDir, 'driver-ship.tex'),
       this.#driverSource(preamble, labelSeed, seedFiles?.aux !== undefined)
     );
-    for (const ext of ['aux', 'toc', 'lof', 'lot', 'out']) {
+    for (const ext of SHIP_SEED_EXTENSIONS) {
       rmSync(path.join(this.workDir, `driver-ship.${ext}`), { force: true });
     }
     // Prefer the converged canonical files verbatim. In particular,
@@ -806,7 +989,7 @@ export class ShippingChain {
     // fields of \newlabel; synthesizing only value/page silently changes the
     // painted color/link state even when extracted text is identical.
     for (const [ext, content] of Object.entries(seedFiles ?? {})) {
-      if (!['aux', 'toc', 'lof', 'lot', 'out'].includes(ext)) continue;
+      if (!SHIP_SEED_EXTENSIONS.includes(ext)) continue;
       writeFileSync(path.join(this.workDir, `driver-ship.${ext}`), content);
     }
     // contents seeds: \tableofcontents & friends read these ONCE at their
@@ -818,14 +1001,19 @@ export class ShippingChain {
     }
     // --shell-escape: package.loadlib (the fork shim) is blocked in
     // restricted mode, same reason the resident root runs unrestricted
+    const includeDirs = includeDirectories(this.source);
+    for (const dir of includeDirs) mkdirSync(path.join(this.workDir, dir), { recursive: true });
     this.root = spawn('lualatex', ['--shell-escape', '-interaction=nonstopmode', 'driver-ship.tex'], {
       cwd: this.workDir,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: withProjectInputs(process.env, {
-        docDir: this.docDir,
-        overlayDir: inputState ? this.inputMirrorDir : this.overlayDir,
-      }),
+      env: {
+        ...withProjectInputs(process.env, {
+          docDir: this.docDir,
+          overlayDir: inputState ? this.inputMirrorDir : this.overlayDir,
+        }),
+        TDOM_SHIP_INCLUDE_DIRS: includeDirs.join('\n'),
+      },
     });
     let log = '';
     this.root.stdout.on('data', (d) => {
@@ -867,6 +1055,18 @@ export class ShippingChain {
    * covers the edit, {mode:'reboot-needed'} when the change reaches page-1
    * material (caller decides: full reboot or cold canonical only).
    */
+  /**
+   * `source` is one plain edit of one replay unit away from the chain's
+   * current source: resume() can replay it without a reboot. Pacing asks
+   * this before it lets a held keystroke wait for the next one
+   * (tex64-internal #72).
+   */
+  replayableFrom(source) {
+    if (source === this.source) return true;
+    if (!this.source || !plainReplayEdit(this.source, source)) return false;
+    return singleReplayUnit(this.lines, this.#unitsOf(source)) !== null;
+  }
+
   resume(newSource, nextInputState = null) {
     if (this.gen === 0 && this.baselinePages === null) {
       this.lastRejectReason = 'baseline-not-certified';
@@ -1003,7 +1203,7 @@ export class ShippingChain {
     const slots = Math.max(0, this.checkpointLimit() - distinctCheckpointPeerCount(this.checkpoints));
     const stride = slots > 0 ? Math.max(1, Math.ceil((this.baselinePages - best.page) / slots)) : 0;
     peer.send(`RESUME ${this.gen} ${stride}\n`);
-    const cutoffMs = Math.max(1, Number(process.env.TDOM_SHIP_WAVE_CUTOFF ?? 700));
+    const cutoffMs = this.waveCutoffMs();
     const deadlineGen = this.gen;
     this.waveDeadlineTimer = setTimeout(() => {
       if (
@@ -1018,6 +1218,7 @@ export class ShippingChain {
       this.lastRejectReason = 'deadline-exceeded';
       this.wavePublishedGen = deadlineGen;
       this.done = true;
+      this.#reportWaveOutcome('rejected', this.lastRejectReason);
       const root = this.rootPeer;
       this.rootPeer = null;
       if (root?.alive) {
@@ -1141,6 +1342,8 @@ export class ShippingChain {
       baselineReady: this.baselinePages !== null,
       completePdf: this.publishedPdf,
       rejectReason: this.lastRejectReason,
+      waveCutoffMs: this.waveCutoffMs(),
+      visibleCutoffMs: this.visibleCutoffMs(),
       retry: retry ? {
         state: retry.state,
         activeAttemptId: retry.activeAttemptId,

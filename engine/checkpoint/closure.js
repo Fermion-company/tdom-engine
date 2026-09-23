@@ -15,12 +15,19 @@ const LITERAL_ENVS = new Set([
   'alltt',
   'filecontents',
   'filecontents*',
+  'Verbatim',
   'BVerbatim',
   'LVerbatim',
   'VVerbatim',
+  'Verbatim*',
   'BVerbatim*',
   'LVerbatim*',
   'VVerbatim*',
+  'SaveVerbatim',
+  'VerbatimOut',
+  'tcblisting',
+  'luacode',
+  'luacode*',
 ]);
 
 const CONDITIONALS = new Set([
@@ -74,7 +81,10 @@ function bracedArgument(text, at) {
   return null;
 }
 
-export function sourceClosure(text) {
+// `literalEnvs` names the literal environments the preamble declares
+// (\lstnewenvironment and friends, see literalEnvironmentNames): a
+// listing that quotes \end{document} or an unbalanced brace is closed.
+export function sourceClosure(text, { literalEnvs = null } = {}) {
   const envs = [];
   const conditionals = [];
   const loops = [];
@@ -145,6 +155,48 @@ export function sourceClosure(text) {
     while (end < text.length && /[A-Za-z@]/.test(text[end])) end++;
     const name = text.slice(i + 1, end);
 
+    // \string quotes the next token: `\string\verb` prints a name, it does
+    // not open a verbatim payload.
+    if (name === 'string') {
+      let p = skipSpace(text, end);
+      if (text[p] === '\\') {
+        p++;
+        if (/[A-Za-z@]/.test(text[p] ?? '')) while (p < text.length && /[A-Za-z@]/.test(text[p])) p++;
+        else p++;
+      } else {
+        p++;
+      }
+      i = p;
+      continue;
+    }
+
+    if (name === 'lstinline' || name === 'mintinline') {
+      let p = end;
+      if (text[p] === '[') {
+        const close = text.indexOf(']', p);
+        if (close < 0) return fail(`${name}-options`, i);
+        p = close + 1;
+      }
+      if (name === 'mintinline') {
+        const language = bracedArgument(text, p);
+        if (!language) return fail('mintinline-language', i);
+        p = language.end;
+      }
+      if (text[p] === '{') {
+        const payload = bracedArgument(text, p);
+        if (!payload) return fail('verb-payload', i);
+        i = payload.end;
+        continue;
+      }
+      const delim = text[p];
+      if (!delim || /[A-Za-z\s]/.test(delim)) return fail('verb-delimiter', i);
+      const close = text.indexOf(delim, p + 1);
+      const nl = text.indexOf('\n', p + 1);
+      if (close < 0 || (nl >= 0 && nl < close)) return fail('verb-payload', i);
+      i = close + 1;
+      continue;
+    }
+
     if (name === 'verb') {
       let p = end;
       if (text[p] === '*') p++;
@@ -164,7 +216,7 @@ export function sourceClosure(text) {
       if (!env) return fail(`${name}-environment`, i);
       if (name === 'begin') {
         envs.push(env);
-        if (LITERAL_ENVS.has(env)) literal = env;
+        if (LITERAL_ENVS.has(env) || literalEnvs?.has(env)) literal = env;
       } else {
         if (envs.at(-1) !== env) return fail(`unexpected:end:${env}`, i);
         envs.pop();

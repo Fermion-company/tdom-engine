@@ -58,6 +58,7 @@ const pageDivs = new Map();
 const provisionalStages = new Map(); // latest unpublished display list per page
 const provisionalRemovedPages = new Set();
 const provisionalDisplayLists = new Map(); // complete resident page layout, including unchanged pages
+let residentPageCountAuthoritative = false;
 let committedCanonicalGeneration = null;
 let lastEngineStatus = null;
 let viewportWarmTimer = null;
@@ -566,6 +567,7 @@ function beginClientDocumentReset(epoch) {
   provisionalStages.clear();
   provisionalRemovedPages.clear();
   provisionalDisplayLists.clear();
+  residentPageCountAuthoritative = false;
   bootComplete = false;
   directEditClickEpoch++;
   cancelDirectOpenings();
@@ -617,6 +619,8 @@ function adoptDoc(doc) {
   shipPages.clear();
   appliedRev = doc.report.rev;
   appliedSrcRev = doc.report.srcRev ?? doc.report.rev;
+  residentPageCountAuthoritative =
+    currentCanonicalPageCount(canonical, null, documentReset.adoptedEpoch, appliedSrcRev) === doc.pages.length;
   if (previewPolicy === 'structured') {
     stageProvisionalPatches(doc.pages.map(displayList => ({ type: 'replace-page', displayList })), false, doc.pages.length);
   }
@@ -630,6 +634,37 @@ function adoptDoc(doc) {
 }
 
 // ---------------------------------------------------------------- pages
+
+// The newest exact generation of this document is the page-count reference.
+// Requiring one for the CURRENT revision made every keystroke's count
+// unknown until canonical caught up: the toolbar flickered to "/ —" and each
+// keystroke demanded a full canonical compile (tex64-internal #72). A
+// resident count that matches the newest canonical stays authoritative; a
+// mismatch still demands canonical and shows "/ —" (#67).
+function currentCanonicalPageCount(reported, committed, documentEpoch, srcRev) {
+  const generations = [];
+  const count = (value) => Number.isSafeInteger(Number(value)) && Number(value) >= 0;
+  if (Number(reported?.rev) > 0 && Number(reported.rev) <= Number(srcRev) && count(reported.pageCount)) {
+    generations.push({ rev: Number(reported.rev), pageCount: Number(reported.pageCount) });
+  }
+  if (Number(committed?.epoch) === Number(documentEpoch) &&
+      Number(committed?.rev) > 0 && Number(committed.rev) <= Number(srcRev) && count(committed.pageCount)) {
+    generations.push({ rev: Number(committed.rev), pageCount: Number(committed.pageCount) });
+  }
+  if (!generations.length) return null;
+  const newest = Math.max(...generations.map(generation => generation.rev));
+  const counts = generations.filter(generation => generation.rev === newest).map(generation => generation.pageCount);
+  return counts.every(value => value === counts[0]) ? counts[0] : null;
+}
+
+function residentPageTransactionValid(pageCount, residentPages, stagePages, removedPages) {
+  if (!Number.isSafeInteger(pageCount) || pageCount < 0) return false;
+  const resident = new Set(residentPages);
+  if (resident.size !== pageCount) return false;
+  for (let page = 1; page <= pageCount; page++) if (!resident.has(page)) return false;
+  return [...stagePages].every(page => Number.isSafeInteger(page) && page >= 1 && page <= pageCount) &&
+    [...removedPages].every(page => Number.isSafeInteger(page) && page > pageCount);
+}
 
 function srcOf(target) {
   const src = target?.dataset?.src ?? target?.closest?.('[data-src]')?.dataset?.src;
@@ -737,24 +772,35 @@ function flushDirectPresentationUpdates() {
 
 function tryCommitProvisionalStages() {
   if (directPresentationBlocked()) return;
-  // A provisional shrink cannot decide which printed page disappears. Hold
-  // its replacements too, so moved ink does not appear on both old and new
-  // pages while the definitive PDF establishes the page count.
   if (usesCanonicalSurface() || documentReset.pending) return;
-  if (provisionalRemovedPages.size) {
-    requestCanonicalDisplay({ residentImpossible: true });
-    return;
-  }
-  if (!provisionalStages.size) return;
-  // Canonical can create pages the resident layout never had (for example
-  // an unbreakable display after a large fixed gap). Its old extra page has
-  // no resident remove-pages event. Never mix those two page address spaces.
-  if (committedCanonicalGeneration?.epoch === documentReset.adoptedEpoch &&
-      committedCanonicalGeneration.pageCount !== provisionalDisplayLists.size) {
-    requestCanonicalDisplay({ residentImpossible: true });
-    return;
-  }
+  if (!provisionalStages.size && !provisionalRemovedPages.size) return;
+  const residentPageCount = provisionalDisplayLists.size;
   const stages = [...provisionalStages.values()].sort((a, b) => a.dl.page - b.dl.page);
+  // A report is the resident generation boundary. Refuse a malformed or
+  // incomplete address space, including delayed pages beyond its declared
+  // tail, rather than publishing a mixed paper.
+  if (!residentPageTransactionValid(
+    residentPageCount,
+    provisionalDisplayLists.keys(),
+    stages.map(stage => Number(stage.dl?.page)),
+    provisionalRemovedPages
+  )) {
+    requestCanonicalDisplay({ residentImpossible: true });
+    return;
+  }
+  // Removing the page that owns a live editor would disconnect its native
+  // focus/selection (and possibly an IME composition). Keep the exact path
+  // for that uncommon case; ordinary pagination changes remain provisional.
+  if (directEditor && provisionalRemovedPages.has(Number(directEditor.pageNumber))) {
+    requestCanonicalDisplay({ residentImpossible: true });
+    return;
+  }
+  const canonicalPageCount = currentCanonicalPageCount(
+    canonical, committedCanonicalGeneration, documentReset.adoptedEpoch, appliedSrcRev
+  );
+  const pageCountMismatch = canonicalPageCount !== null &&
+    canonicalPageCount !== residentPageCount;
+  if (canonicalPageCount === null || pageCountMismatch) requestCanonicalDisplay();
   if (stages.some(stage => !stage.ready || stage.sourceRev !== appliedSrcRev ||
       stage.documentEpoch !== documentReset.adoptedEpoch ||
       Number(stage.snapshot?.srcRev) !== appliedSrcRev ||
@@ -783,8 +829,14 @@ function tryCommitProvisionalStages() {
     delete div.dataset.provPending;
     div.classList.remove('awaiting-canonical');
   }
+  // Tail removal belongs to the same renderer transaction as the replacement
+  // pages above. The browser cannot paint old tail pages beside the new
+  // resident generation, even when its page count is only provisional.
+  if (provisionalRemovedPages.size) reconcilePageCount(residentPageCount);
+  provisionalRemovedPages.clear();
+  residentPageCountAuthoritative = canonicalPageCount === residentPageCount;
   for (const stage of stages) updateCanonState(stage.dl.page);
-  if (stages.every(stage => {
+  if (residentPageCountAuthoritative && stages.every(stage => {
     const page = pageDivs.get(stage.dl.page);
     return !page.classList.contains('is-final') || Number(page.dataset.canonPresentedRev) >= stage.sourceRev;
   })) fulfillCanonicalDisplay();
@@ -1001,8 +1053,8 @@ function svgFor(dl, className = '') {
 }
 
 function removePagesFrom(from) {
-  // Resident pagination is provisional. A shrink must not erase the last
-  // printed page before the definitive PDF (including any moved ink) lands.
+  // Stage a resident shrink until every replacement page is ready, so the
+  // old tail and the new generation disappear in one browser transaction.
   lastRemoveRev = appliedSrcRev;
   for (const n of provisionalStages.keys()) if (n >= from) provisionalStages.delete(n);
   for (const [n, div] of pageDivs) if (n >= from) {
@@ -2015,7 +2067,7 @@ function dropOpaqueCanonicalBatchPage(registration) {
   tryCommitOpaqueCanonicalBatch(batch);
 }
 
-function reconcileOpaquePageCount(pageCount) {
+function reconcilePageCount(pageCount) {
   if (!Number.isInteger(pageCount) || pageCount < 0) return;
   for (const [pageNumber, page] of [...pageDivs]) {
     if (pageNumber <= pageCount) continue;
@@ -2230,6 +2282,7 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch, pageCount: batch.pageCount };
   provisionalStages.clear();
   provisionalRemovedPages.clear();
+  residentPageCountAuthoritative = true;
   for (const [n, rev] of pageDirtyRev) if (rev <= batch.rev) pageDirtyRev.delete(n);
   directEditClickEpoch++;
   opaqueBatchCommitDepth++;
@@ -2243,7 +2296,7 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   applyStagedDirectEditor(batch.editorStage, batch, editorScrollAnchor);
   // The editor can move from a removed tail page to a surviving page.
   // Transfer it while both ancestors are still connected.
-  reconcileOpaquePageCount(batch.pageCount);
+  reconcilePageCount(batch.pageCount);
   scheduleViewportWarm();
   updateBadge();
 }
@@ -2661,7 +2714,7 @@ function updateCanonState(n) {
       div,
       src,
       useShip
-        ? { w: geometry.paperwidth, h: geometry.paperheight }
+        ? ship.paper ?? { w: geometry.paperwidth, h: geometry.paperheight }
         : canonical.papers?.[n - 1] ?? canonical.paper,
       useShip
         ? {
@@ -6530,6 +6583,7 @@ pagesEl.addEventListener('scroll', () => {
             ready: previewReady(visible.required),
             presentationPending: pending,
             pageCount: visible.entries.length,
+            pageCountAuthoritative: residentPageCountAuthoritative,
             zoom,
             page: visible.topPage,
             srcRev: appliedSrcRev,
@@ -6953,6 +7007,8 @@ function receivePreviewEvent(msg) {
           srcRev: batch.srcRev,
           batchKey: key,
           deadlineAt: batch.deadlineAt,
+          // Rotated/resized pages carry their own displayed box (#64).
+          paper: msg.papers?.[page - 1] ?? null,
         });
       }
       // There may be no visible page during a reset/resize. The backing

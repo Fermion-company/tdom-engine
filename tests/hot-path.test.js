@@ -547,13 +547,13 @@ second paragraph
   assert.equal(directGate.safe, true, 'exact paired wrappers stay incremental');
   assert.equal(
     directGate.requiresShippingExact,
-    true,
-    'segmentable output-routine aliases still require TeX-exact page promotion'
+    false,
+    'a balanced known environment is delayed only in its exact rescue block'
   );
   assert.equal(
     classifyDocument(direct, directBody).previewPolicy,
-    'shipping-exact',
-    'JS pagination stays presentation-ineligible for the certified region'
+    'structured',
+    'unrelated pages keep the resident structured path'
   );
   assert.equal(
     segmentBody(directBody, 0, { structuralEvents: directGate.segmentEvents }).length,
@@ -594,11 +594,9 @@ second paragraph
   );
 
   const nativeColumns = String.raw`\newcommand\SwitchLedgerLayout{\twocolumn}`;
-  assert.equal(
-    classifyDocument(nativeColumns, String.raw`\SwitchLedgerLayout`).safe,
-    false,
-    'native column-layout commands hidden by wrappers demote'
-  );
+  const nativeColumnsGate = classifyDocument(nativeColumns, String.raw`\SwitchLedgerLayout`);
+  assert.equal(nativeColumnsGate.safe, true, 'a wrapper is not stronger than the direct column switch');
+  assert.equal(nativeColumnsGate.previewPolicy, 'shipping-exact');
 
   const ambiguous = String.raw`\newcommand\SpreadMode{\begin{multicols}{2}}
 \renewcommand\SpreadMode{\begin{paracol}{2}}`;
@@ -607,6 +605,188 @@ second paragraph
     false,
     'multiply-defined structural effects fail closed'
   );
+
+  const chapterDoor = String.raw`\newcommand\ChapterDoor[1]{
+    \clearpage\thispagestyle{empty}\vspace*{3cm}
+    \begin{center}\Large #1\end{center}\clearpage}`;
+  const chapterGate = classifyStructuralAliases(chapterDoor, String.raw`\ChapterDoor{First}`);
+  assert.equal(chapterGate.safe, true, 'a self-contained forced-break wrapper is exact-page scoped');
+  assert.equal(chapterGate.requiresShippingExact, false, 'ordinary forced breaks stay on the resident path');
+  assert.deepEqual(chapterGate.segmentEvents[0]?.sinks, ['forced-page-break']);
+  assert.deepEqual(chapterGate.scopes[0], {
+    key: '\\ChapterDoor',
+    sinks: ['forced-page-break'],
+    scope: 'suffix',
+    authority: 'resident',
+    unresolved: [],
+  });
+
+  const framedCommand = String.raw`\NewDocumentCommand\Exercise{m}{
+    \refstepcounter{exercise}
+    \prop_gput:Nnn \g_answers_prop {\theexercise} {#1}
+    \begin{tcolorbox}[breakable]#1\end{tcolorbox}}`;
+  const framedGate = classifyStructuralAliases(framedCommand, String.raw`\Exercise{Question}`);
+  // tex64-internal #64: untracked state cannot move the box's boundaries.
+  // The call is a self-contained rescue block; ShippingChain owns its pages.
+  assert.equal(framedGate.safe, true, 'a balanced box command does not veto the document');
+  assert.equal(framedGate.requiresShippingExact, true, 'its unresolved commands leave the pages to ShippingChain');
+  assert.deepEqual(framedGate.segmentEvents.map((event) => event.effects), [[{ kind: 'rescue', sinks: ['tcolorbox'] }]]);
+
+  const branchBoxes = String.raw`\NewDocumentCommand\RuleBox{s m}{%
+    \IfBooleanTF{#1}{\begin{tcolorbox}[title=Key]#2\end{tcolorbox}}{\begin{tcolorbox}#2\end{tcolorbox}}}`;
+  assert.equal(classifyStructuralAliases(branchBoxes, String.raw`\RuleBox*{x}`).safe, true,
+    'each branch opening and closing its own box is self-contained');
+  const primitiveSplit = String.raw`\newcommand\Half[1]{\ifx#1y\begin{tcolorbox}\else\end{tcolorbox}\fi}`;
+  assert.equal(classifyStructuralAliases(primitiveSplit, String.raw`\Half{y}`).safe, false,
+    'a primitive conditional cannot open a box on one branch and close it on another');
+  const primitiveWhole = String.raw`\newcommand\Maybe[1]{\ifx#1y\begin{tcolorbox}x\end{tcolorbox}\fi}`;
+  assert.equal(classifyStructuralAliases(primitiveWhole, String.raw`\Maybe{y}`).safe, true);
+  const openOnly = String.raw`\newcommand\Open{\prop_gput:Nnn \g_x_prop {a} {b}\begin{tcolorbox}}`;
+  assert.equal(classifyStructuralAliases(openOnly, String.raw`\Open text`).safe, false,
+    'a command that leaves its box open still vetoes');
+  const turnsPages = String.raw`\newcommand\Wide{\Mystery\begin{landscape}x\end{landscape}}`;
+  assert.equal(classifyStructuralAliases(turnsPages, String.raw`\Wide`).safe, false,
+    'landscape pages stay a document-level decision');
+
+  const unknownHelper = String.raw`\newcommand\Door{\clearpage\MysteryFormatting}`;
+  const unknownGate = classifyStructuralAliases(unknownHelper, String.raw`\Door`);
+  assert.equal(unknownGate.safe, false, 'unknown state is not granted resident or checkpoint authority');
+  assert.equal(unknownGate.requiresShippingExact, false);
+  assert.equal(unknownGate.scopes[0]?.scope, 'suffix');
+  assert.equal(unknownGate.scopes[0]?.authority, 'canonical');
+
+  const dynamicText = String.raw`\NewDocumentCommand\DeepMacro{m}{%
+    \expandafter\textbf\expandafter{\csname deep@#1\endcsname}}
+  \expandafter\def\csname deep@one\endcsname{Generated heading}`;
+  const dynamicTextGate = classifyStructuralAliases(dynamicText, String.raw`\DeepMacro{one}`);
+  assert.equal(dynamicTextGate.safe, true, 'a name registry whose entries reach no page sink is ordinary text');
+  assert.equal(dynamicTextGate.requiresShippingExact, false);
+
+  const dynamicDoor = String.raw`\NewDocumentCommand\UseDoor{m}{\csname door@#1\endcsname}
+  \expandafter\def\csname door@one\endcsname{\clearpage Chapter}`;
+  const dynamicDoorGate = classifyStructuralAliases(dynamicDoor, String.raw`\UseDoor{one}`);
+  assert.equal(dynamicDoorGate.safe, false, 'a registry entry that breaks the page taints every lookup');
+  assert.ok(dynamicDoorGate.reasons.some((reason) => /forced-page-break/.test(reason)));
+
+  const hostileKnownEnvironment = String.raw`\renewenvironment{tcolorbox}
+    {\global\output={\shipout\box255}}{}
+  \newcommand\Box{\begin{tcolorbox}x\end{tcolorbox}}`;
+  assert.equal(
+    classifyStructuralAliases(hostileKnownEnvironment, String.raw`\Box`).safe,
+    false,
+    'a local environment binding overrides the familiar package name'
+  );
+
+  const unknownLocalEnvironment = String.raw`\newenvironment{Local}{\MysteryFormatting}{}
+  \newcommand\Door{\clearpage\begin{Local}x\end{Local}}`;
+  assert.equal(
+    classifyStructuralAliases(unknownLocalEnvironment, String.raw`\Door`).safe,
+    false,
+    'a local environment with unknown executable code is not effect-free'
+  );
+
+  const conditionalBoundary = String.raw`\NewDocumentCommand\Gate{s}{%
+    \IfBooleanTF{#1}{\begin{tcolorbox}}{\end{tcolorbox}}}`;
+  assert.equal(
+    classifyStructuralAliases(conditionalBoundary, String.raw`\Gate* text \Gate`).safe,
+    false,
+    'mutually exclusive branches are not concatenated into a false balanced boundary'
+  );
+
+  const preambleColumns = String.raw`\newcommand\Setup{\twocolumn}
+  \Setup`;
+  const preambleColumnsGate = classifyStructuralAliases(preambleColumns, 'body');
+  assert.equal(preambleColumnsGate.safe, true);
+  assert.equal(preambleColumnsGate.requiresShippingExact, true, 'executed preamble aliases affect policy');
+
+  const rawApiAlias = String.raw`\newcommand\Install{\RawShipout\box255}`;
+  assert.equal(classifyStructuralAliases(rawApiAlias, String.raw`\Install`).safe, false);
+
+  const geometryWrite = String.raw`\newcommand\Resize{\clearpage\setlength{\textwidth}{420pt}}`;
+  assert.equal(classifyStructuralAliases(geometryWrite, String.raw`\Resize`).safe, false);
+
+  const rawOutput = String.raw`\newcommand\TakeOverPages{\output={\shipout\box255}}`;
+  assert.equal(
+    classifyStructuralAliases(rawOutput, String.raw`\TakeOverPages`).safe,
+    false,
+    'a wrapper that changes the output routine remains document-opaque'
+  );
+
+  const aliasedOutput = String.raw`\let\TakeOverPages\output`;
+  assert.equal(
+    classifyStructuralAliases(aliasedOutput, String.raw`\TakeOverPages`).safe,
+    false,
+    'primitive aliases do not hide document-global output access'
+  );
+
+  const snapshottedOutput = String.raw`\let\TakeOverPages\output
+\def\output{locally harmless replacement}`;
+  assert.equal(
+    classifyStructuralAliases(snapshottedOutput, String.raw`\TakeOverPages`).safe,
+    false,
+    '\\let retains the primitive meaning captured before a later redefinition'
+  );
+
+  const dynamicOutput = String.raw`\newcommand\TakeOverPages{\csname output\endcsname={}}`;
+  assert.equal(
+    classifyStructuralAliases(dynamicOutput, String.raw`\TakeOverPages`).safe,
+    false,
+    'a literal dynamic lookup of the output primitive remains document-opaque'
+  );
+
+  const preambleTakeover = String.raw`\newcommand\TakeOverPages{\output={\shipout\box255}}
+\TakeOverPages`;
+  assert.equal(
+    classifyStructuralAliases(preambleTakeover, 'body').safe,
+    false,
+    'executing a dangerous local macro in the preamble is still a document veto'
+  );
+
+  const symbolAlias = String.raw`\let\?\output
+\newcommand\TakeOverPages{\?={}}`;
+  assert.equal(
+    classifyStructuralAliases(symbolAlias, String.raw`\TakeOverPages`).safe,
+    false,
+    'an unknown control symbol cannot conceal a primitive alias'
+  );
+
+  const redefinedBreak = String.raw`\renewcommand\clearpage{local formatting}
+\newcommand\Door{\clearpage}`;
+  assert.equal(
+    classifyStructuralAliases(redefinedBreak, String.raw`\Door`).uses.length,
+    0,
+    'source-local bindings take precedence over a built-in command name'
+  );
+
+  assert.equal(
+    classifyStructuralAliases(rawOutput, String.raw`\begin{alltt}\TakeOverPages\end{alltt}`).safe,
+    false,
+    'alltt executes commands and must not mask a dangerous alias'
+  );
+
+  assert.equal(
+    classifyDocument('', String.raw`\verb|%| \shipout\hbox{X}`).safe,
+    false,
+    'a percent sign inside verb does not comment out later executable tokens'
+  );
+  assert.equal(
+    classifyDocument('', String.raw`value=\outputpenalty`).safe,
+    true,
+    'reading outputpenalty is not an output-routine assignment'
+  );
+  assert.equal(
+    classifyDocument(String.raw`\def\output{\relax}`, 'body').safe,
+    false,
+    'redefining an implicitly invoked page API is unsafe even without a literal call'
+  );
+
+  const allttBox = String.raw`\newcommand\Box{\begin{tcolorbox}x\end{tcolorbox}}`;
+  const allttBody = String.raw`\begin{alltt}
+\Box
+\end{alltt}`;
+  const allttGate = classifyStructuralAliases(allttBox, allttBody);
+  const allttSegments = segmentBody(allttBody, 0, { structuralEvents: allttGate.segmentEvents });
+  assert.deepEqual(allttSegments[0]?.structuralSinks, ['tcolorbox'], 'alltt passes executable aliases to rescue');
 });
 
 test('shipping-exact edits publish source immediately without resident page patches', () => {
@@ -749,6 +929,9 @@ test('mixed heavy document resumes exact waves from visible edits in rich TeX co
       ['tail tcolorbox', 'TAILBOXA', 'TAILBOXB', true],
       ['tail footnote argument', 'TAILNOTEA', 'TAILNOTEB', true],
       ['captured multi-page argument', 'CAPTUREMARKA', 'CAPTUREMARKB', true],
+      // tex64-internal #64: a letter typed inside math replays like prose;
+      // the raster comparison below proves the published PDF exact.
+      ['math token', 'n(n+1)', 'm(n+1)', true],
       // Caption text is a moving argument and changes the .lof output.  The
       // tail may execute, but it must not replace the visible authority while
       // the retained prefix was built from the old auxiliary-file universe.
@@ -794,8 +977,10 @@ test('mixed heavy document resumes exact waves from visible edits in rich TeX co
       assert.ok(wave.elapsedMs < waveCutoffMs, `${label}: exact wave took ${wave.elapsedMs}ms`);
       const pdf = chain.info().completePdf;
       assert.ok(pdf, `${label}: complete PDF published`);
-      const { stdout } = await promisify(execFile)('pdftotext', [pdf, '-'], { timeout: 30_000 });
-      assert.match(stdout, new RegExp(after), `${label}: certified PDF contains the edit`);
+      if (label !== 'math token') {
+        const { stdout } = await promisify(execFile)('pdftotext', [pdf, '-'], { timeout: 30_000 });
+        assert.match(stdout, new RegExp(after), `${label}: certified PDF contains the edit`);
+      }
       console.log(`    mixed shipping ${label}: page ${outcome.fromPage}, ${wave.elapsedMs}ms`);
       source = next;
       publishedSource = next;
@@ -838,7 +1023,6 @@ test('mixed heavy document resumes exact waves from visible edits in rich TeX co
 
     const rejectedGeneration = chain.info().gen;
     const unsafe = [
-      ['math token', source.replace('n(n+1)', 'm(n+1)')],
       ['comment text', source.replace('COMMENTMARKA', 'COMMENTMARKB')],
       ['control-word splice', source.replace('\\section{Combined tail}', '\\sectiom{Combined tail}')],
       ['TeX special character', source.replace('TAILPROSEB', 'TAILPROS{B')],

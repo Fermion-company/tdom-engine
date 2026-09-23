@@ -37,7 +37,20 @@ extern void lua_pushcclosure(lua_State *L, lua_CFunction fn, int n);
 extern void lua_pushboolean(lua_State *L, int value);
 extern void lua_setfield(lua_State *L, int idx, const char *k);
 
+/* Checkpoint parents never consume child exit status. Re-assert that just
+ * before every fork: a disposition set once at boot does not survive (the
+ * census found ~4 zombies per keystroke under dormant checkpoints). */
+static int discard_child_status(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = SIG_IGN;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_NOCLDWAIT;
+  return sigaction(SIGCHLD, &sa, NULL);
+}
+
 static int l_fork(lua_State *L) {
+  if (discard_child_status() != 0) { lua_pushinteger(L, -1); return 1; }
   lua_pushinteger(L, (lua_Integer)fork());
   return 1;
 }
@@ -87,6 +100,11 @@ static int l_fork_pdf(lua_State *L) {
     lua_pushinteger(L, -1);
     return 1;
   }
+  if (discard_child_status() != 0) {
+    fclose(private_file);
+    lua_pushinteger(L, -1);
+    return 1;
+  }
   pid_t pid = fork();
   if (pid == 0 && dup2(fileno(private_file), fd) < 0) _exit(125);
   fclose(private_file);
@@ -126,7 +144,7 @@ static int l_exit(lua_State *L) {
  * SIGCHLD so exited render children do not accumulate as zombies. */
 static int l_ignore_sigchld(lua_State *L) {
   (void)L;
-  signal(SIGCHLD, SIG_IGN);
+  discard_child_status();
   return 0;
 }
 

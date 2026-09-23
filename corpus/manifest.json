@@ -51,11 +51,11 @@
     },
     {
       "file": "13-macro-wrapped-native-columns.tex",
-      "expect": "opaque"
+      "expect": "shipping-exact"
     },
     {
       "file": "14-mixed-heavy-columns.tex",
-      "expect": "shipping-exact"
+      "expect": "structured"
     },
     {
       "file": "../samples/demo-lua.tex",

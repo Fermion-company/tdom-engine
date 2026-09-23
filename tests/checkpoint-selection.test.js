@@ -316,6 +316,12 @@ test('the resident budget scales with the document up to the ceiling', () => {
   assert.equal(checkpointBudgetFor(640, { ceiling: 64 }), 64);
   assert.equal(checkpointBudgetFor(640, { ceiling: 2 }), 2);
   assert.equal(checkpointBudgetFor(0, { ceiling: 8 }), 1);
+  // Once canonical proves the physical size, one coverage slot per page and
+  // the root are enough; the page bound never increases the block budget.
+  assert.equal(checkpointBudgetFor(15, { ceiling: 12, pageCount: 3 }), 4);
+  assert.equal(checkpointBudgetFor(24, { ceiling: 12, pageCount: 5 }), 6);
+  assert.equal(checkpointBudgetFor(5, { ceiling: 12, pageCount: 30 }), 6);
+  assert.equal(checkpointBudgetFor(640, { ceiling: 12, pageCount: 316 }), 12);
 });
 
 test('a larger budget spreads coverage over the whole document instead of bracketing every hot block', () => {

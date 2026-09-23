@@ -221,7 +221,7 @@ test('label renames propagate backwards to earlier referencing blocks', opts, as
 
 // ------------------------------------------------ Build lease vs caret warm
 
-test('a caret warm walk yields to a Build lease at its next block boundary and resumes later', async () => {
+test('a caret warm walk yields to a Build lease at its next block boundary and resumes later', opts, async () => {
   const work = WORK + '-warm-yield';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -262,7 +262,7 @@ test('a caret warm walk yields to a Build lease at its next block boundary and r
   }
 });
 
-test('a keystroke far from every checkpoint returns within its cold budget and the resume publishes the typeset', async () => {
+test('a keystroke far from every checkpoint returns within its cold budget and the resume publishes the typeset', opts, async () => {
   const work = WORK + '-cold-budget';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -312,7 +312,7 @@ test('a keystroke far from every checkpoint returns within its cold budget and t
   }
 });
 
-test('a caret warm that reaches the block of a budgeted keystroke hands over to the resume', async () => {
+test('a caret warm that reaches the block of a budgeted keystroke hands over to the resume', opts, async () => {
   const work = WORK + '-cold-warm';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -350,7 +350,7 @@ test('a caret warm that reaches the block of a budgeted keystroke hands over to 
   }
 });
 
-test('a keystroke during the cold walk stops it at a live boundary instead of rebooting', async () => {
+test('a keystroke during the cold walk stops it at a live boundary instead of rebooting', opts, async () => {
   const work = WORK + '-cold-interrupt';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -389,7 +389,7 @@ test('a keystroke during the cold walk stops it at a live boundary instead of re
   }
 });
 
-test('a keystroke during a caret warm walk takes the lock at the next block boundary', async () => {
+test('a keystroke during a caret warm walk takes the lock at the next block boundary', opts, async () => {
   const work = WORK + '-warm-edit-priority';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -473,7 +473,7 @@ test('a keep-set boundary without a continuation is materialized by the idle gri
   }
 });
 
-test('a keystroke at the block a caret warm is walking toward resumes from the boundary it reached', async () => {
+test('a keystroke at the block a caret warm is walking toward resumes from the boundary it reached', opts, async () => {
   const work = WORK + '-warm-frontier-edit';
   rmSync(work, { recursive: true, force: true });
   const paragraphs = [];
@@ -507,7 +507,7 @@ test('a keystroke at the block a caret warm is walking toward resumes from the b
   }
 });
 
-test('a reopened document adopts its cached isolated rescues during the boot walk', async () => {
+test('a reopened document adopts its cached isolated rescues during the boot walk', opts, async () => {
   const work = WORK + '-iso-disk-cache';
   rmSync(work, { recursive: true, force: true });
   const doc = [
@@ -650,4 +650,83 @@ test('fork-real rescues from the real-output root match the cold compile bit for
   }
   await new Promise((r) => setTimeout(r, 300));
   assert.ok(!alive(realRootPid), 'close retires the real-output root with the rest of the tree');
+});
+
+test('microtype expansion and protrusion keep resident glyphs where the PDF paints them (tex64-internal #66)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-microtype-'));
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  const prose = 'Resumable typesetting means that a checkpoint taken before an edited block ' +
+    'reproduces the complete output once only the following blocks are processed again, ' +
+    'which is exactly the property the live preview relies on for every keystroke it shows ' +
+    'while the full compilation of the document is still running in the background.';
+  try {
+    await eng.open([
+      '\\documentclass{article}',
+      '\\usepackage{microtype}',
+      '\\hyphenpenalty=10000 \\emergencystretch=3em',
+      '\\begin{document}',
+      `\\noindent\`\`Quoted opening'' of a paragraph that protrudes into the margin. ${prose}`,
+      '',
+      '\\microtypesetup{protrusion=false}',
+      prose,
+      '\\end{document}',
+      '',
+    ].join('\n'));
+    const lines = (text, not = null) => {
+      const block = eng.blocks.find((item) => item.text.includes(text) && !(not && item.text.includes(not)));
+      return (block?.galley?.items ?? []).filter((item) => item.k === 'box' && item.runs?.length);
+    };
+    const quoted = lines('Quoted opening');
+    assert.ok(quoted.length >= 3);
+    assert.ok(Math.min(...quoted[0].runs.map((run) => run.x)) < -0.1,
+      'the opening quote hangs into the left margin as the PDF paints it');
+    // without protrusion every justified line fills its box exactly, but
+    // only if each glyph and font kern advances by its expanded width
+    const plain = lines('Resumable typesetting', 'Quoted opening');
+    assert.ok(plain.length >= 3);
+    for (const item of plain.slice(0, -1)) {
+      const right = Math.max(...item.runs.map((run) => run.x + run.w));
+      assert.ok(Math.abs(right - item.w) < 0.05, `line content ends at the box edge (${right} vs ${item.w})`);
+    }
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a forward \\cref under hyperref typesets in the resident chain (tex64-internal #66)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-forward-cref-'));
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  try {
+    await eng.open([
+      '\\documentclass{article}',
+      '\\usepackage{hyperref}',
+      '\\usepackage{cleveref}',
+      '\\begin{document}',
+      'First paragraph refers ahead to \\cref{tab:cost} and \\ref{tab:cost}.',
+      '',
+      'Second paragraph of ordinary prose.',
+      '',
+      '\\begin{table}[b]',
+      '\\centering',
+      '\\begin{tabular}{ll} a & b \\\\ \\end{tabular}',
+      '\\caption{Cost}\\label{tab:cost}',
+      '\\end{table}',
+      '',
+      'Closing paragraph.',
+      '\\end{document}',
+      '',
+    ].join('\n'));
+    await eng.canonical.settle();
+    // the cleveref companion used to get two groups where hyperref reads
+    // five: LuaLaTeX rejected the block and it fell to an isolated rescue
+    const block = eng.blocks.find((item) => item.text.includes('refers ahead'));
+    assert.equal(block.rescued, false, 'the referring paragraph is typeset in-chain');
+    assert.notEqual(block.galley?.tdomDeferred, true);
+    assert.ok(block.galley.items.length > 0);
+    assert.equal(eng.labelTable.get('tab:cost'), '1');
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

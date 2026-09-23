@@ -167,6 +167,25 @@ test('multiline custom tcolorbox definitions are classified as breakable rescues
   assert.equal(result.breakableRe.test('\\begin{plainbox}'), false);
 });
 
+test('structural alias rescue is limited to sinks that need an isolated real page', () => {
+  const options = {
+    preHash: 'preamble-1',
+    breakableFor: 'preamble-1',
+    breakableRe: null,
+    source: () => '',
+  };
+  assert.equal(
+    needsRescue('\\ChapterDoor{First}', { ...options, structuralSinks: ['forced-page-break'] }).needs,
+    false,
+    'the resident output absorb already preserves ordinary forced breaks'
+  );
+  assert.equal(
+    needsRescue('\\RuleBox{Text}', { ...options, structuralSinks: ['tcolorbox'] }).needs,
+    true,
+    'page-splitting boxes still use the exact isolated lane'
+  );
+});
+
 test('ordinary isolated rescue still reuses the loaded preamble checkpoint', () => {
   const checkpoint0 = { name: 'loaded-preamble-checkpoint' };
   const block = { id: 'b1', text: 'ordinary paragraph', pageOffset: 20 };

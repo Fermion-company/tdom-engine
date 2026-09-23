@@ -81,8 +81,11 @@ last-known-good を保持する。
 
 現行 ShippingChain は `\begin{document}` hook 完了後、最初の user source unit を読む直前に page 0 の
 body-root checkpoint を作る。first page の plain edit は preamble を再実行せず、この root から全 body を
-exact replay する。700ms の replay deadline を越えた edit は exact tree を昇格せず、Phase B の
-`VisualCut` が入るまでは旧 exact pixels を保持する。source acceptance と新しい文字の即時描画は同義ではない。
+exact replay する。replay deadline は 700ms を下限とし、直近の canonical 組版より 500ms 以上早く終われる
+範囲だけ最大3000msまで延長する。延長中は表示要求の canonical を開始せず、重い TeX 処理を並走させない。
+replay が拒否された時点で待機を解除し、完成した complete PDF は別の表示期限内に全ページを読み込んでから
+原子的に昇格する。期限を越えた edit は exact tree を昇格せず、Phase B の `VisualCut` が入るまでは旧 exact
+pixels を保持する。source acceptance と新しい文字の即時描画は同義ではない。
 
 ## 10.3 diff と checkpoint rekey
 
@@ -209,7 +212,7 @@ display list は本文 glyph と行単位の exact chunk を別素材として�
 
 structured page の差し替えには、その page の未変更部分も含む exact chunk が必要になる。foreground walk は source-dirty block の後で galley が収束しても、同じ既存 page の未準備 exact block までは続ける。前方の未準備 block も再開位置に含める。ただし入力 checkpoint が editHold / renderHold または全境界を収める通常予算で保持される block は、既存の RENDER から準備できるため walk を延長しない。renderHold の枠はこの page 群を優先し、そこへ到達するためだけに再実行した無関係な prefix の描画で埋めない。保持数の上限は変えず、準備済み chunk がある page の通常の収束停止は維持する。
 
-`maxCheckpoints`（既定は env、主サーバは 8）は通常の常駐 checkpoint 骨格の予算である。骨格を block 数の等間隔にすると、編集点との間に巨大な TikZ / user macro block が一つあるだけで、無関係な地の文の毎打鍵がその block を再実行する（実測: 160 回の複合 macro 展開を跨いだ日本語 1 文字が 4.4 秒）。そこで各 block の cold typeset 高水位時間を記録し、最も高価な block の入力・出力境界を優先して残し、余りを重み付き分位へ配る。これは `tikzpicture` や `tcolorbox` の名前を判定する局所対応ではなく、未知 package / macro にも同じ実測原理で働く。上記 fixture では同じ編集が fresh-open 直後でも 15ms になった。
+`maxCheckpoints`（既定は env、主サーバは 8）は通常の常駐 checkpoint 骨格の予算である。初回 canonical 後は実ページ数+1でも上限を掛け、小文書だけを root＋1ページあたり最大1本へ縮める。骨格を block 数の等間隔にすると、編集点との間に巨大な TikZ / user macro block が一つあるだけで、無関係な地の文の毎打鍵がその block を再実行する（実測: 160 回の複合 macro 展開を跨いだ日本語 1 文字が 4.4 秒）。そこで各 block の cold typeset 高水位時間を記録し、最も高価な block の入力・出力境界を優先して残し、余りを重み付き分位へ配る。これは `tikzpicture` や `tcolorbox` の名前を判定する局所対応ではなく、未知 package / macro にも同じ実測原理で働く。上記 fixture では同じ編集が fresh-open 直後でも 15ms になった。
 末尾用の保存枠は、終端の `\par`・skip・改ページだけの block より前に置く。通常の保存間隔内に明示的な改ページがあればその直後を選び、最後の本文と未変更の見出しを同じ短い walk で用意する。このソース上の手掛かりは保存位置にのみ使い、組版する token は省略しない。選択順は root、高コスト block の入力・出力境界、末尾 anchor、残枠の重み付き分位である。予算内に全候補が収まらない場合は末尾の予測可能性を優先するため、予算値によらず分位境界や最後の高コスト block の出力境界が外れ、末尾以外の編集が追加 block を再実行する場合がある。
 
 ただし骨格選択だけでは生存 checkpoint 数の上限にならない。`#retireOffGrid(idx)` は「その JOB が処理した 1 index」しか退役させないので、mid-document から resume する pass（rescue pump・settle・chain・backward-ref）は各停止点に orphan checkpoint を残し、誰も retire しないまま生存集合が creep する（実測: budget 8 指定でも 25 個生存、boot 時 55 個超で 16GB 機が窒息）。`#enforceCheckpointCap()` が「ckpt0 ＋実測コスト骨格 ＋ editHold ＋ renderHold だけ残し、他は DIE」で畳み直す。`#updateInner()` 末（boot/edit walk 後）・`#asyncRescueOne` 後・`#runChainPass` の finally で呼ぶ。各 checkpoint は累積 dormant page を保持する常駐 lualatex なので、これは実メモリの上限である。

@@ -66,6 +66,7 @@ const INPUT_HASH_CACHE_MAX = 4096;
 const BUILD_LEASE_DEFAULT_MS = 660_000;
 const BUILD_LEASE_MAX_MS = 900_000;
 const SYNCTEX_HELPER_PREPARE_MS = 15_000;
+const INDEX_TOOL_TIMEOUT_MS = 60_000;
 const MUTABLE_COMPILE_ARTIFACT = /(?:^canon\.(?:fls|log|pdf|synctex\.gz)$|\.(?:aux|bcf|blg|idx|ind|ilg|glo|gls|glg|acn|acr|alg|lof|lot|nav|out|run\.xml|snm|toc|vrb)$)/;
 
 export class CanonicalRenderer {
@@ -174,6 +175,7 @@ export class CanonicalRenderer {
     this.resetting = false;
     this._texts = null;
     this.children = new Set(); // in-flight lualatex/pdftocairo/pdftotext/pdfinfo
+    this.indexToolKeys = new Map(); // .ind path -> hash of the .idx it was made from
     // Authority-only lualatex children run in private process groups. A live
     // edit can stop those independent groups for the shipping foreground
     // lease without killing a half-written aux workdir. Export and opaque
@@ -625,6 +627,18 @@ export class CanonicalRenderer {
     this.authorityResumeTimer = setTimeout(() => this.#resumeAuthority(), delay);
     this.authorityResumeTimer.unref?.();
     return true;
+  }
+
+  /** Release a shipping foreground lease after replay rejects the revision. */
+  releaseAuthorityDeferral() {
+    if (this.disposed || this.pressure !== 'authority') return false;
+    const deferred = this.authorityPausedUntil > Date.now() || this.authorityPausedPids.size > 0;
+    this.authorityPausedUntil = 0;
+    this.#resumeAuthority();
+    if (this.pendingJob && !this.running && !this.buildLease && this.#hasDisplayDemand(this.pendingJob)) {
+      this.#armPending(0, { keepEarlier: true });
+    }
+    return deferred;
   }
 
   acquireBuildLease(requestId, ttlMs = BUILD_LEASE_DEFAULT_MS) {
@@ -1211,6 +1225,11 @@ export class CanonicalRenderer {
     if (!this.pendingJob) return;
     if (this.buildLease) return;
     const job = this.pendingJob;
+    if (this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
+        Date.now() < this.authorityPausedUntil) {
+      this.#armPending(this.authorityPausedUntil - Date.now());
+      return;
+    }
     if (waitForResident && !job.fallbackReason && this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
         !this.residentImpossibleDemandIds.size && typeof this.residentDisplayState === 'function') {
       const state = this.residentDisplayState(job.rev);
@@ -1326,8 +1345,11 @@ export class CanonicalRenderer {
       log = await this.#runLatex(tex, background);
       if (this.disposed) throw new Error('renderer disposed');
       if (compileEpoch !== this.compileEpoch) throw new Error('canonical compile superseded');
+      const indexChanged = await this.#runIndexTools(background);
+      if (this.disposed) throw new Error('renderer disposed');
+      if (compileEpoch !== this.compileEpoch) throw new Error('canonical compile superseded');
       const after = auxState();
-      const changed = after !== before;
+      const changed = after !== before || indexChanged;
       before = after;
       if (!changed) break;
       // Another pass of an obsolete snapshot only delays the revision the
@@ -1360,7 +1382,7 @@ export class CanonicalRenderer {
     );
     const firstPaper = papers[0] ?? null;
     const seedFiles = {};
-    for (const name of auxFiles) {
+    for (const name of [...auxFiles, 'canon.ind']) {
       const file = path.join(this.workDir, name);
       if (existsSync(file)) seedFiles[path.extname(name).slice(1)] = readFileSync(file, 'utf8');
     }
@@ -1408,6 +1430,52 @@ export class CanonicalRenderer {
       try { this.#removeMutableCompileArtifacts(); } catch { /* preserve the compile error */ }
       throw error;
     }
+  }
+
+  /** makeindex, as latexmk runs it between passes.
+   *
+   * Canonical compiles with -output-directory, so imakeidx's own makeindex
+   * call (when shell escape allows it at all) looks for the .idx beside the
+   * document and finds nothing: the editing view lacked the index the Build
+   * has, with a different page count (issue #68 of tex64-internal).
+   * Bibliographies do not need this; the server materializes canon.bbl from
+   * the project's .bib files before compiling. makeindex runs only when an
+   * .idx changed since it last ran, so an edit that touches no index entry
+   * costs nothing. Returns whether any .ind changed (one more pass). */
+  async #runIndexTools(background) {
+    let files = null;
+    try { files = parseFlsFiles(readFileSync(path.join(this.workDir, 'canon.fls'), 'utf8'), this.docDir); } catch { /* no recorder */ }
+    const readText = (file) => { try { return readFileSync(file, 'utf8'); } catch { return null; } };
+    const requestedNice = Number(process.env.TDOM_CANON_NICE ?? 10);
+    const niceLevel = Number.isFinite(requestedNice) ? requestedNice : 10;
+    let changed = false;
+    for (const idx of files?.outputs ?? []) {
+      if (!idx.endsWith('.idx') || !isPathInside(this.workDir, idx)) continue;
+      const ind = `${idx.slice(0, -4)}.ind`;
+      const key = fnv1a(readText(idx) ?? '');
+      if (this.indexToolKeys.get(ind) === key && existsSync(ind)) continue;
+      const before = readText(ind);
+      const args = ['-q', '-o', path.basename(ind), path.basename(idx)];
+      try {
+        await this.#exec(
+          background ? 'nice' : 'makeindex',
+          background ? ['-n', String(niceLevel), 'makeindex', ...args] : args,
+          {
+            cwd: path.dirname(idx),
+            timeout: INDEX_TOOL_TIMEOUT_MS,
+            maxBuffer: 16 * 1024 * 1024,
+            env: withProjectInputs(process.env, { docDir: this.docDir, overlayDir: this.overlayDir, recursive: true }),
+          },
+          { authority: background, buildHeavy: !background }
+        );
+      } catch {
+        // A missing makeindex or a malformed entry leaves TeX to report the
+        // missing index, exactly as a latexmk run would.
+      }
+      this.indexToolKeys.set(ind, key);
+      if (readText(ind) !== before) changed = true;
+    }
+    return changed;
   }
 
   async #runLatex(tex, background = false) {

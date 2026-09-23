@@ -2,13 +2,22 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { ShippingChain } from './shipping.js';
-import { shippingLabelSeed } from './shipping-seeds.js';
+import { auxLabelValues, shippingLabelSeed } from './shipping-seeds.js';
+import { uniformCanonicalGeometry } from './canonical-arrival.js';
 import { sharedCheckpointBudget } from './checkpoint-retirement.js';
 
 const RETRY_LIMIT = 3;
 const TRANSIENT_CODES = new Set(['EAGAIN', 'ENOMEM', 'EMFILE', 'ENFILE', 'ETIMEDOUT', 'ECONNRESET']);
 const digest = (value) => createHash('sha256').update(String(value)).digest('hex');
 const digestBytes = (value) => createHash('sha256').update(value).digest('hex');
+
+export function usefulShippingCutoffMs(canonicalMs) {
+  const measured = Number(canonicalMs);
+  if (!Number.isFinite(measured) || measured <= 0) return 700;
+  // A late replay is useful only while it still leaves a meaningful lead
+  // over the last full compile. Bound the extra CPU even on very slow docs.
+  return Math.max(700, Math.min(3000, measured - 500));
+}
 
 function relativeProjectPath(root, candidate) {
   if (!root || !candidate) return null;
@@ -193,6 +202,26 @@ function snapshotsMatch(a, b) {
     a.snapshotId === b.snapshotId;
 }
 
+/** Everything but the root source text agrees: a baseline certified for an
+ * older revision is still this document's exact lineage, and a replay can
+ * carry it forward like any keystroke. */
+function sameLineage(a, b) {
+  return a.sessionId === b.sessionId &&
+    a.documentEpoch === b.documentEpoch &&
+    a.preHash === b.preHash &&
+    a.dependencyHash === b.dependencyHash &&
+    a.executionProfileHash === b.executionProfileHash;
+}
+
+/** A gen-0 baseline of the current chain is still being built or validated. */
+export function shippingBaselineInFlight(engine) {
+  const retry = engine.shipRetry;
+  return !!engine.shipping && !engine.shipStale && !engine.shipping.err &&
+    engine.shipBootedFor === engine.preHash &&
+    retry?.activeAttemptId != null && retry.activeChainId === engine.shipping.chainId &&
+    !engine.shipping.info?.().baselineReady;
+}
+
 function clearActive(retry, attempt) {
   if (retry.activeAttemptId !== attempt.bootAttemptId || retry.activeChainId !== attempt.chainId) return false;
   retry.activeAttemptId = null;
@@ -236,7 +265,7 @@ function neutralAttempt(engine, attempt, reason) {
 }
 
 /** Settle one gen-0 outcome exactly once, with no await inside the CAS. */
-export function settleShippingBaseline(engine, chain, event, queueShipBoot = () => {}) {
+export function settleShippingBaseline(engine, chain, event, queueShipBoot = () => {}, catchUp = () => {}) {
   const attempt = chain.bootAttempt;
   if (!attempt || event.bootAttemptId !== attempt.bootAttemptId || event.chainId !== attempt.chainId) {
     engine.diagnostics.push('shipping: baseline callback identity mismatch');
@@ -275,6 +304,27 @@ export function settleShippingBaseline(engine, chain, event, queueShipBoot = () 
     engine.shipBootTries = 0;
     engine.diagnostics.push(`shipping: baseline certified current (${attempt.bootAttemptId})`);
     return { outcome: 'certified-current' };
+  }
+
+  if (event.outcome === 'CERTIFIED' && event.pdfCertificateId && currentChain && !engine.shipStale &&
+      !currentMatchesAttempt && sameLineage(current, attempt)) {
+    // Edits landed while the baseline was being built. Its pages are exact
+    // for the source it booted with; replay forward like any keystroke
+    // instead of discarding it (under continuous typing every baseline used
+    // to be superseded and the chain never became usable).
+    clearActive(retry, attempt);
+    retry.state = 'ready';
+    retry.consecutiveFailures = 0;
+    retry.lastOutcome = 'certified-behind';
+    retry.lastFailureClass = null;
+    retry.lastFailureFingerprint = null;
+    retry.cooldownUntil = 0;
+    retry.lastCertifiedSnapshot = attempt.snapshotId;
+    retry.recoveryReason = 'baseline-certified-replay-forward';
+    engine.shipBootTries = 0;
+    engine.diagnostics.push(`shipping: baseline certified behind the source (${attempt.bootAttemptId}) — replaying forward`);
+    catchUp();
+    return { outcome: 'certified-behind' };
   }
 
   if (event.outcome === 'CERTIFIED' && (!currentMatchesAttempt || !currentChain)) {
@@ -342,6 +392,8 @@ export function makeShippingChain(engine, queueShipBoot) {
       currentJob: engine.currentJob,
       activeResidentRenders: engine.activeResidentRenderCheckpoints,
     }).shippingLimit,
+    waveCutoffMs: () => usefulShippingCutoffMs(engine.canonical?.info?.().ms),
+    pageGeometry: () => !uniformCanonicalGeometry(engine.canonical?.info?.()),
   });
   chain.onWave = (wave) => {
     if (engine.shipStale || chain !== engine.shipping ||
@@ -355,25 +407,51 @@ export function makeShippingChain(engine, queueShipBoot) {
     engine.onShipWave?.({ ...wave, srcRev: engine.shipGenRev.get(wave.gen) ?? 0 });
   };
   chain.onLabel = ({ key, val }) => {
+    const written = engine.shipAuxLabelValues?.get(key);
+    if (written?.length > 1) {
+      // A label the production aux defines several times (beamer overlays,
+      // \againframe) is reported once per definition. Any value that
+      // production also wrote is expected; comparing each report with one
+      // seed made the reseed oscillate between them (#76).
+      if (!written.includes(String(val)) && !engine.shipStale) {
+        engine.shipStale = true;
+        engine.diagnostics.push(`shipping: label ${key} left its written values (${val}) — reseeding`);
+        queueShipBoot();
+      }
+      return;
+    }
     const known = engine.labelTable.get(key);
     const seeded = engine.shipLabelOverrides.get(key) ?? known;
-    if (seeded !== undefined && String(seeded) !== String(val) && !engine.shipStale) {
+    if (seeded !== undefined && String(seeded) !== String(val)) {
       // backward effect: a label value the seeds promised has moved —
       // EARLIER pages may print stale numbers. Record the SHIP-observed
       // truth and reboot with corrected seeds (bounded: a divergence the
       // reseed cannot absorb must not loop). Until then the cold
-      // canonical owns the display truth.
-      engine.shipStale = true;
+      // canonical owns the display truth. The stale run keeps harvesting:
+      // every later divergence lands in the overrides too, so one reboot
+      // converges instead of relearning one label per boot.
       engine.shipLabelOverrides.set(key, val);
-      engine.diagnostics.push(`shipping: label ${key} diverged (${seeded} -> ${val}) — reseeding`);
-      queueShipBoot();
+      if (!engine.shipStale) {
+        engine.shipStale = true;
+        engine.diagnostics.push(`shipping: label ${key} diverged (${seeded} -> ${val}) — reseeding`);
+        queueShipBoot();
+      }
     } else if (seeded === undefined) {
       engine.shipLabelOverrides.set(key, val);
     }
   };
+  chain.onWaveOutcome = ({ gen, outcome }) => {
+    if (outcome !== 'rejected' || chain !== engine.shipping ||
+        engine.shipGenRev.get(gen) !== engine.srcRev) return;
+    engine.canonical?.releaseAuthorityDeferral?.();
+  };
   chain.retryState = engine.shipRetry;
   chain.onBaselineOutcome = (event) => {
-    settleShippingBaseline(engine, chain, event, queueShipBoot);
+    settleShippingBaseline(engine, chain, event, queueShipBoot, () => {
+      const pending = engine.shipPendingInputChanges;
+      engine.shipPendingInputChanges = null;
+      shipUpdate(engine, engine.store.get(engine.file), pending?.projectInputChanges ?? null, queueShipBoot);
+    });
   };
   return chain;
 }
@@ -425,6 +503,7 @@ export async function bootShipping(engine, { makeShipping, paginateNow, computeT
     );
     const toc = computeToc(prov);
     const seedFiles = canonicalGeneration.seedFiles;
+    engine.shipAuxLabelValues = auxLabelValues(seedFiles.aux);
     engine.shipDesiredInputSnapshot = snapshot.snapshotId;
     if (engine.shipBootedFor !== null || engine.shipping.rootPeer || engine.shipping.disposed) {
       // a previous run exists: replace the whole instance (its net server
@@ -509,13 +588,17 @@ export function queueShipBoot(engine, bootShipping) {
 /** Hot-path hook: cheap (a unit diff + one socket line). */
 export function shipUpdate(engine, text, projectInputChanges, queueShipBoot) {
   if (!engine.shipping || engine.mode !== 'structured') return;
-  if (engine.shipBooting) {
+  // Booting, or the gen-0 baseline is still being built: hold the newest
+  // input. The baseline's settlement replays forward to it; asking for a
+  // reboot here would discard the baseline as soon as it certifies.
+  if (engine.shipBooting || shippingBaselineInFlight(engine)) {
     // Root bytes alone cannot detect an included-file edit. Preserve the
     // latest explicit input evidence until this boot has installed its own
     // immutable mirror, then converge or replace it.
     const inputState = shippingInputState(engine, projectInputChanges);
     engine.shipDesiredInputSnapshot = inputState.identity.snapshotId;
     engine.shipPendingInputChanges = { text, projectInputChanges };
+    engine.canonical?.releaseAuthorityDeferral?.();
     return;
   }
   if (
@@ -532,6 +615,7 @@ export function shipUpdate(engine, text, projectInputChanges, queueShipBoot) {
   if (engine.shipDisabledFor === engine.preHash) return;
   if (engine.shipBootedFor !== engine.preHash || engine.shipStale || engine.shipping.err) {
     queueShipBoot();
+    engine.canonical?.releaseAuthorityDeferral?.();
     return;
   }
   const inputState = shippingInputState(engine, projectInputChanges);
@@ -546,7 +630,10 @@ export function shipUpdate(engine, text, projectInputChanges, queueShipBoot) {
   } else if (r.mode === 'unchanged') {
     engine.shipGenRev.set(engine.shipping.gen, engine.srcRev);
     engine.shipGenSnapshot?.set(engine.shipping.gen, inputState.identity.snapshotId);
+    engine.canonical?.releaseAuthorityDeferral?.();
   } else if (r.mode === 'reboot-needed') {
+    engine.diagnostics.push(`shipping: replay needs a new baseline (${r.reason ?? 'no checkpoint before the edit'})`);
     queueShipBoot();
+    engine.canonical?.releaseAuthorityDeferral?.();
   }
 }

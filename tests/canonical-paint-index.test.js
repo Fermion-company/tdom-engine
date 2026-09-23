@@ -233,6 +233,79 @@ test('duplicate raw nodes for one exact hbox are deduplicated, not treated as tw
   assert.equal(result?.length, 1);
 });
 
+test('one line reported through several enclosing boxes is one slot, not an ambiguity (tex64-internal #66)', () => {
+  // two-column SyncTeX: each source line of a paragraph returns the line's
+  // baseline and horizontal extent through the column vbox and its parents
+  const texts = ['前方参照は番号', '後段処理に依存', '浮動体位置Q'];
+  const witnesses = texts.map((text) => witnessFor(text));
+  const candidates = texts.flatMap((text, index) => [700, 60, 48].map((top) => {
+    const candidate = candidateFor({ page: 6, left: 307, baseline: 324 + index * 16 });
+    candidate.box.top = top;
+    candidate.box.bottom = 794 - top / 4;
+    return candidate;
+  })).filter((candidate) => candidate.box.top <= candidate.y);
+  const paint = {
+    page: 6,
+    items: texts.flatMap((text, index) => paintFor(text, { page: 6, left: 307, baseline: 324 + index * 16 }).items),
+  };
+  const result = certifyCanonicalBlock({ witnesses, candidates, paintPages: [paint] });
+  assert.equal(result?.length, 3);
+  assert.deepEqual(result.map((entry) => entry.candidate.y), [324, 340, 356]);
+  assert.ok(result.every((entry) => entry.candidate.box.bottom - entry.candidate.box.top < 12),
+    'the certified slot takes its height from the witness, whichever report it came through');
+});
+
+test('a JFM half-width punctuation mark may overhang the next paint item, nothing else may (tex64-internal #66)', () => {
+  // 「…得る。Q」: the 。 item ends a full em after its start, TeX set the Q
+  // half an em in (ltjsarticle, two-column stress paper)
+  const size = 9.2;
+  const witness = {
+    ...witnessFor('変わり得る。Q'),
+    contentRight: 5.5 * size + 7.75,
+  };
+  const paint = (lastText, overlap) => ({
+    page: 1,
+    items: [
+      { page: 1, left: 48, right: 48 + Array.from(lastText).length * size, baseline: 80, paintText: lastText,
+        glyphSizes: Array.from(lastText, () => size), glyphColors: Array.from(lastText, () => '#000000'), safe: true },
+      { page: 1, left: 48 + Array.from(lastText).length * size - overlap, right: 48 + 5.5 * size + 7.75, baseline: 80,
+        paintText: 'Q', glyphSizes: [size], glyphColors: ['#000000'], safe: true },
+    ],
+  });
+  witness.glyphSizes = Array.from('変わり得る。Q', () => size);
+  const certify = (lastText, overlap, w = witness) => certifyCanonicalBlock({
+    witnesses: [w], candidates: [candidateFor({ page: 1, left: 48, baseline: 80 })], paintPages: [paint(lastText, overlap)],
+  });
+  assert.equal(certify('変わり得る。', size / 2)?.length, 1, 'the 。 item reaches half an em into the Q');
+  assert.equal(certify('変わり得る。', size / 2 + 1), null, 'more than half an em is not JFM layout');
+  const plain = { ...witnessFor('変わり得るよQ'), contentRight: witness.contentRight, glyphSizes: witness.glyphSizes };
+  assert.equal(certify('変わり得るよ', size / 2, plain), null, 'an ordinary glyph never overlaps its successor');
+});
+
+test('a line whose JFM-boxed 、 overflows it certifies through SyncTeX\'s visible box (tex64-internal #66)', () => {
+  // the 、 glyph advances a full em inside its half-em JFM box, so the line
+  // paints half an em past its 240 bp box and SyncTeX reports that extent
+  const size = 9.2;
+  const text = 'を同時に検査すると、';
+  const overflowing = { ...witnessFor(text, { width: 240, size }) };
+  overflowing.contentRight = 240 + size / 2;
+  const paint = paintFor(text, { page: 2, left: 48, baseline: 378, size });
+  paint.items[0].right = 48 + 240 + size / 2;
+  const visible = candidateFor({ page: 2, left: 48, baseline: 378, width: 240 + size / 2 });
+  const column = candidateFor({ page: 2, left: 48, baseline: 378, width: 240 });
+  const result = certifyCanonicalBlock({ witnesses: [overflowing], candidates: [visible], paintPages: [paint] });
+  assert.equal(result?.length, 1);
+  assert.equal(result[0].candidate.box.left, 48);
+  assert.equal(result[0].candidate.box.right, 288, 'the anchor keeps the resident line box, not the visible extent');
+  assert.equal(certifyCanonicalBlock({ witnesses: [overflowing], candidates: [visible, column], paintPages: [paint] })?.length, 1,
+    'the visible box and the column box of one line are one slot');
+  const fitting = { ...overflowing, contentRight: 240 };
+  const fittingPaint = paintFor(text, { page: 2, left: 48, baseline: 378, size });
+  fittingPaint.items[0].right = 288;
+  assert.equal(certifyCanonicalBlock({ witnesses: [fitting], candidates: [visible], paintPages: [fittingPaint] }), null,
+    'a wider box is only a visible extent when the resident line overflows by exactly that much');
+});
+
 test('the base-to-current effect set includes every changed visual line', () => {
   const base = galleyLineWitnesses({ items: ['a', 'b', 'c', 'd', 'e', 'f'].map((text) => lineBox(text)) });
   const current = galleyLineWitnesses({ items: ['a', 'B', 'c', 'd', 'e', 'F'].map((text) => lineBox(text)) });
@@ -278,10 +351,32 @@ test('operator-list glyph identity and TextContent geometry must agree exactly',
   assert.equal(page?.items[0].baseline, 77);
   assert.equal(page?.items[0].paintText, 'AB');
   assert.deepEqual(page?.items[0].glyphSizes, [9.2, 9.2]);
-  assert.equal(buildPdfPaintPage({
+  // tex64-internal #66: a disagreement costs the items it touches, not the
+  // whole page. They carry no size and are never certified.
+  const disagreed = buildPdfPaintPage({
     ...base,
     operatorList: { ...base.operatorList, argsArray: [['body', 9.2], [[glyph('A'), glyph('C')]]] },
-  }), null, 'text extraction disagreement rejects the entire page index');
+  });
+  assert.equal(disagreed.items[0].safe, false, 'a glyph text extraction disagrees with is never certified');
+  assert.ok(disagreed.items[0].glyphSizes.some(Number.isNaN));
+  const line = (str, y) => ({ str, dir: 'ltr', width: 9.2 * str.length, height: 9.2, transform: [9.2, 0, 0, 9.2, 48, y] });
+  const delimiter = buildPdfPaintPage({
+    ...base,
+    textContent: { items: [line('max(0,R', 765), line('next line', 750)] },
+    operatorList: {
+      fnArray: [OPS.setFont, OPS.showText],
+      // an extensible delimiter painted without a Unicode mapping
+      argsArray: [['body', 9.2], [[...'max0,Rnextline'].map(glyph)]],
+    },
+  });
+  assert.ok(delimiter, 'one unmapped delimiter keeps the page index');
+  assert.equal(delimiter.items[0].safe, false);
+  assert.equal(delimiter.items[1].safe, true, 'the next line still certifies');
+  assert.deepEqual(delimiter.items[1].glyphSizes, Array(8).fill(9.2));
+  assert.equal(buildPdfPaintPage({
+    ...base,
+    operatorList: { ...base.operatorList, argsArray: [['body', 9.2], [[...'QRSTUVWXYZQRSTUVWXYZ'].map(glyph)]] },
+  }), null, 'text that never realigns still rejects the entire page index');
   const marked = buildPdfPaintPage({
     ...base,
     operatorList: {
