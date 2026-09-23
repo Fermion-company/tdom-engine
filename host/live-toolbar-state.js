@@ -12,6 +12,13 @@ export const normalizeLiveToolbarSnapshot = (current = {}, update = {}) => {
     0,
     Math.floor(finiteNumber(update.pageCount, finiteNumber(current.pageCount, 0)))
   );
+  // The frame reports pageCountAuthoritative=false while its resident page
+  // count still differs from the real output (paracol, longtblr, multicols):
+  // the number is provisional and a host shows "/ —" rather than a count that
+  // is about to change. Snapshots without the field keep the last value.
+  const pageCountAuthoritative = typeof update.pageCountAuthoritative === 'boolean'
+    ? update.pageCountAuthoritative
+    : current.pageCountAuthoritative !== false;
   const requestedPage = Math.max(
     1,
     Math.floor(finiteNumber(update.page, finiteNumber(current.page, 1)))
@@ -19,6 +26,7 @@ export const normalizeLiveToolbarSnapshot = (current = {}, update = {}) => {
   const zoom = Math.max(0.01, finiteNumber(update.zoom, finiteNumber(current.zoom, 1)));
   return {
     pageCount,
+    pageCountAuthoritative,
     // A page beyond the document is never shown, but page count 0 (nothing
     // reported yet) must not clamp the number to zero.
     page: Math.min(requestedPage, pageCount || 1),
