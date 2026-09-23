@@ -551,6 +551,58 @@ test('an idle chain retires and the next caret move boots it again (tex64-intern
   }
 });
 
+test('pdflscape pages stay structured and ship in their own geometry (tex64-internal #64)', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  const work = path.join(WORK, 'landscape');
+  rmSync(work, { recursive: true, force: true });
+  const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
+  const doc = [
+    '\\documentclass{article}',
+    '\\usepackage{pdflscape}',
+    '\\begin{document}',
+    'Portrait opening page with ordinary prose.',
+    '',
+    '\\begin{landscape}',
+    'A wide landscape page whose text runs along the long edge.',
+    '\\end{landscape}',
+    '',
+    'Portrait closing page after the landscape section.',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  try {
+    const arrivals = [];
+    eng.onShipWave = (info) => arrivals.push(info);
+    await eng.open(doc);
+    assert.equal(eng.previewPolicy, 'shipping-exact');
+    const t0 = Date.now();
+    while ((eng.shipRetry?.state !== 'ready' || eng.shipBooting) && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(eng.mode, 'structured', 'the rotated canonical page does not demote the document');
+    const papers = eng.canonical.info().papers;
+    assert.equal(papers.length, 3);
+    assert.equal(papers[1].rotation, 90);
+
+    const src = eng.getSource();
+    const at = src.indexOf('long edge') + 'long edge'.length;
+    await eng.edit(at, at, 'X');
+    const rev = eng.srcRev;
+    const t1 = Date.now();
+    while (!arrivals.some((a) => a.srcRev === rev) && Date.now() - t1 < 30_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const hit = arrivals.find((a) => a.srcRev === rev);
+    assert.ok(hit, 'an edit on the landscape page lands a ship wave');
+    assert.deepEqual(hit.papers?.map((paper) => paper.rotation), [0, 90, 0], 'the wave carries each page geometry');
+    assert.equal(hit.papers[1].w, papers[1].w);
+    assert.equal(hit.papers[1].h, papers[1].h);
+  } finally {
+    delete process.env.TDOM_SHIP;
+    await eng.close();
+  }
+});
+
 test('four healthy structural rebaselines do not exhaust shipping recovery', opts, async () => {
   process.env.TDOM_SHIP = '1';
   const previousCanonicalIdle = process.env.TDOM_CANON_IDLE;

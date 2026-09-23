@@ -133,6 +133,22 @@ function singleReplayUnit(oldUnits, newUnits) {
   return changed;
 }
 
+/** Displayed box of every page, as the canonical renderer reports it:
+ * width/height after /Rotate, in bp. */
+async function pdfPapers(document) {
+  const papers = [];
+  for (let index = 1; index <= document.numPages; index++) {
+    const page = await document.getPage(index);
+    const [x1, y1, x2, y2] = page.view;
+    const rotation = ((Math.round(Number(page.rotate) || 0) % 360) + 360) % 360;
+    const quarterTurn = rotation === 90 || rotation === 270;
+    const w = Math.abs(x2 - x1);
+    const h = Math.abs(y2 - y1);
+    papers.push({ w: quarterTurn ? h : w, h: quarterTurn ? w : h, rotation });
+  }
+  return papers;
+}
+
 class Peer {
   constructor(socket) {
     socket.setNoDelay(true);
@@ -151,7 +167,9 @@ class Peer {
 }
 
 export class ShippingChain {
-  constructor({ workDir, docDir, overlayDir = null, checkpointBudget = null, waveCutoffMs = null }) {
+  constructor({
+    workDir, docDir, overlayDir = null, checkpointBudget = null, waveCutoffMs = null, pageGeometry = null,
+  }) {
     this.workDir = path.resolve(workDir);
     this.docDir = docDir ? path.resolve(docDir) : this.workDir;
     this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
@@ -172,6 +190,11 @@ export class ShippingChain {
     this.maxCheckpoints = Math.max(1, Math.floor(Number(process.env.TDOM_MAX_CHECKPOINTS) || 64));
     this.checkpointBudget = checkpointBudget;
     this.dynamicWaveCutoffMs = waveCutoffMs;
+    // Documents whose canonical pages differ in size or /Rotate (pdflscape)
+    // need each wave page's own displayed box; the viewer otherwise draws
+    // it into the resident viewport (tex64-internal #64).
+    this.pageGeometry = pageGeometry;
+    this.wavePapers = null;
     this.labels = new Map(); // key -> {val, page} captured this lineage
     this.pagePdf = new Map(); // page -> pdf path (current generation wins)
     this.pageGen = new Map(); // page -> generation owning pagePdf
@@ -483,6 +506,7 @@ export class ShippingChain {
       });
       const document = await task.promise;
       const valid = document.numPages === expectedPages;
+      this.wavePapers = valid && this.pageGeometry?.() ? await pdfPapers(document) : null;
       await document.destroy().catch(() => {});
       return valid;
     } catch {
@@ -594,6 +618,7 @@ export class ShippingChain {
       this.svgCache.clear();
       this.onWave?.({
         pages: Array.from({ length: pageCount }, (_, index) => index + 1),
+        ...(this.wavePapers ? { papers: this.wavePapers } : {}),
         changedPages: expected,
         gen: validatingGen,
         snapshotId: validatingSnapshotId,

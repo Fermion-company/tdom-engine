@@ -40,11 +40,17 @@ const UNSAFE_PACKAGES = [
   'pagegrid',
   'fancytabs',
   'thumbs',
-  // These packages rotate complete shipped pages. Until page-local geometry
-  // and source hit maps are verified together, keep canonical authority.
-  'pdflscape',
-  'lscape',
+  // NOT pdflscape/lscape: rotated pages keep the document structured under
+  // the shipping-exact policy (LANDSCAPE_PACKAGES below).
 ];
+
+// These packages turn complete physical pages. The resident renderer has
+// one viewport, but a shipping-exact document never shows resident pages:
+// its surface is canonical and ShippingChain pixels with per-page geometry,
+// and clicks resolve through the canonical page's own rotation
+// (tex64-internal #64).
+const LANDSCAPE_PACKAGES = ['pdflscape', 'lscape'];
+const LANDSCAPE_BODY_RE = /\\begin\s*\{\s*landscape\s*\}/;
 // NOT here: multicol/paracol/longtable/tcolorbox/mdframed — their
 // environments are single blocks (the segmenter never splits inside an
 // environment) and the isolated exact-render rescue shows real LuaLaTeX
@@ -74,7 +80,6 @@ const UNSAFE_PAGE_GEOMETRY = [
   [/\\pdfvariable\s+(?:pagewidth|pageheight)\b/, 'per-page PDF size assignment'],
   [/\\(?:pdfvariable\s+pageattr|pdfpageattr\b|pdfextension\s+pageattr\b)/, 'raw PDF page attributes'],
   [/\\special\s*\{[^}]*@thispage\b/i, 'raw PDF page special'],
-  [/\\begin\s*\{\s*landscape\s*\}/, 'landscape page environment'],
 ];
 
 // Body constructs the JS page assembly cannot represent even per block:
@@ -166,10 +171,12 @@ export function classifyPreamble(preamble) {
   const actions = maskStructuralDefinitions(pre);
   const pkgRe = /\\(?:usepackage|RequirePackage)\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}/g;
   let m;
+  let landscapePages = false;
   while ((m = pkgRe.exec(actions))) {
     for (const raw of m[1].split(',')) {
       const name = raw.trim();
       if (UNSAFE_PACKAGES.includes(name)) reasons.push(`package ${name}`);
+      if (LANDSCAPE_PACKAGES.includes(name)) landscapePages = true;
     }
   }
   for (const [re, why] of UNSAFE_PREAMBLE) {
@@ -190,8 +197,8 @@ export function classifyPreamble(preamble) {
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
-    previewPolicy: canonicalAnchor ? 'canonical-anchor' : 'structured',
-    previewReasons: canonicalAnchor ? ['twocolumn class option'] : [],
+    previewPolicy: landscapePages ? 'shipping-exact' : canonicalAnchor ? 'canonical-anchor' : 'structured',
+    previewReasons: landscapePages ? ['landscape pages'] : canonicalAnchor ? ['twocolumn class option'] : [],
   };
 }
 
@@ -243,18 +250,21 @@ export function classifyDocument(preamble, body) {
   }
   const bodyColumnSwitch = BODY_COLUMN_SWITCH_RE.test(bod);
   const shippingExact = aliases.requiresShippingExact;
+  const landscapePages = pre.previewPolicy === 'shipping-exact' || LANDSCAPE_BODY_RE.test(bod);
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
-    previewPolicy: shippingExact
+    previewPolicy: shippingExact || landscapePages
       ? 'shipping-exact'
       : bodyColumnSwitch
         ? 'canonical-anchor'
         : pre.previewPolicy,
-    previewReasons: shippingExact
-      ? [...new Set(aliases.shippingExactUses.flatMap((use) =>
-          use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)
-        ))]
+    previewReasons: shippingExact || landscapePages
+      ? [...new Set([
+          ...(landscapePages ? ['landscape pages'] : []),
+          ...aliases.shippingExactUses.flatMap((use) =>
+            use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)),
+        ])]
       : bodyColumnSwitch
       ? [...new Set([...pre.previewReasons, 'body column switch'])]
       : pre.previewReasons,

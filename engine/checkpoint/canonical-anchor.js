@@ -14,6 +14,7 @@ import {
   mixedVisualCutHeightMatches,
 } from './canonical-paint-index.js';
 import { chmodSync, writeFileSync } from 'node:fs';
+import { uniformCanonicalGeometry } from './canonical-arrival.js';
 import path from 'node:path';
 
 const PLAIN_FLOW_UNSAFE = /[\\$%{}&#^_~]/;
@@ -574,6 +575,9 @@ export function planTerminalCanonicalAnchor({
   const canonicalAnchorPolicy = report?.previewPolicy === 'canonical-anchor';
   const residentEditCandidate = report?.residentEditCandidate === true;
   if (report?.mode !== 'structured' || !canonical?.id) return reject('no-structured-canonical');
+  // Rotated or resized physical pages (pdflscape, other paper) have no
+  // single anchor coordinate system (tex64-internal #64).
+  if (!uniformCanonicalGeometry(canonical)) return reject('mixed-geometry');
   if (!canonicalAnchorPolicy && !residentEditCandidate &&
       canonical.pageCount === report.stats?.pageCount) return reject('not-needed');
   if (report.dirtySourceNodes?.length !== 1) return reject('dirty-blocks');

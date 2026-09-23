@@ -308,10 +308,16 @@ test('safety gate: clean documents pass, page-mechanism hazards demote', () => {
     true,
     'literal examples do not acquire primitive access'
   );
-  assert.equal(classifyDocument('\\documentclass{article}\\usepackage{pdflscape}', 'body').safe, false);
+  // tex64-internal #64: rotated pages keep the document structured; the
+  // canonical/ShippingChain surface shows them in their own geometry.
+  const landscapePackage = classifyDocument('\\documentclass{article}\\usepackage{pdflscape}', 'body');
+  assert.equal(landscapePackage.safe, true);
+  assert.equal(landscapePackage.previewPolicy, 'shipping-exact');
   assert.equal(classifyDocument('\\documentclass{article}', '\\pagewidth=420pt body').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}', '\\pdfvariable pageattr{/Rotate 90} body').safe, false);
-  assert.equal(classifyDocument('\\documentclass{article}', '\\begin{landscape}body\\end{landscape}').safe, false);
+  const landscapeBody = classifyDocument('\\documentclass{article}', '\\begin{landscape}body\\end{landscape}');
+  assert.equal(landscapeBody.safe, true);
+  assert.equal(landscapeBody.previewPolicy, 'shipping-exact');
   // \marginpar stays STRUCTURED since the canonical-only block tier
   // (paper drafts carry \todo marks routinely): the block's body typesets
   // in-chain, the margin pixels come from the canonical layer

@@ -2714,7 +2714,7 @@ function updateCanonState(n) {
       div,
       src,
       useShip
-        ? { w: geometry.paperwidth, h: geometry.paperheight }
+        ? ship.paper ?? { w: geometry.paperwidth, h: geometry.paperheight }
         : canonical.papers?.[n - 1] ?? canonical.paper,
       useShip
         ? {
@@ -7007,6 +7007,8 @@ function receivePreviewEvent(msg) {
           srcRev: batch.srcRev,
           batchKey: key,
           deadlineAt: batch.deadlineAt,
+          // Rotated/resized pages carry their own displayed box (#64).
+          paper: msg.papers?.[page - 1] ?? null,
         });
       }
       // There may be no visible page during a reset/resize. The backing

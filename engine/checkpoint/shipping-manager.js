@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { ShippingChain } from './shipping.js';
 import { auxLabelValues, shippingLabelSeed } from './shipping-seeds.js';
+import { uniformCanonicalGeometry } from './canonical-arrival.js';
 import { sharedCheckpointBudget } from './checkpoint-retirement.js';
 
 const RETRY_LIMIT = 3;
@@ -351,6 +352,7 @@ export function makeShippingChain(engine, queueShipBoot) {
       activeResidentRenders: engine.activeResidentRenderCheckpoints,
     }).shippingLimit,
     waveCutoffMs: () => usefulShippingCutoffMs(engine.canonical?.info?.().ms),
+    pageGeometry: () => !uniformCanonicalGeometry(engine.canonical?.info?.()),
   });
   chain.onWave = (wave) => {
     if (engine.shipStale || chain !== engine.shipping ||
