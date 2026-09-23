@@ -1829,6 +1829,9 @@ const server = http.createServer(async (req, res) => {
             demandId: body.demandId ?? null,
             residentImpossible: body.residentImpossible ?? false,
           });
+      // A held ShippingChain replay is the fastest exact answer to a viewer
+      // that could not paint the resident pages (tex64-internal #72).
+      if (body.fulfilled !== true) engine.noteDisplayDemand?.();
       return json(res, { ok: true, ...result, documentEpoch, srcRev: body.srcRev,
         demandId: body.demandId ?? null, scheduledInMs: engine.canonical.info().scheduledInMs });
     }

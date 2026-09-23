@@ -458,6 +458,99 @@ test('a replay keeps canonical\'s index: first-page edits do not lose \\printind
   }
 });
 
+const PACED_DOC = [
+  '\\documentclass{article}',
+  '\\begin{document}',
+  ...Array.from({ length: 14 }, (_, i) =>
+    `Paragraph ${i + 1} carries ordinary prose that the resident layer paints on its own, ` +
+    'so a keystroke here needs the replay only to upgrade the page to exact pixels. ' +
+    'It is long enough to wrap over several lines of the text block.\n'),
+  '\\end{document}',
+  '',
+].join('\n');
+
+async function openPaced(work) {
+  rmSync(work, { recursive: true, force: true });
+  const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
+  const arrivals = [];
+  eng.onShipWave = (info) => arrivals.push(info);
+  await eng.open(PACED_DOC);
+  const t0 = Date.now();
+  while ((eng.shipRetry?.state !== 'ready' || eng.shipBooting ||
+          eng.canonicalPageCount !== eng.pages.length) && Date.now() - t0 < 120_000) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.equal(eng.shipping?.info?.().baselineReady, true);
+  return { eng, arrivals };
+}
+
+async function typeAt(eng, marker, text) {
+  const at = eng.getSource().indexOf(marker) + marker.length;
+  await eng.edit(at, at, text);
+}
+
+test('a paintable keystroke holds its replay until typing pauses (tex64-internal #72)', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  process.env.TDOM_SHIP_CATCHUP_MS = '700';
+  const { eng, arrivals } = await openPaced(path.join(WORK, 'paced'));
+  try {
+    const gen0 = eng.shipping.gen;
+    await typeAt(eng, 'Paragraph 3 carries', 'X');
+    assert.ok(eng.shipDeferred, 'the replay is held');
+    assert.equal(eng.shipping.gen, gen0, 'no replay starts while the resident pages are paintable');
+    await typeAt(eng, 'Paragraph 3 carriesX', 'Y');
+    assert.equal(eng.shipping.gen, gen0, 'the next keystroke keeps holding');
+    const rev = eng.srcRev;
+    const t1 = Date.now();
+    while (!arrivals.some((a) => a.srcRev === rev) && Date.now() - t1 < 30_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(arrivals.some((a) => a.srcRev === rev), 'the pause catches the chain up to the newest source');
+    assert.equal(eng.shipping.gen, gen0 + 1, 'one replay for the whole burst');
+    assert.equal(eng.shipDeferred, null);
+
+    // A viewer that cannot paint asks for canonical: the held replay runs now.
+    await typeAt(eng, 'Paragraph 9 carries', 'Z');
+    assert.ok(eng.shipDeferred);
+    assert.equal(eng.noteDisplayDemand(), true);
+    assert.equal(eng.shipping.gen, gen0 + 2, 'a display demand releases the held replay at once');
+    await typeAt(eng, 'Paragraph 9 carriesZ', 'W');
+    assert.equal(eng.shipDeferred, null, 'after a demand, the passage replays immediately');
+  } finally {
+    delete process.env.TDOM_SHIP;
+    delete process.env.TDOM_SHIP_CATCHUP_MS;
+    await eng.close();
+  }
+});
+
+test('an idle chain retires and the next caret move boots it again (tex64-internal #72)', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  process.env.TDOM_SHIP_IDLE_MS = '2500';
+  const { eng } = await openPaced(path.join(WORK, 'idle'));
+  try {
+    const t0 = Date.now();
+    while (!eng.shipIdleRetired && Date.now() - t0 < 30_000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(eng.shipIdleRetired, true, 'a quiet document retires its chain');
+    assert.equal(eng.shipping.rootPeer, null, 'the retired chain holds no process');
+    assert.equal(eng.shipBootedFor, null);
+
+    const at = eng.getSource().indexOf('Paragraph 5');
+    await eng.warmEditOffset(at);
+    assert.equal(eng.shipIdleRetired, false);
+    const t1 = Date.now();
+    while (!(eng.shipping?.info?.().baselineReady && eng.shipRetry?.state === 'ready') && Date.now() - t1 < 60_000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(eng.shipping.info().baselineReady, true, 'a caret move boots the chain again');
+  } finally {
+    delete process.env.TDOM_SHIP;
+    delete process.env.TDOM_SHIP_IDLE_MS;
+    await eng.close();
+  }
+});
+
 test('four healthy structural rebaselines do not exhaust shipping recovery', opts, async () => {
   process.env.TDOM_SHIP = '1';
   const previousCanonicalIdle = process.env.TDOM_CANON_IDLE;
@@ -468,6 +561,9 @@ test('four healthy structural rebaselines do not exhaust shipping recovery', opt
   // and canonical-seeded ShippingChain route.
   process.env.TDOM_CANON_IDLE = '10';
   process.env.TDOM_CANON_COOLDOWN = '0';
+  // Each '{}' edit must reach the chain at once; pacing (#72) would hold a
+  // paintable keystroke until typing pauses.
+  process.env.TDOM_SHIP_CATCHUP_MS = '0';
   const work = path.join(WORK, 'engine-rebaseline-recovery');
   rmSync(work, { recursive: true, force: true });
   const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
@@ -522,6 +618,7 @@ test('four healthy structural rebaselines do not exhaust shipping recovery', opt
     else process.env.TDOM_CANON_IDLE = previousCanonicalIdle;
     if (previousCanonicalCooldown === undefined) delete process.env.TDOM_CANON_COOLDOWN;
     else process.env.TDOM_CANON_COOLDOWN = previousCanonicalCooldown;
+    delete process.env.TDOM_SHIP_CATCHUP_MS;
     await eng.close();
   }
 });

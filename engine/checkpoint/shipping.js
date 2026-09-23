@@ -909,6 +909,18 @@ export class ShippingChain {
    * covers the edit, {mode:'reboot-needed'} when the change reaches page-1
    * material (caller decides: full reboot or cold canonical only).
    */
+  /**
+   * `source` is one plain edit of one replay unit away from the chain's
+   * current source: resume() can replay it without a reboot. Pacing asks
+   * this before it lets a held keystroke wait for the next one
+   * (tex64-internal #72).
+   */
+  replayableFrom(source) {
+    if (source === this.source) return true;
+    if (!this.source || !plainReplayEdit(this.source, source)) return false;
+    return singleReplayUnit(this.lines, this.#unitsOf(source)) !== null;
+  }
+
   resume(newSource, nextInputState = null) {
     if (this.gen === 0 && this.baselinePages === null) {
       this.lastRejectReason = 'baseline-not-certified';

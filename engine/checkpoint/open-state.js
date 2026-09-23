@@ -1,3 +1,4 @@
+import { clearShipPacing } from './ship-pacing.js';
 import { makeChunkMap } from './constructor-state.js';
 
 export function resetOpenState(engine, text, file) {
@@ -17,6 +18,7 @@ export function resetOpenState(engine, text, file) {
       recoveryReason: 'document-reset',
     });
   }
+  clearShipPacing(engine);
   engine.shipBootTries = 0;
   engine.shipBootedFor = null;
   engine.shipDesiredCanonicalId = null;

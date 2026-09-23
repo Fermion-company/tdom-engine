@@ -120,6 +120,13 @@ import {
   shipUpdate as shipUpdateHelper,
 } from './shipping-manager.js';
 import { opaqueUpdate as opaqueUpdateHelper } from './opaque-mode.js';
+import {
+  clearShipPacing,
+  deferShipUpdate,
+  immediateShipUpdate,
+  noteDisplayDemand as noteDisplayDemandHelper,
+  noteShipActivity,
+} from './ship-pacing.js';
 import { scheduleStructuredReprobe as scheduleStructuredReprobeHelper } from './structured-reprobe.js';
 import { teardownResidentTree } from './teardown-tree.js';
 import {
@@ -200,6 +207,7 @@ export class CheckpointEngine {
       this.overlayDir = nextOverlay;
       clearTimeout(this.shipBootTimer);
       this.shipBootTimer = null;
+      clearShipPacing(this);
       if (this.shipping) {
         await this.shipping.close().catch(() => {});
         this.shipping = this.#makeShipping();
@@ -263,6 +271,8 @@ export class CheckpointEngine {
   }
 
   async warmEditOffset(offset, file = this.file) {
+    // A caret move is the earliest sign of editing: it boots a retired chain.
+    if (!this.closed) this.#noteShipActivity();
     const sourceFile = path.resolve(this.docDir, file);
     const rootFile = path.resolve(this.docDir, this.file);
     const source = sourceFile === rootFile ? this.getSource() : this.includes.get(sourceFile)?.text;
@@ -1258,6 +1268,7 @@ export class CheckpointEngine {
       this.onDocumentResetPending?.(event);
     };
     if (!args.coldResume) {
+      this.#noteShipActivity();
       this.lastEditAt = Date.now(); // pauses the idle-gated isolated renders
       const foregroundLeaseMs = shippingPriorityQuietMs(this, 0);
       this.foregroundLeaseMs = foregroundLeaseMs;
@@ -1430,7 +1441,7 @@ export class CheckpointEngine {
         timer: t,
         callbacks: {
           queueChainWork: (kind, from, labels) => this.#queueChainWork(kind, from, labels),
-          shipUpdate: (sourceText, changes) => this.#shipUpdate(sourceText, changes),
+          shipUpdate: (sourceText, changes) => this.#shipNow(sourceText, changes),
           scheduleBackground: (from, dirtyBlocks) => this.#scheduleBackground(from, dirtyBlocks),
           fidelitySummary: () => this.#fidelitySummary(),
         },
@@ -1518,7 +1529,8 @@ export class CheckpointEngine {
         scheduleHeaders: () => this.#scheduleHeaders(),
         enforceCheckpointCap: () => this.#enforceCheckpointCap(),
         scheduleBackground: (fgStop, dirtyBlocks, options) => this.#scheduleBackground(fgStop, dirtyBlocks, options),
-        shipUpdate: (sourceText, changes) => this.#shipUpdate(sourceText, changes),
+        shipUpdate: (sourceText, changes) => this.#shipNow(sourceText, changes),
+        deferShipUpdate: (sourceText, changes) => this.#shipLater(sourceText, changes),
         fidelitySummary: () => this.#fidelitySummary(),
       },
     });
@@ -1571,6 +1583,42 @@ export class CheckpointEngine {
   /** Hot-path hook: cheap (a unit diff + one socket line). */
   #shipUpdate(text, projectInputChanges = null) {
     shipUpdateHelper(this, text, projectInputChanges, () => this.#queueShipBoot());
+  }
+
+  // tex64-internal #72: see ship-pacing.js. A keystroke the viewer cannot
+  // paint from resident pages reaches the chain now; a paintable one waits
+  // for typing to pause.
+  #shipNow(text, projectInputChanges = null) {
+    immediateShipUpdate(this, text, projectInputChanges, (t, c) => this.#shipUpdate(t, c));
+  }
+
+  #shipLater(text, projectInputChanges = null) {
+    deferShipUpdate(this, text, projectInputChanges, (t, c) => this.#shipUpdate(t, c));
+  }
+
+  /** The viewer asked for canonical pixels of the current revision. */
+  noteDisplayDemand() {
+    return noteDisplayDemandHelper(this, (t, c) => this.#shipUpdate(t, c));
+  }
+
+  #noteShipActivity() {
+    noteShipActivity(this, {
+      retire: () => this.#retireShipping(),
+      reboot: () => this.#queueShipBoot(),
+    });
+  }
+
+  /** Free an idle chain's process tree; the next caret move or edit boots it. */
+  async #retireShipping() {
+    const previous = this.shipping;
+    if (!previous) return;
+    clearTimeout(this.shipBootTimer);
+    this.shipBootTimer = null;
+    this.shipping = this.#makeShipping();
+    this.shipBootedFor = null;
+    this.shipDesiredCanonicalId = null;
+    this.shipDesiredCanonicalHash = null;
+    await previous.close().catch(() => {});
   }
 
   #opaqueUpdate(editLabel, t, reasons, projectInputChanges = null) {
@@ -1633,7 +1681,7 @@ export class CheckpointEngine {
         !this.shipping?.info?.().baselineReady ||
         this.shipStale || !!this.shipping?.err ||
         this.shipping?.source !== source;
-      if (needsBaseline && generation?.id === info.id && generation.seedFiles &&
+      if (needsBaseline && !this.shipIdleRetired && generation?.id === info.id && generation.seedFiles &&
           this.shipDesiredCanonicalId !== generation.id) {
         this.shipDesiredCanonicalId = generation.id;
         this.shipDesiredCanonicalHash = generation.pdfHash ?? null;
