@@ -93,10 +93,11 @@ export function initializeEngineState(
   // took down the server AND the editor session). Audit tools run with a
   // reduced budget via this env; the measured-cost skeleton avoids
   // replaying the most expensive skipped blocks.
-  // TDOM_MAX_CHECKPOINTS is the ceiling; the budget in force is fixed per
-  // source generation from the block count (checkpointBudgetFor).
+  // TDOM_MAX_CHECKPOINTS is the ceiling. The first source generation uses
+  // the block count; canonical then supplies an exact page-count bound.
   engine.checkpointCeiling = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
   engine.maxCheckpoints = engine.checkpointCeiling;
+  engine.canonicalPageCount = null;
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
   engine.confirmedLiveHeapKb = 0;

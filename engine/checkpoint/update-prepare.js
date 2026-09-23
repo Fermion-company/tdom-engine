@@ -98,7 +98,10 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   // sparse resident skeleton once for this source generation; subsequent
   // JOBs reuse it unless a genuinely hotter block changes the top set.
   engine.checkpointKeepCache = null;
-  engine.maxCheckpoints = checkpointBudgetFor(engine.blocks.length, { ceiling: engine.checkpointCeiling });
+  engine.maxCheckpoints = checkpointBudgetFor(engine.blocks.length, {
+    ceiling: engine.checkpointCeiling,
+    pageCount: engine.canonicalPageCount,
+  });
   if (shippingExactUses.length) {
     engine.previewPolicy = 'shipping-exact';
     engine.previewReasons = [...new Set(shippingExactUses.flatMap((use) =>

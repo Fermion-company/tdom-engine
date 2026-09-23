@@ -102,7 +102,7 @@ import {
 } from './canonical-arrival.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
 import { adoptGalleyBlock } from './galley-adoption.js';
-import { checkpointKeepSet, nearestCheckpoint,
+import { checkpointBudgetFor, checkpointKeepSet, nearestCheckpoint,
   nextTypesetCost,
   gridMissingBoundaries,
 } from './checkpoint-selection.js';
@@ -1606,6 +1606,19 @@ export class CheckpointEngine {
       cropCanonicalChunks: (canonicalInfo) => this.#cropCanonicalChunks(canonicalInfo),
       teardownTree: () => this.#teardownTree(),
     });
+    if (!info?.error && info.rev === this.srcRev && this.mode === 'structured') {
+      const prior = this.maxCheckpoints;
+      this.canonicalPageCount = Math.max(1, Math.floor(Number(info.pageCount) || 1));
+      this.maxCheckpoints = checkpointBudgetFor(this.blocks.length, {
+        ceiling: this.checkpointCeiling,
+        pageCount: this.canonicalPageCount,
+      });
+      if (this.maxCheckpoints !== prior) {
+        this.checkpointKeepCache = null;
+        if (this.maxCheckpoints < prior) this.#enforceCheckpointCap();
+        else void this.maintainGrid();
+      }
+    }
     if (!info?.error) this.#syncResidentIndex();
     // Canonical convergence supplies the exact checkpoint authority whenever
     // the current lineage cannot represent the source (initial boot,
