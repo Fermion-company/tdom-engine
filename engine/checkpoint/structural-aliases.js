@@ -782,6 +782,83 @@ function exactCommandEffect(
   return exact;
 }
 
+// Box-like environments whose whole effect stays inside the block that
+// contains them: the rescue classifier typesets that block with the real
+// output routine, and ShippingChain proves its pages. Landscape turns
+// physical pages and stays a document-level decision.
+const SELF_CONTAINED_SINKS = new Set([...STRUCTURAL_ENVIRONMENTS].filter((env) => env !== 'landscape'));
+
+/**
+ * A command whose every structural environment opens and closes inside one
+ * call, on every branch it can take (tex64-internal #64). Unlike
+ * exactCommandEffect it tolerates commands it cannot certify (expl3 state,
+ * \IfBooleanTF, pgfkeys): those can only change the contents of the box,
+ * not where the box starts or ends, so the call site is a self-contained
+ * rescue block whose pages ShippingChain proves. A brace group and each
+ * primitive conditional branch must leave the environment stack as it
+ * found it, so `\IfBooleanTF{#1}{\begin{X}}{\end{X}}` never passes.
+ */
+function selfContainedCommand(key, defs, memo = new Map(), active = new Set()) {
+  if (memo.has(key)) return memo.get(key);
+  const record = defs.get(key);
+  if (!record || record.definitionKind !== 'command' || !record.bodies.length || active.has(key) ||
+      ![...record.may].every((sink) => SELF_CONTAINED_SINKS.has(sink))) {
+    memo.set(key, false);
+    return false;
+  }
+  active.add(key);
+  const result = record.bodies.every((body) => balancedBody(body, defs, memo, active));
+  active.delete(key);
+  memo.set(key, result);
+  return result;
+}
+
+function balancedBody(body, defs, memo, active) {
+  const opened = [];
+  const groups = [];
+  const conditions = [];
+  for (let i = 0; i < body.length; ) {
+    const char = body[i];
+    if (char === '{') { groups.push(opened.length); i++; continue; }
+    if (char === '}') {
+      if (groups.length && groups.pop() !== opened.length) return false;
+      i++;
+      continue;
+    }
+    if (char !== '\\') { i++; continue; }
+    const control = readControl(body, i);
+    if (!control) { i++; continue; }
+    const name = control.name;
+    if (name === 'begin' || name === 'end') {
+      const env = readBalanced(body, control.end);
+      if (env) {
+        const envName = env.value.trim();
+        const local = defs.get(`env:${envName}`);
+        const structural = local ? local.may.size > 0 : SELF_CONTAINED_SINKS.has(envName);
+        if (structural) {
+          if (name === 'begin') opened.push(envName);
+          else if (opened.pop() !== envName) return false;
+        }
+        i = env.end;
+        continue;
+      }
+    }
+    if (/^if/.test(name)) {
+      conditions.push(opened.length);
+    } else if (name === 'else' || name === 'or' || name === 'fi') {
+      // A macro named \if... that takes braced arguments never reaches a
+      // \fi of its own; only a real branch boundary is checked.
+      if (conditions.length && conditions.at(-1) !== opened.length) return false;
+      if (name === 'fi') conditions.pop();
+    } else {
+      const dependency = defs.get(`\\${name}`);
+      if (dependency?.may.size && !selfContainedCommand(`\\${name}`, defs, memo, active)) return false;
+    }
+    i = control.end;
+  }
+  return opened.length === 0 && groups.length === 0;
+}
+
 function unresolvedDefinitionCommands(key, defs, memo = new Map(), active = new Set()) {
   if (memo.has(key)) return memo.get(key);
   const record = defs.get(key);
@@ -873,6 +950,7 @@ function usedStructuralAliases(bodyInfo, defs) {
   const found = [];
   const exactMemo = new Map();
   const unresolvedMemo = new Map();
+  const selfContainedMemo = new Map();
   for (let i = 0; i < source.length; ) {
     if (source[i] !== '\\') {
       i++;
@@ -916,13 +994,18 @@ function usedStructuralAliases(bodyInfo, defs) {
     if (record?.may.size) {
       const exact = exactCommandEffect(key, defs, exactMemo);
       const unresolved = exact ? [] : unresolvedDefinitionCommands(key, defs, unresolvedMemo);
+      // An uncertified command that still opens and closes its boxes within
+      // one call is a rescue block at its call site, like a wrapper
+      // environment; its unresolved commands leave the pages to
+      // ShippingChain (shippingExactUses).
+      const selfContained = !exact && selfContainedCommand(key, defs, selfContainedMemo);
       found.push({
         key,
         at: i,
         sinks: [...record.may],
-        effects: exact ?? [],
-        exact: !!exact,
-        scoped: false,
+        effects: exact ?? (selfContained ? [{ kind: 'rescue', sinks: [...record.may] }] : []),
+        exact: !!exact || selfContained,
+        scoped: selfContained,
         unresolved,
       });
     }

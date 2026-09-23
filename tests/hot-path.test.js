@@ -626,8 +626,27 @@ second paragraph
     \prop_gput:Nnn \g_answers_prop {\theexercise} {#1}
     \begin{tcolorbox}[breakable]#1\end{tcolorbox}}`;
   const framedGate = classifyStructuralAliases(framedCommand, String.raw`\Exercise{Question}`);
-  assert.equal(framedGate.safe, false, 'untracked state prevents a false block-boundary proof');
-  assert.equal(framedGate.segmentEvents.length, 0);
+  // tex64-internal #64: untracked state cannot move the box's boundaries.
+  // The call is a self-contained rescue block; ShippingChain owns its pages.
+  assert.equal(framedGate.safe, true, 'a balanced box command does not veto the document');
+  assert.equal(framedGate.requiresShippingExact, true, 'its unresolved commands leave the pages to ShippingChain');
+  assert.deepEqual(framedGate.segmentEvents.map((event) => event.effects), [[{ kind: 'rescue', sinks: ['tcolorbox'] }]]);
+
+  const branchBoxes = String.raw`\NewDocumentCommand\RuleBox{s m}{%
+    \IfBooleanTF{#1}{\begin{tcolorbox}[title=Key]#2\end{tcolorbox}}{\begin{tcolorbox}#2\end{tcolorbox}}}`;
+  assert.equal(classifyStructuralAliases(branchBoxes, String.raw`\RuleBox*{x}`).safe, true,
+    'each branch opening and closing its own box is self-contained');
+  const primitiveSplit = String.raw`\newcommand\Half[1]{\ifx#1y\begin{tcolorbox}\else\end{tcolorbox}\fi}`;
+  assert.equal(classifyStructuralAliases(primitiveSplit, String.raw`\Half{y}`).safe, false,
+    'a primitive conditional cannot open a box on one branch and close it on another');
+  const primitiveWhole = String.raw`\newcommand\Maybe[1]{\ifx#1y\begin{tcolorbox}x\end{tcolorbox}\fi}`;
+  assert.equal(classifyStructuralAliases(primitiveWhole, String.raw`\Maybe{y}`).safe, true);
+  const openOnly = String.raw`\newcommand\Open{\prop_gput:Nnn \g_x_prop {a} {b}\begin{tcolorbox}}`;
+  assert.equal(classifyStructuralAliases(openOnly, String.raw`\Open text`).safe, false,
+    'a command that leaves its box open still vetoes');
+  const turnsPages = String.raw`\newcommand\Wide{\Mystery\begin{landscape}x\end{landscape}}`;
+  assert.equal(classifyStructuralAliases(turnsPages, String.raw`\Wide`).safe, false,
+    'landscape pages stay a document-level decision');
 
   const unknownHelper = String.raw`\newcommand\Door{\clearpage\MysteryFormatting}`;
   const unknownGate = classifyStructuralAliases(unknownHelper, String.raw`\Door`);
