@@ -924,12 +924,20 @@ export class CheckpointEngine {
     if (!(this.bootRescueBudgetMs > 0) || !this.realRoot?.pid || !this.checkpoints.get(0)) return null;
     const block = this.blocks[idx];
     const started = performance.now();
+    let outcome = 'boot-failed';
     try {
       const iso = await this.#isoCompile(block, idx, 'boot rescue');
       this.#isoCacheSet(cacheKey, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash }));
+      outcome = 'boot';
       return iso;
     } finally {
-      this.bootRescueBudgetMs -= performance.now() - started;
+      const compileMs = performance.now() - started;
+      this.bootRescueBudgetMs -= compileMs;
+      this.rescueLog.push({
+        id: block.id, cached: false, mode: this.isoModeOf.get(block.id) ?? null,
+        compileMs: Math.round(compileMs), totalMs: Math.round(compileMs), outcome, at: Date.now(), queued: this.rescueQueue.size,
+      });
+      if (this.rescueLog.length > 200) this.rescueLog.splice(0, this.rescueLog.length - 200);
     }
   }
 
