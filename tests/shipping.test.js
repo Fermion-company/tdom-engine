@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
-import { ShippingChain } from '../engine/checkpoint/shipping.js';
+import { ShippingChain, joinOpenBracketArguments } from '../engine/checkpoint/shipping.js';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 
 const execFileP = promisify(execFile);
@@ -664,6 +664,97 @@ test('a TikZ position the document reads back still rejects a drifted replay', o
   const { wave, reject } = await shipEditOutcome(path.join(WORK, 'tikz-read'), doc, 'MOVEMARK');
   assert.equal(wave, undefined, 'a moved mark the page read keeps the wave out');
   assert.equal(reject, 'output-manifest-changed');
+});
+
+test('an \\include from a subdirectory boots the chain and replays (tex64-internal #62)', opts, async () => {
+  // \include writes chapters/ch1.aux relative to the process's own
+  // directory: the root, each replay branch and each page child
+  const root = path.join(WORK, 'include-subdir');
+  rmSync(root, { recursive: true, force: true });
+  mkdirSync(path.join(root, 'project', 'chapters'), { recursive: true });
+  writeFileSync(path.join(root, 'project', 'chapters', 'ch1.tex'),
+    '\\section{Included}\\label{sec:inc}\nIncluded chapter text.\n');
+  const doc = [
+    '\\documentclass{article}',
+    '\\begin{document}',
+    'Opening paragraph MOVEMARK before the chapter, see section~\\ref{sec:inc}.',
+    '',
+    '\\include{chapters/ch1}',
+    '',
+    'Closing paragraph after the chapter.',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const chain = new ShippingChain({ workDir: path.join(root, 'work'), docDir: path.join(root, 'project') });
+  const waves = [];
+  chain.onWave = (wave) => waves.push(wave);
+  try {
+    await chain.open(doc);
+    const t0 = Date.now();
+    while ((!chain.info().baselineReady || !chain.info().done) && !chain.err && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(chain.err?.message ?? null, null, 'the root runs to the end');
+    assert.equal(chain.info().baselineReady, true);
+    const next = doc.replace('MOVEMARK', 'MOVEMARK with a few more words');
+    assert.equal(chain.resume(next).mode, 'resumed');
+    const generation = chain.info().gen;
+    const t1 = Date.now();
+    while (!waves.some((wave) => wave.gen === generation) && !chain.info().rejectReason && !chain.err &&
+        Date.now() - t1 < 10_000) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(chain.err?.message ?? null, null, 'the replay runs to the end');
+    assert.ok(waves.some((wave) => wave.gen === generation), `the replay publishes (${chain.info().rejectReason})`);
+  } finally {
+    await chain.close();
+  }
+});
+
+test('ship units never end inside a bracket argument', () => {
+  assert.deepEqual(joinOpenBracketArguments(['\\twocolumn[\n', '\\maketitle\n', 'abstract\n]\n\n', 'Body.\n']),
+    ['\\twocolumn[\n\\maketitle\nabstract\n]\n\n', 'Body.\n']);
+  assert.deepEqual(joinOpenBracketArguments(['a % \\foo[\n', '\\\\[2pt] b\n', '\\[ x \\]\n']),
+    ['a % \\foo[\n', '\\\\[2pt] b\n', '\\[ x \\]\n'], 'comments, \\\\[..] and display math open no argument');
+  assert.deepEqual(joinOpenBracketArguments(['\\foo[{]}\n', 'x]\n', 'y\n']), ['\\foo[{]}\nx]\n', 'y\n'],
+    'a braced ] does not close the argument');
+  const literal = ['\\foo[ never closed\n', ...Array.from({ length: 40 }, (_, i) => `p${i}\n`)];
+  assert.ok(joinOpenBracketArguments(literal).length > 2, 'an unclosed literal bracket folds a bounded run only');
+});
+
+test('a \\twocolumn[...] title block ships without a TeX error (tex64-internal #62)', opts, async () => {
+  const doc = [
+    '\\documentclass[twocolumn]{article}',
+    '\\title{Two columns}\\author{Stress}',
+    '\\begin{document}',
+    '',
+    '\\twocolumn[',
+    '\\maketitle',
+    '\\begin{abstract}',
+    'An abstract that spans the full width above both columns MOVEMARK.',
+    '\\end{abstract}',
+    ']',
+    '',
+    '\\section{Intro}',
+    'Body text in the first column.',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const work = path.join(WORK, 'twocolumn-title');
+  rmSync(work, { recursive: true, force: true });
+  const chain = new ShippingChain({ workDir: work, docDir: path.dirname(DOC) });
+  try {
+    await chain.open(doc);
+    const t0 = Date.now();
+    while ((!chain.info().baselineReady || !chain.info().done) && !chain.err && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(chain.info().baselineReady, true);
+    const log = readFileSync(path.join(work, 'driver-ship.log'), 'utf8');
+    assert.doesNotMatch(log, /^! /m, 'the root reads the whole bracket argument from one unit');
+  } finally {
+    await chain.close();
+  }
 });
 
 test('four healthy structural rebaselines do not exhaust shipping recovery', opts, async () => {

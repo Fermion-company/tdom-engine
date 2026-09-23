@@ -167,6 +167,68 @@ class Peer {
   }
 }
 
+// \include writes <file>.aux relative to the working directory of whichever
+// process reaches it: the root, a replay branch or a page child. Each of
+// them needs the include's directories, or TeX stops with "I can't write on
+// file `chapters/ch1.aux'" and the chain never boots (tex64-internal #62).
+export function includeDirectories(source) {
+  const dirs = new Set();
+  for (const match of String(source ?? '').matchAll(/\\include\s*\{([^{}]+)\}/g)) {
+    const dir = path.posix.dirname(match[1].trim());
+    if (dir === '.' || path.posix.isAbsolute(dir) || dir.split('/').includes('..')) continue;
+    dirs.add(dir);
+  }
+  return [...dirs];
+}
+
+// Each unit is its own input file, and TeX cannot scan a macro argument
+// across the end of one ("File ended while scanning use of \@topnewpage").
+// The segmenter keeps braces balanced but may cut inside a bracket argument
+// that spans lines, such as `\twocolumn[` \maketitle ... `]`. Join units
+// until every bracket argument a control word opened is closed again. A
+// bracket that stays open that long is literal text (verbatim), not an
+// argument, and must not fold the rest of the body into one unit.
+const MAX_JOINED_UNITS = 32;
+
+export function joinOpenBracketArguments(units) {
+  const joined = [];
+  let pending = '';
+  let count = 0;
+  for (const unit of units) {
+    pending += unit;
+    count++;
+    if (count < MAX_JOINED_UNITS && endsInsideBracketArgument(pending)) continue;
+    joined.push(pending);
+    pending = '';
+    count = 0;
+  }
+  if (pending) joined.push(pending);
+  return joined;
+}
+
+function endsInsideBracketArgument(text) {
+  const open = []; // brace depth at which each bracket argument opened
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '%') {
+      const newline = text.indexOf('\n', i);
+      if (newline < 0) break;
+      i = newline;
+    } else if (ch === '\\') {
+      const word = /^[A-Za-z@]+/.exec(text.slice(i + 1, i + 65));
+      if (!word) { i++; continue; }
+      i += word[0].length;
+      let next = i + 1;
+      while (text[next] === ' ' || text[next] === '\t') next++;
+      if (text[next] === '[') { open.push(depth); i = next; }
+    } else if (ch === '{') depth++;
+    else if (ch === '}') depth = Math.max(0, depth - 1);
+    else if (ch === ']' && open.length && open.at(-1) === depth) open.pop();
+  }
+  return open.length > 0;
+}
+
 export class ShippingChain {
   constructor({
     workDir, docDir, overlayDir = null, checkpointBudget = null, waveCutoffMs = null, pageGeometry = null,
@@ -693,11 +755,12 @@ export class ShippingChain {
     // equivalent for input-buffer callbacks such as LuaTeX-ja. Slice at the
     // same safe boundaries instead, so concatenating the units reconstructs
     // the original body exactly.
-    const units = segments.map((segment, index) => {
+    const sliced = segments.map((segment, index) => {
       const start = index === 0 ? 0 : segment.start;
       const end = segments[index + 1]?.start ?? body.length;
       return body.slice(start, end);
     });
+    const units = joinOpenBracketArguments(sliced);
     units.push('\\end{document}');
     return units;
   }
@@ -938,14 +1001,19 @@ export class ShippingChain {
     }
     // --shell-escape: package.loadlib (the fork shim) is blocked in
     // restricted mode, same reason the resident root runs unrestricted
+    const includeDirs = includeDirectories(this.source);
+    for (const dir of includeDirs) mkdirSync(path.join(this.workDir, dir), { recursive: true });
     this.root = spawn('lualatex', ['--shell-escape', '-interaction=nonstopmode', 'driver-ship.tex'], {
       cwd: this.workDir,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: withProjectInputs(process.env, {
-        docDir: this.docDir,
-        overlayDir: inputState ? this.inputMirrorDir : this.overlayDir,
-      }),
+      env: {
+        ...withProjectInputs(process.env, {
+          docDir: this.docDir,
+          overlayDir: inputState ? this.inputMirrorDir : this.overlayDir,
+        }),
+        TDOM_SHIP_INCLUDE_DIRS: includeDirs.join('\n'),
+      },
     });
     let log = '';
     this.root.stdout.on('data', (d) => {

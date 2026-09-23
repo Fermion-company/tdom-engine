@@ -112,8 +112,27 @@ local function job_extensions()
   return exts
 end
 
+-- \include writes <file>.aux relative to the current directory, so every
+-- private directory a replay or page child enters needs the include's
+-- directories (the root's are made before it starts)
+local INCLUDE_DIRS = {}
+for dir in (os.getenv('TDOM_SHIP_INCLUDE_DIRS') or ''):gmatch('[^\n]+') do
+  INCLUDE_DIRS[#INCLUDE_DIRS + 1] = dir
+end
+
+local function make_include_dirs(base)
+  for _, dir in ipairs(INCLUDE_DIRS) do
+    local at = base
+    for part in dir:gmatch('[^/]+') do
+      at = at .. '/' .. part
+      lfs.mkdir(at)
+    end
+  end
+end
+
 local function prepare_branch(dir)
   lfs.mkdir(dir)
+  make_include_dirs(dir)
   local mappings = {}
   for _, ext in ipairs(job_extensions()) do
     local source = BRANCHDIR .. '/driver-ship.' .. ext
@@ -265,6 +284,7 @@ function tdom_ship_before()
   local page = PAGE + 1
   local dir = WORKDIR .. '/ship-g' .. GEN .. '-p' .. page
   lfs.mkdir(dir)
+  make_include_dirs(dir)
   -- \enddocument re-inputs \jobname.aux: the pager that ships the FINAL
   -- page (\enddocument's \clearpage) needs one in ITS cwd or it aborts
   -- before finalizing the page PDF
