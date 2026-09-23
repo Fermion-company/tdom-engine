@@ -828,7 +828,7 @@ function refreshProjectBibliography(changedFile) {
       ensureProjectOutputDirectories(source);
       await materializeProjectBibliography(source, activeProject);
       await engine.canonical.waitForBuildLease();
-      lastReport = await engine.open(source, activeProject.file);
+      lastReport = await engine.open(source, activeProject.file, { projectSeeds: false });
       completeDocumentReset(resetEpoch);
     } else {
       await materializeProjectBibliography(source, activeProject);
@@ -934,7 +934,7 @@ engine.onExternalChange = (changedInput) => {
       ensureProjectOutputDirectories(source);
       await materializeProjectBibliography(source, activeProject);
       await engine.canonical.waitForBuildLease();
-      lastReport = await engine.open(source, activeProject.file);
+      lastReport = await engine.open(source, activeProject.file, { projectSeeds: false });
       completeDocumentReset(resetEpoch);
       broadcast({ kind: 'update', report: lastReport });
       return lastReport;
@@ -2474,7 +2474,7 @@ const server = http.createServer(async (req, res) => {
               force: true,
             });
             await materializeProjectBibliography(next, activeProject);
-            const report = await engine.open(next, activeProject.file);
+            const report = await engine.open(next, activeProject.file, { projectSeeds: false });
             return report;
           }
           const preambleInputChanged = changedInputs.some((file) =>
@@ -2489,7 +2489,7 @@ const server = http.createServer(async (req, res) => {
               force: true,
             });
             await materializeProjectBibliography(next, activeProject);
-            const report = await engine.open(next, activeProject.file);
+            const report = await engine.open(next, activeProject.file, { projectSeeds: false });
             return report;
           }
           let primaryReport;
@@ -2755,7 +2755,7 @@ const server = http.createServer(async (req, res) => {
           }
           let openCompleted = false;
           try {
-            lastReport = await engine.open(text, context.file);
+            lastReport = await engine.open(text, context.file, { canonicalBaseline: !preparedImport });
             openCompleted = true;
             if (preparedImport) {
               if (engine.srcRev !== expectedSrcRev || engine.getSource() !== text ||

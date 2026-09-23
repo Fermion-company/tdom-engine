@@ -58,6 +58,20 @@ const SVG_CACHE_MAX = 400; // pages kept as SVG strings (LRU)
 // without bound.
 const GENERATION_MAX = 4;
 const BUILD_SEED_EXTENSIONS = ['aux', 'toc', 'lof', 'lot', 'out'];
+// Aux family of the last promoted compile per project, kept across engine
+// restarts (the app's workDir persists). `.json`, so neither the start-up
+// sweep nor the mutable-artifact cleanup (MUTABLE_COMPILE_ARTIFACT) sees it.
+const PROJECT_SEED_DIR = 'aux-seeds';
+const PROJECT_SEED_VERSION = 1;
+const PROJECT_SEED_MAX_FILES = 64;
+const PROJECT_SEED_MAX_BYTES = 32 * 1024 * 1024;
+
+function preambleHash(source) {
+  const text = String(source ?? '').replace(/\r\n?/g, '\n');
+  const begin = text.search(/\\begin\s*\{document\}/);
+  return createHash('sha256').update(begin < 0 ? text : text.slice(0, begin)).digest('hex').slice(0, 32);
+}
+
 // Input invalidations remembered for content identity (one per child edit,
 // external change or bibliography refresh). Older generations cannot be
 // proven current and compile again, exactly as before.
@@ -171,6 +185,8 @@ export class CanonicalRenderer {
     this.sourceBoxInFlight = new Set(); // source-box reads must finish before document reset removes artifacts
     this.svgOutputSeq = 0;
     this.onResult = null; // callback({...info}) after every compile attempt
+    this.projectSeedKey = null; // docDir + main file of the open document (restoreProjectSeeds)
+    this.projectSeedsPlaced = false; // the next compile starts from kept aux (retried without on failure)
     this.disposed = false;
     this.resetting = false;
     this._texts = null;
@@ -448,6 +464,106 @@ export class CanonicalRenderer {
       for (const ext of BUILD_SEED_EXTENSIONS) {
         try { rmSync(path.join(this.workDir, `canon.${ext}`), { force: true }); } catch { /* best effort */ }
       }
+    }
+  }
+
+  /**
+   * Place the aux family the previous engine process converged on for this
+   * project (docDir + main file) before the first compile of an open, when
+   * the preamble is the one that wrote it. The 316-page book's first
+   * baseline then needs one pass instead of three. Seeds only save passes:
+   * the compile still reruns until the aux family stops changing, exactly as
+   * latexmk does with the aux files it finds, and a seeded compile that
+   * fails is repeated once from nothing (#compile). `place: false` only
+   * binds the project, for an open that adopts a Build generation and its
+   * own seeds or restarts its aux on purpose.
+   */
+  restoreProjectSeeds(mainFile, source, { place = true } = {}) {
+    this.projectSeedKey = typeof mainFile === 'string' && mainFile
+      ? createHash('sha256').update(`${this.docDir}\0${path.resolve(this.docDir, mainFile)}`).digest('hex').slice(0, 32)
+      : null;
+    this.projectSeedsPlaced = false;
+    if (!place || !this.projectSeedKey || process.env.TDOM_CANON_PROJECT_SEEDS === '0' ||
+        this.last || this.running || this.disposed) return false;
+    // A seed set already in place (a Build import) is newer than ours.
+    if (existsSync(path.join(this.workDir, 'canon.aux'))) return false;
+    let stored;
+    try {
+      stored = JSON.parse(readFileSync(path.join(this.workDir, PROJECT_SEED_DIR, `${this.projectSeedKey}.json`), 'utf8'));
+    } catch {
+      return false;
+    }
+    const seeds = stored?.version === PROJECT_SEED_VERSION && stored.seeds && typeof stored.seeds === 'object'
+      ? stored.seeds : null;
+    if (!seeds || typeof seeds.aux !== 'string') return false;
+    // Package code writes the aux (biblatex's \abx@aux@..., hyperref's
+    // five-field \newlabel): an aux from another preamble can stop the run
+    // under -halt-on-error. Only the preamble the seeds were made by.
+    if (stored.preamble !== preambleHash(source)) return false;
+    let bytes = 0;
+    for (const ext of BUILD_SEED_EXTENSIONS) {
+      if (seeds[ext] === undefined) continue;
+      if (typeof seeds[ext] !== 'string') return false;
+      bytes += Buffer.byteLength(seeds[ext]);
+    }
+    if (bytes > PROJECT_SEED_MAX_BYTES) return false;
+    this.#seedBuildAuxFiles(seeds);
+    this.projectSeedsPlaced = true;
+    return true;
+  }
+
+  #dropProjectSeeds() {
+    if (!this.projectSeedKey) return;
+    try { rmSync(path.join(this.workDir, PROJECT_SEED_DIR, `${this.projectSeedKey}.json`), { force: true }); } catch { /* best effort */ }
+  }
+
+  #persistProjectSeeds(seedFiles, source) {
+    if (!this.projectSeedKey || process.env.TDOM_CANON_PROJECT_SEEDS === '0') return;
+    // \include writes one aux per child, which canon.aux only \@input's and
+    // the pass loop's aux-family check does not hash: a restored canon.aux
+    // could read stale (or another project's) child aux files and stop after
+    // one pass. Such projects keep the fixpoint from nothing.
+    let childAux = true;
+    try {
+      const files = parseFlsFiles(readFileSync(path.join(this.workDir, 'canon.fls'), 'utf8'), this.docDir);
+      childAux = !files || [...files.outputs].some((file) =>
+        file.endsWith('.aux') && path.resolve(file) !== path.join(this.workDir, 'canon.aux'));
+    } catch { /* no recorder: treat as unknown */ }
+    if (childAux) {
+      this.#dropProjectSeeds();
+      return;
+    }
+    const seeds = {};
+    let bytes = 0;
+    for (const ext of BUILD_SEED_EXTENSIONS) {
+      if (typeof seedFiles?.[ext] !== 'string') continue;
+      seeds[ext] = seedFiles[ext];
+      bytes += Buffer.byteLength(seedFiles[ext]);
+    }
+    if (typeof seeds.aux !== 'string' || bytes > PROJECT_SEED_MAX_BYTES) return;
+    const dir = path.join(this.workDir, PROJECT_SEED_DIR);
+    const file = path.join(dir, `${this.projectSeedKey}.json`);
+    const tmp = `${file}.${process.pid}.tmp`;
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(tmp, JSON.stringify({ version: PROJECT_SEED_VERSION, preamble: preambleHash(source), seeds }), 'utf8');
+      renameSync(tmp, file);
+      const names = readdirSync(dir).filter((name) => name.endsWith('.json'));
+      if (names.length > PROJECT_SEED_MAX_FILES) {
+        const byAge = names
+          .map((name) => {
+            try { return { name, mtime: statSync(path.join(dir, name)).mtimeMs }; } catch { return null; }
+          })
+          .filter(Boolean)
+          .sort((a, b) => a.mtime - b.mtime);
+        for (const { name } of byAge.slice(0, byAge.length - PROJECT_SEED_MAX_FILES)) {
+          rmSync(path.join(dir, name), { force: true });
+        }
+      }
+    } catch {
+      // Seeds are an optimisation: a failed write leaves the next open to
+      // run its fixpoint from nothing.
+      try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
     }
   }
 
@@ -1004,6 +1120,28 @@ export class CanonicalRenderer {
     // exact compile of this revision and is rebound to it right here, so the
     // edit response and the next anchor see canonical.rev === srcRev.
     if (!this.buildLease && this.#reconcile(source, rev)) return;
+    // engine.open() schedules the opened source before its boot walk, and the
+    // walk ends by scheduling the same revision again. That second call must
+    // neither queue a second compile of the same bytes behind the running
+    // one (it would sit out the cost cooldown as a phantom pending job) nor
+    // restart the debounce of the one still waiting. It may only bring the
+    // start forward: an opaque document (display pressure) or a closure
+    // fallback starts sooner than the structured baseline debounce.
+    // A Build lease is exempt: the Build import owns the pending job it
+    // creates here (commitBuildGeneration), whatever is already running.
+    // A baseline that already failed for these bytes is not compiled again.
+    const srcHash = this.#sourceHash(source);
+    if (!this.buildLease && !this.pendingJob && (
+      this.runningJob?.rev === rev && this.runningJob.srcHash === srcHash ||
+      !this.running && this.lastError?.rev === rev && this.lastError.srcHash === srcHash
+    )) return;
+    const waiting = this.pendingJob;
+    if (!this.buildLease && waiting && this.timer && waiting.rev === rev && waiting.inputEpoch === this.inputEpoch &&
+        waiting.source === source) {
+      if (fallbackReason && !waiting.fallbackReason) waiting.fallbackReason = fallbackReason;
+      this.#armPending(this.delayFor(waiting), { keepEarlier: true });
+      return;
+    }
     this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now(), fallbackReason };
     if (this.coldBaselineCatchup && !this.#hasColdBaselineCatchup(this.pendingJob)) {
       this.coldBaselineCatchup = null;
@@ -1255,7 +1393,12 @@ export class CanonicalRenderer {
     }
     const startedWithoutCanonical = !this.last;
     const compileEpoch = this.compileEpoch;
-    this.runningJob = { rev: job.rev, inputEpoch: job.inputEpoch, fallbackReason: job.fallbackReason };
+    this.runningJob = {
+      rev: job.rev,
+      inputEpoch: job.inputEpoch,
+      fallbackReason: job.fallbackReason,
+      srcHash: this.#sourceHash(job.source, job.inputEpoch),
+    };
     this.running = this.#compile({
       ...job,
       compileEpoch,
@@ -1269,7 +1412,11 @@ export class CanonicalRenderer {
     })
       .catch((err) => {
         if (compileEpoch !== this.compileEpoch || err?.tdomSuperseded) return;
-        this.lastError = { rev: job.rev, message: String(err?.message || err) };
+        this.lastError = {
+          rev: job.rev,
+          message: String(err?.message || err),
+          srcHash: this.#sourceHash(job.source, job.inputEpoch),
+        };
         // execFile's wall timeout keeps advancing while SIGSTOP holds a
         // pre-existing compile. Preserve that exact job for one normal
         // post-Build retry; a newer edit remains latest-wins.
@@ -1312,7 +1459,25 @@ export class CanonicalRenderer {
     }
   }
 
-  async #compile({ source, rev, inputEpoch = this.inputEpoch, background = false,
+  async #compile(job) {
+    // The first compile of an open may start from the project's kept aux
+    // (restoreProjectSeeds). If that run fails, the kept aux may be why (a
+    // package the preamble no longer loads wrote it): forget it and compile
+    // once more from nothing, which is exactly the unseeded behaviour. The
+    // failed run already removed its mutable aux files.
+    const seeded = this.projectSeedsPlaced === true;
+    this.projectSeedsPlaced = false;
+    try {
+      return await this.#compileOnce(job);
+    } catch (error) {
+      const epoch = job.compileEpoch ?? this.compileEpoch;
+      if (!seeded || error?.tdomSuperseded || this.disposed || epoch !== this.compileEpoch) throw error;
+      this.#dropProjectSeeds();
+      return this.#compileOnce(job);
+    }
+  }
+
+  async #compileOnce({ source, rev, inputEpoch = this.inputEpoch, background = false,
     compileEpoch = this.compileEpoch, superseding = false }) {
     const superseded = () => {
       const err = new Error('canonical compile superseded');
@@ -1420,6 +1585,7 @@ export class CanonicalRenderer {
       throw new Error(this.disposed ? 'renderer disposed' : 'canonical compile superseded');
     }
     this.#registerGeneration(generation, { promote: !obsolete });
+    if (!obsolete) this.#persistProjectSeeds(seedFiles, source);
     // Keep PDF import/open off the typing path. This intentionally does not
     // await: canonical pixels are already committed and the index is merely
     // an optional fast-proof accelerator.
@@ -2191,6 +2357,8 @@ export class CanonicalRenderer {
       this.buildPausedPids.clear();
       this.docDir = path.resolve(docDir);
       this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
+      this.projectSeedKey = null;
+      this.projectSeedsPlaced = false;
       this.#clearGenerations();
       this.lastError = null;
       this.lastEndAt = 0;

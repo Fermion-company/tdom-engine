@@ -26,6 +26,8 @@ canonical scheduling は latest-wins である。compile 中に新しい source 
 
 structured mode では `pressure = 'authority'` で、基本 debounce に加えて前回 compile time に比例した cooldown を持つ。opaque mode では `pressure = 'display'` になり、canonical compile 自体が表示更新なので debounce 中心で動く。
 
+最初の baseline は resident の boot walk を待たない。`engine.open()` は walk の前に、open が公開する revision（`srcRev + 1`）でその source を予約する。canonical は resident tree を使わないので、walk と並んで走る（316 ページの実文書では walk 76 s と 3 pass の baseline 125 s が直列で、どちらも終わるまで打鍵を anchor できなかった）。walk の最後の `schedule()` は同じ revision・同じ bytes なので、走行中ならそのまま、着地済みなら `#reconcile` で終わり、2 本目の compile も待機中の debounce のやり直しも作らない（同じ bytes で失敗済みの revision も組み直さない）。walk より先に着地した世代は、その `#reconcile` が arrival hook（検証・crop・checkpoint 予算）を現行 revision で呼び直す。Build lease 中の `schedule()` はこの省略をせず、Build 取り込みが所有する pending job を必ず作る。Build を取り込む open では先行させない。open が例外で終わった場合は予約した revision を消費済みにし、後の編集が同じ revision 番号で別の source を公開しないようにする。
+
 `GET /pdf` は `engine.exportPDF()` 経由で `canonical.ensure()` を呼ぶ。表示用 checkpoint state から PDF を作る経路はない。
 
 ### 8.2a content identity（世代の再束縛）
@@ -55,6 +57,23 @@ Build 直後に別章を編集して元に戻す往復はこれで recompile を
 通常 Build を取り込む `commitBuildGeneration` は、検証済みの aux/toc/lof/lot/out を canonical の作業
 ディレクトリへ `canon.*` として配置し、Build に無い拡張子の古いファイルは消す。Build 後の最初の canonical
 compile は Build が収束させた aux 群から始まるので、本文編集なら 1 pass で fixpoint に達する。
+
+### 8.2b' 開き直したプロジェクトの aux
+
+最後に昇格した compile の aux 系（aux・toc・lof・lot・out）は、プロジェクト（`docDir` と main ファイル）ごとに
+canonical 作業ディレクトリの `aux-seeds/<key>.json` へ、その compile の preamble のハッシュと一緒に保存する。
+アプリの作業ディレクトリは起動をまたいで残るので、次に同じプロジェクトを開いたときは `engine.open()` が最初の
+compile の前に `restoreProjectSeeds()` でそれを `canon.*` として置き、最初の baseline は多くの場合 1 pass で
+fixpoint に達する（316 ページの実文書で 3 pass → 1 pass）。種は pass を省くだけで、compile は aux 系が
+変わらなくなるまで回り続ける（latexmk が既存の aux から始めるのと同じ）。
+
+aux にはパッケージ自身が命令を書く（biblatex の `\abx@aux@…` など）ので、別の preamble の aux は
+`-halt-on-error` の下で compile を止め得る。置くのは preamble が保存時と同じときだけで、それでも種ありの
+compile が失敗したら保存分を捨てて種なしで 1 回だけ compile し直す。`\include` は子ごとの aux を書き、
+pass ループの fixpoint 判定は `canon.*` しか見ないので、子 aux を書いた compile の種は保存しない
+（古い子 aux を読んだまま 1 pass で止まり得る）。Build を取り込む open は Build 自身の種を使い、
+参考文献や preamble 入力の変更による内部の開き直しは従来どおり空の aux から始める。
+`TDOM_CANON_PROJECT_SEEDS=0` で無効、保存は 64 プロジェクトまで（mtime の古い順に削除）。
 
 ### 8.2c Build lease と resident bootstrap
 

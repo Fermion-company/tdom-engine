@@ -45,6 +45,9 @@ export function resetOpenState(engine, text, file) {
   engine.modeReasons = [];
   engine.previewPolicy = 'structured';
   engine.previewReasons = [];
+  // An opaque predecessor left the canonical at display pressure; the new
+  // document's gate sets it again if it is opaque too.
+  engine.canonical.pressure = 'authority';
   engine.opaqueStickyPre = null;
   engine.verifyState = null;
   engine.pendingChain = null;
