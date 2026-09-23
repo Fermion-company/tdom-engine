@@ -255,6 +255,57 @@ test('one line reported through several enclosing boxes is one slot, not an ambi
     'the certified slot takes its height from the witness, whichever report it came through');
 });
 
+test('a JFM half-width punctuation mark may overhang the next paint item, nothing else may (tex64-internal #66)', () => {
+  // 「…得る。Q」: the 。 item ends a full em after its start, TeX set the Q
+  // half an em in (ltjsarticle, two-column stress paper)
+  const size = 9.2;
+  const witness = {
+    ...witnessFor('変わり得る。Q'),
+    contentRight: 5.5 * size + 7.75,
+  };
+  const paint = (lastText, overlap) => ({
+    page: 1,
+    items: [
+      { page: 1, left: 48, right: 48 + Array.from(lastText).length * size, baseline: 80, paintText: lastText,
+        glyphSizes: Array.from(lastText, () => size), glyphColors: Array.from(lastText, () => '#000000'), safe: true },
+      { page: 1, left: 48 + Array.from(lastText).length * size - overlap, right: 48 + 5.5 * size + 7.75, baseline: 80,
+        paintText: 'Q', glyphSizes: [size], glyphColors: ['#000000'], safe: true },
+    ],
+  });
+  witness.glyphSizes = Array.from('変わり得る。Q', () => size);
+  const certify = (lastText, overlap, w = witness) => certifyCanonicalBlock({
+    witnesses: [w], candidates: [candidateFor({ page: 1, left: 48, baseline: 80 })], paintPages: [paint(lastText, overlap)],
+  });
+  assert.equal(certify('変わり得る。', size / 2)?.length, 1, 'the 。 item reaches half an em into the Q');
+  assert.equal(certify('変わり得る。', size / 2 + 1), null, 'more than half an em is not JFM layout');
+  const plain = { ...witnessFor('変わり得るよQ'), contentRight: witness.contentRight, glyphSizes: witness.glyphSizes };
+  assert.equal(certify('変わり得るよ', size / 2, plain), null, 'an ordinary glyph never overlaps its successor');
+});
+
+test('a line whose JFM-boxed 、 overflows it certifies through SyncTeX\'s visible box (tex64-internal #66)', () => {
+  // the 、 glyph advances a full em inside its half-em JFM box, so the line
+  // paints half an em past its 240 bp box and SyncTeX reports that extent
+  const size = 9.2;
+  const text = 'を同時に検査すると、';
+  const overflowing = { ...witnessFor(text, { width: 240, size }) };
+  overflowing.contentRight = 240 + size / 2;
+  const paint = paintFor(text, { page: 2, left: 48, baseline: 378, size });
+  paint.items[0].right = 48 + 240 + size / 2;
+  const visible = candidateFor({ page: 2, left: 48, baseline: 378, width: 240 + size / 2 });
+  const column = candidateFor({ page: 2, left: 48, baseline: 378, width: 240 });
+  const result = certifyCanonicalBlock({ witnesses: [overflowing], candidates: [visible], paintPages: [paint] });
+  assert.equal(result?.length, 1);
+  assert.equal(result[0].candidate.box.left, 48);
+  assert.equal(result[0].candidate.box.right, 288, 'the anchor keeps the resident line box, not the visible extent');
+  assert.equal(certifyCanonicalBlock({ witnesses: [overflowing], candidates: [visible, column], paintPages: [paint] })?.length, 1,
+    'the visible box and the column box of one line are one slot');
+  const fitting = { ...overflowing, contentRight: 240 };
+  const fittingPaint = paintFor(text, { page: 2, left: 48, baseline: 378, size });
+  fittingPaint.items[0].right = 288;
+  assert.equal(certifyCanonicalBlock({ witnesses: [fitting], candidates: [visible], paintPages: [fittingPaint] }), null,
+    'a wider box is only a visible extent when the resident line overflows by exactly that much');
+});
+
 test('the base-to-current effect set includes every changed visual line', () => {
   const base = galleyLineWitnesses({ items: ['a', 'b', 'c', 'd', 'e', 'f'].map((text) => lineBox(text)) });
   const current = galleyLineWitnesses({ items: ['a', 'B', 'c', 'd', 'e', 'F'].map((text) => lineBox(text)) });

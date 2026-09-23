@@ -677,33 +677,52 @@ export function certifyCanonicalBlock({ witnesses, candidates, paintPages }) {
   }));
   const edges = witnesses.map((witness) => physical
     .filter((entry) => candidateMatchesWitness(entry.candidate, entry.pageItems, witness))
-    .map((entry) => entry.candidateIndex));
+    .map((entry) => ({ index: entry.candidateIndex, key: lineSlotKey(entry.candidate, witness) })));
   if (edges.some((options) => !options.length)) return null;
-  // SyncTeX reports one line through several enclosing boxes that differ
-  // only vertically; a matched line keeps its page, baseline and horizontal
-  // extent and takes its height from the witness, so those are one slot.
-  // Uniqueness is decided between slots, not between their reports.
+  // SyncTeX reports one line through several boxes: enclosing boxes that
+  // differ only vertically, or the line hbox by its visible extent. A matched
+  // line keeps its page, baseline and line box and takes its height from the
+  // witness, so those reports are one slot. Uniqueness is decided between
+  // slots, not between their reports.
   const slotIds = new Map();
-  const slotOf = physical.map((entry) => {
-    const key = lineSlotKey(entry.candidate);
+  const slotEdges = edges.map((options) => [...new Set(options.map(({ key }) => {
     if (!slotIds.has(key)) slotIds.set(key, slotIds.size);
     return slotIds.get(key);
-  });
-  const slotEdges = edges.map((options) => [...new Set(options.map((index) => slotOf[index]))]);
+  }))]);
   const matching = uniquePerfectMatching(slotEdges, slotIds.size);
   if (!matching) return null;
   return matching.map((slot, lineIndex) => ({
     lineIndex,
     candidate: canonicalLineCandidate(
-      physical[edges[lineIndex].find((index) => slotOf[index] === slot)].candidate,
+      physical[edges[lineIndex].find(({ key }) => slotIds.get(key) === slot).index].candidate,
       witnesses[lineIndex]
     ),
   }));
 }
 
-function lineSlotKey(candidate) {
-  return [candidate.page, candidate.y, candidate.box.left, candidate.box.right]
+function lineSlotKey(candidate, witness) {
+  const line = lineBoxFor(candidate, witness);
+  return [candidate.page, candidate.y, line.left, line.right]
     .map((value) => Number(value).toFixed(3)).join(':');
+}
+
+/** The resident line box a SyncTeX report stands for, or null. SyncTeX
+ * reports either an enclosing column box, whose h/W are the line's own
+ * horizontal box, or the line hbox by its visible extent, which reaches past
+ * the line box where a glyph overflows it: a JFM-boxed 、 or 。 at the line
+ * end paints a full em in a half-em box, a protruding character hangs into
+ * the margin. */
+function lineBoxFor(candidate, witness) {
+  const left = Number(candidate.box.left);
+  const right = Number(candidate.box.right);
+  if (sameNumber(right - left, witness.lineWidth, BOX_TOLERANCE_BP)) return { left, right };
+  const visibleLeft = Math.min(0, witness.contentLeft);
+  const visibleRight = Math.max(witness.lineWidth, witness.contentRight);
+  if (visibleRight - visibleLeft > witness.lineWidth + BOX_TOLERANCE_BP &&
+      sameNumber(right - left, visibleRight - visibleLeft, BOX_TOLERANCE_BP)) {
+    return { left: left - visibleLeft, right: left - visibleLeft + witness.lineWidth };
+  }
+  return null;
 }
 
 export function candidateMatchesWitness(candidate, pageItems, witness) {
@@ -717,8 +736,8 @@ export function candidateMatchesWitness(candidate, pageItems, witness) {
   // exact source line baseline and h/W are the exact horizontal line box.
   // Accept only an enclosing vertical box, then normalize it to the resident
   // line envelope after the PDF paint witness proves the baseline contents.
-  if (!sameNumber(box.right - box.left, witness.lineWidth, BOX_TOLERANCE_BP) ||
-      box.top > lineTop + BOX_TOLERANCE_BP || box.bottom < lineBottom - BOX_TOLERANCE_BP) return false;
+  const line = lineBoxFor(candidate, witness);
+  if (!line || box.top > lineTop + BOX_TOLERANCE_BP || box.bottom < lineBottom - BOX_TOLERANCE_BP) return false;
   const inside = pageItems.filter((item) =>
     item?.safe && Math.abs(Number(item.baseline) - baseline) <= BASELINE_TOLERANCE_BP &&
     Number(item.left) >= box.left - BOX_TOLERANCE_BP &&
@@ -726,7 +745,8 @@ export function candidateMatchesWitness(candidate, pageItems, witness) {
   ).sort((left, right) => left.left - right.left);
   if (!inside.length) return false;
   for (let index = 1; index < inside.length; index++) {
-    if (inside[index].left < inside[index - 1].right - BOX_TOLERANCE_BP) return false;
+    const overlap = inside[index - 1].right - inside[index].left;
+    if (overlap > BOX_TOLERANCE_BP && overlap > punctuationOverhang(inside[index - 1], inside[index])) return false;
   }
   const paintText = inside.map((item) => item.paintText).join('');
   const glyphSizes = inside.flatMap((item) => item.glyphSizes);
@@ -740,20 +760,43 @@ export function candidateMatchesWitness(candidate, pageItems, witness) {
   const glyphColors = inside.flatMap((item) => item.glyphColors ?? []);
   if (glyphColors.length !== witness.glyphCount ||
       glyphColors.some((color, index) => !color || color !== witness.glyphColors?.[index])) return false;
-  const contentLeft = inside[0].left - box.left;
-  const contentRight = inside.at(-1).right - box.left;
+  const contentLeft = inside[0].left - line.left;
+  const contentRight = inside.at(-1).right - line.left;
   return sameNumber(contentLeft, witness.contentLeft, CONTENT_TOLERANCE_BP) &&
     sameNumber(contentRight, witness.contentRight, CONTENT_TOLERANCE_BP);
 }
 
+// A JFM sets CJK punctuation half an em wide while the font advances it a
+// full em, so the PDF text item of a closing mark (、。）」…) reaches half an
+// em past where TeX puts the next glyph, and an opening mark's item (（「…)
+// starts half an em before the previous glyph ends. That is the one overlap
+// between adjacent paint items that is layout rather than paint.
+const CLOSING_PUNCTUATION = /[、。，．）〕］｝〉》」』】〙〗｠»]$/u;
+const OPENING_PUNCTUATION = /^[（〔［｛〈《「『【〘〖｟«]/u;
+const CENTERED_PUNCTUATION = /[・：；]/u;
+
+function punctuationOverhang(before, after) {
+  const last = Array.from(String(before?.paintText ?? '')).at(-1) ?? '';
+  const first = Array.from(String(after?.paintText ?? ''))[0] ?? '';
+  const lastSize = Number(before?.glyphSizes?.at(-1));
+  const firstSize = Number(after?.glyphSizes?.[0]);
+  let allowance = 0;
+  if (CLOSING_PUNCTUATION.test(last) && Number.isFinite(lastSize)) allowance += lastSize / 2;
+  else if (CENTERED_PUNCTUATION.test(last) && Number.isFinite(lastSize)) allowance += lastSize / 4;
+  if (OPENING_PUNCTUATION.test(first) && Number.isFinite(firstSize)) allowance += firstSize / 2;
+  else if (CENTERED_PUNCTUATION.test(first) && Number.isFinite(firstSize)) allowance += firstSize / 4;
+  return allowance ? allowance + BOX_TOLERANCE_BP : 0;
+}
+
 function canonicalLineCandidate(candidate, witness) {
   const baseline = Number(candidate.y);
+  const line = lineBoxFor(candidate, witness);
   return {
     ...candidate,
     box: {
-      left: Number(candidate.box.left),
+      left: line.left,
       top: baseline - witness.height,
-      right: Number(candidate.box.right),
+      right: line.right,
       bottom: baseline + witness.depth,
     },
   };
