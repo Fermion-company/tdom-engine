@@ -117,6 +117,7 @@ import {
   bootShipping as bootShippingHelper,
   makeShippingChain,
   queueShipBoot as queueShipBootHelper,
+  shippingBaselineInFlight,
   shipUpdate as shipUpdateHelper,
 } from './shipping-manager.js';
 import { opaqueUpdate as opaqueUpdateHelper } from './opaque-mode.js';
@@ -1677,10 +1678,14 @@ export class CheckpointEngine {
     if (!info?.error && info.rev === this.srcRev) {
       const source = this.store.get(this.file);
       const generation = this.canonical.sourceMatches(source) ? this.canonical.last : null;
-      const needsBaseline = this.shipBootedFor === null ||
+      // A baseline still being built settles and replays forward; a ready
+      // chain that is only behind (a held or rejected replay) replays
+      // forward on its next update. Neither needs a new baseline.
+      const needsBaseline = !shippingBaselineInFlight(this) && (
+        this.shipBootedFor === null ||
         !this.shipping?.info?.().baselineReady ||
         this.shipStale || !!this.shipping?.err ||
-        this.shipping?.source !== source;
+        (this.shipping?.source !== source && !this.shipping?.replayableFrom?.(source)));
       if (needsBaseline && !this.shipIdleRetired && generation?.id === info.id && generation.seedFiles &&
           this.shipDesiredCanonicalId !== generation.id) {
         this.shipDesiredCanonicalId = generation.id;

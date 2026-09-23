@@ -202,6 +202,26 @@ function snapshotsMatch(a, b) {
     a.snapshotId === b.snapshotId;
 }
 
+/** Everything but the root source text agrees: a baseline certified for an
+ * older revision is still this document's exact lineage, and a replay can
+ * carry it forward like any keystroke. */
+function sameLineage(a, b) {
+  return a.sessionId === b.sessionId &&
+    a.documentEpoch === b.documentEpoch &&
+    a.preHash === b.preHash &&
+    a.dependencyHash === b.dependencyHash &&
+    a.executionProfileHash === b.executionProfileHash;
+}
+
+/** A gen-0 baseline of the current chain is still being built or validated. */
+export function shippingBaselineInFlight(engine) {
+  const retry = engine.shipRetry;
+  return !!engine.shipping && !engine.shipStale && !engine.shipping.err &&
+    engine.shipBootedFor === engine.preHash &&
+    retry?.activeAttemptId != null && retry.activeChainId === engine.shipping.chainId &&
+    !engine.shipping.info?.().baselineReady;
+}
+
 function clearActive(retry, attempt) {
   if (retry.activeAttemptId !== attempt.bootAttemptId || retry.activeChainId !== attempt.chainId) return false;
   retry.activeAttemptId = null;
@@ -245,7 +265,7 @@ function neutralAttempt(engine, attempt, reason) {
 }
 
 /** Settle one gen-0 outcome exactly once, with no await inside the CAS. */
-export function settleShippingBaseline(engine, chain, event, queueShipBoot = () => {}) {
+export function settleShippingBaseline(engine, chain, event, queueShipBoot = () => {}, catchUp = () => {}) {
   const attempt = chain.bootAttempt;
   if (!attempt || event.bootAttemptId !== attempt.bootAttemptId || event.chainId !== attempt.chainId) {
     engine.diagnostics.push('shipping: baseline callback identity mismatch');
@@ -284,6 +304,27 @@ export function settleShippingBaseline(engine, chain, event, queueShipBoot = () 
     engine.shipBootTries = 0;
     engine.diagnostics.push(`shipping: baseline certified current (${attempt.bootAttemptId})`);
     return { outcome: 'certified-current' };
+  }
+
+  if (event.outcome === 'CERTIFIED' && event.pdfCertificateId && currentChain && !engine.shipStale &&
+      !currentMatchesAttempt && sameLineage(current, attempt)) {
+    // Edits landed while the baseline was being built. Its pages are exact
+    // for the source it booted with; replay forward like any keystroke
+    // instead of discarding it (under continuous typing every baseline used
+    // to be superseded and the chain never became usable).
+    clearActive(retry, attempt);
+    retry.state = 'ready';
+    retry.consecutiveFailures = 0;
+    retry.lastOutcome = 'certified-behind';
+    retry.lastFailureClass = null;
+    retry.lastFailureFingerprint = null;
+    retry.cooldownUntil = 0;
+    retry.lastCertifiedSnapshot = attempt.snapshotId;
+    retry.recoveryReason = 'baseline-certified-replay-forward';
+    engine.shipBootTries = 0;
+    engine.diagnostics.push(`shipping: baseline certified behind the source (${attempt.bootAttemptId}) — replaying forward`);
+    catchUp();
+    return { outcome: 'certified-behind' };
   }
 
   if (event.outcome === 'CERTIFIED' && (!currentMatchesAttempt || !currentChain)) {
@@ -406,7 +447,11 @@ export function makeShippingChain(engine, queueShipBoot) {
   };
   chain.retryState = engine.shipRetry;
   chain.onBaselineOutcome = (event) => {
-    settleShippingBaseline(engine, chain, event, queueShipBoot);
+    settleShippingBaseline(engine, chain, event, queueShipBoot, () => {
+      const pending = engine.shipPendingInputChanges;
+      engine.shipPendingInputChanges = null;
+      shipUpdate(engine, engine.store.get(engine.file), pending?.projectInputChanges ?? null, queueShipBoot);
+    });
   };
   return chain;
 }
@@ -543,7 +588,10 @@ export function queueShipBoot(engine, bootShipping) {
 /** Hot-path hook: cheap (a unit diff + one socket line). */
 export function shipUpdate(engine, text, projectInputChanges, queueShipBoot) {
   if (!engine.shipping || engine.mode !== 'structured') return;
-  if (engine.shipBooting) {
+  // Booting, or the gen-0 baseline is still being built: hold the newest
+  // input. The baseline's settlement replays forward to it; asking for a
+  // reboot here would discard the baseline as soon as it certifies.
+  if (engine.shipBooting || shippingBaselineInFlight(engine)) {
     // Root bytes alone cannot detect an included-file edit. Preserve the
     // latest explicit input evidence until this boot has installed its own
     // immutable mirror, then converge or replace it.
@@ -584,6 +632,7 @@ export function shipUpdate(engine, text, projectInputChanges, queueShipBoot) {
     engine.shipGenSnapshot?.set(engine.shipping.gen, inputState.identity.snapshotId);
     engine.canonical?.releaseAuthorityDeferral?.();
   } else if (r.mode === 'reboot-needed') {
+    engine.diagnostics.push(`shipping: replay needs a new baseline (${r.reason ?? 'no checkpoint before the edit'})`);
     queueShipBoot();
     engine.canonical?.releaseAuthorityDeferral?.();
   }
