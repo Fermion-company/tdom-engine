@@ -523,10 +523,11 @@ test('a cold resume that starts before its block typesets it instead of stopping
     paragraphs.push('');
   }
   const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
-  // as in the fuzzer: the neighbours' exact pixels never land, so the walk
-  // keeps extending to them
-  const previousRender = process.env.TDOM_NO_RENDER;
+  // as in the fuzzer: the neighbours' exact pixels never land (no RENDER, no
+  // canonical crop), so the walk keeps extending to them
+  const previousEnv = { TDOM_NO_RENDER: process.env.TDOM_NO_RENDER, TDOM_NO_CANONICAL: process.env.TDOM_NO_CANONICAL };
   process.env.TDOM_NO_RENDER = '1';
+  process.env.TDOM_NO_CANONICAL = '1';
   const e = new CheckpointEngine({ workDir: work });
   e.checkpointCeiling = 4;
   try {
@@ -538,6 +539,11 @@ test('a cold resume that starts before its block typesets it instead of stopping
     const at = e.getSource().indexOf('Paragraph 47 ');
     const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
     assert.equal(cold.stats.chainVerdict, 'cold');
+    for (const n of [43, 45]) {
+      const neighbour = e.blocks.find((b) => b.text.startsWith(`Paragraph ${n} `));
+      assert.ok(neighbour?.needsRender && e.chunks.get(neighbour.id)?.forGalley !== neighbour.galleyHash,
+        `paragraph ${n} still waits for its exact pixels`);
+    }
     const until = Date.now() + 60_000;
     while ((e.pendingChain || e.coldDirty.size || e.bgActive || e.updating) && resumes.length <= 3 && Date.now() < until) {
       await new Promise((r) => setTimeout(r, 50));
@@ -550,8 +556,10 @@ test('a cold resume that starts before its block typesets it instead of stopping
     assert.ok(block?.galley && block.text.startsWith('Section 47'), 'the galley belongs to the edited text');
   } finally {
     await e.close();
-    if (previousRender === undefined) delete process.env.TDOM_NO_RENDER;
-    else process.env.TDOM_NO_RENDER = previousRender;
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 
