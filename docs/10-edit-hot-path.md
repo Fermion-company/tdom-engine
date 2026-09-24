@@ -173,6 +173,8 @@ body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironm
 
 `#scheduleBackground()` は、編集後 300ms の idle gate を待ってから `#runChainPass()` を lock 内で走らせる。次の編集が来ると `bgAbort` で止まり、進捗位置から後で再開する。
 
+settle は `from`（入口 state が古い最初の block）より前の block では収束を判定しない。`from` の境界が退役していると pass はその手前の checkpoint から再生するが、そこで galley と exit state が一致しても、foreground が更新済みの block を再現しただけで、動いた state が収まった証拠にはならない（cold resume が何度か走ると、その pin が `editHold` から押し出されて起きる）。
+
 ## 10.7 references と toc
 
 label が動いたとき、後方で定義された label を前方 block が参照していることがある。foreground 中に `pendingChain` が無ければ、ref index から候補 block を取り、必要なものだけ再組版する。

@@ -615,6 +615,53 @@ test('a cold resume left with nothing to typeset still runs the settle it carrie
   }
 });
 
+test('a settle whose first stale boundary retired still carries the counter to the end', opts, async () => {
+  const work = WORK + '-settle-from';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the settle fixture keeps the resident chain walking for a while.`);
+    if (i % 40 === 0) paragraphs.push('', `\\begin{equation} x = ${i} \\end{equation}`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const previousCanonical = process.env.TDOM_NO_CANONICAL;
+  process.env.TDOM_NO_CANONICAL = '1';
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  const equationsAt = (b) => JSON.parse(b.stateVec)[e.counters.indexOf('equation')];
+  try {
+    await e.open(doc);
+    e.coldPrefixBudgetMs = 0;
+    const at = e.getSource().indexOf('Paragraph 20 ');
+    const moved = await e.edit(at, at, '\\begin{equation} y \\end{equation}\n\n');
+    assert.equal(moved.stats.chainVerdict, 'counters');
+    assert.equal(e.pendingChain?.kind, 'settle');
+    // Lose the boundary at the settle's first stale block, as later walks'
+    // pins and the cap can: the pass must start below it, over blocks the
+    // foreground already brought up to date.
+    const from = e.pendingChain.from;
+    const peer = e.checkpoints.get(from);
+    assert.ok(peer, `the foreground left a boundary at ${from}`);
+    e.editHold = e.editHold.filter((idx) => idx !== from);
+    e.renderHold.delete(from);
+    peer.send('DIE\n');
+    if (peer.pid) e.dyingPids.add(peer.pid);
+    for (const [idx, candidate] of [...e.checkpoints]) if (candidate === peer) e.checkpoints.delete(idx);
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.bgActive || e.updating) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(e.pendingChain, null);
+    assert.equal(equationsAt(e.blocks[e.blocks.length - 1]), 5, 'the moved counter reached the end of the document');
+  } finally {
+    await e.close();
+    if (previousCanonical === undefined) delete process.env.TDOM_NO_CANONICAL;
+    else process.env.TDOM_NO_CANONICAL = previousCanonical;
+  }
+});
+
 test('a keystroke during a caret warm walk takes the lock at the next block boundary', opts, async () => {
   const work = WORK + '-warm-edit-priority';
   rmSync(work, { recursive: true, force: true });
