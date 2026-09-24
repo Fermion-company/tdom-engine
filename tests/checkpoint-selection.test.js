@@ -403,6 +403,10 @@ test('a walk step is killed for an edit only when its remaining time outweighs t
   const long = [...Array.from({ length: 20 }, () => ({ typesetCostMs: 100 })), { typesetCostMs: 400 }];
   assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 50, retainedIdx: 0 }), false);
   assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 50, retainedIdx: 19 }), true);
+  // a caret warm's step that already ran long: kill, whatever the replay behind it
+  assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 400, retainedIdx: 0, warm: true }), true);
+  assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 400, retainedIdx: 0 }), false);
+  assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 50, retainedIdx: 0, warm: true }), false);
   // an unknown cost after a replay, or no job: never
   assert.equal(walkKillPaysOff({ blocks, jobIdx: 4, jobElapsedMs: 10, retainedIdx: 2 }), false);
   assert.equal(walkKillPaysOff({ blocks, jobIdx: -1, jobElapsedMs: 10, retainedIdx: 0 }), false);

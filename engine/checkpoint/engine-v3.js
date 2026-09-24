@@ -56,7 +56,7 @@ import { resetOpenState } from './open-state.js';
 import { initializeEngineState } from './constructor-state.js';
 import { awaitWaiter, fulfillWaiter, rejectWaiter } from './waiters.js';
 import { abortBackgroundJob } from './abort-background-job.js';
-import { editElsewhereThanWalk, walkKillPaysOff } from './walk-preemption.js';
+import { editElsewhereThanWalk, endWalkRetain, walkKillPaysOff } from './walk-preemption.js';
 import { Timer } from './timer.js';
 import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
@@ -387,6 +387,9 @@ export class CheckpointEngine {
       this.bgActive = true;
       this.warming = true;
       this.bgWalkTarget = target;
+      this.walkRetains = true;
+      this.walkRetainedAt = performance.now();
+      this.walkRetainedIdx = null;
       let replayed;
       try {
         replayed = await this.#retypesetChain(
@@ -403,6 +406,7 @@ export class CheckpointEngine {
         this.bgActive = false;
         this.warming = false;
         this.bgWalkTarget = null;
+        endWalkRetain(this);
       }
       if (replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev) {
         // Pin the boundary this walk reached so the warm that superseded it
@@ -647,6 +651,15 @@ export class CheckpointEngine {
       const interactive = !override && !!block.galley &&
         (this.updating && !this.bgActive || this.warming);
       const previous = this.blocks[idx - 1];
+      // A background walk keeps one boundary per walkRetainMs of replay
+      // (docs/10 §10.4a): an edit that kills its step then loses at most that
+      // much, and the next walk starts there.
+      if (replayToken && !override && this.bgActive && this.walkRetains &&
+          performance.now() - (this.walkRetainedAt ?? 0) > this.walkRetainMs && !this.editHold.includes(idx)) {
+        this.editHold = [idx, ...this.editHold.filter((k) => k !== this.walkRetainedIdx)].slice(0, 8);
+        this.walkRetainedIdx = idx;
+        this.walkRetainedAt = performance.now();
+      }
       advance = !!replayToken && ck.replayToken === replayToken && !override &&
         !this.#checkpointKeepSet().has(idx) && !this.editHold.includes(idx) && !this.renderHold.has(idx) &&
         !this.renderWant.has(previous?.id) &&
@@ -1527,6 +1540,10 @@ export class CheckpointEngine {
       rescuing: this.rescuingIdx ?? null,
     };
     this.editPending++;
+    // a keystroke (or an input change), not the engine's own cold resume:
+    // walks stop for it at their next boundary (update-typeset-phase.js)
+    const keystroke = !args.coldResume;
+    if (keystroke) this.keystrokePending++;
     let lockHeld = false;
     if (this.coldWalking || this.warming) {
       this.bgAbort = true;
@@ -1556,6 +1573,7 @@ export class CheckpointEngine {
             jobIdx,
             jobElapsedMs: performance.now() - job.startedAt,
             retainedIdx: this.#nearestCheckpoint(jobIdx),
+            warm: this.warming,
           })) {
         abortBackgroundJob(this, 'background walk pre-empted by an edit');
       }
@@ -1565,6 +1583,7 @@ export class CheckpointEngine {
       const report = await this.#locked(async () => {
         lockHeld = true;
         this.editPending--;
+        if (keystroke) this.keystrokePending--;
         this.lastLock = { ...entry, lockedAtEpochMs: Date.now() };
         // serialize async header-job arrivals against updates: an hf apply
         // between an update's prevHashes capture and its patch computation
@@ -1586,7 +1605,10 @@ export class CheckpointEngine {
       if (documentResetPending) this.onDocumentResetComplete?.({ error });
       throw error;
     } finally {
-      if (!lockHeld) this.editPending--;
+      if (!lockHeld) {
+        this.editPending--;
+        if (keystroke) this.keystrokePending--;
+      }
     }
   }
 

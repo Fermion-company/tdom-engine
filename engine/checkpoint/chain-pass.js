@@ -2,6 +2,7 @@ import { performance } from 'node:perf_hooks';
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { resolvedInGalley } from './util/galley.js';
+import { endWalkRetain } from './walk-preemption.js';
 
 /**
  * The deferred chain pass. 'settle': re-typeset forward from the stop
@@ -118,6 +119,9 @@ export async function runChainPass(engine, callbacks) {
           // stays live.
           engine.coldWalking = true;
           engine.bgWalkTarget = target;
+          engine.walkRetains = true;
+          engine.walkRetainedAt = performance.now();
+          engine.walkRetainedIdx = null;
           // walk telemetry for the deferred report (docs/10 §10.4a): where
           // the replay started, how far it got, and each block's cost
           const walkStartedAt = performance.now();
@@ -141,6 +145,7 @@ export async function runChainPass(engine, callbacks) {
           } finally {
             engine.coldWalking = false;
             engine.bgWalkTarget = null;
+            endWalkRetain(engine);
           }
           const reached = from + (n < 0 ? -n - 1 : n);
           const prev = engine.coldWalk?.target === target ? engine.coldWalk : null;

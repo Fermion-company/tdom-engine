@@ -259,6 +259,12 @@ export function initializeEngineState(
   engine.coldDirty = new Set(); // block ids whose galley predates their source text
   engine.coldWalking = false; // a cold chain pass is replaying with STEP right now
   engine.bgWalkTarget = null; // block a caret warm, cold walk or grid walk is heading for
+  engine.keystrokePending = 0; // edits (not cold resumes) waiting for the chain lock
+  // a background walk retains (editHold) one boundary per this much replay
+  engine.walkRetainMs = Math.max(0, Number(process.env.TDOM_WALK_RETAIN_MS ?? 400) || 0);
+  engine.walkRetains = false; // the running caret warm or cold walk keeps boundaries
+  engine.walkRetainedAt = 0;
+  engine.walkRetainedIdx = null;
   engine.coldWalk = null; // telemetry of the last cold replay (from/target/walked/ms/perBlockMs)
   engine.coldTrace = null; // timestamps of the current cold keystroke's deferred path
   // Grid materialization (docs/03): the keep set is computed from measured

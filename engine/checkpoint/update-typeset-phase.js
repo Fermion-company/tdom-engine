@@ -149,6 +149,12 @@ export async function runUpdateTypesetPhase(engine, {
     // block steps for longer than the preview takes. A short rest is still
     // walked, natively. A preview that fails or is late leaves the walk to
     // go on as before.
+    // A keystroke waiting for the lock carries newer text: stop at this
+    // boundary (the walk's start included) instead of waiting on it.
+    if (!coldResume && coldBudgetMs > 0 && atCleanBoundary && i < firstDirty && engine.keystrokePending > 0) {
+      verdict = 'cold';
+      break;
+    }
     const previewEtaMs = preview
       ? Math.max(0, (Number(preview.block.typesetCostMs) || 300) + 100 - (performance.now() - preview.startedAt))
       : 0;
@@ -214,10 +220,14 @@ export async function runUpdateTypesetPhase(engine, {
     // for a keystroke waiting on the lock: its walk may start before the
     // boundary the chain pass reached (an exact neighbour whose input boundary
     // is not held, a block another walk already typeset), and a stop there
-    // re-queues the same blocks with no progress.
+    // re-queues the same blocks with no progress. A waiting keystroke (not a
+    // waiting resume) stops any walk at its next such boundary, budget or
+    // not: it carries newer text, and the boundary stays pinned for the next
+    // pass (measured: a keystroke waited 3.7 s for a resume to spend its
+    // budget).
     if (coldBudgetMs > 0 && wasClean && !changed && i <= lastDirty &&
         (!coldResume || typesetDirty || engine.editPending > 0) &&
-        (performance.now() - walkStartedAt > coldBudgetMs ||
+        (performance.now() - walkStartedAt > coldBudgetMs || engine.keystrokePending > 0 ||
           // a preview in hand ends the walk unless the rest is short
           (preview?.galley && costTo(i) > (engine.coldPreviewFromMs ?? 500) / 2))) {
       verdict = 'cold';
@@ -285,8 +295,9 @@ export async function runUpdateTypesetPhase(engine, {
     // A budget stop can come before the preview: wait a bounded while for
     // it, then show it. The block stays source-dirty below (coldDirty), so
     // the resume walk still typesets it in its own lineage and replaces it.
+    // Not while a newer keystroke waits for the lock: it carries newer text.
     let timer = null;
-    const galley = preview.galley !== undefined ? preview.galley : await Promise.race([
+    const galley = preview.galley !== undefined ? preview.galley : engine.keystrokePending > 0 ? null : await Promise.race([
       preview.compile,
       new Promise((resolve) => { timer = setTimeout(() => resolve(null), engine.coldPreviewWaitMs ?? 1000); }),
     ]);
