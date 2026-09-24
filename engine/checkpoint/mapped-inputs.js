@@ -3,6 +3,7 @@ import path from 'node:path';
 import { segmentBody } from '../segmenter.js';
 import { fnv1a } from '../hash.js';
 import { resolveProjectInput } from '../project-inputs.js';
+import { cacheIncludeRead } from './include-cache.js';
 
 // An input is token substitution, not a paragraph boundary. Segment the
 // substituted body and keep a source map for regions crossing file edges.
@@ -45,7 +46,7 @@ export function expandInputParagraphs(segs, context) {
       try {
         const stat = statSync(resolved.readPath);
         text = readFileSync(resolved.readPath, 'utf8');
-        context.includes.set(resolved.actualPath, { mtime: stat.mtimeMs, readPath: resolved.readPath, text });
+        cacheIncludeRead(context.includes, resolved.actualPath, { mtime: stat.mtimeMs, readPath: resolved.readPath, text });
         context.watchInclude(resolved.readPath);
       } catch { continue; }
       const rootUnit = depth === 0 ? segmentIndex + 1 : inheritedRootUnit;

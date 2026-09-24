@@ -81,11 +81,12 @@ export function initializeEngineState(
   engine.bgTask = Promise.resolve();
   engine.onAsyncPatches = null; // callback(report-ish) for gfx swaps
   engine.onExternalChange = null; // callback when an \input file changes
+  engine.unchangedInputEvents = 0; // watcher events dropped: the bytes were already read
   engine.backendName = 'checkpoint';
   engine.diagnostics = [];
   engine.tocHash = null;
-  engine.includes = new Map(); // path -> {mtime, text}
-  engine.watchers = new Map(); // path -> FSWatcher
+  engine.includes = new Map(); // path -> {mtime, readPath, text, announcedText} (include-cache.js)
+  engine.watchers = new Map(); // path -> {close()} re-arming watch handle (include-expander.js)
   // Resident-fork budget. Every checkpoint is a live lualatex process
   // (~100-300MB unique RSS on package-heavy preambles), so N engines on a
   // big document multiply into real RAM: 64 forks × 2 audit engines ×

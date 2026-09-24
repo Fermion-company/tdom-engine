@@ -64,6 +64,7 @@ import { chunkTargets } from './chunk-targets.js';
 import { focusRescueIds } from './update-helpers.js';
 import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, includeOnlyFromSource, watchInclude } from './include-expander.js';
+import { announceIncludeReads, includeReadCurrent } from './include-cache.js';
 import { needsRescue } from './rescue-classifier.js';
 import { scheduleHeaders as scheduleHeadersHelper } from './header-scheduler.js';
 import {
@@ -2391,7 +2392,17 @@ export class CheckpointEngine {
     // would enqueue a second refresh for every keystroke in a child buffer.
     if (this.overlayDir && isPathInside(this.overlayDir, full)) return;
     if (path.resolve(full) === path.join(this.workDir, 'driver.bbl')) return;
-    watchInclude(full, this.watchers, (changed) => this.onExternalChange?.(changed));
+    watchInclude(full, this.watchers, (changed) => {
+      // Touches, sync clients and indexers raise events without changing a
+      // byte. Refreshing anyway advances srcRev and restarts canonical: on
+      // the 316-page book 33 such events after /open held the first
+      // canonical back for 305 s.
+      if (includeReadCurrent(this.includes, changed)) {
+        this.unchangedInputEvents++;
+        return;
+      }
+      this.onExternalChange?.(changed);
+    });
   }
 
   async refresh(inputChanges = {}) {
@@ -2404,6 +2415,7 @@ export class CheckpointEngine {
       removed: [...removed],
       unknown: inputChanges?.unknown === true || (!changed.length && !removed.length),
     };
+    announceIncludeReads(this.includes, [...changed, ...removed]);
     this.canonical.invalidateInputs(projectInputChanges);
     return this.#update({ editLabel: 'external-include', projectInputChanges });
   }
