@@ -36,7 +36,7 @@ generation の同一性は「root source のバイト列」と「compile が読�
 root は `srcHash` が、input は `inputManifest`（logical path → sha256、`-recorder` の `canon.fls` から採取。
 Build 取り込みでは `.fls` 検証済みの records から受け取る）が担う。
 
-`inputEpoch` は子ファイル編集・外部変更・bibliography 更新のたびに単調増加するが、その epoch ごとに
+`inputEpoch` は子ファイル編集・外部変更（バイト列が変わった通知だけ。docs/13 §13.4）・bibliography 更新のたびに単調増加するが、その epoch ごとに
 「どの logical path を無効化したか」を `inputInvalidations` に記録する。ある generation について、
 
 1. root が `srcHash` と一致し、

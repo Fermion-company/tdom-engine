@@ -43,6 +43,7 @@ import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read
 import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
 import { buildLeasePreviewSettlement } from './engine/checkpoint/build-lease-preview.js';
 import { watchInclude } from './engine/checkpoint/include-expander.js';
+import { includeReadCurrent } from './engine/checkpoint/include-cache.js';
 import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
 
 // Certified canonical anchoring is deliberately narrow: only plain-text
@@ -917,6 +918,9 @@ engine.onExternalChange = (changedInput) => {
     // An overlay can land while this refresh waits behind the edit that
     // carries it; the write then no longer changes any TeX input.
     if (diskChangeShadowedByOverlay(activeProject, changedFile)) return lastReport;
+    // A refresh queued ahead of this one may already have read these bytes
+    // and invalidated them on canonical.
+    if (changedFile && includeReadCurrent(engine.includes, changedFile)) return lastReport;
     const retired = retireSavedOverlay(activeProject, changedFile);
     const source = engine.getSource();
     const nextBibliography = describeExternalBibliography(source, activeProject.docDir, activeProject.overlayDir);
@@ -1676,6 +1680,7 @@ const server = http.createServer(async (req, res) => {
         rev: engine.rev,
         srcRev: engine.srcRev,
         documentEpoch,
+        unchangedInputEvents: engine.unchangedInputEvents,
         progress: engine.progress ?? null,
         // pages the resident layout has right now (async rescues and
         // repaginations move it between edit reports)

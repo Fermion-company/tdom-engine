@@ -4,6 +4,7 @@ import { fnv1a } from '../hash.js';
 import { segmentBody } from '../segmenter.js';
 import { resolveProjectInput } from '../project-inputs.js';
 import { expandInputParagraphs } from './mapped-inputs.js';
+import { cacheIncludeRead } from './include-cache.js';
 
 export function expandIncludes(segs, depth, context) {
   if (depth > 3) return segs;
@@ -97,7 +98,7 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
     const text = !overlay && cached && cached.mtime === st.mtimeMs && cached.readPath === readPath
       ? cached.text
       : readFileSync(readPath, 'utf8');
-    context.includes.set(full, { mtime: st.mtimeMs, readPath, text });
+    cacheIncludeRead(context.includes, full, { mtime: st.mtimeMs, readPath, text });
     context.watchInclude(readPath);
     const subs = expandIncludes(
       expandInputParagraphs(segmentBody(text, 0, { literalEnvs: context.literalEnvs }), {

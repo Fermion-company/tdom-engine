@@ -78,6 +78,7 @@ Electron ホストは `execPath: process.execPath` と `extraEnv: { ELECTRON_RUN
 - 組版対象は常に **root 文書**である。子ファイルのタブに切り替えただけで root が差し替わることはない。
 - 未保存の子バッファは **overlay** として渡り、変わったものだけが差分として送られる。閉じられた（または保存された）バッファは `removeOverlays` で外れる。
 - `removeOverlays` の時点でディスクが overlay と同じバイト列なら（保存）、エンジンは overlay ファイルを入力として残す（`savedOverlays`）。実効入力は変わらないので srcRev・anchor epoch・canonical の input epoch を進めず、その `/edit` は直前の report を返す。overlay が被さっているファイルへのディスク書込み（自動保存の fs.watch 通知を含む）も入力変化として扱わない。保存済み overlay と異なるバイト列がディスクに書かれたときだけ overlay を外し、通常の除去として refresh する。
+- `\input` / `\include` で読んだファイルの fs.watch 通知は、ディスクのバイト列がエンジンの最後に読んだ内容と同じで、かつその内容を canonical に伝え済みなら捨てる（`include-cache.js`）。touch や、Spotlight・iCloud Drive・Dropbox などによる同じ内容の書き戻しは、srcRev も canonical の input epoch も進めない。捨てた数は `/status` の `unchangedInputEvents`。316ページの文書で `/open` 直後に33章すべてへ通知が届いたとき、以前は空の update が33回続き、最初の canonical が落ち着くまで305 sかかった。「伝え済み」の内容（`announcedText`）は、そのパスで最初に読んだ内容と、外部変更の refresh が canonical を無効化する直前のディスク内容である。cold resume や structured re-probe が新しいバイト列を読み直しても `announcedText` は変わらないので、その通知は捨てずに refresh する。refresh が待ち行列にある間に先行の refresh が同じバイト列を読んで伝え済みにした場合も、server はその refresh を行わない。画像や listing のように include として読んでいないファイルは、従来どおり通知ごとに refresh する。
 - 子ファイル anchor の直前入力の検証は、ディスクが直前に読んだ内容と同じか、この編集の要求内容と同じで mtime が打鍵時刻（`clientEditAtEpochMs`）以降の場合だけ通す（編集がエンジンへ届く前に自動保存が同じ内容を書いた場合）。
 - root が未変更で mtime も同じなら、ディスクを読み直さず保持中のソースを使う。無意味な全文 diff を避ける。
 - `workspaceRoot` の外へ出るパスは拒否される。
