@@ -563,6 +563,56 @@ test('a cold resume that starts before its block typesets it instead of stopping
   }
 });
 
+test('a cold resume left with nothing to typeset still runs the settle it carried', opts, async () => {
+  const work = WORK + '-cold-carry';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the cold carry fixture keeps the resident chain walking for a while.`);
+    if (i % 40 === 0) paragraphs.push('', `\\begin{equation} x = ${i} \\end{equation}`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  // no canonical: its arrival could re-seed the lineage and hide a lost settle
+  const previousCanonical = process.env.TDOM_NO_CANONICAL;
+  process.env.TDOM_NO_CANONICAL = '1';
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  const equationsAt = (b) => JSON.parse(b.stateVec)[e.counters.indexOf('equation')];
+  try {
+    await e.open(doc);
+    e.coldPreviewEnabled = false;
+    // 1. a new equation moves the counter for the rest of the document: settle
+    e.coldPrefixBudgetMs = 0;
+    let at = e.getSource().indexOf('Paragraph 20 ');
+    const moved = await e.edit(at, at, '\\begin{equation} y \\end{equation}\n\n');
+    assert.equal(moved.stats.chainVerdict, 'counters');
+    // 2. a cold keystroke far down carries that settle through its resume
+    e.coldPrefixBudgetMs = 1;
+    at = e.getSource().indexOf('Paragraph 150 ');
+    const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
+    assert.equal(cold.stats.chainVerdict, 'cold');
+    assert.equal(e.pendingChain?.kind, 'cold');
+    assert.equal(e.pendingChain.carry?.kind, 'settle', 'the cold work carries the pending settle');
+    // 3. the next keystroke typesets that block itself: the resume finds nothing
+    e.coldPrefixBudgetMs = 0;
+    const hot = await e.edit(at, at + 'Section'.length, 'Chapter');
+    assert.notEqual(hot.stats.chainVerdict, 'cold');
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.coldDirty.size || e.bgActive || e.updating) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(e.pendingChain, null);
+    assert.equal(e.coldDirty.size, 0);
+    assert.equal(equationsAt(e.blocks[e.blocks.length - 1]), 5, 'the moved counter reached the end of the document');
+  } finally {
+    await e.close();
+    if (previousCanonical === undefined) delete process.env.TDOM_NO_CANONICAL;
+    else process.env.TDOM_NO_CANONICAL = previousCanonical;
+  }
+});
+
 test('a keystroke during a caret warm walk takes the lock at the next block boundary', opts, async () => {
   const work = WORK + '-warm-edit-priority';
   rmSync(work, { recursive: true, force: true });

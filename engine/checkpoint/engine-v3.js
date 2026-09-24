@@ -1582,8 +1582,15 @@ export class CheckpointEngine {
     if (prepared.response) return prepared.response;
     const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
     // Every cold block was re-typeset by a walk that passed over it (or a
-    // keystroke landed there first): nothing is left for this resume.
-    if (coldResume && !dirtySource.size) return null;
+    // keystroke landed there first): nothing is left for this resume except
+    // the settle/rebuild it carried, which the document still owes.
+    if (coldResume && !dirtySource.size) {
+      if (chainCarry?.kind) {
+        this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels);
+        this.#kickPendingChain();
+      }
+      return null;
+    }
     const plainPreviewAdmission = classifyPlainPreviewEdit(this, {
       text, editContext, oldBlocks, dirtySource, rebooted,
     });
