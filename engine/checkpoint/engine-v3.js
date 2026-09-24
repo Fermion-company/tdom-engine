@@ -1582,8 +1582,15 @@ export class CheckpointEngine {
     if (prepared.response) return prepared.response;
     const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
     // Every cold block was re-typeset by a walk that passed over it (or a
-    // keystroke landed there first): nothing is left for this resume.
-    if (coldResume && !dirtySource.size) return null;
+    // keystroke landed there first): nothing is left for this resume except
+    // the settle/rebuild it carried, which the document still owes.
+    if (coldResume && !dirtySource.size) {
+      if (chainCarry?.kind) {
+        this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels);
+        this.#kickPendingChain();
+      }
+      return null;
+    }
     const plainPreviewAdmission = classifyPlainPreviewEdit(this, {
       text, editContext, oldBlocks, dirtySource, rebooted,
     });
@@ -1643,6 +1650,7 @@ export class CheckpointEngine {
         // A boot, reboot or retry fills every galley from block zero: that
         // walk has no prefix to defer.
         coldBudgetMs: rebooted || retry || editLabel === 'open' ? 0 : this.coldPrefixBudgetMs,
+        coldResume,
         callbacks: {
           nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
           typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),

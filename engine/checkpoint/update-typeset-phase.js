@@ -16,6 +16,7 @@ export async function runUpdateTypesetPhase(engine, {
   defRe,
   plainPreviewAdmission = null,
   coldBudgetMs = 0,
+  coldResume = false,
   callbacks,
 }) {
   const {
@@ -128,6 +129,7 @@ export async function runUpdateTypesetPhase(engine, {
     }
   }
   const walkStartedAt = performance.now();
+  let typesetDirty = false; // a source-dirty or galley-less block is behind the walk
   while (i < engine.blocks.length) {
     // /status liveness marker: which block the foreground pass is on —
     // a long boot walk shows movement instead of silence
@@ -145,6 +147,7 @@ export async function runUpdateTypesetPhase(engine, {
     forkMs += performance.now() - t0;
     typesetCount++;
     const wasClean = before.hadGalley && !dirtySource.has(block.id);
+    if (!wasClean) typesetDirty = true;
     adoptGalley(block, galley);
     // track label movements
     for (const l of galley.labels ?? []) {
@@ -166,7 +169,13 @@ export async function runUpdateTypesetPhase(engine, {
     // to a source-dirty block that is still ahead. Past the budget, stop at
     // this completed boundary instead of holding the keystroke for the whole
     // sparse replay; the chain pass resumes from here and re-runs the update.
+    // A cold resume stops only once it has typeset one of its own blocks, or
+    // for a keystroke waiting on the lock: its walk may start before the
+    // boundary the chain pass reached (an exact neighbour whose input boundary
+    // is not held, a block another walk already typeset), and a stop there
+    // re-queues the same blocks with no progress.
     if (coldBudgetMs > 0 && wasClean && !changed && i <= lastDirty &&
+        (!coldResume || typesetDirty || engine.editPending > 0) &&
         (performance.now() - walkStartedAt > coldBudgetMs ||
           // a preview in hand ends the walk unless the rest is short
           (preview?.galley && costTo(i) > (engine.coldPreviewFromMs ?? 500) / 2))) {
