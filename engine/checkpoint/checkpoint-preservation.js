@@ -28,9 +28,11 @@ export function preserveCheckpointSuffix({
   const nextEditHold = editHold
     .map((idx) => (idx <= prefixLen ? idx : idx >= oldSuffixStart ? idx + delta : -1))
     .filter((idx) => idx >= 0);
+  const rekey = (f) => (f <= prefixLen ? f : f >= oldSuffixStart ? f + delta : prefixLen);
   if (pendingChain) {
-    const f = pendingChain.from;
-    pendingChain.from = f <= prefixLen ? f : f >= oldSuffixStart ? f + delta : prefixLen;
+    pendingChain.from = rekey(pendingChain.from);
+    // the settle/rebuild a cold walk carries starts from a block index too
+    if (pendingChain.carry) pendingChain.carry.from = rekey(pendingChain.carry.from);
   }
   return { checkpoints: rekeyed, renderHold: holds, editHold: nextEditHold };
 }
