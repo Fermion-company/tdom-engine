@@ -3,7 +3,7 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, rmSync, mkdtempSync, writeFileSync, readdirSync, utimesSync } from 'node:fs';
+import { readFileSync, rmSync, mkdtempSync, writeFileSync, readdirSync, utimesSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +11,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 import { includeReadCurrent } from '../engine/checkpoint/include-cache.js';
+import { watchInclude } from '../engine/checkpoint/include-expander.js';
 
 const DEMO = readFileSync(fileURLToPath(new URL('../samples/demo-lua.tex', import.meta.url)), 'utf8');
 const WORK = fileURLToPath(new URL('../.tdom-v3-test', import.meta.url));
@@ -992,6 +993,95 @@ test('a touched \\input or \\include file whose bytes did not change does not ad
     assert.equal(events.length, 2);
   } finally {
     await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an \\input file saved by renaming a new file over it keeps reaching onExternalChange', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-atomic-input-'));
+  const one = path.join(root, 'one.tex');
+  writeFileSync(one, 'First chapter paragraph with ordinary prose.\n');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const events = [];
+  const refreshes = [];
+  eng.onExternalChange = (file) => {
+    events.push(file);
+    refreshes.push(eng.refresh({ changed: [file] }));
+  };
+  const until = async (done, what) => {
+    const deadline = Date.now() + 10_000;
+    while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(done(), what);
+  };
+  const shows = (text) => eng.blocks.some((b) => b.text.includes(text));
+  // what vim and sync clients do: write a temp file, rename it over the input
+  const replace = (text) => {
+    writeFileSync(`${one}.tmp`, text);
+    renameSync(`${one}.tmp`, one);
+  };
+  try {
+    await eng.open([
+      '\\documentclass{article}',
+      '\\begin{document}',
+      '\\input{one}',
+      '',
+      '\\end{document}',
+      '',
+    ].join('\n'));
+    const opened = eng.srcRev;
+    const dropped = eng.unchangedInputEvents;
+
+    // A save without changes swaps the inode but not the bytes: no refresh
+    // re-expands the file, so only the watcher itself can follow the path.
+    replace(readFileSync(one));
+    await until(() => eng.unchangedInputEvents > dropped, 'the same-bytes replace fired');
+    assert.equal(eng.srcRev, opened);
+    writeFileSync(one, 'First chapter paragraph, edited in place after a save.\n');
+    await until(() => shows('edited in place after a save'), 'an in-place write after the replace reaches the resident');
+    await Promise.all(refreshes);
+    assert.deepEqual(events, [one]);
+
+    replace('First chapter paragraph, replaced on disk.\n');
+    await until(() => shows('replaced on disk'), 'the atomic replace reaches the resident');
+    writeFileSync(one, 'First chapter paragraph, replaced and then edited in place.\n');
+    await until(() => shows('replaced and then edited in place'), 'the in-place write after it reaches the resident');
+    await Promise.all(refreshes);
+    assert.ok(events.length >= 3 && events.every((file) => file === one));
+    assert.ok(eng.watchers.has(one));
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a deleted include watch still delivers, then leaves the map until an expansion reads the file again', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-deleted-input-'));
+  const one = path.join(root, 'one.tex');
+  writeFileSync(one, 'before\n');
+  const watchers = new Map();
+  const events = [];
+  const until = async (done, what) => {
+    const deadline = Date.now() + 5_000;
+    while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(done(), what);
+  };
+  // libuv registers a watch on a later loop turn
+  const armed = () => new Promise((r) => setTimeout(r, 100));
+  try {
+    watchInclude(one, watchers, (file) => events.push(file));
+    await armed();
+    rmSync(one);
+    await until(() => events.length === 1, 'the deletion is delivered');
+    assert.equal(events[0], one);
+    assert.equal(watchers.has(one), false, 'a missing path is left to the next expansion');
+
+    writeFileSync(one, 'after\n');
+    watchInclude(one, watchers, (file) => events.push(file));
+    await armed();
+    writeFileSync(one, 'after, edited\n');
+    await until(() => events.length === 2, 'the path is watched again');
+  } finally {
+    for (const watcher of watchers.values()) watcher.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

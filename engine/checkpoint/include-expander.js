@@ -246,16 +246,58 @@ function stripTexComments(text) {
     .join('\n');
 }
 
+// fs.watch follows the inode, not the path: after an editor or sync client
+// saves by renaming a new file over this one (vim, most atomic writers), the
+// old watch sits on an unlinked inode and never fires again. A `rename` event
+// or a new inode at the path re-arms it on whatever the path holds now. The
+// path can be missing mid-save, so the debounced delivery retries once; a
+// path still missing then leaves `watchers`, and the next expansion that
+// reads it watches it again. The map keeps one handle per path across
+// re-arms, and closing it closes the live watch.
 export function watchInclude(full, watchers, onExternalChange) {
   if (watchers.has(full)) return;
+  let timer = null;
+  let live = null;
+  let closed = false;
+  const handle = {
+    close() {
+      closed = true;
+      live?.close();
+    },
+  };
+  const arm = () => {
+    try {
+      const identity = fileIdentity(full);
+      const w = watch(full, (event) => {
+        if (w === live && (event === 'rename' || fileIdentity(full) !== identity)) {
+          w.close();
+          live = null;
+          arm();
+        }
+        clearTimeout(timer);
+        timer = setTimeout(deliver, 120);
+      });
+      live = w;
+    } catch {
+      /* watching is best-effort */
+    }
+  };
+  const deliver = () => {
+    if (!live && !closed) {
+      arm();
+      if (!live && watchers.get(full) === handle) watchers.delete(full);
+    }
+    onExternalChange?.(full);
+  };
+  arm();
+  if (live) watchers.set(full, handle);
+}
+
+function fileIdentity(file) {
   try {
-    let timer = null;
-    const w = watch(full, () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => onExternalChange?.(full), 120);
-    });
-    watchers.set(full, w);
+    const st = statSync(file);
+    return `${st.dev}:${st.ino}`;
   } catch {
-    /* watching is best-effort */
+    return null;
   }
 }
