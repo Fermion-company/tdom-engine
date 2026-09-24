@@ -56,6 +56,9 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
   if (coldResume) {
     void engine.bgTask.then((work) => (work ? coldResume(work) : undefined)).catch((err) => {
       engine.diagnostics.push('cold resume failed: ' + (err?.message ?? err));
+      // nothing resumes these any more: the next edit of each block typesets
+      // it, and the rescue pump must not wait on them
+      engine.coldDirty?.clear();
     });
   }
   // High-fidelity chunk renders go to the pump ONLY for the blocks this

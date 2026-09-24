@@ -66,8 +66,11 @@ export function buildUpdateResponse({
       checkpoints: checkpoints.size,
       chainVerdict: verdict ?? 'walked',
       // Source-dirty blocks a cold stop left with a galley older than their
-      // text: their pages show the previous typeset until the resume lands.
+      // text: their pages show the previous typeset until the resume lands,
+      // except coldPreview, a block typeset from the walk's starting
+      // checkpoint (docs/10 §10.4b).
       coldPending: cold?.pending ?? [],
+      coldPreview: cold?.preview ?? null,
       // The cold resume's own replay: checkpoint it started from, the
       // block it walked to, blocks and ms spent across its passes.
       coldWalk,

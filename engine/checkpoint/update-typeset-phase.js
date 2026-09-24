@@ -27,6 +27,7 @@ export async function runUpdateTypesetPhase(engine, {
     paginateNow,
     computeToc,
     queueMovedOffsets,
+    coldPreview = null,
   } = callbacks;
   const dirtyBlocks = [];
   const depDirty = [];
@@ -84,13 +85,56 @@ export async function runUpdateTypesetPhase(engine, {
   }
   const replayToken = {};
   let i = nearestCheckpoint(Math.min(firstDisplay, engine.blocks.length));
+  // a walk that threw left its preview running
+  engine.coldPreviewActive?.cancel();
+  engine.coldPreviewActive = null;
+  // Cold preview (docs/10 §10.4b): when the clean prefix between the nearest
+  // checkpoint and the one edited block is expected to take a while to
+  // replay, typeset that block right away in a fork of the same checkpoint,
+  // beside the walk. The walk then stops cold once the preview is in (or at
+  // the budget) and shows it, instead of leaving the old text on the page
+  // until the resume walk arrives. Not while other blocks on the page still
+  // need exact pixels: the page cannot paint before the walk reaches them.
+  let preview = null;
+  const costTo = (from) => {
+    let ms = 0;
+    for (let k = from; k < firstDirty; k++) ms += Number(engine.blocks[k].typesetCostMs) || 0;
+    return ms;
+  };
+  if (coldPreview && coldBudgetMs > 0 && !defEdit && dirtySource.size === 1 &&
+      firstDirty < engine.blocks.length && dirtySource.has(engine.blocks[firstDirty].id) && i < firstDirty &&
+      firstDisplay === firstDirty && lastDisplay === lastDirty) {
+    const estimateMs = costTo(i);
+    if (estimateMs > (engine.coldPreviewFromMs ?? 500)) {
+      const block = engine.blocks[firstDirty];
+      const startedAt = performance.now();
+      let started = null;
+      try {
+        started = coldPreview(firstDirty, i);
+      } catch (err) {
+        engine.diagnostics?.push(`cold preview of ${block.id}: ${err?.message ?? err}`);
+      }
+      if (started) {
+        preview = { block, text: block.text, estimateMs: Math.round(estimateMs), galley: undefined, readyMs: null };
+        preview.cancel = started.cancel;
+        preview.release = started.release;
+        engine.coldPreviewActive = started;
+        preview.compile = started.galley.catch(() => null).then((galley) => {
+          preview.galley = galley;
+          preview.readyMs = Math.round(performance.now() - startedAt);
+          return galley;
+        });
+      }
+    }
+  }
   const walkStartedAt = performance.now();
   while (i < engine.blocks.length) {
     // /status liveness marker: which block the foreground pass is on —
     // a long boot walk shows movement instead of silence
     engine.progress = { phase: 'typeset', at: i + 1, total: engine.blocks.length };
     const block = engine.blocks[i];
-    const before = { hash: block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
+    // a cold preview is no witness of the block's own typeset (§10.4b)
+    const before = { hash: block.galley?.tdomColdPreview ? null : block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
     // The edited source block carries the old galley but not its closure;
     // that certificate was checked on oldBlocks before the walk.
     const plainBefore = plainPreviewAdmission?.blockId === block.id &&
@@ -123,7 +167,9 @@ export async function runUpdateTypesetPhase(engine, {
     // this completed boundary instead of holding the keystroke for the whole
     // sparse replay; the chain pass resumes from here and re-runs the update.
     if (coldBudgetMs > 0 && wasClean && !changed && i <= lastDirty &&
-        performance.now() - walkStartedAt > coldBudgetMs) {
+        (performance.now() - walkStartedAt > coldBudgetMs ||
+          // a preview in hand ends the walk unless the rest is short
+          (preview?.galley && costTo(i) > (engine.coldPreviewFromMs ?? 500) / 2))) {
       verdict = 'cold';
       break;
     }
@@ -178,11 +224,40 @@ export async function runUpdateTypesetPhase(engine, {
   }
   if (defEdit && verdict) verdict = 'leak';
   const fgStop = i;
+  const walkMs = Math.round(performance.now() - walkStartedAt);
 
   // A cold stop leaves every source-dirty block at or past the boundary with
   // a galley older than its text. Remember them: the resume walk targets the
   // first one, and any walk that re-typesets one drops it again (adoptGalley).
   let cold = null;
+  if (verdict === 'cold' && preview && fgStop < firstDirty && engine.blocks[firstDirty] === preview.block &&
+      preview.block.text === preview.text) {
+    // A budget stop can come before the preview: wait a bounded while for
+    // it, then show it. The block stays source-dirty below (coldDirty), so
+    // the resume walk still typesets it in its own lineage and replaces it.
+    let timer = null;
+    const galley = preview.galley !== undefined ? preview.galley : await Promise.race([
+      preview.compile,
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), engine.coldPreviewWaitMs ?? 1000); }),
+    ]);
+    clearTimeout(timer);
+    if (galley && engine.blocks[firstDirty] === preview.block && preview.block.text === preview.text) {
+      // Downstream blocks were typeset against the old exit state: keep it
+      // on the block, so the walk that typesets it natively compares against
+      // what they assumed and carries a moved counter on (§10.4).
+      const exitState = preview.block.stateVec;
+      adoptGalley(preview.block, galley);
+      preview.block.stateVec = exitState;
+      if (!dirtyBlocks.includes(preview.block.id)) dirtyBlocks.push(preview.block.id);
+      engine.coldPreviews = (engine.coldPreviews ?? 0) + 1;
+      preview.adopted = true;
+      // glyph-only: no RENDER will want the checkpoint it forked
+      if (!preview.block.needsRender) preview.release();
+    }
+  }
+  // the walk reached the block itself, or the preview came too late
+  if (preview && !preview.adopted) preview.cancel();
+  engine.coldPreviewActive = null;
   if (verdict === 'cold') {
     const pending = [];
     for (let k = fgStop; k < engine.blocks.length; k++) {
@@ -190,7 +265,14 @@ export async function runUpdateTypesetPhase(engine, {
       if (dirtySource.has(block.id) || !block.galley) pending.push(block.id);
     }
     for (const id of pending) engine.coldDirty.add(id);
-    cold = { pending, from: fgStop };
+    cold = {
+      pending,
+      from: fgStop,
+      preview: preview ? {
+        block: preview.block.id, adopted: !!preview.adopted, estimateMs: preview.estimateMs,
+        readyMs: preview.readyMs, walkMs,
+      } : null,
+    };
     engine.coldTrace = { stopAt: performance.now() };
     queueChainWork('cold', fgStop, changedLabels);
   }

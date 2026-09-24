@@ -184,6 +184,17 @@ export function initializeEngineState(
   engine.bootRescueMs = Math.max(0, Number(process.env.TDOM_BOOT_RESCUE_MS ?? 45_000) || 0);
   engine.bootRescueBudgetMs = 0;
   engine.rescueAdoptWaiting = 0; // rescue adoptions queued on the chain lock (a grid pass yields to them)
+  engine.coldPreviewEnabled = process.env.TDOM_COLD_PREVIEW !== '0'; // docs/10 §10.4b
+  // start a preview when the replay estimate (sum of intrinsic block costs,
+  // about half the measured replay) exceeds this
+  engine.coldPreviewFromMs = Math.max(0, Number(process.env.TDOM_COLD_PREVIEW_FROM_MS ?? 500) || 0);
+  // a budget stop waits this long for a preview still typesetting
+  engine.coldPreviewWaitMs = Math.max(0, Number(process.env.TDOM_COLD_PREVIEW_WAIT_MS ?? 1000) || 0);
+  engine.coldPreviewTimeoutMs = 15_000;
+  engine.coldPreviewSeq = 0;
+  engine.coldPreviewHolds = new Map(); // peer a preview forked -> Set of block ids, kept for their RENDER
+  engine.coldPreviewActive = null; // the current foreground walk's preview (cancelled if the walk throws)
+  engine.coldPreviews = 0; // cold keystrokes shown through a preview (/status)
   engine.rescuePumping = false;
   engine.isoChildren = new Set(); // in-flight isolated lualatex processes
 

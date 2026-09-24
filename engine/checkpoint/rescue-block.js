@@ -22,7 +22,9 @@ export async function rescueBlock(engine, idx, why, callbacks) {
       });
       engine.rescueQueue.set(block.id, cacheKey);
       pumpRescues();
-      return { ...block.galley, tdomStale: true };
+      const kept = { ...block.galley, tdomStale: true };
+      delete kept.tdomColdPreview; // the held copy is no longer a preview (docs/10 §10.4b)
+      return kept;
     }
     // A boot walk with the fork runners up compiles a first-ever rescue
     // right here, within its compile-time budget (bootIsoCompile returns

@@ -1700,6 +1700,7 @@ const server = http.createServer(async (req, res) => {
         canonicalAnchorPresentation: lastAnchorPresentation,
         canonicalAnchorInputDiagnostic: lastReport?.canonicalAnchorInputDiagnostic ?? null,
         warm: engine.warmInfo ?? null,
+        coldPreviews: engine.coldPreviews ?? 0,
         cold: engine.coldDirty?.size
           ? { pending: [...engine.coldDirty], walk: engine.progress?.phase === 'cold' ? engine.progress : null }
           : null,

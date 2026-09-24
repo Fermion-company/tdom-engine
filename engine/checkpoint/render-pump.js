@@ -168,8 +168,29 @@ async function renderBlockInner(engine, block, callbacks) {
     releaseRenderHold(idx);
     return true;
   }
-  const ck = engine.checkpoints.get(idx);
+  let ck = engine.checkpoints.get(idx);
+  let checkpointIndex = idx;
+  let prelude = null;
   const captureCk = block.galley?.capture ? engine.checkpoints.get(idx + 1) : null;
+  const cold = block.galley?.tdomColdPreview;
+  // a preview carried to a newer text has no pixels to give: the walk that
+  // typesets the block replaces it
+  if (cold && cold.text !== block.text) return false;
+  if (cold) {
+    // a cold preview (docs/10 §10.4b) renders the way it was typeset: from
+    // the peer it forked, with the re-seeded entry state (while that peer
+    // is still resident, at whatever index an edit above moved it to), even
+    // when a walk has since reached the block's own entry
+    for (const [index, peer] of engine.checkpoints) {
+      if (peer !== cold.peer || index >= idx) continue;
+      ck = peer;
+      checkpointIndex = index;
+      prelude = cold.prelude;
+      engine.renderStats ??= { captureHits: 0, captureMisses: 0, retypesets: 0 };
+      engine.renderStats.coldPreviews = (engine.renderStats.coldPreviews ?? 0) + 1;
+      break;
+    }
+  }
   if (!ck && !captureCk) {
     // checkpoint retired off the grid (long documents keep ~64): the
     // Neither exact path has a resident owner: RENDER needs the state AT the
@@ -177,17 +198,24 @@ async function renderBlockInner(engine, block, callbacks) {
     renderIsolated(block, idx);
     return false;
   }
-  await renderResidentBlock(engine, {
-    block,
-    idx,
-    ck,
-    targets,
-    forGalley,
-    awaitRender,
-    renderIsolated,
-    asyncRepaginate,
-    chunkTargets,
-    releaseRenderHold,
-  });
+  try {
+    await renderResidentBlock(engine, {
+      block,
+      idx,
+      ck,
+      checkpointIndex,
+      prelude,
+      targets,
+      forGalley,
+      awaitRender,
+      renderIsolated,
+      asyncRepaginate,
+      chunkTargets,
+      releaseRenderHold,
+    });
+  } finally {
+    const owners = prelude !== null ? engine.coldPreviewHolds?.get(ck) : null;
+    if (owners?.delete(block.id) && !owners.size) engine.coldPreviewHolds.delete(ck);
+  }
   return targets.every(target => engine.chunks.get(target.key)?.forGalley === forGalley);
 }

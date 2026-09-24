@@ -26,6 +26,7 @@ export function buildJobBlockBody({
   let body;
   let jobId;
   let refSnapshot = null;
+  let prelude = '';
   if (override) {
     // raw job (rescue continuation): caller supplies the exact body
     body = Buffer.from(override.body, 'utf8');
@@ -80,7 +81,7 @@ export function buildJobBlockBody({
     // material, so a primer there would just sit as extra height.
     const primer = buildLastskipPrimer(block, idx, blocks);
     const volatilePre = ck.vstale && idx > 0 ? volatilePrelude(idx) : '';
-    const prelude =
+    prelude =
       volatilePre + (defs.length ? `\\makeatletter ${defs.join(' ')}\\makeatother\n` : '') + primer;
     const edit = instrumentEditRegions(block.text);
     // Metadata stays on the source block; only the transient resident job
@@ -91,5 +92,5 @@ export function buildJobBlockBody({
     body = Buffer.from(prelude + edit.text, 'utf8');
     jobId = block.id;
   }
-  return { body, jobId, refSnapshot };
+  return { body, jobId, refSnapshot, prelude };
 }

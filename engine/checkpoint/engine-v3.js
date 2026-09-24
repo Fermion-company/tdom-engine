@@ -137,6 +137,7 @@ import {
   buildVolatilePrelude,
 } from './tex-templates.js';
 import { isoCompile as isoCompileHelper } from './iso-compile.js';
+import { fnv1a } from '../hash.js';
 import { buildJobBlockBody } from './job-body.js';
 import { classifyPlainPreviewEdit } from './plain-preview.js';
 
@@ -910,6 +911,111 @@ export class CheckpointEngine {
     this.#isoDiskCache()?.set(key, iso, baseKey);
   }
 
+  #releaseColdPreviewHold(peer, blockId) {
+    const owners = this.coldPreviewHolds?.get(peer);
+    if (!owners?.delete(blockId) || owners.size) return;
+    this.coldPreviewHolds.delete(peer);
+  }
+
+  // checkpoints a cold preview forked, kept until its exact pixels land
+  #coldPreviewHeld() {
+    return this.coldPreviewHolds?.size
+      ? checkpointIndicesForPeers(this.checkpoints, [...this.coldPreviewHolds.keys()]) : [];
+  }
+
+  /**
+   * Cold preview (docs/10 §10.4b): the one edited block, typeset natively in
+   * a fork of the checkpoint the walk starts from, with the entry state of
+   * its (unchanged) predecessor re-seeded exactly as for a vstale lineage
+   * (#volatilePrelude): one block's typeset instead of the replay of every
+   * clean block in between. The child reports its galley and is not kept:
+   * nobody waits for its checkpoint slot (-1), so it is told to DIE.
+   * The peer stays resident (coldPreviewHolds) until the preview's exact
+   * RENDER from it is done, a walk replaces the preview, or 30 s pass.
+   * Returns { galley: Promise, cancel, release } or null.
+   */
+  #coldPreview(idx, fromIdx) {
+    if (!this.coldPreviewEnabled || this.mode !== 'structured' || this.previewPolicy !== 'structured') return null;
+    const block = this.blocks[idx];
+    const ck = this.checkpoints.get(fromIdx);
+    // the gates typeset-dispatch applies before an in-chain JOB
+    if (!block || !ck || !(fromIdx < idx) || this.poisoned.get(block.id) === fnv1a(block.text) ||
+        (this.chainTimeouts ?? 0) > 0 ||
+        this.#needsRescue(block.text, block.structuralSinks)) return null;
+    const { body, jobId: blockJobId, refSnapshot, prelude: jobPrelude } = buildJobBlockBody({
+      block,
+      idx,
+      blocks: this.blocks,
+      ck: { vstale: true },
+      override: null,
+      labelTable: this.labelTable,
+      hrefTable: this.hrefTable,
+      geometry: this.geometry,
+      volatilePrelude: (i) => this.#volatilePrelude(i),
+    });
+    // After a heading the true lineage also carries \@afterheading's
+    // \everypar (the first paragraph's indent); the prelude only restores
+    // the flag
+    const prevVec = JSON.parse(this.blocks[idx - 1]?.stateVec ?? '[]');
+    const afterHeading = prevVec.length >= 2 && prevVec[prevVec.length - 2] === 1
+      ? '\\makeatletter\\@afterheading\\makeatother\n' : '';
+    const prelude = jobPrelude + afterHeading;
+    const text = body.toString('utf8').slice(jobPrelude.length);
+    const payload = Buffer.from(prelude + text, 'utf8');
+    const jobId = `${blockJobId}~cold${++this.coldPreviewSeq}`;
+    // before the walk's first JOB, whose off-grid retirement could take it
+    const owners = this.coldPreviewHolds.get(ck) ?? new Set();
+    owners.add(block.id);
+    this.coldPreviewHolds.set(ck, owners);
+    const release = () => this.#releaseColdPreviewHold(ck, block.id);
+    setTimeout(release, 30_000).unref?.();
+    const key = 'galley:' + jobId;
+    const galleyP = this.#await(key, this.coldPreviewTimeoutMs);
+    // FORKED fills the pid: a child that dies without a galley fails fast,
+    // and an unused one is killed
+    this.renderPids ??= new Map();
+    this.renderPids.set(jobId, 0);
+    const poll = setInterval(() => {
+      const pid = this.renderPids.get(jobId);
+      if (!(pid > 0)) return;
+      try { process.kill(pid, 0); } catch { this._reject(key, new Error(`cold preview child of ${block.id} exited`)); }
+    }, 200);
+    let settled = false;
+    const galley = galleyP.then((g) => {
+      if (g.closure === 'error') {
+        release();
+        return null;
+      }
+      if (refSnapshot) {
+        g.tdomRefVals = refSnapshot;
+        g.refs = [...new Set([...(g.refs ?? []), ...Object.keys(refSnapshot)])];
+      }
+      // its exact render forks the same peer with the same prelude
+      g.tdomColdPreview = { peer: ck, prelude, text: block.text };
+      return g;
+    }).finally(() => {
+      settled = true;
+      clearInterval(poll);
+      this.renderPids.delete(jobId);
+    });
+    const cancel = () => {
+      release();
+      if (settled) return; // the child reported and is on its way to DIE
+      const pid = this.renderPids.get(jobId);
+      if (pid > 0) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      } else {
+        this.cancelledJobIds ??= new Set();
+        this.cancelledJobIds.add(jobId); // killed when FORKED arrives
+        setTimeout(() => this.cancelledJobIds?.delete(jobId), 30_000).unref?.();
+      }
+      this._reject(key, new Error('cold preview unused'));
+    };
+    ck.send(`JOB ${jobId} -1 ${payload.length} - F 0\n`);
+    ck.sendRaw(payload);
+    return { galley, cancel, release };
+  }
+
   /**
    * First-ever rescue during a boot walk: compile it on the walk while the
    * walk's rescue budget (TDOM_BOOT_RESCUE_MS of compile time, default 45 s)
@@ -1146,7 +1252,7 @@ export class CheckpointEngine {
       editHold: [0, ...this.editHold, ...active, ...(continuation === null ? [] : [continuation])],
       coveragePins: this.editHold,
       renderHold: this.renderHold,
-      activeHold: activeRender,
+      activeHold: [...activeRender, ...this.#coldPreviewHeld()],
       maxPeers: budget.residentLimit,
       dyingPids: this.dyingPids,
     });
@@ -1162,7 +1268,7 @@ export class CheckpointEngine {
       idx,
       keep: this.#checkpointKeepSet(),
       checkpoints: this.checkpoints,
-      editHold: this.editHold,
+      editHold: [...this.editHold, ...this.#coldPreviewHeld()],
       renderHold: this.renderHold,
       block: this.foregroundRenderIds && !this.foregroundRenderIds.has(this.blocks[idx]?.id)
         ? null : this.blocks[idx],
@@ -1216,7 +1322,8 @@ export class CheckpointEngine {
     for (let j = from; j < this.blocks.length; j++) {
       if (shouldAbort?.()) return -(n + 1); // strictly negative: aborted
       const block = this.blocks[j];
-      const before = { hash: block.galleyHash, state: block.stateVec };
+      // a cold preview is no witness of the block's own typeset (docs/10 §10.4b)
+      const before = { hash: block.galley?.tdomColdPreview ? null : block.galleyHash, state: block.stateVec };
       const g = await this.#typesetBlock(j, j < target ? replayToken : null).catch(() => null);
       if (!g) break;
       this.#adoptGalley(block, g);
@@ -1258,12 +1365,21 @@ export class CheckpointEngine {
 
   #adoptGalley(block, galley) {
     this.coldDirty?.delete(block.id);
+    if (!galley.tdomColdPreview && this.coldPreviewHolds?.size) {
+      // a walk replaced the block's preview: its checkpoint has no RENDER left
+      for (const peer of [...this.coldPreviewHolds.keys()]) this.#releaseColdPreviewHold(peer, block.id);
+    }
     this.#normalizeGalleyFonts(galley);
-    this.#indexBlock(
-      block.id,
-      (galley.labels ?? []).map((l) => l.k),
-      galley.refs ?? []
-    );
+    // A cold preview (docs/10 §10.4b) leaves the label index to the walk
+    // that typesets the block in its own lineage: a label it renamed must
+    // vanish there, where the reference pass can still follow it.
+    if (!galley.tdomColdPreview) {
+      this.#indexBlock(
+        block.id,
+        (galley.labels ?? []).map((l) => l.k),
+        galley.refs ?? []
+      );
+    }
     adoptGalleyBlock(block, galley, {
       counters: this.counters,
       chunks: this.chunks,
@@ -1537,6 +1653,8 @@ export class CheckpointEngine {
           paginateNow: () => this.#paginateNow(),
           computeToc: (pages) => this.#computeToc(pages),
           queueMovedOffsets: () => this.#queueMovedOffsets(),
+          // the cold resume walks to a boundary the chain pass reached
+          coldPreview: editLabel === 'cold-resume' ? null : (idx, fromIdx) => this.#coldPreview(idx, fromIdx),
         },
       });
     } catch (err) {

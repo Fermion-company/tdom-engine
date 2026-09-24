@@ -136,6 +136,25 @@ foreground walk は、まだ source-dirty block が先にある状態で clean b
 
 server は cold な編集応答に `canonicalAnchorRefused: 'cold-prefix'` を付け、anchor の文脈（edit・base snapshot・lineage・accept 時刻）を `pendingColdAnchor` に置く。同じ block への続く cold 打鍵が lineage を継げるよう、base があれば `coldPending` の lineage entry（pages なし）を残す。deferred update が同じ `srcRev`・documentEpoch・anchorEpoch で届いたら、その文脈で `planTerminalCanonicalAnchor` → 通常の lineage 登録 → `resolveTerminalCanonicalAnchor` を行い、`update` を broadcast する。先に新しい打鍵が公開していた（`rev` が古い）deferred report は捨てる。`/status` の `cold` に未組版 block と walk の進捗が出る。
 
+## 10.4b cold preview
+
+cold stop の応答は編集 block をまだ組んでいないので、打鍵が紙面に出るのは resume の後になる（316 ページ、上限 12・grid 充填済み: 1.4〜4.7 s。ほぼ全部が最寄り境界からの再生距離）。cold preview は、その間の編集 block を walk の出発点の checkpoint から直接組んで先に見せる。
+
+- 条件: source-dirty block が 1 つだけ、定義の編集（§10.5）でない、rescue 対象の環境（§10.8）でない、今の text で `poisoned` でも deep-lineage の壁（`chainTimeouts`）の中でもない、cold resume 自身の walk でない、そして同じページに exact 画素の要る cold な block が他に無い（`firstDisplay`〜`lastDisplay` が編集 block だけ。ほかに要る block があれば、walk がそこへ着くまでページは描けない）。そのうえで、walk の出発点から編集 block までの推定再生コスト（clean block の `typesetCostMs` の和）が `TDOM_COLD_PREVIEW_FROM_MS`（既定 500。推定は最小標本なので、実際の再生は概ねその 2 倍）を超えたとき。
+- 出発点の checkpoint に、編集 block の JOB をもう 1 本送る。本文は通常の JOB と同じで、前に vstale lineage と同じ `#volatilePrelude`（直前 block の exit vector から counter・`\prevdepth`・`\if@nobreak`）、label 定義、`\lastskip` primer を付ける。直前の exit が `@nobreak` なら `\@afterheading` も付ける（本来の lineage には見出しの `\everypar` が残っている）。見出し以外が立てた `@nobreak` や、`\everypar` に題を持つ run-in 見出しでは近似になるが、どちらも置き換えられる。子の checkpoint 番号は `-1` で、`peer-message.js` は待たれていない `CKPT` を受理しないので、子は galley を返したあと DIE される。GALLEY を返さずに子が消えたら即座に失敗にし、使わなかった preview の子は kill する（walk が例外で抜けたときは次の update が kill する）。
+- 間の clean block を再生しないので、1 block 分の組版で済む（316 ページで 0.15〜0.40 s。再生は 2〜4 s）。間の block が変える untracked state（マクロ定義・フォント宣言など）は入らない。316 ページの 6 箇所では、font 参照の正規化前の番号を除いて galley が一致した。
+- walk は budget に加えて、preview が届いた時点でも完了済み block 境界で cold stop する。ただし残りの推定再生が閾値の半分以下なら、そのまま歩き切る。到達境界は §10.4a と同じく pin され、resume がその先を歩く。budget で止まったときは、preview を `TDOM_COLD_PREVIEW_WAIT_MS`（既定 1000）まで待つ。編集 block の入口で止まったときは preview を使わない。
+- preview は `tdomColdPreview` 付きの galley として adopt する。block は `coldDirty` に残り、自分の lineage で組む walk（resume・caret warm・chain）が置き換える。その walk が preview を「変化なし」と見て、下流を確かめずに収束しないようにするため、次の 2 点を守る。
+  - 各 walk（foreground・`#retypesetChain`・chain pass）は、preview の galley を比較の witness にしない（`before.hash` を持たない）。置き換えた walk は必ず次の block を確かめに進む。
+  - block の `stateVec` は編集前のまま残す。後続 block はその exit state を前提に組まれているので、置き換えた walk は native の exit state をそれと比べ、counter が動いていれば §10.4 どおり下流へ運ぶ。
+- graphics を含む galley（`gfx`）だけは、identity に `cold-preview` を加える。preview の画素は別 lineage の state（checkpoint と block の間の `\tcbset` など）で描かれていることがあるので、置き換えた galley には使わず描き直す。glyph と数式の chunk はそのまま引き継ぐ。
+- label の索引は preview では更新しない。label を消した・変えた打鍵は、置き換えた walk の索引更新で消え、そこで参照の再組版へ回る。
+- exact 画素の要る block は、render pump が preview を組んだのと同じ peer（index はその後の編集で動いていてよい）から同じ prelude で RENDER する（`render-pump.js`、`renderStats.coldPreviews`）。その peer は preview の開始から、この RENDER が終わるか、walk が preview を置き換えるか、30 s 経つまで退役させない（`coldPreviewHolds`。これが無いと、walk の最初の JOB の off-grid 退役や grid 充填の cap で先に消え、画素は resume の後の native RENDER まで出なかった）。peer が無ければ block 自身の checkpoint、それも無ければ isolated render に回す。preview が次の打鍵の新しい text に持ち越された場合は描かない。
+- preview は証明の入力にしない。次の打鍵の `previousGalley` には preview の前の galley を渡す。resident edit admission・plain preview・canonical anchor の base の witness にも使わない。壊れた TeX の last-good 保持（`broken-galley.js`）と stale-first rescue の複製では印を外す。
+- `coldDirty` は文書ごとの状態で、open と resident tree の破棄で空にし、resume が失敗したときも空にする（rescue pump は `coldDirty` が空くのを待つ）。
+- 応答の `stats.coldPreview` には block・推定再生コスト・preview の所要時間・walk 時間・adopt の有無が、`/status` の `coldPreviews` には adopt 数が出る。`TDOM_COLD_PREVIEW=0` で無効になる。
+- 実測（316 ページ、上限 12、grid 充填済み、warm なしで 6 章へ 1 打鍵）: 紙面に出るまで 0.82〜1.43 s（従来 1.35〜4.7 s）。内訳は応答 0.38〜0.61 s と、その 0.4〜0.8 s 後に届く exact 画素の late patch。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。

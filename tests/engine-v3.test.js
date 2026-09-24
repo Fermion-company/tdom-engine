@@ -277,6 +277,7 @@ test('a keystroke far from every checkpoint returns within its cold budget and t
   try {
     await e.open(doc);
     e.coldPrefixBudgetMs = 1; // stop after the first replayed clean block
+    e.coldPreviewEnabled = false; // the plain budget stop (the preview has its own test)
     const deferred = new Promise((resolve) => { e.onDeferredUpdate = resolve; });
     const at = e.getSource().indexOf('Paragraph 150 ');
     assert.ok(at > 0);
@@ -312,6 +313,123 @@ test('a keystroke far from every checkpoint returns within its cold budget and t
   }
 });
 
+test('a cold keystroke shows its block through a preview typeset from the far checkpoint, and the walk that replaces it still carries its effects on', opts, async () => {
+  const work = WORK + '-cold-preview';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    if (i === 155) paragraphs.push('\\section{Late}', '');
+    const ref = i === 20 ? ' See \\ref{p:hundred}.' : '';
+    const label = i === 100 ? '\\label{p:hundred}' : '';
+    paragraphs.push(`Paragraph ${i} of the cold preview fixture keeps the resident chain walking for a while.${ref}${label}`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', '\\section{First}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  const block = (head) => e.blocks.find((b) => b.text.startsWith(head));
+  const settle = async () => {
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.coldDirty.size || e.bgActive || e.updating) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(e.coldDirty.size, 0, 'the cold resume landed');
+    assert.equal(e.pendingChain, null);
+  };
+  const coldEdit = async (at, end, text) => {
+    const report = await e.edit(at, end, text);
+    assert.equal(report.stats.chainVerdict, 'cold');
+    assert.equal(report.stats.coldPreview?.adopted, true, JSON.stringify(report.stats.coldPreview));
+    return report;
+  };
+  try {
+    await e.open(doc);
+    e.coldPrefixBudgetMs = 1; // stop after the first replayed clean block
+    e.coldPreviewFromMs = 0; // preview every cold keystroke
+    e.coldPreviewWaitMs = 60_000; // and always wait for it
+    const section = e.counters.indexOf('section');
+    assert.equal(JSON.parse(block('\\section{Late}').stateVec)[section], 2);
+
+    // 1. a moved counter: every later heading is renumbered
+    let at = e.getSource().indexOf('Paragraph 150 ');
+    const exitBefore = block('Paragraph 150 ').stateVec;
+    const cold = await coldEdit(at, at, '\\section{Early} ');
+    const id = String(cold.dirtySourceNodes[0]).replace(/^src-/, '');
+    assert.deepEqual(cold.stats.coldPending, [id], 'the previewed block still waits for its own lineage');
+    const previewed = e.blocks.find((b) => b.id === id);
+    assert.ok(previewed.galley.tdomColdPreview && previewed.text.startsWith('\\section{Early} Paragraph 150'));
+    assert.equal(previewed.stateVec, exitBefore, 'the block keeps the exit state its successors were typeset against');
+    const previewItems = JSON.stringify(previewed.galley.items);
+    const commands = cold.patches.flatMap((patch) => patch.displayList?.commands ?? []);
+    assert.ok(commands.some((c) => c.src === id), 'the keystroke\'s page paints the previewed block');
+    assert.ok(!commands.some((c) => c.op === 'pending-exact' && c.src === id));
+    await settle();
+    const native = e.blocks.find((b) => b.id === id);
+    assert.ok(!native.galley.tdomColdPreview, 'a walk in the block\'s own lineage replaced the preview');
+    assert.equal(JSON.stringify(native.galley.items), previewItems, 'the far checkpoint typeset the same lines');
+    assert.equal(JSON.parse(block('\\section{Late}').stateVec)[section], 3);
+
+    // 2. untracked state (a font declaration) must still reach the next paragraph
+    const fontOf = (b) => b.galley.items.find((it) => it.k === 'box' && it.runs?.some((r) => r.t))?.runs.find((r) => r.t)?.f;
+    const nextFont = fontOf(block('Paragraph 141 '));
+    at = e.getSource().indexOf('Paragraph 140 ');
+    await coldEdit(at, at, '\\bfseries ');
+    await settle();
+    assert.notEqual(fontOf(block('Paragraph 141 ')), nextFont, 'the declaration leaks into the next paragraph');
+
+    // 3. a renamed label vanishes for its (earlier) reference
+    assert.ok(e.labelTable.has('p:hundred'));
+    at = e.getSource().indexOf('\\label{p:hundred}') + '\\label{p:hundre'.length;
+    await coldEdit(at, at + 1, '');
+    await settle();
+    assert.ok(!e.labelTable.has('p:hundred'), 'the old label is gone');
+    assert.equal(block('Paragraph 20 ').galley.tdomRefVals?.['p:hundred'], undefined, 'its reference re-resolved');
+  } finally {
+    await e.close();
+  }
+});
+
+test('a cold preview of a block with exact pixels renders them from the checkpoint it was typeset from', opts, async () => {
+  const work = WORK + '-cold-preview-gfx';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    // only the edited paragraph needs exact pixels: no cold neighbor holds its page
+    paragraphs.push(`Paragraph ${i} holds ${i === 150 ? '$x^2$' : 'text'} marked ${i} in the cold preview fixture.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 2; // a long resume walk: the render lands while the preview is shown
+  try {
+    await e.open(doc);
+    await e.renderTask;
+    e.coldPrefixBudgetMs = 1;
+    e.coldPreviewFromMs = 0;
+    e.coldPreviewWaitMs = 60_000;
+    const at = e.getSource().indexOf('marked 150') + 'marked'.length;
+    const cold = await e.edit(at, at, ' X');
+    assert.equal(cold.stats.coldPreview?.adopted, true, JSON.stringify(cold.stats.coldPreview));
+    const id = String(cold.dirtySourceNodes[0]).replace(/^src-/, '');
+    const previewed = e.blocks.find((b) => b.id === id);
+    assert.ok(previewed.needsRender, 'the fixture block needs exact pixels');
+    await e.renderTask;
+    assert.ok((e.renderStats?.coldPreviews ?? 0) >= 1, 'the preview rendered from its own checkpoint');
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.coldDirty.size || e.updating || e.bgActive) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await e.renderTask;
+    const native = e.blocks.find((b) => b.id === id);
+    assert.ok(!native.galley.tdomColdPreview);
+    assert.equal(e.chunks.get(id)?.forGalley, native.galleyHash, 'the replacing galley got pixels of its own');
+  } finally {
+    await e.close();
+  }
+});
+
 test('a caret warm that reaches the block of a budgeted keystroke hands over to the resume', opts, async () => {
   const work = WORK + '-cold-warm';
   rmSync(work, { recursive: true, force: true });
@@ -327,6 +445,7 @@ test('a caret warm that reaches the block of a budgeted keystroke hands over to 
   try {
     await e.open(doc);
     e.coldPrefixBudgetMs = 1;
+    e.coldPreviewFromMs = 0; // with a preview on screen (docs/10 §10.4b)
     const deferred = new Promise((resolve) => { e.onDeferredUpdate = resolve; });
     const at = e.getSource().indexOf('Paragraph 150 ');
     const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
@@ -365,6 +484,7 @@ test('a keystroke during the cold walk stops it at a live boundary instead of re
   try {
     await e.open(doc);
     e.coldPrefixBudgetMs = 1;
+    e.coldPreviewFromMs = 0; // with a preview on screen (docs/10 §10.4b)
     const at = e.getSource().indexOf('Paragraph 150 ');
     const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
     assert.equal(cold.stats.chainVerdict, 'cold');

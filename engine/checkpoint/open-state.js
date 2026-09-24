@@ -66,6 +66,9 @@ export function resetOpenState(engine, text, file) {
   engine.renderWant = new Map();
   engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };
   engine.renderHold = new Map();
+  engine.coldPreviewHolds = new Map();
+  engine.coldDirty = new Set(); // a cold keystroke of the previous document never resumes here
+  engine.coldTrace = null;
   engine.rescueQueue = new Map();
   engine.rescueFocus = new Set();
   engine.tocHash = null;

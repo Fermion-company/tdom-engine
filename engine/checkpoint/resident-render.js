@@ -46,7 +46,10 @@ async function runShipCommand(engine, {
 
 export async function renderResidentBlock(
   engine,
-  { block, idx, ck, targets, forGalley, awaitRender, renderIsolated, asyncRepaginate, chunkTargets, releaseRenderHold }
+  {
+    block, idx, ck, checkpointIndex = idx, prelude = null, targets, forGalley,
+    awaitRender, renderIsolated, asyncRepaginate, chunkTargets, releaseRenderHold,
+  }
 ) {
   const inflightKey = block.id + ':' + forGalley;
   engine.rendering ??= new Set();
@@ -57,7 +60,9 @@ export async function renderResidentBlock(
     mkdirSync(jobdir, { recursive: true });
     const pdf = path.join(jobdir, 'driver.pdf');
     rmSync(pdf, { force: true });
-    const body = Buffer.from(buildLastskipPrimer(block, idx, engine.blocks) + block.text, 'utf8');
+    // a cold preview's checkpoint is not the block's own: its JOB prelude
+    // re-seeds the entry state (and already ends with the primer)
+    const body = Buffer.from((prelude ?? buildLastskipPrimer(block, idx, engine.blocks)) + block.text, 'utf8');
     engine.renderStats ??= { captureHits: 0, captureMisses: 0, retypesets: 0 };
 
     let shippedCapture = false;
@@ -113,7 +118,7 @@ export async function renderResidentBlock(
         requestId,
         command: `RENDER ${block.id} ${encodeURIComponent(jobdir)} ${body.length} ${requestId}\n`,
         body,
-        checkpointIndex: idx,
+        checkpointIndex,
         awaitRender,
         renderIsolated,
       });

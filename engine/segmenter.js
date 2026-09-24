@@ -367,7 +367,9 @@ export function diffBlocks(oldBlocks, segs, nextId) {
         // One-generation proof input for canonical-addressed wrapped prose:
         // the planner may overlay only the final visual line when every
         // earlier LuaLaTeX line is byte-identical across the edit.
-        previousGalley: ob.galley,
+        // (a cold preview is not a proof input: keep the galley it stands
+        // in for, docs/10 §10.4b)
+        previousGalley: ob.galley?.tdomColdPreview ? (ob.previousGalley ?? null) : ob.galley,
         galleyHash: ob.galleyHash,
         stateVec: ob.stateVec,
         units: ob.units,

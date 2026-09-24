@@ -173,7 +173,8 @@ export async function runChainPass(engine, callbacks) {
         }
         engine.progress = { phase: 'chain', at: j + 1, total: engine.blocks.length };
         const block = engine.blocks[j];
-        const before = { hash: block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
+        // a cold preview is no witness of the block's own typeset (docs/10 §10.4b)
+        const before = { hash: block.galley?.tdomColdPreview ? null : block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
         let galley;
         try {
           galley = await typesetBlock(j);
