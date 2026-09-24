@@ -595,10 +595,12 @@ test('a cold resume left with nothing to typeset still runs the settle it carrie
     assert.equal(cold.stats.chainVerdict, 'cold');
     assert.equal(e.pendingChain?.kind, 'cold');
     assert.equal(e.pendingChain.carry?.kind, 'settle', 'the cold work carries the pending settle');
-    // 3. the next keystroke typesets that block itself: the resume finds nothing
+    // 3. the next keystroke deletes that paragraph: the resume finds nothing
     e.coldPrefixBudgetMs = 0;
-    const hot = await e.edit(at, at + 'Section'.length, 'Chapter');
+    const next = e.getSource().indexOf('Paragraph 151 ');
+    const hot = await e.edit(at, next, '');
     assert.notEqual(hot.stats.chainVerdict, 'cold');
+    assert.ok(!e.blocks.some((b) => cold.dirtySourceNodes.includes(`src-${b.id}`)), 'the cold block is gone');
     const until = Date.now() + 90_000;
     while ((e.pendingChain || e.coldDirty.size || e.bgActive || e.updating) && Date.now() < until) {
       await new Promise((r) => setTimeout(r, 50));
