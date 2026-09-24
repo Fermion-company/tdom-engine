@@ -115,7 +115,55 @@ end)()
 -- pdf_literal's token list). Each sample also stamps the nodes it is about
 -- to move, so the harvest knows which contribution a top-level item was.
 local blk_trail = nil -- per job; nil outside one
+-- Lua GC policy (docs/03 §3.2). A full GC marks every live object, so a
+-- forked process copies the whole heap it shares with its checkpoint
+-- relatives (~900 MB with Japanese fonts) and spends 0.8-2.5 s on it, while a
+-- replayed block leaves ~3 MB of garbage (316 pages: a 64MB allowance made
+-- every 24th replayed block pay a GC, and the resident engine held 3.4 GB).
+-- A lineage therefore collects only once its garbage outweighs that copy:
+-- more than its own measured live heap (TDOM_GC_GARBAGE_RATIO of it, at least
+-- 64MB, at most TDOM_GC_MAX_GARBAGE_MB). A foreground JOB waits for twice
+-- that: the edit's input checkpoint is forked again on every keystroke, and a
+-- collect in its child would repeat each time; background walks collect.
+local GC_GARBAGE_RATIO = math.max(0, tonumber(os.getenv('TDOM_GC_GARBAGE_RATIO')) or 1)
+local GC_MAX_GARBAGE_KB = math.max(65536, (tonumber(os.getenv('TDOM_GC_MAX_GARBAGE_MB')) or 1024) * 1024)
+-- a block that has already run this long leaves its collect to a later JOB:
+-- the engine's JOB timeout (12 s) counts it
+local GC_DEFER_AFTER_S = 6
+-- per JOB: the largest live heap the engine measured in this root. A font
+-- this lineage has not loaded yet is live growth, not garbage.
+local gc_base_kb = 0
+
+local function gc_limit_kb(allowances)
+  local live = TDOM_GC_FLOOR or 0
+  local allowance = math.max(65536, math.min(GC_MAX_GARBAGE_KB, live * GC_GARBAGE_RATIO))
+  return math.max(live, gc_base_kb) + allowances * allowance
+end
+
+local function gc_collect(passes)
+  for _ = 1, passes do collectgarbage('collect') end
+  TDOM_GC_FLOOR = collectgarbage('count') -- this lineage's measured live heap
+end
+
+-- JOBs run with the collector stopped. A block that allocates far past the
+-- allowance (a Lua-heavy package) is collected where it stands, when it next
+-- contributes to the main vertical list, instead of growing until the block
+-- ends. Its working set is not the lineage's live heap: the JOB measures that
+-- again at its end.
+local gc_guard_kb = nil -- per JOB: usage after the last in-block collect
+local gc_guard_ms = 0
+local function gc_guard()
+  if not (JOB and TDOM_GC_FLOOR) then return end
+  local kb = collectgarbage('count')
+  if kb <= math.max(gc_limit_kb(2), gc_guard_kb or 0) + 262144 then return end
+  local started = os.gettimeofday and os.gettimeofday() or os.clock()
+  collectgarbage('collect')
+  gc_guard_kb = collectgarbage('count')
+  gc_guard_ms = gc_guard_ms + ((os.gettimeofday and os.gettimeofday() or os.clock()) - started) * 1000
+end
+
 local function note_trail(info)
+  gc_guard()
   if not blk_trail then return end
   local epoch = #blk_trail + 1
   local n = EPOCH_ATTR and tex.lists.contrib_head
@@ -1134,31 +1182,17 @@ local function reseed_page()
   end)
 end
 
-local function checkpoint_gc(initial, interactive)
+local function checkpoint_gc(initial, interactive, elapsed_s)
   if os.getenv('TDOM_NO_CKPT_GC') then return end
   if initial or not TDOM_GC_FLOOR then
-    collectgarbage('collect')
-    collectgarbage('collect')
-    TDOM_GC_FLOOR = collectgarbage('count')
+    gc_collect(2)
     return
   end
-  -- Advance the inherited incremental collector instead of sweeping the
-  -- entire Japanese font heap twice on each fork from the same boundary.
-  -- A hard garbage allowance still bounds deep lineages when a block
-  -- allocates faster than these incremental steps can reclaim it.
   local kb = collectgarbage('count')
-  -- A collector step may enter an atomic scan of the entire font heap.
-  -- Foreground forks defer it while remaining inside the garbage allowance.
-  if interactive and kb <= TDOM_GC_FLOOR + 65536 then return end
-  local completed = collectgarbage('step', 2048)
-  kb = collectgarbage('count')
-  if completed then
-    TDOM_GC_FLOOR = kb
-  elseif kb > TDOM_GC_FLOOR + 65536 then
-    collectgarbage('collect')
-    collectgarbage('collect')
-    TDOM_GC_FLOOR = collectgarbage('count')
-  end
+  -- a block the guard collected is measured again at its boundary
+  if not gc_guard_kb and kb <= gc_limit_kb(interactive and 2 or 1) then return end
+  if (elapsed_s or 0) > GC_DEFER_AFTER_S and kb <= gc_limit_kb(2) + 262144 then return end
+  gc_collect(1)
 end
 
 function tdom_seed()
@@ -1499,9 +1533,10 @@ function tdom_report()
   if head and not capture then node.flush_list(head) end
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
   conn:send(payload)
+  payload, items = nil, nil -- not live across the collect
   local gc_started = os.gettimeofday and os.gettimeofday() or os.clock()
-  checkpoint_gc(JOB.calibrate, JOB.interactive)
-  local gc_ms = ((os.gettimeofday and os.gettimeofday() or os.clock()) - gc_started) * 1000
+  checkpoint_gc(JOB.calibrate, JOB.interactive, (T_JOB or 0) > 0 and gc_started - T_JOB or 0)
+  local gc_ms = ((os.gettimeofday and os.gettimeofday() or os.clock()) - gc_started) * 1000 + gc_guard_ms
   -- this child now becomes the next checkpoint in the chain
   CKPT = JOB.ckpt
   conn:send('CKPT ' .. CKPT .. ' ' .. fk.getpid() .. ' ' .. (TDOM_GC_FLOOR or 0) .. ' ' .. gc_ms .. '\n')
@@ -1742,12 +1777,13 @@ function tdom_wait()
         drop_capture()
         JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F', calibrate = mode == 'C' }
         fk.set_interactive(JOB.interactive and 1 or 0)
-        -- Re-loading a font already measured in this document is live growth,
-        -- not another 64MB of garbage to sweep on every fork from its input.
-        if JOB.interactive then
-          TDOM_GC_FLOOR = math.max(TDOM_GC_FLOOR or 0, tonumber(live_floor) or 0)
-        end
-        collectgarbage(JOB.interactive and 'stop' or 'restart')
+        gc_base_kb = tonumber(live_floor) or 0
+        gc_guard_kb, gc_guard_ms = nil, 0
+        -- Collected only by checkpoint_gc and gc_guard. A running collector
+        -- would start a cycle at once (restart zeroes the debt) and mark the
+        -- shared heap a little per allocation: the same copy as a full GC,
+        -- spread over every job of the lineage.
+        collectgarbage('stop')
         T_JOB = os.gettimeofday and os.gettimeofday() or os.clock()
         blk_labels = {}
         blk_refs = {}

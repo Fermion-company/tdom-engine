@@ -648,8 +648,10 @@ export class CheckpointEngine {
           this.#checkpointKeepSet().has(idx + 1))
           ? `c${++this.captureSeq}`
           : '-';
-      const interactive = !override && !!block.galley &&
-        (this.updating && !this.bgActive || this.warming);
+      // Every JOB the edit waits for runs at the foreground QoS, including the
+      // @state continuation of a rescued block and a block with no galley yet
+      // (docs/03 §3.2).
+      const interactive = this.updating && !this.bgActive || this.warming;
       const previous = this.blocks[idx - 1];
       // A background walk keeps one boundary per walkRetainMs of replay
       // (docs/10 §10.4a): an edit that kills its step then loses at most that
@@ -671,12 +673,13 @@ export class CheckpointEngine {
         this.currentJob.pid = ck.pid;
       }
       const calibrate = !override && this.calibrateInitialHeap && idx === this.blocks.length - 1;
-      const liveFloor = Math.max(Number(block.galley?.gcFloorKb) || 0, this.confirmedLiveHeapKb || 0);
+      // the largest live heap measured in this root (reset with the root: a
+      // galley kept from an older root does not carry its floor over)
+      const liveFloor = this.confirmedLiveHeapKb || 0;
       ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}\n`);
       ck.sendRaw(body);
       const [galley, nextCheckpoint] = await Promise.all([galleyP, ckptP]);
       nextCheckpoint.replayToken = replayToken;
-      galley.gcFloorKb = nextCheckpoint.gcFloorKb;
       this.confirmedLiveHeapKb = Math.max(this.confirmedLiveHeapKb || 0, nextCheckpoint.gcFloorKb || 0);
       if (process.env.TDOM_TRACE_JOB) console.error('[job-gc]', jobId, JSON.stringify({ interactive, gcMs: nextCheckpoint.gcMs, ...galley.tm }));
       block.typesetCleanupMs = (block.typesetCleanupMs ?? 0) + (nextCheckpoint.gcMs ?? 0);

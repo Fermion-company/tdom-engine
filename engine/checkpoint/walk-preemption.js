@@ -25,8 +25,8 @@ export function editElsewhereThanWalk({ blocks, target, rootFile, editContext = 
  * Whether killing a background walk's in-flight step saves the waiting edit
  * more than the walk loses (docs/10 §10.4a). What is lost is the replay since
  * the walk's last retained boundary, which a later walk must repeat: under
- * `minMs` a kill is always cheap (a caret warm's step reopens fonts and runs
- * far past the block's intrinsic cost, so its remaining time is not
+ * `minMs` a kill is always cheap (a caret warm's step that hits a checkpoint
+ * GC runs far past the block's intrinsic cost, so its remaining time is not
  * estimable). Otherwise the step's expected remaining time must outweigh it,
  * both at measured replay speed, about twice the intrinsic (minimum) cost.
  */
@@ -34,8 +34,8 @@ export function walkKillPaysOff({ blocks, jobIdx, jobElapsedMs, retainedIdx, min
   const replayMs = (k) => 2 * (Number(blocks?.[k]?.typesetCostMs) || 0);
   if (!Number.isInteger(jobIdx) || jobIdx < 0 || !Number.isFinite(jobElapsedMs)) return false;
   // a caret warm's step that has already run this long is one of its slow
-  // ones (measured: 1.3-3 s for blocks of a few hundred ms): the edit would
-  // wait for most of it
+  // ones (a checkpoint GC: 1.3-3 s for blocks of a few hundred ms under the
+  // old 64MB allowance): the edit would wait for most of it
   if (warm && jobElapsedMs >= longStepMs) return true;
   let lost = Math.max(0, jobElapsedMs);
   for (let k = Math.max(0, Number.isInteger(retainedIdx) ? retainedIdx : jobIdx); k < jobIdx; k++) lost += replayMs(k);
