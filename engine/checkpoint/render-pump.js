@@ -82,6 +82,14 @@ function pumpRenders(engine, callbacks) {
             interactive = current;
           }
         }
+        // Backlog (typically the previous keystroke's page) does not share the
+        // machine with the current edit's own render: the page being typed on
+        // waits for that one.
+        const cohort = engine.interactiveRenderCohort;
+        if (!interactive && cohort?.rev === engine.srcRev && cohort.active.size > 0) {
+          await new Promise((r) => setTimeout(r, 25));
+          continue;
+        }
         const configuredQuiet = Number(process.env.TDOM_RENDER_QUIET_MS ?? 120);
         const renderQuiet = Number.isFinite(configuredQuiet) ? Math.max(0, configuredQuiet) : 120;
         const quietMs = interactive ? renderQuiet : shippingPriorityQuietMs(engine, renderQuiet);
@@ -114,6 +122,10 @@ function pumpRenders(engine, callbacks) {
             if (!block.needsRender) return;
             const ready = await renderBlock(engine, block, callbacks).catch((err) => {
               if (!err?.tdomSuperseded) engine.diagnostics.push(`render ${id}: ${err?.message ?? err}`);
+              // An edit pre-empted it; its page still waits for these pixels
+              // (typically the previous keystroke's). Only queued ids survive
+              // preemption, so put it back behind the edit's own cohort.
+              else if (!engine.renderWant.has(id)) engine.renderWant.set(id, { interactiveRev: null });
               return false;
             });
             if (cohort && !ready) cohort.unavailable = true;

@@ -1698,6 +1698,7 @@ export class CheckpointEngine {
       text,
       editLabel,
       dirtySource,
+      removedBlocks: diff?.removed ?? [],
       typesetResult: this._typesetResult,
       rebooted,
       diagnostics,

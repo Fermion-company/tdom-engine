@@ -215,9 +215,9 @@ hot path の最後に `#shipUpdate(source)`、`canonical.schedule(source, srcRev
 - resident の PDF descriptor は boot で読み書き可能にし、各 JOB/CAPTURE/RENDER/ISO fork の直前に現在の bytes と位置を匿名ファイルへ複製する。子だけが複製先を継続し、出力時に専用 job directory へ移す。TikZ/hyperref が先に PDF object を作っていても cold compile は不要。装飾は過去画像を再利用せず、その編集で組版した node list を ship する。graphics の chunk identity には source hash も含め、寸法を変えない色・underlay 編集でも再描画する。エラーで凍結した galley は以前の paint identity を維持する。
 - exact chunk の ship は、galley 抽出と同じく前ブロックの lastskip primer と最上位 topskip を除く。RENDER と isolated fallback も前ブロックの lastskip を復元してから組版するため、余白の max-merge と SVG の原点・高さが foreground JOB に一致する。
 - 通常編集の foreground で変わった bounded hot 集合には現在の `srcRev` を付け、後着の cold queue より先に、最終編集から `TDOM_RENDER_QUIET_MS`（既定120ms）後に処理する。編集中の block だけでなく、同じ紙面の一括表示に必要な隣接 block も含める。boot/reboot・過去世代・deferred chain は、有効な shipping baseline がある場合の優先時間（既定900ms）を維持し、現世代 hot への後着 background enqueue は優先度を落とさない。
-- 新しい編集は、前の edit/boot が残した resident render 子プロセスを preempt し、未着手 queue は保持する。旧世代の優先印は失効し、同時実行数（既定2）と checkpoint の上限は変えない。render fork は foreground JOB と衝突しない固有 request id で追跡する。
+- 新しい編集は、前の edit/boot が残した resident render 子プロセスを preempt し、未着手 queue は保持する。preempt した render の block も queue に戻す（優先印なし）。現在の編集の cohort の render が走っている間、backlog の render は始めない。旧世代の優先印は失効し、同時実行数（既定2）と checkpoint の上限は変えない。render fork は foreground JOB と衝突しない固有 request id で追跡する。
 
-display list は本文 glyph と行単位の exact chunk を別素材として保持する。stale chunk・未取得の exact 素材・透明な math run が残る場合、ビューアはその新しいページ群を公開せず、直前の完成した紙面を保持する。fresh chunk は exact 判定された連続行だけの window にし、安全な散文行や `\texttt` / `\textit` は glyph のまま使う。全素材・文字座標・ソース範囲が揃ってから、影響するページ群を同時に提示する。MathLiveによる別フォントの数式描画で補わない。
+display list は本文 glyph と行単位の exact chunk を別素材として保持する。stale chunk・未取得の exact 素材・透明な math run が残る場合、ビューアはその新しいページ群を公開せず、直前の完成した紙面を保持する。fresh chunk は exact 判定された連続行だけの window にし、安全な散文行や `\texttt` / `\textit` は glyph のまま使う。全素材・文字座標・ソース範囲が揃ってから、影響するページ群を取引ごとに同時に提示する（取引の範囲は docs/04 §4.5）。MathLiveによる別フォントの数式描画で補わない。
 
 各 edit report と async patch は、その時点の font manifest を page patch と同時に送る。client は新しい `@font-face` を登録し、face の decode が完了するまでページ群の提示を待つ。画面外の準備中に該当 run が透明でも、表示中の完成ページは保持する。
 

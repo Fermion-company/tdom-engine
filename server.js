@@ -1686,6 +1686,7 @@ const server = http.createServer(async (req, res) => {
           active: [...(engine.rendering ?? [])],
           pids: Object.fromEntries(engine.renderPids ?? []),
           stats: engine.renderStats,
+          timings: (engine.renderTimings ?? []).slice(-12),
         },
         rescue: {
           queued: engine.rescueQueue?.size ?? 0,
@@ -2522,6 +2523,12 @@ const server = http.createServer(async (req, res) => {
         throw err;
       }
       if (inputUnchanged) return json(res, lastReport);
+      // when this keystroke reached the server and left the engine (epoch ms)
+      lastReport.timing = {
+        clientEditAtEpochMs: Number.isFinite(Number(body.clientEditAtEpochMs)) ? Number(body.clientEditAtEpochMs) : null,
+        receivedAtEpochMs: nowEpoch,
+        engineDoneAtEpochMs: Date.now(),
+      };
       if (Number(lastAnchorPresentation?.srcRev) !== Number(lastReport.srcRev)) {
         lastAnchorPresentation = null;
       }

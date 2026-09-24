@@ -190,7 +190,7 @@ exact chunk は主に四つの経路から来る。
 
 resident CAPTURE/RENDER は hot dirty block と async chain で実際に変化した block に寄せられる。大量の cold block を全文 sweep しない。dirty block 数が `TDOM_RENDER_HOT_MAX` を超える場合は hot render を抑制し、cold boot の全 checkpoint に node list を保持しない。
 
-各 resident render は foreground JOB の block id とは別の単調増加 `requestId` を持つ。新しい編集が始まると、未着手の cold render queue と実行中の resident render を破棄し、現在の dirty block を空いた lane の先頭へ入れる。孤立 compile は結果を cache として再利用できるため、この preemption の対象外である。fork 通知が cancellation より遅れて到着した場合も `requestId` で識別して子 process を回収する。
+各 resident render は foreground JOB の block id とは別の単調増加 `requestId` を持つ。新しい編集が始まると、実行中の resident render を破棄し、現在の dirty block を空いた lane の先頭へ入れる。破棄した render の block は、新しい編集の cohort の後ろに queue し直す（前の打鍵のページはその画素を待っている。queue に無ければ、その block が次に組版されるまで誰も描かなかった）。孤立 compile は結果を cache として再利用できるため、この preemption の対象外である。fork 通知が cancellation より遅れて到着した場合も `requestId` で識別して子 process を回収する。
 render lane の終了時にも queue を再確認する。全 lane が終了判定を済ませてから pumping counter を下げるまでの間に新しい item が入っても、次の打鍵を待たず replacement pump を起動する。
 
 CAPTURE の初期対象は `\[...\]`、`$$...$$`、equation/align/gather/multline 等の display math に限定する。token は source edit ごとに単調増加し、block id と token の両方が一致した場合だけ shipout する。capture child を fork した直後に checkpoint 親の list を解放し、次の JOB child は継承した古い list を組版前に破棄する。graphics、float、breakable box は backend/output-routine state の所有境界が異なるため、従来の RENDER/isolated 経路を使う。

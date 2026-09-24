@@ -56,6 +56,9 @@ export async function renderResidentBlock(
   if (engine.rendering.has(inflightKey)) return;
   engine.rendering.add(inflightKey);
   const jobdir = path.join(engine.workDir, `render-${block.id}-${forGalley}`);
+  // where one exact render's time goes (/status render.timings)
+  const t0 = Date.now();
+  const timing = { block: block.id, previewPeer: prelude !== null, at: t0 };
   try {
     mkdirSync(jobdir, { recursive: true });
     const pdf = path.join(jobdir, 'driver.pdf');
@@ -123,11 +126,18 @@ export async function renderResidentBlock(
         renderIsolated,
       });
     }
+    timing.doneMs = Date.now() - t0;
     // DONE fires from finish_pdffile, but the child's stdio buffers reach
     // the disk only on _exit — wait until the file is complete (%%EOF)
     await waitForPdf(pdf);
+    timing.pdfMs = Date.now() - t0;
     await cropRenderTargets({ jobdir, pdf, targets, chunks: engine.chunks, forGalley, prefix: 'chunk' });
+    timing.cropMs = Date.now() - t0;
     if (block.galleyHash === forGalley) asyncRepaginate();
+    timing.publishedMs = Date.now() - t0;
+    engine.renderTimings ??= [];
+    engine.renderTimings.push(timing);
+    if (engine.renderTimings.length > 40) engine.renderTimings.shift();
   } finally {
     engine.rendering.delete(inflightKey);
     // the job dir held one PDF + page SVGs whose useful content now lives

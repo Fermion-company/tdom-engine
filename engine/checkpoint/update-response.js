@@ -9,6 +9,7 @@ export function buildUpdateResponse({
   previewReasons,
   canonical,
   dirtySource,
+  removedBlocks = [],
   dirtyBlocks,
   depDirty,
   dirtyPages,
@@ -48,6 +49,9 @@ export function buildUpdateResponse({
     canonical,
     fonts,
     dirtySourceNodes: [...dirtySource].map((id) => 'src-' + id),
+    // blocks the edit removed: the viewer keeps the pages that showed them
+    // in the edit's page transaction (docs/04 §4.5)
+    removedSourceNodes: removedBlocks.map((id) => 'src-' + id),
     dirtySemanticNodes: dirtyBlocks.map((id) => 'blk-' + id),
     dirtyDependencies: depDirty,
     dirtyLayoutNodes: dirtyBlocks.map((id) => 'galley-' + id),
