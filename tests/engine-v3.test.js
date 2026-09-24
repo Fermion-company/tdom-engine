@@ -509,6 +509,52 @@ test('a keystroke during the cold walk stops it at a live boundary instead of re
   }
 });
 
+test('a cold resume that starts before its block typesets it instead of stopping cold again', opts, async () => {
+  const work = WORK + '-cold-resume-progress';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 48; i += 1) {
+    // the edited paragraph's page holds more exact-render neighbours ahead
+    // of it than the edit-locus pins keep: the resume walk has to start
+    // before the boundary the cold chain pass reached
+    const math = i >= 37 && i <= 45 && i % 2 === 1;
+    paragraphs.push(`Paragraph ${i} ${math ? `holds $x^{${i}}$` : 'is plain text'} in the cold resume fixture.`);
+    if (i % 12 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  // as in the fuzzer: the neighbours' exact pixels never land, so the walk
+  // keeps extending to them
+  const previousRender = process.env.TDOM_NO_RENDER;
+  process.env.TDOM_NO_RENDER = '1';
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  try {
+    await e.open(doc);
+    e.coldPrefixBudgetMs = 1;
+    e.coldPreviewEnabled = false;
+    const resumes = [];
+    e.onDeferredUpdate = (report) => resumes.push(report);
+    const at = e.getSource().indexOf('Paragraph 47 ');
+    const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
+    assert.equal(cold.stats.chainVerdict, 'cold');
+    const until = Date.now() + 60_000;
+    while ((e.pendingChain || e.coldDirty.size || e.bgActive || e.updating) && resumes.length <= 3 && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(e.coldDirty.size, 0, `still cold after ${resumes.length} resumes: ${resumes.map((r) => r.stats.chainVerdict).join(',')}`);
+    assert.equal(resumes.length, 1, 'one resume typesets the block');
+    assert.notEqual(resumes[0].stats.chainVerdict, 'cold');
+    assert.deepEqual(resumes[0].dirtySourceNodes, cold.dirtySourceNodes);
+    const block = e.blocks.find((b) => b.id === String(cold.dirtySourceNodes[0]).replace(/^src-/, ''));
+    assert.ok(block?.galley && block.text.startsWith('Section 47'), 'the galley belongs to the edited text');
+  } finally {
+    await e.close();
+    if (previousRender === undefined) delete process.env.TDOM_NO_RENDER;
+    else process.env.TDOM_NO_RENDER = previousRender;
+  }
+});
+
 test('a keystroke during a caret warm walk takes the lock at the next block boundary', opts, async () => {
   const work = WORK + '-warm-edit-priority';
   rmSync(work, { recursive: true, force: true });

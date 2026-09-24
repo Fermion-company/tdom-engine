@@ -1643,6 +1643,7 @@ export class CheckpointEngine {
         // A boot, reboot or retry fills every galley from block zero: that
         // walk has no prefix to defer.
         coldBudgetMs: rebooted || retry || editLabel === 'open' ? 0 : this.coldPrefixBudgetMs,
+        coldResume,
         callbacks: {
           nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
           typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),
