@@ -116,7 +116,9 @@ export async function runUpdateTypesetPhase(engine, {
         engine.diagnostics?.push(`cold preview of ${block.id}: ${err?.message ?? err}`);
       }
       if (started) {
-        preview = { block, text: block.text, estimateMs: Math.round(estimateMs), galley: undefined, readyMs: null };
+        preview = {
+          block, text: block.text, estimateMs: Math.round(estimateMs), galley: undefined, readyMs: null, startedAt,
+        };
         preview.cancel = started.cancel;
         preview.release = started.release;
         engine.coldPreviewActive = started;
@@ -130,7 +132,41 @@ export async function runUpdateTypesetPhase(engine, {
   }
   const walkStartedAt = performance.now();
   let typesetDirty = false; // a source-dirty or galley-less block is behind the walk
+  // per-block walk timing for the report: [index, ms, flags]
+  const walkTrace = [];
+  engine.lastWalkTrace = {
+    coldResume, firstDirty, lastDirty, from: i, dirty: dirtySource.size, lastNoGalley, blocks: walkTrace,
+  };
+  // the walk may stop cold here: its starting checkpoint, or the boundary
+  // after a clean replay that reproduced its galley and exit state
+  let atCleanBoundary = true;
+  let previewAwaited = false;
   while (i < engine.blocks.length) {
+    // While a cold preview is in flight and the walk would still be far from
+    // the block when it lands (so it would stop cold at the next boundary
+    // anyway), wait for it here instead of stepping the next clean block
+    // beside it: both children compete for the same cores, and one heavy
+    // block steps for longer than the preview takes. A short rest is still
+    // walked, natively. A preview that fails or is late leaves the walk to
+    // go on as before.
+    const previewEtaMs = preview
+      ? Math.max(0, (Number(preview.block.typesetCostMs) || 300) + 100 - (performance.now() - preview.startedAt))
+      : 0;
+    if (preview && !previewAwaited && atCleanBoundary && i < firstDirty &&
+        previewEtaMs < (engine.coldPreviewWaitMs ?? 1000) &&
+        costTo(i) - previewEtaMs > (engine.coldPreviewFromMs ?? 500) / 2) {
+      previewAwaited = true;
+      let timer = null;
+      const galley = preview.galley !== undefined ? preview.galley : await Promise.race([
+        preview.compile,
+        new Promise((resolve) => { timer = setTimeout(() => resolve(null), engine.coldPreviewWaitMs ?? 1000); }),
+      ]);
+      clearTimeout(timer);
+      if (galley) {
+        verdict = 'cold';
+        break;
+      }
+    }
     // /status liveness marker: which block the foreground pass is on —
     // a long boot walk shows movement instead of silence
     engine.progress = { phase: 'typeset', at: i + 1, total: engine.blocks.length };
@@ -158,6 +194,11 @@ export async function runUpdateTypesetPhase(engine, {
       if (l.h != null) engine.hrefTable.set(l.k, l.h);
     }
     const changed = block.galleyHash !== before.hash || block.stateVec !== before.state;
+    atCleanBoundary = wasClean && !changed;
+    if (walkTrace.length < 48) {
+      walkTrace.push([i, Math.round(performance.now() - t0),
+        `${wasClean ? 'c' : 'd'}${changed ? 'x' : ''}${block.rescued ? 'r' : ''}${preview?.galley ? 'p' : ''}`]);
+    }
     if (changed || !wasClean) {
       dirtyBlocks.push(block.id);
       if (wasClean) {

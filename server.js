@@ -43,7 +43,7 @@ import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read
 import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
 import { buildLeasePreviewSettlement } from './engine/checkpoint/build-lease-preview.js';
 import { watchInclude } from './engine/checkpoint/include-expander.js';
-import { includeReadCurrent } from './engine/checkpoint/include-cache.js';
+import { includeHoldsText, includeReadCurrent, rebindIncludeRead } from './engine/checkpoint/include-cache.js';
 import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
 
 // Certified canonical anchoring is deliberately narrow: only plain-text
@@ -2393,6 +2393,16 @@ const server = http.createServer(async (req, res) => {
             }
           }
           const overlayDelta = applyProjectOverlays(activeProject, body);
+          // The autosave of this keystroke can reach the engine first, through
+          // the watcher, while this request waits behind an earlier edit: an
+          // overlay of the bytes the engine already read is no input change
+          // (measured: a second 4 s update behind a jump in the 316-page book).
+          overlayDelta.changed = overlayDelta.changed.filter((file) => {
+            if (!includeHoldsText(engine.includes, file, activeProject.overlays.get(file))) return true;
+            rebindIncludeRead(engine.includes, file,
+              path.join(activeProject.overlayDir, path.relative(activeProject.docDir, file)));
+            return false;
+          });
           const changedInputs = [...overlayDelta.changed, ...overlayDelta.removed];
           if (!rootChanged && !changedInputs.length) {
             // Saving an overlay's bytes leaves every TeX input as it was: no
@@ -2533,6 +2543,9 @@ const server = http.createServer(async (req, res) => {
         clientEditAtEpochMs: Number.isFinite(Number(body.clientEditAtEpochMs)) ? Number(body.clientEditAtEpochMs) : null,
         receivedAtEpochMs: nowEpoch,
         engineDoneAtEpochMs: Date.now(),
+        lock: engine.lastLock ?? null,
+        walk: engine.lastWalkTrace ?? null,
+        coldWalk: engine.coldWalkTrace?.slice(-24) ?? null,
       };
       if (Number(lastAnchorPresentation?.srcRev) !== Number(lastReport.srcRev)) {
         lastAnchorPresentation = null;

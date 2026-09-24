@@ -64,7 +64,8 @@ export async function runChainPass(engine, callbacks) {
         const startedAt = performance.now();
         if (process.env.TDOM_TRACE_GRID) console.error('[grid] walk', JSON.stringify({ from, target, missing: missing.length, t: Math.round(performance.now()) }));
         engine.progress = { phase: 'grid', at: from + 1, total: target };
-        engine.coldWalking = true; // never killed mid-block (see #update)
+        engine.coldWalking = true; // killed mid-block only by an edit elsewhere (see #update)
+        engine.bgWalkTarget = target;
         let n;
         try {
           n = await retypesetChain(
@@ -75,6 +76,7 @@ export async function runChainPass(engine, callbacks) {
           );
         } finally {
           engine.coldWalking = false;
+          engine.bgWalkTarget = null;
         }
         const reached = from + (n < 0 ? -n - 1 : n);
         if (process.env.TDOM_TRACE_GRID) console.error('[grid] done', JSON.stringify({ from, target, reached, n, abort: engine.bgAbort, has: engine.checkpoints.has(target), t: Math.round(performance.now()) }));
@@ -111,13 +113,16 @@ export async function runChainPass(engine, callbacks) {
         const from = target < 0 ? -1 : nearestCheckpoint(target);
         if (target >= 0 && from < target) {
           engine.progress = { phase: 'cold', at: from + 1, total: target };
-          // Never killed mid-block (see #update): an edit sets bgAbort and
-          // the walk returns at its next boundary, which stays live.
+          // Not killed mid-block by an edit of the same file (see #update):
+          // it sets bgAbort and the walk returns at its next boundary, which
+          // stays live.
           engine.coldWalking = true;
+          engine.bgWalkTarget = target;
           // walk telemetry for the deferred report (docs/10 §10.4a): where
           // the replay started, how far it got, and each block's cost
           const walkStartedAt = performance.now();
           let lastAt = walkStartedAt;
+          engine.coldWalkTrace = []; // report timing only
           const perBlockMs = [];
           let n;
           try {
@@ -128,12 +133,14 @@ export async function runChainPass(engine, callbacks) {
                 engine.progress = { phase: 'cold', at: j + 2, total: target };
                 const now = performance.now();
                 perBlockMs.push(Math.round(now - lastAt));
+                engine.coldWalkTrace?.push([j, Math.round(now - lastAt), engine.blocks[j]?.rescued ? 'r' : '']);
                 lastAt = now;
               },
               () => engine.bgAbort || engine.editPending > 0
             );
           } finally {
             engine.coldWalking = false;
+            engine.bgWalkTarget = null;
           }
           const reached = from + (n < 0 ? -n - 1 : n);
           const prev = engine.coldWalk?.target === target ? engine.coldWalk : null;

@@ -203,7 +203,10 @@ async function renderBlockInner(engine, block, callbacks) {
       break;
     }
   }
-  if (!ck && !captureCk) {
+  // the preview's RENDER that went out beside its JOB (docs/10 §10.4b)
+  const early = cold?.early && !cold.early.used && !cold.early.discarded && !cold.early.failure &&
+    cold.early.text === block.text ? cold.early : null;
+  if (!ck && !captureCk && !early) {
     // checkpoint retired off the grid (long documents keep ~64): the
     // Neither exact path has a resident owner: RENDER needs the state AT the
     // block, CAPTURE needs the state just AFTER it. Fall back to isolated.
@@ -224,6 +227,7 @@ async function renderBlockInner(engine, block, callbacks) {
       asyncRepaginate,
       chunkTargets,
       releaseRenderHold,
+      early,
     });
   } finally {
     const owners = prelude !== null ? engine.coldPreviewHolds?.get(ck) : null;

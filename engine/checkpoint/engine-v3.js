@@ -56,6 +56,7 @@ import { resetOpenState } from './open-state.js';
 import { initializeEngineState } from './constructor-state.js';
 import { awaitWaiter, fulfillWaiter, rejectWaiter } from './waiters.js';
 import { abortBackgroundJob } from './abort-background-job.js';
+import { editElsewhereThanWalk, walkKillPaysOff } from './walk-preemption.js';
 import { Timer } from './timer.js';
 import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
@@ -82,6 +83,7 @@ import { mayCaptureNativeBlock, mayNeedRender, releaseRenderHold } from './rende
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
 import { preemptResidentRenders, queueRender as queueRenderHelper } from './render-pump.js';
+import { startResidentRender } from './resident-render.js';
 import { withReplaceablePreviewJob } from './build-lease-preview.js';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 import { queueMovedOffsets as queueMovedOffsetsHelper } from './rescue-offsets.js';
@@ -384,6 +386,7 @@ export class CheckpointEngine {
       const beforeChunksRev = this.chunks.rev;
       this.bgActive = true;
       this.warming = true;
+      this.bgWalkTarget = target;
       let replayed;
       try {
         replayed = await this.#retypesetChain(
@@ -399,6 +402,7 @@ export class CheckpointEngine {
       } finally {
         this.bgActive = false;
         this.warming = false;
+        this.bgWalkTarget = null;
       }
       if (replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev) {
         // Pin the boundary this walk reached so the warm that superseded it
@@ -597,6 +601,14 @@ export class CheckpointEngine {
     if (!ck) throw new Error(`no checkpoint at ${idx} for block ${block.id}`);
     this.jobInput = ck;
     await this.#reapDying(); // bound the live-fork set before minting ckpt idx+1
+    // an edit that arrived meanwhile found no job to kill (#update): do not
+    // start one it would wait for
+    if (this.bgAbort && this.bgActive) {
+      this.jobInput = null;
+      const err = new Error('background pass aborted (edit waiting)');
+      err.tdomAborted = true;
+      throw err;
+    }
     const { body, jobId, refSnapshot } = buildJobBlockBody({
       block,
       idx,
@@ -616,7 +628,7 @@ export class CheckpointEngine {
     // unhandled rejection after Promise.all already bailed on the first one
     galleyP.catch(() => {});
     ckptP.catch(() => {});
-    this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1 };
+    this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1, startedAt: performance.now() };
     let advance = false;
     try {
       // An exact-render JOB already owns the exact TeX node list that the
@@ -742,6 +754,7 @@ export class CheckpointEngine {
       !block.rescued && !this.poisoned.has(block.id) &&
       !block.galley.tdomDeferred && !block.galley.tdomFrozen &&
       !block.galley.tdomPendingPaint && !block.galley.tdomStale;
+    let killed = false;
     try {
       return await typesetBlockHelper(this, idx, {
         needsRescue: (text, structuralSinks) => this.#needsRescue(text, structuralSinks),
@@ -755,11 +768,16 @@ export class CheckpointEngine {
         sourceClosure,
         sourceRequiresCanonicalOnly,
       });
+    } catch (err) {
+      // a background walk an edit killed mid-block (#update): its partial
+      // time is no sample of the block's cost (the minimum is kept)
+      killed = this.bgAbort && this.bgActive;
+      throw err;
     } finally {
       // Session-high-water cost is intentional: a later rescue-cache hit
       // must not make the scheduler forget the expensive cold replay that a
       // distant edit would pay again after checkpoint retirement.
-      this.#recordTypesetCost(block, performance.now() - started - block.typesetCleanupMs);
+      if (!killed) this.#recordTypesetCost(block, performance.now() - started - block.typesetCleanupMs);
     }
   }
 
@@ -968,8 +986,12 @@ export class CheckpointEngine {
     const owners = this.coldPreviewHolds.get(ck) ?? new Set();
     owners.add(block.id);
     this.coldPreviewHolds.set(ck, owners);
+    let early = null;
     const release = () => this.#releaseColdPreviewHold(ck, block.id);
-    setTimeout(release, 30_000).unref?.();
+    setTimeout(() => {
+      release();
+      early?.discard();
+    }, 30_000).unref?.();
     const key = 'galley:' + jobId;
     const galleyP = this.#await(key, this.coldPreviewTimeoutMs);
     // FORKED fills the pid: a child that dies without a galley fails fast,
@@ -992,7 +1014,7 @@ export class CheckpointEngine {
         g.refs = [...new Set([...(g.refs ?? []), ...Object.keys(refSnapshot)])];
       }
       // its exact render forks the same peer with the same prelude
-      g.tdomColdPreview = { peer: ck, prelude, text: block.text };
+      g.tdomColdPreview = { peer: ck, prelude, text: block.text, early };
       return g;
     }).finally(() => {
       settled = true;
@@ -1001,6 +1023,7 @@ export class CheckpointEngine {
     });
     const cancel = () => {
       release();
+      early?.discard();
       if (settled) return; // the child reported and is on its way to DIE
       const pid = this.renderPids.get(jobId);
       if (pid > 0) {
@@ -1014,6 +1037,19 @@ export class CheckpointEngine {
     };
     ck.send(`JOB ${jobId} -1 ${payload.length} - F 0\n`);
     ck.sendRaw(payload);
+    // The first keystroke after a pause also sends the exact RENDER the pump
+    // would send once the preview is adopted (same peer, prelude and text),
+    // now: the pump then only crops its PDF. In a burst the pump's own quiet
+    // gate decides, so a render is not started and killed per keystroke.
+    if (block.needsRender && this.coldPreviewEarlyRender && (this.editGapMs ?? 0) > 400) {
+      early = startResidentRender(this, {
+        block,
+        ck,
+        checkpointIndex: fromIdx,
+        body: Buffer.from(prelude + block.text, 'utf8'),
+        awaitRender: (key, timeout) => this.#await(key, timeout),
+      });
+    }
     return { galley, cancel, release };
   }
 
@@ -1074,16 +1110,21 @@ export class CheckpointEngine {
   }
 
   async #rescueBlock(idx, why) {
-    return rescueBlockHelper(this, idx, why, {
-      rescueCacheKey: (block, blockIdx) => this.#rescueCacheKey(block, blockIdx),
-      isoCacheGet: (cacheKey) => this.#isoCacheGet(cacheKey),
-      isoBaseGet: (targetBlock, blockIdx) => this.#isoBaseGet(targetBlock, blockIdx),
-      bootIsoCompile: (blockIdx, cacheKey) => this.#bootIsoCompile(blockIdx, cacheKey),
-      jobBlock: (blockIdx, override) => this.#jobBlock(blockIdx, override),
-      stateJobBody: (iso) => this.#stateJobBody(iso),
-      pumpRescues: () => this.#pumpRescues(),
-      brokenBlockGalley: (blockIdx, frozen) => this.#brokenBlockGalley(blockIdx, frozen),
-    });
+    this.rescuingIdx = idx; // report timing only
+    try {
+      return await rescueBlockHelper(this, idx, why, {
+        rescueCacheKey: (block, blockIdx) => this.#rescueCacheKey(block, blockIdx),
+        isoCacheGet: (cacheKey) => this.#isoCacheGet(cacheKey),
+        isoBaseGet: (targetBlock, blockIdx) => this.#isoBaseGet(targetBlock, blockIdx),
+        bootIsoCompile: (blockIdx, cacheKey) => this.#bootIsoCompile(blockIdx, cacheKey),
+        jobBlock: (blockIdx, override) => this.#jobBlock(blockIdx, override),
+        stateJobBody: (iso) => this.#stateJobBody(iso),
+        pumpRescues: () => this.#pumpRescues(),
+        brokenBlockGalley: (blockIdx, frozen) => this.#brokenBlockGalley(blockIdx, frozen),
+      });
+    } finally {
+      this.rescuingIdx = null;
+    }
   }
 
   /**
@@ -1366,6 +1407,9 @@ export class CheckpointEngine {
 
   #adoptGalley(block, galley) {
     this.coldDirty?.delete(block.id);
+    // a replaced preview's early RENDER (if the pump never took it) is moot
+    const replacedEarly = block.galley?.tdomColdPreview?.early;
+    if (replacedEarly && replacedEarly !== galley.tdomColdPreview?.early) replacedEarly.discard();
     if (!galley.tdomColdPreview && this.coldPreviewHolds?.size) {
       // a walk replaced the block's preview: its checkpoint has no RENDER left
       for (const peer of [...this.coldPreviewHolds.keys()]) this.#releaseColdPreviewHold(peer, block.id);
@@ -1445,6 +1489,9 @@ export class CheckpointEngine {
     };
     if (!args.coldResume) {
       this.#noteShipActivity();
+      // the first keystroke after a pause (a jump elsewhere) sends its cold
+      // preview's RENDER at once (#coldPreview)
+      this.editGapMs = Date.now() - (this.lastEditAt ?? 0);
       this.lastEditAt = Date.now(); // pauses the idle-gated isolated renders
       const foregroundLeaseMs = shippingPriorityQuietMs(this, 0);
       this.foregroundLeaseMs = foregroundLeaseMs;
@@ -1467,16 +1514,58 @@ export class CheckpointEngine {
     // replay away, and the consumed boundary is then rebuilt with JOB forks
     // from an older checkpoint before this edit can run (measured: a
     // keystroke waiting 25 s behind the host's own warm on the 316-page
-    // fixture). Let such a walk stop at its next block boundary instead.
+    // fixture). Let such a walk stop at its next block boundary instead,
+    // unless it is heading for another file's blocks (below).
+    // what this update found holding the chain (report timing only)
+    const entry = {
+      label: args.editLabel ?? null,
+      entryAtEpochMs: Date.now(),
+      heldBy: this.updating ? 'update' : this.warming ? 'warm' : this.coldWalking
+        ? (this.pendingChain?.kind ?? 'walk') : this.bgActive ? (this.pendingChain?.kind ?? 'chain') : null,
+      job: this.currentJob
+        ? { idx: this.currentJob.ckptIdx - 1, ms: Math.round(performance.now() - this.currentJob.startedAt) } : null,
+      rescuing: this.rescuingIdx ?? null,
+    };
     this.editPending++;
     let lockHeld = false;
-    if (this.coldWalking || this.warming) this.bgAbort = true;
-    else abortBackgroundJob(this);
+    if (this.coldWalking || this.warming) {
+      this.bgAbort = true;
+      // The first keystroke after a pause (a jump elsewhere) ends the step of
+      // a caret warm, and of a cold or grid walk heading for another file's
+      // blocks, now instead of after a heavy block (measured 1.2-2.6 s on the
+      // 316-page fixture): it gains nothing from them. Only that walk's
+      // replay since its last retained boundary is lost, so only when the
+      // step's remaining time outweighs it; the edit's own region is served
+      // by its own walk and cold preview, and a cold or grid walk replays on a
+      // later idle gate. Within a burst every walk stops at its boundary and
+      // pins it, so each keystroke still leaves progress behind (killing
+      // there starved warms and far resumes alike), and a cold walk toward
+      // this edit's own file always does (§10.4a).
+      const job = this.currentJob;
+      const jobIdx = job ? job.ckptIdx - 1 : -1;
+      if (!args.coldResume && (this.editGapMs ?? 0) > 400 && job?.startedAt != null &&
+          (this.warming || editElsewhereThanWalk({
+            blocks: this.blocks,
+            target: this.bgWalkTarget,
+            rootFile: this.file,
+            editContext: args.editContext,
+            projectInputChanges: args.projectInputChanges,
+          })) &&
+          walkKillPaysOff({
+            blocks: this.blocks,
+            jobIdx,
+            jobElapsedMs: performance.now() - job.startedAt,
+            retainedIdx: this.#nearestCheckpoint(jobIdx),
+          })) {
+        abortBackgroundJob(this, 'background walk pre-empted by an edit');
+      }
+    } else abortBackgroundJob(this);
     await this.bgTask.catch(() => {});
     try {
       const report = await this.#locked(async () => {
         lockHeld = true;
         this.editPending--;
+        this.lastLock = { ...entry, lockedAtEpochMs: Date.now() };
         // serialize async header-job arrivals against updates: an hf apply
         // between an update's prevHashes capture and its patch computation
         // would mark unrelated pages dirty

@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
-import { includeReadCurrent } from '../engine/checkpoint/include-cache.js';
+import { includeHoldsText, includeReadCurrent } from '../engine/checkpoint/include-cache.js';
 import { watchInclude } from '../engine/checkpoint/include-expander.js';
 
 const DEMO = readFileSync(fileURLToPath(new URL('../samples/demo-lua.tex', import.meta.url)), 'utf8');
@@ -330,6 +330,10 @@ test('a cold keystroke shows its block through a preview typeset from the far ch
   const doc = ['\\documentclass{article}', '\\begin{document}', '\\section{First}', ...paragraphs, '\\end{document}', ''].join('\n');
   const e = new CheckpointEngine({ workDir: work });
   e.checkpointCeiling = 4;
+  // a grid boundary right before an edited block (filled while a step
+  // settles) leaves no clean block to stop at before it: no preview
+  const gridFill = process.env.TDOM_GRID_FILL;
+  process.env.TDOM_GRID_FILL = '0';
   const block = (head) => e.blocks.find((b) => b.text.startsWith(head));
   const settle = async () => {
     const until = Date.now() + 90_000;
@@ -389,6 +393,8 @@ test('a cold keystroke shows its block through a preview typeset from the far ch
     assert.equal(block('Paragraph 20 ').galley.tdomRefVals?.['p:hundred'], undefined, 'its reference re-resolved');
   } finally {
     await e.close();
+    if (gridFill === undefined) delete process.env.TDOM_GRID_FILL;
+    else process.env.TDOM_GRID_FILL = gridFill;
   }
 });
 
@@ -411,6 +417,7 @@ test('a cold preview of a block with exact pixels renders them from the checkpoi
     e.coldPrefixBudgetMs = 1;
     e.coldPreviewFromMs = 0;
     e.coldPreviewWaitMs = 60_000;
+    e.coldPreviewEarlyRender = false; // the pump's own RENDER from the preview's peer
     const at = e.getSource().indexOf('marked 150') + 'marked'.length;
     const cold = await e.edit(at, at, ' X');
     assert.equal(cold.stats.coldPreview?.adopted, true, JSON.stringify(cold.stats.coldPreview));
@@ -419,6 +426,7 @@ test('a cold preview of a block with exact pixels renders them from the checkpoi
     assert.ok(previewed.needsRender, 'the fixture block needs exact pixels');
     await e.renderTask;
     assert.ok((e.renderStats?.coldPreviews ?? 0) >= 1, 'the preview rendered from its own checkpoint');
+    assert.ok(!(e.renderTimings ?? []).some((t) => t.block === id && t.earlyMs != null));
     const until = Date.now() + 90_000;
     while ((e.pendingChain || e.coldDirty.size || e.updating || e.bgActive) && Date.now() < until) {
       await new Promise((r) => setTimeout(r, 50));
@@ -427,6 +435,56 @@ test('a cold preview of a block with exact pixels renders them from the checkpoi
     const native = e.blocks.find((b) => b.id === id);
     assert.ok(!native.galley.tdomColdPreview);
     assert.equal(e.chunks.get(id)?.forGalley, native.galleyHash, 'the replacing galley got pixels of its own');
+  } finally {
+    await e.close();
+  }
+});
+
+test('the first keystroke after a pause sends its cold preview RENDER beside the preview JOB', opts, async () => {
+  const work = WORK + '-cold-preview-early';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} holds ${i === 150 ? '$x^2$' : 'text'} marked ${i} in the early render fixture.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 2;
+  try {
+    await e.open(doc);
+    await e.renderTask;
+    e.coldPrefixBudgetMs = 1;
+    e.coldPreviewFromMs = 0;
+    e.coldPreviewWaitMs = 60_000;
+    e.lastEditAt = 0; // a pause before this keystroke
+    const at = e.getSource().indexOf('marked 150') + 'marked'.length;
+    const cold = await e.edit(at, at, ' X');
+    assert.equal(cold.stats.coldPreview?.adopted, true, JSON.stringify(cold.stats.coldPreview));
+    const id = String(cold.dirtySourceNodes[0]).replace(/^src-/, '');
+    const previewed = e.blocks.find((b) => b.id === id);
+    assert.ok(previewed.galley.tdomColdPreview?.early, 'the preview sent its RENDER');
+    const previewHash = previewed.galleyHash;
+    await e.renderTask;
+    assert.ok((e.renderTimings ?? []).some((t) => t.block === id && t.earlyMs != null), 'the pump cropped the early PDF');
+    // the preview's own pixels, unless the resume replaced the galley already
+    const now = e.blocks.find((b) => b.id === id);
+    const early = e.chunks.get(id);
+    if (now.galleyHash === previewHash) assert.equal(early?.forGalley, previewHash);
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.coldDirty.size || e.updating || e.bgActive) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await e.renderTask;
+    const native = e.blocks.find((b) => b.id === id);
+    assert.ok(!native.galley.tdomColdPreview);
+    assert.equal(e.chunks.get(id)?.forGalley, native.galleyHash, 'the replacing galley got pixels of its own');
+    if (early?.forGalley === previewHash) {
+      // cropped with the padding the RENDER child wrote beside its PDF
+      assert.ok(early.xBp < 0 && early.wBp > early.logicalWBp, JSON.stringify({ xBp: early.xBp, wBp: early.wBp }));
+    }
+    assert.deepEqual(readdirSync(work).filter((name) => /-early\d+$/.test(name)), [], 'no early render dir is left');
   } finally {
     await e.close();
   }
@@ -1170,6 +1228,10 @@ test('a touched \\input or \\include file whose bytes did not change does not ad
     await Promise.all(refreshes);
     assert.ok(eng.srcRev > opened);
     assert.ok(eng.blocks.some((b) => b.text.includes('revised on disk')));
+    // the overlay of this same save, arriving after the watcher's refresh,
+    // changes no input (server /edit); other bytes still do
+    assert.equal(includeHoldsText(eng.includes, one, 'First chapter paragraph, revised on disk.\n'), true);
+    assert.equal(includeHoldsText(eng.includes, one, 'First chapter paragraph, revised again.\n'), false);
 
     // A resident update that re-reads new child bytes without invalidating
     // them on canonical (a cold resume; here a root keystroke) must not
@@ -1180,10 +1242,12 @@ test('a touched \\input or \\include file whose bytes did not change does not ad
     await eng.edit(at, at, 'Closing root paragraph.\n\n');
     assert.ok(eng.blocks.some((b) => b.text.includes('revised before its event')), 'the keystroke re-read the child');
     assert.equal(includeReadCurrent(eng.includes, two), false, 'canonical was not told about these bytes');
+    assert.equal(includeHoldsText(eng.includes, two, 'Second chapter paragraph, revised before its event.\n'), false);
     await until(() => events.length === 2, 'the event still reaches onExternalChange');
     assert.equal(events[1], two);
     await eng.refresh({ changed: [two] });
     assert.equal(includeReadCurrent(eng.includes, two), true);
+    assert.equal(includeHoldsText(eng.includes, two, 'Second chapter paragraph, revised before its event.\n'), true);
 
     autoRefresh = true;
     const refreshed = eng.srcRev;

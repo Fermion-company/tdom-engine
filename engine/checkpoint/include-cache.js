@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 // engine.includes maps each project input the resident read to
@@ -26,6 +26,29 @@ export function announceIncludeReads(includes, files) {
     try { announcedText = readFileSync(cached.readPath, 'utf8'); } catch { /* gone: nothing announced */ }
     includes.set(file, { ...cached, announcedText });
   }
+}
+
+// True when an overlay carrying `text` for project file `file` changes no TeX
+// input: the resident already read exactly these bytes for it and canonical
+// was told about them. An autosave of the same keystroke reaches the engine
+// first, through the watcher, while the overlay request waits behind an
+// earlier edit.
+export function includeHoldsText(includes, file, text) {
+  if (typeof text !== 'string') return false;
+  const cached = includes.get(path.resolve(file));
+  return typeof cached?.text === 'string' && cached.text === text && cached.announcedText === text;
+}
+
+// The overlay of `file` at `readPath` now holds the bytes the resident read
+// elsewhere (includeHoldsText): read it from there on, as canonical does
+// (its SyncTeX names the overlay), until the next expansion re-reads it.
+export function rebindIncludeRead(includes, file, readPath) {
+  const key = path.resolve(file);
+  const cached = includes.get(key);
+  if (!cached) return;
+  let mtime;
+  try { mtime = statSync(readPath).mtimeMs; } catch { return; }
+  includes.set(key, { ...cached, readPath, mtime });
 }
 
 // True when a watcher event on `file` changes no TeX input: every include

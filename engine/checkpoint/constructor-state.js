@@ -192,6 +192,9 @@ export function initializeEngineState(
   // a budget stop waits this long for a preview still typesetting
   engine.coldPreviewWaitMs = Math.max(0, Number(process.env.TDOM_COLD_PREVIEW_WAIT_MS ?? 1000) || 0);
   engine.coldPreviewTimeoutMs = 15_000;
+  // the first keystroke after a pause sends its preview's RENDER beside the JOB
+  engine.coldPreviewEarlyRender = process.env.TDOM_COLD_PREVIEW_EARLY_RENDER !== '0';
+  engine.editGapMs = null; // time since the edit before the current one
   engine.coldPreviewSeq = 0;
   engine.coldPreviewHolds = new Map(); // peer a preview forked -> Set of block ids, kept for their RENDER
   engine.coldPreviewActive = null; // the current foreground walk's preview (cancelled if the walk throws)
@@ -255,6 +258,7 @@ export function initializeEngineState(
   engine.coldPrefixBudgetMs = Math.max(0, Number(process.env.TDOM_COLD_PREFIX_MS ?? 1500) || 0);
   engine.coldDirty = new Set(); // block ids whose galley predates their source text
   engine.coldWalking = false; // a cold chain pass is replaying with STEP right now
+  engine.bgWalkTarget = null; // block a caret warm, cold walk or grid walk is heading for
   engine.coldWalk = null; // telemetry of the last cold replay (from/target/walked/ms/perBlockMs)
   engine.coldTrace = null; // timestamps of the current cold keystroke's deferred path
   // Grid materialization (docs/03): the keep set is computed from measured
