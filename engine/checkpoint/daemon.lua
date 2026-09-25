@@ -1182,12 +1182,25 @@ local function reseed_page()
   end)
 end
 
+-- The engine keeps this file in the work directory while a keystroke waits
+-- for the chain lock (engine-v3.js #keystrokeWaiting). A background JOB then
+-- takes the interactive allowance: the keystroke waits for this step's
+-- collect, and a later background step collects instead.
+local function keystroke_waiting()
+  if not WORKDIR then return false end
+  local f = io.open(WORKDIR .. '/keystroke-waiting', 'r')
+  if not f then return false end
+  f:close()
+  return true
+end
+
 local function checkpoint_gc(initial, interactive, elapsed_s)
   if os.getenv('TDOM_NO_CKPT_GC') then return end
   if initial or not TDOM_GC_FLOOR then
     gc_collect(2)
     return
   end
+  interactive = interactive or keystroke_waiting()
   local kb = collectgarbage('count')
   -- a block the guard collected is measured again at its boundary
   if not gc_guard_kb and kb <= gc_limit_kb(interactive and 2 or 1) then return end

@@ -44,7 +44,7 @@
 // into an SVG chunk, swapped in asynchronously.
 
 import net from 'node:net';
-import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureShim } from './forkshim.js';
@@ -714,6 +714,9 @@ export class CheckpointEngine {
       nextCheckpoint.replayToken = replayToken;
       this.confirmedLiveHeapKb = Math.max(this.confirmedLiveHeapKb || 0, nextCheckpoint.gcFloorKb || 0);
       if (process.env.TDOM_TRACE_JOB) console.error('[job-gc]', jobId, JSON.stringify({ interactive, gcMs: nextCheckpoint.gcMs, ...galley.tm }));
+      // a keystroke waiting on this background step waited for its collect
+      // too (report timing: lock.gcWaitedMs)
+      if (!interactive) this.bgGcMsTotal = (this.bgGcMsTotal ?? 0) + (nextCheckpoint.gcMs ?? 0);
       block.typesetCleanupMs = (block.typesetCleanupMs ?? 0) + (nextCheckpoint.gcMs ?? 0);
       if (!override && block.nativeClosureRequired !== false && galley.closure === 'error') {
         const bad = this.checkpoints.get(idx + 1);
@@ -1584,11 +1587,12 @@ export class CheckpointEngine {
         ? { idx: this.currentJob.ckptIdx - 1, ms: Math.round(performance.now() - this.currentJob.startedAt) } : null,
       rescuing: this.rescuingIdx ?? null,
     };
+    const gcBefore = this.bgGcMsTotal ?? 0;
     this.editPending++;
     // a keystroke (or an input change), not the engine's own cold resume:
     // walks stop for it at their next boundary (update-typeset-phase.js)
     const keystroke = !args.coldResume;
-    if (keystroke) this.keystrokePending++;
+    if (keystroke) this.#keystrokeWaiting(+1);
     let lockHeld = false;
     if (this.coldWalking || this.warming) {
       this.bgAbort = true;
@@ -1628,8 +1632,8 @@ export class CheckpointEngine {
       const report = await this.#locked(async () => {
         lockHeld = true;
         this.editPending--;
-        if (keystroke) this.keystrokePending--;
-        this.lastLock = { ...entry, lockedAtEpochMs: Date.now() };
+        if (keystroke) this.#keystrokeWaiting(-1);
+        this.lastLock = { ...entry, lockedAtEpochMs: Date.now(), gcWaitedMs: Math.round((this.bgGcMsTotal ?? 0) - gcBefore) };
         // serialize async header-job arrivals against updates: an hf apply
         // between an update's prevHashes capture and its patch computation
         // would mark unrelated pages dirty
@@ -1653,9 +1657,25 @@ export class CheckpointEngine {
     } finally {
       if (!lockHeld) {
         this.editPending--;
-        if (keystroke) this.keystrokePending--;
+        if (keystroke) this.#keystrokeWaiting(-1);
       }
     }
+  }
+
+  // While a keystroke waits for the chain lock, a marker in the work
+  // directory tells the daemon's background JOBs to leave their checkpoint
+  // collect to a later step (daemon.lua checkpoint_gc): a collect costs
+  // 0.8-2.5 s on a 316-page lineage, and the keystroke waited for all of it
+  // (tex64-internal #84).
+  #keystrokeWaiting(delta) {
+    const before = this.keystrokePending;
+    this.keystrokePending = Math.max(0, before + delta);
+    if ((before > 0) === (this.keystrokePending > 0) || !this.workDir) return;
+    const marker = path.join(this.workDir, 'keystroke-waiting');
+    try {
+      if (this.keystrokePending > 0) writeFileSync(marker, '');
+      else rmSync(marker, { force: true });
+    } catch { /* timing only: the collect runs as before */ }
   }
 
   async #updateInner({

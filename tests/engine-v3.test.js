@@ -3,7 +3,7 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, rmSync, mkdtempSync, writeFileSync, readdirSync, utimesSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, mkdtempSync, writeFileSync, readdirSync, utimesSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1306,6 +1306,30 @@ test('a breakable box declared in a project .sty is split where it straddles a p
     const printed = Number(stdout.match(/Output written on main\.pdf \((\d+) page/)?.[1]);
     assert.ok(printed >= 2);
     assert.equal(eng.pages.length, printed, 'resident pagination matches the real output');
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a keystroke waiting for the chain lock leaves the daemon a marker to defer background collects (#84)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-keystroke-marker-'));
+  const work = path.join(root, 'work');
+  const marker = path.join(work, 'keystroke-waiting');
+  const eng = new CheckpointEngine({ workDir: work, docDir: root });
+  try {
+    await eng.open(['\\documentclass{article}', '\\begin{document}', 'First paragraph.', '', 'Second paragraph.', '', '\\end{document}', ''].join('\n'));
+    assert.equal(existsSync(marker), false);
+    const at = eng.getSource().indexOf('Second paragraph');
+    const first = eng.edit(at, at, 'A');
+    const second = eng.edit(at, at, 'B');
+    // the second keystroke waits while the first holds the lock
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(existsSync(marker), true, 'marker while a keystroke waits');
+    await Promise.all([first, second]);
+    assert.equal(existsSync(marker), false, 'removed once no keystroke waits');
+    assert.equal(eng.keystrokePending, 0);
+    assert.equal(typeof eng.lastLock?.gcWaitedMs, 'number');
   } finally {
     await eng.close();
     rmSync(root, { recursive: true, force: true });
