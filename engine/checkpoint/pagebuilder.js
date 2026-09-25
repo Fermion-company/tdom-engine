@@ -404,8 +404,11 @@ class PageBuilder {
         if (!e) break;
       }
       // a block's first stream node: record its effective entry offset
-      // (space already unavailable on this page: \pagetotal plus whatever
-      // inserts/floats took off \pagegoal). FIRST-seen wins: this is the
+      // (space already unavailable on this page: \pagetotal, the pending
+      // \pagedepth of the line above — the node lands below it — plus
+      // whatever inserts/floats took off \pagegoal). Without the depth a
+      // splitting rescue compiled 2pt higher than print, and its first
+      // part overfilled the page (tex64-internal #88). FIRST-seen wins: this is the
       // position the block was GIVEN — where the real run's output routine
       // decides whether/where to break. Recording the post-requeue landing
       // instead creates a SECOND stable fixpoint for splitting rescues
@@ -415,7 +418,7 @@ class PageBuilder {
       // the given position, the isolated real-routine compile is the single
       // authority for the break and the fixpoint is unique.
       if (e.first && e.bid && !this.blockEntry.has(e.bid)) {
-        this.blockEntry.set(e.bid, this.textheight - this.goal + this.total);
+        this.blockEntry.set(e.bid, this.textheight - this.goal + this.total + this.depth);
       }
       switch (e.t) {
         case 'box':

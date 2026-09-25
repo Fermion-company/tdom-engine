@@ -1236,6 +1236,41 @@ test('a forward \\cref under hyperref typesets in the resident chain (tex64-inte
   }
 });
 
+test('a breakable box rescued mid-page keeps the pagination of the real output', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-midpage-split-'));
+  const lorem = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ';
+  const source = [
+    '\\documentclass{article}', '\\usepackage[most]{tcolorbox}',
+    '\\newtcolorbox{splitbox}[1]{enhanced, breakable, title={#1}}', '\\begin{document}',
+    lorem.repeat(13), '',
+    '\\begin{splitbox}{Straddles}', lorem.repeat(14), '\\end{splitbox}', '',
+    'Closing paragraph after the box.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  writeFileSync(path.join(root, 'main.tex'), source);
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  try {
+    await eng.open(source);
+    const deadline = Date.now() + 120_000;
+    while ((eng.rescueQueue.size || eng.rescuePumping) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    await eng.bgTask;
+    const split = eng.blocks.find((b) => b.text.includes('\\begin{splitbox}'));
+    assert.ok(split.rescued);
+    assert.ok(split.galley.items.some((it) => it.k === 'eject'), 'the box splits at its offset');
+    const { stdout } = await promisify(execFile)('lualatex', ['-interaction=nonstopmode', '-halt-on-error', 'main.tex'], { cwd: root, timeout: 120_000 });
+    const printed = Number(stdout.match(/Output written on main\.pdf \((\d+) page/)?.[1]);
+    // Compiled 2pt above print (the line above's depth) or cropped with the
+    // iso page's \topskip on top, the first part overfilled page 1 and the
+    // builder pushed it whole to page 2: one page more than print.
+    assert.equal(eng.pages.length, printed, 'the first part stays on the page it was split for');
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a touched \\input or \\include file whose bytes did not change does not advance srcRev', opts, async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-external-input-'));
   const one = path.join(root, 'one.tex');
