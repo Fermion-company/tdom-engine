@@ -72,6 +72,10 @@ function traceStage(ev, page, extra = {}) {
 }
 const provisionalRemovedPages = new Set();
 const provisionalDisplayLists = new Map(); // complete resident page layout, including unchanged pages
+// Resident pages held by a zero-layout placeholder (a page-wide pending-exact:
+// a block whose galley has not arrived). While any exist the resident page
+// count is not settled. A line-level pending-exact only waits for ink.
+const provisionalPendingLayout = new Set();
 let residentPageCountAuthoritative = false;
 let committedCanonicalGeneration = null;
 let lastEngineStatus = null;
@@ -583,6 +587,7 @@ function beginClientDocumentReset(epoch) {
   pageEditGroup.clear();
   provisionalRemovedPages.clear();
   provisionalDisplayLists.clear();
+  provisionalPendingLayout.clear();
   residentPageCountAuthoritative = false;
   bootComplete = false;
   directEditClickEpoch++;
@@ -623,6 +628,7 @@ function adoptDoc(doc) {
   pageEditGroup.clear();
   provisionalRemovedPages.clear();
   provisionalDisplayLists.clear();
+  provisionalPendingLayout.clear();
   committedCanonicalGeneration = null;
   pageDirtyRev.clear();
   clearCanonicalAnchorPreview();
@@ -748,13 +754,19 @@ function stageProvisionalPatches(patches, flash, pageCount = null, editIds = nul
   const delivered = patches.filter(patch => patch.type === 'replace-page').map(patch => patch.displayList.page);
   if (delivered.length) traceStage('deliver', null, { pages: delivered });
   for (const patch of patches) {
-    if (patch.type === 'replace-page') provisionalDisplayLists.set(patch.displayList.page, patch.displayList);
-    else if (patch.type === 'remove-pages') {
+    if (patch.type === 'replace-page') {
+      const dl = patch.displayList;
+      provisionalDisplayLists.set(dl.page, dl);
+      if (dl.commands?.some(cmd => cmd.op === 'pending-exact' && cmd.wholePage)) provisionalPendingLayout.add(dl.page);
+      else provisionalPendingLayout.delete(dl.page);
+    } else if (patch.type === 'remove-pages') {
       for (const n of provisionalDisplayLists.keys()) if (n >= patch.from) provisionalDisplayLists.delete(n);
+      for (const n of provisionalPendingLayout) if (n >= patch.from) provisionalPendingLayout.delete(n);
     }
   }
   if (Number.isInteger(pageCount) && pageCount >= 0) {
     for (const n of provisionalDisplayLists.keys()) if (n > pageCount) provisionalDisplayLists.delete(n);
+    for (const n of provisionalPendingLayout) if (n > pageCount) provisionalPendingLayout.delete(n);
     if ([...pageDivs.keys(), ...provisionalStages.keys()].some(n => n > pageCount)) removePagesFrom(pageCount + 1);
   }
   if (usesCanonicalSurface()) {
@@ -879,6 +891,12 @@ function tryCommitProvisionalStages() {
     stage.documentEpoch === documentReset.adoptedEpoch &&
     Number(stage.snapshot?.srcRev) === appliedSrcRev &&
     Number(stage.snapshot?.documentEpoch) === stage.documentEpoch;
+  // Before this document's first canonical the resident count is the only
+  // one. Once no resident page waits for a block's geometry (the boot walk
+  // compiled its rescues) it is settled, and a ready group need not wait for
+  // every page's exact ink: on the 316-page book that wait lasted until the
+  // first canonical, about four minutes after opening (tex64-internal #83).
+  const residentCountSettled = canonicalPageCount === null && !provisionalPendingLayout.size;
   let committing = stages;
   if (!stages.every(stageReady)) {
     // While the page count is settled, a ready group (provisionalCommitGroups)
@@ -886,8 +904,11 @@ function tryCommitProvisionalStages() {
     // exact pixels (the previous keystroke's, or a running head the edit
     // touched) would hold back the page being typed on now. Numbers on far
     // pages may briefly lag until theirs land.
-    if (pageCountMismatch || canonicalPageCount === null || provisionalRemovedPages.size || directEditor ||
-        stages.some(stage => !pageDivs.has(stage.dl.page))) return;
+    if (pageCountMismatch || (canonicalPageCount === null && !residentCountSettled) ||
+        provisionalRemovedPages.size || directEditor) return;
+    // no canonical has made the shells yet: the resident count does
+    if (residentCountSettled) for (let n = 1; n <= residentPageCount; n++) ensureShell(n);
+    if (stages.some(stage => !pageDivs.has(stage.dl.page))) return;
     committing = provisionalCommitGroups(stages, committedPageSrcs, pageEditGroup)
       .filter(group => group.every(stageReady)).flat()
       .sort((a, b) => a.dl.page - b.dl.page);
