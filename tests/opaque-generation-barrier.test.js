@@ -34,6 +34,21 @@ test('staged pages commit in groups: a reflow, a moved or split paragraph and on
   assert.deepEqual(pages(groupsOf([stage(30, 'a'), stage(80, 'b')], new Map(), new Map([[30, 1], [80, 2]]))), [[30], [80]]);
   // page furniture ('_…') joins nothing
   assert.deepEqual(pages(groupsOf([stage(10, '_hf', 'a'), stage(20, '_hf', 'b')], new Map(), new Map())), [[10], [20]]);
+  // first presentation: blank neighbours cannot disagree across a page break,
+  // so each page (or block spanning pages) commits on its own (#83)
+  const blank = () => false;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b'), stage(164, 'b')], new Map(), new Map(), blank)), [[162], [163, 164]]);
+  // a painted neighbour still ties the reflow
+  const paintedAt = (n) => (page) => page === n;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b')], new Map(), new Map(), paintedAt(162))), [[162, 163]]);
+  // the next keystroke on the presented page: blank neighbours still waiting
+  // for their ink stay blank and do not hold it back
+  const readyAt = (n) => (s) => s.dl.page === n;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b', 'c'), stage(164, 'c')], new Map(), new Map(), paintedAt(163), readyAt(163))),
+    [[162], [163], [164]]);
+  // …but a ready blank neighbour joins the painted page's reflow
+  const readyAll = () => true;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b')], new Map(), new Map(), paintedAt(163), readyAll)), [[162, 163]]);
 });
 
 test('the VisualCut raster verifier is loaded and served by the preview origin', () => {

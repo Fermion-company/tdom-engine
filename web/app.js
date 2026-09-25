@@ -701,8 +701,13 @@ function displayListSrcs(dl) {
 /** Staged pages that must change together (docs/04 §4.5): consecutive
  * pages (material reflows across the page break), pages that paint or
  * painted the same block (a paragraph moving across an unchanged float
- * page), and the pages of one edit (a split or merge renames blocks). */
-function provisionalCommitGroups(stages, committedSrcs, editGroup) {
+ * page), and the pages of one edit (a split or merge renames blocks).
+ * Consecutive pages are tied only while one of them shows a paper, and a
+ * blank page whose stage is not ready joins nothing: it stays blank, and
+ * next to a blank shell no reflow can duplicate or drop a line. On a
+ * document's first presentation every page is blank, and tying them made
+ * the whole document one group (tex64-internal #83). */
+function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () => true, ready = () => true) {
   const root = new Map(stages.map(stage => [stage.dl.page, stage.dl.page]));
   const find = page => {
     while (root.get(page) !== page) page = root.get(page);
@@ -715,9 +720,12 @@ function provisionalCommitGroups(stages, committedSrcs, editGroup) {
     if (map.has(key)) join(page, map.get(key));
     else map.set(key, page);
   };
+  const staged = new Map(stages.map(stage => [stage.dl.page, stage]));
+  const waiting = stage => !painted(stage.dl.page) && !ready(stage);
   for (const stage of stages) {
     const page = stage.dl.page;
-    if (root.has(page - 1)) join(page, page - 1);
+    if (waiting(stage)) continue;
+    if (root.has(page - 1) && !waiting(staged.get(page - 1)) && (painted(page) || painted(page - 1))) join(page, page - 1);
     stage.srcs ??= displayListSrcs(stage.dl);
     for (const src of stage.srcs) note(pageOfSrc, src, page);
     for (const src of committedSrcs.get(page) ?? []) note(pageOfSrc, src, page);
@@ -731,6 +739,11 @@ function provisionalCommitGroups(stages, committedSrcs, editGroup) {
     groups.get(group).push(stage);
   }
   return [...groups.values()];
+}
+
+function pagePainted(page) {
+  const div = pageDivs.get(page);
+  return Boolean(div) && (div.dataset.prov === '1' || div.dataset.canonPresentedRev !== undefined);
 }
 
 function srcOf(target) {
@@ -909,7 +922,7 @@ function tryCommitProvisionalStages() {
     // no canonical has made the shells yet: the resident count does
     if (residentCountSettled) for (let n = 1; n <= residentPageCount; n++) ensureShell(n);
     if (stages.some(stage => !pageDivs.has(stage.dl.page))) return;
-    committing = provisionalCommitGroups(stages, committedPageSrcs, pageEditGroup)
+    committing = provisionalCommitGroups(stages, committedPageSrcs, pageEditGroup, pagePainted, stageReady)
       .filter(group => group.every(stageReady)).flat()
       .sort((a, b) => a.dl.page - b.dl.page);
     if (!committing.length) return;
