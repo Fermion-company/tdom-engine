@@ -2126,7 +2126,14 @@ export class CheckpointEngine {
             // A cold keystroke's resume (docs/10 §10.4a) outranks isolated
             // rescue adoption: the adopt walk holds the chain lock for seconds
             // and the keystroke's page is not on screen until the resume runs.
-            const waiting = this.editPending > 0 || this.coldDirty.size > 0 || this.pendingChain?.kind === 'cold' ||
+            // Not when the resume is owed only for this very block (an edit
+            // inside a multicols that the walk left cold): its adoption walk
+            // re-typesets the same path, and the resume would only re-show
+            // the held galley (tex64-internal #94: 2.4-3.0 s edits waited
+            // for it).
+            const resumeOnlyFor = this.coldDirty.size > 0 && [...this.coldDirty].every((id) => id === bid);
+            const coldAhead = (this.coldDirty.size > 0 || this.pendingChain?.kind === 'cold') && !resumeOnlyFor;
+            const waiting = this.editPending > 0 || coldAhead ||
               !this.rescueFocus.has(bid) && Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800);
             if (!waiting) break;
             await new Promise((r) => setTimeout(r, 200));
