@@ -112,13 +112,14 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
       depth + 1,
       { ...context, file: full, rootUnit }
     );
+    const starts = lineStarts(text);
     return subs.map((s) => {
       const direct = !s.file;
       return {
         ...s,
         file: s.file ?? full,
-        sourceStart: s.sourceStart ?? (direct ? offsetPosition(text, s.start) : undefined),
-        sourceEnd: s.sourceEnd ?? (direct ? offsetPosition(text, s.end) : undefined),
+        sourceStart: s.sourceStart ?? (direct ? offsetPosition(text, starts, s.start) : undefined),
+        sourceEnd: s.sourceEnd ?? (direct ? offsetPosition(text, starts, s.end) : undefined),
         hash: fnv1a(`${full}|${s.hash}`),
       };
     });
@@ -138,17 +139,25 @@ function wrapIncludedBlocks(expanded, rel) {
   return blocks;
 }
 
-function offsetPosition(text, offset) {
+// Every keystroke re-expands every \input file; counting newlines from the
+// file's start for each block was quadratic per file (about 10 ms a
+// keystroke on the 316-page book, tex64-internal #85).
+function lineStarts(text) {
+  const starts = [0];
+  for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
+  return starts;
+}
+
+function offsetPosition(text, starts, offset) {
   const safe = Math.max(0, Math.min(text.length, Number(offset) || 0));
-  let line = 1;
-  let lineStart = 0;
-  for (let i = 0; i < safe; i++) {
-    if (text.charCodeAt(i) === 10) {
-      line++;
-      lineStart = i + 1;
-    }
+  let lo = 0;
+  let hi = starts.length;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (starts[mid] <= safe) lo = mid;
+    else hi = mid;
   }
-  return { line, column: safe - lineStart + 1 };
+  return { line: lo + 1, column: safe - starts[lo] + 1 };
 }
 
 // Files consumed by TeX without entering the source DOM still participate in
