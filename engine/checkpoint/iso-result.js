@@ -67,9 +67,19 @@ export async function readIsoCompileResult(
       // carries the entry strut (the block starts mid-page — crop below
       // it and let the pagebuilder place the partial box at the block's
       // offset), later pages span the full text height. No full flag —
-      // the preview stamps its normal page furniture.
-      const cut = k === 1 ? strut : 0;
-      const h = (geo.textheight ?? st.h) - cut;
+      // the preview stamps its normal page furniture. The strut sits under
+      // the \topskip glue of the empty \hbox that opens the iso page, so
+      // the block's material starts at strut + \topskip: cropping at the
+      // strut alone left that glue on top of the part, 10pt too tall to
+      // fit where the pagebuilder places it (tex64-internal #88).
+      // The part fills its page exactly at the compiled offset, which is
+      // the entry offset rounded to the 0.25bp quantum; placed at the real
+      // offset it can overshoot by up to half a quantum and be pushed to
+      // the next page whole. One quantum off its height (0.09mm of an open
+      // bottom edge) keeps it on the page it was split for.
+      const topskipW = typeof geo.topskip === 'object' ? geo.topskip?.w ?? 0 : geo.topskip ?? 0;
+      const cut = k === 1 && strut > 0.01 ? strut + topskipW : 0;
+      const h = (geo.textheight ?? st.h) - cut - (cut > 0 ? 0.25 : 0);
       chunks.push({ key, svg: cropSvgAt(svg, x0, y0 + cut, w, h), wBp: w, hBp: h,
         editPage: k, editX: x0, editY: y0 + cut });
       items.push({ k: 'box', h, d: 0, chunk: key, coff: 0 });

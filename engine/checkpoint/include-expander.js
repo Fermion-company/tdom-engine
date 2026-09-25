@@ -4,6 +4,7 @@ import { fnv1a } from '../hash.js';
 import { segmentBody } from '../segmenter.js';
 import { resolveProjectInput } from '../project-inputs.js';
 import { expandInputParagraphs } from './mapped-inputs.js';
+import { cacheIncludeRead, resourceContentSig } from './include-cache.js';
 
 export function expandIncludes(segs, depth, context) {
   if (depth > 3) return segs;
@@ -97,7 +98,7 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
     const text = !overlay && cached && cached.mtime === st.mtimeMs && cached.readPath === readPath
       ? cached.text
       : readFileSync(readPath, 'utf8');
-    context.includes.set(full, { mtime: st.mtimeMs, readPath, text });
+    cacheIncludeRead(context.includes, full, { mtime: st.mtimeMs, readPath, text });
     context.watchInclude(readPath);
     const subs = expandIncludes(
       expandInputParagraphs(segmentBody(text, 0, { literalEnvs: context.literalEnvs }), {
@@ -111,13 +112,14 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
       depth + 1,
       { ...context, file: full, rootUnit }
     );
+    const starts = lineStarts(text);
     return subs.map((s) => {
       const direct = !s.file;
       return {
         ...s,
         file: s.file ?? full,
-        sourceStart: s.sourceStart ?? (direct ? offsetPosition(text, s.start) : undefined),
-        sourceEnd: s.sourceEnd ?? (direct ? offsetPosition(text, s.end) : undefined),
+        sourceStart: s.sourceStart ?? (direct ? offsetPosition(text, starts, s.start) : undefined),
+        sourceEnd: s.sourceEnd ?? (direct ? offsetPosition(text, starts, s.end) : undefined),
         hash: fnv1a(`${full}|${s.hash}`),
       };
     });
@@ -137,23 +139,31 @@ function wrapIncludedBlocks(expanded, rel) {
   return blocks;
 }
 
-function offsetPosition(text, offset) {
+// Every keystroke re-expands every \input file; counting newlines from the
+// file's start for each block was quadratic per file (about 10 ms a
+// keystroke on the 316-page book, tex64-internal #85).
+function lineStarts(text) {
+  const starts = [0];
+  for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
+  return starts;
+}
+
+function offsetPosition(text, starts, offset) {
   const safe = Math.max(0, Math.min(text.length, Number(offset) || 0));
-  let line = 1;
-  let lineStart = 0;
-  for (let i = 0; i < safe; i++) {
-    if (text.charCodeAt(i) === 10) {
-      line++;
-      lineStart = i + 1;
-    }
+  let lo = 0;
+  let hi = starts.length;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (starts[mid] <= safe) lo = mid;
+    else hi = mid;
   }
-  return { line, column: safe - lineStart + 1 };
+  return { line: lo + 1, column: safe - starts[lo] + 1 };
 }
 
 // Files consumed by TeX without entering the source DOM still participate in
-// block identity. A replacement PNG/PDF/listing marks only its owning block
-// dirty; the watcher then calls engine.refresh(), preserving stale pixels
-// until the fresh exact chunk lands.
+// block identity, by content (a touch changes nothing). A replacement
+// PNG/PDF/listing marks only its owning block dirty; the watcher then calls
+// engine.refresh(), preserving stale pixels until the fresh exact chunk lands.
 function decorateExternalResources(seg, context) {
   const specs = [];
   const seenTex = new Set();
@@ -172,7 +182,7 @@ function decorateExternalResources(seg, context) {
       context.watchInclude(resolved.readPath);
       const contentSig = resolved.overlay
         ? fnv1a(readFileSync(resolved.readPath, 'utf8'))
-        : `${st.mtimeMs}:${st.size}`;
+        : resourceContentSig(context.resources, resolved.readPath, st);
       specs.push(`${resolved.actualPath}:${resolved.readPath}:${contentSig}`);
       return resolved;
     } catch {
@@ -245,16 +255,58 @@ function stripTexComments(text) {
     .join('\n');
 }
 
+// fs.watch follows the inode, not the path: after an editor or sync client
+// saves by renaming a new file over this one (vim, most atomic writers), the
+// old watch sits on an unlinked inode and never fires again. A `rename` event
+// or a new inode at the path re-arms it on whatever the path holds now. The
+// path can be missing mid-save, so the debounced delivery retries once; a
+// path still missing then leaves `watchers`, and the next expansion that
+// reads it watches it again. The map keeps one handle per path across
+// re-arms, and closing it closes the live watch.
 export function watchInclude(full, watchers, onExternalChange) {
   if (watchers.has(full)) return;
+  let timer = null;
+  let live = null;
+  let closed = false;
+  const handle = {
+    close() {
+      closed = true;
+      live?.close();
+    },
+  };
+  const arm = () => {
+    try {
+      const identity = fileIdentity(full);
+      const w = watch(full, (event) => {
+        if (w === live && (event === 'rename' || fileIdentity(full) !== identity)) {
+          w.close();
+          live = null;
+          arm();
+        }
+        clearTimeout(timer);
+        timer = setTimeout(deliver, 120);
+      });
+      live = w;
+    } catch {
+      /* watching is best-effort */
+    }
+  };
+  const deliver = () => {
+    if (!live && !closed) {
+      arm();
+      if (!live && watchers.get(full) === handle) watchers.delete(full);
+    }
+    onExternalChange?.(full);
+  };
+  arm();
+  if (live) watchers.set(full, handle);
+}
+
+function fileIdentity(file) {
   try {
-    let timer = null;
-    const w = watch(full, () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => onExternalChange?.(full), 120);
-    });
-    watchers.set(full, w);
+    const st = statSync(file);
+    return `${st.dev}:${st.ino}`;
   } catch {
-    /* watching is best-effort */
+    return null;
   }
 }

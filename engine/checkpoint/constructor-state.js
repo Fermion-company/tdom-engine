@@ -81,11 +81,13 @@ export function initializeEngineState(
   engine.bgTask = Promise.resolve();
   engine.onAsyncPatches = null; // callback(report-ish) for gfx swaps
   engine.onExternalChange = null; // callback when an \input file changes
+  engine.unchangedInputEvents = 0; // watcher events dropped: the bytes were already read
   engine.backendName = 'checkpoint';
   engine.diagnostics = [];
   engine.tocHash = null;
-  engine.includes = new Map(); // path -> {mtime, text}
-  engine.watchers = new Map(); // path -> FSWatcher
+  engine.includes = new Map(); // path -> {mtime, readPath, text, announcedText} (include-cache.js)
+  engine.resourceReads = new Map(); // read path -> {mtime, size, hash, announcedHash} (include-cache.js)
+  engine.watchers = new Map(); // path -> {close()} re-arming watch handle (include-expander.js)
   // Resident-fork budget. Every checkpoint is a live lualatex process
   // (~100-300MB unique RSS on package-heavy preambles), so N engines on a
   // big document multiply into real RAM: 64 forks × 2 audit engines ×
@@ -179,6 +181,27 @@ export function initializeEngineState(
   // rebuild, async rescue adoption)
   engine.chainLock = Promise.resolve();
   engine.rescueQueue = new Map(); // block.id -> cacheKey at queue time
+  engine.rescueFocus = new Set(); // queued rescues on the edited / caret page, served first
+  // compile time a boot walk may spend on first-ever rescues inline (#bootIsoCompile), and what is left of it
+  engine.bootRescueMs = Math.max(0, Number(process.env.TDOM_BOOT_RESCUE_MS ?? 45_000) || 0);
+  engine.bootRescueBudgetMs = 0;
+  engine.rescueAdoptWaiting = 0; // rescue adoptions queued on the chain lock (a grid pass yields to them)
+  engine.coldPreviewEnabled = process.env.TDOM_COLD_PREVIEW !== '0'; // docs/10 §10.4b
+  // start a preview when the replay estimate (sum of intrinsic block costs,
+  // about half the measured replay) exceeds this
+  engine.coldPreviewFromMs = Math.max(0, Number(process.env.TDOM_COLD_PREVIEW_FROM_MS ?? 500) || 0);
+  // a budget stop waits this long for a preview still typesetting
+  engine.coldPreviewWaitMs = Math.max(0, Number(process.env.TDOM_COLD_PREVIEW_WAIT_MS ?? 1000) || 0);
+  engine.coldPreviewTimeoutMs = 15_000;
+  // the first keystroke after a pause sends its preview's RENDER beside the JOB
+  engine.coldPreviewEarlyRender = process.env.TDOM_COLD_PREVIEW_EARLY_RENDER !== '0';
+  engine.updateSeq = 0; // one per #update that took the lock
+  engine.earlyRenderUpdate = null; // the update whose edited block sent its early RENDER (docs/10 §10.4c)
+  engine.editGapMs = null; // time since the edit before the current one
+  engine.coldPreviewSeq = 0;
+  engine.coldPreviewHolds = new Map(); // peer a preview forked -> Set of block ids, kept for their RENDER
+  engine.coldPreviewActive = null; // the current foreground walk's preview (cancelled if the walk throws)
+  engine.coldPreviews = 0; // cold keystrokes shown through a preview (/status)
   engine.rescuePumping = false;
   engine.isoChildren = new Set(); // in-flight isolated lualatex processes
 
@@ -238,6 +261,13 @@ export function initializeEngineState(
   engine.coldPrefixBudgetMs = Math.max(0, Number(process.env.TDOM_COLD_PREFIX_MS ?? 1500) || 0);
   engine.coldDirty = new Set(); // block ids whose galley predates their source text
   engine.coldWalking = false; // a cold chain pass is replaying with STEP right now
+  engine.bgWalkTarget = null; // block a caret warm, cold walk or grid walk is heading for
+  engine.keystrokePending = 0; // edits (not cold resumes) waiting for the chain lock
+  // a background walk retains (editHold) one boundary per this much replay
+  engine.walkRetainMs = Math.max(0, Number(process.env.TDOM_WALK_RETAIN_MS ?? 400) || 0);
+  engine.walkRetains = false; // the running caret warm or cold walk keeps boundaries
+  engine.walkRetainedAt = 0;
+  engine.walkRetainedIdx = null;
   engine.coldWalk = null; // telemetry of the last cold replay (from/target/walked/ms/perBlockMs)
   engine.coldTrace = null; // timestamps of the current cold keystroke's deferred path
   // Grid materialization (docs/03): the keep set is computed from measured

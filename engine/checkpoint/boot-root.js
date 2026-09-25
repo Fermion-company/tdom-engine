@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { writeFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { documentBounds } from '../segmenter.js';
+import { fnv1a } from '../hash.js';
 import { scanCounterDefs, texErrorFrom } from './util/tex.js';
 import { withProjectInputs } from '../project-inputs.js';
 
@@ -33,6 +34,10 @@ export async function bootRoot(
   const bounds = documentBounds(text);
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
   engine.counters = [...baseCounters, ...scanCounterDefs(preamble)];
+  // the declarations every checkpoint of this root holds (preamble-patch.js)
+  engine.bootPreamble = preamble;
+  engine.bootPreHash = fnv1a(preamble);
+  engine.defsPatch = null;
   // \pagestyle set in the preamble runs before the driver shims exist —
   // scan for it; otherwise book-family classes default to 'headings'
   const psMatch = preamble.match(/^[^%\n]*\\pagestyle\s*\{(\w+)\}/m);

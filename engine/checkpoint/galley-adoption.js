@@ -11,6 +11,10 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
     if (!reusedStaleGalley) galley.tdomPaintSourceHash = block.hash;
     identity.push(galley.tdomPaintSourceHash);
   }
+  // A cold preview (docs/10 §10.4b) paints graphics from another lineage's
+  // state (a \tcbset between its checkpoint and the block): the galley that
+  // replaces it must not keep those pixels. Glyph and math chunks carry on.
+  if (galley.gfx && galley.tdomColdPreview) identity.push('cold-preview');
   block.galleyHash = fnv1a(JSON.stringify(identity));
   if (galley.tdomIsoChunks) {
     // Isolated rescue bypasses buildJobBlockBody, which normally records

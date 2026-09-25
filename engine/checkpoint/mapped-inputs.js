@@ -3,6 +3,7 @@ import path from 'node:path';
 import { segmentBody } from '../segmenter.js';
 import { fnv1a } from '../hash.js';
 import { resolveProjectInput } from '../project-inputs.js';
+import { cacheIncludeRead } from './include-cache.js';
 
 // An input is token substitution, not a paragraph boundary. Segment the
 // substituted body and keep a source map for regions crossing file edges.
@@ -19,7 +20,6 @@ export function expandInputParagraphs(segs, context) {
     length += text.length;
   };
   const expand = (source, file, start, end, depth, structuralEvents = [], inheritedRootUnit = null) => {
-    const local = segmentBody(source.slice(start, end), start, { structuralEvents, literalEnvs: context.literalEnvs });
     let cursor = start;
     const literal = stop => {
       const base = length;
@@ -30,6 +30,15 @@ export function expandInputParagraphs(segs, context) {
       }
       cursor = stop;
     };
+    // Segmenting a file only finds its \input lines: a file without one (every
+    // chapter of the 316-page book) is taken literally. This runs for every
+    // file on every keystroke (tex64-internal #85).
+    const nested = source.indexOf('\\input', start);
+    if (depth >= 4 || nested < 0 || nested >= end) {
+      literal(end);
+      return;
+    }
+    const local = segmentBody(source.slice(start, end), start, { structuralEvents, literalEnvs: context.literalEnvs });
     for (let segmentIndex = 0; segmentIndex < local.length; segmentIndex++) {
       const seg = local[segmentIndex];
       const match = seg.text.match(/^\s*\\input\s*\{([^}]+)\}\s*$/);
@@ -44,8 +53,13 @@ export function expandInputParagraphs(segs, context) {
       let text;
       try {
         const stat = statSync(resolved.readPath);
-        text = readFileSync(resolved.readPath, 'utf8');
-        context.includes.set(resolved.actualPath, { mtime: stat.mtimeMs, readPath: resolved.readPath, text });
+        // unchanged since the last expansion: the bytes read then (same rule
+        // as include-expander's expandTextFile)
+        const cached = context.includes.get(resolved.actualPath);
+        text = !resolved.overlay && cached && cached.mtime === stat.mtimeMs && cached.readPath === resolved.readPath
+          ? cached.text
+          : readFileSync(resolved.readPath, 'utf8');
+        cacheIncludeRead(context.includes, resolved.actualPath, { mtime: stat.mtimeMs, readPath: resolved.readPath, text });
         context.watchInclude(resolved.readPath);
       } catch { continue; }
       const rootUnit = depth === 0 ? segmentIndex + 1 : inheritedRootUnit;

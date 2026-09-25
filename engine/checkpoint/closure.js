@@ -197,6 +197,22 @@ export function sourceClosure(text, { literalEnvs = null } = {}) {
       continue;
     }
 
+    // KKluaverb reads \KKverb|...| and \KKcodeS...\KKcodeE as literal text
+    // (a process_input_buffer rewrite; its default delimiters are | and |).
+    // The payload may span lines. A brace or a % inside it is data.
+    if (name === 'KKverb' || name === 'KKcodeS') {
+      const closer = name === 'KKverb' ? '|' : '\\KKcodeE';
+      if (name === 'KKverb' && text[end] !== '|') {
+        i = end;
+        continue;
+      }
+      const from = name === 'KKverb' ? end + 1 : end;
+      const close = text.indexOf(closer, from);
+      if (close < 0) return fail('verb-payload', i);
+      i = close + closer.length;
+      continue;
+    }
+
     if (name === 'verb') {
       let p = end;
       if (text[p] === '*') p++;

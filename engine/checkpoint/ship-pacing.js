@@ -63,7 +63,21 @@ export function residentPaintable(engine, pages, patches, projectInputChanges) {
     !(patch.displayList?.commands ?? []).some(paintBlocked));
 }
 
-export function flushDeferredShipUpdate(engine, run) {
+// While the canonical compile of the held revision runs, the catch-up waits
+// for it and looks again this often.
+const CANONICAL_WAIT_MS = 2000;
+// Only documents whose canonical compile takes this long: on a short one
+// the replay is the faster way to exact pages, and each run is small.
+const DEFAULT_YIELD_MIN_MS = 20_000;
+export const shipYieldMinMs = () => envMs('TDOM_SHIP_YIELD_MIN_MS', DEFAULT_YIELD_MIN_MS);
+
+/** A long canonical compile is running or queued (it covers the newest source). */
+function canonicalBusy(engine) {
+  const info = engine.canonical?.info?.();
+  return !!info?.inFlight && Number(info.ms) >= shipYieldMinMs();
+}
+
+export function flushDeferredShipUpdate(engine, run, { yieldToCanonical = false } = {}) {
   clearTimeout(engine.shipDeferTimer);
   engine.shipDeferTimer = null;
   const pending = engine.shipDeferred;
@@ -73,6 +87,19 @@ export function flushDeferredShipUpdate(engine, run) {
   // still the newest source; immediateShipUpdate supersedes it in the same
   // tick otherwise.
   if (!pending || pending.srcRev !== engine.srcRev) return false;
+  // tex64-internal #92: the catch-up only upgrades pages the viewer already
+  // painted, and the canonical compile of the same source will do that too.
+  // On a long document, replaying it beside that compile ran two
+  // complete-document TeX runs at once (1.4-2.0 GB each on the 316-page
+  // book, in half the samples of a busy ten-minute session; swap +1.35 GB,
+  // keystrokes shown after 1.2 s instead of 0.43 s). There the replay now
+  // follows the compile.
+  if (yieldToCanonical && canonicalBusy(engine)) {
+    engine.shipDeferred = pending;
+    engine.shipDeferTimer = setTimeout(() => flushDeferredShipUpdate(engine, run, { yieldToCanonical }), CANONICAL_WAIT_MS);
+    engine.shipDeferTimer.unref?.();
+    return false;
+  }
   run(pending.text, pending.projectInputChanges);
   return true;
 }
@@ -103,7 +130,7 @@ export function deferShipUpdate(engine, text, projectInputChanges, run) {
   }
   engine.shipDeferred = { text, projectInputChanges, srcRev: engine.srcRev };
   clearTimeout(engine.shipDeferTimer);
-  engine.shipDeferTimer = setTimeout(() => flushDeferredShipUpdate(engine, run), shipCatchupMs());
+  engine.shipDeferTimer = setTimeout(() => flushDeferredShipUpdate(engine, run, { yieldToCanonical: true }), shipCatchupMs());
   engine.shipDeferTimer.unref?.();
 }
 

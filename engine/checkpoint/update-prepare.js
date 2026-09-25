@@ -6,6 +6,8 @@ import { firstDirtyIndex, nextEditHold, editPageRenderIds } from './update-helpe
 import { checkpointBudgetFor } from './checkpoint-selection.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { sourceClosure } from './closure.js';
+import { planPreamblePatch } from './preamble-patch.js';
+import { projectPackageText } from './rescue-classifier.js';
 
 export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, callbacks }) {
   const { opaqueUpdate, deferClosureUpdate, bootRoot, scheduleStructuredReprobe, expandIncludes, unindexBlock } = callbacks;
@@ -187,7 +189,50 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   }
 
   let rebooted = false;
-  if (preHash !== engine.preHash) {
+  // A preamble edit that only changes the body of a macro or environment
+  // the document declares re-runs that declaration in front of the jobs
+  // that use it, instead of rebooting the root (tex64-internal #93).
+  let patch = null;
+  if (preHash !== engine.preHash && engine.preHash != null && engine.root &&
+      engine.bootPreamble != null && engine.lastPreamble != null && process.env.TDOM_PREAMBLE_PATCH !== '0') {
+    patch = planPreamblePatch({
+      bootPreamble: engine.bootPreamble,
+      prevPreamble: engine.lastPreamble,
+      preamble,
+      blockTexts: engine.blocks.map((b) => b.text),
+      packageText: projectPackageText(preamble, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
+    });
+    if (!patch.ok) {
+      engine.diagnostics.push(`preamble patch refused: ${patch.reason}`);
+      patch = null;
+    }
+  }
+  if (patch) {
+    engine.preHash = preHash;
+    engine.defsPatch = patch.prelude ? patch : null;
+    // A changed heading or caption also changes the lists that print it.
+    const LIST_SOURCE_RE = /\\(?:part|chapter|(?:sub)*section|paragraph|caption)\*?\s*[[{]/;
+    const LIST_RE = /\\(?:tableofcontents|listoffigures|listoftables)(?![A-Za-z])/;
+    let lists = false;
+    let dirty = 0;
+    for (const b of engine.blocks) {
+      if (!patch.dirtyRe?.test(b.text)) continue;
+      if (LIST_SOURCE_RE.test(b.text)) lists = true;
+      dirtySource.add(b.id);
+      b.units = null;
+      dirty++;
+    }
+    if (lists) {
+      for (const b of engine.blocks) {
+        if (LIST_RE.test(b.text) && !dirtySource.has(b.id)) {
+          dirtySource.add(b.id);
+          dirty++;
+        }
+      }
+    }
+    engine.preamblePatches = (engine.preamblePatches ?? 0) + 1;
+    engine.lastPreamblePatch = { names: patch.names, dirty, at: Date.now() };
+  } else if (preHash !== engine.preHash) {
     if (process.env.TDOM_DEBUG_BOOT) {
       console.error(
         `[tdom-debug] preHash mismatch: have=${engine.preHash} want=${preHash} ` +
@@ -223,6 +268,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
       b.units = null;
     }
   }
+  engine.lastPreamble = preamble;
   timer.lap('boot');
 
   const firstDirty = firstDirtyIndex(oldBlocks, engine.blocks, dirtySource, diff);
@@ -234,18 +280,28 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   // boundaries INSIDE the window die. Whether the suffix may be TRUSTED
   // is decided after the foreground walk (verdict): definition edits and
   // untracked-state leaks still kill and rebuild it, off the hot path.
-  ({
-    checkpoints: engine.checkpoints,
-    renderHold: engine.renderHold,
-    editHold: engine.editHold,
-  } = preserveCheckpointSuffix({
+  const preserved = preserveCheckpointSuffix({
     checkpoints: engine.checkpoints,
     renderHold: engine.renderHold,
     editHold: engine.editHold,
     pendingChain: engine.pendingChain,
     bounds: diff.bounds,
     dyingPids: engine.dyingPids,
-  }));
+  });
+  engine.checkpoints = preserved.checkpoints;
+  engine.renderHold = preserved.renderHold;
+  engine.editHold = preserved.editHold;
+  // /status diff: how many changed regions a source snapshot had and what
+  // that cost in checkpoints (tex64-internal #96)
+  if (diff.bounds.regions > 1 || preserved.died) {
+    const stats = engine.diffStats ??= { updates: 0, multiRegion: 0, maxRegions: 0, kept: 0, died: 0, last: null };
+    stats.updates++;
+    if (diff.bounds.regions > 1) stats.multiRegion++;
+    stats.maxRegions = Math.max(stats.maxRegions, diff.bounds.regions);
+    stats.kept += preserved.kept;
+    stats.died += preserved.died;
+    stats.last = { regions: diff.bounds.regions, kept: preserved.kept, died: preserved.died, at: Date.now() };
+  }
 
   // Pin before the walk can retire a newly materialized input or capture
   // owner. Finalization cannot recover a checkpoint that has already died.

@@ -12,7 +12,7 @@ export function plainPreviewWitness(block) {
       block.closure?.native !== true || block.closure?.closed !== true ||
       block.nativeClosureRequired !== true || block.fidelity?.level !== SAFE_GLYPH ||
       block.needsRender || block.gfx || block.rescued || g.gfx ||
-      g.tdomFrozen || g.tdomStale || g.tdomDeferred || g.tdomPendingPaint || g.tdomIsoChunks ||
+      g.tdomFrozen || g.tdomStale || g.tdomDeferred || g.tdomPendingPaint || g.tdomIsoChunks || g.tdomColdPreview ||
       !Array.isArray(g.items) || !g.state || typeof block.stateVec !== 'string' ||
       ![g.floats, g.events, g.labels, g.refs, g.toclines].every(empty)) return null;
   const layout = [];

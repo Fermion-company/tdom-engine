@@ -203,6 +203,9 @@ export function captureCanonicalAnchorBase({ blocks, domBlocks, edit, certificat
   const block = candidates[0];
   const dom = domBlocks.find((item) => item.id === block?.id);
   if (!block || !dom) return reject('base-block');
+  // a cold preview's lines and the exit state kept beside it describe two
+  // different typesets (docs/10 §10.4b)
+  if (block.galley?.tdomColdPreview) return reject('base-cold-preview');
   const plain = !hasGalleySideEffects(block.galley) && block.fidelity?.level === SAFE_GLYPH;
   if (editFile && (typeof dom.source?.file !== 'string' || path.resolve(dom.source.file) !== editFile)) return reject('base-dom-file');
   const plainWitnesses = plain ? galleyLineWitnesses(block.galley) : null;

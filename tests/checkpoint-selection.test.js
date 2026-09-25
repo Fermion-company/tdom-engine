@@ -13,6 +13,7 @@ import {
   sharedCheckpointBudget,
 } from '../engine/checkpoint/checkpoint-retirement.js';
 import { ShippingChain } from '../engine/checkpoint/shipping.js';
+import { editElsewhereThanWalk, walkKillPaysOff } from '../engine/checkpoint/walk-preemption.js';
 
 test('measured-cost checkpoint selection brackets unknown expensive blocks', () => {
   const blocks = Array.from({ length: 51 }, () => ({ typesetCostMs: 2 }));
@@ -361,3 +362,53 @@ test('the grid pass only chases boundaries whose nearest resident replay is a re
   // a boundary far from any resident one is missing; root and the end never are
   assert.deepEqual(gridMissingBoundaries(blocks, new Set([0, 30, 90, 120]), held([0, 90]), 4), [30]);
 });
+
+test('an edit pre-empts a background walk mid-block only when it changes other files', () => {
+  const root = '/doc/main.tex';
+  const ch1 = '/doc/content/ch01.tex';
+  const ch2 = '/doc/content/ch02.tex';
+  const blocks = [{ file: null }, { file: ch1 }, { file: ch1 }, { file: ch2 }];
+  const at = (target, args) => editElsewhereThanWalk({ blocks, target, rootFile: root, ...args });
+  // another chapter's overlay: the walk toward ch01 does nothing for it
+  assert.equal(at(2, { projectInputChanges: { changed: [ch2], removed: [] } }), true);
+  // the chapter the walk is heading for (continued typing there) waits for the boundary
+  assert.equal(at(2, { projectInputChanges: { changed: [ch1], removed: [] } }), false);
+  assert.equal(at(2, { projectInputChanges: { changed: [ch2, '/doc/content/../content/ch01.tex'], removed: [] } }), false);
+  assert.equal(at(2, { projectInputChanges: { changed: [], removed: [ch1] } }), false);
+  // a root edit is the root file's: far from a chapter, near a root block
+  assert.equal(at(3, { editContext: { file: root } }), true);
+  assert.equal(at(0, { editContext: { file: root } }), false);
+  // unknown inputs, no walk, or nothing named: keep the boundary stop
+  assert.equal(at(2, { projectInputChanges: { changed: [], removed: [], unknown: true } }), false);
+  assert.equal(at(null, { projectInputChanges: { changed: [ch2], removed: [] } }), false);
+  assert.equal(at(9, { projectInputChanges: { changed: [ch2], removed: [] } }), false);
+  assert.equal(at(2, {}), false);
+});
+
+test('a walk step is killed for an edit only when its remaining time outweighs the replay lost', () => {
+  // intrinsic costs; the replay runs at about twice that
+  const blocks = [{ typesetCostMs: 10 }, { typesetCostMs: 10 }, { typesetCostMs: 400 }, { typesetCostMs: 50 }, {}];
+  // a heavy step just started right after the walk's retained boundary: kill
+  assert.equal(walkKillPaysOff({ blocks, jobIdx: 2, jobElapsedMs: 100, retainedIdx: 2 }), true);
+  assert.equal(walkKillPaysOff({ blocks, jobIdx: 2, jobElapsedMs: 100, retainedIdx: 0 }), true);
+  // a step that just left a retained boundary is cheap to redo, whatever
+  // its (unknowable for a caret warm) remaining time
+  assert.equal(walkKillPaysOff({ blocks, jobIdx: 3, jobElapsedMs: 10, retainedIdx: 3 }), true);
+  assert.equal(walkKillPaysOff({ blocks, jobIdx: 4, jobElapsedMs: 10, retainedIdx: 4 }), true);
+  // nearly done after a while, or a light block after a replay: wait for its boundary
+  assert.equal(walkKillPaysOff({ blocks, jobIdx: 2, jobElapsedMs: 700, retainedIdx: 2 }), false);
+  assert.equal(walkKillPaysOff({ blocks, jobIdx: 3, jobElapsedMs: 10, retainedIdx: 1 }), false);
+  // a long replay since the last retained boundary (a warm that ran through
+  // a pause) outweighs the step: keep it
+  const long = [...Array.from({ length: 20 }, () => ({ typesetCostMs: 100 })), { typesetCostMs: 400 }];
+  assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 50, retainedIdx: 0 }), false);
+  assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 50, retainedIdx: 19 }), true);
+  // a caret warm's step that already ran long: kill, whatever the replay behind it
+  assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 400, retainedIdx: 0, warm: true }), true);
+  assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 400, retainedIdx: 0 }), false);
+  assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 50, retainedIdx: 0, warm: true }), false);
+  // an unknown cost after a replay, or no job: never
+  assert.equal(walkKillPaysOff({ blocks, jobIdx: 4, jobElapsedMs: 10, retainedIdx: 2 }), false);
+  assert.equal(walkKillPaysOff({ blocks, jobIdx: -1, jobElapsedMs: 10, retainedIdx: 0 }), false);
+});
+

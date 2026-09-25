@@ -26,6 +26,8 @@ canonical scheduling は latest-wins である。compile 中に新しい source 
 
 structured mode では `pressure = 'authority'` で、基本 debounce に加えて前回 compile time に比例した cooldown を持つ。opaque mode では `pressure = 'display'` になり、canonical compile 自体が表示更新なので debounce 中心で動く。
 
+最初の baseline は resident の boot walk を待たない。`engine.open()` は walk の前に、open が公開する revision（`srcRev + 1`）でその source を予約する。canonical は resident tree を使わないので、walk と並んで走る（316 ページの実文書では walk 76 s と 3 pass の baseline 125 s が直列で、どちらも終わるまで打鍵を anchor できなかった）。walk の最後の `schedule()` は同じ revision・同じ bytes なので、走行中ならそのまま、着地済みなら `#reconcile` で終わり、2 本目の compile も待機中の debounce のやり直しも作らない（同じ bytes で失敗済みの revision も組み直さない）。walk より先に着地した世代は、その `#reconcile` が arrival hook（検証・crop・checkpoint 予算）を現行 revision で呼び直す。Build lease 中の `schedule()` はこの省略をせず、Build 取り込みが所有する pending job を必ず作る。Build を取り込む open では先行させない（`TDOM_CANON_EARLY_BASELINE=0` で従来どおり walk の後に予約）。初回の open では並走する 3 pass の compile の分だけ walk が遅くなる（316 ページの実文書で `/open` 88 s → 117 s）が、アプリの viewer は開いた直後、現在の revision の canonical が着地するまで live 面に切り替えない（web/app.js は開いた時点の全ページを一つの取引として段取りし、枠の exact chunk が揃わないページがある限り確定しない）ので、表示までの時間は `/open` と最初の canonical の遅い方で決まり、先行させた方が短い（最初の canonical は開始から 216 s → 153 s）。開き直しでは §8.2b' の aux で 1 pass になり、`/open` はほぼ変わらず（69 s → 70 s）、canonical は `/open` の完了時点で着地済みになる（109 s → 70 s）。open が例外で終わった場合は予約した revision を消費済みにし、後の編集が同じ revision 番号で別の source を公開しないようにする。
+
 `GET /pdf` は `engine.exportPDF()` 経由で `canonical.ensure()` を呼ぶ。表示用 checkpoint state から PDF を作る経路はない。
 
 ### 8.2a content identity（世代の再束縛）
@@ -34,7 +36,7 @@ generation の同一性は「root source のバイト列」と「compile が読�
 root は `srcHash` が、input は `inputManifest`（logical path → sha256、`-recorder` の `canon.fls` から採取。
 Build 取り込みでは `.fls` 検証済みの records から受け取る）が担う。
 
-`inputEpoch` は子ファイル編集・外部変更・bibliography 更新のたびに単調増加するが、その epoch ごとに
+`inputEpoch` は子ファイル編集・外部変更（バイト列が変わった通知だけ。docs/13 §13.4）・bibliography 更新のたびに単調増加するが、その epoch ごとに
 「どの logical path を無効化したか」を `inputInvalidations` に記録する。ある generation について、
 
 1. root が `srcHash` と一致し、
@@ -55,6 +57,23 @@ Build 直後に別章を編集して元に戻す往復はこれで recompile を
 通常 Build を取り込む `commitBuildGeneration` は、検証済みの aux/toc/lof/lot/out を canonical の作業
 ディレクトリへ `canon.*` として配置し、Build に無い拡張子の古いファイルは消す。Build 後の最初の canonical
 compile は Build が収束させた aux 群から始まるので、本文編集なら 1 pass で fixpoint に達する。
+
+### 8.2b' 開き直したプロジェクトの aux
+
+最後に昇格した compile の aux 系（aux・toc・lof・lot・out）は、プロジェクト（`docDir` と main ファイル）ごとに
+canonical 作業ディレクトリの `aux-seeds/<key>.json` へ、その compile の preamble のハッシュと一緒に保存する。
+アプリの作業ディレクトリは起動をまたいで残るので、次に同じプロジェクトを開いたときは `engine.open()` が最初の
+compile の前に `restoreProjectSeeds()` でそれを `canon.*` として置き、最初の baseline は多くの場合 1 pass で
+fixpoint に達する（316 ページの実文書で 3 pass → 1 pass）。種は pass を省くだけで、compile は aux 系が
+変わらなくなるまで回り続ける（latexmk が既存の aux から始めるのと同じ）。
+
+aux にはパッケージ自身が命令を書く（biblatex の `\abx@aux@…` など）ので、別の preamble の aux は
+`-halt-on-error` の下で compile を止め得る。置くのは preamble が保存時と同じときだけで、それでも種ありの
+compile が失敗したら保存分を捨てて種なしで 1 回だけ compile し直す。`\include` は子ごとの aux を書き、
+pass ループの fixpoint 判定は `canon.*` しか見ないので、子 aux を書いた compile の種は保存しない
+（古い子 aux を読んだまま 1 pass で止まり得る）。Build を取り込む open は Build 自身の種を使い、
+参考文献や preamble 入力の変更による内部の開き直しは従来どおり空の aux から始める。
+`TDOM_CANON_PROJECT_SEEDS=0` で無効、保存は 64 プロジェクトまで（mtime の古い順に削除）。
 
 ### 8.2c Build lease と resident bootstrap
 
@@ -98,6 +117,10 @@ compile は Build が収束させた aux 群から始まるので、本文編集
 `engine-v3.js` の `OUTPUT_HIJACK_RE` に一致する block は、文書全体を opaque にせず exact block として扱われる。現在の対象は、`multicols`、`paracol`、`longtable`、`landscape`、`mdframed`、`framed`、`shaded`、breakable `tcolorbox`、`\includepdf` である。
 
 rescue block は stale-first で表示される。前回の galley/chunk があればそれを保持し、isolated exact compile は async queue で進む。
+
+前回の galley が無い初回 rescue は、測った箱を持たない placeholder になる。placeholder は後続のページ割りを動かし得るので、一つでも残っていれば組んだ全ページが表示不可（`pendingExact`）になる（`pagebuilder.js` `buildPages`）。そのため boot（reboot を含む）の walk は、fork runner（checkpoint 0 と real-output root）が生きている間、初回 rescue をその場で compile して採用する（`#bootIsoCompile`、compile 時間の合計で `TDOM_BOOT_RESCUE_MS` 既定 45 s まで。超えた分と fork が無い場合（cold compile は 1 件 5 s を超える）は従来どおり placeholder と async queue）。316 ページの実文書では multicols 31 個が fork-real で 1 件 約 1 s、`/open` が 70 s 台から 90 s 台に延びる代わりに、/open の時点で常駐側が 316 ページ・queue 0 になる（従来は placeholder が全ページを約 4 分塞ぎ、開いた直後の打鍵は最初の canonical まで表示されなかった）。boot walk は pagination 前（page offset 0）に compile するので、実際の offset が違う block はディスクキャッシュから採用した結果と同じく moved-offset pass が再 rescue する。
+
+async queue は文書順に進むが、編集した block と caret の block（`/warm`）を含むページにある queue 中の rescue（そのページの `pendingExact` と block）を `rescueFocus` として先に取り、打鍵後の静寂待ち（800 ms）も省く（compile は lock の外、採用の walk は打鍵に block 境界で譲るのは同じ）。採用が chain lock を待っている間は grid 充填 pass が次の block 境界で譲る（docs/03）。
 
 isolated compile の結果はプロセスを跨いで保持する（`iso-disk-cache.js`、`<workDir>/isocache/<epoch>/<key>.json`（`iso-` 始まりの名前は server 起動時の stale artifact sweep に消されるので使わない） + chunk の PDF）。rescue key は compile が依存する入力（block text・入口 state・preamble・参照 label の値・page offset）をすべて含むので、同じ入力なら後のエンジンが結果を再利用できる。再オープン時は boot walk がその block を inline で adopt し（`rescueBlock` の cache hit 経路 = state job 1 本）、cold compile の drain を待たずに resident のページ数が canonical と揃う（316 ページの実文書では multicols 31 block × cold 5.4 s + adopt walk ≈ 5 分が消える）。boot walk は pagination 前に key を作る（page offset 0、galley なし）ので、実 offset で保存した結果は見つからない。そのため各結果に offset を含まない base link（text・入口 state・preamble）も置き、galley のない初回 rescue は base の結果を（参照 label の値が当時と同じなら）その場で adopt する。着地した offset が `compiledOff` と違えば moved-offset pass が通常どおり再 rescue する。key（full・base とも）には直前 block の trailing glue（幅・stretch/shrink とその order。iso compile が `\addvspace` の合流のために再現する入力で、state vector には幅しか無い）も含める。base 採用時は cache の `refVals` を現在の label 値と照合し（未定義の forward ref は後の label pass が key を変えて再 rescue する）、名前空間 `epoch` は daemon.lua / shipd.lua と iso 関連 JS（context・render source・runner・compile・result・rescue-block・rescue-cache・disk-cache）のハッシュ・engine version・`lualatex --version` を含み、toolchain や cache の意味論の更新後は古い結果を使わない。`TDOM_ISO_DISK_CACHE=0` で無効、既定の上限は 512 entry（mtime の古い順に削除）。
 

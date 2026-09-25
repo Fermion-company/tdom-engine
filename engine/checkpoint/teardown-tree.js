@@ -13,6 +13,8 @@ export function teardownResidentTree(engine) {
   engine.rescueQueue.clear();
   engine.renderWant.clear();
   engine.renderHold.clear();
+  engine.coldPreviewHolds?.clear();
+  engine.coldDirty?.clear();
   engine.pendingChain = null;
   engine.editHold = [];
   clearTimeout(engine.shipBootTimer);

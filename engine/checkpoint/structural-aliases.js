@@ -212,46 +212,46 @@ const LITERAL_ENVS = [
 ].join('|');
 const LITERAL_RE = new RegExp(`\\\\begin\\{(${LITERAL_ENVS})\\}[\\s\\S]*?\\\\end\\{\\1\\}`, 'g');
 
-function blankRange(chars, start, end) {
-  for (let i = start; i < end; i++) {
-    if (chars[i] !== '\n' && chars[i] !== '\r') chars[i] = ' ';
-  }
-}
-
-/** Mask comments and literal payloads without changing source offsets. */
+/** Mask comments and literal payloads without changing source offsets.
+ * Runs over the whole expanded body on every keystroke: blanked positions
+ * are marked in a byte mask and the result is built from slices, instead
+ * of splitting the body into one string per character (half of the 40 ms
+ * segment phase on the 316-page book, tex64-internal #85). */
 function maskIgnored(source) {
   source = String(source ?? '');
-  const chars = source.split('');
-  const text = chars.join('');
-  for (const match of text.matchAll(LITERAL_RE)) blankRange(chars, match.index, match.index + match[0].length);
+  const blank = new Uint8Array(source.length);
+  const mark = (start, end) => blank.fill(1, start, end);
+  const at = (i) => (blank[i] && source[i] !== '\n' && source[i] !== '\r' ? ' ' : source[i]);
+  for (const match of source.matchAll(LITERAL_RE)) mark(match.index, match.index + match[0].length);
 
-  for (let i = 0; i < chars.length; ) {
-    if (chars[i] === ' ') {
+  for (let i = 0; i < source.length; ) {
+    const c = at(i);
+    if (c === ' ') {
       i++;
       continue;
     }
-    if (chars[i] === '%') {
+    if (c === '%') {
       let slashes = 0;
-      for (let p = i - 1; p >= 0 && chars[p] === '\\'; p--) slashes++;
+      for (let p = i - 1; p >= 0 && at(p) === '\\'; p--) slashes++;
       if (slashes % 2 === 0) {
         let end = i;
-        while (end < chars.length && chars[end] !== '\n') end++;
-        blankRange(chars, i, end);
+        while (end < source.length && at(end) !== '\n') end++;
+        mark(i, end);
         i = end;
         continue;
       }
     }
-    if (chars[i] === '\\') {
+    if (c === '\\') {
       const control = readControl(source, i);
       if (control?.name === 'verb') {
-        let at = control.end;
-        if (chars[at] === '*') at++;
-        const delim = chars[at];
+        let pos = control.end;
+        if (at(pos) === '*') pos++;
+        const delim = at(pos);
         if (delim && !/[A-Za-z\s]/.test(delim)) {
-          let end = at + 1;
-          while (end < chars.length && chars[end] !== delim && chars[end] !== '\n') end++;
-          if (chars[end] === delim) end++;
-          blankRange(chars, i, end);
+          let end = pos + 1;
+          while (end < source.length && at(end) !== delim && at(end) !== '\n') end++;
+          if (at(end) === delim) end++;
+          mark(i, end);
           i = end;
           continue;
         }
@@ -259,7 +259,23 @@ function maskIgnored(source) {
     }
     i++;
   }
-  return chars.join('');
+  return applyBlank(source, blank);
+}
+
+// `source` with every marked position except line ends turned into a space.
+function applyBlank(source, blank) {
+  const parts = [];
+  let from = 0;
+  for (let i = blank.indexOf(1); i >= 0 && i < source.length; ) {
+    let end = i;
+    while (end < source.length && blank[end]) end++;
+    parts.push(source.slice(from, i), source.slice(i, end).replace(/[^\n\r]/g, ' '));
+    from = end;
+    i = blank.indexOf(1, end);
+  }
+  if (!parts.length) return source;
+  parts.push(source.slice(from));
+  return parts.join('');
 }
 
 function skipSpace(source, at) {
@@ -940,9 +956,10 @@ function unresolvedDefinitionCommands(key, defs, memo = new Map(), active = new 
 }
 
 function maskSpans(source, spans) {
-  const chars = source.split('');
-  for (const [start, end] of spans) blankRange(chars, start, end);
-  return chars.join('');
+  if (!spans.length) return source;
+  const blank = new Uint8Array(source.length);
+  for (const [start, end] of spans) blank.fill(1, Math.max(0, start), Math.min(source.length, end));
+  return applyBlank(source, blank);
 }
 
 function usedStructuralAliases(bodyInfo, defs) {

@@ -8,15 +8,19 @@ export async function drain(eng, timeoutMs = 180_000) {
     await (eng.hfTask ?? Promise.resolve())?.catch?.(() => {});
     // rescuePumping: the pump dequeues BEFORE awaiting the compile, so an
     // in-flight async rescue is invisible to rescueQueue.size alone
+    // coldDirty: a budgeted keystroke's block waits for its cold resume
+    // (docs/10 §10.4a), which runs after the chain pass hands it back
     const busy =
-      eng.pendingChain || eng.bgActive || eng.rescuePumping || (eng.rescueQueue?.size ?? 0) > 0;
+      eng.pendingChain || eng.bgActive || eng.rescuePumping || (eng.rescueQueue?.size ?? 0) > 0 ||
+      (eng.coldDirty?.size ?? 0) > 0;
     if (!busy) {
       await new Promise((r) => setTimeout(r, 400));
       if (
         !eng.pendingChain &&
         !eng.bgActive &&
         !eng.rescuePumping &&
-        (eng.rescueQueue?.size ?? 0) === 0
+        (eng.rescueQueue?.size ?? 0) === 0 &&
+        (eng.coldDirty?.size ?? 0) === 0
       )
         return;
     } else {

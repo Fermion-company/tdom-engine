@@ -56,8 +56,26 @@ let inFlight = false;
 const history = [];
 const pageDivs = new Map();
 const provisionalStages = new Map(); // latest unpublished display list per page
+// blocks each page shows now (its last committed display list): material
+// moving between two staged pages is found through the page it leaves
+const committedPageSrcs = new Map(); // page -> Set of block ids
+// pages of one edit: a report's pages that paint, or painted, a block the
+// edit changed, added or removed (a paragraph split or merged across an
+// unchanged float page keeps its halves in one transaction)
+const pageEditGroup = new Map(); // page -> report sequence
+let editGroupSeq = 0;
+// Stage timings for measurement drivers: recorded only after one sets
+// window.__tdomStageTrace = [] (epoch ms, comparable with the engine's).
+function traceStage(ev, page, extra = {}) {
+  const trace = globalThis.__tdomStageTrace;
+  if (Array.isArray(trace) && trace.length < 20000) trace.push({ ev, page, srcRev: appliedSrcRev, at: Date.now(), ...extra });
+}
 const provisionalRemovedPages = new Set();
 const provisionalDisplayLists = new Map(); // complete resident page layout, including unchanged pages
+// Resident pages held by a zero-layout placeholder (a page-wide pending-exact:
+// a block whose galley has not arrived). While any exist the resident page
+// count is not settled. A line-level pending-exact only waits for ink.
+const provisionalPendingLayout = new Set();
 let residentPageCountAuthoritative = false;
 let committedCanonicalGeneration = null;
 let lastEngineStatus = null;
@@ -565,8 +583,11 @@ function beginClientDocumentReset(epoch) {
   deferredDirectPresentationEvents.length = 0;
   deferredDirectPresentationCommits.clear();
   provisionalStages.clear();
+  committedPageSrcs.clear();
+  pageEditGroup.clear();
   provisionalRemovedPages.clear();
   provisionalDisplayLists.clear();
+  provisionalPendingLayout.clear();
   residentPageCountAuthoritative = false;
   bootComplete = false;
   directEditClickEpoch++;
@@ -603,8 +624,11 @@ function adoptDoc(doc) {
   pagesEl.textContent = '';
   pageDivs.clear();
   provisionalStages.clear();
+  committedPageSrcs.clear();
+  pageEditGroup.clear();
   provisionalRemovedPages.clear();
   provisionalDisplayLists.clear();
+  provisionalPendingLayout.clear();
   committedCanonicalGeneration = null;
   pageDirtyRev.clear();
   clearCanonicalAnchorPreview();
@@ -666,21 +690,96 @@ function residentPageTransactionValid(pageCount, residentPages, stagePages, remo
     [...removedPages].every(page => Number.isSafeInteger(page) && page > pageCount);
 }
 
+function displayListSrcs(dl) {
+  const srcs = new Set();
+  for (const cmd of dl?.commands ?? []) {
+    if (cmd.src && !String(cmd.src).startsWith('_')) srcs.add(cmd.src); // '_…' is page furniture
+  }
+  return srcs;
+}
+
+/** Staged pages that must change together (docs/04 §4.5): consecutive
+ * pages (material reflows across the page break), pages that paint or
+ * painted the same block (a paragraph moving across an unchanged float
+ * page), and the pages of one edit (a split or merge renames blocks).
+ * Consecutive pages are tied only while one of them shows a paper, and a
+ * blank page whose stage is not ready joins nothing: it stays blank, and
+ * next to a blank shell no reflow can duplicate or drop a line. On a
+ * document's first presentation every page is blank, and tying them made
+ * the whole document one group (tex64-internal #83). */
+function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () => true, ready = () => true) {
+  const root = new Map(stages.map(stage => [stage.dl.page, stage.dl.page]));
+  const find = page => {
+    while (root.get(page) !== page) page = root.get(page);
+    return page;
+  };
+  const join = (a, b) => root.set(find(a), find(b));
+  const pageOfSrc = new Map();
+  const pageOfEdit = new Map();
+  const note = (map, key, page) => {
+    if (map.has(key)) join(page, map.get(key));
+    else map.set(key, page);
+  };
+  const staged = new Map(stages.map(stage => [stage.dl.page, stage]));
+  const waiting = stage => !painted(stage.dl.page) && !ready(stage);
+  for (const stage of stages) {
+    const page = stage.dl.page;
+    if (waiting(stage)) continue;
+    if (root.has(page - 1) && !waiting(staged.get(page - 1)) && (painted(page) || painted(page - 1))) join(page, page - 1);
+    stage.srcs ??= displayListSrcs(stage.dl);
+    for (const src of stage.srcs) note(pageOfSrc, src, page);
+    for (const src of committedSrcs.get(page) ?? []) note(pageOfSrc, src, page);
+    const edit = editGroup.get(page);
+    if (edit !== undefined) note(pageOfEdit, edit, page);
+  }
+  const groups = new Map();
+  for (const stage of stages) {
+    const group = find(stage.dl.page);
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(stage);
+  }
+  return [...groups.values()];
+}
+
+function pagePainted(page) {
+  const div = pageDivs.get(page);
+  return Boolean(div) && (div.dataset.prov === '1' || div.dataset.canonPresentedRev !== undefined);
+}
+
 function srcOf(target) {
   const src = target?.dataset?.src ?? target?.closest?.('[data-src]')?.dataset?.src;
   if (!src || src.startsWith('_')) return null;
   return src;
 }
 
-function stageProvisionalPatches(patches, flash, pageCount = null) {
+function stageProvisionalPatches(patches, flash, pageCount = null, editIds = null) {
+  if (editIds?.size) {
+    const group = ++editGroupSeq;
+    for (const patch of patches) {
+      if (patch.type !== 'replace-page') continue;
+      const page = patch.displayList.page;
+      const shown = committedPageSrcs.get(page) ?? new Set();
+      if ([...displayListSrcs(patch.displayList)].some(id => editIds.has(id)) || [...shown].some(id => editIds.has(id))) {
+        pageEditGroup.set(page, group);
+      }
+    }
+  }
+  const delivered = patches.filter(patch => patch.type === 'replace-page').map(patch => patch.displayList.page);
+  if (delivered.length) traceStage('deliver', null, { pages: delivered });
   for (const patch of patches) {
-    if (patch.type === 'replace-page') provisionalDisplayLists.set(patch.displayList.page, patch.displayList);
-    else if (patch.type === 'remove-pages') {
+    if (patch.type === 'replace-page') {
+      const dl = patch.displayList;
+      provisionalDisplayLists.set(dl.page, dl);
+      if (dl.commands?.some(cmd => cmd.op === 'pending-exact' && cmd.wholePage)) provisionalPendingLayout.add(dl.page);
+      else provisionalPendingLayout.delete(dl.page);
+    } else if (patch.type === 'remove-pages') {
       for (const n of provisionalDisplayLists.keys()) if (n >= patch.from) provisionalDisplayLists.delete(n);
+      for (const n of provisionalPendingLayout) if (n >= patch.from) provisionalPendingLayout.delete(n);
     }
   }
   if (Number.isInteger(pageCount) && pageCount >= 0) {
     for (const n of provisionalDisplayLists.keys()) if (n > pageCount) provisionalDisplayLists.delete(n);
+    for (const n of provisionalPendingLayout) if (n > pageCount) provisionalPendingLayout.delete(n);
     if ([...pageDivs.keys(), ...provisionalStages.keys()].some(n => n > pageCount)) removePagesFrom(pageCount + 1);
   }
   if (usesCanonicalSurface()) {
@@ -801,11 +900,34 @@ function tryCommitProvisionalStages() {
   const pageCountMismatch = canonicalPageCount !== null &&
     canonicalPageCount !== residentPageCount;
   if (canonicalPageCount === null || pageCountMismatch) requestCanonicalDisplay();
-  if (stages.some(stage => !stage.ready || stage.sourceRev !== appliedSrcRev ||
-      stage.documentEpoch !== documentReset.adoptedEpoch ||
-      Number(stage.snapshot?.srcRev) !== appliedSrcRev ||
-      Number(stage.snapshot?.documentEpoch) !== stage.documentEpoch)) return;
-  const editorStage = stages.find(stage => stage.dl.page === directEditor?.pageNumber);
+  const stageReady = stage => stage.ready && stage.sourceRev === appliedSrcRev &&
+    stage.documentEpoch === documentReset.adoptedEpoch &&
+    Number(stage.snapshot?.srcRev) === appliedSrcRev &&
+    Number(stage.snapshot?.documentEpoch) === stage.documentEpoch;
+  // Before this document's first canonical the resident count is the only
+  // one. Once no resident page waits for a block's geometry (the boot walk
+  // compiled its rescues) it is settled, and a ready group need not wait for
+  // every page's exact ink: on the 316-page book that wait lasted until the
+  // first canonical, about four minutes after opening (tex64-internal #83).
+  const residentCountSettled = canonicalPageCount === null && !provisionalPendingLayout.size;
+  let committing = stages;
+  if (!stages.every(stageReady)) {
+    // While the page count is settled, a ready group (provisionalCommitGroups)
+    // does not wait for another: typically a page elsewhere still waiting for
+    // exact pixels (the previous keystroke's, or a running head the edit
+    // touched) would hold back the page being typed on now. Numbers on far
+    // pages may briefly lag until theirs land.
+    if (pageCountMismatch || (canonicalPageCount === null && !residentCountSettled) ||
+        provisionalRemovedPages.size || directEditor) return;
+    // no canonical has made the shells yet: the resident count does
+    if (residentCountSettled) for (let n = 1; n <= residentPageCount; n++) ensureShell(n);
+    if (stages.some(stage => !pageDivs.has(stage.dl.page))) return;
+    committing = provisionalCommitGroups(stages, committedPageSrcs, pageEditGroup, pagePainted, stageReady)
+      .filter(group => group.every(stageReady)).flat()
+      .sort((a, b) => a.dl.page - b.dl.page);
+    if (!committing.length) return;
+  }
+  const editorStage = committing.find(stage => stage.dl.page === directEditor?.pageNumber);
   const editorRegion = editorStage ? directEditorRegionInSnapshot(editorStage.snapshot, directEditor) : null;
   if (editorStage && !provisionalStageKeepsEditor(editorStage, editorRegion)) {
     const pending = directEditorSnapshotPending(editorStage.snapshot, directEditor, editorStage.sourceRev, editorRegion);
@@ -814,9 +936,15 @@ function tryCommitProvisionalStages() {
   }
   // All affected pages change within this synchronous transaction. A new
   // provisional page is also kept detached until its complete ink is ready.
-  provisionalStages.clear();
-  for (const stage of stages) {
+  if (committing === stages) {
+    provisionalStages.clear();
+    pageEditGroup.clear();
+  } else for (const stage of committing) provisionalStages.delete(stage.dl.page);
+  for (const stage of committing) {
     const { dl, staging, sourceRev, snapshot } = stage;
+    traceStage('commit', dl.page, { sourceRev });
+    committedPageSrcs.set(dl.page, stage.srcs ?? displayListSrcs(dl));
+    pageEditGroup.delete(dl.page);
     let div = pageDivs.get(dl.page);
     if (!div) div = ensureShell(dl.page);
     div.querySelector(':scope > svg:not(.tdom-canonical-delta)')?.remove();
@@ -835,13 +963,13 @@ function tryCommitProvisionalStages() {
   if (provisionalRemovedPages.size) reconcilePageCount(residentPageCount);
   provisionalRemovedPages.clear();
   residentPageCountAuthoritative = canonicalPageCount === residentPageCount;
-  for (const stage of stages) updateCanonState(stage.dl.page);
-  if (residentPageCountAuthoritative && stages.every(stage => {
+  for (const stage of committing) updateCanonState(stage.dl.page);
+  if (residentPageCountAuthoritative && committing === stages && stages.every(stage => {
     const page = pageDivs.get(stage.dl.page);
     return !page.classList.contains('is-final') || Number(page.dataset.canonPresentedRev) >= stage.sourceRev;
   })) fulfillCanonicalDisplay();
   if (liveSearch.query) scheduleLiveSearchRefresh();
-  if (stages.some(stage => stage.dl.page === directEditor?.pageNumber)) {
+  if (committing.some(stage => stage.dl.page === directEditor?.pageNumber)) {
     repositionDirectEditor();
     void refreshDirectEditGeometry();
   }
@@ -959,9 +1087,13 @@ function renderPage(dl, flash) {
   if (div) div.dataset.provPending = '1';
   if (dl.commands.some(cmd => cmd.op === 'canon' || cmd.op === 'pending-exact' ||
       cmd.op === 'glyphs' && cmd.math || cmd.op === 'chunk' && cmd.st)) {
+    traceStage('blocked', dl.page);
+    stage.srcs = displayListSrcs(dl);
+    committedPageSrcs.set(dl.page, new Set([...(committedPageSrcs.get(dl.page) ?? []), ...stage.srcs]));
     requestCanonicalDisplay({ residentImpossible: dl.commands.some(cmd => cmd.op === 'canon') });
     return;
   }
+  traceStage('stage', dl.page);
   const families = [...new Set(dl.commands.filter(cmd => cmd.op === 'glyphs' && cmd.fam).map(cmd => cmd.fam))];
   injectFonts(families);
   const staging = document.createElement('div');
@@ -986,11 +1118,15 @@ function renderPage(dl, flash) {
     staging.querySelectorAll('text[data-font-pending]').forEach(node => node.removeAttribute('data-font-pending'));
     stage.staging = staging;
     stage.ready = true;
+    traceStage('ready', dl.page);
     tryCommitProvisionalStages();
   };
   const images = [...staging.querySelectorAll('img')];
+  if (Array.isArray(globalThis.__tdomStageTrace)) {
+    void Promise.all(images.map(img => img.decode())).then(() => traceStage('decoded', dl.page, { images: images.length }), () => {});
+  }
   const pending = [
-    loadProvisionalSnapshot(sourceRev).then(snapshot => { stage.snapshot = snapshot; }),
+    loadProvisionalSnapshot(sourceRev).then(snapshot => { stage.snapshot = snapshot; traceStage('snapshot', dl.page); }),
     ...images.map(img => img.decode()),
     Promise.all(images.map(loadChunkInputGeometry)).then(chunks => {
       stage.glyphs = provisionalChunkGlyphs(dl.commands, chunks);
@@ -1205,7 +1341,11 @@ function applyReport(report) {
   }
   // Not even an empty call while frozen: it re-renders earlier staged pages
   // for the new appliedSrcRev.
-  if (!frozen) stageProvisionalPatches(provisionalPatches, true, report.stats?.pageCount);
+  if (!frozen) {
+    const editIds = new Set([...(report.dirtySourceNodes ?? []), ...(report.removedSourceNodes ?? [])]
+      .map(node => String(node).replace(/^src-/, '')));
+    stageProvisionalPatches(provisionalPatches, true, report.stats?.pageCount, editIds);
+  }
   for (const patch of provisionalPatches) {
     if (patch.type === 'replace-page') updateCanonState(patch.displayList.page);
   }
@@ -2074,6 +2214,8 @@ function reconcilePageCount(pageCount) {
     canonicalStageObserver?.unobserve(page);
     page.remove();
     pageDivs.delete(pageNumber);
+    committedPageSrcs.delete(pageNumber);
+    pageEditGroup.delete(pageNumber);
     pageDirtyRev.delete(pageNumber);
     shipPages.delete(pageNumber);
     provisionalStages.delete(pageNumber);
@@ -2280,6 +2422,8 @@ function tryCommitOpaqueCanonicalBatch(batch) {
     entry.apply();
   }
   committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch, pageCount: batch.pageCount };
+  for (const [page, dl] of provisionalDisplayLists) committedPageSrcs.set(page, displayListSrcs(dl));
+  pageEditGroup.clear();
   provisionalStages.clear();
   provisionalRemovedPages.clear();
   residentPageCountAuthoritative = true;

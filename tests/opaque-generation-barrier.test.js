@@ -14,7 +14,42 @@ const STYLE = readFileSync(fileURLToPath(new URL('../web/style.css', import.meta
 const PAGE_COUNT_GATES = Function(`${APP.slice(
   APP.indexOf('function currentCanonicalPageCount'),
   APP.indexOf('function srcOf')
-)}; return { currentCanonicalPageCount, residentPageTransactionValid };`)();
+)}; return { currentCanonicalPageCount, residentPageTransactionValid, provisionalCommitGroups };`)();
+
+test('staged pages commit in groups: a reflow, a moved or split paragraph and one edit stay together', () => {
+  const groupsOf = PAGE_COUNT_GATES.provisionalCommitGroups;
+  const stage = (page, ...srcs) => ({ dl: { page, commands: srcs.map((src) => ({ op: 'glyphs', src })) } });
+  const pages = (groups) => groups.map((group) => group.map((s) => s.dl.page)).sort((a, b) => a[0] - b[0]);
+  // consecutive pages reflow into each other; a far page is independent
+  assert.deepEqual(pages(groupsOf([stage(10, 'a'), stage(11, 'b'), stage(40, 'c')], new Map(), new Map())), [[10, 11], [40]]);
+  // one block painted on two non-adjacent pages
+  assert.deepEqual(pages(groupsOf([stage(10, 'x'), stage(14, 'x')], new Map(), new Map())), [[10, 14]]);
+  // a paragraph moving whole across an unchanged float page (51 → 53): the
+  // page it leaves still shows it
+  const shown = new Map([[51, new Set(['p', 'q'])], [53, new Set(['r'])]]);
+  assert.deepEqual(pages(groupsOf([stage(51, 'q'), stage(53, 'p', 'r')], shown, new Map())), [[51, 53]]);
+  // a split names the second half anew: the edit's pages stay together
+  assert.deepEqual(pages(groupsOf([stage(51, 'x'), stage(53, 'y')], new Map(), new Map([[51, 1], [53, 1]]))), [[51, 53]]);
+  // the previous keystroke's page does not hold back the current one
+  assert.deepEqual(pages(groupsOf([stage(30, 'a'), stage(80, 'b')], new Map(), new Map([[30, 1], [80, 2]]))), [[30], [80]]);
+  // page furniture ('_…') joins nothing
+  assert.deepEqual(pages(groupsOf([stage(10, '_hf', 'a'), stage(20, '_hf', 'b')], new Map(), new Map())), [[10], [20]]);
+  // first presentation: blank neighbours cannot disagree across a page break,
+  // so each page (or block spanning pages) commits on its own (#83)
+  const blank = () => false;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b'), stage(164, 'b')], new Map(), new Map(), blank)), [[162], [163, 164]]);
+  // a painted neighbour still ties the reflow
+  const paintedAt = (n) => (page) => page === n;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b')], new Map(), new Map(), paintedAt(162))), [[162, 163]]);
+  // the next keystroke on the presented page: blank neighbours still waiting
+  // for their ink stay blank and do not hold it back
+  const readyAt = (n) => (s) => s.dl.page === n;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b', 'c'), stage(164, 'c')], new Map(), new Map(), paintedAt(163), readyAt(163))),
+    [[162], [163], [164]]);
+  // …but a ready blank neighbour joins the painted page's reflow
+  const readyAll = () => true;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b')], new Map(), new Map(), paintedAt(163), readyAll)), [[162, 163]]);
+});
 
 test('the VisualCut raster verifier is loaded and served by the preview origin', () => {
   assert.match(INDEX, /<script src="\/canonical-anchor-raster\.js"><\/script>/);

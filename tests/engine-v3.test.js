@@ -3,13 +3,15 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, rmSync, mkdtempSync, writeFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, mkdtempSync, writeFileSync, readdirSync, utimesSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
+import { includeHoldsText, includeReadCurrent, inputReadCurrent } from '../engine/checkpoint/include-cache.js';
+import { watchInclude } from '../engine/checkpoint/include-expander.js';
 
 const DEMO = readFileSync(fileURLToPath(new URL('../samples/demo-lua.tex', import.meta.url)), 'utf8');
 const WORK = fileURLToPath(new URL('../.tdom-v3-test', import.meta.url));
@@ -139,16 +141,79 @@ test('inline math lines are chunk-banded while plain paragraphs stay glyphs', op
 
 test('preamble edits take the honest full-rebuild path', opts, async () => {
   const src = eng.getSource();
-  const anchor = '\\newcommand{\\engine}{Fermion TeX Engine}';
+  const anchor = '\\newtheorem{theorem}{Theorem}[section]';
   const idx = src.indexOf(anchor);
-  const r = await eng.edit(idx, idx + anchor.length, '\\newcommand{\\engine}{Fermion Engine}');
+  const r = await eng.edit(idx, idx + anchor.length, '\\newtheorem{theorem}{Satz}[section]');
   assert.ok(r.stats.rebooted, 'root process rebooted on preamble change');
   assert.ok(eng.getDOM().labels['sec:math'] === '2', 'state rebuilt correctly');
+});
+
+test('a changed \\newcommand body re-runs in front of the blocks that use it, without a reboot (#93)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-preamble-patch-'));
+  const para = (k) => `Paragraph ${k} of ordinary prose that fills a line or two of the preview in this test.`;
+  const doc = (body, wrap = '\\fbox{#1}') => [
+    '\\documentclass{article}',
+    `\\newcommand{\\engine}{${body}}`,
+    `\\newcommand{\\boxed}[1]{${wrap}}`,
+    '\\newcommand{\\both}{\\engine{} and more}',
+    '\\begin{document}',
+    ...Array.from({ length: 16 }, (_, k) =>
+      (k === 3 ? 'Here the \\engine{} appears. ' : k === 9 ? 'A \\boxed{word} here. ' : k === 13 ? 'Also \\both. ' : '') + para(k) + '\n'),
+    '\\end{document}', '',
+  ].join('\n');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh'), docDir: root });
+  const fresh2 = new CheckpointEngine({ workDir: path.join(root, 'fresh2'), docDir: root });
+  const galleys = (e) => e.blocks.map((b) => b.galleyHash);
+  try {
+    await eng.open(doc('Fermion TeX Engine'));
+    await eng.bgTask;
+    const rootPid = eng.root?.pid;
+    const src = eng.getSource();
+    const at = src.indexOf('Fermion TeX Engine');
+    const r = await eng.edit(at, at + 'Fermion TeX Engine'.length, 'A Much Longer Engine Name');
+    await eng.bgTask;
+    assert.ok(!r.stats.rebooted, 'no reboot');
+    assert.equal(eng.root?.pid, rootPid, 'the booted root stays');
+    assert.equal(eng.preamblePatches, 1);
+    assert.equal(eng.lastPreamblePatch.dirty, 2, 'the block using \\engine and the one using \\both');
+    assert.ok(r.stats.blocksTypeset < eng.blocks.length, `blocks typeset: ${r.stats.blocksTypeset}`);
+    await fresh.open(doc('A Much Longer Engine Name'));
+    assert.deepEqual(galleys(eng), galleys(fresh), 'the same galleys as a document opened with the new preamble');
+    // a second declaration, then both back: the prelude follows the booted root
+    const at2 = eng.getSource().indexOf('\\fbox{#1}');
+    await eng.edit(at2, at2 + '\\fbox{#1}'.length, '\\textbf{#1}');
+    await eng.bgTask;
+    assert.equal(eng.preamblePatches, 2);
+    assert.equal(eng.lastPreamblePatch.dirty, 1);
+    const back = eng.getSource().replace('A Much Longer Engine Name', 'Fermion TeX Engine').replace('\\textbf{#1}', '\\fbox{#1}');
+    await eng.edit(0, eng.getSource().length, back);
+    await eng.bgTask;
+    assert.equal(eng.preamblePatches, 3);
+    assert.equal(eng.defsPatch, null, 'nothing left to re-run');
+    assert.equal(eng.root?.pid, rootPid);
+    await fresh2.open(doc('Fermion TeX Engine'));
+    assert.deepEqual(galleys(eng), galleys(fresh2));
+    // a package change still reboots
+    const pkg = eng.getSource().indexOf('\\begin{document}');
+    const r4 = await eng.edit(pkg, pkg, '\\usepackage{amssymb}\n');
+    assert.ok(r4.stats.rebooted);
+  } finally {
+    await eng.close();
+    await fresh.close();
+    await fresh2.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('the engine survives malformed input mid-typing', opts, async () => {
   const src = eng.getSource();
   const idx = src.indexOf('Edit any word');
+  // Run alone, this test can snapshot the pages before the running-head job
+  // of the open lands (hfSig null) and compare after it did.
+  for (const deadline = Date.now() + 10_000; (eng.hfPending || eng.hfQueuedSig) && Date.now() < deadline;) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
   const blocksBefore = eng.blocks.map((block) => block.id);
   const pagesBefore = eng.getDisplayLists();
   const r1 = await eng.edit(idx, idx, '\\emph{');
@@ -277,6 +342,7 @@ test('a keystroke far from every checkpoint returns within its cold budget and t
   try {
     await e.open(doc);
     e.coldPrefixBudgetMs = 1; // stop after the first replayed clean block
+    e.coldPreviewEnabled = false; // the plain budget stop (the preview has its own test)
     const deferred = new Promise((resolve) => { e.onDeferredUpdate = resolve; });
     const at = e.getSource().indexOf('Paragraph 150 ');
     assert.ok(at > 0);
@@ -312,6 +378,237 @@ test('a keystroke far from every checkpoint returns within its cold budget and t
   }
 });
 
+test('a cold keystroke shows its block through a preview typeset from the far checkpoint, and the walk that replaces it still carries its effects on', opts, async () => {
+  const work = WORK + '-cold-preview';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    if (i === 155) paragraphs.push('\\section{Late}', '');
+    const ref = i === 20 ? ' See \\ref{p:hundred}.' : '';
+    const label = i === 100 ? '\\label{p:hundred}' : '';
+    paragraphs.push(`Paragraph ${i} of the cold preview fixture keeps the resident chain walking for a while.${ref}${label}`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', '\\section{First}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  // a grid boundary right before an edited block (filled while a step
+  // settles) leaves no clean block to stop at before it: no preview
+  const gridFill = process.env.TDOM_GRID_FILL;
+  process.env.TDOM_GRID_FILL = '0';
+  const block = (head) => e.blocks.find((b) => b.text.startsWith(head));
+  const settle = async () => {
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.coldDirty.size || e.bgActive || e.updating) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(e.coldDirty.size, 0, 'the cold resume landed');
+    assert.equal(e.pendingChain, null);
+  };
+  const coldEdit = async (at, end, text) => {
+    const report = await e.edit(at, end, text);
+    assert.equal(report.stats.chainVerdict, 'cold');
+    assert.equal(report.stats.coldPreview?.adopted, true, JSON.stringify(report.stats.coldPreview));
+    return report;
+  };
+  try {
+    await e.open(doc);
+    e.coldPrefixBudgetMs = 1; // stop after the first replayed clean block
+    e.coldPreviewFromMs = 0; // preview every cold keystroke
+    e.coldPreviewWaitMs = 60_000; // and always wait for it
+    const section = e.counters.indexOf('section');
+    assert.equal(JSON.parse(block('\\section{Late}').stateVec)[section], 2);
+
+    // 1. a moved counter: every later heading is renumbered
+    let at = e.getSource().indexOf('Paragraph 150 ');
+    const exitBefore = block('Paragraph 150 ').stateVec;
+    const cold = await coldEdit(at, at, '\\section{Early} ');
+    const id = String(cold.dirtySourceNodes[0]).replace(/^src-/, '');
+    assert.deepEqual(cold.stats.coldPending, [id], 'the previewed block still waits for its own lineage');
+    const previewed = e.blocks.find((b) => b.id === id);
+    assert.ok(previewed.galley.tdomColdPreview && previewed.text.startsWith('\\section{Early} Paragraph 150'));
+    assert.equal(previewed.stateVec, exitBefore, 'the block keeps the exit state its successors were typeset against');
+    const previewItems = JSON.stringify(previewed.galley.items);
+    const commands = cold.patches.flatMap((patch) => patch.displayList?.commands ?? []);
+    assert.ok(commands.some((c) => c.src === id), 'the keystroke\'s page paints the previewed block');
+    assert.ok(!commands.some((c) => c.op === 'pending-exact' && c.src === id));
+    await settle();
+    const native = e.blocks.find((b) => b.id === id);
+    assert.ok(!native.galley.tdomColdPreview, 'a walk in the block\'s own lineage replaced the preview');
+    assert.equal(JSON.stringify(native.galley.items), previewItems, 'the far checkpoint typeset the same lines');
+    assert.equal(JSON.parse(block('\\section{Late}').stateVec)[section], 3);
+
+    // 2. untracked state (a font declaration) must still reach the next paragraph
+    const fontOf = (b) => b.galley.items.find((it) => it.k === 'box' && it.runs?.some((r) => r.t))?.runs.find((r) => r.t)?.f;
+    const nextFont = fontOf(block('Paragraph 141 '));
+    at = e.getSource().indexOf('Paragraph 140 ');
+    await coldEdit(at, at, '\\bfseries ');
+    await settle();
+    assert.notEqual(fontOf(block('Paragraph 141 ')), nextFont, 'the declaration leaks into the next paragraph');
+
+    // 3. a renamed label vanishes for its (earlier) reference
+    assert.ok(e.labelTable.has('p:hundred'));
+    at = e.getSource().indexOf('\\label{p:hundred}') + '\\label{p:hundre'.length;
+    await coldEdit(at, at + 1, '');
+    await settle();
+    assert.ok(!e.labelTable.has('p:hundred'), 'the old label is gone');
+    assert.equal(block('Paragraph 20 ').galley.tdomRefVals?.['p:hundred'], undefined, 'its reference re-resolved');
+  } finally {
+    await e.close();
+    if (gridFill === undefined) delete process.env.TDOM_GRID_FILL;
+    else process.env.TDOM_GRID_FILL = gridFill;
+  }
+});
+
+test('a cold preview of a block with exact pixels renders them from the checkpoint it was typeset from', opts, async () => {
+  const work = WORK + '-cold-preview-gfx';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    // only the edited paragraph needs exact pixels: no cold neighbor holds its page
+    paragraphs.push(`Paragraph ${i} holds ${i === 150 ? '$x^2$' : 'text'} marked ${i} in the cold preview fixture.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 2; // a long resume walk: the render lands while the preview is shown
+  try {
+    await e.open(doc);
+    await e.renderTask;
+    e.coldPrefixBudgetMs = 1;
+    e.coldPreviewFromMs = 0;
+    e.coldPreviewWaitMs = 60_000;
+    e.coldPreviewEarlyRender = false; // the pump's own RENDER from the preview's peer
+    const at = e.getSource().indexOf('marked 150') + 'marked'.length;
+    const cold = await e.edit(at, at, ' X');
+    assert.equal(cold.stats.coldPreview?.adopted, true, JSON.stringify(cold.stats.coldPreview));
+    const id = String(cold.dirtySourceNodes[0]).replace(/^src-/, '');
+    const previewed = e.blocks.find((b) => b.id === id);
+    assert.ok(previewed.needsRender, 'the fixture block needs exact pixels');
+    await e.renderTask;
+    assert.ok((e.renderStats?.coldPreviews ?? 0) >= 1, 'the preview rendered from its own checkpoint');
+    assert.ok(!(e.renderTimings ?? []).some((t) => t.block === id && t.earlyMs != null));
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.coldDirty.size || e.updating || e.bgActive) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await e.renderTask;
+    const native = e.blocks.find((b) => b.id === id);
+    assert.ok(!native.galley.tdomColdPreview);
+    assert.equal(e.chunks.get(id)?.forGalley, native.galleyHash, 'the replacing galley got pixels of its own');
+  } finally {
+    await e.close();
+  }
+});
+
+test('the first keystroke after a pause sends the edited block RENDER beside its own JOB', opts, async () => {
+  const work = WORK + '-edit-early';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 12; i += 1) {
+    paragraphs.push(`Paragraph ${i} holds ${i === 6 ? '$x^2$' : i === 3 || i === 4 ? `$z_${i}$` : 'text'} marked ${i} in the edit render fixture.`);
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  try {
+    await e.open(doc);
+    await e.renderTask;
+    e.lastEditAt = 0; // a pause before this keystroke
+    const at = e.getSource().indexOf('$x^2$') + '$x^2$'.length;
+    const r = await e.edit(at, at, ' X');
+    assert.equal(r.stats.chainVerdict, 'clean', 'a plain hot edit');
+    const id = String(r.dirtySourceNodes[0]).replace(/^src-/, '');
+    const edited = e.blocks.find((b) => b.id === id);
+    assert.ok(edited.needsRender, 'the fixture block needs exact pixels');
+    assert.ok(edited.galley.tdomEarlyRender, 'its JOB sent the RENDER');
+    await e.renderTask;
+    const timing = (e.renderTimings ?? []).find((t) => t.block === id && t.earlyMs != null);
+    assert.ok(timing && !timing.previewPeer, 'the pump cropped the early PDF');
+    const chunk = e.chunks.get(id);
+    assert.equal(chunk?.forGalley, edited.galleyHash, 'for the galley the JOB returned');
+    assert.ok(chunk.xBp < 0 && chunk.wBp > chunk.logicalWBp, JSON.stringify({ xBp: chunk.xBp, wBp: chunk.wBp }));
+    // a burst: its first keystroke's RENDER is killed by the second, whose
+    // own RENDER is the pump's (no early RENDER within 400 ms)
+    e.lastEditAt = 0;
+    let next = e.getSource().indexOf('$x^2$') + '$x^2$'.length;
+    const first = await e.edit(next, next, 'Y');
+    const firstBlock = e.blocks.find((b) => b.id === String(first.dirtySourceNodes[0]).replace(/^src-/, ''));
+    assert.ok(firstBlock.galley.tdomEarlyRender, 'the first keystroke of the burst sent one');
+    next = e.getSource().indexOf('$x^2$') + '$x^2$'.length;
+    e.lastEditAt = Date.now(); // the previous keystroke just arrived
+    const burst = await e.edit(next, next, 'Z');
+    const again = e.blocks.find((b) => b.id === String(burst.dirtySourceNodes[0]).replace(/^src-/, ''));
+    assert.ok(!again.galley.tdomEarlyRender, 'no early RENDER within 400 ms of the previous keystroke');
+    await e.renderTask;
+    assert.equal(e.chunks.get(again.id)?.forGalley, again.galleyHash, 'the pump rendered the last keystroke');
+    // one early RENDER per update, however many edited blocks need pixels
+    e.lastEditAt = 0;
+    const from = e.getSource().indexOf('$z_3$');
+    const to = e.getSource().indexOf('$z_4$') + '$z_4$'.length;
+    await e.edit(from, to, e.getSource().slice(from, to).replace('$z_3$', '$w_3$').replace('$z_4$', '$w_4$'));
+    const sent = e.blocks.filter((b) => b.galley?.tdomEarlyRender);
+    assert.equal(sent.length, 1, 'one early RENDER for the update, though two edited blocks need pixels');
+    await e.renderTask;
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(readdirSync(work).filter((name) => /-early\d+$/.test(name)), [], 'no early render dir is left');
+  } finally {
+    await e.close();
+  }
+});
+
+test('the first keystroke after a pause sends its cold preview RENDER beside the preview JOB', opts, async () => {
+  const work = WORK + '-cold-preview-early';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} holds ${i === 150 ? '$x^2$' : 'text'} marked ${i} in the early render fixture.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 2;
+  try {
+    await e.open(doc);
+    await e.renderTask;
+    e.coldPrefixBudgetMs = 1;
+    e.coldPreviewFromMs = 0;
+    e.coldPreviewWaitMs = 60_000;
+    e.lastEditAt = 0; // a pause before this keystroke
+    const at = e.getSource().indexOf('marked 150') + 'marked'.length;
+    const cold = await e.edit(at, at, ' X');
+    assert.equal(cold.stats.coldPreview?.adopted, true, JSON.stringify(cold.stats.coldPreview));
+    const id = String(cold.dirtySourceNodes[0]).replace(/^src-/, '');
+    const previewed = e.blocks.find((b) => b.id === id);
+    assert.ok(previewed.galley.tdomColdPreview?.early, 'the preview sent its RENDER');
+    const previewHash = previewed.galleyHash;
+    await e.renderTask;
+    assert.ok((e.renderTimings ?? []).some((t) => t.block === id && t.earlyMs != null), 'the pump cropped the early PDF');
+    // the preview's own pixels, unless the resume replaced the galley already
+    const now = e.blocks.find((b) => b.id === id);
+    const early = e.chunks.get(id);
+    if (now.galleyHash === previewHash) assert.equal(early?.forGalley, previewHash);
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.coldDirty.size || e.updating || e.bgActive) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await e.renderTask;
+    const native = e.blocks.find((b) => b.id === id);
+    assert.ok(!native.galley.tdomColdPreview);
+    assert.equal(e.chunks.get(id)?.forGalley, native.galleyHash, 'the replacing galley got pixels of its own');
+    if (early?.forGalley === previewHash) {
+      // cropped with the padding the RENDER child wrote beside its PDF
+      assert.ok(early.xBp < 0 && early.wBp > early.logicalWBp, JSON.stringify({ xBp: early.xBp, wBp: early.wBp }));
+    }
+    assert.deepEqual(readdirSync(work).filter((name) => /-early\d+$/.test(name)), [], 'no early render dir is left');
+  } finally {
+    await e.close();
+  }
+});
+
 test('a caret warm that reaches the block of a budgeted keystroke hands over to the resume', opts, async () => {
   const work = WORK + '-cold-warm';
   rmSync(work, { recursive: true, force: true });
@@ -327,6 +624,7 @@ test('a caret warm that reaches the block of a budgeted keystroke hands over to 
   try {
     await e.open(doc);
     e.coldPrefixBudgetMs = 1;
+    e.coldPreviewFromMs = 0; // with a preview on screen (docs/10 §10.4b)
     const deferred = new Promise((resolve) => { e.onDeferredUpdate = resolve; });
     const at = e.getSource().indexOf('Paragraph 150 ');
     const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
@@ -365,6 +663,7 @@ test('a keystroke during the cold walk stops it at a live boundary instead of re
   try {
     await e.open(doc);
     e.coldPrefixBudgetMs = 1;
+    e.coldPreviewFromMs = 0; // with a preview on screen (docs/10 §10.4b)
     const at = e.getSource().indexOf('Paragraph 150 ');
     const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
     assert.equal(cold.stats.chainVerdict, 'cold');
@@ -386,6 +685,208 @@ test('a keystroke during the cold walk stops it at a live boundary instead of re
     assert.ok(third.stats.blocksTypeset <= 3, `after the walk the block is hot (got ${third.stats.blocksTypeset}${interrupted ? ', interrupted' : ''})`);
   } finally {
     await e.close();
+  }
+});
+
+test('a cold resume that starts before its block typesets it instead of stopping cold again', opts, async () => {
+  const work = WORK + '-cold-resume-progress';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 48; i += 1) {
+    // the edited paragraph's page holds more exact-render neighbours ahead
+    // of it than the edit-locus pins keep: the resume walk has to start
+    // before the boundary the cold chain pass reached
+    const math = i >= 37 && i <= 45 && i % 2 === 1;
+    paragraphs.push(`Paragraph ${i} ${math ? `holds $x^{${i}}$` : 'is plain text'} in the cold resume fixture.`);
+    if (i % 12 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  // as in the fuzzer: the neighbours' exact pixels never land (no RENDER, no
+  // canonical crop), so the walk keeps extending to them
+  const previousEnv = { TDOM_NO_RENDER: process.env.TDOM_NO_RENDER, TDOM_NO_CANONICAL: process.env.TDOM_NO_CANONICAL };
+  process.env.TDOM_NO_RENDER = '1';
+  process.env.TDOM_NO_CANONICAL = '1';
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  try {
+    await e.open(doc);
+    e.coldPrefixBudgetMs = 1;
+    e.coldPreviewEnabled = false;
+    const resumes = [];
+    e.onDeferredUpdate = (report) => resumes.push(report);
+    const at = e.getSource().indexOf('Paragraph 47 ');
+    const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
+    assert.equal(cold.stats.chainVerdict, 'cold');
+    for (const n of [43, 45]) {
+      const neighbour = e.blocks.find((b) => b.text.startsWith(`Paragraph ${n} `));
+      assert.ok(neighbour?.needsRender && e.chunks.get(neighbour.id)?.forGalley !== neighbour.galleyHash,
+        `paragraph ${n} still waits for its exact pixels`);
+    }
+    const until = Date.now() + 60_000;
+    while ((e.pendingChain || e.coldDirty.size || e.bgActive || e.updating) && resumes.length <= 3 && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(e.coldDirty.size, 0, `still cold after ${resumes.length} resumes: ${resumes.map((r) => r.stats.chainVerdict).join(',')}`);
+    assert.equal(resumes.length, 1, 'one resume typesets the block');
+    assert.notEqual(resumes[0].stats.chainVerdict, 'cold');
+    assert.deepEqual(resumes[0].dirtySourceNodes, cold.dirtySourceNodes);
+    const block = e.blocks.find((b) => b.id === String(cold.dirtySourceNodes[0]).replace(/^src-/, ''));
+    assert.ok(block?.galley && block.text.startsWith('Section 47'), 'the galley belongs to the edited text');
+  } finally {
+    await e.close();
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('a cold resume left with nothing to typeset still runs the settle it carried', opts, async () => {
+  const work = WORK + '-cold-carry';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the cold carry fixture keeps the resident chain walking for a while.`);
+    if (i % 40 === 0) paragraphs.push('', `\\begin{equation} x = ${i} \\end{equation}`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  // no canonical: its arrival could re-seed the lineage and hide a lost settle
+  const previousCanonical = process.env.TDOM_NO_CANONICAL;
+  process.env.TDOM_NO_CANONICAL = '1';
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  const equationsAt = (b) => JSON.parse(b.stateVec)[e.counters.indexOf('equation')];
+  try {
+    await e.open(doc);
+    e.coldPreviewEnabled = false;
+    // 1. a new equation moves the counter for the rest of the document: settle
+    e.coldPrefixBudgetMs = 0;
+    let at = e.getSource().indexOf('Paragraph 20 ');
+    const moved = await e.edit(at, at, '\\begin{equation} y \\end{equation}\n\n');
+    assert.equal(moved.stats.chainVerdict, 'counters');
+    // 2. a cold keystroke far down carries that settle through its resume
+    e.coldPrefixBudgetMs = 1;
+    at = e.getSource().indexOf('Paragraph 150 ');
+    const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
+    assert.equal(cold.stats.chainVerdict, 'cold');
+    assert.equal(e.pendingChain?.kind, 'cold');
+    assert.equal(e.pendingChain.carry?.kind, 'settle', 'the cold work carries the pending settle');
+    // 3. the next keystroke deletes that paragraph: the resume finds nothing
+    e.coldPrefixBudgetMs = 0;
+    const next = e.getSource().indexOf('Paragraph 151 ');
+    const hot = await e.edit(at, next, '');
+    assert.notEqual(hot.stats.chainVerdict, 'cold');
+    assert.ok(!e.blocks.some((b) => cold.dirtySourceNodes.includes(`src-${b.id}`)), 'the cold block is gone');
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.coldDirty.size || e.bgActive || e.updating) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(e.pendingChain, null);
+    assert.equal(e.coldDirty.size, 0);
+    assert.equal(equationsAt(e.blocks[e.blocks.length - 1]), 5, 'the moved counter reached the end of the document');
+  } finally {
+    await e.close();
+    if (previousCanonical === undefined) delete process.env.TDOM_NO_CANONICAL;
+    else process.env.TDOM_NO_CANONICAL = previousCanonical;
+  }
+});
+
+test('a settle whose first stale boundary retired still carries the counter to the end', opts, async () => {
+  const work = WORK + '-settle-from';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the settle fixture keeps the resident chain walking for a while.`);
+    if (i % 40 === 0) paragraphs.push('', `\\begin{equation} x = ${i} \\end{equation}`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const previousCanonical = process.env.TDOM_NO_CANONICAL;
+  process.env.TDOM_NO_CANONICAL = '1';
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  const equationsAt = (b) => JSON.parse(b.stateVec)[e.counters.indexOf('equation')];
+  try {
+    await e.open(doc);
+    e.coldPrefixBudgetMs = 0;
+    const at = e.getSource().indexOf('Paragraph 20 ');
+    const moved = await e.edit(at, at, '\\begin{equation} y \\end{equation}\n\n');
+    assert.equal(moved.stats.chainVerdict, 'counters');
+    assert.equal(e.pendingChain?.kind, 'settle');
+    // Lose the boundary at the settle's first stale block, as later walks'
+    // pins and the cap can: the pass must start below it, over blocks the
+    // foreground already brought up to date.
+    const from = e.pendingChain.from;
+    const peer = e.checkpoints.get(from);
+    assert.ok(peer, `the foreground left a boundary at ${from}`);
+    e.editHold = e.editHold.filter((idx) => idx !== from);
+    e.renderHold.delete(from);
+    peer.send('DIE\n');
+    if (peer.pid) e.dyingPids.add(peer.pid);
+    for (const [idx, candidate] of [...e.checkpoints]) if (candidate === peer) e.checkpoints.delete(idx);
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.bgActive || e.updating) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(e.pendingChain, null);
+    assert.equal(equationsAt(e.blocks[e.blocks.length - 1]), 5, 'the moved counter reached the end of the document');
+  } finally {
+    await e.close();
+    if (previousCanonical === undefined) delete process.env.TDOM_NO_CANONICAL;
+    else process.env.TDOM_NO_CANONICAL = previousCanonical;
+  }
+});
+
+test('the settle a cold walk carries follows its blocks when an edit above shifts them', opts, async () => {
+  const work = WORK + '-cold-carry-shift';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the carry shift fixture keeps the resident chain walking for a while.`);
+    if (i % 40 === 0) paragraphs.push('', `\\begin{equation} x = ${i} \\end{equation}`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const previousCanonical = process.env.TDOM_NO_CANONICAL;
+  process.env.TDOM_NO_CANONICAL = '1';
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  const equationsAt = (b) => JSON.parse(b.stateVec)[e.counters.indexOf('equation')];
+  try {
+    await e.open(doc);
+    e.coldPreviewEnabled = false;
+    // 1. a new equation moves the counter for the rest of the document: settle
+    e.coldPrefixBudgetMs = 0;
+    let at = e.getSource().indexOf('Paragraph 20 ');
+    const moved = await e.edit(at, at, '\\begin{equation} y \\end{equation}\n\n');
+    assert.equal(moved.stats.chainVerdict, 'counters');
+    // 2. a cold keystroke far down carries that settle
+    e.coldPrefixBudgetMs = 1;
+    at = e.getSource().indexOf('Paragraph 150 ');
+    const cold = await e.edit(at, at + 'Paragraph'.length, 'Section');
+    assert.equal(cold.stats.chainVerdict, 'cold');
+    assert.equal(e.pendingChain?.carry?.kind, 'settle', 'the cold work carries the pending settle');
+    // 3. a new paragraph above shifts every block the settle still owes
+    e.coldPrefixBudgetMs = 0;
+    at = e.getSource().indexOf('Paragraph 10 ');
+    const shifted = await e.edit(at, at, 'An inserted paragraph.\n\n');
+    assert.notEqual(shifted.stats.chainVerdict, 'cold');
+    const until = Date.now() + 90_000;
+    while ((e.pendingChain || e.coldDirty.size || e.bgActive || e.updating) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(e.pendingChain, null);
+    assert.equal(e.coldDirty.size, 0);
+    assert.equal(equationsAt(e.blocks[e.blocks.length - 1]), 5, 'the moved counter reached the end of the document');
+  } finally {
+    await e.close();
+    if (previousCanonical === undefined) delete process.env.TDOM_NO_CANONICAL;
+    else process.env.TDOM_NO_CANONICAL = previousCanonical;
   }
 });
 
@@ -551,6 +1052,57 @@ test('a reopened document adopts its cached isolated rescues during the boot wal
   }
 });
 
+test('a boot walk with the fork runners up measures first-ever rescues before /open returns', opts, async () => {
+  const doc = [
+    '\\documentclass{article}', '\\usepackage{multicol}', '\\begin{document}',
+    'Plain paragraph before the columns with ordinary prose on the page.', '',
+    '\\begin{multicols}{2}',
+    'Left column text explains the idea in the first column with several plain sentences.',
+    'It continues with another sentence so the column has a few lines of text.', '',
+    '\\columnbreak',
+    'Right column text compares the idea with another one in the second column.',
+    '\\end{multicols}', '',
+    'Plain paragraph after the columns. Closing prose for the page.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  // a placeholder (no measured box) holds every assembled page: count the
+  // page-wide pending markers in the report /open publishes
+  const pagesHeld = (report) => report.patches
+    .filter((patch) => patch.type === 'replace-page')
+    .filter((patch) => patch.displayList.commands.some((cmd) => cmd.op === 'pending-exact' && cmd.wholePage)).length;
+  const boot = async (name, budgetMs) => {
+    const work = WORK + name;
+    rmSync(work, { recursive: true, force: true });
+    process.env.TDOM_ISO_REAL_FORK = '1';
+    if (budgetMs != null) process.env.TDOM_BOOT_RESCUE_MS = String(budgetMs);
+    try {
+      return new CheckpointEngine({ workDir: work });
+    } finally {
+      delete process.env.TDOM_ISO_REAL_FORK;
+      delete process.env.TDOM_BOOT_RESCUE_MS;
+    }
+  };
+  const inline = await boot('-boot-rescue', null);
+  try {
+    const report = await inline.open(doc);
+    const block = inline.blocks.find((b) => /begin\{multicols\}/.test(b.text));
+    assert.ok(inline.realRoot?.pid > 0);
+    assert.equal(pagesHeld(report), 0, 'no placeholder holds the opened pages');
+    assert.ok(block?.galley && !block.galley.tdomPendingPaint, 'the boot walk adopted a measured galley');
+    assert.equal(inline.isoModeOf.get(block.id), 'fork-real');
+    assert.equal(inline.bootRescueBudgetMs, 0, 'the budget ends with the boot walk');
+  } finally {
+    await inline.close();
+  }
+  const deferred = await boot('-boot-rescue-off', 0);
+  try {
+    const report = await deferred.open(doc);
+    assert.ok(pagesHeld(report) > 0, 'without a budget the first rescue is a placeholder for the async pump');
+  } finally {
+    await deferred.close();
+  }
+});
+
 // --- real-output rescue root (TDOM_ISO_REAL_FORK) -------------------------
 //
 // Splitting environments used to be rescued COLD (a standalone lualatex,
@@ -593,6 +1145,22 @@ async function rasterPages(pdfBuf, tag) {
   }
 }
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+// Process state letter (R, S, Z, ...) or null once the pid is gone.
+const processState = (pid) => {
+  try { return readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]?.[0] ?? null; } catch { /* not Linux */ }
+  try { return execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' }).trim()[0] || null; } catch { return null; }
+};
+// A SIGKILLed process whose parent died with it stays a zombie until
+// something reaps it; in a container whose pid 1 is not an init that can
+// outlast the check. Dead is dead: only a process still running counts.
+const retired = async (pid, ms = 5000) => {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    if (!alive(pid) || processState(pid) === 'Z') return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+};
 
 test('the real-output root is opt-in: without the flag splitting rescues stay cold', opts, () => {
   assert.equal(eng.isoRealFork, false);
@@ -648,8 +1216,8 @@ test('fork-real rescues from the real-output root match the cold compile bit for
   } finally {
     if (e) await e.close();
   }
-  await new Promise((r) => setTimeout(r, 300));
-  assert.ok(!alive(realRootPid), 'close retires the real-output root with the rest of the tree');
+  assert.ok(await retired(realRootPid),
+    `close retires the real-output root with the rest of the tree (state ${processState(realRootPid)})`);
 });
 
 test('microtype expansion and protrusion keep resident glyphs where the PDF paints them (tex64-internal #66)', opts, async () => {
@@ -727,6 +1295,414 @@ test('a forward \\cref under hyperref typesets in the resident chain (tex64-inte
     assert.equal(eng.labelTable.get('tab:cost'), '1');
   } finally {
     await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a breakable box rescued mid-page keeps the pagination of the real output', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-midpage-split-'));
+  const lorem = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ';
+  const source = [
+    '\\documentclass{article}', '\\usepackage[most]{tcolorbox}',
+    '\\newtcolorbox{splitbox}[1]{enhanced, breakable, title={#1}}', '\\begin{document}',
+    lorem.repeat(13), '',
+    '\\begin{splitbox}{Straddles}', lorem.repeat(14), '\\end{splitbox}', '',
+    'Closing paragraph after the box.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  writeFileSync(path.join(root, 'main.tex'), source);
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  try {
+    await eng.open(source);
+    const deadline = Date.now() + 120_000;
+    while ((eng.rescueQueue.size || eng.rescuePumping) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    await eng.bgTask;
+    const split = eng.blocks.find((b) => b.text.includes('\\begin{splitbox}'));
+    assert.ok(split.rescued);
+    assert.ok(split.galley.items.some((it) => it.k === 'eject'), 'the box splits at its offset');
+    const { stdout } = await promisify(execFile)('lualatex', ['-interaction=nonstopmode', '-halt-on-error', 'main.tex'], { cwd: root, timeout: 120_000 });
+    const printed = Number(stdout.match(/Output written on main\.pdf \((\d+) page/)?.[1]);
+    // Compiled 2pt above print (the line above's depth) or cropped with the
+    // iso page's \topskip on top, the first part overfilled page 1 and the
+    // builder pushed it whole to page 2: one page more than print.
+    assert.equal(eng.pages.length, printed, 'the first part stays on the page it was split for');
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a breakable box declared in a project .sty is split where it straddles a page (#88)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-package-breakable-'));
+  writeFileSync(path.join(root, 'mystyle.sty'), [
+    '\\RequirePackage[most]{tcolorbox}',
+    '\\DeclareTColorBox{splitbox}{ m }{enhanced, breakable, title={#1}}',
+    '\\DeclareTColorBox{shortbox}{ m }{enhanced, breakable, title={#1}}',
+    '',
+  ].join('\n'));
+  const lorem = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ';
+  const source = [
+    '\\documentclass{article}', '\\usepackage{mystyle}', '\\begin{document}',
+    '\\begin{shortbox}{Fits}', 'A short box at the top of the page.', '\\end{shortbox}', '',
+    lorem.repeat(10), '',
+    '\\begin{splitbox}{Straddles}', lorem.repeat(14), '\\end{splitbox}', '',
+    'Closing paragraph after the box.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  writeFileSync(path.join(root, 'main.tex'), source);
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  try {
+    await eng.open(source);
+    const deadline = Date.now() + 120_000;
+    while ((eng.rescueQueue.size || eng.rescuePumping) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    await eng.bgTask;
+    const split = eng.blocks.find((b) => b.text.includes('\\begin{splitbox}'));
+    const short = eng.blocks.find((b) => b.text.includes('\\begin{shortbox}'));
+    assert.ok(split.contextRescue, 'the straddling box was sent to the real routine');
+    assert.equal(short.contextRescue, undefined, 'a box that fits keeps the fast path');
+    assert.ok(split.galley.items.some((it) => it.k === 'eject'), 'the rescued galley carries the split');
+    const { stdout } = await promisify(execFile)('lualatex', ['-interaction=nonstopmode', '-halt-on-error', 'main.tex'], { cwd: root, timeout: 120_000 });
+    const printed = Number(stdout.match(/Output written on main\.pdf \((\d+) page/)?.[1]);
+    assert.ok(printed >= 2);
+    assert.equal(eng.pages.length, printed, 'resident pagination matches the real output');
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a keystroke waiting for the chain lock leaves the daemon a marker to defer background collects (#84)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-keystroke-marker-'));
+  const work = path.join(root, 'work');
+  const marker = path.join(work, 'keystroke-waiting');
+  const eng = new CheckpointEngine({ workDir: work, docDir: root });
+  try {
+    await eng.open(['\\documentclass{article}', '\\begin{document}', 'First paragraph.', '', 'Second paragraph.', '', '\\end{document}', ''].join('\n'));
+    assert.equal(existsSync(marker), false);
+    const at = eng.getSource().indexOf('Second paragraph');
+    const first = eng.edit(at, at, 'A');
+    const second = eng.edit(at, at, 'B');
+    // the second keystroke waits while the first holds the lock
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(existsSync(marker), true, 'marker while a keystroke waits');
+    await Promise.all([first, second]);
+    assert.equal(existsSync(marker), false, 'removed once no keystroke waits');
+    assert.equal(eng.keystrokePending, 0);
+    assert.equal(typeof eng.lastLock?.gcWaitedMs, 'number');
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('source lines pass process_input_buffer in the resident as in a file read (KKluaverb)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-input-buffer-'));
+  // stands in for KKluaverb, which turns \KKverb|...| into literal text
+  // while TeX reads the line
+  writeFileSync(path.join(root, 'rewrite.sty'), [
+    '\\RequirePackage{luatexbase}',
+    '\\directlua{luatexbase.add_to_callback("process_input_buffer",',
+    '  function(line) return (line:gsub("@@RAW@@", "Converted")) end, "tdom-test-rewrite")}',
+    '',
+  ].join('\n'));
+  const source = [
+    '\\documentclass{article}', '\\usepackage{rewrite}', '\\begin{document}',
+    'First paragraph with @@RAW@@ inside.', '',
+    'Second paragraph.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const text = (needle) => {
+    const block = eng.blocks.find((b) => b.text.includes(needle));
+    return (block?.galley?.items ?? []).filter((it) => it.runs).map((it) => it.runs.map((r) => r.t ?? '').join('')).join(' ');
+  };
+  try {
+    await eng.open(source);
+    assert.match(text('First paragraph'), /Converted/);
+    assert.doesNotMatch(text('First paragraph'), /@@RAW@@|RAW/);
+    const at = eng.getSource().indexOf('Second paragraph');
+    await eng.edit(at, at, 'Now @@RAW@@ here. ');
+    assert.match(text('Second paragraph'), /NowConvertedhere\./, 'the keystroke path rewrites too'); // runs carry no inter-word glue
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an edit in two distant places keeps the checkpoints between them and skips the clean blocks (#96)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-two-regions-'));
+  const para = (k) => `Paragraph ${k} with enough ordinary prose to fill a couple of lines in the preview of this test document.`;
+  const doc = (first, last) => ['\\documentclass{article}', '\\begin{document}',
+    ...Array.from({ length: 24 }, (_, k) => (k === 1 ? first : k === 22 ? last : para(k)) + '\n'), '\\end{document}', ''].join('\n');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh'), docDir: root });
+  try {
+    await eng.open(doc(para(1), para(22)));
+    await eng.bgTask;
+    const before = eng.checkpoints.size;
+    const edited = doc(para(1) + ' An early change.', para(22) + ' A late change.');
+    const r = await eng.edit(0, eng.getSource().length, edited);
+    await eng.bgTask;
+    const trace = eng.lastWalkTrace?.blocks ?? [];
+    assert.ok(trace.some(([, , flags]) => String(flags).startsWith('skip>')), `the walk skipped to the second region: ${JSON.stringify(trace)}`);
+    assert.ok(r.stats.blocksTypeset < 16, `blocks typeset: ${r.stats.blocksTypeset} ${JSON.stringify(trace)} ckpts ${[...eng.checkpoints.keys()]}`);
+    assert.ok((eng.diffStats?.multiRegion ?? 0) >= 1);
+    assert.ok(eng.checkpoints.size >= Math.min(before, 3));
+    // the same layout as a document opened with the new text
+    await fresh.open(edited);
+    assert.equal(eng.pages.length, fresh.pages.length);
+    assert.deepEqual(eng.blocks.map((b) => b.galleyHash), fresh.blocks.map((b) => b.galleyHash));
+  } finally {
+    await eng.close();
+    await fresh.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a touched \\input or \\include file whose bytes did not change does not advance srcRev', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-external-input-'));
+  const one = path.join(root, 'one.tex');
+  const two = path.join(root, 'two.tex');
+  writeFileSync(one, 'First chapter paragraph with ordinary prose.\n');
+  writeFileSync(two, 'Second chapter paragraph with ordinary prose.\n');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  // refresh on each event as server.js does, unless a step drives it itself
+  const events = [];
+  const refreshes = [];
+  let autoRefresh = true;
+  eng.onExternalChange = (file) => {
+    events.push(file);
+    if (autoRefresh) refreshes.push(eng.refresh({ changed: [file] }));
+  };
+  const until = async (done, what) => {
+    const deadline = Date.now() + 10_000;
+    while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(done(), what);
+  };
+  try {
+    await eng.open([
+      '\\documentclass{article}',
+      '\\begin{document}',
+      '\\input{one}',
+      '',
+      '\\include{two}',
+      '',
+      '\\end{document}',
+      '',
+    ].join('\n'));
+    const opened = eng.srcRev;
+    const dropped = eng.unchangedInputEvents;
+    // what indexers and sync clients do: a touch, and a rewrite of the same bytes
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(one, later, later);
+    writeFileSync(two, readFileSync(two));
+    await until(() => eng.unchangedInputEvents >= dropped + 2, 'both watcher events fired');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(eng.srcRev, opened, 'unchanged bytes leave srcRev alone');
+    assert.deepEqual(events, []);
+
+    writeFileSync(one, 'First chapter paragraph, revised on disk.\n');
+    await until(() => events.length === 1, 'a byte change reaches onExternalChange');
+    assert.equal(events[0], one);
+    await Promise.all(refreshes);
+    assert.ok(eng.srcRev > opened);
+    assert.ok(eng.blocks.some((b) => b.text.includes('revised on disk')));
+    // the overlay of this same save, arriving after the watcher's refresh,
+    // changes no input (server /edit); other bytes still do
+    assert.equal(includeHoldsText(eng.includes, one, 'First chapter paragraph, revised on disk.\n'), true);
+    assert.equal(includeHoldsText(eng.includes, one, 'First chapter paragraph, revised again.\n'), false);
+
+    // A resident update that re-reads new child bytes without invalidating
+    // them on canonical (a cold resume; here a root keystroke) must not
+    // swallow the watcher event those bytes raise.
+    autoRefresh = false;
+    writeFileSync(two, 'Second chapter paragraph, revised before its event.\n');
+    const at = eng.getSource().indexOf('\\end{document}');
+    await eng.edit(at, at, 'Closing root paragraph.\n\n');
+    assert.ok(eng.blocks.some((b) => b.text.includes('revised before its event')), 'the keystroke re-read the child');
+    assert.equal(includeReadCurrent(eng.includes, two), false, 'canonical was not told about these bytes');
+    assert.equal(includeHoldsText(eng.includes, two, 'Second chapter paragraph, revised before its event.\n'), false);
+    await until(() => events.length === 2, 'the event still reaches onExternalChange');
+    assert.equal(events[1], two);
+    await eng.refresh({ changed: [two] });
+    assert.equal(includeReadCurrent(eng.includes, two), true);
+    assert.equal(includeHoldsText(eng.includes, two, 'Second chapter paragraph, revised before its event.\n'), true);
+
+    autoRefresh = true;
+    const refreshed = eng.srcRev;
+    const droppedAfter = eng.unchangedInputEvents;
+    utimesSync(two, later, later);
+    await until(() => eng.unchangedInputEvents > droppedAfter, 'the touch after the refresh fired');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(eng.srcRev, refreshed);
+    assert.equal(events.length, 2);
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a touched listing or mid-paragraph \\input whose bytes did not change leaves its block clean and srcRev alone', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-external-resource-'));
+  const code = path.join(root, 'code.txt');
+  const frag = path.join(root, 'frag.tex');
+  writeFileSync(code, 'int main(void) { return 0; }\n');
+  writeFileSync(frag, 'an inline fragment');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const events = [];
+  const refreshes = [];
+  let autoRefresh = true;
+  eng.onExternalChange = (file) => {
+    events.push(file);
+    if (autoRefresh) refreshes.push(eng.refresh({ changed: [file] }));
+  };
+  const until = async (done, what) => {
+    const deadline = Date.now() + 10_000;
+    while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(done(), what);
+  };
+  const hashes = () => eng.blocks.map((b) => b.hash).join('|');
+  try {
+    await eng.open([
+      '\\documentclass{article}',
+      '\\usepackage{verbatim}',
+      '\\begin{document}',
+      'Before the listing.',
+      '',
+      '\\verbatiminput{code.txt}',
+      '',
+      'Text with \\input{frag} inside a paragraph.',
+      '',
+      '\\end{document}',
+      '',
+    ].join('\n'));
+    const opened = eng.srcRev;
+    const identity = hashes();
+    const dropped = eng.unchangedInputEvents;
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(code, later, later);
+    writeFileSync(frag, readFileSync(frag));
+    await until(() => eng.unchangedInputEvents >= dropped + 2, 'both watcher events fired');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(eng.srcRev, opened, 'unchanged bytes leave srcRev alone');
+    assert.deepEqual(events, []);
+    // a later expansion (a keystroke) sees the new mtimes: block identity is by content
+    const at = eng.getSource().indexOf('Before the listing.');
+    await eng.edit(at, at, 'X');
+    await eng.edit(at, at + 1, '');
+    assert.equal(hashes(), identity, 'a touch does not dirty the owning blocks');
+
+    writeFileSync(code, 'int main(void) { return 1; }\n');
+    await until(() => events.length === 1, 'a byte change reaches onExternalChange');
+    assert.equal(events[0], code);
+    await Promise.all(refreshes);
+    assert.notEqual(hashes(), identity, 'the listing block is dirty after a real change');
+
+    // A keystroke that re-reads new resource bytes before their watcher event
+    // must not swallow that event: canonical has not been told about them.
+    autoRefresh = false;
+    writeFileSync(frag, 'a revised fragment');
+    await eng.edit(at, at, 'Y');
+    assert.equal(inputReadCurrent(eng.includes, eng.resourceReads, frag), false);
+    await until(() => events.length === 2, 'the event still reaches onExternalChange');
+    assert.equal(events[1], frag);
+    await eng.refresh({ changed: [frag] });
+    assert.equal(inputReadCurrent(eng.includes, eng.resourceReads, frag), true);
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an \\input file saved by renaming a new file over it keeps reaching onExternalChange', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-atomic-input-'));
+  const one = path.join(root, 'one.tex');
+  writeFileSync(one, 'First chapter paragraph with ordinary prose.\n');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const events = [];
+  const refreshes = [];
+  eng.onExternalChange = (file) => {
+    events.push(file);
+    refreshes.push(eng.refresh({ changed: [file] }));
+  };
+  const until = async (done, what) => {
+    const deadline = Date.now() + 10_000;
+    while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(done(), what);
+  };
+  const shows = (text) => eng.blocks.some((b) => b.text.includes(text));
+  // what vim and sync clients do: write a temp file, rename it over the input
+  const replace = (text) => {
+    writeFileSync(`${one}.tmp`, text);
+    renameSync(`${one}.tmp`, one);
+  };
+  try {
+    await eng.open([
+      '\\documentclass{article}',
+      '\\begin{document}',
+      '\\input{one}',
+      '',
+      '\\end{document}',
+      '',
+    ].join('\n'));
+    const opened = eng.srcRev;
+    const dropped = eng.unchangedInputEvents;
+
+    // A save without changes swaps the inode but not the bytes: no refresh
+    // re-expands the file, so only the watcher itself can follow the path.
+    replace(readFileSync(one));
+    await until(() => eng.unchangedInputEvents > dropped, 'the same-bytes replace fired');
+    assert.equal(eng.srcRev, opened);
+    writeFileSync(one, 'First chapter paragraph, edited in place after a save.\n');
+    await until(() => shows('edited in place after a save'), 'an in-place write after the replace reaches the resident');
+    await Promise.all(refreshes);
+    assert.deepEqual(events, [one]);
+
+    replace('First chapter paragraph, replaced on disk.\n');
+    await until(() => shows('replaced on disk'), 'the atomic replace reaches the resident');
+    writeFileSync(one, 'First chapter paragraph, replaced and then edited in place.\n');
+    await until(() => shows('replaced and then edited in place'), 'the in-place write after it reaches the resident');
+    await Promise.all(refreshes);
+    assert.ok(events.length >= 3 && events.every((file) => file === one));
+    assert.ok(eng.watchers.has(one));
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a deleted include watch still delivers, then leaves the map until an expansion reads the file again', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-deleted-input-'));
+  const one = path.join(root, 'one.tex');
+  writeFileSync(one, 'before\n');
+  const watchers = new Map();
+  const events = [];
+  const until = async (done, what) => {
+    const deadline = Date.now() + 5_000;
+    while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(done(), what);
+  };
+  // libuv registers a watch on a later loop turn
+  const armed = () => new Promise((r) => setTimeout(r, 100));
+  try {
+    watchInclude(one, watchers, (file) => events.push(file));
+    await armed();
+    rmSync(one);
+    await until(() => events.length === 1, 'the deletion is delivered');
+    assert.equal(events[0], one);
+    assert.equal(watchers.has(one), false, 'a missing path is left to the next expansion');
+
+    writeFileSync(one, 'after\n');
+    watchInclude(one, watchers, (file) => events.push(file));
+    await armed();
+    writeFileSync(one, 'after, edited\n');
+    await until(() => events.length === 2, 'the path is watched again');
+  } finally {
+    for (const watcher of watchers.values()) watcher.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

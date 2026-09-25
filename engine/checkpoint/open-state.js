@@ -45,6 +45,9 @@ export function resetOpenState(engine, text, file) {
   engine.modeReasons = [];
   engine.previewPolicy = 'structured';
   engine.previewReasons = [];
+  // An opaque predecessor left the canonical at display pressure; the new
+  // document's gate sets it again if it is opaque too.
+  engine.canonical.pressure = 'authority';
   engine.opaqueStickyPre = null;
   engine.verifyState = null;
   engine.pendingChain = null;
@@ -63,7 +66,11 @@ export function resetOpenState(engine, text, file) {
   engine.renderWant = new Map();
   engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };
   engine.renderHold = new Map();
+  engine.coldPreviewHolds = new Map();
+  engine.coldDirty = new Set(); // a cold keystroke of the previous document never resumes here
+  engine.coldTrace = null;
   engine.rescueQueue = new Map();
+  engine.rescueFocus = new Set();
   engine.tocHash = null;
   engine.hf = new Map();
   engine.hfSig = null;
@@ -72,6 +79,7 @@ export function resetOpenState(engine, text, file) {
   engine.hfQueuedSig = null;
   engine.diagnostics.length = 0;
   engine.includes.clear();
+  engine.resourceReads.clear();
   engine.shippingIncludeTrace = [];
   engine.shipPendingInputChanges = null;
   engine.shipGenSnapshot?.clear();

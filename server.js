@@ -16,7 +16,7 @@
 
 import http from 'node:http';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -43,6 +43,7 @@ import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read
 import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
 import { buildLeasePreviewSettlement } from './engine/checkpoint/build-lease-preview.js';
 import { watchInclude } from './engine/checkpoint/include-expander.js';
+import { includeHoldsText, inputReadCurrent, rebindIncludeRead } from './engine/checkpoint/include-cache.js';
 import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
 
 // Certified canonical anchoring is deliberately narrow: only plain-text
@@ -570,6 +571,22 @@ function buildLeaseBinding(projectRoot, mainFile) {
   return { root, file, bound };
 }
 
+// An overlay is rewritten on every keystroke while a canonical compile, the
+// ShippingChain or an isolated rescue may be reading it. An in-place write
+// lets such a reader splice the old head onto the new tail ("String contains
+// an invalid utf-8 sequence" in the middle of an unedited line). A rename
+// swaps the whole file: an open reader keeps the bytes it started with.
+function writeOverlayFile(target, text) {
+  const tmp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.tmp`);
+  try {
+    writeFileSync(tmp, text, 'utf8');
+    renameSync(tmp, target);
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
+}
+
 function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = {}, replace = false) {
   if (!context.overlayDir) return { changed: [], removed: [], saved: [] };
   context.savedOverlays ??= new Map();
@@ -604,7 +621,7 @@ function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = 
     const rel = path.relative(context.docDir, filePath);
     const target = path.join(context.overlayDir, rel);
     mkdirSync(path.dirname(target), { recursive: true });
-    writeFileSync(target, text, 'utf8');
+    writeOverlayFile(target, text);
     context.overlays.set(filePath, text);
     changed.push(filePath);
   }
@@ -812,7 +829,7 @@ function refreshProjectBibliography(changedFile) {
       ensureProjectOutputDirectories(source);
       await materializeProjectBibliography(source, activeProject);
       await engine.canonical.waitForBuildLease();
-      lastReport = await engine.open(source, activeProject.file);
+      lastReport = await engine.open(source, activeProject.file, { projectSeeds: false });
       completeDocumentReset(resetEpoch);
     } else {
       await materializeProjectBibliography(source, activeProject);
@@ -901,6 +918,9 @@ engine.onExternalChange = (changedInput) => {
     // An overlay can land while this refresh waits behind the edit that
     // carries it; the write then no longer changes any TeX input.
     if (diskChangeShadowedByOverlay(activeProject, changedFile)) return lastReport;
+    // A refresh queued ahead of this one may already have read these bytes
+    // and invalidated them on canonical.
+    if (changedFile && inputReadCurrent(engine.includes, engine.resourceReads, changedFile)) return lastReport;
     const retired = retireSavedOverlay(activeProject, changedFile);
     const source = engine.getSource();
     const nextBibliography = describeExternalBibliography(source, activeProject.docDir, activeProject.overlayDir);
@@ -918,7 +938,7 @@ engine.onExternalChange = (changedInput) => {
       ensureProjectOutputDirectories(source);
       await materializeProjectBibliography(source, activeProject);
       await engine.canonical.waitForBuildLease();
-      lastReport = await engine.open(source, activeProject.file);
+      lastReport = await engine.open(source, activeProject.file, { projectSeeds: false });
       completeDocumentReset(resetEpoch);
       broadcast({ kind: 'update', report: lastReport });
       return lastReport;
@@ -1660,6 +1680,19 @@ const server = http.createServer(async (req, res) => {
         rev: engine.rev,
         srcRev: engine.srcRev,
         documentEpoch,
+        unchangedInputEvents: engine.unchangedInputEvents,
+        diffStats: engine.diffStats ?? null,
+        // preamble edits served without a reboot (tex64-internal #93)
+        preamblePatches: engine.preamblePatches ?? 0,
+        lastPreamblePatch: engine.lastPreamblePatch ?? null,
+        // the last foreground walk, without its per-block rows
+        lastWalk: engine.lastWalkTrace ? {
+          from: engine.lastWalkTrace.from, firstDirty: engine.lastWalkTrace.firstDirty,
+          lastDirty: engine.lastWalkTrace.lastDirty, typeset: engine.lastWalkTrace.typeset ?? null,
+          stop: engine.lastWalkTrace.stop ?? null, verdict: engine.lastWalkTrace.verdict ?? null,
+          ms: engine.lastWalkTrace.ms ?? null,
+          skips: (engine.lastWalkTrace.blocks ?? []).filter(([, , f]) => String(f).startsWith('skip>')).map(([k, , f]) => `${k}${f.slice(4)}`),
+        } : null,
         progress: engine.progress ?? null,
         // pages the resident layout has right now (async rescues and
         // repaginations move it between edit reports)
@@ -1670,6 +1703,7 @@ const server = http.createServer(async (req, res) => {
           active: [...(engine.rendering ?? [])],
           pids: Object.fromEntries(engine.renderPids ?? []),
           stats: engine.renderStats,
+          timings: (engine.renderTimings ?? []).slice(-12),
         },
         rescue: {
           queued: engine.rescueQueue?.size ?? 0,
@@ -1677,6 +1711,10 @@ const server = http.createServer(async (req, res) => {
           disk: engine.isoDiskCache?.stats ?? null,
           realRoot: engine.realRoot?.pid ?? null,
           rootPid: engine.root?.pid ?? null,
+          // package-declared breakable boxes sent to the real routine
+          // because they did not fit from their entry offset (#88)
+          contextRescues: engine.contextRescues ?? 0,
+          packageBreakable: engine._packageBreakableRe ? String(engine._packageBreakableRe).split('|').length : 0,
           log: (engine.rescueLog ?? []).slice(-60),
         },
         shipping: engine.shipping?.info?.() ?? null,
@@ -1684,6 +1722,7 @@ const server = http.createServer(async (req, res) => {
         canonicalAnchorPresentation: lastAnchorPresentation,
         canonicalAnchorInputDiagnostic: lastReport?.canonicalAnchorInputDiagnostic ?? null,
         warm: engine.warmInfo ?? null,
+        coldPreviews: engine.coldPreviews ?? 0,
         cold: engine.coldDirty?.size
           ? { pending: [...engine.coldDirty], walk: engine.progress?.phase === 'cold' ? engine.progress : null }
           : null,
@@ -2370,6 +2409,16 @@ const server = http.createServer(async (req, res) => {
             }
           }
           const overlayDelta = applyProjectOverlays(activeProject, body);
+          // The autosave of this keystroke can reach the engine first, through
+          // the watcher, while this request waits behind an earlier edit: an
+          // overlay of the bytes the engine already read is no input change
+          // (measured: a second 4 s update behind a jump in the 316-page book).
+          overlayDelta.changed = overlayDelta.changed.filter((file) => {
+            if (!includeHoldsText(engine.includes, file, activeProject.overlays.get(file))) return true;
+            rebindIncludeRead(engine.includes, file,
+              path.join(activeProject.overlayDir, path.relative(activeProject.docDir, file)));
+            return false;
+          });
           const changedInputs = [...overlayDelta.changed, ...overlayDelta.removed];
           if (!rootChanged && !changedInputs.length) {
             // Saving an overlay's bytes leaves every TeX input as it was: no
@@ -2458,7 +2507,7 @@ const server = http.createServer(async (req, res) => {
               force: true,
             });
             await materializeProjectBibliography(next, activeProject);
-            const report = await engine.open(next, activeProject.file);
+            const report = await engine.open(next, activeProject.file, { projectSeeds: false });
             return report;
           }
           const preambleInputChanged = changedInputs.some((file) =>
@@ -2473,7 +2522,7 @@ const server = http.createServer(async (req, res) => {
               force: true,
             });
             await materializeProjectBibliography(next, activeProject);
-            const report = await engine.open(next, activeProject.file);
+            const report = await engine.open(next, activeProject.file, { projectSeeds: false });
             return report;
           }
           let primaryReport;
@@ -2505,6 +2554,15 @@ const server = http.createServer(async (req, res) => {
         throw err;
       }
       if (inputUnchanged) return json(res, lastReport);
+      // when this keystroke reached the server and left the engine (epoch ms)
+      lastReport.timing = {
+        clientEditAtEpochMs: Number.isFinite(Number(body.clientEditAtEpochMs)) ? Number(body.clientEditAtEpochMs) : null,
+        receivedAtEpochMs: nowEpoch,
+        engineDoneAtEpochMs: Date.now(),
+        lock: engine.lastLock ?? null,
+        walk: engine.lastWalkTrace ?? null,
+        coldWalk: engine.coldWalkTrace?.slice(-24) ?? null,
+      };
       if (Number(lastAnchorPresentation?.srcRev) !== Number(lastReport.srcRev)) {
         lastAnchorPresentation = null;
       }
@@ -2739,7 +2797,7 @@ const server = http.createServer(async (req, res) => {
           }
           let openCompleted = false;
           try {
-            lastReport = await engine.open(text, context.file);
+            lastReport = await engine.open(text, context.file, { canonicalBaseline: !preparedImport });
             openCompleted = true;
             if (preparedImport) {
               if (engine.srcRev !== expectedSrcRev || engine.getSource() !== text ||

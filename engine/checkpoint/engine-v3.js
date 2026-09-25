@@ -44,7 +44,7 @@
 // into an SVG chunk, swapped in asynchronously.
 
 import net from 'node:net';
-import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureShim } from './forkshim.js';
@@ -56,14 +56,17 @@ import { resetOpenState } from './open-state.js';
 import { initializeEngineState } from './constructor-state.js';
 import { awaitWaiter, fulfillWaiter, rejectWaiter } from './waiters.js';
 import { abortBackgroundJob } from './abort-background-job.js';
+import { editElsewhereThanWalk, endWalkRetain, walkKillPaysOff } from './walk-preemption.js';
 import { Timer } from './timer.js';
 import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
 import { computeToc, pageSpecs, hfJobBody } from './page-metadata.js';
 import { chunkTargets } from './chunk-targets.js';
+import { focusRescueIds } from './update-helpers.js';
 import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, includeOnlyFromSource, watchInclude } from './include-expander.js';
-import { needsRescue } from './rescue-classifier.js';
+import { announceIncludeReads, announceResourceReads, inputReadCurrent } from './include-cache.js';
+import { needsRescue, projectPackageText } from './rescue-classifier.js';
 import { scheduleHeaders as scheduleHeadersHelper } from './header-scheduler.js';
 import {
   normalizeGalleyFonts,
@@ -80,6 +83,7 @@ import { mayCaptureNativeBlock, mayNeedRender, releaseRenderHold } from './rende
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
 import { preemptResidentRenders, queueRender as queueRenderHelper } from './render-pump.js';
+import { startResidentRender } from './resident-render.js';
 import { withReplaceablePreviewJob } from './build-lease-preview.js';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 import { queueMovedOffsets as queueMovedOffsetsHelper } from './rescue-offsets.js';
@@ -136,6 +140,7 @@ import {
   buildVolatilePrelude,
 } from './tex-templates.js';
 import { isoCompile as isoCompileHelper } from './iso-compile.js';
+import { fnv1a } from '../hash.js';
 import { buildJobBlockBody } from './job-body.js';
 import { classifyPlainPreviewEdit } from './plain-preview.js';
 
@@ -180,9 +185,31 @@ export class CheckpointEngine {
 
   // ------------------------------------------------------------ lifecycle
 
-  async open(text, file = 'main.tex') {
+  async open(text, file = 'main.tex', { canonicalBaseline = true, projectSeeds = true } = {}) {
     resetOpenState(this, text, file);
-    return this.#update({ editLabel: 'open' });
+    // The canonical baseline compiles the opened source by itself and needs
+    // nothing from the resident tree: start it beside the boot walk instead
+    // of after it. On the 316-page book the walk (76 s) and the 3-pass
+    // baseline (125 s) ran in series, and no keystroke could be anchored
+    // until both had finished. Every open path ends with exactly one srcRev
+    // increment and schedule() of this same text; that call finds this job
+    // running, or its generation current (#reconcile), and adds no compile.
+    // An open that adopts a Build generation right after skips it (and
+    // places that Build's aux family instead of the project's last one); a
+    // reopen for a changed bibliography or preamble input starts its aux
+    // from nothing, as before.
+    const source = this.store.get(file);
+    const reserved = this.srcRev + 1;
+    this.canonical.restoreProjectSeeds(file, source, { place: canonicalBaseline && projectSeeds });
+    if (canonicalBaseline && process.env.TDOM_CANON_EARLY_BASELINE !== '0') this.canonical.schedule(source, reserved);
+    try {
+      return await this.#update({ editLabel: 'open' });
+    } catch (error) {
+      // The baseline may still land as `reserved`: never publish another
+      // source under that revision.
+      if (canonicalBaseline && this.srcRev < reserved) this.srcRev = reserved;
+      throw error;
+    }
   }
 
   /**
@@ -218,6 +245,7 @@ export class CheckpointEngine {
       }
       this.watchers.clear();
       this.includes.clear();
+      this.resourceReads.clear();
       this.preHash = null;
       this.preGate = null;
       this.opaqueStickyPre = null;
@@ -300,6 +328,9 @@ export class CheckpointEngine {
     // A page is published atomically. Warm its missing exact neighbors too;
     // a fast edited chunk alone cannot replace an otherwise unpaintable page.
     const targetId = this.blocks[target].id;
+    // and bring the caret page's queued rescues to the front of the pump
+    const focus = focusRescueIds(this.pages, new Set([targetId]), this.rescueQueue);
+    if (focus.size) this.rescueFocus = focus;
     const pageIds = new Set(this.pages.filter(page => page.draw?.some(draw => draw.u?.blockId === targetId))
       .flatMap(page => page.draw.map(draw => draw.u?.blockId)));
     const missing = this.blocks.map((block, index) => ({ block, index })).filter(({ block }) =>
@@ -356,6 +387,10 @@ export class CheckpointEngine {
       const beforeChunksRev = this.chunks.rev;
       this.bgActive = true;
       this.warming = true;
+      this.bgWalkTarget = target;
+      this.walkRetains = true;
+      this.walkRetainedAt = performance.now();
+      this.walkRetainedIdx = null;
       let replayed;
       try {
         replayed = await this.#retypesetChain(
@@ -371,6 +406,8 @@ export class CheckpointEngine {
       } finally {
         this.bgActive = false;
         this.warming = false;
+        this.bgWalkTarget = null;
+        endWalkRetain(this);
       }
       if (replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev) {
         // Pin the boundary this walk reached so the warm that superseded it
@@ -569,7 +606,15 @@ export class CheckpointEngine {
     if (!ck) throw new Error(`no checkpoint at ${idx} for block ${block.id}`);
     this.jobInput = ck;
     await this.#reapDying(); // bound the live-fork set before minting ckpt idx+1
-    const { body, jobId, refSnapshot } = buildJobBlockBody({
+    // an edit that arrived meanwhile found no job to kill (#update): do not
+    // start one it would wait for
+    if (this.bgAbort && this.bgActive) {
+      this.jobInput = null;
+      const err = new Error('background pass aborted (edit waiting)');
+      err.tdomAborted = true;
+      throw err;
+    }
+    const { body, jobId, refSnapshot, prelude: jobPrelude } = buildJobBlockBody({
       block,
       idx,
       blocks: this.blocks,
@@ -579,6 +624,7 @@ export class CheckpointEngine {
       hrefTable: this.hrefTable,
       geometry: this.geometry,
       volatilePrelude: (i) => this.#volatilePrelude(i),
+      defsPrelude: this.#defsPreludeFor(block),
     });
     const galleyKey = 'galley:' + jobId;
     const ckptKey = 'ckpt:' + (idx + 1);
@@ -588,8 +634,9 @@ export class CheckpointEngine {
     // unhandled rejection after Promise.all already bailed on the first one
     galleyP.catch(() => {});
     ckptP.catch(() => {});
-    this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1 };
+    this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1, startedAt: performance.now() };
     let advance = false;
+    let early = null;
     try {
       // An exact-render JOB already owns the exact TeX node list that the
       // asynchronous preview needs.  Retain it in the post-block checkpoint
@@ -604,9 +651,20 @@ export class CheckpointEngine {
           this.#checkpointKeepSet().has(idx + 1))
           ? `c${++this.captureSeq}`
           : '-';
-      const interactive = !override && !!block.galley &&
-        (this.updating && !this.bgActive || this.warming);
+      // Every JOB the edit waits for runs at the foreground QoS, including the
+      // @state continuation of a rescued block and a block with no galley yet
+      // (docs/03 §3.2).
+      const interactive = this.updating && !this.bgActive || this.warming;
       const previous = this.blocks[idx - 1];
+      // A background walk keeps one boundary per walkRetainMs of replay
+      // (docs/10 §10.4a): an edit that kills its step then loses at most that
+      // much, and the next walk starts there.
+      if (replayToken && !override && this.bgActive && this.walkRetains &&
+          performance.now() - (this.walkRetainedAt ?? 0) > this.walkRetainMs && !this.editHold.includes(idx)) {
+        this.editHold = [idx, ...this.editHold.filter((k) => k !== this.walkRetainedIdx)].slice(0, 8);
+        this.walkRetainedIdx = idx;
+        this.walkRetainedAt = performance.now();
+      }
       advance = !!replayToken && ck.replayToken === replayToken && !override &&
         !this.#checkpointKeepSet().has(idx) && !this.editHold.includes(idx) && !this.renderHold.has(idx) &&
         !this.renderWant.has(previous?.id) &&
@@ -618,14 +676,48 @@ export class CheckpointEngine {
         this.currentJob.pid = ck.pid;
       }
       const calibrate = !override && this.calibrateInitialHeap && idx === this.blocks.length - 1;
-      const liveFloor = Math.max(Number(block.galley?.gcFloorKb) || 0, this.confirmedLiveHeapKb || 0);
+      // the largest live heap measured in this root (reset with the root: a
+      // galley kept from an older root does not carry its floor over)
+      const liveFloor = this.confirmedLiveHeapKb || 0;
       ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}\n`);
       ck.sendRaw(body);
+      // The block this edit changed ships its exact RENDER beside its JOB,
+      // forked from the same entry state with the JOB's own prelude (label
+      // definitions, \lastskip primer), instead of after the update ends
+      // (docs/10 §10.4c): the pump then only crops that PDF. An edited block
+      // is always a fork JOB (a walk consumes only clean blocks before the
+      // first dirty one), so its input stays alive for the RENDER. One per
+      // update, only the first keystroke after a pause with none waiting
+      // behind it, and never for a block the pump can CAPTURE from this
+      // JOB's node list.
+      if (!override && !advance && !(capture !== '-' && mayCaptureNativeBlock(block)) &&
+          block.sourceChanged && block.needsRender && !ck.vstale &&
+          this.updating && !this.bgActive && this.coldPreviewEarlyRender && this.earlyRenderUpdate !== this.updateSeq &&
+          (this.editGapMs ?? 0) > 400 && !(this.keystrokePending > 0)) {
+        try {
+          early = startResidentRender(this, {
+            block,
+            ck,
+            checkpointIndex: idx,
+            body: Buffer.from(jobPrelude + block.text, 'utf8'),
+            awaitRender: (key, timeout) => this.#await(key, timeout),
+          });
+          this.earlyRenderUpdate = this.updateSeq;
+          const unused = early;
+          setTimeout(() => unused.discard(), 30_000).unref?.();
+        } catch (err) {
+          // an optimisation that failed (job dir): the pump renders as before
+          this.diagnostics.push(`early render ${block.id}: ${err?.message ?? err}`);
+          early = null;
+        }
+      }
       const [galley, nextCheckpoint] = await Promise.all([galleyP, ckptP]);
       nextCheckpoint.replayToken = replayToken;
-      galley.gcFloorKb = nextCheckpoint.gcFloorKb;
       this.confirmedLiveHeapKb = Math.max(this.confirmedLiveHeapKb || 0, nextCheckpoint.gcFloorKb || 0);
       if (process.env.TDOM_TRACE_JOB) console.error('[job-gc]', jobId, JSON.stringify({ interactive, gcMs: nextCheckpoint.gcMs, ...galley.tm }));
+      // a keystroke waiting on this background step waited for its collect
+      // too (report timing: lock.gcWaitedMs)
+      if (!interactive) this.bgGcMsTotal = (this.bgGcMsTotal ?? 0) + (nextCheckpoint.gcMs ?? 0);
       block.typesetCleanupMs = (block.typesetCleanupMs ?? 0) + (nextCheckpoint.gcMs ?? 0);
       if (!override && block.nativeClosureRequired !== false && galley.closure === 'error') {
         const bad = this.checkpoints.get(idx + 1);
@@ -656,8 +748,13 @@ export class CheckpointEngine {
       if (calibrate) this.calibrateInitialHeap = false;
       if (!advance) this.#retireOffGrid(idx);
       this.#enforceCheckpointCap(idx + 1);
+      // the pump takes it only for this galley (render-pump.js)
+      if (early) galley.tdomEarlyRender = early;
+      // the pump's own RENDER of this galley uses the same label definitions
+      if (!override && !ck.vstale) galley.tdomRenderPrelude = jobPrelude;
       return galley;
     } catch (err) {
+      early?.discard();
       // A stuck fork child (e.g. a TeX infinite loop in this block) never
       // reads DIE from its socket — kill it hard or it spins at full CPU
       // forever. The pid arrived with the FORKED announcement. Guard > 0:
@@ -714,6 +811,7 @@ export class CheckpointEngine {
       !block.rescued && !this.poisoned.has(block.id) &&
       !block.galley.tdomDeferred && !block.galley.tdomFrozen &&
       !block.galley.tdomPendingPaint && !block.galley.tdomStale;
+    let killed = false;
     try {
       return await typesetBlockHelper(this, idx, {
         needsRescue: (text, structuralSinks) => this.#needsRescue(text, structuralSinks),
@@ -727,11 +825,16 @@ export class CheckpointEngine {
         sourceClosure,
         sourceRequiresCanonicalOnly,
       });
+    } catch (err) {
+      // a background walk an edit killed mid-block (#update): its partial
+      // time is no sample of the block's cost (the minimum is kept)
+      killed = this.bgAbort && this.bgActive;
+      throw err;
     } finally {
       // Session-high-water cost is intentional: a later rescue-cache hit
       // must not make the scheduler forget the expensive cold replay that a
       // distant edit would pay again after checkpoint retirement.
-      this.#recordTypesetCost(block, performance.now() - started - block.typesetCleanupMs);
+      if (!killed) this.#recordTypesetCost(block, performance.now() - started - block.typesetCleanupMs);
     }
   }
 
@@ -813,11 +916,14 @@ export class CheckpointEngine {
       preHash: this.preHash,
       breakableFor: this._breakableFor,
       breakableRe: this._breakableRe,
+      packageBreakableRe: this._packageBreakableRe,
       source: () => this.store.get(this.file) ?? '',
+      packageText: (preamble) => projectPackageText(preamble, { docDir: this.docDir, overlayDir: this.overlayDir }),
       structuralSinks,
     });
     if (result.breakableFor !== this._breakableFor) this._breakableFor = result.breakableFor;
     if (result.breakableRe !== this._breakableRe) this._breakableRe = result.breakableRe;
+    if (result.packageBreakableRe !== this._packageBreakableRe) this._packageBreakableRe = result.packageBreakableRe;
     return result.needs;
   }
 
@@ -835,7 +941,7 @@ export class CheckpointEngine {
     return rescueCacheKey(block, idx, {
       blocks: this.blocks,
       labelTable: this.labelTable,
-      preHash: this.preHash,
+      preHash: this.#rescuePre(block),
     });
   }
 
@@ -884,6 +990,161 @@ export class CheckpointEngine {
     this.#isoDiskCache()?.set(key, iso, baseKey);
   }
 
+  #releaseColdPreviewHold(peer, blockId) {
+    const owners = this.coldPreviewHolds?.get(peer);
+    if (!owners?.delete(blockId) || owners.size) return;
+    this.coldPreviewHolds.delete(peer);
+  }
+
+  // checkpoints a cold preview forked, kept until its exact pixels land
+  #coldPreviewHeld() {
+    return this.coldPreviewHolds?.size
+      ? checkpointIndicesForPeers(this.checkpoints, [...this.coldPreviewHolds.keys()]) : [];
+  }
+
+  /**
+   * Cold preview (docs/10 §10.4b): the one edited block, typeset natively in
+   * a fork of the checkpoint the walk starts from, with the entry state of
+   * its (unchanged) predecessor re-seeded exactly as for a vstale lineage
+   * (#volatilePrelude): one block's typeset instead of the replay of every
+   * clean block in between. The child reports its galley and is not kept:
+   * nobody waits for its checkpoint slot (-1), so it is told to DIE.
+   * The peer stays resident (coldPreviewHolds) until the preview's exact
+   * RENDER from it is done, a walk replaces the preview, or 30 s pass.
+   * Returns { galley: Promise, cancel, release } or null.
+   */
+  #coldPreview(idx, fromIdx) {
+    if (!this.coldPreviewEnabled || this.mode !== 'structured' || this.previewPolicy !== 'structured') return null;
+    const block = this.blocks[idx];
+    const ck = this.checkpoints.get(fromIdx);
+    // the gates typeset-dispatch applies before an in-chain JOB
+    if (!block || !ck || !(fromIdx < idx) || this.poisoned.get(block.id) === fnv1a(block.text) ||
+        (this.chainTimeouts ?? 0) > 0 ||
+        this.#needsRescue(block.text, block.structuralSinks)) return null;
+    const { body, jobId: blockJobId, refSnapshot, prelude: jobPrelude } = buildJobBlockBody({
+      block,
+      idx,
+      blocks: this.blocks,
+      ck: { vstale: true },
+      override: null,
+      labelTable: this.labelTable,
+      hrefTable: this.hrefTable,
+      geometry: this.geometry,
+      volatilePrelude: (i) => this.#volatilePrelude(i),
+      defsPrelude: this.#defsPreludeFor(block),
+    });
+    // After a heading the true lineage also carries \@afterheading's
+    // \everypar (the first paragraph's indent); the prelude only restores
+    // the flag
+    const prevVec = JSON.parse(this.blocks[idx - 1]?.stateVec ?? '[]');
+    const afterHeading = prevVec.length >= 2 && prevVec[prevVec.length - 2] === 1
+      ? '\\makeatletter\\@afterheading\\makeatother\n' : '';
+    const prelude = jobPrelude + afterHeading;
+    const text = body.toString('utf8').slice(jobPrelude.length);
+    const payload = Buffer.from(prelude + text, 'utf8');
+    const jobId = `${blockJobId}~cold${++this.coldPreviewSeq}`;
+    // before the walk's first JOB, whose off-grid retirement could take it
+    const owners = this.coldPreviewHolds.get(ck) ?? new Set();
+    owners.add(block.id);
+    this.coldPreviewHolds.set(ck, owners);
+    let early = null;
+    const release = () => this.#releaseColdPreviewHold(ck, block.id);
+    setTimeout(() => {
+      release();
+      early?.discard();
+    }, 30_000).unref?.();
+    const key = 'galley:' + jobId;
+    const galleyP = this.#await(key, this.coldPreviewTimeoutMs);
+    // FORKED fills the pid: a child that dies without a galley fails fast,
+    // and an unused one is killed
+    this.renderPids ??= new Map();
+    this.renderPids.set(jobId, 0);
+    const poll = setInterval(() => {
+      const pid = this.renderPids.get(jobId);
+      if (!(pid > 0)) return;
+      try { process.kill(pid, 0); } catch { this._reject(key, new Error(`cold preview child of ${block.id} exited`)); }
+    }, 200);
+    let settled = false;
+    const galley = galleyP.then((g) => {
+      if (g.closure === 'error') {
+        release();
+        return null;
+      }
+      if (refSnapshot) {
+        g.tdomRefVals = refSnapshot;
+        g.refs = [...new Set([...(g.refs ?? []), ...Object.keys(refSnapshot)])];
+      }
+      // its exact render forks the same peer with the same prelude
+      g.tdomColdPreview = { peer: ck, prelude, text: block.text, early };
+      return g;
+    }).finally(() => {
+      settled = true;
+      clearInterval(poll);
+      this.renderPids.delete(jobId);
+    });
+    const cancel = () => {
+      release();
+      early?.discard();
+      if (settled) return; // the child reported and is on its way to DIE
+      const pid = this.renderPids.get(jobId);
+      if (pid > 0) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      } else {
+        this.cancelledJobIds ??= new Set();
+        this.cancelledJobIds.add(jobId); // killed when FORKED arrives
+        setTimeout(() => this.cancelledJobIds?.delete(jobId), 30_000).unref?.();
+      }
+      this._reject(key, new Error('cold preview unused'));
+    };
+    ck.send(`JOB ${jobId} -1 ${payload.length} - F 0\n`);
+    ck.sendRaw(payload);
+    // The first keystroke after a pause also sends the exact RENDER the pump
+    // would send once the preview is adopted (same peer, prelude and text),
+    // now: the pump then only crops its PDF. In a burst the pump's own quiet
+    // gate decides, so a render is not started and killed per keystroke.
+    if (block.needsRender && this.coldPreviewEarlyRender && (this.editGapMs ?? 0) > 400) {
+      early = startResidentRender(this, {
+        block,
+        ck,
+        checkpointIndex: fromIdx,
+        body: Buffer.from(prelude + block.text, 'utf8'),
+        awaitRender: (key, timeout) => this.#await(key, timeout),
+      });
+    }
+    return { galley, cancel, release };
+  }
+
+  /**
+   * First-ever rescue during a boot walk: compile it on the walk while the
+   * walk's rescue budget (TDOM_BOOT_RESCUE_MS of compile time, default 45 s)
+   * lasts and both fork peers are up, so /open publishes measured pages
+   * instead of placeholders, any one of which holds every page (pagebuilder
+   * buildPages). A cold compile (5+ s per block) is never paid here. The
+   * result is cached like an async rescue's; the boot walk runs before
+   * pagination (page offset 0), and the moved-offset pass re-rescues the
+   * block at its real offset, exactly as for a result adopted from disk.
+   */
+  async #bootIsoCompile(idx, cacheKey) {
+    if (!(this.bootRescueBudgetMs > 0) || !this.realRoot?.pid || !this.checkpoints.get(0)) return null;
+    const block = this.blocks[idx];
+    const started = performance.now();
+    let outcome = 'boot-failed';
+    try {
+      const iso = await this.#isoCompile(block, idx, 'boot rescue');
+      this.#isoCacheSet(cacheKey, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) }));
+      outcome = 'boot';
+      return iso;
+    } finally {
+      const compileMs = performance.now() - started;
+      this.bootRescueBudgetMs -= compileMs;
+      this.rescueLog.push({
+        id: block.id, cached: false, mode: this.isoModeOf.get(block.id) ?? null,
+        compileMs: Math.round(compileMs), totalMs: Math.round(compileMs), outcome, at: Date.now(), queued: this.rescueQueue.size,
+      });
+      if (this.rescueLog.length > 200) this.rescueLog.splice(0, this.rescueLog.length - 200);
+    }
+  }
+
   /**
    * First-ever rescue of a block with no galley (a boot walk): a stored
    * result for the same text, entry state and preamble, compiled at some
@@ -894,7 +1155,7 @@ export class CheckpointEngine {
   #isoBaseGet(block, idx) {
     const disk = this.#isoDiskCache();
     if (!disk) return undefined;
-    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash });
+    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) });
     const found = disk.getBase(baseKey);
     if (process.env.TDOM_TRACE_ISO_CACHE) {
       console.error('[iso-cache] lookup', block.id, 'idx', idx, 'base', baseKey, 'prev', this.blocks[idx - 1]?.id,
@@ -910,15 +1171,21 @@ export class CheckpointEngine {
   }
 
   async #rescueBlock(idx, why) {
-    return rescueBlockHelper(this, idx, why, {
-      rescueCacheKey: (block, blockIdx) => this.#rescueCacheKey(block, blockIdx),
-      isoCacheGet: (cacheKey) => this.#isoCacheGet(cacheKey),
-      isoBaseGet: (targetBlock, blockIdx) => this.#isoBaseGet(targetBlock, blockIdx),
-      jobBlock: (blockIdx, override) => this.#jobBlock(blockIdx, override),
-      stateJobBody: (iso) => this.#stateJobBody(iso),
-      pumpRescues: () => this.#pumpRescues(),
-      brokenBlockGalley: (blockIdx, frozen) => this.#brokenBlockGalley(blockIdx, frozen),
-    });
+    this.rescuingIdx = idx; // report timing only
+    try {
+      return await rescueBlockHelper(this, idx, why, {
+        rescueCacheKey: (block, blockIdx) => this.#rescueCacheKey(block, blockIdx),
+        isoCacheGet: (cacheKey) => this.#isoCacheGet(cacheKey),
+        isoBaseGet: (targetBlock, blockIdx) => this.#isoBaseGet(targetBlock, blockIdx),
+        bootIsoCompile: (blockIdx, cacheKey) => this.#bootIsoCompile(blockIdx, cacheKey),
+        jobBlock: (blockIdx, override) => this.#jobBlock(blockIdx, override),
+        stateJobBody: (iso) => this.#stateJobBody(iso),
+        pumpRescues: () => this.#pumpRescues(),
+        brokenBlockGalley: (blockIdx, frozen) => this.#brokenBlockGalley(blockIdx, frozen),
+      });
+    } finally {
+      this.rescuingIdx = null;
+    }
   }
 
   /**
@@ -930,6 +1197,16 @@ export class CheckpointEngine {
    * labels by the per-job defs. Natural fresh lineages never pass through
    * here — the hot path stays byte-identical to a continuous run.
    */
+  /** The changed preamble declarations this block uses (preamble-patch.js). */
+  #defsPreludeFor(block) {
+    return this.defsPatch?.touches(block.text) ? this.defsPatch.prelude : '';
+  }
+
+  /** The preamble identity of a rescue key: the booted root plus a patch the block uses. */
+  #rescuePre(block) {
+    return this.defsPatch?.touches(block.text) ? `${this.bootPreHash}:${this.defsPatch.sig}` : this.bootPreHash ?? this.preHash;
+  }
+
   #volatilePrelude(idx) {
     return buildVolatilePrelude({
       stateVecJson: this.blocks[idx - 1]?.stateVec,
@@ -1088,7 +1365,7 @@ export class CheckpointEngine {
       editHold: [0, ...this.editHold, ...active, ...(continuation === null ? [] : [continuation])],
       coveragePins: this.editHold,
       renderHold: this.renderHold,
-      activeHold: activeRender,
+      activeHold: [...activeRender, ...this.#coldPreviewHeld()],
       maxPeers: budget.residentLimit,
       dyingPids: this.dyingPids,
     });
@@ -1104,7 +1381,7 @@ export class CheckpointEngine {
       idx,
       keep: this.#checkpointKeepSet(),
       checkpoints: this.checkpoints,
-      editHold: this.editHold,
+      editHold: [...this.editHold, ...this.#coldPreviewHeld()],
       renderHold: this.renderHold,
       block: this.foregroundRenderIds && !this.foregroundRenderIds.has(this.blocks[idx]?.id)
         ? null : this.blocks[idx],
@@ -1158,7 +1435,8 @@ export class CheckpointEngine {
     for (let j = from; j < this.blocks.length; j++) {
       if (shouldAbort?.()) return -(n + 1); // strictly negative: aborted
       const block = this.blocks[j];
-      const before = { hash: block.galleyHash, state: block.stateVec };
+      // a cold preview is no witness of the block's own typeset (docs/10 §10.4b)
+      const before = { hash: block.galley?.tdomColdPreview ? null : block.galleyHash, state: block.stateVec };
       const g = await this.#typesetBlock(j, j < target ? replayToken : null).catch(() => null);
       if (!g) break;
       this.#adoptGalley(block, g);
@@ -1200,12 +1478,26 @@ export class CheckpointEngine {
 
   #adoptGalley(block, galley) {
     this.coldDirty?.delete(block.id);
+    // a replaced preview's early RENDER (if the pump never took it) is moot
+    const replacedEarly = block.galley?.tdomColdPreview?.early;
+    if (replacedEarly && replacedEarly !== galley.tdomColdPreview?.early) replacedEarly.discard();
+    const replacedEarlyRender = block.galley?.tdomEarlyRender;
+    if (replacedEarlyRender && replacedEarlyRender !== galley.tdomEarlyRender) replacedEarlyRender.discard();
+    if (!galley.tdomColdPreview && this.coldPreviewHolds?.size) {
+      // a walk replaced the block's preview: its checkpoint has no RENDER left
+      for (const peer of [...this.coldPreviewHolds.keys()]) this.#releaseColdPreviewHold(peer, block.id);
+    }
     this.#normalizeGalleyFonts(galley);
-    this.#indexBlock(
-      block.id,
-      (galley.labels ?? []).map((l) => l.k),
-      galley.refs ?? []
-    );
+    // A cold preview (docs/10 §10.4b) leaves the label index to the walk
+    // that typesets the block in its own lineage: a label it renamed must
+    // vanish there, where the reference pass can still follow it.
+    if (!galley.tdomColdPreview) {
+      this.#indexBlock(
+        block.id,
+        (galley.labels ?? []).map((l) => l.k),
+        galley.refs ?? []
+      );
+    }
     adoptGalleyBlock(block, galley, {
       counters: this.counters,
       chunks: this.chunks,
@@ -1270,6 +1562,9 @@ export class CheckpointEngine {
     };
     if (!args.coldResume) {
       this.#noteShipActivity();
+      // the first keystroke after a pause (a jump elsewhere) sends its cold
+      // preview's RENDER at once (#coldPreview)
+      this.editGapMs = Date.now() - (this.lastEditAt ?? 0);
       this.lastEditAt = Date.now(); // pauses the idle-gated isolated renders
       const foregroundLeaseMs = shippingPriorityQuietMs(this, 0);
       this.foregroundLeaseMs = foregroundLeaseMs;
@@ -1292,21 +1587,71 @@ export class CheckpointEngine {
     // replay away, and the consumed boundary is then rebuilt with JOB forks
     // from an older checkpoint before this edit can run (measured: a
     // keystroke waiting 25 s behind the host's own warm on the 316-page
-    // fixture). Let such a walk stop at its next block boundary instead.
+    // fixture). Let such a walk stop at its next block boundary instead,
+    // unless it is heading for another file's blocks (below).
+    // what this update found holding the chain (report timing only)
+    const entry = {
+      label: args.editLabel ?? null,
+      entryAtEpochMs: Date.now(),
+      heldBy: this.updating ? 'update' : this.warming ? 'warm' : this.coldWalking
+        ? (this.pendingChain?.kind ?? 'walk') : this.bgActive ? (this.pendingChain?.kind ?? 'chain') : null,
+      job: this.currentJob
+        ? { idx: this.currentJob.ckptIdx - 1, ms: Math.round(performance.now() - this.currentJob.startedAt) } : null,
+      rescuing: this.rescuingIdx ?? null,
+    };
+    const gcBefore = this.bgGcMsTotal ?? 0;
     this.editPending++;
+    // a keystroke (or an input change), not the engine's own cold resume:
+    // walks stop for it at their next boundary (update-typeset-phase.js)
+    const keystroke = !args.coldResume;
+    if (keystroke) this.#keystrokeWaiting(+1);
     let lockHeld = false;
-    if (this.coldWalking || this.warming) this.bgAbort = true;
-    else abortBackgroundJob(this);
+    if (this.coldWalking || this.warming) {
+      this.bgAbort = true;
+      // The first keystroke after a pause (a jump elsewhere) ends the step of
+      // a caret warm, and of a cold or grid walk heading for another file's
+      // blocks, now instead of after a heavy block (measured 1.2-2.6 s on the
+      // 316-page fixture): it gains nothing from them. Only that walk's
+      // replay since its last retained boundary is lost, so only when the
+      // step's remaining time outweighs it; the edit's own region is served
+      // by its own walk and cold preview, and a cold or grid walk replays on a
+      // later idle gate. Within a burst every walk stops at its boundary and
+      // pins it, so each keystroke still leaves progress behind (killing
+      // there starved warms and far resumes alike), and a cold walk toward
+      // this edit's own file always does (§10.4a).
+      const job = this.currentJob;
+      const jobIdx = job ? job.ckptIdx - 1 : -1;
+      if (!args.coldResume && (this.editGapMs ?? 0) > 400 && job?.startedAt != null &&
+          (this.warming || editElsewhereThanWalk({
+            blocks: this.blocks,
+            target: this.bgWalkTarget,
+            rootFile: this.file,
+            editContext: args.editContext,
+            projectInputChanges: args.projectInputChanges,
+          })) &&
+          walkKillPaysOff({
+            blocks: this.blocks,
+            jobIdx,
+            jobElapsedMs: performance.now() - job.startedAt,
+            retainedIdx: this.#nearestCheckpoint(jobIdx),
+            warm: this.warming,
+          })) {
+        abortBackgroundJob(this, 'background walk pre-empted by an edit');
+      }
+    } else abortBackgroundJob(this);
     await this.bgTask.catch(() => {});
     try {
       const report = await this.#locked(async () => {
         lockHeld = true;
         this.editPending--;
+        if (keystroke) this.#keystrokeWaiting(-1);
+        this.lastLock = { ...entry, lockedAtEpochMs: Date.now(), gcWaitedMs: Math.round((this.bgGcMsTotal ?? 0) - gcBefore) };
         // serialize async header-job arrivals against updates: an hf apply
         // between an update's prevHashes capture and its patch computation
         // would mark unrelated pages dirty
         this.updating = true;
         this.bgAbort = false;
+        this.updateSeq++;
         try {
           preemptResidentRenders(this);
           return await this.#updateInner({ ...args, announceDocumentReset });
@@ -1322,8 +1667,27 @@ export class CheckpointEngine {
       if (documentResetPending) this.onDocumentResetComplete?.({ error });
       throw error;
     } finally {
-      if (!lockHeld) this.editPending--;
+      if (!lockHeld) {
+        this.editPending--;
+        if (keystroke) this.#keystrokeWaiting(-1);
+      }
     }
+  }
+
+  // While a keystroke waits for the chain lock, a marker in the work
+  // directory tells the daemon's background JOBs to leave their checkpoint
+  // collect to a later step (daemon.lua checkpoint_gc): a collect costs
+  // 0.8-2.5 s on a 316-page lineage, and the keystroke waited for all of it
+  // (tex64-internal #84).
+  #keystrokeWaiting(delta) {
+    const before = this.keystrokePending;
+    this.keystrokePending = Math.max(0, before + delta);
+    if ((before > 0) === (this.keystrokePending > 0) || !this.workDir) return;
+    const marker = path.join(this.workDir, 'keystroke-waiting');
+    try {
+      if (this.keystrokePending > 0) writeFileSync(marker, '');
+      else rmSync(marker, { force: true });
+    } catch { /* timing only: the collect runs as before */ }
   }
 
   async #updateInner({
@@ -1408,8 +1772,15 @@ export class CheckpointEngine {
     if (prepared.response) return prepared.response;
     const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
     // Every cold block was re-typeset by a walk that passed over it (or a
-    // keystroke landed there first): nothing is left for this resume.
-    if (coldResume && !dirtySource.size) return null;
+    // keystroke landed there first): nothing is left for this resume except
+    // the settle/rebuild it carried, which the document still owes.
+    if (coldResume && !dirtySource.size) {
+      if (chainCarry?.kind) {
+        this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels);
+        this.#kickPendingChain();
+      }
+      return null;
+    }
     const plainPreviewAdmission = classifyPlainPreviewEdit(this, {
       text, editContext, oldBlocks, dirtySource, rebooted,
     });
@@ -1454,6 +1825,9 @@ export class CheckpointEngine {
     // stop, protocol timeout) triggers ONE full rebuild retry; if that
     // also fails the error surfaces to the client while the last good
     // pages keep being served.
+    // A boot (or reboot) walk may compile first-ever rescues inline
+    // (#bootIsoCompile) for this much compile time in total.
+    this.bootRescueBudgetMs = rebooted || editLabel === 'open' ? this.bootRescueMs : 0;
     try {
       await runUpdateTypesetPhase(this, {
         oldBlocks,
@@ -1466,6 +1840,7 @@ export class CheckpointEngine {
         // A boot, reboot or retry fills every galley from block zero: that
         // walk has no prefix to defer.
         coldBudgetMs: rebooted || retry || editLabel === 'open' ? 0 : this.coldPrefixBudgetMs,
+        coldResume,
         callbacks: {
           nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
           typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),
@@ -1476,9 +1851,12 @@ export class CheckpointEngine {
           paginateNow: () => this.#paginateNow(),
           computeToc: (pages) => this.#computeToc(pages),
           queueMovedOffsets: () => this.#queueMovedOffsets(),
+          // the cold resume walks to a boundary the chain pass reached
+          coldPreview: editLabel === 'cold-resume' ? null : (idx, fromIdx) => this.#coldPreview(idx, fromIdx),
         },
       });
     } catch (err) {
+      this.bootRescueBudgetMs = 0;
       if (this.closed) throw err; // shutting down — no rebuild, no opaque demotion
       if (!retry) {
         this.diagnostics.push('typeset phase failed (' + err.message + ') — full rebuild');
@@ -1510,6 +1888,7 @@ export class CheckpointEngine {
         projectInputChanges
       );
     }
+    this.bootRescueBudgetMs = 0;
     // The settle/rebuild a cold walk carried through its resume is queued
     // again behind this update's own verdict (docs/10 §10.6 merging).
     if (chainCarry?.kind) this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels);
@@ -1517,6 +1896,7 @@ export class CheckpointEngine {
       text,
       editLabel,
       dirtySource,
+      removedBlocks: diff?.removed ?? [],
       typesetResult: this._typesetResult,
       rebooted,
       diagnostics,
@@ -1743,18 +2123,33 @@ export class CheckpointEngine {
     (async () => {
       try {
         while (!this.closed && this.rescueQueue.size) {
-          const [bid] = this.rescueQueue.entries().next().value;
-          // A cold keystroke's resume (docs/10 §10.4a) outranks isolated
-          // rescue adoption: the adopt walk holds the chain lock for seconds
-          // and the keystroke's page is not on screen until the resume runs.
-          while (
-            !this.closed &&
-            (this.editPending > 0 || this.coldDirty.size > 0 || this.pendingChain?.kind === 'cold' ||
-              Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800))
-          ) {
+          // The edited / caret page's own rescues first (rescueFocus): until
+          // they land, that page carries a page-wide pending-exact marker and
+          // nothing the user types there can be painted, while the backlog
+          // behind them only fixes pages nobody is looking at. They skip the
+          // typing quiet window too: the isolated compile runs off the lock,
+          // and the adopt walk still yields to every keystroke at a block
+          // boundary (an aborted focus rescue is picked again at once).
+          let bid;
+          for (;;) {
+            if (this.closed || !this.rescueQueue.size) return;
+            bid = [...this.rescueFocus].find((id) => this.rescueQueue.has(id)) ??
+              this.rescueQueue.keys().next().value;
+            // A cold keystroke's resume (docs/10 §10.4a) outranks isolated
+            // rescue adoption: the adopt walk holds the chain lock for seconds
+            // and the keystroke's page is not on screen until the resume runs.
+            // Not when the resume is owed only for this very block (an edit
+            // inside a multicols that the walk left cold): its adoption walk
+            // re-typesets the same path, and the resume would only re-show
+            // the held galley (tex64-internal #94: 2.4-3.0 s edits waited
+            // for it).
+            const resumeOnlyFor = this.coldDirty.size > 0 && [...this.coldDirty].every((id) => id === bid);
+            const coldAhead = (this.coldDirty.size > 0 || this.pendingChain?.kind === 'cold') && !resumeOnlyFor;
+            const waiting = this.editPending > 0 || coldAhead ||
+              !this.rescueFocus.has(bid) && Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800);
+            if (!waiting) break;
             await new Promise((r) => setTimeout(r, 200));
           }
-          if (this.closed) return;
           await withReplaceablePreviewJob(this, 'async-rescue', async () => {
             // Keep the latest-wins entry while the Build gate is closed. A
             // newer edit may replace its cache key before this job starts.
@@ -1803,14 +2198,22 @@ export class CheckpointEngine {
       rescueCached = false;
       const iso = await this.#isoCompile(block, idx, 'async exact rescue');
       rescueCompileMs = performance.now() - rescueStartedAt;
-      const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash });
+      const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) });
       if (process.env.TDOM_TRACE_ISO_CACHE) {
         console.error('[iso-cache] set', bid, 'idx', idx, 'base', baseKey, 'key', key, 'prev', this.blocks[idx - 1]?.id,
           'state', this.blocks[idx - 1]?.stateVec, 'pre', this.preHash);
       }
       this.#isoCacheSet(key, iso, baseKey);
     }
+    // a grid pass holding the lock yields at its next block boundary
+    this.rescueAdoptWaiting++;
+    let waiting = true;
+    const stopWaiting = () => {
+      if (waiting) this.rescueAdoptWaiting--;
+      waiting = false;
+    };
     const outcome = await this.#locked(async () => {
+      stopWaiting();
       if (this.mode !== 'structured') return 'done';
       idx = this.blocks.findIndex((b) => b.id === bid);
       if (idx < 0) return 'done';
@@ -1869,7 +2272,7 @@ export class CheckpointEngine {
       // back to the grid so the boot rescue storm can't creep the live set
       this.#enforceCheckpointCap();
       return 'done';
-    });
+    }).finally(stopWaiting);
     this.rescueLog.push({
       id: bid,
       cached: rescueCached,
@@ -2173,6 +2576,7 @@ export class CheckpointEngine {
       overlayDir: this.overlayDir,
       workDir: this.workDir,
       includes: this.includes,
+      resources: this.resourceReads,
       includeTrace: this.shippingIncludeTrace,
       diagnostics: this.diagnostics,
       includeOnly: includeOnlyFromSource(source),
@@ -2185,7 +2589,17 @@ export class CheckpointEngine {
     // would enqueue a second refresh for every keystroke in a child buffer.
     if (this.overlayDir && isPathInside(this.overlayDir, full)) return;
     if (path.resolve(full) === path.join(this.workDir, 'driver.bbl')) return;
-    watchInclude(full, this.watchers, (changed) => this.onExternalChange?.(changed));
+    watchInclude(full, this.watchers, (changed) => {
+      // Touches, sync clients and indexers raise events without changing a
+      // byte. Refreshing anyway advances srcRev and restarts canonical: on
+      // the 316-page book 33 such events after /open held the first
+      // canonical back for 305 s.
+      if (inputReadCurrent(this.includes, this.resourceReads, changed)) {
+        this.unchangedInputEvents++;
+        return;
+      }
+      this.onExternalChange?.(changed);
+    });
   }
 
   async refresh(inputChanges = {}) {
@@ -2198,6 +2612,8 @@ export class CheckpointEngine {
       removed: [...removed],
       unknown: inputChanges?.unknown === true || (!changed.length && !removed.length),
     };
+    announceIncludeReads(this.includes, [...changed, ...removed]);
+    announceResourceReads(this.resourceReads, [...changed, ...removed]);
     this.canonical.invalidateInputs(projectInputChanges);
     return this.#update({ editLabel: 'external-include', projectInputChanges });
   }
@@ -2209,6 +2625,7 @@ export class CheckpointEngine {
         this.includes.delete(identity);
       }
     }
+    for (const file of changed) this.resourceReads.delete(file);
     this.canonical.invalidateInputs({ changed: [...changed] });
   }
 
