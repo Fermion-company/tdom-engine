@@ -281,3 +281,25 @@ test('ordinary isolated rescue still reuses the loaded preamble checkpoint', () 
   assert.equal(prepared.splitMode, false);
   assert.equal(prepared.ck0, checkpoint0);
 });
+
+test('a held replay waits for a long canonical compile of the same source, not a short one (#92)', async () => {
+  const { flushDeferredShipUpdate } = await import('../engine/checkpoint/ship-pacing.js');
+  const runs = [];
+  const engineWith = (ms, inFlight) => ({
+    srcRev: 5,
+    shipDeferred: { text: 'x', projectInputChanges: null, srcRev: 5 },
+    shipDeferTimer: null,
+    canonical: { info: () => ({ inFlight, ms }) },
+  });
+  const long = engineWith(60_000, true);
+  assert.equal(flushDeferredShipUpdate(long, (t) => runs.push(t), { yieldToCanonical: true }), false);
+  assert.ok(long.shipDeferred, 'held while the long compile runs');
+  clearTimeout(long.shipDeferTimer);
+  long.canonical = { info: () => ({ inFlight: false, ms: 60_000 }) };
+  assert.equal(flushDeferredShipUpdate(long, (t) => runs.push(t), { yieldToCanonical: true }), true);
+  assert.equal(flushDeferredShipUpdate(engineWith(3_000, true), (t) => runs.push(t), { yieldToCanonical: true }), true,
+    'a short document replays at once');
+  assert.equal(flushDeferredShipUpdate(engineWith(60_000, true), (t) => runs.push(t)), true,
+    'a display demand never waits');
+  assert.equal(runs.length, 3);
+});
