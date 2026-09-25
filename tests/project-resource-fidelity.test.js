@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -167,6 +167,64 @@ See \cite{knuth1984}.
       assert.match(bbl, /The TeXbook/);
     }
   } finally {
+    rmSync(docDir, { recursive: true, force: true });
+  }
+});
+
+test('a regenerated bibliography replaces driver.bbl and canon.bbl by rename, not in place', {
+  skip: bibtexAvailable ? false : 'bibtex not installed',
+}, async () => {
+  const docDir = mkdtempSync(path.join(tmpdir(), 'tdom-bib-rename-'));
+  const workDir = path.join(docDir, 'work');
+  const canonicalWorkDir = path.join(docDir, 'canonical');
+  const sourceFor = (key) => String.raw`\documentclass{article}
+\begin{document}
+See \cite{${key}}.
+\bibliographystyle{plain}
+\bibliography{refs}
+\end{document}`;
+  writeFileSync(path.join(docDir, 'refs.bib'), String.raw`@book{knuth1984,
+  title={The TeXbook},
+  author={Knuth, Donald E.},
+  year={1984},
+  publisher={Addison-Wesley}
+}
+@book{lamport1994,
+  title={LaTeX: A Document Preparation System},
+  author={Lamport, Leslie},
+  year={1994},
+  publisher={Addison-Wesley}
+}`);
+  const prepare = (key) => {
+    const source = sourceFor(key);
+    return prepareExternalBibliography({
+      source,
+      descriptor: describeExternalBibliography(source, docDir),
+      docDir,
+      documentFile: 'main.tex',
+      workDir,
+      canonicalWorkDir,
+    });
+  };
+  const files = [path.join(workDir, 'driver.bbl'), path.join(canonicalWorkDir, 'canon.bbl')];
+  const fds = [];
+  try {
+    assert.equal((await prepare('knuth1984')).prepared, true);
+    // A reader that opened the old file (the canonical compile, the resident
+    // driver) must keep reading the old bytes while the new list is written.
+    for (const file of files) fds.push(openSync(file, 'r'));
+    assert.equal((await prepare('lamport1994')).prepared, true);
+    for (const [i, file] of files.entries()) {
+      assert.match(readFileSync(fds[i], 'utf8'), /\\bibitem\{knuth1984\}/, `${path.basename(file)} was rewritten in place`);
+      const now = readFileSync(file, 'utf8');
+      assert.match(now, /\\bibitem\{lamport1994\}/);
+      assert.doesNotMatch(now, /knuth1984/);
+    }
+    for (const dir of [workDir, canonicalWorkDir]) {
+      assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith('.tmp')), [], 'no temp file is left behind');
+    }
+  } finally {
+    for (const fd of fds) closeSync(fd);
     rmSync(docDir, { recursive: true, force: true });
   }
 });

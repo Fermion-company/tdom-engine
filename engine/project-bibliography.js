@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -88,7 +89,7 @@ export async function prepareExternalBibliography({
     } else {
       await prepareBiblatex(source, descriptor, docDir, overlayDir, workDir, driverBbl);
     }
-    copyFileSync(driverBbl, canonBbl);
+    replaceFile(canonBbl, driverBbl);
     return { prepared: true, files: descriptor.files };
   } catch (error) {
     // A normal build may already have produced the exact .bbl. It is a safe
@@ -97,12 +98,12 @@ export async function prepareExternalBibliography({
     const base = path.basename(documentFile, path.extname(documentFile));
     const existing = path.join(docDir, `${base}.bbl`);
     if (existsSync(driverBbl)) {
-      if (!existsSync(canonBbl)) copyFileSync(driverBbl, canonBbl);
+      if (!existsSync(canonBbl)) replaceFile(canonBbl, driverBbl);
       return { prepared: true, files: descriptor.files, warning: String(error?.message || error) };
     }
     if (existsSync(existing)) {
-      copyFileSync(existing, driverBbl);
-      copyFileSync(existing, canonBbl);
+      replaceFile(driverBbl, existing);
+      replaceFile(canonBbl, existing);
       return { prepared: true, files: descriptor.files, warning: String(error?.message || error) };
     }
     throw error;
@@ -131,14 +132,14 @@ async function prepareClassicBibtex(descriptor, docDir, overlayDir, workDir, dri
     // BibTeX returns failure for an empty citation set. The correct visible
     // result is an empty bibliography, not a stale list from another file.
     if (!descriptor.citations.length) {
-      writeFileSync(driverBbl, '\\begin{thebibliography}{1}\n\\end{thebibliography}\n', 'utf8');
+      replaceFile(driverBbl, null, '\\begin{thebibliography}{1}\n\\end{thebibliography}\n');
       return;
     }
     throw new Error(bibliographyError('BibTeX', error));
   }
   const generated = path.join(stage, `${job}.bbl`);
   if (!existsSync(generated)) throw new Error('BibTeX produced no bibliography output');
-  copyFileSync(generated, driverBbl);
+  replaceFile(driverBbl, generated);
 }
 
 async function prepareBiblatex(source, descriptor, docDir, overlayDir, workDir, driverBbl) {
@@ -166,7 +167,24 @@ async function prepareBiblatex(source, descriptor, docDir, overlayDir, workDir, 
   }
   const generated = path.join(stage, 'tdom-bib.bbl');
   if (!existsSync(generated)) throw new Error('Biber produced no tdom-bib.bbl');
-  copyFileSync(generated, driverBbl);
+  replaceFile(driverBbl, generated);
+}
+
+// The canonical compile reads canon.bbl and the resident driver re-expands
+// driver.bbl while a citation edit regenerates them. An in-place write lets
+// such a reader see a truncated file or split a UTF-8 sequence; a rename in
+// the same directory swaps the whole file, so an open reader keeps the bytes
+// it started with (same reason as the overlay writes in server.js).
+function replaceFile(target, from, text = null) {
+  const tmp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.tmp`);
+  try {
+    if (from) copyFileSync(from, tmp);
+    else writeFileSync(tmp, text, 'utf8');
+    renameSync(tmp, target);
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
 }
 
 function bibliographyEnv(docDir, overlayDir) {
