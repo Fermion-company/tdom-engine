@@ -1271,6 +1271,47 @@ test('a breakable box rescued mid-page keeps the pagination of the real output',
   }
 });
 
+test('a breakable box declared in a project .sty is split where it straddles a page (#88)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-package-breakable-'));
+  writeFileSync(path.join(root, 'mystyle.sty'), [
+    '\\RequirePackage[most]{tcolorbox}',
+    '\\DeclareTColorBox{splitbox}{ m }{enhanced, breakable, title={#1}}',
+    '\\DeclareTColorBox{shortbox}{ m }{enhanced, breakable, title={#1}}',
+    '',
+  ].join('\n'));
+  const lorem = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ';
+  const source = [
+    '\\documentclass{article}', '\\usepackage{mystyle}', '\\begin{document}',
+    '\\begin{shortbox}{Fits}', 'A short box at the top of the page.', '\\end{shortbox}', '',
+    lorem.repeat(10), '',
+    '\\begin{splitbox}{Straddles}', lorem.repeat(14), '\\end{splitbox}', '',
+    'Closing paragraph after the box.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  writeFileSync(path.join(root, 'main.tex'), source);
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  try {
+    await eng.open(source);
+    const deadline = Date.now() + 120_000;
+    while ((eng.rescueQueue.size || eng.rescuePumping) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    await eng.bgTask;
+    const split = eng.blocks.find((b) => b.text.includes('\\begin{splitbox}'));
+    const short = eng.blocks.find((b) => b.text.includes('\\begin{shortbox}'));
+    assert.ok(split.contextRescue, 'the straddling box was sent to the real routine');
+    assert.equal(short.contextRescue, undefined, 'a box that fits keeps the fast path');
+    assert.ok(split.galley.items.some((it) => it.k === 'eject'), 'the rescued galley carries the split');
+    const { stdout } = await promisify(execFile)('lualatex', ['-interaction=nonstopmode', '-halt-on-error', 'main.tex'], { cwd: root, timeout: 120_000 });
+    const printed = Number(stdout.match(/Output written on main\.pdf \((\d+) page/)?.[1]);
+    assert.ok(printed >= 2);
+    assert.equal(eng.pages.length, printed, 'resident pagination matches the real output');
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a touched \\input or \\include file whose bytes did not change does not advance srcRev', opts, async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-external-input-'));
   const one = path.join(root, 'one.tex');

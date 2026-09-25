@@ -66,7 +66,7 @@ import { focusRescueIds } from './update-helpers.js';
 import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, includeOnlyFromSource, watchInclude } from './include-expander.js';
 import { announceIncludeReads, announceResourceReads, inputReadCurrent } from './include-cache.js';
-import { needsRescue } from './rescue-classifier.js';
+import { needsRescue, projectPackageText } from './rescue-classifier.js';
 import { scheduleHeaders as scheduleHeadersHelper } from './header-scheduler.js';
 import {
   normalizeGalleyFonts,
@@ -912,11 +912,14 @@ export class CheckpointEngine {
       preHash: this.preHash,
       breakableFor: this._breakableFor,
       breakableRe: this._breakableRe,
+      packageBreakableRe: this._packageBreakableRe,
       source: () => this.store.get(this.file) ?? '',
+      packageText: (preamble) => projectPackageText(preamble, { docDir: this.docDir, overlayDir: this.overlayDir }),
       structuralSinks,
     });
     if (result.breakableFor !== this._breakableFor) this._breakableFor = result.breakableFor;
     if (result.breakableRe !== this._breakableRe) this._breakableRe = result.breakableRe;
+    if (result.packageBreakableRe !== this._packageBreakableRe) this._packageBreakableRe = result.packageBreakableRe;
     return result.needs;
   }
 

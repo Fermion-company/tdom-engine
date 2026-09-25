@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import { buildDisplayList } from '../engine/checkpoint/display-list.js';
 import { buildStream } from '../engine/checkpoint/stream.js';
 import { prepareIsoCompileJob } from '../engine/checkpoint/iso-context.js';
-import { needsRescue } from '../engine/checkpoint/rescue-classifier.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fnv1a } from '../engine/hash.js';
+import { needsRescue, projectPackageText } from '../engine/checkpoint/rescue-classifier.js';
+import { queueMovedOffsets } from '../engine/checkpoint/rescue-offsets.js';
 
 const geometry = {
   oddsidemargin: 0,
@@ -165,6 +170,74 @@ test('multiline custom tcolorbox definitions are classified as breakable rescues
   });
   assert.equal(result.needs, true);
   assert.equal(result.breakableRe.test('\\begin{plainbox}'), false);
+});
+
+test('breakable boxes declared in a project package are found but not rescued up front (#88)', () => {
+  const docDir = mkdtempSync(path.join(tmpdir(), 'tdom-package-boxes-'));
+  try {
+    writeFileSync(path.join(docDir, 'mystyle.sty'), String.raw`\RequirePackage[most]{tcolorbox}
+\RequirePackage{mystyle-boxes}
+`);
+    writeFileSync(path.join(docDir, 'mystyle-boxes.sty'), String.raw`\DeclareTColorBox{KKfbox1}{ m O{} }
+{enhanced, breakable,
+ title={#1}}
+\NewTColorBox{plainbox}{ m }{enhanced, title={#1}}
+\DeclareTColorBox{offbox}{}{breakable=false}
+`);
+    const source = String.raw`\documentclass{article}
+\usepackage{mystyle,amsmath}
+\begin{document}
+\begin{KKfbox1}{Title}Body\end{KKfbox1}
+\end{document}`;
+    const preamble = source.split('\\begin{document}')[0];
+    const result = needsRescue('\\begin{KKfbox1}{Title}Body\\end{KKfbox1}', {
+      preHash: 'preamble-1',
+      breakableFor: null,
+      breakableRe: null,
+      source: () => source,
+      packageText: (pre) => projectPackageText(pre, { docDir }),
+    });
+    assert.equal(result.needs, false, 'fits-where-it-stands instances keep the fast path');
+    assert.equal(result.breakableRe, null);
+    assert.equal(result.packageBreakableRe.test('\\begin{KKfbox1}'), true);
+    assert.equal(result.packageBreakableRe.test('\\begin{plainbox}'), false);
+    assert.equal(result.packageBreakableRe.test('\\begin{offbox}'), false);
+    assert.match(projectPackageText(preamble, { docDir }), /DeclareTColorBox\{KKfbox1\}/);
+  } finally {
+    rmSync(docDir, { recursive: true, force: true });
+  }
+});
+
+test('a package breakable box is rescued only where it does not fit from its entry offset (#88)', () => {
+  const text = (n) => `\\begin{KKfbox1}{Box ${n}}Body\\end{KKfbox1}`;
+  const galley = (h) => ({ h, d: 0, items: [{ k: 'box', h }] });
+  const blocks = [
+    { id: 'fits', text: text(1), galley: galley(300) },
+    { id: 'straddles', text: text(2), galley: galley(300) },
+    { id: 'plain', text: 'Ordinary paragraph.', galley: galley(900) },
+  ];
+  const engine = {
+    mode: 'structured',
+    blocks,
+    geometry: { textheight: 550 },
+    rescueQueue: new Map(),
+    _packageBreakableRe: /\\begin\{KKfbox1\}/,
+  };
+  let pumped = 0;
+  const run = () => queueMovedOffsets(engine, {
+    paginateNow: () => ({ blockEntry: new Map([['fits', 100], ['straddles', 400], ['plain', 0]]) }),
+    rescueCacheKey: (block) => `${block.id}@${block.pageOffset}`,
+    pumpRescues: () => { pumped++; },
+  });
+  run();
+  assert.deepEqual([...engine.rescueQueue.keys()], ['straddles']);
+  assert.equal(blocks[1].contextRescue, fnv1a(text(2)));
+  assert.equal(blocks[1].pageOffset, 400, 'the rescue compiles at the offset the box was given');
+  assert.equal(blocks[0].contextRescue, undefined);
+  assert.equal(pumped, 1);
+  engine.rescueQueue.clear();
+  run();
+  assert.equal(engine.rescueQueue.size, 0, 'queued once per source text');
 });
 
 test('structural alias rescue is limited to sinks that need an isolated real page', () => {

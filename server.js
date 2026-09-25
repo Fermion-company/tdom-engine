@@ -1699,6 +1699,10 @@ const server = http.createServer(async (req, res) => {
           disk: engine.isoDiskCache?.stats ?? null,
           realRoot: engine.realRoot?.pid ?? null,
           rootPid: engine.root?.pid ?? null,
+          // package-declared breakable boxes sent to the real routine
+          // because they did not fit from their entry offset (#88)
+          contextRescues: engine.contextRescues ?? 0,
+          packageBreakable: engine._packageBreakableRe ? String(engine._packageBreakableRe).split('|').length : 0,
           log: (engine.rescueLog ?? []).slice(-60),
         },
         shipping: engine.shipping?.info?.() ?? null,

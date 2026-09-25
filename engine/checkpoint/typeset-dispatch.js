@@ -102,6 +102,13 @@ export async function typesetBlock(engine, idx, callbacks) {
     TRACE?.('rescue(env)', T0);
     return g;
   }
+  // a package-declared breakable box that did not fit from its entry
+  // offset (queueMovedOffsets): the real run splits it
+  if (block.contextRescue === sig) {
+    const g = await rescueSafely('breakable box splits at its page offset');
+    TRACE?.('rescue(context)', T0);
+    return g;
+  }
   if (engine.poisoned.get(block.id) === sig) {
     return rescueSafely('previous in-chain failure');
   }

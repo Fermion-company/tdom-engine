@@ -31,6 +31,7 @@ export async function isoCompile(
       geometry: engine.geometry,
       needsRescue,
       breakableRe: () => engine._breakableRe,
+      packageBreakableRe: () => engine._packageBreakableRe,
     });
   engine.isoModeOf?.set(block.id, runner);
   mkdirSync(jobdir, { recursive: true });

@@ -19,6 +19,7 @@ export function prepareIsoCompileJob({
   geometry,
   needsRescue,
   breakableRe,
+  packageBreakableRe = () => null,
 }) {
   // Fork mode: rescue in a child forked from a resident root — the
   // preamble (the 10-15s / 300-500MB part of a cold iso on package-heavy
@@ -35,7 +36,8 @@ export function prepareIsoCompileJob({
     (aliasSplitMode || /\\begin\{(mdframed|framed|shaded|longtable|multicols\*?)\}|\\begin\{tcolorbox\}\[[^\]]*breakable/.test(
       block.text
     ) ||
-      (breakableRe()?.test(block.text) ?? false));
+      (breakableRe()?.test(block.text) ?? false) ||
+      (packageBreakableRe()?.test(block.text) ?? false));
   // Page-EMITTING blocks (\includepdf: whole foreign pages) keep the REAL
   // output routine so every page ships and becomes a per-page chunk. The
   // dormant absorb would hand their zero-dimension page paintings back to
