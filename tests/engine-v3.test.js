@@ -141,11 +141,69 @@ test('inline math lines are chunk-banded while plain paragraphs stay glyphs', op
 
 test('preamble edits take the honest full-rebuild path', opts, async () => {
   const src = eng.getSource();
-  const anchor = '\\newcommand{\\engine}{Fermion TeX Engine}';
+  const anchor = '\\newtheorem{theorem}{Theorem}[section]';
   const idx = src.indexOf(anchor);
-  const r = await eng.edit(idx, idx + anchor.length, '\\newcommand{\\engine}{Fermion Engine}');
+  const r = await eng.edit(idx, idx + anchor.length, '\\newtheorem{theorem}{Satz}[section]');
   assert.ok(r.stats.rebooted, 'root process rebooted on preamble change');
   assert.ok(eng.getDOM().labels['sec:math'] === '2', 'state rebuilt correctly');
+});
+
+test('a changed \\newcommand body re-runs in front of the blocks that use it, without a reboot (#93)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-preamble-patch-'));
+  const para = (k) => `Paragraph ${k} of ordinary prose that fills a line or two of the preview in this test.`;
+  const doc = (body, wrap = '\\fbox{#1}') => [
+    '\\documentclass{article}',
+    `\\newcommand{\\engine}{${body}}`,
+    `\\newcommand{\\boxed}[1]{${wrap}}`,
+    '\\newcommand{\\both}{\\engine{} and more}',
+    '\\begin{document}',
+    ...Array.from({ length: 16 }, (_, k) =>
+      (k === 3 ? 'Here the \\engine{} appears. ' : k === 9 ? 'A \\boxed{word} here. ' : k === 13 ? 'Also \\both. ' : '') + para(k) + '\n'),
+    '\\end{document}', '',
+  ].join('\n');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh'), docDir: root });
+  const fresh2 = new CheckpointEngine({ workDir: path.join(root, 'fresh2'), docDir: root });
+  const galleys = (e) => e.blocks.map((b) => b.galleyHash);
+  try {
+    await eng.open(doc('Fermion TeX Engine'));
+    await eng.bgTask;
+    const rootPid = eng.root?.pid;
+    const src = eng.getSource();
+    const at = src.indexOf('Fermion TeX Engine');
+    const r = await eng.edit(at, at + 'Fermion TeX Engine'.length, 'A Much Longer Engine Name');
+    await eng.bgTask;
+    assert.ok(!r.stats.rebooted, 'no reboot');
+    assert.equal(eng.root?.pid, rootPid, 'the booted root stays');
+    assert.equal(eng.preamblePatches, 1);
+    assert.equal(eng.lastPreamblePatch.dirty, 2, 'the block using \\engine and the one using \\both');
+    assert.ok(r.stats.blocksTypeset < eng.blocks.length, `blocks typeset: ${r.stats.blocksTypeset}`);
+    await fresh.open(doc('A Much Longer Engine Name'));
+    assert.deepEqual(galleys(eng), galleys(fresh), 'the same galleys as a document opened with the new preamble');
+    // a second declaration, then both back: the prelude follows the booted root
+    const at2 = eng.getSource().indexOf('\\fbox{#1}');
+    await eng.edit(at2, at2 + '\\fbox{#1}'.length, '\\textbf{#1}');
+    await eng.bgTask;
+    assert.equal(eng.preamblePatches, 2);
+    assert.equal(eng.lastPreamblePatch.dirty, 1);
+    const back = eng.getSource().replace('A Much Longer Engine Name', 'Fermion TeX Engine').replace('\\textbf{#1}', '\\fbox{#1}');
+    await eng.edit(0, eng.getSource().length, back);
+    await eng.bgTask;
+    assert.equal(eng.preamblePatches, 3);
+    assert.equal(eng.defsPatch, null, 'nothing left to re-run');
+    assert.equal(eng.root?.pid, rootPid);
+    await fresh2.open(doc('Fermion TeX Engine'));
+    assert.deepEqual(galleys(eng), galleys(fresh2));
+    // a package change still reboots
+    const pkg = eng.getSource().indexOf('\\begin{document}');
+    const r4 = await eng.edit(pkg, pkg, '\\usepackage{amssymb}\n');
+    assert.ok(r4.stats.rebooted);
+  } finally {
+    await eng.close();
+    await fresh.close();
+    await fresh2.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('the engine survives malformed input mid-typing', opts, async () => {

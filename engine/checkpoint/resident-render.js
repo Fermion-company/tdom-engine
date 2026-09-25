@@ -129,7 +129,9 @@ export async function renderResidentBlock(
     // the prelude the galley's JOB used (label definitions and the primer;
     // docs/10 §10.4c), else the primer alone.
     const body = Buffer.from(
-      (prelude ?? block.galley?.tdomRenderPrelude ?? buildLastskipPrimer(block, idx, engine.blocks)) + block.text, 'utf8');
+      (prelude ?? block.galley?.tdomRenderPrelude ??
+        ((engine.defsPatch?.touches(block.text) ? engine.defsPatch.prelude : '') +
+          buildLastskipPrimer(block, idx, engine.blocks))) + block.text, 'utf8');
     engine.renderStats ??= { captureHits: 0, captureMisses: 0, retypesets: 0 };
 
     let shippedCapture = shippedEarly;

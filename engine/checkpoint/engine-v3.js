@@ -624,6 +624,7 @@ export class CheckpointEngine {
       hrefTable: this.hrefTable,
       geometry: this.geometry,
       volatilePrelude: (i) => this.#volatilePrelude(i),
+      defsPrelude: this.#defsPreludeFor(block),
     });
     const galleyKey = 'galley:' + jobId;
     const ckptKey = 'ckpt:' + (idx + 1);
@@ -940,7 +941,7 @@ export class CheckpointEngine {
     return rescueCacheKey(block, idx, {
       blocks: this.blocks,
       labelTable: this.labelTable,
-      preHash: this.preHash,
+      preHash: this.#rescuePre(block),
     });
   }
 
@@ -1030,6 +1031,7 @@ export class CheckpointEngine {
       hrefTable: this.hrefTable,
       geometry: this.geometry,
       volatilePrelude: (i) => this.#volatilePrelude(i),
+      defsPrelude: this.#defsPreludeFor(block),
     });
     // After a heading the true lineage also carries \@afterheading's
     // \everypar (the first paragraph's indent); the prelude only restores
@@ -1129,7 +1131,7 @@ export class CheckpointEngine {
     let outcome = 'boot-failed';
     try {
       const iso = await this.#isoCompile(block, idx, 'boot rescue');
-      this.#isoCacheSet(cacheKey, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash }));
+      this.#isoCacheSet(cacheKey, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) }));
       outcome = 'boot';
       return iso;
     } finally {
@@ -1153,7 +1155,7 @@ export class CheckpointEngine {
   #isoBaseGet(block, idx) {
     const disk = this.#isoDiskCache();
     if (!disk) return undefined;
-    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash });
+    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) });
     const found = disk.getBase(baseKey);
     if (process.env.TDOM_TRACE_ISO_CACHE) {
       console.error('[iso-cache] lookup', block.id, 'idx', idx, 'base', baseKey, 'prev', this.blocks[idx - 1]?.id,
@@ -1195,6 +1197,16 @@ export class CheckpointEngine {
    * labels by the per-job defs. Natural fresh lineages never pass through
    * here — the hot path stays byte-identical to a continuous run.
    */
+  /** The changed preamble declarations this block uses (preamble-patch.js). */
+  #defsPreludeFor(block) {
+    return this.defsPatch?.touches(block.text) ? this.defsPatch.prelude : '';
+  }
+
+  /** The preamble identity of a rescue key: the booted root plus a patch the block uses. */
+  #rescuePre(block) {
+    return this.defsPatch?.touches(block.text) ? `${this.bootPreHash}:${this.defsPatch.sig}` : this.bootPreHash ?? this.preHash;
+  }
+
   #volatilePrelude(idx) {
     return buildVolatilePrelude({
       stateVecJson: this.blocks[idx - 1]?.stateVec,
@@ -2186,7 +2198,7 @@ export class CheckpointEngine {
       rescueCached = false;
       const iso = await this.#isoCompile(block, idx, 'async exact rescue');
       rescueCompileMs = performance.now() - rescueStartedAt;
-      const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.preHash });
+      const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) });
       if (process.env.TDOM_TRACE_ISO_CACHE) {
         console.error('[iso-cache] set', bid, 'idx', idx, 'base', baseKey, 'key', key, 'prev', this.blocks[idx - 1]?.id,
           'state', this.blocks[idx - 1]?.stateVec, 'pre', this.preHash);

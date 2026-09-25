@@ -425,6 +425,7 @@ export function buildIsoCompileSource({
   realOutput,
   strut,
   runner = ck0 ? 'fork-absorb' : 'cold',
+  defsPrelude = '',
 }) {
   const L = [];
   if (runner === 'cold') {
@@ -445,6 +446,9 @@ export function buildIsoCompileSource({
   // real \output, real \vsize, empty page — so nothing needs resetting;
   // the program below is exactly the cold one minus the preamble.
   L.push('\\makeatletter\\pagestyle{empty}\\hoffset=-1in\\voffset=-1in');
+  // a forked root holds the declarations it booted with (preamble-patch.js;
+  // the cold program's preamble already has them, re-running is harmless)
+  if (defsPrelude) L.push(defsPrelude.trimEnd());
   if (runner !== 'cold') {
     // A real-height isolated child must use LaTeX's real output semantics,
     // not the marker-only enlargement inherited from the dormant driver.

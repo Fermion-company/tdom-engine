@@ -1682,6 +1682,9 @@ const server = http.createServer(async (req, res) => {
         documentEpoch,
         unchangedInputEvents: engine.unchangedInputEvents,
         diffStats: engine.diffStats ?? null,
+        // preamble edits served without a reboot (tex64-internal #93)
+        preamblePatches: engine.preamblePatches ?? 0,
+        lastPreamblePatch: engine.lastPreamblePatch ?? null,
         // the last foreground walk, without its per-block rows
         lastWalk: engine.lastWalkTrace ? {
           from: engine.lastWalkTrace.from, firstDirty: engine.lastWalkTrace.firstDirty,

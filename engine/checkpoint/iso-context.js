@@ -20,6 +20,7 @@ export function prepareIsoCompileJob({
   needsRescue,
   breakableRe,
   packageBreakableRe = () => null,
+  defsPrelude = '',
 }) {
   // Fork mode: rescue in a child forked from a resident root — the
   // preamble (the 10-15s / 300-500MB part of a cold iso on package-heavy
@@ -128,6 +129,7 @@ export function prepareIsoCompileJob({
     realOutput,
     strut,
     runner,
+    defsPrelude,
   });
   return {
     ck0,

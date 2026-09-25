@@ -22,6 +22,7 @@ export function buildJobBlockBody({
   hrefTable,
   geometry,
   volatilePrelude,
+  defsPrelude = '',
 }) {
   let body;
   let jobId;
@@ -81,8 +82,9 @@ export function buildJobBlockBody({
     // material, so a primer there would just sit as extra height.
     const primer = buildLastskipPrimer(block, idx, blocks);
     const volatilePre = ck.vstale && idx > 0 ? volatilePrelude(idx) : '';
+    // changed preamble declarations first: the checkpoint may predate them
     prelude =
-      volatilePre + (defs.length ? `\\makeatletter ${defs.join(' ')}\\makeatother\n` : '') + primer;
+      defsPrelude + volatilePre + (defs.length ? `\\makeatletter ${defs.join(' ')}\\makeatother\n` : '') + primer;
     const edit = instrumentEditRegions(block.text);
     // Metadata stays on the source block; only the transient resident job
     // receives the zero-width attribute wrappers.
