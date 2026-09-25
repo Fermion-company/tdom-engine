@@ -43,7 +43,7 @@ import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read
 import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
 import { buildLeasePreviewSettlement } from './engine/checkpoint/build-lease-preview.js';
 import { watchInclude } from './engine/checkpoint/include-expander.js';
-import { includeHoldsText, includeReadCurrent, rebindIncludeRead } from './engine/checkpoint/include-cache.js';
+import { includeHoldsText, inputReadCurrent, rebindIncludeRead } from './engine/checkpoint/include-cache.js';
 import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
 
 // Certified canonical anchoring is deliberately narrow: only plain-text
@@ -920,7 +920,7 @@ engine.onExternalChange = (changedInput) => {
     if (diskChangeShadowedByOverlay(activeProject, changedFile)) return lastReport;
     // A refresh queued ahead of this one may already have read these bytes
     // and invalidated them on canonical.
-    if (changedFile && includeReadCurrent(engine.includes, changedFile)) return lastReport;
+    if (changedFile && inputReadCurrent(engine.includes, engine.resourceReads, changedFile)) return lastReport;
     const retired = retireSavedOverlay(activeProject, changedFile);
     const source = engine.getSource();
     const nextBibliography = describeExternalBibliography(source, activeProject.docDir, activeProject.overlayDir);

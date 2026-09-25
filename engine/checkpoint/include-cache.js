@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
@@ -66,4 +67,67 @@ export function includeReadCurrent(includes, file) {
     if (!bytes.equals(Buffer.from(cached.text, 'utf8'))) return false;
   }
   return bytes !== null;
+}
+
+// engine.resourceReads maps each input TeX reads without it entering the
+// source DOM (an image, a listing, a mid-paragraph \input) to
+// {mtime, size, hash, announcedHash}, keyed by the path TeX reads. Block
+// identity uses the content hash, so a touch or a same-bytes rewrite leaves
+// the owning block clean; the file is hashed again only when its mtime or
+// size moves. `announcedHash` follows `announcedText` above.
+export function resourceContentSig(resources, file, st) {
+  const key = path.resolve(file);
+  const cached = resources?.get(key);
+  if (cached && cached.mtime === st.mtimeMs && cached.size === st.size) return cached.hash;
+  const hash = hashFile(key);
+  resources?.set(key, { mtime: st.mtimeMs, size: st.size, hash, announcedHash: cached ? cached.announcedHash : hash });
+  return hash;
+}
+
+export function announceResourceReads(resources, files) {
+  for (const file of files) {
+    const key = path.resolve(file);
+    if (!resources?.has(key)) continue;
+    try {
+      const st = statSync(key);
+      const hash = hashFile(key);
+      resources.set(key, { mtime: st.mtimeMs, size: st.size, hash, announcedHash: hash });
+    } catch {
+      resources.delete(key);
+    }
+  }
+}
+
+// True when a watcher event on `file` changes no TeX input: every read of it
+// the resident made (as an include, as a resource) holds the bytes on disk,
+// and canonical was told about them. A file the resident never read is
+// never unchanged here.
+export function inputReadCurrent(includes, resources, file) {
+  const target = path.resolve(file);
+  const viaResource = resources?.has(target) ?? false;
+  let viaInclude = false;
+  for (const cached of includes.values()) {
+    if (typeof cached?.readPath === 'string' && path.resolve(cached.readPath) === target) viaInclude = true;
+  }
+  if (!viaInclude && !viaResource) return false;
+  if (viaInclude && !includeReadCurrent(includes, target)) return false;
+  return !viaResource || resourceReadCurrent(resources, target);
+}
+
+function resourceReadCurrent(resources, target) {
+  const cached = resources.get(target);
+  if (!cached || cached.hash !== cached.announcedHash) return false;
+  let st;
+  try { st = statSync(target); } catch { return false; }
+  if (st.size !== cached.size) return false;
+  if (st.mtimeMs === cached.mtime) return true;
+  let hash;
+  try { hash = hashFile(target); } catch { return false; }
+  if (hash !== cached.hash) return false;
+  resources.set(target, { ...cached, mtime: st.mtimeMs });
+  return true;
+}
+
+function hashFile(file) {
+  return createHash('sha1').update(readFileSync(file)).digest('hex');
 }

@@ -86,6 +86,7 @@ export function initializeEngineState(
   engine.diagnostics = [];
   engine.tocHash = null;
   engine.includes = new Map(); // path -> {mtime, readPath, text, announcedText} (include-cache.js)
+  engine.resourceReads = new Map(); // read path -> {mtime, size, hash, announcedHash} (include-cache.js)
   engine.watchers = new Map(); // path -> {close()} re-arming watch handle (include-expander.js)
   // Resident-fork budget. Every checkpoint is a live lualatex process
   // (~100-300MB unique RSS on package-heavy preambles), so N engines on a

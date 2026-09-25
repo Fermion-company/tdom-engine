@@ -65,7 +65,7 @@ import { chunkTargets } from './chunk-targets.js';
 import { focusRescueIds } from './update-helpers.js';
 import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, includeOnlyFromSource, watchInclude } from './include-expander.js';
-import { announceIncludeReads, includeReadCurrent } from './include-cache.js';
+import { announceIncludeReads, announceResourceReads, inputReadCurrent } from './include-cache.js';
 import { needsRescue } from './rescue-classifier.js';
 import { scheduleHeaders as scheduleHeadersHelper } from './header-scheduler.js';
 import {
@@ -245,6 +245,7 @@ export class CheckpointEngine {
       }
       this.watchers.clear();
       this.includes.clear();
+      this.resourceReads.clear();
       this.preHash = null;
       this.preGate = null;
       this.opaqueStickyPre = null;
@@ -2533,6 +2534,7 @@ export class CheckpointEngine {
       overlayDir: this.overlayDir,
       workDir: this.workDir,
       includes: this.includes,
+      resources: this.resourceReads,
       includeTrace: this.shippingIncludeTrace,
       diagnostics: this.diagnostics,
       includeOnly: includeOnlyFromSource(source),
@@ -2550,7 +2552,7 @@ export class CheckpointEngine {
       // byte. Refreshing anyway advances srcRev and restarts canonical: on
       // the 316-page book 33 such events after /open held the first
       // canonical back for 305 s.
-      if (includeReadCurrent(this.includes, changed)) {
+      if (inputReadCurrent(this.includes, this.resourceReads, changed)) {
         this.unchangedInputEvents++;
         return;
       }
@@ -2569,6 +2571,7 @@ export class CheckpointEngine {
       unknown: inputChanges?.unknown === true || (!changed.length && !removed.length),
     };
     announceIncludeReads(this.includes, [...changed, ...removed]);
+    announceResourceReads(this.resourceReads, [...changed, ...removed]);
     this.canonical.invalidateInputs(projectInputChanges);
     return this.#update({ editLabel: 'external-include', projectInputChanges });
   }
@@ -2580,6 +2583,7 @@ export class CheckpointEngine {
         this.includes.delete(identity);
       }
     }
+    for (const file of changed) this.resourceReads.delete(file);
     this.canonical.invalidateInputs({ changed: [...changed] });
   }
 

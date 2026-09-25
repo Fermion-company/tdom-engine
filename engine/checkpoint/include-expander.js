@@ -4,7 +4,7 @@ import { fnv1a } from '../hash.js';
 import { segmentBody } from '../segmenter.js';
 import { resolveProjectInput } from '../project-inputs.js';
 import { expandInputParagraphs } from './mapped-inputs.js';
-import { cacheIncludeRead } from './include-cache.js';
+import { cacheIncludeRead, resourceContentSig } from './include-cache.js';
 
 export function expandIncludes(segs, depth, context) {
   if (depth > 3) return segs;
@@ -152,9 +152,9 @@ function offsetPosition(text, offset) {
 }
 
 // Files consumed by TeX without entering the source DOM still participate in
-// block identity. A replacement PNG/PDF/listing marks only its owning block
-// dirty; the watcher then calls engine.refresh(), preserving stale pixels
-// until the fresh exact chunk lands.
+// block identity, by content (a touch changes nothing). A replacement
+// PNG/PDF/listing marks only its owning block dirty; the watcher then calls
+// engine.refresh(), preserving stale pixels until the fresh exact chunk lands.
 function decorateExternalResources(seg, context) {
   const specs = [];
   const seenTex = new Set();
@@ -173,7 +173,7 @@ function decorateExternalResources(seg, context) {
       context.watchInclude(resolved.readPath);
       const contentSig = resolved.overlay
         ? fnv1a(readFileSync(resolved.readPath, 'utf8'))
-        : `${st.mtimeMs}:${st.size}`;
+        : resourceContentSig(context.resources, resolved.readPath, st);
       specs.push(`${resolved.actualPath}:${resolved.readPath}:${contentSig}`);
       return resolved;
     } catch {

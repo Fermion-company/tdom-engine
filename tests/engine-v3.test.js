@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
-import { includeHoldsText, includeReadCurrent } from '../engine/checkpoint/include-cache.js';
+import { includeHoldsText, includeReadCurrent, inputReadCurrent } from '../engine/checkpoint/include-cache.js';
 import { watchInclude } from '../engine/checkpoint/include-expander.js';
 
 const DEMO = readFileSync(fileURLToPath(new URL('../samples/demo-lua.tex', import.meta.url)), 'utf8');
@@ -1313,6 +1313,78 @@ test('a touched \\input or \\include file whose bytes did not change does not ad
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(eng.srcRev, refreshed);
     assert.equal(events.length, 2);
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a touched listing or mid-paragraph \\input whose bytes did not change leaves its block clean and srcRev alone', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-external-resource-'));
+  const code = path.join(root, 'code.txt');
+  const frag = path.join(root, 'frag.tex');
+  writeFileSync(code, 'int main(void) { return 0; }\n');
+  writeFileSync(frag, 'an inline fragment');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const events = [];
+  const refreshes = [];
+  let autoRefresh = true;
+  eng.onExternalChange = (file) => {
+    events.push(file);
+    if (autoRefresh) refreshes.push(eng.refresh({ changed: [file] }));
+  };
+  const until = async (done, what) => {
+    const deadline = Date.now() + 10_000;
+    while (!done() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.ok(done(), what);
+  };
+  const hashes = () => eng.blocks.map((b) => b.hash).join('|');
+  try {
+    await eng.open([
+      '\\documentclass{article}',
+      '\\usepackage{verbatim}',
+      '\\begin{document}',
+      'Before the listing.',
+      '',
+      '\\verbatiminput{code.txt}',
+      '',
+      'Text with \\input{frag} inside a paragraph.',
+      '',
+      '\\end{document}',
+      '',
+    ].join('\n'));
+    const opened = eng.srcRev;
+    const identity = hashes();
+    const dropped = eng.unchangedInputEvents;
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(code, later, later);
+    writeFileSync(frag, readFileSync(frag));
+    await until(() => eng.unchangedInputEvents >= dropped + 2, 'both watcher events fired');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(eng.srcRev, opened, 'unchanged bytes leave srcRev alone');
+    assert.deepEqual(events, []);
+    // a later expansion (a keystroke) sees the new mtimes: block identity is by content
+    const at = eng.getSource().indexOf('Before the listing.');
+    await eng.edit(at, at, 'X');
+    await eng.edit(at, at + 1, '');
+    assert.equal(hashes(), identity, 'a touch does not dirty the owning blocks');
+
+    writeFileSync(code, 'int main(void) { return 1; }\n');
+    await until(() => events.length === 1, 'a byte change reaches onExternalChange');
+    assert.equal(events[0], code);
+    await Promise.all(refreshes);
+    assert.notEqual(hashes(), identity, 'the listing block is dirty after a real change');
+
+    // A keystroke that re-reads new resource bytes before their watcher event
+    // must not swallow that event: canonical has not been told about them.
+    autoRefresh = false;
+    writeFileSync(frag, 'a revised fragment');
+    await eng.edit(at, at, 'Y');
+    assert.equal(inputReadCurrent(eng.includes, eng.resourceReads, frag), false);
+    await until(() => events.length === 2, 'the event still reaches onExternalChange');
+    assert.equal(events[1], frag);
+    await eng.refresh({ changed: [frag] });
+    assert.equal(inputReadCurrent(eng.includes, eng.resourceReads, frag), true);
   } finally {
     await eng.close();
     rmSync(root, { recursive: true, force: true });
