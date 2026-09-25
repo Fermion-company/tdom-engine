@@ -125,8 +125,11 @@ export async function renderResidentBlock(
       }
     }
     // a cold preview's checkpoint is not the block's own: its JOB prelude
-    // re-seeds the entry state (and already ends with the primer)
-    const body = Buffer.from((prelude ?? buildLastskipPrimer(block, idx, engine.blocks)) + block.text, 'utf8');
+    // re-seeds the entry state (and already ends with the primer). Otherwise
+    // the prelude the galley's JOB used (label definitions and the primer;
+    // docs/10 §10.4c), else the primer alone.
+    const body = Buffer.from(
+      (prelude ?? block.galley?.tdomRenderPrelude ?? buildLastskipPrimer(block, idx, engine.blocks)) + block.text, 'utf8');
     engine.renderStats ??= { captureHits: 0, captureMisses: 0, retypesets: 0 };
 
     let shippedCapture = shippedEarly;

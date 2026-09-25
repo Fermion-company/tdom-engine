@@ -24,6 +24,8 @@ export async function rescueBlock(engine, idx, why, callbacks) {
       pumpRescues();
       const kept = { ...block.galley, tdomStale: true };
       delete kept.tdomColdPreview; // the held copy is no longer a preview (docs/10 §10.4b)
+      delete kept.tdomEarlyRender; // nor rendered for its text
+      delete kept.tdomRenderPrelude;
       return kept;
     }
     // A boot walk with the fork runners up compiles a first-ever rescue

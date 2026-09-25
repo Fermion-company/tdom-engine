@@ -203,9 +203,11 @@ async function renderBlockInner(engine, block, callbacks) {
       break;
     }
   }
-  // the preview's RENDER that went out beside its JOB (docs/10 §10.4b)
-  const early = cold?.early && !cold.early.used && !cold.early.discarded && !cold.early.failure &&
-    cold.early.text === block.text ? cold.early : null;
+  // the RENDER that went out beside the preview's JOB (docs/10 §10.4b) or
+  // beside the edited block's own JOB (§10.4c): the galley it was sent for
+  // carries it, so a later state change (a new galley) never takes its PDF
+  const sent = cold ? cold.early : block.galley?.tdomEarlyRender;
+  const early = sent && !sent.used && !sent.discarded && !sent.failure && sent.text === block.text ? sent : null;
   if (!ck && !captureCk && !early) {
     // checkpoint retired off the grid (long documents keep ~64): the
     // Neither exact path has a resident owner: RENDER needs the state AT the

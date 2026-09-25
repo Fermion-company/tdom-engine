@@ -613,7 +613,7 @@ export class CheckpointEngine {
       err.tdomAborted = true;
       throw err;
     }
-    const { body, jobId, refSnapshot } = buildJobBlockBody({
+    const { body, jobId, refSnapshot, prelude: jobPrelude } = buildJobBlockBody({
       block,
       idx,
       blocks: this.blocks,
@@ -634,6 +634,7 @@ export class CheckpointEngine {
     ckptP.catch(() => {});
     this.currentJob = { galleyKey, ckptKey, parent: ck, ckptIdx: idx + 1, startedAt: performance.now() };
     let advance = false;
+    let early = null;
     try {
       // An exact-render JOB already owns the exact TeX node list that the
       // asynchronous preview needs.  Retain it in the post-block checkpoint
@@ -678,6 +679,36 @@ export class CheckpointEngine {
       const liveFloor = this.confirmedLiveHeapKb || 0;
       ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}\n`);
       ck.sendRaw(body);
+      // The block this edit changed ships its exact RENDER beside its JOB,
+      // forked from the same entry state with the JOB's own prelude (label
+      // definitions, \lastskip primer), instead of after the update ends
+      // (docs/10 §10.4c): the pump then only crops that PDF. An edited block
+      // is always a fork JOB (a walk consumes only clean blocks before the
+      // first dirty one), so its input stays alive for the RENDER. One per
+      // update, only the first keystroke after a pause with none waiting
+      // behind it, and never for a block the pump can CAPTURE from this
+      // JOB's node list.
+      if (!override && !advance && !(capture !== '-' && mayCaptureNativeBlock(block)) &&
+          block.sourceChanged && block.needsRender && !ck.vstale &&
+          this.updating && !this.bgActive && this.coldPreviewEarlyRender && this.earlyRenderUpdate !== this.updateSeq &&
+          (this.editGapMs ?? 0) > 400 && !(this.keystrokePending > 0)) {
+        try {
+          early = startResidentRender(this, {
+            block,
+            ck,
+            checkpointIndex: idx,
+            body: Buffer.from(jobPrelude + block.text, 'utf8'),
+            awaitRender: (key, timeout) => this.#await(key, timeout),
+          });
+          this.earlyRenderUpdate = this.updateSeq;
+          const unused = early;
+          setTimeout(() => unused.discard(), 30_000).unref?.();
+        } catch (err) {
+          // an optimisation that failed (job dir): the pump renders as before
+          this.diagnostics.push(`early render ${block.id}: ${err?.message ?? err}`);
+          early = null;
+        }
+      }
       const [galley, nextCheckpoint] = await Promise.all([galleyP, ckptP]);
       nextCheckpoint.replayToken = replayToken;
       this.confirmedLiveHeapKb = Math.max(this.confirmedLiveHeapKb || 0, nextCheckpoint.gcFloorKb || 0);
@@ -712,8 +743,13 @@ export class CheckpointEngine {
       if (calibrate) this.calibrateInitialHeap = false;
       if (!advance) this.#retireOffGrid(idx);
       this.#enforceCheckpointCap(idx + 1);
+      // the pump takes it only for this galley (render-pump.js)
+      if (early) galley.tdomEarlyRender = early;
+      // the pump's own RENDER of this galley uses the same label definitions
+      if (!override && !ck.vstale) galley.tdomRenderPrelude = jobPrelude;
       return galley;
     } catch (err) {
+      early?.discard();
       // A stuck fork child (e.g. a TeX infinite loop in this block) never
       // reads DIE from its socket — kill it hard or it spins at full CPU
       // forever. The pid arrived with the FORKED announcement. Guard > 0:
@@ -1426,6 +1462,8 @@ export class CheckpointEngine {
     // a replaced preview's early RENDER (if the pump never took it) is moot
     const replacedEarly = block.galley?.tdomColdPreview?.early;
     if (replacedEarly && replacedEarly !== galley.tdomColdPreview?.early) replacedEarly.discard();
+    const replacedEarlyRender = block.galley?.tdomEarlyRender;
+    if (replacedEarlyRender && replacedEarlyRender !== galley.tdomEarlyRender) replacedEarlyRender.discard();
     if (!galley.tdomColdPreview && this.coldPreviewHolds?.size) {
       // a walk replaced the block's preview: its checkpoint has no RENDER left
       for (const peer of [...this.coldPreviewHolds.keys()]) this.#releaseColdPreviewHold(peer, block.id);
@@ -1593,6 +1631,7 @@ export class CheckpointEngine {
         // would mark unrelated pages dirty
         this.updating = true;
         this.bgAbort = false;
+        this.updateSeq++;
         try {
           preemptResidentRenders(this);
           return await this.#updateInner({ ...args, announceDocumentReset });

@@ -157,6 +157,15 @@ cold stop の応答は編集 block をまだ組んでいないので、打鍵が
 - `/edit` の応答と SSE `update` の `timing` には、打鍵の client 時刻・server の受信・engine の完了（epoch ms）に加えて、`lock`（`#update` に入った時刻と lock を取れた時刻、そのとき chain を持っていたもの `heldBy`: update・warm・cold・grid と実行中の job の block と経過 ms）、`walk`（foreground walk の出発点・編集範囲と、block ごとの ms と印。c=clean・d=dirty、x=galley か exit state が変化、r=rescue、p=その時点で preview が届いていた）、`coldWalk`（直近の cold walk の block ごとの ms）が出る。
 - 実測（316 ページ、上限 12、grid 充填済み、warm なしで 6 章へ 1 打鍵）: 紙面に出るまで 0.82〜1.43 s（従来 1.35〜4.7 s）。内訳は応答 0.38〜0.61 s と、その 0.4〜0.8 s 後に届く exact 画素の late patch。
 
+## 10.4c 編集 block の先行 RENDER
+
+exact 画素の要る block（`needsRender`）を編集すると、render pump は foreground update が終わるのを待ってから、その block の入口の checkpoint から RENDER する（`engine.updating` の間は pump が止まる）。walk が編集 block の手前の block を組み直す打鍵では、walk の時間に RENDER の組版がそのまま足されていた（316 ページ・高負荷: 2 block の walk 0.8〜0.9 s の後に RENDER 0.6〜0.8 s）。
+
+- 編集 block の JOB を送った直後に、同じ checkpoint へ RENDER を送る（`startResidentRender`）。本文は JOB と同じ prelude（label 定義と `\lastskip` primer）＋本文なので、画素の参照番号も galley と揃う。本文が変わった block は必ず fork の JOB で組まれる（walk が STEP で消費するのは最初の dirty block より前の clean block だけ）ので、RENDER の入力は残っている。
+- 条件: update（cold resume を含む）の中で、本文が変わった block（`sourceChanged`）で、`needsRender`、この JOB の node list から pump が CAPTURE できる block（`mayCaptureNativeBlock`: display math と、float も改ページも無い native の gfx block）でない、checkpoint が vstale でない。そのうえで lock を取った 1 回の update に 1 本まで（`updateSeq`・`earlyRenderUpdate`）、止まった後の最初の 1 打（`editGapMs` 400 ms 超）で、後ろに打鍵が待っていないとき。打鍵が続く間は pump の quiet gate に任せる。ただし続けて打つ最初の 1 打は単独の打鍵と区別できないので、その RENDER は次の打鍵で kill されて無駄になる（打鍵の続きごとに 1 本）。`TDOM_COLD_PREVIEW_EARLY_RENDER=0` で §10.4b と一緒に止まる。
+- JOB が返した galley に `tdomEarlyRender` として付け、pump はその galley が block に付いていて本文が同じときだけ、その PDF を切り出す（`render-pump.js`）。後の update が block を別の state で組み直して galley が替われば使わない。次の打鍵の preempt では子が kill され、PDF の置き場は galley が替わったとき（`#adoptGalley`）か 30 s 後に消える。JOB が失敗したときもその場で捨てる。last-good 保持と stale-first rescue の複製では印を外す。置き場を作れなかったときは送らず、pump がふだんどおり描く。
+- pump が自分で送る RENDER も、galley を組んだ JOB の prelude（`tdomRenderPrelude`。vstale でない checkpoint の JOB だけが残す）を本文の前に付けるので、先行 RENDER が kill された打鍵でも参照番号は galley と揃う。isolated rescue などその prelude の無い galley は、従来どおり primer だけを付ける。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。

@@ -194,6 +194,8 @@ export function initializeEngineState(
   engine.coldPreviewTimeoutMs = 15_000;
   // the first keystroke after a pause sends its preview's RENDER beside the JOB
   engine.coldPreviewEarlyRender = process.env.TDOM_COLD_PREVIEW_EARLY_RENDER !== '0';
+  engine.updateSeq = 0; // one per #update that took the lock
+  engine.earlyRenderUpdate = null; // the update whose edited block sent its early RENDER (docs/10 §10.4c)
   engine.editGapMs = null; // time since the edit before the current one
   engine.coldPreviewSeq = 0;
   engine.coldPreviewHolds = new Map(); // peer a preview forked -> Set of block ids, kept for their RENDER

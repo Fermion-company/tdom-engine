@@ -184,7 +184,7 @@ exact chunk は主に四つの経路から来る。
 | 経路 | 内容 |
 | --- | --- |
 | resident CAPTURE | display math の foreground JOB が既に組んだ node list を post-block checkpoint から copy-free で引き渡し、再組版せず shipout する |
-| resident RENDER | warm pre-block checkpoint から block を再実行して tight PDF として shipout する（capture 非対象・miss 時の fallback） |
+| resident RENDER | warm pre-block checkpoint から block を再実行して tight PDF として shipout する（capture 非対象・miss 時の fallback）。止まった後の最初の打鍵では、CAPTURE できない編集 block に限り、JOB の直後に同じ checkpoint から RENDER を送り、pump はその PDF を切り出す（docs/10 §10.4c） |
 | canonical crop | source・SyncTeX・PDFの全行の位置を照合でき、未検証の描画がない場合に限りSVGから切り出す |
 | isolated render | standalone `lualatex` で該当 block を compile し、rescue chunk を作る |
 

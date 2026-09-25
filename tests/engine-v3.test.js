@@ -440,6 +440,62 @@ test('a cold preview of a block with exact pixels renders them from the checkpoi
   }
 });
 
+test('the first keystroke after a pause sends the edited block RENDER beside its own JOB', opts, async () => {
+  const work = WORK + '-edit-early';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 12; i += 1) {
+    paragraphs.push(`Paragraph ${i} holds ${i === 6 ? '$x^2$' : i === 3 || i === 4 ? `$z_${i}$` : 'text'} marked ${i} in the edit render fixture.`);
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  try {
+    await e.open(doc);
+    await e.renderTask;
+    e.lastEditAt = 0; // a pause before this keystroke
+    const at = e.getSource().indexOf('$x^2$') + '$x^2$'.length;
+    const r = await e.edit(at, at, ' X');
+    assert.equal(r.stats.chainVerdict, 'clean', 'a plain hot edit');
+    const id = String(r.dirtySourceNodes[0]).replace(/^src-/, '');
+    const edited = e.blocks.find((b) => b.id === id);
+    assert.ok(edited.needsRender, 'the fixture block needs exact pixels');
+    assert.ok(edited.galley.tdomEarlyRender, 'its JOB sent the RENDER');
+    await e.renderTask;
+    const timing = (e.renderTimings ?? []).find((t) => t.block === id && t.earlyMs != null);
+    assert.ok(timing && !timing.previewPeer, 'the pump cropped the early PDF');
+    const chunk = e.chunks.get(id);
+    assert.equal(chunk?.forGalley, edited.galleyHash, 'for the galley the JOB returned');
+    assert.ok(chunk.xBp < 0 && chunk.wBp > chunk.logicalWBp, JSON.stringify({ xBp: chunk.xBp, wBp: chunk.wBp }));
+    // a burst: its first keystroke's RENDER is killed by the second, whose
+    // own RENDER is the pump's (no early RENDER within 400 ms)
+    e.lastEditAt = 0;
+    let next = e.getSource().indexOf('$x^2$') + '$x^2$'.length;
+    const first = await e.edit(next, next, 'Y');
+    const firstBlock = e.blocks.find((b) => b.id === String(first.dirtySourceNodes[0]).replace(/^src-/, ''));
+    assert.ok(firstBlock.galley.tdomEarlyRender, 'the first keystroke of the burst sent one');
+    next = e.getSource().indexOf('$x^2$') + '$x^2$'.length;
+    e.lastEditAt = Date.now(); // the previous keystroke just arrived
+    const burst = await e.edit(next, next, 'Z');
+    const again = e.blocks.find((b) => b.id === String(burst.dirtySourceNodes[0]).replace(/^src-/, ''));
+    assert.ok(!again.galley.tdomEarlyRender, 'no early RENDER within 400 ms of the previous keystroke');
+    await e.renderTask;
+    assert.equal(e.chunks.get(again.id)?.forGalley, again.galleyHash, 'the pump rendered the last keystroke');
+    // one early RENDER per update, however many edited blocks need pixels
+    e.lastEditAt = 0;
+    const from = e.getSource().indexOf('$z_3$');
+    const to = e.getSource().indexOf('$z_4$') + '$z_4$'.length;
+    await e.edit(from, to, e.getSource().slice(from, to).replace('$z_3$', '$w_3$').replace('$z_4$', '$w_4$'));
+    const sent = e.blocks.filter((b) => b.galley?.tdomEarlyRender);
+    assert.equal(sent.length, 1, 'one early RENDER for the update, though two edited blocks need pixels');
+    await e.renderTask;
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(readdirSync(work).filter((name) => /-early\d+$/.test(name)), [], 'no early render dir is left');
+  } finally {
+    await e.close();
+  }
+});
+
 test('the first keystroke after a pause sends its cold preview RENDER beside the preview JOB', opts, async () => {
   const work = WORK + '-cold-preview-early';
   rmSync(work, { recursive: true, force: true });
