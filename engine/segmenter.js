@@ -81,6 +81,7 @@ export function segmentBody(text, baseOffset, { structuralEvents = [], literalEn
   let inDisplay = false;
   let inVerbatim = null; // env name while inside a literal environment
   let inAlltt = false; // commands/braces execute; unlike normal TeX, % is data
+  let inKKcode = false; // inside \KKcodeS...\KKcodeE (KKluaverb)
   let cur = null; // { start, end }
   let curStructuralSinks = new Set();
 
@@ -101,6 +102,12 @@ export function segmentBody(text, baseOffset, { structuralEvents = [], literalEn
   };
 
   for (const ln of lines) {
+    // KKluaverb's \KKcodeS...\KKcodeE: literal lines, like a verbatim env
+    if (inKKcode) {
+      if (cur === null) cur = { start: ln.start };
+      if (ln.text.includes('\\KKcodeE')) inKKcode = false;
+      continue;
+    }
     if (inVerbatim) {
       // literal content: no comment stripping, no depth tracking, no
       // blank-line flush (blank lines inside a listing stay in the block)
@@ -111,7 +118,7 @@ export function segmentBody(text, baseOffset, { structuralEvents = [], literalEn
     // Neutralize inline \verb before comments: its delimiter may contain a
     // literal `%`, which must not hide executable text later on the line.
     let stripped = ln.text.replace(
-      /\\verb\*?([^A-Za-z\s])(.*?)\1/g,
+      /\\verb\*?([^A-Za-z\s])(.*?)\1|\\KKverb\|[^|]*\|/g,
       (match) => ' '.repeat(match.length)
     );
     if (!inAlltt) stripped = stripComment(stripped);
@@ -134,6 +141,14 @@ export function segmentBody(text, baseOffset, { structuralEvents = [], literalEn
       continue;
     }
 
+    const kkcode = stripped.indexOf('\\KKcodeS');
+    if (kkcode >= 0 && !ln.text.slice(ln.text.indexOf('\\KKcodeS')).includes('\\KKcodeE')) {
+      const before = stripped.slice(0, kkcode);
+      envDepth = Math.max(0, envDepth + countMatches(before, /\\begin\{[^}]*\}/g) - countMatches(before, /\\end\{[^}]*\}/g));
+      braceDepth = Math.max(0, braceDepth + braceDelta(before));
+      inKKcode = true;
+      continue;
+    }
     const verb = literalBegin(stripped, literalEnvs);
     if (verb) {
       // enter literal mode unless the same line also closes it; the

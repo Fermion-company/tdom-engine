@@ -67,3 +67,11 @@ test('a real display delimiter still owns internal blank lines', () => {
     'tail',
   ]);
 });
+
+test('KKluaverb payloads do not open braces or comments for the segmenter', () => {
+  assert.deepEqual(texts('A \\KKverb|{| B.\n\nNext.'), ['A \\KKverb|{| B.\n', 'Next.']);
+  assert.deepEqual(texts('\\KKcodeS\n\\begin{itemize} % {\n\n\\KKcodeE\n\nNext.'), [
+    '\\KKcodeS\n\\begin{itemize} % {\n\n\\KKcodeE\n',
+    'Next.',
+  ]);
+});

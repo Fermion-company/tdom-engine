@@ -54,3 +54,10 @@ test('\\string quotes \\verb and inline listings are literal payloads', () => {
   assert.equal(closed('\\mintinline{latex}|\\begin{x}|'), true);
   assert.equal(closed('\\lstinline!unfinished'), false);
 });
+
+test('KKluaverb payloads are literal: braces and % inside do not hold the block', () => {
+  assert.equal(sourceClosure('A \\KKverb|{ % | B.').closed, true);
+  assert.equal(sourceClosure('\\KKcodeS\n\\begin{itemize} % {\n\\KKcodeE').closed, true);
+  assert.equal(sourceClosure('A \\KKverb|still typing').reason, 'verb-payload');
+  assert.equal(sourceClosure('\\KKcodeS\n{').reason, 'verb-payload');
+});
