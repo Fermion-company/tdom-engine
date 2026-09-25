@@ -75,3 +75,20 @@ test('KKluaverb payloads do not open braces or comments for the segmenter', () =
     'Next.',
   ]);
 });
+
+test('diffBlocks keeps the unchanged blocks between two changed regions (#96)', async () => {
+  const { diffBlocks } = await import('../engine/segmenter.js');
+  const old = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'].map((t, i) => ({ id: `o${i}`, hash: t, text: t, start: 0, end: 0 }));
+  const segs = ['a', 'B', 'X', 'c', 'd', 'e', 'f', 'g', 'h', 'I', 'j'].map((t) => ({ hash: t, text: t, start: 0, end: 0 }));
+  let n = 0;
+  const d = diffBlocks(old, segs, () => n++);
+  assert.deepEqual(d.blocks.map((b) => b.id), ['o0', 'o1', 'b0', 'o2', 'o3', 'o4', 'o5', 'o6', 'o7', 'o8', 'o9']);
+  assert.deepEqual([...d.dirty], ['o1', 'b0', 'o8']);
+  assert.equal(d.bounds.regions, 2);
+  // the boundary before c (old 2) survives before its new place (3), after an edit
+  assert.deepEqual(d.bounds.boundaryMap.get(2), { to: 3, exact: false });
+  assert.deepEqual(d.bounds.boundaryMap.get(1), { to: 1, exact: true });
+  assert.equal(d.bounds.boundaryMap.has(8), false, 'the boundary before an edited block does not');
+  assert.deepEqual(d.bounds.changedOld, [1, 8]);
+  assert.deepEqual(d.bounds.changedNew, [1, 2, 9]);
+});

@@ -236,8 +236,28 @@ export async function runUpdateTypesetPhase(engine, {
     // External project updates can dirty disjoint blocks in one source
     // snapshot (for example an included chapter plus the generated .bbl at
     // the end). Never accept an intermediate clean block as convergence
-    // while a later source-dirty block is still waiting.
-    if (i <= lastDisplay) continue;
+    // while a later source-dirty block is still waiting. But once this
+    // clean block reproduced its galley and exit state, the blocks up to the
+    // next dirty one would too: resume there, from the boundary the edit
+    // kept before it (diffBlocks' boundaryMap), instead of re-typesetting
+    // every block in between (tex64-internal #96).
+    if (i <= lastDisplay) {
+      if (wasClean && !changed && !defEdit && !changedLabels.size && !preview) {
+        let next = i;
+        while (next < engine.blocks.length && !dirtySource.has(engine.blocks[next].id) &&
+          engine.blocks[next].galley && !(next >= firstDisplay && next <= lastDisplay &&
+            engine.foregroundRenderIds?.has(engine.blocks[next].id) && next !== i)) next++;
+        // the nearest kept boundary at or before that block (the walk
+        // replays from it up to the dirty block, as from its start)
+        let to = Math.min(next, engine.blocks.length - 1);
+        while (to > i && !engine.checkpoints.has(to)) to--;
+        if (to > i) {
+          if (walkTrace.length < 48) walkTrace.push([i, 0, `skip>${to}`]);
+          i = to;
+        }
+      }
+      continue;
+    }
     if (!wasClean) {
       if (!defEdit && changed && i > lastNoGalley && i < engine.blocks.length &&
           dirtyBlocks.length === 1 && dirtyBlocks[0] === block.id && !changedLabels.size &&
@@ -438,5 +458,6 @@ export async function runUpdateTypesetPhase(engine, {
   // screen meanwhile, and canonical guarantees the final pixels.
   queueMovedOffsets();
   timer.lap('pagectx');
+  Object.assign(engine.lastWalkTrace, { typeset: typesetCount, stop: fgStop, verdict, ms: walkMs });
   engine._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict, cold };
 }

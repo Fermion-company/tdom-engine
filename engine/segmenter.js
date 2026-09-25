@@ -348,53 +348,96 @@ export function diffBlocks(oldBlocks, segs, nextId) {
   for (let i = 0; i < p; i++) {
     blocks.push(refresh(oldBlocks[i], segs[i]));
   }
-  // Middle: pair positionally.
-  const midOld = so - p;
-  const midNew = sn - p;
-  const shared = Math.min(midOld, midNew);
-  for (let i = 0; i < shared; i++) {
-    const ob = oldBlocks[p + i];
-    const sg = segs[p + i];
-    if (ob.hash === sg.hash) {
-      blocks.push(refresh(ob, sg));
-    } else {
-      // Modified in place: keep the id. Expansion/semantics must rebuild
-      // (they depend on the text), but the layout cache is carried over —
-      // the layout key decides whether the rebuilt semantics differ.
-      // The PREVIOUS galley rides along as the stale-first display: an
-      // edited rescue-environment block without it had to pay a SYNCHRONOUS
-      // isolated compile (~2s) on every keystroke — old-but-clean pixels
-      // plus an async exact render is the doctrine, and it needs the old
-      // galley to exist. The block stays in `dirty`, so everything that
-      // must re-typeset still does; the carried fields are only the
-      // "last good" state the rescue tiers show meanwhile.
-      const nb = {
-        id: ob.id,
+  // Middle: blocks whose text did not change are found by hash (a longest
+  // common subsequence), so a second changed region further down does not
+  // turn every block between the two into a changed one, and an inserted or
+  // deleted block does not shift the pairing of all that follow
+  // (tex64-internal #96). Between two such anchors the blocks pair up by
+  // position as before: a block edited in place keeps its id.
+  const anchors = middleAnchors(oldBlocks, segs, p, so, p, sn);
+  const matchedOld = new Map(); // old index -> new index, for every kept block
+  for (let i = 0; i < p; i++) matchedOld.set(i, i);
+  let regions = 0;
+  let oi = p;
+  let ni = p;
+  const gap = (oEnd, nEnd) => {
+    const midOld = oEnd - oi;
+    const midNew = nEnd - ni;
+    if (midOld || midNew) regions++;
+    const shared = Math.min(midOld, midNew);
+    const base = { o: oi, n: ni };
+    for (let i = 0; i < shared; i++) {
+      const ob = oldBlocks[base.o + i];
+      const sg = segs[base.n + i];
+      if (ob.hash === sg.hash) {
+        blocks.push(refresh(ob, sg));
+        matchedOld.set(base.o + i, base.n + i);
+      } else {
+        // Modified in place: keep the id. Expansion/semantics must rebuild
+        // (they depend on the text), but the layout cache is carried over —
+        // the layout key decides whether the rebuilt semantics differ.
+        // The PREVIOUS galley rides along as the stale-first display: an
+        // edited rescue-environment block without it had to pay a SYNCHRONOUS
+        // isolated compile (~2s) on every keystroke — old-but-clean pixels
+        // plus an async exact render is the doctrine, and it needs the old
+        // galley to exist. The block stays in `dirty`, so everything that
+        // must re-typeset still does; the carried fields are only the
+        // "last good" state the rescue tiers show meanwhile.
+        const nb = {
+          id: ob.id,
+          start: sg.start,
+          end: sg.end,
+          text: sg.text,
+          hash: sg.hash,
+          sem: null,
+          exp: null,
+          layout: ob.layout,
+          layoutKey: ob.layoutKey,
+          galley: ob.galley,
+          // One-generation proof input for canonical-addressed wrapped prose:
+          // the planner may overlay only the final visual line when every
+          // earlier LuaLaTeX line is byte-identical across the edit.
+          // (a cold preview is not a proof input: keep the galley it stands
+          // in for, docs/10 §10.4b)
+          previousGalley: ob.galley?.tdomColdPreview ? (ob.previousGalley ?? null) : ob.galley,
+          galleyHash: ob.galleyHash,
+          stateVec: ob.stateVec,
+          units: ob.units,
+          rescued: ob.rescued,
+          pageOffset: ob.pageOffset,
+          fidelity: ob.fidelity,
+          needsRender: ob.needsRender,
+          gfx: ob.gfx,
+          kind: ob.kind,
+          consumesToc: ob.consumesToc,
+          file: sg.file ?? null,
+          sourceStart: sg.sourceStart ?? null,
+          sourceEnd: sg.sourceEnd ?? null,
+          sourceParts: sg.sourceParts ?? null,
+          includeStart: !!sg.includeStart,
+          includeEnd: !!sg.includeEnd,
+          externalGraphics: !!sg.externalGraphics,
+          structuralSinks: sg.structuralSinks ?? [],
+          sourceChanged: true,
+          typesetCostMs: ob.typesetCostMs,
+        };
+        blocks.push(nb);
+        dirty.add(nb.id);
+      }
+    }
+    for (let i = shared; i < midNew; i++) {
+      const sg = segs[base.n + i];
+      const id = 'b' + nextId();
+      blocks.push({
+        id,
         start: sg.start,
         end: sg.end,
         text: sg.text,
         hash: sg.hash,
         sem: null,
         exp: null,
-        layout: ob.layout,
-        layoutKey: ob.layoutKey,
-        galley: ob.galley,
-        // One-generation proof input for canonical-addressed wrapped prose:
-        // the planner may overlay only the final visual line when every
-        // earlier LuaLaTeX line is byte-identical across the edit.
-        // (a cold preview is not a proof input: keep the galley it stands
-        // in for, docs/10 §10.4b)
-        previousGalley: ob.galley?.tdomColdPreview ? (ob.previousGalley ?? null) : ob.galley,
-        galleyHash: ob.galleyHash,
-        stateVec: ob.stateVec,
-        units: ob.units,
-        rescued: ob.rescued,
-        pageOffset: ob.pageOffset,
-        fidelity: ob.fidelity,
-        needsRender: ob.needsRender,
-        gfx: ob.gfx,
-        kind: ob.kind,
-        consumesToc: ob.consumesToc,
+        layout: null,
+        layoutKey: null,
         file: sg.file ?? null,
         sourceStart: sg.sourceStart ?? null,
         sourceEnd: sg.sourceEnd ?? null,
@@ -404,43 +447,44 @@ export function diffBlocks(oldBlocks, segs, nextId) {
         externalGraphics: !!sg.externalGraphics,
         structuralSinks: sg.structuralSinks ?? [],
         sourceChanged: true,
-        typesetCostMs: ob.typesetCostMs,
-      };
-      blocks.push(nb);
-      dirty.add(nb.id);
+      });
+      dirty.add(id);
+      added.push(id);
     }
+    for (let i = shared; i < midOld; i++) removed.push(oldBlocks[base.o + i].id);
+    oi = oEnd;
+    ni = nEnd;
+  };
+  for (const [ao, an] of anchors) {
+    gap(ao, an);
+    blocks.push(refresh(oldBlocks[ao], segs[an]));
+    matchedOld.set(ao, an);
+    oi = ao + 1;
+    ni = an + 1;
   }
-  for (let i = shared; i < midNew; i++) {
-    const sg = segs[p + i];
-    const id = 'b' + nextId();
-    blocks.push({
-      id,
-      start: sg.start,
-      end: sg.end,
-      text: sg.text,
-      hash: sg.hash,
-      sem: null,
-      exp: null,
-      layout: null,
-      layoutKey: null,
-      file: sg.file ?? null,
-      sourceStart: sg.sourceStart ?? null,
-      sourceEnd: sg.sourceEnd ?? null,
-      sourceParts: sg.sourceParts ?? null,
-      includeStart: !!sg.includeStart,
-      includeEnd: !!sg.includeEnd,
-      externalGraphics: !!sg.externalGraphics,
-      structuralSinks: sg.structuralSinks ?? [],
-      sourceChanged: true,
-    });
-    dirty.add(id);
-    added.push(id);
-  }
-  for (let i = shared; i < midOld; i++) removed.push(oldBlocks[p + i].id);
+  gap(so, sn);
   // Common suffix.
   for (let i = 0; i < nNew - sn; i++) {
     blocks.push(refresh(oldBlocks[so + i], segs[sn + i]));
+    matchedOld.set(so + i, sn + i);
   }
+  // Checkpoint re-keying (checkpoint-preservation.js): the boundary before
+  // old block k survives at the boundary before its new position when that
+  // block is kept. Prefix boundaries (k <= prefixLen) hold exactly the old
+  // state; the others follow an edit and survive as volatile-stale, the
+  // rule the suffix always had. The end of the document follows the end.
+  const boundaryMap = new Map();
+  for (let k = 0; k <= nOld; k++) {
+    if (k <= p) boundaryMap.set(k, { to: k, exact: true });
+    else if (k === nOld) boundaryMap.set(k, { to: nNew, exact: false });
+    else if (matchedOld.has(k)) boundaryMap.set(k, { to: matchedOld.get(k), exact: false });
+  }
+  // the blocks of the window that did change, on each side
+  const keptNew = new Set(matchedOld.values());
+  const changedOld = [];
+  for (let k = p; k < so; k++) if (!matchedOld.has(k)) changedOld.push(k);
+  const changedNew = [];
+  for (let k = p; k < sn; k++) if (!keptNew.has(k)) changedNew.push(k);
 
   // Window bounds for checkpoint re-keying: a checkpoint at boundary k holds
   // the state after blocks[0..k-1], so prefix boundaries (k <= prefixLen)
@@ -452,8 +496,40 @@ export function diffBlocks(oldBlocks, segs, nextId) {
     dirty,
     added,
     removed,
-    bounds: { prefixLen: p, oldSuffixStart: so, newSuffixStart: sn },
+    bounds: { prefixLen: p, oldSuffixStart: so, newSuffixStart: sn, boundaryMap, regions, changedOld, changedNew },
   };
+}
+
+// Pairs [oldIndex, newIndex] of unchanged blocks in the middle windows, in
+// order: a longest common subsequence of their hashes. A window too large
+// for the table keeps the positional pairing (no anchors).
+const MAX_LCS_CELLS = 4_000_000;
+function middleAnchors(oldBlocks, segs, oStart, oEnd, nStart, nEnd) {
+  const n = oEnd - oStart;
+  const m = nEnd - nStart;
+  if (!n || !m || n * m > MAX_LCS_CELLS) return [];
+  const width = m + 1;
+  const table = new Int32Array((n + 1) * width);
+  for (let i = n - 1; i >= 0; i--) {
+    const h = oldBlocks[oStart + i].hash;
+    for (let j = m - 1; j >= 0; j--) {
+      table[i * width + j] = h === segs[nStart + j].hash
+        ? table[(i + 1) * width + j + 1] + 1
+        : Math.max(table[(i + 1) * width + j], table[i * width + j + 1]);
+    }
+  }
+  const anchors = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (oldBlocks[oStart + i].hash === segs[nStart + j].hash) {
+      anchors.push([oStart + i, nStart + j]);
+      i++;
+      j++;
+    } else if (table[(i + 1) * width + j] >= table[i * width + j + 1]) i++;
+    else j++;
+  }
+  return anchors;
 }
 
 function refresh(block, seg) {

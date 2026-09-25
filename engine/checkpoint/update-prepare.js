@@ -234,18 +234,28 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   // boundaries INSIDE the window die. Whether the suffix may be TRUSTED
   // is decided after the foreground walk (verdict): definition edits and
   // untracked-state leaks still kill and rebuild it, off the hot path.
-  ({
-    checkpoints: engine.checkpoints,
-    renderHold: engine.renderHold,
-    editHold: engine.editHold,
-  } = preserveCheckpointSuffix({
+  const preserved = preserveCheckpointSuffix({
     checkpoints: engine.checkpoints,
     renderHold: engine.renderHold,
     editHold: engine.editHold,
     pendingChain: engine.pendingChain,
     bounds: diff.bounds,
     dyingPids: engine.dyingPids,
-  }));
+  });
+  engine.checkpoints = preserved.checkpoints;
+  engine.renderHold = preserved.renderHold;
+  engine.editHold = preserved.editHold;
+  // /status diff: how many changed regions a source snapshot had and what
+  // that cost in checkpoints (tex64-internal #96)
+  if (diff.bounds.regions > 1 || preserved.died) {
+    const stats = engine.diffStats ??= { updates: 0, multiRegion: 0, maxRegions: 0, kept: 0, died: 0, last: null };
+    stats.updates++;
+    if (diff.bounds.regions > 1) stats.multiRegion++;
+    stats.maxRegions = Math.max(stats.maxRegions, diff.bounds.regions);
+    stats.kept += preserved.kept;
+    stats.died += preserved.died;
+    stats.last = { regions: diff.bounds.regions, kept: preserved.kept, died: preserved.died, at: Date.now() };
+  }
 
   // Pin before the walk can retire a newly materialized input or capture
   // owner. Finalization cannot recover a checkpoint that has already died.

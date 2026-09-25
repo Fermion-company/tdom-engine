@@ -29,11 +29,16 @@ export function firstDirtyIndex(oldBlocks, blocks, dirtySource, diff) {
 export function hasDefinitionEdit(oldBlocks, blocks, bounds, defRe) {
   // comment-stripped: a `% \newcommand` in the window must not forfeit
   // suffix trust (it costs a full async suffix rebuild)
+  // Only the blocks that changed: an unchanged definition between two
+  // edited regions is the same definition (tex64-internal #96).
   const { prefixLen, oldSuffixStart, newSuffixStart } = bounds;
-  for (let k = prefixLen; k < oldSuffixStart; k++) {
+  const range = (from, to) => Array.from({ length: Math.max(0, to - from) }, (_, k) => from + k);
+  const oldIdx = bounds.changedOld ?? range(prefixLen, oldSuffixStart);
+  const newIdx = bounds.changedNew ?? range(prefixLen, newSuffixStart);
+  for (const k of oldIdx) {
     if (defRe.test(stripComments(oldBlocks[k]?.text ?? ''))) return true;
   }
-  for (let k = prefixLen; k < newSuffixStart; k++) {
+  for (const k of newIdx) {
     if (defRe.test(stripComments(blocks[k]?.text ?? ''))) return true;
   }
   return false;

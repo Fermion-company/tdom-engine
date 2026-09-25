@@ -1375,6 +1375,36 @@ test('source lines pass process_input_buffer in the resident as in a file read (
   }
 });
 
+test('an edit in two distant places keeps the checkpoints between them and skips the clean blocks (#96)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-two-regions-'));
+  const para = (k) => `Paragraph ${k} with enough ordinary prose to fill a couple of lines in the preview of this test document.`;
+  const doc = (first, last) => ['\\documentclass{article}', '\\begin{document}',
+    ...Array.from({ length: 24 }, (_, k) => (k === 1 ? first : k === 22 ? last : para(k)) + '\n'), '\\end{document}', ''].join('\n');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh'), docDir: root });
+  try {
+    await eng.open(doc(para(1), para(22)));
+    await eng.bgTask;
+    const before = eng.checkpoints.size;
+    const edited = doc(para(1) + ' An early change.', para(22) + ' A late change.');
+    const r = await eng.edit(0, eng.getSource().length, edited);
+    await eng.bgTask;
+    const trace = eng.lastWalkTrace?.blocks ?? [];
+    assert.ok(trace.some(([, , flags]) => String(flags).startsWith('skip>')), `the walk skipped to the second region: ${JSON.stringify(trace)}`);
+    assert.ok(r.stats.blocksTypeset < 16, `blocks typeset: ${r.stats.blocksTypeset} ${JSON.stringify(trace)} ckpts ${[...eng.checkpoints.keys()]}`);
+    assert.ok((eng.diffStats?.multiRegion ?? 0) >= 1);
+    assert.ok(eng.checkpoints.size >= Math.min(before, 3));
+    // the same layout as a document opened with the new text
+    await fresh.open(edited);
+    assert.equal(eng.pages.length, fresh.pages.length);
+    assert.deepEqual(eng.blocks.map((b) => b.galleyHash), fresh.blocks.map((b) => b.galleyHash));
+  } finally {
+    await eng.close();
+    await fresh.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a touched \\input or \\include file whose bytes did not change does not advance srcRev', opts, async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-external-input-'));
   const one = path.join(root, 'one.tex');

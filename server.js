@@ -1681,6 +1681,15 @@ const server = http.createServer(async (req, res) => {
         srcRev: engine.srcRev,
         documentEpoch,
         unchangedInputEvents: engine.unchangedInputEvents,
+        diffStats: engine.diffStats ?? null,
+        // the last foreground walk, without its per-block rows
+        lastWalk: engine.lastWalkTrace ? {
+          from: engine.lastWalkTrace.from, firstDirty: engine.lastWalkTrace.firstDirty,
+          lastDirty: engine.lastWalkTrace.lastDirty, typeset: engine.lastWalkTrace.typeset ?? null,
+          stop: engine.lastWalkTrace.stop ?? null, verdict: engine.lastWalkTrace.verdict ?? null,
+          ms: engine.lastWalkTrace.ms ?? null,
+          skips: (engine.lastWalkTrace.blocks ?? []).filter(([, , f]) => String(f).startsWith('skip>')).map(([k, , f]) => `${k}${f.slice(4)}`),
+        } : null,
         progress: engine.progress ?? null,
         // pages the resident layout has right now (async rescues and
         // repaginations move it between edit reports)
