@@ -2067,14 +2067,29 @@ function inject_capture()
   })
 end
 
+-- The lines of an injected body, each run through process_input_buffer as
+-- if TeX read it from a file. tex.print lines never reach that callback, so
+-- a package that rewrites source lines while they are read (KKluaverb turns
+-- \KKverb|...| and \KKcodeS...\KKcodeE into literal text there) saw raw
+-- source instead: `\section{x}` inside a verb became a heading and a `%`
+-- ate the rest of the paragraph, with no error.
+local function input_lines(body)
+  local filter = callback.find and callback.find('process_input_buffer')
+  local lines = {}
+  for l in (body .. '\n'):gmatch('(.-)\n') do
+    if filter then
+      local ok, out = pcall(filter, l)
+      if ok and type(out) == 'string' then l = out end
+    end
+    lines[#lines + 1] = l
+  end
+  return lines
+end
+
 function inject_raw(body)
   -- feed a self-contained program (iso rescue): no \par, no harvest, no
   -- report — the body carries its own ending (\shipout + @@end)
-  local lines = {}
-  for l in (body .. '\n'):gmatch('(.-)\n') do
-    lines[#lines + 1] = l
-  end
-  tex.print(lines)
+  tex.print(input_lines(body))
 end
 
 -- This certifies only input tokenization, never the complete TeX state.
@@ -2122,10 +2137,7 @@ function inject_job(body, ship)
   -- The dormant page collects the nodes; tdom_report harvests them.
   JOB.sourceCatcodesSafe = native_source_catcodes_safe(body)
   JOB.activeChars = source_active_chars(body)
-  local lines = {}
-  for l in (body .. '\n'):gmatch('(.-)\n') do
-    lines[#lines + 1] = l
-  end
+  local lines = input_lines(body)
   lines[#lines + 1] = '\\par'
   if ship then
     lines[#lines + 1] = '\\directlua{tdom_ship()}'

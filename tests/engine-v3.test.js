@@ -1341,6 +1341,40 @@ test('a keystroke waiting for the chain lock leaves the daemon a marker to defer
   }
 });
 
+test('source lines pass process_input_buffer in the resident as in a file read (KKluaverb)', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-input-buffer-'));
+  // stands in for KKluaverb, which turns \KKverb|...| into literal text
+  // while TeX reads the line
+  writeFileSync(path.join(root, 'rewrite.sty'), [
+    '\\RequirePackage{luatexbase}',
+    '\\directlua{luatexbase.add_to_callback("process_input_buffer",',
+    '  function(line) return (line:gsub("@@RAW@@", "Converted")) end, "tdom-test-rewrite")}',
+    '',
+  ].join('\n'));
+  const source = [
+    '\\documentclass{article}', '\\usepackage{rewrite}', '\\begin{document}',
+    'First paragraph with @@RAW@@ inside.', '',
+    'Second paragraph.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  const eng = new CheckpointEngine({ workDir: path.join(root, 'work'), docDir: root });
+  const text = (needle) => {
+    const block = eng.blocks.find((b) => b.text.includes(needle));
+    return (block?.galley?.items ?? []).filter((it) => it.runs).map((it) => it.runs.map((r) => r.t ?? '').join('')).join(' ');
+  };
+  try {
+    await eng.open(source);
+    assert.match(text('First paragraph'), /Converted/);
+    assert.doesNotMatch(text('First paragraph'), /@@RAW@@|RAW/);
+    const at = eng.getSource().indexOf('Second paragraph');
+    await eng.edit(at, at, 'Now @@RAW@@ here. ');
+    assert.match(text('Second paragraph'), /NowConvertedhere\./, 'the keystroke path rewrites too'); // runs carry no inter-word glue
+  } finally {
+    await eng.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a touched \\input or \\include file whose bytes did not change does not advance srcRev', opts, async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-external-input-'));
   const one = path.join(root, 'one.tex');
