@@ -1194,17 +1194,35 @@ local function keystroke_waiting()
   return true
 end
 
+-- A background step collects in slices and stops when a keystroke starts
+-- waiting meanwhile: arriving mid-collect it used to wait for the rest
+-- (0.8-2.5 s). The cycle stays open in this checkpoint, and the next step
+-- that collects finishes it. Returns whether the cycle finished.
+local GC_SLICE_KB = 16384
+local function gc_collect_background()
+  while not collectgarbage('step', GC_SLICE_KB) do
+    if keystroke_waiting() then return false end
+  end
+  TDOM_GC_FLOOR = collectgarbage('count')
+  return true
+end
+
 local function checkpoint_gc(initial, interactive, elapsed_s)
   if os.getenv('TDOM_NO_CKPT_GC') then return end
   if initial or not TDOM_GC_FLOOR then
     gc_collect(2)
     return
   end
+  local background = not interactive
   interactive = interactive or keystroke_waiting()
   local kb = collectgarbage('count')
   -- a block the guard collected is measured again at its boundary
   if not gc_guard_kb and kb <= gc_limit_kb(interactive and 2 or 1) then return end
   if (elapsed_s or 0) > GC_DEFER_AFTER_S and kb <= gc_limit_kb(2) + 262144 then return end
+  if background and not gc_guard_kb then
+    gc_collect_background()
+    return
+  end
   gc_collect(1)
 end
 
