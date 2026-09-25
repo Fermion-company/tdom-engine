@@ -151,6 +151,11 @@ test('preamble edits take the honest full-rebuild path', opts, async () => {
 test('the engine survives malformed input mid-typing', opts, async () => {
   const src = eng.getSource();
   const idx = src.indexOf('Edit any word');
+  // Run alone, this test can snapshot the pages before the running-head job
+  // of the open lands (hfSig null) and compare after it did.
+  for (const deadline = Date.now() + 10_000; (eng.hfPending || eng.hfQueuedSig) && Date.now() < deadline;) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
   const blocksBefore = eng.blocks.map((block) => block.id);
   const pagesBefore = eng.getDisplayLists();
   const r1 = await eng.edit(idx, idx, '\\emph{');
