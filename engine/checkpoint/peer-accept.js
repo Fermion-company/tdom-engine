@@ -9,6 +9,7 @@ export function acceptPeer(engine, sock) {
     for (const [idx, p] of engine.checkpoints) {
       if (p === peer) engine.checkpoints.delete(idx);
     }
+    if (engine.realRoot === peer) engine.realRoot = null; // splitting rescues go cold again
     // fail fast: if the process carrying the in-flight job dies (TeX
     // emergency stop on a broken block, missing file, ...), reject its
     // waiters immediately instead of running out the 30s timeout

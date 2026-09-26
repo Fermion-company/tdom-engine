@@ -35,6 +35,8 @@ local PDFPATH = ''
 local ACTIVE_FEED = ''
 local BRANCHDIR = ''
 local ROOT_CHECKPOINTED = false
+local REPLAY_FROM = 0
+local REPLAY_STRIDE = 1
 
 local function send(s) conn:send(s) end
 
@@ -87,10 +89,52 @@ local OUTPUT_EXTS = {
   'idx', 'glo', 'gls', 'nav', 'snm'
 }
 
+-- Every other job file of the branch travels too. Converged inputs the run
+-- only reads (canonical's makeindex .ind) would otherwise be missing, so a
+-- replay's \printindex ended a page short (tex64-internal #77); package
+-- "list of" files (bclogo's .bcl, algorithm .loa, listings .lol ...) would be
+-- missing from the replay's output manifest and reject every wave, while the
+-- replay kept writing into its parent's file through the inherited
+-- descriptor (#64). The job's own source, log and pages are not outputs.
+local NOT_JOB_OUTPUT = { tex = true, log = true, pdf = true, svg = true }
+
+local function job_extensions()
+  local exts, seen = {}, {}
+  for _, ext in ipairs(OUTPUT_EXTS) do exts[#exts + 1] = ext; seen[ext] = true end
+  for name in lfs.dir(BRANCHDIR) do
+    local ext = name:match('^driver%-ship%.([%w%.]+)$')
+    if ext and not seen[ext] and not NOT_JOB_OUTPUT[ext] and not ext:match('^synctex') and
+        lfs.attributes(BRANCHDIR .. '/' .. name, 'mode') == 'file' then
+      exts[#exts + 1] = ext
+      seen[ext] = true
+    end
+  end
+  return exts
+end
+
+-- \include writes <file>.aux relative to the current directory, so every
+-- private directory a replay or page child enters needs the include's
+-- directories (the root's are made before it starts)
+local INCLUDE_DIRS = {}
+for dir in (os.getenv('TDOM_SHIP_INCLUDE_DIRS') or ''):gmatch('[^\n]+') do
+  INCLUDE_DIRS[#INCLUDE_DIRS + 1] = dir
+end
+
+local function make_include_dirs(base)
+  for _, dir in ipairs(INCLUDE_DIRS) do
+    local at = base
+    for part in dir:gmatch('[^/]+') do
+      at = at .. '/' .. part
+      lfs.mkdir(at)
+    end
+  end
+end
+
 local function prepare_branch(dir)
   lfs.mkdir(dir)
+  make_include_dirs(dir)
   local mappings = {}
-  for _, ext in ipairs(OUTPUT_EXTS) do
+  for _, ext in ipairs(job_extensions()) do
     local source = BRANCHDIR .. '/driver-ship.' .. ext
     local target = dir .. '/driver-ship.' .. ext
     local cloned = fk.copy_open_fd(source, target)
@@ -128,10 +172,11 @@ local function adopt_private_input(prepared)
 end
 
 local function wait_as_checkpoint()
+  fk.set_interactive(0)
   while true do
     local line = conn:receive('*l')
     if not line then fk._exit(0) end
-    local cmd, a = line:match('^(%S+)%s*(%S*)')
+    local cmd, a, stride = line:match('^(%S+)%s*(%S*)%s*(%S*)')
     if cmd == 'DIE' then
       fk._exit(0)
     elseif cmd == 'RESUME' then
@@ -144,9 +189,12 @@ local function wait_as_checkpoint()
       local prepared_input = prepare_private_input()
       local resume_pid = fk.fork()
       if resume_pid == 0 then
+        fk.set_interactive(1)
         adopt_private_input(prepared_input)
         adopt_branch(resume_dir, branch)
         GEN = resume_gen
+        REPLAY_FROM = PAGE
+        REPLAY_STRIDE = math.max(0, tonumber(stride) or 1)
         ROLE = 'root'
         EOF = false
         pcall(function() conn:close() end)
@@ -167,6 +215,8 @@ end
 local function ensure_root_checkpoint()
   if ROOT_CHECKPOINTED or ROLE ~= 'root' or PAGE ~= 0 or NLINE ~= 0 then return end
   ROOT_CHECKPOINTED = true
+  collectgarbage('collect')
+  collectgarbage('collect')
   local checkpoint_dir = WORKDIR .. '/ship-g' .. GEN .. '-ck0'
   local checkpoint_branch = prepare_branch(checkpoint_dir)
   local cpid = fk.fork()
@@ -184,9 +234,20 @@ end
 
 function tdom_ship_label(key, val)
   if ROLE == 'pager' then return end
+  -- amsmath hands \ltx@label (and so the kernel label hook) the key WITH
+  -- its braces ({eq:x}); strip one pair like the resident daemon does
+  if key:sub(1, 1) == '{' and key:sub(-1) == '}' then key = key:sub(2, -2) end
   send('SLABEL ' .. (PAGE + 1) .. ' ' .. #key .. ' ' .. #val .. '\n')
   send(key)
   send(val)
+end
+
+-- A saved TikZ position (\pgfsyspdfmark) was read back: this lineage's pages
+-- depend on it (pgf reads positions only for cross-picture references,
+-- including current page). The orchestrator lets an unread mark drift.
+function tdom_ship_posread(id)
+  if ROLE == 'pager' or not id or id == '' or id:find('%s') then return end
+  send('SPOS ' .. id .. '\n')
 end
 
 -- ---------------------------------------------------------------- shipout
@@ -223,6 +284,7 @@ function tdom_ship_before()
   local page = PAGE + 1
   local dir = WORKDIR .. '/ship-g' .. GEN .. '-p' .. page
   lfs.mkdir(dir)
+  make_include_dirs(dir)
   -- \enddocument re-inputs \jobname.aux: the pager that ships the FINAL
   -- page (\enddocument's \clearpage) needs one in ITS cwd or it aborts
   -- before finalizing the page PDF
@@ -267,6 +329,7 @@ function tdom_ship_after()
   if not PRIVATE_PDF or ROLE ~= 'root' then return end
   PAGE = PAGE + 1
   send('SSHIP ' .. PAGE .. ' ' .. NLINE .. ' ' .. GEN .. '\n')
+  if EOF or REPLAY_STRIDE == 0 or (PAGE - REPLAY_FROM) % REPLAY_STRIDE ~= 0 then return end
   local checkpoint_page = PAGE
   local checkpoint_gen = GEN
   local checkpoint_dir = WORKDIR .. '/ship-g' .. checkpoint_gen .. '-ck' .. checkpoint_page
@@ -300,8 +363,9 @@ local function next_unit()
   while true do
     local line = conn:receive('*l')
     if not line then fk._exit(0) end
-    local cmd, a = line:match('^(%S+)%s*(%S*)')
+    local cmd, a, terminal = line:match('^(%S+)%s*(%S*)%s*(%S*)')
     if cmd == 'SLINE' then
+      EOF = terminal == 'END'
       local len = tonumber(a) or 0
       return len > 0 and conn:receive(len) or ''
     elseif cmd == 'SEOF' then

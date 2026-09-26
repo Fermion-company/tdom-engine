@@ -8,6 +8,7 @@
 
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { ENGINE_MARKER, NO_FILE_ACCESS, resolveEngineDir } from './engine-dir.js';
@@ -18,10 +19,23 @@ export const DEFAULT_PORT = 4646;
 // First boot compiles the fork shim with cc and boots a resident lualatex —
 // far slower than a plain HTTP server coming up.
 export const DEFAULT_START_TIMEOUT_MS = 90_000;
-// One checkpoint is one forked lualatex (~100-300MB). The engine's own
-// default of 64 is sized for a dedicated box, not for a host app sharing the
-// machine with an editor, a language server and a browser.
-export const DEFAULT_MAX_CHECKPOINTS = '8';
+// One checkpoint is one dormant forked lualatex. It costs the pages the
+// active process has dirtied since the fork: a boot walk dirties nearly the
+// whole heap after each fork, so on a 316-page book every dormant fork
+// ends up holding 100–200 MB (measured on macOS: 32 of them next to the
+// 2 GB active roots pushed a 16 GB machine 7 GB into swap). The engine
+// keeps min(ceiling, blocks + 1) of them; this is the ceiling a host
+// sharing the machine with an editor, a language server and a browser
+// allows, by installed memory.
+export function defaultCheckpointCeiling(totalMemoryBytes = os.totalmem()) {
+  const gib = Number(totalMemoryBytes) / 2 ** 30;
+  if (!Number.isFinite(gib) || gib <= 0) return '8';
+  if (gib >= 48) return '48';
+  if (gib >= 24) return '24';
+  if (gib >= 12) return '12';
+  return '8';
+}
+export const DEFAULT_MAX_CHECKPOINTS = defaultCheckpointCeiling();
 
 const isPortAvailable = (port) =>
   new Promise((resolve) => {

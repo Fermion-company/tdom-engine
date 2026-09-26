@@ -1,4 +1,5 @@
 import { rejectWaiter } from './waiters.js';
+import { clearShipPacing } from './ship-pacing.js';
 
 export async function closeEngine(engine) {
   engine.closed = true;
@@ -14,6 +15,7 @@ export async function closeEngine(engine) {
   }
   engine.canonical.dispose();
   clearTimeout(engine.shipBootTimer);
+  clearShipPacing(engine);
   if (engine.shipping) await engine.shipping.close().catch(() => {});
   engine.rescueQueue.clear();
   engine.renderWant.clear();

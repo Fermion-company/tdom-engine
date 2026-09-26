@@ -3,12 +3,15 @@
 //   2. unknown/unsafe structure demotes to opaque instead of breaking.
 
 import { test } from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import {
   rmSync,
   mkdirSync,
   writeFileSync,
+  readFileSync,
   existsSync,
+  readdirSync,
   realpathSync,
   symlinkSync,
 } from 'node:fs';
@@ -248,6 +251,31 @@ test('authority pressure: fast baseline, then deep idle + cost cooldown', () => 
       c.delayFor() >= 8000 * c.displayCooldownFactor - 100,
       `display pacing scales with compile cost (got ${c.delayFor()})`
     );
+    // The first baseline can finish behind an edit for which the viewer has
+    // no resident pixels. #drain grants exactly this immediate successor one
+    // short-debounce catch-up instead of another long-document cooldown.
+    c.pressure = 'authority';
+    c.last.id = 1;
+    c.pendingJob = { source: 'new', rev: 2, inputEpoch: c.inputEpoch, scheduledAt: Date.now() };
+    c.coldBaselineCatchup = {
+      baselineId: 1,
+      rev: 2,
+      inputEpoch: c.inputEpoch,
+      source: 'new',
+    };
+    c.displayDemand = { rev: 2, inputEpoch: c.inputEpoch };
+    c.activeDisplayDemandIds.add('viewer');
+    c.residentImpossibleDemandIds.add('viewer');
+    assert.equal(
+      c.delayFor(c.pendingJob),
+      c.displayDebounceMs,
+      'a resident-impossible edit immediately behind the first baseline uses the short debounce'
+    );
+    c.residentImpossibleDemandIds.clear();
+    assert.ok(
+      c.delayFor(c.pendingJob) >= 8000 * c.displayCooldownFactor - 100,
+      'the allowance does not bypass pacing while resident pixels can still arrive'
+    );
   } finally {
     c.dispose();
   }
@@ -274,10 +302,23 @@ test('safety gate: clean documents pass, page-mechanism hazards demote', () => {
   assert.deepEqual(switchedColumns.previewReasons, ['body column switch']);
   assert.equal(classifyDocument('\\documentclass[landscape]{article}', '').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}\\AtBeginShipout{x}', '').safe, false);
-  assert.equal(classifyDocument('\\documentclass{article}\\usepackage{pdflscape}', 'body').safe, false);
+  assert.equal(classifyDocument('\\documentclass{article}', '\\output={\\shipout\\box255}').safe, false);
+  assert.equal(classifyDocument('\\documentclass{article}', '\\AddToHook{shipout/before}{x}').safe, false);
+  assert.equal(
+    classifyDocument('\\documentclass{article}', '\\begin{verbatim}\\output={x}\\end{verbatim}').safe,
+    true,
+    'literal examples do not acquire primitive access'
+  );
+  // tex64-internal #64: rotated pages keep the document structured; the
+  // canonical/ShippingChain surface shows them in their own geometry.
+  const landscapePackage = classifyDocument('\\documentclass{article}\\usepackage{pdflscape}', 'body');
+  assert.equal(landscapePackage.safe, true);
+  assert.equal(landscapePackage.previewPolicy, 'shipping-exact');
   assert.equal(classifyDocument('\\documentclass{article}', '\\pagewidth=420pt body').safe, false);
   assert.equal(classifyDocument('\\documentclass{article}', '\\pdfvariable pageattr{/Rotate 90} body').safe, false);
-  assert.equal(classifyDocument('\\documentclass{article}', '\\begin{landscape}body\\end{landscape}').safe, false);
+  const landscapeBody = classifyDocument('\\documentclass{article}', '\\begin{landscape}body\\end{landscape}');
+  assert.equal(landscapeBody.safe, true);
+  assert.equal(landscapeBody.previewPolicy, 'shipping-exact');
   // \marginpar stays STRUCTURED since the canonical-only block tier
   // (paper drafts carry \todo marks routinely): the block's body typesets
   // in-chain, the margin pixels come from the canonical layer
@@ -335,6 +376,53 @@ const DOC1 = [
   '\\end{document}',
   '',
 ].join('\n');
+
+test('first baseline credit survives a soft demand until the viewer escalates it', opts, async () => {
+  const work = WORK + '-cold-baseline-escalation';
+  rmSync(work, { recursive: true, force: true });
+  const c = new CanonicalRenderer({
+    workDir: work,
+    debounceMs: 0,
+    displayDebounceMs: 100,
+  });
+  const waitFor = async (predicate, label, timeoutMs = 15_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      assert.ok(Date.now() < deadline, `timed out waiting for ${label}`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+  try {
+    c.schedule(DOC1, 1);
+    await waitFor(() => c.info().runningRev === 1, 'the first baseline to start');
+
+    const next = DOC1.replace('Page one canonical test.', 'Page one edited while baseline compiles.');
+    c.schedule(next, 2);
+    assert.deepEqual(
+      c.requestDisplay(2, 0, { demandId: 'viewer', residentImpossible: false }),
+      { accepted: true, duplicate: false }
+    );
+
+    await waitFor(
+      () => c.info().id === 1 && c.info().runningRev === null && c.info().scheduledRev === 2,
+      'the first baseline to land behind the pending edit'
+    );
+    assert.equal(c.coldBaselineCatchup?.rev, 2,
+      'the actual drain grants its immediate pending successor one catch-up credit');
+    assert.ok(c.info().scheduledInMs > c.displayDebounceMs,
+      'a soft demand alone retains the normal cost cooldown');
+
+    assert.deepEqual(
+      c.requestDisplay(2, 0, { demandId: 'viewer', residentImpossible: true }),
+      { accepted: false, duplicate: true }
+    );
+    assert.ok(c.info().scheduledInMs <= c.displayDebounceMs,
+      'the late hard escalation re-arms the credited job at the short debounce');
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
+  }
+});
 
 const MIXED_PAPER_DOC = [
   '\\documentclass{article}',
@@ -687,6 +775,10 @@ test('unsafe preamble demotes to opaque and still renders via canonical', opts, 
       ].join('\n')
     );
     assert.equal(r.mode, 'opaque');
+    // the baseline open scheduled before its gate still starts at the
+    // display cadence once the document turned out to be opaque
+    assert.ok(eng.canonical.running || eng.canonical.timerDueAt - Date.now() <= eng.canonical.displayDebounceMs + 50,
+      'the opaque display compile is not held for the structured baseline debounce');
     assert.ok(r.modeReasons.some((x) => x.includes('eso-pic')), 'reason names the package');
     assert.equal(eng.getDisplayLists().length, 0, 'no provisional pages in opaque mode');
     assert.ok(
@@ -950,5 +1042,400 @@ test('incremental pagination matches a from-scratch build after edits', opts, as
     }
   } finally {
     await eng.close();
+  }
+});
+
+// ------------------------------------------ content identity (issue #52, D)
+//
+// A child-file edit advances the canonical input epoch. Restoring the child to
+// the bytes the last generation was compiled from must rebind that generation
+// to the current revision at once (so the next anchor anywhere in the document
+// has canonical.rev === srcRev) instead of waiting for a full recompile.
+
+const IDENTITY_ROOT = [
+  '\\documentclass{article}',
+  '\\begin{document}',
+  'Root paragraph.',
+  '',
+  '\\input{chapter}',
+  '\\end{document}',
+  '',
+].join('\n');
+
+function identityFixture(name) {
+  const work = WORK + name;
+  rmSync(work, { recursive: true, force: true });
+  const docDir = path.join(work, 'doc');
+  const overlayDir = path.join(work, 'overlay');
+  const canonDir = path.join(work, 'canon');
+  for (const dir of [docDir, overlayDir, canonDir]) mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(docDir, 'chapter.tex'), 'Chapter text A.\n');
+  return { work, docDir, overlayDir, canonDir };
+}
+
+async function untilRunning(c, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!c.running) {
+    if (Date.now() > deadline) throw new Error('compile did not start');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+test('content identity: a child restored to its compiled bytes rebinds the last generation', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-identity');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  const results = [];
+  c.onResult = (info) => results.push({ id: info.id, rev: info.rev, rebound: info.rebound });
+  try {
+    const gen = await c.ensure(IDENTITY_ROOT, 1);
+    const child = path.join(c.docDir, 'chapter.tex');
+    const overlay = path.join(c.overlayDir, 'chapter.tex');
+    assert.ok(gen.inputManifest instanceof Map, 'the recorder file list yields an input manifest');
+    assert.equal(gen.inputManifest.get(child), createHash('sha256').update('Chapter text A.\n').digest('hex'),
+      'the manifest hashes the child bytes LuaLaTeX read');
+    assert.ok(![...gen.inputManifest.keys()].some((file) => file.endsWith('canon.tex')), 'the root is not an input');
+    assert.ok(![...gen.inputManifest.keys()].some((file) => /texmf/.test(file)), 'system files are not tracked');
+
+    // an unsaved child edit: not the compiled content, a compile is queued
+    writeFileSync(overlay, 'Chapter text AQ.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false);
+    c.schedule(IDENTITY_ROOT, 2);
+    assert.equal(c.pendingJob?.rev, 2);
+    assert.equal(c.info().rev, 1);
+
+    // the edit is undone: the generation is the exact compile of revision 3
+    writeFileSync(overlay, 'Chapter text A.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), true, 'restored bytes match the manifest');
+    results.length = 0;
+    c.schedule(IDENTITY_ROOT, 3);
+    assert.equal(c.pendingJob, null, 'no compile is queued for compiled content');
+    assert.equal(c.timer, null);
+    assert.equal(c.info().id, gen.id);
+    assert.equal(c.info().rev, 3, 'rebound synchronously to the current revision');
+    assert.equal(c.info().rebound, 1);
+    assert.equal(gen.inputEpoch, c.inputEpoch, 'the generation now owns the current input epoch');
+    assert.deepEqual(results, [{ id: gen.id, rev: 3, rebound: 1 }], 'observers see the rebound revision');
+    const certificate = c.generationCertificate();
+    assert.equal(certificate.rev, 3);
+    assert.equal(certificate.inputEpoch, c.inputEpoch);
+    await c.settle();
+    assert.equal(c.info().rev, 3);
+    assert.equal(c.info().error, null);
+    assert.equal(c.generations.size, 1, 'nothing was compiled');
+
+    // effective bytes follow TeX's search order: overlay first, then disk
+    writeFileSync(child, 'Chapter text B.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), true, 'disk is shadowed by the overlay');
+    rmSync(overlay);
+    c.invalidateInputs({ removed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false, 'without the overlay TeX would read B');
+    writeFileSync(child, 'Chapter text A.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), true);
+
+    // fail closed: a change outside the compile's inputs, or an unknown set
+    c.invalidateInputs({ changed: [path.join(c.docDir, 'never-read.tex')] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false, 'a path this compile never read is unprovable');
+    c.schedule(IDENTITY_ROOT, 4);
+    assert.equal(c.pendingJob?.rev, 4, 'unprovable inputs compile again');
+    await c.settle();
+    assert.equal(c.info().rev, 4);
+    assert.notEqual(c.info().id, gen.id, 'a real compile produced the next generation');
+    c.invalidateInputs({ unknown: true });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false, 'an unknown change set is unprovable');
+    c.invalidateInputs();
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false);
+  } finally {
+    c.dispose();
+  }
+});
+
+test('content identity: a root round-trip during a compile rebinds and retires the stale compile', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-identity-stale');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    const gen = await c.ensure(IDENTITY_ROOT, 1);
+    const edited = IDENTITY_ROOT.replace('Root paragraph.', 'Root paragraph edited.');
+    c.schedule(edited, 2);
+    const settled = c.settle();
+    await untilRunning(c);
+    assert.equal(c.runningJob?.rev, 2);
+    // the edit is undone while revision 2 compiles: revision 3 is compiled
+    // content, and the running compile's result must not move canonical back
+    c.schedule(IDENTITY_ROOT, 3);
+    assert.equal(c.info().id, gen.id);
+    assert.equal(c.info().rev, 3);
+    await settled;
+    assert.equal(c.info().id, gen.id, 'the stale compile did not replace the rebound generation');
+    assert.equal(c.info().rev, 3);
+    assert.equal(c.info().error, null, 'a retired compile is not an error');
+    assert.deepEqual([...c.generations.values()].map((g) => g.rev), [3], 'revision 2 never registered');
+  } finally {
+    c.dispose();
+  }
+});
+
+const MULTI_PASS_ROOT = [
+  '\\documentclass{article}',
+  '\\begin{document}',
+  '\\tableofcontents',
+  '\\section{First}',
+  'Body one.',
+  '\\newpage',
+  '\\section{Second}',
+  'Body two.',
+  '\\end{document}',
+  '',
+].join('\n');
+
+test('scheduled compiles yield between passes to a newer revision', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-passes');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    const gen = await c.ensure(MULTI_PASS_ROOT, 1);
+    assert.ok(gen.passes >= 2, `table of contents needs a second pass (got ${gen.passes})`);
+    // a heading edit rewrites the table of contents: revision 2 needs a
+    // second pass, and a fixpoint reached in one pass is published as usual
+    c.schedule(MULTI_PASS_ROOT.replace('\\section{First}', '\\section{First, revised}'), 2);
+    const settled = c.settle();
+    await untilRunning(c);
+    assert.equal(c.runningJob?.rev, 2);
+    // a newer edit lands during pass one of revision 2
+    const newest = MULTI_PASS_ROOT.replace('Body two.', 'Body two, newest.');
+    c.schedule(newest, 3);
+    await settled;
+    assert.equal(c.info().rev, 3, 'converged on the newest revision');
+    assert.equal(c.info().error, null);
+    assert.deepEqual([...c.generations.values()].map((g) => g.rev), [1, 3],
+      'the superseded revision 2 was abandoned after its pass instead of published');
+    const texts = await c.pageTexts();
+    if (texts) assert.match(texts.join('\n'), /Body two, newest/);
+  } finally {
+    c.dispose();
+  }
+});
+
+test('Build seeds let the first post-Build canonical reach its fixpoint in one pass', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-build-seeds');
+  writeFileSync(path.join(docDir, 'main.tex'), MULTI_PASS_ROOT);
+  // a real Build of the same source: converged aux/toc plus PDF and SyncTeX
+  await promisify(execFile)('lualatex', ['-synctex=1', '-interaction=nonstopmode', 'main.tex'], { cwd: docDir, timeout: 120_000 });
+  await promisify(execFile)('lualatex', ['-synctex=1', '-interaction=nonstopmode', 'main.tex'], { cwd: docDir, timeout: 120_000 });
+  const sha = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
+  const seedFiles = { aux: readFileSync(path.join(docDir, 'main.aux'), 'utf8'), toc: readFileSync(path.join(docDir, 'main.toc'), 'utf8') };
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    const lease = c.acquireBuildLease('build:seed', 60_000);
+    c.schedule(MULTI_PASS_ROOT, 1);
+    const prepared = await c.prepareBuildGeneration({
+      requestId: 'build:seed', token: lease.token, source: MULTI_PASS_ROOT, rev: 1,
+      pdf: path.join(docDir, 'main.pdf'), pdfHash: sha(path.join(docDir, 'main.pdf')),
+      synctex: path.join(docDir, 'main.synctex.gz'), synctexHash: sha(path.join(docDir, 'main.synctex.gz')),
+      syncInputMap: [{ logicalPath: path.join(c.workDir, 'canon.tex'), recordedPath: path.join(docDir, 'main.tex') }],
+      seedFiles,
+    });
+    const build = await c.commitBuildGeneration(prepared, MULTI_PASS_ROOT, 1);
+    c.releaseBuildLease('build:seed', lease.token);
+    assert.equal(c.info().id, build.id);
+    // a body edit after the Build: the seeded toc is already right
+    c.schedule(MULTI_PASS_ROOT.replace('Body one.', 'Body one, revised.'), 2);
+    await c.settle();
+    assert.equal(c.info().rev, 2);
+    assert.equal(c.info().error, null);
+    assert.equal(c.info().passes, 1, 'the seeded aux family is the fixpoint of a body edit');
+  } finally {
+    c.dispose();
+  }
+});
+
+test('a reopened project starts its first compile from the aux family its last compile converged on', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-project-seeds');
+  const first = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    assert.equal(first.restoreProjectSeeds('main.tex', MULTI_PASS_ROOT), false, 'nothing kept for a new project');
+    const gen = await first.ensure(MULTI_PASS_ROOT, 1);
+    assert.ok(gen.passes >= 2, `table of contents needs a second pass (got ${gen.passes})`);
+  } finally {
+    first.dispose();
+  }
+  const edited = MULTI_PASS_ROOT.replace('Body one.', 'Body one, revised.');
+  // another main file of the same folder, a Build import, another preamble: nothing placed
+  const other = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    assert.equal(other.restoreProjectSeeds('main.tex', edited, { place: false }), false);
+    assert.equal(existsSync(path.join(other.workDir, 'canon.aux')), false, 'a Build import keeps its own seeds');
+    assert.equal(other.restoreProjectSeeds('other.tex', edited), false);
+    assert.equal(existsSync(path.join(other.workDir, 'canon.aux')), false, 'another main file has its own aux');
+    const repackaged = edited.replace('\\begin{document}', '\\usepackage{xcolor}\n\\begin{document}');
+    assert.equal(other.restoreProjectSeeds('main.tex', repackaged), false);
+    assert.equal(existsSync(path.join(other.workDir, 'canon.aux')), false, 'aux from another preamble stays out');
+  } finally {
+    other.dispose();
+  }
+  // the next engine process: same workDir, fresh renderer, no generation
+  const reopened = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    assert.equal(reopened.restoreProjectSeeds('main.tex', edited), true);
+    reopened.schedule(edited, 1);
+    await reopened.settle();
+    assert.equal(reopened.info().error, null);
+    assert.equal(reopened.info().passes, 1, 'the kept aux family is the fixpoint of a body edit');
+    const texts = await reopened.pageTexts();
+    if (texts) assert.match(texts.join('\n'), /Body one, revised/);
+  } finally {
+    reopened.dispose();
+  }
+});
+
+test('a first compile that fails on kept aux forgets it and compiles from nothing', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-project-seeds-bad');
+  const first = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    first.restoreProjectSeeds('main.tex', MULTI_PASS_ROOT);
+    await first.ensure(MULTI_PASS_ROOT, 1);
+  } finally {
+    first.dispose();
+  }
+  // a package that wrote the kept aux is gone from the TeX tree: its macro
+  // is undefined when the aux is read and -halt-on-error stops the run
+  const seedDir = path.join(realpathSync(canonDir), 'aux-seeds');
+  const [seedFile] = readdirSync(seedDir);
+  const stored = JSON.parse(readFileSync(path.join(seedDir, seedFile), 'utf8'));
+  stored.seeds.aux = `\\tdomSeedTestUndefinedMacro{x}\n${stored.seeds.aux}`;
+  writeFileSync(path.join(seedDir, seedFile), JSON.stringify(stored));
+  const reopened = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    assert.equal(reopened.restoreProjectSeeds('main.tex', MULTI_PASS_ROOT), true);
+    reopened.schedule(MULTI_PASS_ROOT, 1);
+    await reopened.settle();
+    assert.equal(reopened.info().error, null, 'the retry without the kept aux succeeded');
+    assert.equal(reopened.info().rev, 1);
+    assert.ok(reopened.info().passes >= 2, 'the retry ran the fixpoint from nothing');
+    const again = JSON.parse(readFileSync(path.join(seedDir, seedFile), 'utf8'));
+    assert.doesNotMatch(again.seeds.aux, /tdomSeedTestUndefinedMacro/, 'the bad aux was replaced by the good compile');
+  } finally {
+    reopened.dispose();
+  }
+});
+
+test('an \\include project keeps no aux seeds', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-project-seeds-include');
+  writeFileSync(path.join(docDir, 'part.tex'), '\\section{Included}\nIncluded body.\n');
+  const root = MULTI_PASS_ROOT.replace('Body two.', 'Body two.\n\\include{part}');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
+  try {
+    c.restoreProjectSeeds('main.tex', root);
+    const gen = await c.ensure(root, 1);
+    assert.equal(c.info().error, null);
+    assert.ok(gen.passes >= 2);
+    const seedDir = path.join(realpathSync(canonDir), 'aux-seeds');
+    assert.deepEqual(existsSync(seedDir) ? readdirSync(seedDir) : [], [],
+      'child aux files are outside the pass loop\'s fixpoint check');
+  } finally {
+    c.dispose();
+  }
+});
+
+test('schedule() of the revision already compiling adds no second compile, except for a Build lease', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-same-rev');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0, idleMs: 0 });
+  const results = [];
+  c.onResult = (info) => results.push(info.rev);
+  try {
+    c.schedule(MULTI_PASS_ROOT, 1);
+    await untilRunning(c);
+    c.schedule(MULTI_PASS_ROOT, 1);
+    assert.equal(c.pendingJob, null, 'the running compile covers the same revision and bytes');
+    await c.settle();
+    assert.equal(c.info().rev, 1);
+    assert.equal(c.generations.size, 1);
+    // the open's own schedule() after the baseline landed only rebinds, and
+    // announces the generation again for the arrival hooks at this revision
+    const announced = results.length;
+    c.schedule(MULTI_PASS_ROOT, 1);
+    assert.equal(c.pendingJob, null);
+    assert.equal(c.running, null);
+    assert.deepEqual(results.slice(announced), [1]);
+    // a Build import owns the pending job it schedules, even for a compiling revision
+    const edited = MULTI_PASS_ROOT.replace('Body one.', 'Body one, leased.');
+    c.schedule(edited, 2);
+    await untilRunning(c);
+    const lease = c.acquireBuildLease('build:same-rev', 60_000);
+    assert.ok(lease.acquired);
+    c.schedule(edited, 2);
+    assert.equal(c.pendingJob?.rev, 2, 'the Build import finds its pending job');
+    c.releaseBuildLease('build:same-rev', lease.token);
+    await c.settle();
+    assert.equal(c.info().rev, 2);
+    assert.equal(c.info().error, null);
+  } finally {
+    c.dispose();
+  }
+});
+
+test('open starts the canonical baseline beside the resident boot and compiles it once', opts, async () => {
+  const work = WORK + '-open-baseline';
+  rmSync(work, { recursive: true, force: true });
+  const eng = new CheckpointEngine({ workDir: work });
+  const arrivals = [];
+  eng.onCanonical = (info) => arrivals.push({ id: info.id, rev: info.rev });
+  try {
+    const source = [
+      '\\documentclass{article}',
+      '\\begin{document}',
+      'First paragraph of the opened document.',
+      '',
+      'Second paragraph.',
+      '\\end{document}',
+      '',
+    ].join('\n');
+    const opening = eng.open(source);
+    // scheduled before the boot walk runs, for the revision open publishes
+    assert.equal(eng.canonical.pendingJob?.rev, eng.srcRev + 1);
+    const report = await opening;
+    assert.equal(report.mode, 'structured');
+    await eng.canonical.settle();
+    const info = eng.canonical.info();
+    assert.equal(info.error, null);
+    assert.equal(info.rev, eng.srcRev);
+    assert.equal(eng.canonical.generations.size, 1, 'the walk\'s own schedule() added no second compile');
+    assert.ok(arrivals.some((arrival) => arrival.rev === eng.srcRev),
+      'the arrival hooks (verification, crop, checkpoint budget) saw the current revision');
+  } finally {
+    await eng.close();
+  }
+});
+
+test('canonical runs makeindex between passes, as the Build does (tex64-internal #68)', opts, async () => {
+  const work = `${WORK}-index`;
+  rmSync(work, { recursive: true, force: true });
+  const doc = (word) => [
+    '\\documentclass{article}',
+    '\\usepackage{makeidx}',
+    '\\makeindex',
+    '\\begin{document}',
+    `${word}\\index{alpha}`,
+    '\\clearpage',
+    'Beta\\index{beta}',
+    '\\printindex',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const c = new CanonicalRenderer({ workDir: work, debounceMs: 0 });
+  try {
+    const first = await c.ensure(doc('Alpha'), 1);
+    assert.equal(first.pageCount, 3, 'the index page is part of the output');
+    assert.match(first.seedFiles.ind, /\\item alpha, 1/);
+    // A body edit that leaves every \index entry alone reuses the index:
+    // one pass, no makeindex.
+    const second = await c.ensure(doc('Alpha edited'), 2);
+    assert.equal(second.pageCount, 3);
+    assert.equal(second.passes, 1);
+  } finally {
+    await c.dispose?.();
+    rmSync(work, { recursive: true, force: true });
   }
 });

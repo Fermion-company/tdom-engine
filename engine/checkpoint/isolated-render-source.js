@@ -1,4 +1,4 @@
-import { labelDefBody, startsVertical } from './util/tex.js';
+import { labelDefBody, startsAddvspace, startsVertical } from './util/tex.js';
 
 export function buildIsolatedRenderSource({
   preamble,
@@ -8,6 +8,7 @@ export function buildIsolatedRenderSource({
   entry,
   prevPd,
   prevNobreak,
+  prevLastskip,
   blockText,
 }) {
   const L = [];
@@ -44,8 +45,12 @@ export function buildIsolatedRenderSource({
     'function tdom_iso_float() local b = tex.box[tdom_iso_fbox] ' +
     'if b then tdom_iso_nf = tdom_iso_nf + 1 tdom_iso_floats[tdom_iso_nf] = node.copy_list(b) end end ' +
     'function tdom_iso_load_box(b) ' +
+    'local pad = math.max(tex.dimen.paperwidth or tex.pagewidth or 0, 65536) ' +
+    'tex.hoffset = pad - tex.sp("1in") ' +
+    'local f = assert(io.open("render-padding.txt", "w")) ' +
+    'f:write(tostring(pad / 65536 * 72 / 72.27)) f:close() ' +
     'tex.box[255] = b ' +
-    'tex.pagewidth = math.max(b.width or 0, 65536) ' +
+    'tex.pagewidth = math.max(b.width or 0, 65536) + 2 * pad ' +
     'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536) end ' +
     'function tdom_iso_load_float(i) local b = tdom_iso_floats[i] ' +
     'if not b then return end tdom_iso_floats[i] = false tdom_iso_load_box(b) end ' +
@@ -88,6 +93,14 @@ export function buildIsolatedRenderSource({
   L.push('\\hbox to0pt{}');
   L.push('\\special{tdom:isostart}');
   L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(prevPd)}}`);
+  // The primer participates in addvspace merging but has no chunk extent.
+  if (prevLastskip?.widthSp && startsAddvspace(blockText)) {
+    const g = prevLastskip;
+    L.push(`\\directlua{local g=node.new('glue') g.width=${g.widthSp} ` +
+      `g.stretch=${g.stretchSp} g.shrink=${g.shrinkSp} ` +
+      `g.stretch_order=${g.stretchOrder} g.shrink_order=${g.shrinkOrder} ` +
+      'node.set_attribute(g,8124,1) node.write(g)}');
+  }
   // see #isoCompile: vertical-env blocks keep the @nobreak flag instead
   // of \noindent, so their own before-skip glue survives
   if (prevNobreak) L.push(startsVertical(blockText) ? '\\makeatletter\\@nobreaktrue\\makeatother' : '\\noindent');
@@ -108,10 +121,11 @@ export function buildIsolatedRenderSource({
       'if ismark then break end end ' +
       'local out, tail = nil, nil local n = head ' +
       'while n do local nxt = n.next n.next = nil n.prev = nil ' +
+      'if node.has_attribute(n,8124) or (n.id == node.id("glue") and n.subtype == 10) then node.free(n) ' +
       // footnote bodies ship as their own pages after the floats (kept
       // even when empty so page indices stay aligned with the galley's
       // ins items)
-      'if n.id == INS then local c = n.head or n.list ' +
+      'elseif n.id == INS then local c = n.head or n.list ' +
       'local b if c then b = node.vpack(node.copy_list(c)) else b = node.new("hlist") end ' +
       'tdom_iso_nfeet = tdom_iso_nfeet + 1 tdom_iso_feet[tdom_iso_nfeet] = b ' +
       'node.free(n) else if tail then tail.next = n n.prev = tail else out = n end tail = n end n = nxt end ' +
@@ -119,8 +133,7 @@ export function buildIsolatedRenderSource({
       // galley (float-only block) would make \shipout void = no page
       // and shift every float's page index
       'local b = out and node.vpack(out) or node.new("hlist") ' +
-      'tex.box[255] = b tex.pagewidth = math.max(b.width or 0, 65536) ' +
-      'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536)}'
+      'tdom_iso_load_box(b)}'
   );
   L.push('\\shipout\\box255');
   L.push('\\directlua{tdom_iso_ship_floats()}');

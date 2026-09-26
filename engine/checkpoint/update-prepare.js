@@ -2,17 +2,22 @@ import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch } from './safety.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
-import { firstDirtyIndex } from './update-helpers.js';
+import { firstDirtyIndex, nextEditHold, editPageRenderIds } from './update-helpers.js';
+import { checkpointBudgetFor } from './checkpoint-selection.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { sourceClosure } from './closure.js';
+import { planPreamblePatch } from './preamble-patch.js';
+import { projectPackageText } from './rescue-classifier.js';
 
-export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
+export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, callbacks }) {
   const { opaqueUpdate, deferClosureUpdate, bootRoot, scheduleStructuredReprobe, expandIncludes, unindexBlock } = callbacks;
   const text = engine.store.get(engine.file);
   const diagnostics = [];
+  engine.closureDeferred = null;
 
   const bounds = documentBounds(text);
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
+  engine.literalEnvs = bounds.literalEnvs;
   const preHash = fnv1a(preamble);
 
   // Keep both the old page tree and its block boundaries while the user is
@@ -20,9 +25,11 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   // environment makes the segmenter absorb every following paragraph; if
   // that temporary segmentation were committed, "hold last good" would
   // still make the document tail disappear. The source store advances, but
-  // no TeX path or layout identity advances until the closing syntax lands.
+  // no resident layout identity advances until the closing syntax lands.
+  // The lexical gate is not a TeX parser: canonical must still compile the
+  // current input, either proving it valid or reporting the actual error.
   if (engine.blocks.length) {
-    const preClosure = sourceClosure(preamble);
+    const preClosure = sourceClosure(preamble, { literalEnvs: bounds.literalEnvs });
     if (!preClosure.closed) {
       timer.lap('closure');
       return { response: deferClosureUpdate(editLabel, timer, { ...preClosure, scope: 'preamble' }) };
@@ -50,8 +57,12 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   const rawStructuralGate = classifyStructuralAliases(preamble, bodyText);
   let segs = segmentBody(bodyText, bounds.body.start, {
     structuralEvents: rawStructuralGate.segmentEvents,
+    literalEnvs: bounds.literalEnvs,
   });
-  segs = expandIncludes(segs, 0);
+  segs = expandIncludes(segs, 0, {
+    structuralEvents: rawStructuralGate.segmentEvents,
+    literalEnvs: bounds.literalEnvs,
+  });
   // Macro wrappers can hide output-routine environments from both the raw
   // segmenter and block rescue classifier. Analyse the expanded project body
   // before granting structured display; an exact canonical page is the only
@@ -70,7 +81,7 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   ];
   if (engine.blocks.length) {
     for (const seg of segs) {
-      const closure = sourceClosure(seg.text);
+      const closure = sourceClosure(seg.text, { literalEnvs: bounds.literalEnvs });
       if (!closure.closed) {
         timer.lap('closure');
         return {
@@ -89,6 +100,10 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   // sparse resident skeleton once for this source generation; subsequent
   // JOBs reuse it unless a genuinely hotter block changes the top set.
   engine.checkpointKeepCache = null;
+  engine.maxCheckpoints = checkpointBudgetFor(engine.blocks.length, {
+    ceiling: engine.checkpointCeiling,
+    pageCount: engine.canonicalPageCount,
+  });
   if (shippingExactUses.length) {
     engine.previewPolicy = 'shipping-exact';
     engine.previewReasons = [...new Set(shippingExactUses.flatMap((use) =>
@@ -115,6 +130,17 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
     }
   }
   const dirtySource = new Set(diff.dirty);
+  for (const id of diff.removed) engine.coldDirty?.delete(id);
+  if (editLabel === 'cold-resume') {
+    // The resume re-runs the update for the source as it is now: the blocks
+    // a cold stop left un-typeset are its dirty set. An ordinary keystroke
+    // elsewhere does not chase them (its own hot path stays hot). A walk
+    // that passed over one (a caret warm, typically) already typeset it;
+    // it is still re-run here, cheaply, so the keystroke gets its report.
+    for (const block of engine.blocks) {
+      if (engine.coldDirty?.has(block.id) || coldIds?.has(block.id)) dirtySource.add(block.id);
+    }
+  }
 
   if (!engine.preGate.gate.safe) {
     return {
@@ -163,7 +189,50 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   }
 
   let rebooted = false;
-  if (preHash !== engine.preHash) {
+  // A preamble edit that only changes the body of a macro or environment
+  // the document declares re-runs that declaration in front of the jobs
+  // that use it, instead of rebooting the root (tex64-internal #93).
+  let patch = null;
+  if (preHash !== engine.preHash && engine.preHash != null && engine.root &&
+      engine.bootPreamble != null && engine.lastPreamble != null && process.env.TDOM_PREAMBLE_PATCH !== '0') {
+    patch = planPreamblePatch({
+      bootPreamble: engine.bootPreamble,
+      prevPreamble: engine.lastPreamble,
+      preamble,
+      blockTexts: engine.blocks.map((b) => b.text),
+      packageText: projectPackageText(preamble, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
+    });
+    if (!patch.ok) {
+      engine.diagnostics.push(`preamble patch refused: ${patch.reason}`);
+      patch = null;
+    }
+  }
+  if (patch) {
+    engine.preHash = preHash;
+    engine.defsPatch = patch.prelude ? patch : null;
+    // A changed heading or caption also changes the lists that print it.
+    const LIST_SOURCE_RE = /\\(?:part|chapter|(?:sub)*section|paragraph|caption)\*?\s*[[{]/;
+    const LIST_RE = /\\(?:tableofcontents|listoffigures|listoftables)(?![A-Za-z])/;
+    let lists = false;
+    let dirty = 0;
+    for (const b of engine.blocks) {
+      if (!patch.dirtyRe?.test(b.text)) continue;
+      if (LIST_SOURCE_RE.test(b.text)) lists = true;
+      dirtySource.add(b.id);
+      b.units = null;
+      dirty++;
+    }
+    if (lists) {
+      for (const b of engine.blocks) {
+        if (LIST_RE.test(b.text) && !dirtySource.has(b.id)) {
+          dirtySource.add(b.id);
+          dirty++;
+        }
+      }
+    }
+    engine.preamblePatches = (engine.preamblePatches ?? 0) + 1;
+    engine.lastPreamblePatch = { names: patch.names, dirty, at: Date.now() };
+  } else if (preHash !== engine.preHash) {
     if (process.env.TDOM_DEBUG_BOOT) {
       console.error(
         `[tdom-debug] preHash mismatch: have=${engine.preHash} want=${preHash} ` +
@@ -199,6 +268,7 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
       b.units = null;
     }
   }
+  engine.lastPreamble = preamble;
   timer.lap('boot');
 
   const firstDirty = firstDirtyIndex(oldBlocks, engine.blocks, dirtySource, diff);
@@ -210,18 +280,40 @@ export async function prepareUpdate(engine, { editLabel, timer, callbacks }) {
   // boundaries INSIDE the window die. Whether the suffix may be TRUSTED
   // is decided after the foreground walk (verdict): definition edits and
   // untracked-state leaks still kill and rebuild it, off the hot path.
-  ({
-    checkpoints: engine.checkpoints,
-    renderHold: engine.renderHold,
-    editHold: engine.editHold,
-  } = preserveCheckpointSuffix({
+  const preserved = preserveCheckpointSuffix({
     checkpoints: engine.checkpoints,
     renderHold: engine.renderHold,
     editHold: engine.editHold,
     pendingChain: engine.pendingChain,
     bounds: diff.bounds,
     dyingPids: engine.dyingPids,
-  }));
+  });
+  engine.checkpoints = preserved.checkpoints;
+  engine.renderHold = preserved.renderHold;
+  engine.editHold = preserved.editHold;
+  // /status diff: how many changed regions a source snapshot had and what
+  // that cost in checkpoints (tex64-internal #96)
+  if (diff.bounds.regions > 1 || preserved.died) {
+    const stats = engine.diffStats ??= { updates: 0, multiRegion: 0, maxRegions: 0, kept: 0, died: 0, last: null };
+    stats.updates++;
+    if (diff.bounds.regions > 1) stats.multiRegion++;
+    stats.maxRegions = Math.max(stats.maxRegions, diff.bounds.regions);
+    stats.kept += preserved.kept;
+    stats.died += preserved.died;
+    stats.last = { regions: diff.bounds.regions, kept: preserved.kept, died: preserved.died, at: Date.now() };
+  }
+
+  // Pin before the walk can retire a newly materialized input or capture
+  // owner. Finalization cannot recover a checkpoint that has already died.
+  const pageRenderIds = editPageRenderIds(engine.blocks, engine.pages, dirtySource);
+  engine.foregroundRenderIds = rebooted || !dirtySource.size ? null : new Set([...dirtySource, ...pageRenderIds]);
+  if (engine.foregroundRenderIds) {
+    for (const [index, id] of engine.renderHold) {
+      if (!engine.foregroundRenderIds.has(id)) engine.renderHold.delete(index);
+    }
+  }
+  engine.editHold = rebooted ? [] : nextEditHold(firstDirty,
+    [...dirtySource, ...pageRenderIds], engine.blocks, engine.editHold);
 
   return { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted };
 }

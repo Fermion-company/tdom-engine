@@ -4,9 +4,18 @@ import { instrumentEditRegions } from '../edit-regions.js';
 export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, applyFidelity }) {
   const reusedStaleGalley = !!galley.tdomStale;
   block.galley = galley;
-  block.galleyHash = fnv1a(
-    JSON.stringify([galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events])
-  );
+  const identity = [galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events];
+  // PDF literals/resources are not glyph runs: changing only a gradient or
+  // underlay must invalidate its exact chunk even when every box is identical.
+  if (galley.gfx) {
+    if (!reusedStaleGalley) galley.tdomPaintSourceHash = block.hash;
+    identity.push(galley.tdomPaintSourceHash);
+  }
+  // A cold preview (docs/10 §10.4b) paints graphics from another lineage's
+  // state (a \tcbset between its checkpoint and the block): the galley that
+  // replaces it must not keep those pixels. Glyph and math chunks carry on.
+  if (galley.gfx && galley.tdomColdPreview) identity.push('cold-preview');
+  block.galleyHash = fnv1a(JSON.stringify(identity));
   if (galley.tdomIsoChunks) {
     // Isolated rescue bypasses buildJobBlockBody, which normally records
     // editable source spans. Its real PDF still contains editable prose
@@ -19,6 +28,8 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
       chunks.set(c.key, {
         svg: c.svg,
         wBp: c.wBp,
+        logicalWBp: c.logicalWBp,
+        xBp: c.xBp,
         hBp: c.hBp,
         v: (prev?.v ?? 0) + 1,
         forGalley: block.galleyHash,

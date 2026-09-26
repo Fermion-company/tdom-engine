@@ -9,6 +9,7 @@ export function buildUpdateResponse({
   previewReasons,
   canonical,
   dirtySource,
+  removedBlocks = [],
   dirtyBlocks,
   depDirty,
   dirtyPages,
@@ -20,6 +21,8 @@ export function buildUpdateResponse({
   rebooted,
   checkpoints,
   verdict,
+  cold = null,
+  coldWalk = null,
   pendingChain,
   reused,
   rebuilt,
@@ -46,6 +49,9 @@ export function buildUpdateResponse({
     canonical,
     fonts,
     dirtySourceNodes: [...dirtySource].map((id) => 'src-' + id),
+    // blocks the edit removed: the viewer keeps the pages that showed them
+    // in the edit's page transaction (docs/04 §4.5)
+    removedSourceNodes: removedBlocks.map((id) => 'src-' + id),
     dirtySemanticNodes: dirtyBlocks.map((id) => 'blk-' + id),
     dirtyDependencies: depDirty,
     dirtyLayoutNodes: dirtyBlocks.map((id) => 'galley-' + id),
@@ -63,6 +69,15 @@ export function buildUpdateResponse({
       rebooted,
       checkpoints: checkpoints.size,
       chainVerdict: verdict ?? 'walked',
+      // Source-dirty blocks a cold stop left with a galley older than their
+      // text: their pages show the previous typeset until the resume lands,
+      // except coldPreview, a block typeset from the walk's starting
+      // checkpoint (docs/10 §10.4b).
+      coldPending: cold?.pending ?? [],
+      coldPreview: cold?.preview ?? null,
+      // The cold resume's own replay: checkpoint it started from, the
+      // block it walked to, blocks and ms spent across its passes.
+      coldWalk,
       chainPending: pendingChain
         ? { kind: pendingChain.kind, from: pendingChain.from }
         : null,

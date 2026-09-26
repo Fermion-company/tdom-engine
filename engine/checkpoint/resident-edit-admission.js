@@ -50,7 +50,7 @@ export function classifyResidentEdit(engine, {
     return exactOnly('tex-bearing-paragraph');
   }
   if (!oldBlock.galley || oldBlock.fidelity?.level !== SAFE_GLYPH ||
-      oldBlock.needsRender || oldBlock.gfx || oldBlock.rescued) {
+      oldBlock.needsRender || oldBlock.gfx || oldBlock.rescued || oldBlock.galley.tdomColdPreview) {
     return exactOnly('resident-witness-unavailable');
   }
   return Object.freeze({ kind: 'probe', blockId: block.id });

@@ -2,7 +2,7 @@
  *
  * The checkpoint engine freezes TeX states by fork(): the parent process IS
  * the snapshot, children are alternative continuations. This shim exposes
- * exactly the four primitives that mechanism needs.
+ * the process and descriptor primitives that mechanism needs.
  *
  * Lua API symbols are resolved against the host luatex process at load time,
  * so no Lua headers or libraries are needed to build:
@@ -20,6 +20,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <dirent.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 typedef struct lua_State lua_State;
 typedef long long lua_Integer;
@@ -33,8 +37,88 @@ extern void lua_pushcclosure(lua_State *L, lua_CFunction fn, int n);
 extern void lua_pushboolean(lua_State *L, int value);
 extern void lua_setfield(lua_State *L, int idx, const char *k);
 
+/* Checkpoint parents never consume child exit status. Re-assert that just
+ * before every fork: a disposition set once at boot does not survive (the
+ * census found ~4 zombies per keystroke under dormant checkpoints). */
+static int discard_child_status(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = SIG_IGN;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_NOCLDWAIT;
+  return sigaction(SIGCHLD, &sa, NULL);
+}
+
 static int l_fork(lua_State *L) {
+  if (discard_child_status() != 0) { lua_pushinteger(L, -1); return 1; }
   lua_pushinteger(L, (lua_Integer)fork());
+  return 1;
+}
+
+static int l_set_interactive(lua_State *L) {
+  int result = 0;
+#ifdef __APPLE__
+  int interactive = lua_tointegerx(L, 1, NULL) != 0;
+  result = pthread_set_qos_class_self_np(
+    interactive ? QOS_CLASS_USER_INITIATED : QOS_CLASS_DEFAULT, 0);
+#endif
+  lua_pushboolean(L, result == 0);
+  return 1;
+}
+
+/* Each resident continuation owns its PDF bytes as well as the backend's
+ * in-memory object table. Anonymous files are reclaimed with the process;
+ * checkpoint retirement needs no path bookkeeping. */
+static int copy_pdf_fd(int source, int output) {
+  char buffer[65536];
+  off_t at = 0;
+  for (;;) {
+    ssize_t n = pread(source, buffer, sizeof(buffer), at);
+    if (n == 0) break;
+    if (n < 0) { if (errno == EINTR) continue; return 0; }
+    ssize_t written = 0;
+    while (written < n) {
+      ssize_t k = write(output, buffer + written, (size_t)(n - written));
+      if (k < 0 && errno == EINTR) continue;
+      if (k <= 0) return 0;
+      written += k;
+    }
+    at += n;
+  }
+  off_t offset = lseek(source, 0, SEEK_CUR);
+  return offset >= 0 && lseek(output, offset, SEEK_SET) >= 0;
+}
+
+static int l_fork_pdf(lua_State *L) {
+  int fd = (int)lua_tointegerx(L, 1, NULL);
+  if (fflush(NULL) != 0) { lua_pushinteger(L, -1); return 1; }
+  /* Prepare before fork: a failed copy is an ordinary FORKFAIL, and the
+   * parent never receives a child that still shares writable PDF state. */
+  FILE *private_file = tmpfile();
+  if (!private_file || !copy_pdf_fd(fd, fileno(private_file))) {
+    if (private_file) fclose(private_file);
+    lua_pushinteger(L, -1);
+    return 1;
+  }
+  if (discard_child_status() != 0) {
+    fclose(private_file);
+    lua_pushinteger(L, -1);
+    return 1;
+  }
+  pid_t pid = fork();
+  if (pid == 0 && dup2(fileno(private_file), fd) < 0) _exit(125);
+  fclose(private_file);
+  lua_pushinteger(L, (lua_Integer)pid);
+  return 1;
+}
+
+static int l_publish_pdf(lua_State *L) {
+  int fd = (int)lua_tointegerx(L, 1, NULL);
+  const char *target = lua_tolstring(L, 2, NULL);
+  int output = target ? open(target, O_RDWR | O_CREAT | O_TRUNC, 0600) : -1;
+  int ok = output >= 0 && fflush(NULL) == 0 && copy_pdf_fd(fd, output) && dup2(output, fd) >= 0;
+  if (output >= 0) close(output);
+  lua_pushboolean(L, ok);
   return 1;
 }
 
@@ -60,7 +144,7 @@ static int l_exit(lua_State *L) {
  * SIGCHLD so exited render children do not accumulate as zombies. */
 static int l_ignore_sigchld(lua_State *L) {
   (void)L;
-  signal(SIGCHLD, SIG_IGN);
+  discard_child_status();
   return 0;
 }
 
@@ -79,32 +163,68 @@ static int fd_matches_path(int fd, const char *wanted) {
   return 0;
 #endif
   char resolved_actual[PATH_MAX];
-  char resolved_wanted[PATH_MAX];
   const char *left = realpath(actual, resolved_actual) ? resolved_actual : actual;
-  const char *right = realpath(wanted, resolved_wanted) ? resolved_wanted : wanted;
-  return strcmp(left, right) == 0;
+  return strcmp(left, wanted) == 0;
+}
+
+static int fd_matches_access(int fd, const char *source, int writable) {
+  int flags = fcntl(fd, F_GETFL);
+  if (flags == -1) return 0;
+  if (writable ? (flags & O_ACCMODE) == O_RDONLY : (flags & O_ACCMODE) == O_WRONLY) return 0;
+  return fd_matches_path(fd, source);
+}
+
+static int find_file_fd(const char *source, int writable) {
+  char resolved[PATH_MAX];
+  const char *wanted = realpath(source, resolved) ? resolved : source;
+#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__)
+  DIR *descriptors = opendir("/dev/fd");
+#else
+  DIR *descriptors = opendir("/proc/self/fd");
+#endif
+  if (descriptors) {
+    int found = -1;
+    struct dirent *entry;
+    // Enumerate afresh: TeX can close and reuse descriptors between jobs.
+    // Probing the entire descriptor limit for every absent aux extension
+    // makes a page checkpoint pay thousands of failed system calls.
+    while ((entry = readdir(descriptors)) != NULL) {
+      char *end;
+      long fd = strtol(entry->d_name, &end, 10);
+      if (end == entry->d_name || *end || fd < 3 || fd > INT_MAX) continue;
+      if (found >= 0 && fd >= found) continue;
+      if (fd_matches_access((int)fd, wanted, writable)) found = (int)fd;
+    }
+    closedir(descriptors);
+    return found;
+  }
+#endif
+  long max_fd = sysconf(_SC_OPEN_MAX);
+  if (max_fd < 0 || max_fd > 4096) max_fd = 4096;
+  for (int fd = 3; fd < max_fd; fd++) {
+    if (fd_matches_access(fd, wanted, writable)) return fd;
+  }
+  return -1;
 }
 
 static int find_writable_fd(const char *source) {
-  long max_fd = sysconf(_SC_OPEN_MAX);
-  if (max_fd < 0 || max_fd > 4096) max_fd = 4096;
-  for (int fd = 3; fd < max_fd; fd++) {
-    if (fcntl(fd, F_GETFD) == -1 || !fd_matches_path(fd, source)) continue;
-    int flags = fcntl(fd, F_GETFL);
-    if (flags != -1 && (flags & O_ACCMODE) != O_RDONLY) return fd;
-  }
-  return -1;
+  return find_file_fd(source, 1);
+}
+
+static int l_prepare_pdf(lua_State *L) {
+  const char *source = lua_tolstring(L, 1, NULL);
+  int fd = source ? find_writable_fd(source) : -1;
+  int readable = source && fflush(NULL) == 0 ? open(source, O_RDWR) : -1;
+  off_t offset = fd >= 0 ? lseek(fd, 0, SEEK_CUR) : -1;
+  int ok = readable >= 0 && offset >= 0 && lseek(readable, offset, SEEK_SET) >= 0 && dup2(readable, fd) >= 0;
+  if (readable >= 0) close(readable);
+  lua_pushinteger(L, ok ? fd : -1);
+  return 1;
 }
 
 static int find_readable_fd(const char *source) {
-  long max_fd = sysconf(_SC_OPEN_MAX);
-  if (max_fd < 0 || max_fd > 4096) max_fd = 4096;
-  for (int fd = 3; fd < max_fd; fd++) {
-    if (fcntl(fd, F_GETFD) == -1 || !fd_matches_path(fd, source)) continue;
-    int flags = fcntl(fd, F_GETFL);
-    if (flags != -1 && (flags & O_ACCMODE) != O_WRONLY) return fd;
-  }
-  return -1;
+  return find_file_fd(source, 0);
 }
 
 static int copy_path(const char *source, const char *target) {
@@ -234,6 +354,8 @@ int luaopen_tdomfork(lua_State *L) {
   lua_createtable(L, 0, 8);
   lua_pushcclosure(L, l_fork, 0);
   lua_setfield(L, -2, "fork");
+  lua_pushcclosure(L, l_set_interactive, 0);
+  lua_setfield(L, -2, "set_interactive");
   lua_pushcclosure(L, l_getpid, 0);
   lua_setfield(L, -2, "getpid");
   lua_pushcclosure(L, l_waitpid, 0);
@@ -246,6 +368,12 @@ int luaopen_tdomfork(lua_State *L) {
   lua_setfield(L, -2, "clone_open_fd");
   lua_pushcclosure(L, l_copy_open_fd, 0);
   lua_setfield(L, -2, "copy_open_fd");
+  lua_pushcclosure(L, l_prepare_pdf, 0);
+  lua_setfield(L, -2, "prepare_pdf");
+  lua_pushcclosure(L, l_fork_pdf, 0);
+  lua_setfield(L, -2, "fork_pdf");
+  lua_pushcclosure(L, l_publish_pdf, 0);
+  lua_setfield(L, -2, "publish_pdf");
   lua_pushcclosure(L, l_redirect_open_fd, 0);
   lua_setfield(L, -2, "redirect_open_fd");
   lua_pushcclosure(L, l_prepare_read_fd, 0);

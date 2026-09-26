@@ -19,6 +19,7 @@ export async function typesetBlock(engine, idx, callbacks) {
     pumpRescues,
     sourceClosure,
     sourceRequiresCanonicalOnly,
+    restoreReplayInput,
   } = callbacks;
   const block = engine.blocks[idx];
   const sig = fnv1a(block.text);
@@ -42,7 +43,7 @@ export async function typesetBlock(engine, idx, callbacks) {
   const aborted = () => engine.bgAbort && engine.bgActive;
   const isInfra = (e) => e?.tdomInfra === true;
   const isTimeoutErr = (e) => e?.tdomTimeout === true;
-  const lexical = sourceClosure(block.text);
+  const lexical = sourceClosure(block.text, { literalEnvs: engine.literalEnvs });
   block.nativeClosureRequired = !sourceRequiresCanonicalOnly(block.text);
   block.closure = { ...lexical, native: false };
   if (!lexical.closed) {
@@ -101,6 +102,13 @@ export async function typesetBlock(engine, idx, callbacks) {
     TRACE?.('rescue(env)', T0);
     return g;
   }
+  // a package-declared breakable box that did not fit from its entry
+  // offset (queueMovedOffsets): the real run splits it
+  if (block.contextRescue === sig) {
+    const g = await rescueSafely('breakable box splits at its page offset');
+    TRACE?.('rescue(context)', T0);
+    return g;
+  }
   if (engine.poisoned.get(block.id) === sig) {
     return rescueSafely('previous in-chain failure');
   }
@@ -125,6 +133,12 @@ export async function typesetBlock(engine, idx, callbacks) {
     // and without paying for rescue/state follow-up jobs — the next
     // rebuild retries from scratch
     if (aborted()) throw err;
+    // A STEP continuation has no parent snapshot at this boundary. Restore
+    // it from an older live checkpoint before any content fallback tries an
+    // @state JOB. The failed continuation itself has already been retired.
+    if (err?.tdomConsumedReplayInput != null) {
+      await restoreReplayInput(idx, err);
+    }
     if (err?.tdomClosure === true) {
       block.closure = { closed: false, reason: 'native-error', at: block.text.length, native: true };
       engine.poisoned.delete(block.id);

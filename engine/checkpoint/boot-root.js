@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { writeFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { documentBounds } from '../segmenter.js';
+import { fnv1a } from '../hash.js';
 import { scanCounterDefs, texErrorFrom } from './util/tex.js';
 import { withProjectInputs } from '../project-inputs.js';
 
@@ -20,6 +21,9 @@ export async function bootRoot(
     }
   }
   engine.checkpoints.clear();
+  engine.realRoot = null;
+  engine.confirmedLiveHeapKb = 0;
+  engine.calibrateInitialHeap = true;
   if (engine.root) {
     try { engine.root.kill('SIGKILL'); } catch { /* gone */ }
     engine.root = null;
@@ -30,6 +34,10 @@ export async function bootRoot(
   const bounds = documentBounds(text);
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
   engine.counters = [...baseCounters, ...scanCounterDefs(preamble)];
+  // the declarations every checkpoint of this root holds (preamble-patch.js)
+  engine.bootPreamble = preamble;
+  engine.bootPreHash = fnv1a(preamble);
+  engine.defsPatch = null;
   // \pagestyle set in the preamble runs before the driver shims exist —
   // scan for it; otherwise book-family classes default to 'headings'
   const psMatch = preamble.match(/^[^%\n]*\\pagestyle\s*\{(\w+)\}/m);
@@ -91,12 +99,17 @@ export async function bootRoot(
   });
   engine.rootLogRef = () => rootLog;
 
+  // the real-output root says HELLO on its own socket before checkpoint 0
+  // does; give a slow connect a moment so the first splitting rescue of
+  // the boot walk already finds it (a missing root only means cold)
+  const realRootReady = engine.isoRealFork ? awaitReady('realroot', bootTimeout).catch(() => null) : null;
   await Promise.all([ckptReady, geoReady]).catch((err) => {
     throw new Error(`preamble build failed — ${texErrorFrom(rootLog) || err.message}`);
   });
-  // hyperref (and friends) write PDF objects during \begin{document},
-  // which opens the shared output file at the root — checkpoint children
-  // can then no longer ship their own tight pages. Fall back to isolated
-  // per-block compiles for the exact-render tier in that case.
+  if (realRootReady && !engine.realRoot) {
+    await Promise.race([realRootReady, new Promise((r) => setTimeout(r, 2000))]);
+  }
+  // Kept as diagnostic metadata: daemon forks now own private PDF bytes,
+  // so preamble-created objects no longer disable resident exact rendering.
   engine.pdfOpenedAtRoot = existsSync(path.join(engine.workDir, 'driver.pdf'));
 }

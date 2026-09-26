@@ -56,3 +56,15 @@ jobs:
 
       - name: Fuzz — corpus refs (seed 1)
         run: node tools/fuzz.mjs corpus/06-refs-heavy.tex --seed=1 --bursts=6 --edits=4
+
+      # every keystroke cold and shown through a preview first (docs/10
+      # §10.4b): the walk that replaces it must still reach the fresh state
+      - name: Fuzz — cold previews (seed 5)
+        timeout-minutes: 20
+        run: |
+          node tools/fuzz.mjs corpus/04-ja-mixed.tex --seed=5 --bursts=6 --edits=4
+          node tools/fuzz.mjs corpus/02-math-ams.tex --seed=5 --bursts=6 --edits=4
+        env:
+          TDOM_MAX_CHECKPOINTS: 4
+          TDOM_COLD_PREFIX_MS: 30
+          TDOM_COLD_PREVIEW_FROM_MS: 0

@@ -25,7 +25,7 @@
 
 import { fnv1a } from './hash.js';
 
-const FORCED_START = /^\s*\\(chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
+const FORCED_START = /^\s*\\(par|chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
 
 // Standalone generated-content commands. Each performs its own \par and
 // emits display material nobody types into (the title block, the toc/lof/lot
@@ -44,9 +44,34 @@ const STANDALONE_LINE =
 // counters and merged the entire remaining document into one block — every
 // keystroke anywhere in the tail then re-typeset the whole remainder.
 const VERBATIM_BEGIN_RE =
-  /\\begin\{(verbatim\*?|lstlisting|minted|alltt|filecontents\*?|[BLV]erbatim\*?)\}/;
+  /\\begin\{(verbatim\*?|lstlisting|minted|filecontents\*?|[BLV]erbatim\*?)\}/;
 
-export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
+// Preamble declarations that make a literal environment under the user's
+// own name (listings, fancyvrb, minted, tcolorbox listings, comment). A
+// `TeXBlock` listing is as literal as `lstlisting`, so both the segmenter
+// and the document bounds must know its name.
+const LITERAL_ENV_DECL_RE =
+  /\\(?:lstnewenvironment|DefineVerbatimEnvironment|(?:re)?newtcblisting|(?:Declare|New|Renew|Provide)TCBListing|excludecomment)\s*(?:\[[^\]]*\]\s*)?\{\s*([^{}\s]+)\s*\}/g;
+const NEWMINTED_RE = /\\newminted\s*(?:\[\s*([^\]\s]+)\s*\])?\s*\{\s*([^{}\s]+)\s*\}/g;
+
+export function literalEnvironmentNames(text) {
+  const names = new Set();
+  for (const m of text.matchAll(LITERAL_ENV_DECL_RE)) names.add(m[1]);
+  for (const m of text.matchAll(NEWMINTED_RE)) names.add(m[1] ?? `${m[2]}code`);
+  return names;
+}
+
+function literalBegin(stripped, literalEnvs) {
+  const builtin = VERBATIM_BEGIN_RE.exec(stripped);
+  if (!literalEnvs?.size) return builtin;
+  for (const m of stripped.matchAll(/\\begin\{([^{}]*)\}/g)) {
+    if (builtin && m.index >= builtin.index) break;
+    if (literalEnvs.has(m[1])) return m;
+  }
+  return builtin;
+}
+
+export function segmentBody(text, baseOffset, { structuralEvents = [], literalEnvs = null } = {}) {
   const segs = [];
   const lines = splitLines(text);
   const aliasEvents = [...structuralEvents].sort((a, b) => a.at - b.at);
@@ -55,6 +80,8 @@ export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
   let braceDepth = 0;
   let inDisplay = false;
   let inVerbatim = null; // env name while inside a literal environment
+  let inAlltt = false; // commands/braces execute; unlike normal TeX, % is data
+  let inKKcode = false; // inside \KKcodeS...\KKcodeE (KKluaverb)
   let cur = null; // { start, end }
   let curStructuralSinks = new Set();
 
@@ -75,6 +102,12 @@ export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
   };
 
   for (const ln of lines) {
+    // KKluaverb's \KKcodeS...\KKcodeE: literal lines, like a verbatim env
+    if (inKKcode) {
+      if (cur === null) cur = { start: ln.start };
+      if (ln.text.includes('\\KKcodeE')) inKKcode = false;
+      continue;
+    }
     if (inVerbatim) {
       // literal content: no comment stripping, no depth tracking, no
       // blank-line flush (blank lines inside a listing stay in the block)
@@ -82,9 +115,14 @@ export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
       if (ln.text.includes(`\\end{${inVerbatim}}`)) inVerbatim = null;
       continue;
     }
-    let stripped = stripComment(ln.text);
-    // neutralize inline \verb payloads before counting braces/comments
-    stripped = stripped.replace(/\\verb\*?([^A-Za-z\s])(.*?)\1/g, '\\verb$1v$1');
+    // Neutralize inline \verb before comments: its delimiter may contain a
+    // literal `%`, which must not hide executable text later on the line.
+    let stripped = ln.text.replace(
+      /\\verb\*?([^A-Za-z\s])(.*?)\1|\\KKverb\|[^|]*\|/g,
+      (match) => ' '.repeat(match.length)
+    );
+    if (!inAlltt) stripped = stripComment(stripped);
+    if (!inAlltt && /\\begin\{alltt\}/.test(stripped)) inAlltt = true;
     const blank = stripped.trim().length === 0 && ln.text.trim().length === 0;
     const atTop = envDepth === 0 && braceDepth <= 0 && !inDisplay;
 
@@ -103,7 +141,15 @@ export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
       continue;
     }
 
-    const verb = VERBATIM_BEGIN_RE.exec(stripped);
+    const kkcode = stripped.indexOf('\\KKcodeS');
+    if (kkcode >= 0 && !ln.text.slice(ln.text.indexOf('\\KKcodeS')).includes('\\KKcodeE')) {
+      const before = stripped.slice(0, kkcode);
+      envDepth = Math.max(0, envDepth + countMatches(before, /\\begin\{[^}]*\}/g) - countMatches(before, /\\end\{[^}]*\}/g));
+      braceDepth = Math.max(0, braceDepth + braceDelta(before));
+      inKKcode = true;
+      continue;
+    }
+    const verb = literalBegin(stripped, literalEnvs);
     if (verb) {
       // enter literal mode unless the same line also closes it; the
       // verbatim env itself contributes nothing to envDepth (its \begin
@@ -132,6 +178,7 @@ export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
       }
     }
     if (envDepth < 0) envDepth = 0;
+    if (inAlltt && /\\end\{alltt\}/.test(stripped)) inAlltt = false;
     // `\\[2mm]` in align/tabular is a row break with optional spacing, not
     // the display opener `\[`.  A substring regex sees the second slash of
     // `\\[` and poisons inDisplay for the whole remaining document, merging
@@ -151,20 +198,126 @@ export function segmentBody(text, baseOffset, { structuralEvents = [] } = {}) {
   return segs;
 }
 
+// Environments TeX reads as literal characters, for the document bounds.
+// Unlike VERBATIM_BEGIN_RE this leaves out alltt: \, { and } keep their
+// meaning there, so an \end{document} inside alltt really ends the run.
+const LITERAL_BOUNDARY_ENVS = new Set([
+  'verbatim', 'verbatim*', 'Verbatim', 'Verbatim*', 'BVerbatim', 'BVerbatim*',
+  'LVerbatim', 'LVerbatim*', 'SaveVerbatim', 'VerbatimOut', 'lstlisting', 'minted',
+  'filecontents', 'filecontents*', 'comment', 'tcblisting', 'luacode', 'luacode*',
+]);
+const MARKER_RE = /\\(begin|end)\{([^{}]*)\}/g;
+const INLINE_VERB_RE =
+  /(\\(?:verb\*?|lstinline(?:\[[^\]]*\])?|mintinline(?:\[[^\]]*\])?\{[^{}]*\})([^A-Za-z\s{*]))(.*?)\2/g;
+const INLINE_BRACED_RE =
+  /(\\(?:lstinline(?:\[[^\]]*\])?|mintinline(?:\[[^\]]*\])?\{[^{}]*\})\{)((?:[^{}]|\{[^{}]*\})*)\}/g;
+
+const LITERAL_OR_INLINE_RE = new RegExp(
+  `\\\\(?:verb|lstinline|mintinline)|\\\\begin\\{(?:${[...LITERAL_BOUNDARY_ENVS].map((name) => name.replace('*', '\\*')).join('|')})\\}`
+);
+
+let boundsMemo = { text: null, value: null };
+
 /**
  * Locate the preamble/body split. Returns
- * { preamble:{start,end}, body:{start,end} }. If \begin{document} is missing
- * the whole file is treated as body (keeps the engine alive mid-edit).
+ * { preamble:{start,end}, body:{start,end}, hasBegin, literalEnvs }. If
+ * \begin{document} is missing the whole file is treated as body (keeps the
+ * engine alive mid-edit).
+ *
+ * The markers are the first ACTIVE \begin{document} and the first active
+ * \end{document} after it: not in a comment, not in a verbatim/listing
+ * environment, not in \verb. Manuals and LaTeX tutorials quote
+ * \end{document} in listings; taking the first string match cut the body
+ * there, and the resident dropped every page after the listing.
  */
 export function documentBounds(text) {
-  const b = text.indexOf('\\begin{document}');
-  if (b < 0) {
-    return { preamble: { start: 0, end: 0 }, body: { start: 0, end: text.length } };
+  if (boundsMemo.text !== text) boundsMemo = { text, value: scanDocumentBounds(text) };
+  const { preamble, body, hasBegin, literalEnvs } = boundsMemo.value;
+  return { preamble: { ...preamble }, body: { ...body }, hasBegin, literalEnvs };
+}
+
+function scanDocumentBounds(text) {
+  const literalEnvs = literalEnvironmentNames(text);
+  const { begin, end } = plainDocumentMarkers(text, literalEnvs) ?? findDocumentMarkers(text, literalEnvs);
+  if (begin < 0) {
+    return { preamble: { start: 0, end: 0 }, body: { start: 0, end: text.length }, hasBegin: false, literalEnvs };
   }
-  const bodyStart = b + '\\begin{document}'.length;
-  const e = text.indexOf('\\end{document}', bodyStart);
-  const bodyEnd = e < 0 ? text.length : e;
-  return { preamble: { start: 0, end: b }, body: { start: bodyStart, end: bodyEnd } };
+  const bodyStart = begin + '\\begin{document}'.length;
+  const bodyEnd = end < 0 ? text.length : end;
+  return { preamble: { start: 0, end: begin }, body: { start: bodyStart, end: bodyEnd }, hasBegin: true, literalEnvs };
+}
+
+// The common case without a line scan: each marker occurs once, on an
+// uncommented line, and nothing literal could be quoting it.
+function plainDocumentMarkers(text, literalEnvs) {
+  const begin = text.indexOf('\\begin{document}');
+  const end = text.indexOf('\\end{document}');
+  if (begin < 0 || end < begin) return null;
+  if (text.indexOf('\\begin{document}', begin + 1) >= 0 || text.indexOf('\\end{document}', end + 1) >= 0) return null;
+  if (literalEnvs.size || LITERAL_OR_INLINE_RE.test(text)) return null;
+  if (commentedAt(text, begin) || commentedAt(text, end)) return null;
+  return { begin, end };
+}
+
+function commentedAt(text, offset) {
+  const lineStart = text.lastIndexOf('\n', offset - 1) + 1;
+  const before = text.slice(lineStart, offset);
+  return commentStart(before) < before.length;
+}
+
+function findDocumentMarkers(text, literalEnvs) {
+  let begin = -1;
+  let inLiteral = null;
+  for (let pos = 0; pos <= text.length;) {
+    let eol = text.indexOf('\n', pos);
+    if (eol < 0) eol = text.length;
+    const line = text.slice(pos, eol);
+    let col = 0;
+    scan: while (col <= line.length) {
+      if (inLiteral) {
+        const close = line.indexOf(`\\end{${inLiteral}}`, col);
+        if (close < 0) break;
+        col = close + `\\end{${inLiteral}}`.length;
+        inLiteral = null;
+      }
+      const active = maskInlineVerbatim(line.slice(col));
+      const code = active.slice(0, commentStart(active));
+      MARKER_RE.lastIndex = 0;
+      for (let m; (m = MARKER_RE.exec(code));) {
+        const [, kind, name] = m;
+        if (kind === 'begin' && (LITERAL_BOUNDARY_ENVS.has(name) || literalEnvs.has(name))) {
+          inLiteral = name;
+          col += m.index + m[0].length;
+          continue scan;
+        }
+        if (name !== 'document') continue;
+        if (kind === 'begin' && begin < 0) begin = pos + col + m.index;
+        else if (kind === 'end' && begin >= 0) return { begin, end: pos + col + m.index };
+      }
+      break;
+    }
+    pos = eol + 1;
+  }
+  return { begin, end: -1 };
+}
+
+// Blank out inline verbatim payloads, keeping every offset in place.
+function maskInlineVerbatim(s) {
+  if (!/\\(?:verb|lstinline|mintinline)/.test(s)) return s;
+  return s
+    .replace(INLINE_VERB_RE, (_, head, delim, payload) => `${head}${' '.repeat(payload.length)}${delim}`)
+    .replace(INLINE_BRACED_RE, (_, head, payload) => `${head}${' '.repeat(payload.length)}}`);
+}
+
+// Offset of the first `%` that starts a comment: one preceded by an even
+// run of backslashes (`\\%` is a line break and then a comment).
+function commentStart(s) {
+  for (let i = s.indexOf('%'); i >= 0; i = s.indexOf('%', i + 1)) {
+    let slashes = 0;
+    for (let j = i - 1; j >= 0 && s[j] === '\\'; j--) slashes++;
+    if (slashes % 2 === 0) return i;
+  }
+  return s.length;
 }
 
 /**
@@ -195,95 +348,143 @@ export function diffBlocks(oldBlocks, segs, nextId) {
   for (let i = 0; i < p; i++) {
     blocks.push(refresh(oldBlocks[i], segs[i]));
   }
-  // Middle: pair positionally.
-  const midOld = so - p;
-  const midNew = sn - p;
-  const shared = Math.min(midOld, midNew);
-  for (let i = 0; i < shared; i++) {
-    const ob = oldBlocks[p + i];
-    const sg = segs[p + i];
-    if (ob.hash === sg.hash) {
-      blocks.push(refresh(ob, sg));
-    } else {
-      // Modified in place: keep the id. Expansion/semantics must rebuild
-      // (they depend on the text), but the layout cache is carried over —
-      // the layout key decides whether the rebuilt semantics differ.
-      // The PREVIOUS galley rides along as the stale-first display: an
-      // edited rescue-environment block without it had to pay a SYNCHRONOUS
-      // isolated compile (~2s) on every keystroke — old-but-clean pixels
-      // plus an async exact render is the doctrine, and it needs the old
-      // galley to exist. The block stays in `dirty`, so everything that
-      // must re-typeset still does; the carried fields are only the
-      // "last good" state the rescue tiers show meanwhile.
-      const nb = {
-        id: ob.id,
+  // Middle: blocks whose text did not change are found by hash (a longest
+  // common subsequence), so a second changed region further down does not
+  // turn every block between the two into a changed one, and an inserted or
+  // deleted block does not shift the pairing of all that follow
+  // (tex64-internal #96). Between two such anchors the blocks pair up by
+  // position as before: a block edited in place keeps its id.
+  const anchors = middleAnchors(oldBlocks, segs, p, so, p, sn);
+  const matchedOld = new Map(); // old index -> new index, for every kept block
+  for (let i = 0; i < p; i++) matchedOld.set(i, i);
+  let regions = 0;
+  let oi = p;
+  let ni = p;
+  const gap = (oEnd, nEnd) => {
+    const midOld = oEnd - oi;
+    const midNew = nEnd - ni;
+    if (midOld || midNew) regions++;
+    const shared = Math.min(midOld, midNew);
+    const base = { o: oi, n: ni };
+    for (let i = 0; i < shared; i++) {
+      const ob = oldBlocks[base.o + i];
+      const sg = segs[base.n + i];
+      if (ob.hash === sg.hash) {
+        blocks.push(refresh(ob, sg));
+        matchedOld.set(base.o + i, base.n + i);
+      } else {
+        // Modified in place: keep the id. Expansion/semantics must rebuild
+        // (they depend on the text), but the layout cache is carried over —
+        // the layout key decides whether the rebuilt semantics differ.
+        // The PREVIOUS galley rides along as the stale-first display: an
+        // edited rescue-environment block without it had to pay a SYNCHRONOUS
+        // isolated compile (~2s) on every keystroke — old-but-clean pixels
+        // plus an async exact render is the doctrine, and it needs the old
+        // galley to exist. The block stays in `dirty`, so everything that
+        // must re-typeset still does; the carried fields are only the
+        // "last good" state the rescue tiers show meanwhile.
+        const nb = {
+          id: ob.id,
+          start: sg.start,
+          end: sg.end,
+          text: sg.text,
+          hash: sg.hash,
+          sem: null,
+          exp: null,
+          layout: ob.layout,
+          layoutKey: ob.layoutKey,
+          galley: ob.galley,
+          // One-generation proof input for canonical-addressed wrapped prose:
+          // the planner may overlay only the final visual line when every
+          // earlier LuaLaTeX line is byte-identical across the edit.
+          // (a cold preview is not a proof input: keep the galley it stands
+          // in for, docs/10 §10.4b)
+          previousGalley: ob.galley?.tdomColdPreview ? (ob.previousGalley ?? null) : ob.galley,
+          galleyHash: ob.galleyHash,
+          stateVec: ob.stateVec,
+          units: ob.units,
+          rescued: ob.rescued,
+          pageOffset: ob.pageOffset,
+          fidelity: ob.fidelity,
+          needsRender: ob.needsRender,
+          gfx: ob.gfx,
+          kind: ob.kind,
+          consumesToc: ob.consumesToc,
+          file: sg.file ?? null,
+          sourceStart: sg.sourceStart ?? null,
+          sourceEnd: sg.sourceEnd ?? null,
+          sourceParts: sg.sourceParts ?? null,
+          includeStart: !!sg.includeStart,
+          includeEnd: !!sg.includeEnd,
+          externalGraphics: !!sg.externalGraphics,
+          structuralSinks: sg.structuralSinks ?? [],
+          sourceChanged: true,
+          typesetCostMs: ob.typesetCostMs,
+        };
+        blocks.push(nb);
+        dirty.add(nb.id);
+      }
+    }
+    for (let i = shared; i < midNew; i++) {
+      const sg = segs[base.n + i];
+      const id = 'b' + nextId();
+      blocks.push({
+        id,
         start: sg.start,
         end: sg.end,
         text: sg.text,
         hash: sg.hash,
         sem: null,
         exp: null,
-        layout: ob.layout,
-        layoutKey: ob.layoutKey,
-        galley: ob.galley,
-        // One-generation proof input for canonical-addressed wrapped prose:
-        // the planner may overlay only the final visual line when every
-        // earlier LuaLaTeX line is byte-identical across the edit.
-        previousGalley: ob.galley,
-        galleyHash: ob.galleyHash,
-        stateVec: ob.stateVec,
-        units: ob.units,
-        rescued: ob.rescued,
-        pageOffset: ob.pageOffset,
-        fidelity: ob.fidelity,
-        needsRender: ob.needsRender,
-        gfx: ob.gfx,
-        kind: ob.kind,
-        consumesToc: ob.consumesToc,
+        layout: null,
+        layoutKey: null,
         file: sg.file ?? null,
         sourceStart: sg.sourceStart ?? null,
         sourceEnd: sg.sourceEnd ?? null,
+        sourceParts: sg.sourceParts ?? null,
         includeStart: !!sg.includeStart,
         includeEnd: !!sg.includeEnd,
         externalGraphics: !!sg.externalGraphics,
         structuralSinks: sg.structuralSinks ?? [],
         sourceChanged: true,
-        typesetCostMs: ob.typesetCostMs,
-      };
-      blocks.push(nb);
-      dirty.add(nb.id);
+      });
+      dirty.add(id);
+      added.push(id);
     }
+    for (let i = shared; i < midOld; i++) removed.push(oldBlocks[base.o + i].id);
+    oi = oEnd;
+    ni = nEnd;
+  };
+  for (const [ao, an] of anchors) {
+    gap(ao, an);
+    blocks.push(refresh(oldBlocks[ao], segs[an]));
+    matchedOld.set(ao, an);
+    oi = ao + 1;
+    ni = an + 1;
   }
-  for (let i = shared; i < midNew; i++) {
-    const sg = segs[p + i];
-    const id = 'b' + nextId();
-    blocks.push({
-      id,
-      start: sg.start,
-      end: sg.end,
-      text: sg.text,
-      hash: sg.hash,
-      sem: null,
-      exp: null,
-      layout: null,
-      layoutKey: null,
-      file: sg.file ?? null,
-      sourceStart: sg.sourceStart ?? null,
-      sourceEnd: sg.sourceEnd ?? null,
-      includeStart: !!sg.includeStart,
-      includeEnd: !!sg.includeEnd,
-      externalGraphics: !!sg.externalGraphics,
-      structuralSinks: sg.structuralSinks ?? [],
-      sourceChanged: true,
-    });
-    dirty.add(id);
-    added.push(id);
-  }
-  for (let i = shared; i < midOld; i++) removed.push(oldBlocks[p + i].id);
+  gap(so, sn);
   // Common suffix.
   for (let i = 0; i < nNew - sn; i++) {
     blocks.push(refresh(oldBlocks[so + i], segs[sn + i]));
+    matchedOld.set(so + i, sn + i);
   }
+  // Checkpoint re-keying (checkpoint-preservation.js): the boundary before
+  // old block k survives at the boundary before its new position when that
+  // block is kept. Prefix boundaries (k <= prefixLen) hold exactly the old
+  // state; the others follow an edit and survive as volatile-stale, the
+  // rule the suffix always had. The end of the document follows the end.
+  const boundaryMap = new Map();
+  for (let k = 0; k <= nOld; k++) {
+    if (k <= p) boundaryMap.set(k, { to: k, exact: true });
+    else if (k === nOld) boundaryMap.set(k, { to: nNew, exact: false });
+    else if (matchedOld.has(k)) boundaryMap.set(k, { to: matchedOld.get(k), exact: false });
+  }
+  // the blocks of the window that did change, on each side
+  const keptNew = new Set(matchedOld.values());
+  const changedOld = [];
+  for (let k = p; k < so; k++) if (!matchedOld.has(k)) changedOld.push(k);
+  const changedNew = [];
+  for (let k = p; k < sn; k++) if (!keptNew.has(k)) changedNew.push(k);
 
   // Window bounds for checkpoint re-keying: a checkpoint at boundary k holds
   // the state after blocks[0..k-1], so prefix boundaries (k <= prefixLen)
@@ -295,8 +496,40 @@ export function diffBlocks(oldBlocks, segs, nextId) {
     dirty,
     added,
     removed,
-    bounds: { prefixLen: p, oldSuffixStart: so, newSuffixStart: sn },
+    bounds: { prefixLen: p, oldSuffixStart: so, newSuffixStart: sn, boundaryMap, regions, changedOld, changedNew },
   };
+}
+
+// Pairs [oldIndex, newIndex] of unchanged blocks in the middle windows, in
+// order: a longest common subsequence of their hashes. A window too large
+// for the table keeps the positional pairing (no anchors).
+const MAX_LCS_CELLS = 4_000_000;
+function middleAnchors(oldBlocks, segs, oStart, oEnd, nStart, nEnd) {
+  const n = oEnd - oStart;
+  const m = nEnd - nStart;
+  if (!n || !m || n * m > MAX_LCS_CELLS) return [];
+  const width = m + 1;
+  const table = new Int32Array((n + 1) * width);
+  for (let i = n - 1; i >= 0; i--) {
+    const h = oldBlocks[oStart + i].hash;
+    for (let j = m - 1; j >= 0; j--) {
+      table[i * width + j] = h === segs[nStart + j].hash
+        ? table[(i + 1) * width + j + 1] + 1
+        : Math.max(table[(i + 1) * width + j], table[i * width + j + 1]);
+    }
+  }
+  const anchors = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (oldBlocks[oStart + i].hash === segs[nStart + j].hash) {
+      anchors.push([oStart + i, nStart + j]);
+      i++;
+      j++;
+    } else if (table[(i + 1) * width + j] >= table[i * width + j + 1]) i++;
+    else j++;
+  }
+  return anchors;
 }
 
 function refresh(block, seg) {
@@ -305,6 +538,7 @@ function refresh(block, seg) {
   block.file = seg.file ?? null;
   block.sourceStart = seg.sourceStart ?? null;
   block.sourceEnd = seg.sourceEnd ?? null;
+  block.sourceParts = seg.sourceParts ?? null;
   block.includeStart = !!seg.includeStart;
   block.includeEnd = !!seg.includeEnd;
   block.externalGraphics = !!seg.externalGraphics;

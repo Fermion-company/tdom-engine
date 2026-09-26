@@ -58,7 +58,7 @@ host.stop();                                     // SIGTERM。常駐 TeX ツリ�
 
 `EngineHost` が spawn 時に固定する環境変数は、いずれも**ホストと同居するために必要**な値である。
 
-- `TDOM_MAX_CHECKPOINTS`（既定 `8`）: checkpoint 1 個が常駐 lualatex 1 個（100–300MB）。エンジン既定の 64 は専有マシン向けで、エディタや LSP と同居するホストでは踏めない。
+- `TDOM_MAX_CHECKPOINTS`（既定は搭載メモリで決める: 12 GB 未満 `8`、12 GB 以上 `12`、24 GB 以上 `24`、48 GB 以上 `48`）: 常駐 checkpoint 数の**上限**。初回は `min(上限, block 数 + 1)`、canonical の実ページ数を得た後は `min(上限, block 数 + 1, page 数 + 1)` になる。小文書は root と1ページあたり最大1本、316ページ（約640 block）は上限まで持つ。休眠 fork の実コストは「fork以降に活動中の process が書き換えたページ」で、boot walk は fork 後にヒープのほぼ全体を書き換えるため316ページでは1個100〜200MBに育つ（macOS実測: 上限32で常駐32〜40個・合計7〜10GB、16GB機がswap 7GB）。以前の固定8は316ページで80 blockおきになり、カーソルを置いてから最初の打鍵が組版できるまで最大30sのwarmを要した。それでも間に合わない打鍵は `TDOM_COLD_PREFIX_MS`（エンジン既定1500）でhot pathから切り離され、残りはchain passが続けて`update`を後からbroadcastする（docs/10 §10.4a）。
 - `TDOM_SAMPLE`: boot 用に `samples/` に実在する小さいファイルを選ぶ（`pickBootSample()`）。既定の stress-test 文書は起動に数分かかる。実文書は起動直後の `POST /open` で入れ替わる。
 - `TDOM_WORKDIR`: 絶対パスの作業ディレクトリ。vendored な（書き込めない）checkout の中にスクラッチを作らせない。
 - `TDOM_SHIP` / `TDOM_SHIP_PRIVATE_PDF` / `TDOM_CANONICAL_ANCHOR`（既定すべて `1`）: いずれも打鍵経路の外で動き、対応できない preamble では通常の canonical コンパイルに fail close する。
@@ -77,6 +77,10 @@ Electron ホストは `execPath: process.execPath` と `extraEnv: { ELECTRON_RUN
 
 - 組版対象は常に **root 文書**である。子ファイルのタブに切り替えただけで root が差し替わることはない。
 - 未保存の子バッファは **overlay** として渡り、変わったものだけが差分として送られる。閉じられた（または保存された）バッファは `removeOverlays` で外れる。
+- `removeOverlays` の時点でディスクが overlay と同じバイト列なら（保存）、エンジンは overlay ファイルを入力として残す（`savedOverlays`）。実効入力は変わらないので srcRev・anchor epoch・canonical の input epoch を進めず、その `/edit` は直前の report を返す。overlay が被さっているファイルへのディスク書込み（自動保存の fs.watch 通知を含む）も入力変化として扱わない。保存済み overlay と異なるバイト列がディスクに書かれたときだけ overlay を外し、通常の除去として refresh する。
+- `\input` / `\include` で読んだファイルの fs.watch 通知は、ディスクのバイト列がエンジンの最後に読んだ内容と同じで、かつその内容を canonical に伝え済みなら捨てる（`include-cache.js`）。touch や、Spotlight・iCloud Drive・Dropbox などによる同じ内容の書き戻しは、srcRev も canonical の input epoch も進めない。捨てた数は `/status` の `unchangedInputEvents`。316ページの文書で `/open` 直後に33章すべてへ通知が届いたとき、以前は空の update が33回続き、最初の canonical が落ち着くまで305 sかかった。「伝え済み」の内容（`announcedText`）は、そのパスで最初に読んだ内容と、外部変更の refresh が canonical を無効化する直前のディスク内容である。cold resume や structured re-probe が新しいバイト列を読み直しても `announcedText` は変わらないので、その通知は捨てずに refresh する。refresh が待ち行列にある間に先行の refresh が同じバイト列を読んで伝え済みにした場合も、server はその refresh を行わない。画像や listing のように include として読んでいないファイルは、従来どおり通知ごとに refresh する。
+- fs.watch はパスではなく inode を追う（macOS は kqueue、Linux は inotify）。vim や同期クライアントのように、一時ファイルを書いて rename で被せる保存をすると、古い watch は消えた inode に残り、以後は通知しない。`watchInclude`（`include-expander.js`）は `rename` 通知か、パスの inode（dev:ino）が変わった通知を受けると、その watch を閉じ、パスが今指すファイルに張り直す。通知そのものは 120 ms のデバウンス後に届ける。保存の途中でパスが一時的に無いときは、届ける直前にもう一度張り直す。それでも無ければ（削除）パスを `watchers` から外し、通知だけを届ける。refresh はその削除を読み、ファイルが戻った後にそれを読んだ最初の展開が watch を作り直す。同じバイト列の保存（上の項目で通知を捨てる場合）でも、張り直しはその判定より前に済んでいる。`watchers` の値はパスごとに一つの handle で、張り直しても変わらない。`close()`（`/open`・`setDocumentContext`・エンジン終了）は今の watch を閉じ、以後の張り直しも止める。server.js が保存済み overlay のディスク側に張る watch も同じ関数を使う。
+- 子ファイル anchor の直前入力の検証は、ディスクが直前に読んだ内容と同じか、この編集の要求内容と同じで mtime が打鍵時刻（`clientEditAtEpochMs`）以降の場合だけ通す（編集がエンジンへ届く前に自動保存が同じ内容を書いた場合）。
 - root が未変更で mtime も同じなら、ディスクを読み直さず保持中のソースを使う。無意味な全文 diff を避ける。
 - `workspaceRoot` の外へ出るパスは拒否される。
 
@@ -109,8 +113,8 @@ IME 変換中は snapshot に `deferred: true` を立てる。ドライバは pu
 
 `createEmbedClient()` はその postMessage 往復を包む。
 
-- ホスト → frame: `{ source: 'tdom-host', activationId, action, ... }` — `zoom-in` / `zoom-out` / `zoom-fit` / `goto-page` / `page-prev` / `page-next` / `goto-sync` / `search` / `reset-ack`
-- frame → ホスト: `{ source: 'tdom-embed', activationId, ... }` — 400ms 間隔のスナップショット（`ready` / `pageCount` / `zoom` / `page` / `status` / `search`）に加え、`reset-pending`（文書リセット開始）・`source`（クリック位置のソース逆引き）・`edit`（プレビュー直接編集）
+- ホスト → frame: `{ source: 'tdom-host', activationId, action, ... }` — `zoom-in` / `zoom-out` / `zoom-fit` / `goto-page` / `page-prev` / `page-next` / `goto-sync`（任意の `viewportToken` を付けると、そのページへスクロールした後のスナップショットが同じ token を返す）/ `search` / `reset-ack`
+- frame → ホスト: `{ source: 'tdom-embed', activationId, ... }` — 400ms 間隔のスナップショット（`ready` / `presentationPending` / `pageCount` / `pageCountAuthoritative`（常駐側のページ数が実出力とまだ違うあいだ false。ホストは確定していない数を出さず「/ —」などにする）/ `zoom` / `page` / `srcRev`（適用済みの source revision）/ `viewportToken`（最後にスクロールした `goto-sync` の token）/ `status` / `search`）に加え、`reset-pending`（文書リセット開始）・`source`（クリック位置のソース逆引き）・`edit`（プレビュー直接編集）
 
 `activationId` は URL でホストが渡す。前の活性化から残った iframe が、すでに別の文書やエンジンへ移ったビューアを操作できないようにするためである。
 

@@ -15,6 +15,16 @@ const PAPER_EPSILON_PT = 0.5;
  * Return explicit reasons so the arrival path can fail closed to the exact
  * opaque renderer even when static source scanning missed an indirect macro,
  * class hook, included file, or package implementation. */
+/** Every canonical page shares the first page's displayed box and has no
+ * /Rotate: one coordinate system covers the whole document. */
+export function uniformCanonicalGeometry(info) {
+  const papers = Array.isArray(info?.papers) ? info.papers : [];
+  const first = papers[0];
+  return papers.every((paper) => !((Math.round(Number(paper?.rotation) || 0) % 360)) &&
+    Math.abs(Number(paper?.w) - Number(first?.w)) <= PAPER_EPSILON_PT &&
+    Math.abs(Number(paper?.h) - Number(first?.h)) <= PAPER_EPSILON_PT);
+}
+
 export function canonicalGeometryMismatchReasons(geometry, info) {
   const count = Math.max(0, Math.floor(Number(info?.pageCount) || 0));
   if (!count) return [];
@@ -50,7 +60,11 @@ export function onCanonicalResult(
   info,
   { verifyAgainstCanonical, cropCanonicalChunks, teardownTree = () => {} }
 ) {
-  if (!info.error && engine.mode === 'structured' && info.rev === engine.srcRev) {
+  // A shipping-exact surface is canonical and ShippingChain pixels, each
+  // page in its own displayed geometry; no resident page shares its
+  // coordinates (tex64-internal #64: pdflscape keeps the document).
+  if (!info.error && engine.mode === 'structured' && engine.previewPolicy !== 'shipping-exact' &&
+      info.rev === engine.srcRev) {
     const reasons = canonicalGeometryMismatchReasons(engine.geometry, info);
     if (reasons.length) {
       const stickyPre = engine.preHash;
@@ -65,7 +79,7 @@ export function onCanonicalResult(
   try {
     engine.onCanonical?.({ ...info, modeReasons: engine.modeReasons });
   } catch { /* observer errors are not ours */ }
-  if (info.error || process.env.TDOM_NO_VERIFY) return;
+  if (info.error || engine.closureDeferred || process.env.TDOM_NO_VERIFY) return;
   // verify only at convergence: the compile must be of the CURRENT source
   if (engine.mode !== 'structured' || info.rev !== engine.srcRev) return;
   // canonical-anchor deliberately does not claim that JS pagination maps
@@ -159,6 +173,7 @@ export async function cropCanonicalChunks(engine, info, { asyncRepaginate }) {
 }
 
 async function canonicalCropCandidates(engine, block, id) {
+  if (block.sourceParts) return null;
   const source = block.file ? block.sourceStart : engine.store.position(engine.file, block.start);
   const end = block.file ? block.sourceEnd : engine.store.position(engine.file, block.end);
   const first = Number(source?.line), last = Number(end?.line);
@@ -166,11 +181,15 @@ async function canonicalCropCandidates(engine, block, id) {
   const file = block.file
     ? engine.includes.get(block.file)?.readPath ?? block.file
     : path.join(engine.canonical.workDir, 'canon.tex');
-  const groups = [];
-  for (let line = first; line <= last; line++) {
-    if (engine.canonical.generationCertificate(id)?.rev !== engine.srcRev) return null;
-    groups.push(await engine.canonical.forwardSyncAll({ file, line, column: line === first ? source.column : 1, id }));
-  }
+  if (engine.canonical.generationCertificate(id)?.rev !== engine.srcRev) return null;
+  const groups = await engine.canonical.forwardSyncRange({
+    file,
+    firstLine: first,
+    lastLine: last,
+    firstColumn: Number.isInteger(source.column) && source.column > 0 ? source.column : 1,
+    id,
+  });
+  if (!groups || engine.canonical.generationCertificate(id)?.rev !== engine.srcRev) return null;
   return groups.flat();
 }
 

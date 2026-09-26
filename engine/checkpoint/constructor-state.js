@@ -64,6 +64,7 @@ export function initializeEngineState(
   engine.pages = [];
   engine.chunks = makeChunkMap(); // chunkKey -> {svg, wBp, hBp, v} exact renders
   engine.isoCache = new Map(); // rescue key -> isolated compile result
+  engine.isoDiskCache = null; // IsoDiskCache under workDir, created lazily (docs/08 §8.5)
   engine.isoFailCache = new Map(); // rescue key -> error message (doomed compiles: same inputs fail the same way — don't pay the preamble again on every chain pass over a frozen block)
   engine.isoForkBroken = new Set(); // block ids whose iso fork children die (tcolorbox-class fork/dormant incompatibility) — go straight to cold
   engine.dyingPids = new Set(); // DIE'd checkpoint pids not yet exited — #reapDying backpressure
@@ -80,11 +81,13 @@ export function initializeEngineState(
   engine.bgTask = Promise.resolve();
   engine.onAsyncPatches = null; // callback(report-ish) for gfx swaps
   engine.onExternalChange = null; // callback when an \input file changes
+  engine.unchangedInputEvents = 0; // watcher events dropped: the bytes were already read
   engine.backendName = 'checkpoint';
   engine.diagnostics = [];
   engine.tocHash = null;
-  engine.includes = new Map(); // path -> {mtime, text}
-  engine.watchers = new Map(); // path -> FSWatcher
+  engine.includes = new Map(); // path -> {mtime, readPath, text, announcedText} (include-cache.js)
+  engine.resourceReads = new Map(); // read path -> {mtime, size, hash, announcedHash} (include-cache.js)
+  engine.watchers = new Map(); // path -> {close()} re-arming watch handle (include-expander.js)
   // Resident-fork budget. Every checkpoint is a live lualatex process
   // (~100-300MB unique RSS on package-heavy preambles), so N engines on a
   // big document multiply into real RAM: 64 forks × 2 audit engines ×
@@ -92,9 +95,15 @@ export function initializeEngineState(
   // took down the server AND the editor session). Audit tools run with a
   // reduced budget via this env; the measured-cost skeleton avoids
   // replaying the most expensive skipped blocks.
-  engine.maxCheckpoints = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
+  // TDOM_MAX_CHECKPOINTS is the ceiling. The first source generation uses
+  // the block count; canonical then supplies an exact page-count bound.
+  engine.checkpointCeiling = Math.max(4, Number(process.env.TDOM_MAX_CHECKPOINTS || 64));
+  engine.maxCheckpoints = engine.checkpointCeiling;
+  engine.canonicalPageCount = null;
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
+  engine.confirmedLiveHeapKb = 0;
+  engine.calibrateInitialHeap = false;
 
   // canonical layer: the exact-output authority (see file header)
   engine.canonical = new CanonicalRenderer({
@@ -117,6 +126,10 @@ export function initializeEngineState(
   engine.onShipPage = null; // legacy callback retained for embedders
   engine.onShipWave = null; // callback({pages, gen, srcRev}) after end/closure
   engine.shipGenRev = new Map(); // wave generation -> srcRev it converges to
+  engine.shipGenSnapshot = new Map(); // wave generation -> immutable input snapshot
+  engine.shipDesiredInputSnapshot = null;
+  engine.shippingIncludeTrace = []; // static read order for certified literal child replay
+  engine.shipPendingInputChanges = null;
   engine.shipBootedFor = null; // preamble hash the chain booted with
   // A replay lineage is authoritative only when it starts from the aux
   // family of a converged production compile.  Provisional TOC/label seeds
@@ -168,6 +181,27 @@ export function initializeEngineState(
   // rebuild, async rescue adoption)
   engine.chainLock = Promise.resolve();
   engine.rescueQueue = new Map(); // block.id -> cacheKey at queue time
+  engine.rescueFocus = new Set(); // queued rescues on the edited / caret page, served first
+  // compile time a boot walk may spend on first-ever rescues inline (#bootIsoCompile), and what is left of it
+  engine.bootRescueMs = Math.max(0, Number(process.env.TDOM_BOOT_RESCUE_MS ?? 45_000) || 0);
+  engine.bootRescueBudgetMs = 0;
+  engine.rescueAdoptWaiting = 0; // rescue adoptions queued on the chain lock (a grid pass yields to them)
+  engine.coldPreviewEnabled = process.env.TDOM_COLD_PREVIEW !== '0'; // docs/10 §10.4b
+  // start a preview when the replay estimate (sum of intrinsic block costs,
+  // about half the measured replay) exceeds this
+  engine.coldPreviewFromMs = Math.max(0, Number(process.env.TDOM_COLD_PREVIEW_FROM_MS ?? 500) || 0);
+  // a budget stop waits this long for a preview still typesetting
+  engine.coldPreviewWaitMs = Math.max(0, Number(process.env.TDOM_COLD_PREVIEW_WAIT_MS ?? 1000) || 0);
+  engine.coldPreviewTimeoutMs = 15_000;
+  // the first keystroke after a pause sends its preview's RENDER beside the JOB
+  engine.coldPreviewEarlyRender = process.env.TDOM_COLD_PREVIEW_EARLY_RENDER !== '0';
+  engine.updateSeq = 0; // one per #update that took the lock
+  engine.earlyRenderUpdate = null; // the update whose edited block sent its early RENDER (docs/10 §10.4c)
+  engine.editGapMs = null; // time since the edit before the current one
+  engine.coldPreviewSeq = 0;
+  engine.coldPreviewHolds = new Map(); // peer a preview forked -> Set of block ids, kept for their RENDER
+  engine.coldPreviewActive = null; // the current foreground walk's preview (cancelled if the walk throws)
+  engine.coldPreviews = 0; // cold keystrokes shown through a preview (/status)
   engine.rescuePumping = false;
   engine.isoChildren = new Set(); // in-flight isolated lualatex processes
 
@@ -184,11 +218,27 @@ export function initializeEngineState(
   engine.interactiveRenderCohort = null; // only the current edit's resident-capable exact work
   engine.renderPumping = 0;
   engine.renderTask = Promise.resolve();
+  // Aggregate pump promises may themselves wait for a Build lease. Track
+  // only jobs that already passed the gate when deciding whether acquire is
+  // still settling finite work.
+  engine.buildLeasePreviewJobs = new Set();
   engine.renderSeq = 0; // unique protocol ids keep render forks distinct from foreground JOBs
+  engine.activeResidentRenderCheckpoints = new Map(); // request id -> {peer, index} RENDER/CAPTURE owner
   engine.cancelledRenderIds = new Set(); // late FORKED replies are killed after edit preemption
   engine.captureSeq = 0; // monotonic generation token for retained JOB node lists
   engine.renderStats = { captureHits: 0, captureMisses: 0, retypesets: 0 };
+  // Per-rescue timeline for /status (block, fork/cold, compile and adopt
+  // time): the boot drain of a long document is invisible otherwise.
+  engine.rescueLog = [];
+  engine.isoModeOf = new Map(); // block.id -> 'fork-absorb' | 'fork-real' | 'cold' of the last isolated compile
+  // real-output rescue root (daemon.lua tdom_real_root): a pre-dormant
+  // sibling of checkpoint 0 that forks splitting/page-emitting rescues
+  // under LaTeX's real \output. Opt-in until the cold-vs-fork-real
+  // differential suite and the RSS measurement make it the default.
+  engine.isoRealFork = !!process.env.TDOM_ISO_REAL_FORK && process.env.TDOM_ISO_REAL_FORK !== '0';
+  engine.realRoot = null; // its Peer once it says HELLO realroot
   engine.renderHold = new Map(); // ckpt idx kept alive for a pending render -> block.id
+  engine.foregroundRenderIds = null;
   // Edit-locus pinning: the checkpoints at (and right after) the block the
   // user is typing in are exempt from grid retirement, so a keystroke burst
   // is always "fork once + typeset one block", never a grid replay.
@@ -203,4 +253,32 @@ export function initializeEngineState(
   // re-typesets the suffix serially (definition edits, untracked-state
   // leaks). Idle-gated, preemptible, resumable — see #runChainPass.
   engine.pendingChain = null; // {kind:'rebuild', from, phase:'blocks'|'after', labels:Set}
+  // Cold-prefix budget (docs/10 §10.4a): a keystroke whose nearest resident
+  // checkpoint is far away replays clean blocks for at most this long on the
+  // hot path. Past it the walk stops at a completed block boundary, the
+  // un-typeset edited blocks are remembered here, and the idle-gated chain
+  // pass finishes the replay and re-runs the update off the hot path.
+  engine.coldPrefixBudgetMs = Math.max(0, Number(process.env.TDOM_COLD_PREFIX_MS ?? 1500) || 0);
+  engine.coldDirty = new Set(); // block ids whose galley predates their source text
+  engine.coldWalking = false; // a cold chain pass is replaying with STEP right now
+  engine.bgWalkTarget = null; // block a caret warm, cold walk or grid walk is heading for
+  engine.keystrokePending = 0; // edits (not cold resumes) waiting for the chain lock
+  // a background walk retains (editHold) one boundary per this much replay
+  engine.walkRetainMs = Math.max(0, Number(process.env.TDOM_WALK_RETAIN_MS ?? 400) || 0);
+  engine.walkRetains = false; // the running caret warm or cold walk keeps boundaries
+  engine.walkRetainedAt = 0;
+  engine.walkRetainedIdx = null;
+  engine.coldWalk = null; // telemetry of the last cold replay (from/target/walked/ms/perBlockMs)
+  engine.coldTrace = null; // timestamps of the current cold keystroke's deferred path
+  // Grid materialization (docs/03): the keep set is computed from measured
+  // block costs, but a boot walk only retains the boundaries the partial
+  // costs asked for at the time. The lowest-priority chain pass replays
+  // from the nearest resident boundary to each keep boundary that has no
+  // continuation, so caret warms and cold keystrokes pay one segment at most.
+  engine.gridFill = { materialized: 0, ms: 0, passes: 0, last: null, given: new Set(), stalled: false };
+  // Edits waiting for the chain lock. A caret warm or a deferred chain pass
+  // must not start (or clear the abort flag) while one is pending: the
+  // walk would take the lock first and the keystroke would wait it out.
+  engine.editPending = 0;
+  engine.onDeferredUpdate = null; // callback(report) when a cold resume publishes
 }

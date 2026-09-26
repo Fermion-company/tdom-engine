@@ -16,7 +16,7 @@
 
 import http from 'node:http';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, watch, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -25,10 +25,26 @@ import { CheckpointEngine } from './engine/checkpoint/engine-v3.js';
 import {
   buildTerminalCanonicalPatch,
   captureCanonicalAnchorBase,
+  captureCanonicalAnchorLedger,
+  ledgerAdmitsBlock,
+  mergeCumulativeAnchorPatch,
   dirtyWithoutPatchFallback,
+  flattenCompleteAnchorCandidateGroups,
   planTerminalCanonicalAnchor,
+  canonicalAnchorClientEditTimestamp,
+  classifyChildInputMutation,
+  isOwnAutosavePlainInput,
+  removedOverlayPlainTextDelta,
+  singlePlainTextDelta,
+  warmCanonicalProofOutcome,
 } from './engine/checkpoint/canonical-anchor.js';
 import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
+import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read-proof.js';
+import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
+import { buildLeasePreviewSettlement } from './engine/checkpoint/build-lease-preview.js';
+import { watchInclude } from './engine/checkpoint/include-expander.js';
+import { includeHoldsText, inputReadCurrent, rebindIncludeRead } from './engine/checkpoint/include-cache.js';
+import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
 
 // Certified canonical anchoring is deliberately narrow: only plain-text
 // edits whose unchanged line structure, backend run semantics, SyncTeX
@@ -451,6 +467,8 @@ let lastAnchorPresentation = null;
 // reboot advances it before any client is allowed to discard old pixels.
 let documentEpoch = 1;
 let terminalAnchorLineage = null;
+let terminalAnchorEpoch = 0;
+let warmProofRequestSeq = 0;
 let activeProject = {
   docDir: path.join(ROOT, 'samples'),
   file: sampleFile,
@@ -472,6 +490,7 @@ let queue = Promise.resolve();
 // from a dead server while the queue is occupied.
 let engineBusy = 0;
 let engineBusySince = 0;
+const openRequests = new OpenRequestCache(8);
 function withEngine(fn) {
   engineBusy++;
   if (engineBusy === 1) engineBusySince = Date.now();
@@ -542,15 +561,44 @@ async function materializeProjectBibliography(source, context) {
   return descriptor;
 }
 
+function buildLeaseBinding(projectRoot, mainFile) {
+  if (typeof projectRoot !== 'string' || !path.isAbsolute(projectRoot) ||
+      typeof mainFile !== 'string' || !mainFile) return null;
+  const root = path.resolve(projectRoot);
+  const file = path.isAbsolute(mainFile) ? path.resolve(mainFile) : path.resolve(root, mainFile);
+  if (!isPathInside(root, file)) return null;
+  const bound = root === path.resolve(activeProject.docDir) && file === path.resolve(activeProject.filePath);
+  return { root, file, bound };
+}
+
+// An overlay is rewritten on every keystroke while a canonical compile, the
+// ShippingChain or an isolated rescue may be reading it. An in-place write
+// lets such a reader splice the old head onto the new tail ("String contains
+// an invalid utf-8 sequence" in the middle of an unedited line). A rename
+// swaps the whole file: an open reader keeps the bytes it started with.
+function writeOverlayFile(target, text) {
+  const tmp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.tmp`);
+  try {
+    writeFileSync(tmp, text, 'utf8');
+    renameSync(tmp, target);
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
+}
+
 function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = {}, replace = false) {
-  if (!context.overlayDir) return { changed: [], removed: [] };
+  if (!context.overlayDir) return { changed: [], removed: [], saved: [] };
+  context.savedOverlays ??= new Map();
   if (replace) {
     rmSync(context.overlayDir, { recursive: true, force: true });
     context.overlays.clear();
+    context.savedOverlays.clear();
   }
   mkdirSync(context.overlayDir, { recursive: true });
   const changed = [];
   const removed = [];
+  const saved = [];
   let totalBytes = 0;
   for (const item of Array.isArray(overlays) ? overlays : []) {
     const filePath = typeof item?.filePath === 'string' ? path.resolve(item.filePath) : null;
@@ -562,22 +610,187 @@ function applyProjectOverlays(context, { overlays = [], removeOverlays = [] } = 
       throw new Error('project overlay exceeds the live-preview text limit');
     }
     if (context.overlays.get(filePath) === text) continue;
+    const savedText = context.savedOverlays.get(filePath);
+    context.savedOverlays.delete(filePath);
+    if (savedText === text) {
+      // The file is dirty again with the bytes its saved overlay already
+      // holds; the effective input has not changed.
+      context.overlays.set(filePath, text);
+      continue;
+    }
     const rel = path.relative(context.docDir, filePath);
     const target = path.join(context.overlayDir, rel);
     mkdirSync(path.dirname(target), { recursive: true });
-    writeFileSync(target, text, 'utf8');
+    writeOverlayFile(target, text);
     context.overlays.set(filePath, text);
     changed.push(filePath);
   }
   for (const raw of Array.isArray(removeOverlays) ? removeOverlays : []) {
     const filePath = typeof raw === 'string' ? path.resolve(raw) : null;
     if (!filePath || !isPathInside(context.docDir, filePath) || !context.overlays.has(filePath)) continue;
+    const text = context.overlays.get(filePath);
     context.overlays.delete(filePath);
+    let diskText = null;
+    try { diskText = readFileSync(filePath, 'utf8'); } catch { /* deleted on disk */ }
+    if (diskText === text) {
+      // The host saved exactly the overlay bytes. Keep the overlay file as the
+      // physical input so resident reads, canonical SyncTeX paths and content
+      // signatures stay on one path; the effective input is unchanged. A later
+      // disk change with other bytes retires it (onExternalChange).
+      context.savedOverlays.set(filePath, text);
+      watchInclude(filePath, engine.watchers, (changedInput) => engine.onExternalChange?.(changedInput));
+      saved.push(filePath);
+      continue;
+    }
     const target = path.join(context.overlayDir, path.relative(context.docDir, filePath));
     rmSync(target, { force: true });
     removed.push(filePath);
   }
-  return { changed, removed };
+  return { changed, removed, saved };
+}
+
+// A disk write is a TeX input change only when no overlay shadows that file.
+// A saved overlay stays the input while the disk holds its bytes.
+function diskChangeShadowedByOverlay(context, file) {
+  if (!file || !context?.overlayDir) return false;
+  if (context.overlays.has(file)) return true;
+  const saved = context.savedOverlays?.get(file);
+  if (saved === undefined) return false;
+  try { return readFileSync(file, 'utf8') === saved; } catch { return false; }
+}
+
+// Make the disk file the input again after it diverged from its saved overlay.
+function retireSavedOverlay(context, file) {
+  if (!file || !context?.savedOverlays?.has(file)) return false;
+  context.savedOverlays.delete(file);
+  rmSync(path.join(context.overlayDir, path.relative(context.docDir, file)), { force: true });
+  return true;
+}
+
+function isRealPathInside(root, candidate) {
+  try { return isPathInside(realpathSync(root), realpathSync(candidate)); } catch { return false; }
+}
+
+function ownAutosaveOfEdit(readPath, file, diskBytes, requestedText, clientEditAtEpochMs) {
+  let diskMtimeMs;
+  try { diskMtimeMs = statSync(file).mtimeMs; } catch { return false; }
+  return isOwnAutosavePlainInput({
+    readPathIsLogical: readPath === file,
+    diskText: diskBytes,
+    requestedText,
+    diskMtimeMs,
+    clientEditAtEpochMs,
+  });
+}
+
+function childAnchorEditBeforeOverlay(
+  context,
+  body,
+  source,
+  rootChanged,
+  clientEditAtEpochMs,
+  diagnostics = null
+) {
+  const reject = (reason) => {
+    if (diagnostics) diagnostics.reason = reason;
+    return null;
+  };
+  const classified = classifyChildInputMutation({
+    rootChanged,
+    overlays: body?.overlays,
+    removeOverlays: body?.removeOverlays,
+  });
+  if (!classified.mutation) return reject(classified.reason);
+  const mutation = classified.mutation;
+  if (diagnostics) diagnostics.inputTransition = mutation.kind;
+  const file = path.resolve(mutation.filePath);
+  if (!isPathInside(context.docDir, file) || file === path.resolve(context.filePath) ||
+      path.extname(file).toLowerCase() !== '.tex') return reject('child-input-path');
+  const readProof = singleLiteralChildReadProof({
+    source,
+    sourceFile: context.filePath,
+    targetFile: file,
+    trace: engine.shippingIncludeTrace,
+    includes: engine.includes,
+    inputEpoch: engine.canonical.inputEpoch,
+  });
+  if (!readProof || readProof.source !== source ||
+      readProof.inputEpoch !== engine.canonical.inputEpoch) return reject('child-read-proof');
+  const prior = engine.includes.get(file);
+  const readPath = typeof prior?.readPath === 'string' ? path.resolve(prior.readPath) : null;
+  if (!readPath || typeof prior?.text !== 'string') return reject('child-prior-input');
+  const logicalRelative = path.relative(context.docDir, file);
+  const expectedOverlay = context.overlayDir
+    ? path.resolve(context.overlayDir, logicalRelative)
+    : null;
+  if (diagnostics) {
+    diagnostics.readPathRole = readPath === file
+      ? 'logical'
+      : readPath === expectedOverlay ? 'overlay' : 'other';
+  }
+  if (!isRealPathInside(context.docDir, file)) return reject('child-input-realpath');
+  const safeReadPath = readPath === file
+    ? true
+    : Boolean(expectedOverlay && readPath === expectedOverlay &&
+      isRealPathInside(context.overlayDir, readPath));
+  if (!safeReadPath || !existsSync(readPath)) return reject('child-read-path');
+  let diskBytes;
+  try { diskBytes = readFileSync(readPath, 'utf8'); } catch { return reject('child-prior-unreadable'); }
+  if (mutation.kind === 'remove-overlay') {
+    // The app serializes only dirty buffers. If autosave wins the 80ms push
+    // race, the new child bytes are on disk and the request removes the old
+    // overlay instead of carrying a replacement overlay. Freeze the exact
+    // previous overlay/read witness before applyProjectOverlays removes it.
+    if (!expectedOverlay || readPath !== expectedOverlay) {
+      return reject('child-removal-read-path');
+    }
+    let nextDiskText;
+    let beforeStat;
+    let afterStat;
+    try {
+      beforeStat = statSync(file);
+      nextDiskText = readFileSync(file, 'utf8');
+      afterStat = statSync(file);
+    } catch {
+      return reject('child-removal-disk-unreadable');
+    }
+    if (beforeStat.dev !== afterStat.dev || beforeStat.ino !== afterStat.ino ||
+        beforeStat.size !== afterStat.size || beforeStat.mtimeMs !== afterStat.mtimeMs) {
+      return reject('child-removal-disk-raced');
+    }
+    const checked = removedOverlayPlainTextDelta({
+      priorText: prior.text,
+      activeOverlayText: context.overlays.get(file),
+      priorReadText: diskBytes,
+      diskText: nextDiskText,
+      diskMtimeMs: afterStat.mtimeMs,
+      clientEditAtEpochMs,
+    });
+    if (!checked.delta) return reject(checked.reason);
+    return {
+      ...checked.delta,
+      file,
+      canonicalInputPath: readPath,
+      inputTransition: 'remove-overlay',
+      inputText: nextDiskText,
+    };
+  }
+  // Autosave may write this edit's own bytes before the edit reaches the
+  // engine; the write must postdate the keystroke. Any other bytes are an
+  // unobserved change to the witnessed input.
+  if (diskBytes !== prior.text && !ownAutosaveOfEdit(
+    readPath,
+    file,
+    diskBytes,
+    mutation.text,
+    clientEditAtEpochMs
+  )) {
+    return reject('child-unobserved-input');
+  }
+  const delta = singlePlainTextDelta(prior.text, mutation.text);
+  return delta
+    ? { ...delta, file, canonicalInputPath: readPath, inputTransition: 'overlay' }
+    : reject('child-not-plain-text');
 }
 
 function ensureProjectOutputDirectories(source) {
@@ -615,12 +828,13 @@ function refreshProjectBibliography(changedFile) {
       });
       ensureProjectOutputDirectories(source);
       await materializeProjectBibliography(source, activeProject);
-      lastReport = await engine.open(source, activeProject.file);
+      await engine.canonical.waitForBuildLease();
+      lastReport = await engine.open(source, activeProject.file, { projectSeeds: false });
       completeDocumentReset(resetEpoch);
     } else {
       await materializeProjectBibliography(source, activeProject);
       engine.invalidateProjectInputs?.([path.join(engine.workDir, 'driver.bbl')]);
-      lastReport = await engine.refresh();
+      lastReport = await engine.refresh({ changed: [path.join(engine.workDir, 'driver.bbl')] });
     }
     completeDocumentReset();
     broadcast({ kind: 'update', report: lastReport });
@@ -695,8 +909,19 @@ engine.onDocumentResetComplete = ({ report } = {}) => {
 engine.onAsyncPatches = (partial) => {
   broadcast({ kind: 'patches', rev: partial.rev, fonts: partial.fonts, patches: partial.patches });
 };
-engine.onExternalChange = () => {
+engine.onExternalChange = (changedInput) => {
+  const changedFile = typeof changedInput === 'string' ? path.resolve(changedInput) : null;
+  if (diskChangeShadowedByOverlay(activeProject, changedFile)) return;
+  terminalAnchorLineage = null;
+  terminalAnchorEpoch++;
   withEngine(async () => {
+    // An overlay can land while this refresh waits behind the edit that
+    // carries it; the write then no longer changes any TeX input.
+    if (diskChangeShadowedByOverlay(activeProject, changedFile)) return lastReport;
+    // A refresh queued ahead of this one may already have read these bytes
+    // and invalidated them on canonical.
+    if (changedFile && inputReadCurrent(engine.includes, engine.resourceReads, changedFile)) return lastReport;
+    const retired = retireSavedOverlay(activeProject, changedFile);
     const source = engine.getSource();
     const nextBibliography = describeExternalBibliography(source, activeProject.docDir, activeProject.overlayDir);
     const previousBibliography = activeProject.bibliography;
@@ -712,17 +937,20 @@ engine.onExternalChange = () => {
       });
       ensureProjectOutputDirectories(source);
       await materializeProjectBibliography(source, activeProject);
-      lastReport = await engine.open(source, activeProject.file);
+      await engine.canonical.waitForBuildLease();
+      lastReport = await engine.open(source, activeProject.file, { projectSeeds: false });
       completeDocumentReset(resetEpoch);
       broadcast({ kind: 'update', report: lastReport });
       return lastReport;
     }
-    lastReport = await engine.refresh();
+    lastReport = retired
+      ? await engine.refresh({ removed: [changedFile] })
+      : await engine.refresh({ changed: changedInput ? [changedInput] : [], unknown: !changedInput });
     if (bibliographyChanged) {
       broadcast({ kind: 'update', report: lastReport });
       await materializeProjectBibliography(source, activeProject);
       engine.invalidateProjectInputs?.([path.join(engine.workDir, 'driver.bbl')]);
-      lastReport = await engine.refresh();
+      lastReport = await engine.refresh({ changed: [path.join(engine.workDir, 'driver.bbl')] });
     }
     completeDocumentReset();
     broadcast({ kind: 'update', report: lastReport });
@@ -731,13 +959,77 @@ engine.onExternalChange = () => {
     console.warn('[tdom] project input refresh failed:', error?.message || error);
   });
 };
+// The engine finished the replay a budgeted keystroke deferred and typeset
+// its block: a new display revision of the same source revision. Publish it
+// like the edit response would have, including the anchor the keystroke
+// could not plan at the time (its context waited in pendingColdAnchor).
+engine.onDeferredUpdate = (report) => {
+  const stash = pendingColdAnchor;
+  pendingColdAnchor = null;
+  if (pendingDocumentReset || !report) return;
+  // A keystroke that entered the chain lock right after the resume already
+  // published a newer display revision: this one is stale for every client.
+  if (Number(report.rev) <= Number(lastReport?.rev ?? -1)) return;
+  lastReport = report;
+  if (Number(lastAnchorPresentation?.srcRev) !== Number(report.srcRev)) lastAnchorPresentation = null;
+  report.previewFallback = dirtyWithoutPatchFallback(report);
+  const usable = ENABLE_CANONICAL_ANCHOR && !!stash && stash.srcRev === report.srcRev &&
+    stash.documentEpoch === documentEpoch && stash.anchorEpoch === terminalAnchorEpoch &&
+    report.rebooted !== true && !(report.stats?.coldPending?.length);
+  // The publication promise to the client starts now, not at the keystroke:
+  // proof budgets and the client's publish deadline count from this report.
+  const resumeAcceptedAt = performance.now();
+  const anchorPlan = usable
+    ? planTerminalCanonicalAnchor({
+        blocks: engine.blocks,
+        domBlocks: engine.getDOM().blocks,
+        report,
+        geometry: engine.getGeometry(),
+        lineage: stash.anchorPriorLineage,
+        edit: stash.anchorEdit,
+        baseSnapshot: stash.anchorBaseSnapshot,
+        inputEpoch: engine.canonical.inputEpoch,
+        acceptedAt: resumeAcceptedAt,
+        proofStartedAt: resumeAcceptedAt,
+        clientEditAtEpochMs: stash.anchorClientEditAt,
+        paintContext: { fonts: engine.fonts, twinMetrics: engine.twinMetrics },
+        diagnostics: stash.anchorDiagnostics,
+      })
+    : null;
+  if (anchorPlan) {
+    anchorPlan.public.acceptedElapsedMs = performance.now() - resumeAcceptedAt;
+    anchorPlan.public.coldResumeMs = performance.now() - stash.anchorAcceptedAt;
+    adoptAnchorPlanLineage(anchorPlan, stash.anchorPriorLineage, stash.anchorLedger);
+    report.canonicalAnchor = anchorPlan.public;
+  } else if (ENABLE_CANONICAL_ANCHOR) {
+    report.canonicalAnchorRefused = !stash ? 'cold-resume-unanchored'
+      : !usable ? 'cold-resume-superseded'
+      : stash.anchorDiagnostics?.reason ?? 'unknown';
+    // The unproved lineage kept for this revision has no proof to wait for.
+    if (usable && terminalAnchorLineage?.coldPending && terminalAnchorLineage.lastSrcRev === report.srcRev) {
+      terminalAnchorLineage = null;
+    }
+  }
+  broadcast({ kind: 'update', report });
+  if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, stash.anchorEpoch, stash.anchorProofPrefetch);
+};
 // canonical compiles land asynchronously: tell every client so it can
 // converge its pages to the exact LuaLaTeX render
+// Where the user is editing (last keystroke or caret warm). The proof
+// inputs of the NEXT keystroke there depend on the canonical generation
+// that lands meanwhile: without a refetch, every keystroke after the first
+// spent its proof budget extracting a fresh generation's paint index and
+// fell back (tex64-internal #66: PDF_PAINT_INDEX_UNAVAILABLE).
+let anchorFocus = null;
+
 engine.onCanonical = (info) => {
   if (terminalAnchorLineage && info.id !== terminalAnchorLineage.baseGeneration) {
     terminalAnchorLineage = null;
   }
   broadcast({ kind: 'canonical', canonical: info, mode: engine.mode });
+  if (anchorFocus && !info.error && info.rev === engine.srcRev) {
+    try { prefetchWarmAnchorProof(anchorFocus.offset, anchorFocus.filePath); } catch { /* best effort */ }
+  }
 };
 // Incremental authority (TDOM_SHIP=1): one complete replay PDF reached
 // normal document end. The client atomically swaps its visible pages and
@@ -896,6 +1188,42 @@ function docPayload() {
   };
 }
 
+// The bytes TeX currently reads for a project file when they are not the
+// disk file's: a live overlay, then a saved one. Callers read the disk
+// otherwise.
+function projectInputOverride(file) {
+  const resolved = path.resolve(file);
+  return activeProject.overlays.get(resolved) ?? activeProject.savedOverlays?.get(resolved) ?? null;
+}
+
+function contextProjectPath(context, file) {
+  const resolved = path.resolve(file);
+  try {
+    const realRoot = realpathSync(context.docDir);
+    const realFile = realpathSync(resolved);
+    if (isPathInside(realRoot, realFile)) return path.join(context.docDir, path.relative(realRoot, realFile));
+  } catch { /* fall back to the path recorded by Build */ }
+  return resolved;
+}
+
+function contextInputOverride(context, file) {
+  const resolved = contextProjectPath(context, file);
+  return context.overlays.get(resolved) ?? context.savedOverlays?.get(resolved) ?? null;
+}
+
+function canonicalImportLogicalPath(context, file) {
+  const resolved = contextProjectPath(context, file);
+  if (resolved === path.resolve(context.filePath)) return path.join(engine.canonical.workDir, 'canon.tex');
+  const overlay = context.overlayDir && path.join(context.overlayDir, path.relative(context.docDir, resolved));
+  return overlay && existsSync(overlay) ? overlay : resolved;
+}
+
+function currentCanonicalIdentityMatches(identity) {
+  if (!identity || identity.documentEpoch !== documentEpoch || identity.srcRev !== engine.srcRev) return false;
+  const current = engine.canonical.compilationIdentity(engine.getSource());
+  return identity.inputEpoch === current.inputEpoch && identity.srcHash === current.srcHash;
+}
+
 function bibliographySourceLocation(generatedText, generatedLine = null) {
   const lines = String(generatedText || '').split(/\r?\n/);
   const limit = Number.isFinite(generatedLine)
@@ -911,7 +1239,7 @@ function bibliographySourceLocation(generatedText, generatedLine = null) {
   for (const file of files) {
     let text;
     try {
-      text = activeProject.overlays.get(path.resolve(file)) ?? readFileSync(file, 'utf8');
+      text = projectInputOverride(file) ?? readFileSync(file, 'utf8');
     } catch {
       continue;
     }
@@ -981,7 +1309,7 @@ function activeSourceLine(file, line) {
   const projectFile = path.resolve(file);
   let text = null;
   if (projectFile === path.resolve(activeProject.filePath)) text = engine.getSource();
-  else text = activeProject.overlays.get(projectFile) ?? null;
+  else text = projectInputOverride(projectFile);
   if (text == null) {
     try { text = readFileSync(projectFile, 'utf8'); } catch { return ''; }
   }
@@ -1020,23 +1348,22 @@ async function validatedForwardSyncAll(location, id) {
   return validated.length ? validated : plausible.length ? plausible : candidates;
 }
 
-async function rawForwardCandidatesForRange(source, id, deadline) {
-  const file = canonicalInputForProjectFile(source?.file);
+async function rawForwardCandidatesForRange(source, id, deadline, canonicalInputPath = null) {
+  const file = typeof canonicalInputPath === 'string'
+    ? path.resolve(canonicalInputPath)
+    : canonicalInputForProjectFile(source?.file);
   const first = Math.floor(Number(source?.start?.line));
   const last = Math.floor(Number(source?.end?.line));
   if (!file || !Number.isInteger(first) || !Number.isInteger(last) || first < 1 || last < first) return null;
-  const lines = Array.from({ length: last - first + 1 }, (_, index) => first + index);
-  const groups = Array(lines.length);
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(8, lines.length) }, async () => {
-    while (cursor < lines.length) {
-      if (performance.now() >= deadline) return;
-      const index = cursor++;
-      groups[index] = await engine.canonical.forwardSyncAll({ file, line: lines[index], column: 1, id });
-    }
+  const groups = await engine.canonical.forwardSyncRange({
+    file,
+    firstLine: first,
+    lastLine: last,
+    firstColumn: 1,
+    id,
+    deadline,
   });
-  await Promise.all(workers);
-  return groups.every(Array.isArray) ? groups.flat() : null;
+  return flattenCompleteAnchorCandidateGroups(groups, last - first + 1);
 }
 
 async function beforeDeadline(promise, deadline) {
@@ -1049,22 +1376,210 @@ async function beforeDeadline(promise, deadline) {
   ]).finally(() => clearTimeout(timer));
 }
 
-async function resolveTerminalCanonicalAnchor(plan, epoch) {
-  const candidates = await beforeDeadline(
-    rawForwardCandidatesForRange(plan.source, plan.baseGeneration, plan.proofDeadline),
+// The base generation's SyncTeX records and paint index depend only on the
+// pre-edit witness. Start them alongside the resident edit so its typeset
+// time does not consume the fixed proof budget; the proof itself is unchanged.
+// One ledger per (generation, source revision) at which that generation was
+// the exact compile of the resident: every keystroke at canonical-current
+// state would otherwise rebuild it over all blocks.
+let anchorLedgerCache = null;
+function anchorLedgerFor(certificate) {
+  const cached = anchorLedgerCache;
+  if (cached && cached.id === certificate.id && cached.rev === certificate.rev &&
+      cached.srcRev === engine.srcRev && cached.documentEpoch === documentEpoch) return cached.ledger;
+  const ledger = captureCanonicalAnchorLedger(engine.blocks);
+  anchorLedgerCache = { id: certificate.id, rev: certificate.rev, srcRev: engine.srcRev, documentEpoch, ledger };
+  return ledger;
+}
+
+function prefetchCanonicalAnchorProof(base, completionDeadline) {
+  const rawCandidates = rawForwardCandidatesForRange(
+    base.source,
+    base.certificate.id,
+    completionDeadline,
+    base.canonicalInputPath
+  ).catch(() => null);
+  // Cache filling runs beside resident typesetting. It never publishes by
+  // itself; the resolver still applies its own proof deadline and exact
+  // request identity checks.
+  const paintPages = rawCandidates.then((list) => list?.length
+    ? beforeDeadline(
+        engine.canonical.pdfPaintPages(base.certificate.id, [...new Set(list.map((item) => Number(item.page)))]),
+        completionDeadline
+      ).catch(() => null)
+    : null);
+  return { base, completionDeadline, rawCandidates, paintPages };
+}
+
+// A block's proof inputs (one SyncTeX query per source line, the pages'
+// paint indexes) depend only on the canonical generation. Fetch them for the
+// block under a warmed caret so the first keystroke's proof reads the
+// generation caches instead of spending its budget on CLI calls.
+const WARM_PROOF_PREFETCH_MS = 10_000;
+
+function prefetchWarmAnchorProof(offset, filePath, diagnostics = null) {
+  const reject = (reason) => {
+    if (diagnostics) diagnostics.reason = reason;
+    return null;
+  };
+  if (!ENABLE_CANONICAL_ANCHOR) return reject('anchor-disabled');
+  if (!Number.isFinite(offset)) return reject('warm-offset');
+  const certificate = engine.canonical.generationCertificate();
+  if (!certificate) return reject('canonical-certificate-missing');
+  if (certificate.rev !== engine.srcRev) return reject('canonical-revision-mismatch');
+  if (certificate.inputEpoch !== engine.canonical.inputEpoch) {
+    return reject('canonical-input-epoch-mismatch');
+  }
+  const file = typeof filePath === 'string' ? path.resolve(activeProject.docDir, filePath) : null;
+  const root = !file || file === path.resolve(activeProject.filePath);
+  const readPath = root ? null : engine.includes.get(file)?.readPath;
+  if (!root && typeof readPath !== 'string') return reject('child-read-path-missing');
+  const base = captureCanonicalAnchorBase({
+    blocks: engine.blocks,
+    domBlocks: engine.getDOM().blocks,
+    edit: root
+      ? { start: offset, end: offset, text: '' }
+      : { start: offset, end: offset, text: '', file, canonicalInputPath: path.resolve(readPath) },
+    certificate,
+    diagnostics,
+  });
+  return base
+    ? prefetchCanonicalAnchorProof(base, performance.now() + WARM_PROOF_PREFETCH_MS)
+    : null;
+}
+
+// A budgeted (cold) keystroke returns before its block is typeset. Its anchor
+// context waits here for the engine's deferred update of the same source
+// revision; a newer keystroke, reset or canonical generation retires it.
+let pendingColdAnchor = null;
+
+function anchorLineageEntry(lineage, blockId) {
+  if (!lineage || !blockId) return null;
+  if (lineage.blocks instanceof Map) return lineage.blocks.get(blockId) ?? null;
+  return lineage.blockId === blockId ? lineage : null;
+}
+
+/** Record a certified plan as the current lineage (one entry per block edited since the base). */
+function adoptAnchorPlanLineage(anchorPlan, anchorPriorLineage, anchorLedger) {
+  const prior = anchorPriorLineage &&
+    anchorPriorLineage.baseGeneration === anchorPlan.baseGeneration &&
+    anchorPriorLineage.baseRev === anchorPlan.baseRev &&
+    anchorPriorLineage.lastSrcRev === anchorPlan.srcRev - 1
+    ? anchorPriorLineage
+    : null;
+  const blocks = new Map();
+  if (prior?.blocks instanceof Map) {
+    for (const [id, entry] of prior.blocks) blocks.set(id, entry);
+  } else if (prior) {
+    blocks.set(prior.blockId, {
+      baseSnapshot: prior.baseSnapshot,
+      changedLines: [...(prior.changedLines ?? [])],
+      pages: prior.pages ?? null,
+      visualCut: Boolean(prior.visualCut),
+    });
+  }
+  // Until this keystroke's proof lands, the block keeps the pages its
+  // previous proof certified: that is what the paper still shows.
+  const previous = blocks.get(anchorPlan.blockId);
+  blocks.set(anchorPlan.blockId, {
+    baseSnapshot: anchorPlan.baseSnapshot,
+    changedLines: [...anchorPlan.changedLines],
+    pages: previous?.pages ?? null,
+    visualCut: previous?.pages ? Boolean(previous.visualCut) : Boolean(anchorPlan.visualCut),
+  });
+  anchorPlan.public.blockIds = [...blocks.keys()];
+  terminalAnchorLineage = {
+    blockId: anchorPlan.blockId,
+    baseGeneration: anchorPlan.baseGeneration,
+    baseRev: anchorPlan.baseRev,
+    lastSrcRev: anchorPlan.srcRev,
+    baseSnapshot: anchorPlan.baseSnapshot,
+    changedLines: [...anchorPlan.changedLines],
+    ledger: prior?.ledger instanceof Map ? prior.ledger : anchorLedger,
+    blocks,
+  };
+}
+
+/**
+ * A cold keystroke has a base (captured now, or carried by the lineage it
+ * continues) but no galley to plan against yet. Keep the lineage alive at
+ * this source revision with an unproved entry, so the next keystroke in the
+ * same block continues it and the deferred plan finds its base.
+ */
+function pendingAnchorLineage({ blockId, baseSnapshot, baseGeneration, baseRev, srcRev, prior, ledger }) {
+  const continues = prior && prior.baseGeneration === baseGeneration && prior.baseRev === baseRev &&
+    prior.lastSrcRev === srcRev - 1
+    ? prior
+    : null;
+  const blocks = new Map();
+  if (continues?.blocks instanceof Map) {
+    for (const [id, entry] of continues.blocks) blocks.set(id, entry);
+  } else if (continues) {
+    blocks.set(continues.blockId, {
+      baseSnapshot: continues.baseSnapshot,
+      changedLines: [...(continues.changedLines ?? [])],
+      pages: continues.pages ?? null,
+      visualCut: Boolean(continues.visualCut),
+    });
+  }
+  const previous = blocks.get(blockId);
+  const base = previous?.baseSnapshot ?? baseSnapshot;
+  if (!base) return null;
+  if (!previous) blocks.set(blockId, { baseSnapshot: base, changedLines: [], pages: null, visualCut: false });
+  return {
+    blockId,
+    baseGeneration,
+    baseRev,
+    lastSrcRev: srcRev,
+    baseSnapshot: base,
+    changedLines: [...(previous?.changedLines ?? [])],
+    ledger: continues?.ledger instanceof Map ? continues.ledger : ledger,
+    blocks,
+    coldPending: true,
+  };
+}
+
+async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch = null) {
+  const stillCurrent = () => {
+    if (documentEpoch !== epoch || terminalAnchorEpoch !== anchorEpoch ||
+        engine.srcRev !== plan.srcRev || engine.canonical.inputEpoch !== plan.inputEpoch) return false;
+    const currentCanonical = engine.canonical.info();
+    const currentCertificate = engine.canonical.generationCertificate(plan.baseGeneration);
+    return currentCanonical.id === plan.baseGeneration && currentCanonical.rev === plan.baseRev &&
+      currentCertificate?.pdfHash === plan.baseSnapshot.certificate.pdfHash &&
+      currentCertificate?.synctexHash === plan.baseSnapshot.certificate.synctexHash;
+  };
+  if (!stillCurrent()) return;
+  // Reuse the immutable background work only inside this edit's post-typeset
+  // proof window. If its cache-fill deadline stopped before completing the
+  // range, one fresh bounded attempt finishes the missing entries.
+  const prefetched = prefetch?.base === plan.baseSnapshot ? prefetch : null;
+  const freshCandidates = () => beforeDeadline(
+    rawForwardCandidatesForRange(
+      plan.source,
+      plan.baseGeneration,
+      plan.proofDeadline,
+      plan.baseSnapshot.canonicalInputPath
+    ),
     plan.proofDeadline
   ).catch(() => null);
+  let candidates = prefetched
+    ? await beforeDeadline(prefetched.rawCandidates, plan.proofDeadline).catch(() => null)
+    : await freshCandidates();
+  if (prefetched && candidates === null) {
+    candidates = await freshCandidates();
+  }
   const pages = [...new Set((candidates ?? []).map((candidate) => Number(candidate.page)))];
-  const paintPages = candidates?.length
-    ? await beforeDeadline(engine.canonical.pdfPaintPages(plan.baseGeneration, pages), plan.proofDeadline)
-      .catch(() => null)
+  let paintPages = candidates?.length && prefetched
+    ? await beforeDeadline(prefetched.paintPages, plan.proofDeadline).catch(() => null)
     : null;
-  if (documentEpoch !== epoch || engine.srcRev !== plan.srcRev) return;
-  const currentCanonical = engine.canonical.info();
-  const currentCertificate = engine.canonical.generationCertificate(plan.baseGeneration);
-  if (currentCanonical.id !== plan.baseGeneration || currentCanonical.rev !== plan.baseRev ||
-      currentCertificate?.pdfHash !== plan.baseSnapshot.certificate.pdfHash ||
-      currentCertificate?.synctexHash !== plan.baseSnapshot.certificate.synctexHash) return;
+  if (candidates?.length && !paintPages) {
+    paintPages = await beforeDeadline(
+      engine.canonical.pdfPaintPages(plan.baseGeneration, pages),
+      plan.proofDeadline
+    ).catch(() => null);
+  }
+  if (!stillCurrent()) return;
   let rejectReason = null;
   if (!candidates?.length) rejectReason = 'NO_SYNC_CANDIDATES';
   else if (!paintPages) rejectReason = 'PDF_PAINT_INDEX_UNAVAILABLE';
@@ -1078,13 +1593,37 @@ async function resolveTerminalCanonicalAnchor(plan, epoch) {
     : null;
   if (!rejectReason && !matching) rejectReason = 'AMBIGUOUS_OR_MISMATCHED_ANCHOR';
   if (!rejectReason && performance.now() >= plan.publishDeadline) rejectReason = 'PUBLISH_DEADLINE_EXCEEDED';
-  const patch = matching && !rejectReason
+  let patch = matching && !rejectReason
     ? buildTerminalCanonicalPatch(plan, matching)
     : null;
   if (!rejectReason && !patch) rejectReason = 'PAINT_NOT_ISOLATED';
+  if (patch) {
+    // Publish the whole edited set of this lineage in one patch: the pages
+    // this proof certified plus those the other blocks already hold, all
+    // addressed against the same immutable base generation.
+    const lineage = terminalAnchorLineage;
+    const entry = lineage?.blocks instanceof Map && lineage.baseGeneration === plan.baseGeneration &&
+      lineage.baseRev === plan.baseRev && lineage.lastSrcRev === plan.srcRev
+      ? lineage.blocks.get(plan.blockId)
+      : null;
+    if (entry) {
+      entry.pages = structuredClone(patch.pages);
+      entry.visualCut = Boolean(patch.visualCut);
+      const others = [...lineage.blocks]
+        .filter(([id, other]) => id !== plan.blockId && Array.isArray(other.pages) && other.pages.length)
+        .map(([id, other]) => ({ blockId: id, pages: other.pages, visualCut: other.visualCut }));
+      if (others.length) {
+        patch = mergeCumulativeAnchorPatch(patch, others);
+        if (!patch) rejectReason = 'CUMULATIVE_PATCH_CONFLICT';
+      }
+    }
+  }
   if (patch) patch.proofMs = performance.now() - plan.acceptedAt;
   broadcast({
-    kind: 'canonical-anchor',
+    // A distinct event kind is the capability boundary: clients predating
+    // the exhaustive raster-ring proof ignore it instead of applying the
+    // larger mask through their ordinary canonical-anchor path.
+    kind: patch?.visualCut === true ? 'canonical-visual-cut' : 'canonical-anchor',
     patch: patch ?? {
       status: 'fallback',
       blockId: plan.blockId,
@@ -1112,6 +1651,7 @@ const server = http.createServer(async (req, res) => {
         url.pathname === '/opaque-editor-coordinator.js' ||
         url.pathname === '/direct-edit-geometry.js' ||
         url.pathname === '/viewport-math.js' ||
+        url.pathname === '/canonical-anchor-raster.js' ||
         url.pathname === '/style.css' ||
         url.pathname === '/compare.js')
     ) {
@@ -1140,22 +1680,185 @@ const server = http.createServer(async (req, res) => {
         rev: engine.rev,
         srcRev: engine.srcRev,
         documentEpoch,
+        unchangedInputEvents: engine.unchangedInputEvents,
+        diffStats: engine.diffStats ?? null,
+        // preamble edits served without a reboot (tex64-internal #93)
+        preamblePatches: engine.preamblePatches ?? 0,
+        lastPreamblePatch: engine.lastPreamblePatch ?? null,
+        // the last foreground walk, without its per-block rows
+        lastWalk: engine.lastWalkTrace ? {
+          from: engine.lastWalkTrace.from, firstDirty: engine.lastWalkTrace.firstDirty,
+          lastDirty: engine.lastWalkTrace.lastDirty, typeset: engine.lastWalkTrace.typeset ?? null,
+          stop: engine.lastWalkTrace.stop ?? null, verdict: engine.lastWalkTrace.verdict ?? null,
+          ms: engine.lastWalkTrace.ms ?? null,
+          skips: (engine.lastWalkTrace.blocks ?? []).filter(([, , f]) => String(f).startsWith('skip>')).map(([k, , f]) => `${k}${f.slice(4)}`),
+        } : null,
         progress: engine.progress ?? null,
+        // pages the resident layout has right now (async rescues and
+        // repaginations move it between edit reports)
+        residentPages: engine.pages?.length ?? null,
         render: {
           queued: [...engine.renderWant.keys()],
           pumping: engine.renderPumping,
           active: [...(engine.rendering ?? [])],
           pids: Object.fromEntries(engine.renderPids ?? []),
           stats: engine.renderStats,
+          timings: (engine.renderTimings ?? []).slice(-12),
+        },
+        rescue: {
+          queued: engine.rescueQueue?.size ?? 0,
+          pumping: !!engine.rescuePumping,
+          disk: engine.isoDiskCache?.stats ?? null,
+          realRoot: engine.realRoot?.pid ?? null,
+          rootPid: engine.root?.pid ?? null,
+          // package-declared breakable boxes sent to the real routine
+          // because they did not fit from their entry offset (#88)
+          contextRescues: engine.contextRescues ?? 0,
+          packageBreakable: engine._packageBreakableRe ? String(engine._packageBreakableRe).split('|').length : 0,
+          log: (engine.rescueLog ?? []).slice(-60),
         },
         shipping: engine.shipping?.info?.() ?? null,
         shippingPresentation: lastShipPresentation,
         canonicalAnchorPresentation: lastAnchorPresentation,
+        canonicalAnchorInputDiagnostic: lastReport?.canonicalAnchorInputDiagnostic ?? null,
         warm: engine.warmInfo ?? null,
+        coldPreviews: engine.coldPreviews ?? 0,
+        cold: engine.coldDirty?.size
+          ? { pending: [...engine.coldDirty], walk: engine.progress?.phase === 'cold' ? engine.progress : null }
+          : null,
         foregroundLeaseMs: engine.foregroundLeaseMs ?? 0,
         authorityDeferred: engine.authorityDeferred ?? false,
         canonical: engine.canonical.info(),
+        grid: url.searchParams.has('grid') ? engine.gridInfo?.() ?? null : undefined,
       });
+    }
+    if (req.method === 'POST' && url.pathname === '/canonical/build-lease/acquire') {
+      const body = JSON.parse(await readBody(req));
+      const requestId = body?.requestId;
+      const binding = buildLeaseBinding(body?.projectRoot, body?.mainFile);
+      const ttlMs = body?.ttlMs == null ? undefined : Number(body.ttlMs);
+      if (typeof requestId !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(requestId) || !binding ||
+          ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs < 1_000 || ttlMs > 900_000)) {
+        return json(res, { error: 'invalid build lease' }, 400);
+      }
+      // A lease normally arrives before /open through the host's local gate.
+      // Never grant an orphaned lease after a client timeout when a reset has
+      // already entered its resident bootstrap. The host retries this explicit
+      // busy response before spawning TeX; old/unreachable engines remain its
+      // separate compatibility fallback.
+      if (!pendingDocumentReset && !engine.shipBooting && engine.warming) {
+        // A caret warm walk (up to tens of seconds on a long document) is
+        // resumable: let it stop at its next block boundary instead of
+        // making the explicit Build retry until the whole walk finishes.
+        await engine.yieldWarmForBuild?.({ timeoutMs: 3000 });
+      }
+      if (pendingDocumentReset || engine.shipBooting || engine.warming) {
+        // Name the phase so a slow Build can be attributed to the exact
+        // bootstrap stage that held its lease.
+        const blockedBy = pendingDocumentReset ? 'document-reset' : engine.shipBooting ? 'shipping-boot' : 'warming';
+        return json(res, { ok: false, acquired: false, reason: 'resident-bootstrap-active', blockedBy, retryAfterMs: 250 }, 409);
+      }
+      const result = engine.canonical.acquireBuildLease(requestId, ttlMs);
+      if (!result.acquired) return json(res, { ok: false, ...result }, result.reason === 'lease-busy' ? 409 : 503);
+      const settlement = buildLeasePreviewSettlement(result, engine.buildLeasePreviewJobs);
+      if (settlement) return json(res, settlement, 503);
+      const identity = binding.bound ? {
+        documentEpoch,
+        srcRev: engine.srcRev,
+        ...engine.canonical.compilationIdentity(engine.getSource()),
+      } : null;
+      return json(res, {
+        ok: true,
+        ...result,
+        bound: binding.bound,
+        reason: binding.bound ? null : 'document-mismatch',
+        identity,
+      });
+    }
+    if (req.method === 'POST' && url.pathname === '/canonical/build-lease/release') {
+      const body = JSON.parse(await readBody(req));
+      if (typeof body?.requestId !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(body.requestId) ||
+          typeof body?.token !== 'string' || !/^[0-9a-f-]{36}$/i.test(body.token)) {
+        return json(res, { error: 'invalid build lease release' }, 400);
+      }
+      const result = engine.canonical.releaseBuildLease(body.requestId, body.token);
+      return json(res, { ok: result.released, ...result }, result.released ? 200 : 409);
+    }
+    if (req.method === 'POST' && url.pathname === '/canonical/build-lease/renew') {
+      const body = JSON.parse(await readBody(req));
+      const ttlMs = body?.ttlMs == null ? undefined : Number(body.ttlMs);
+      if (typeof body?.requestId !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(body.requestId) ||
+          typeof body?.token !== 'string' || !/^[0-9a-f-]{36}$/i.test(body.token) ||
+          ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs < 1_000 || ttlMs > 900_000)) {
+        return json(res, { error: 'invalid build lease renewal' }, 400);
+      }
+      const result = engine.canonical.renewBuildLease(body.requestId, body.token, ttlMs);
+      return json(res, { ok: result.renewed, ...result }, result.renewed ? 200 : 409);
+    }
+    if (req.method === 'POST' && url.pathname === '/canonical/build-import') {
+      const body = JSON.parse(await readBody(req));
+      const candidate = body?.canonicalBuild;
+      if (!candidate || !engine.canonical.ownsBuildLease(candidate.requestId, candidate.token)) {
+        return json(res, { ok: false, adopted: false, reason: 'build-lease-mismatch' }, 409);
+      }
+      if (!currentCanonicalIdentityMatches(body.identity)) {
+        return json(res, { ok: false, adopted: false, reason: 'source-identity-changed' }, 409);
+      }
+      const result = await withEngine(async () => {
+        if (!engine.canonical.ownsBuildLease(candidate.requestId, candidate.token) ||
+            !currentCanonicalIdentityMatches(body.identity)) {
+          return { ok: false, adopted: false, reason: 'source-identity-changed' };
+        }
+        const source = engine.getSource();
+        const rev = engine.srcRev;
+        const validation = await validateCanonicalBuildImport({
+          candidate,
+          projectRoot: activeProject.docDir,
+          mainFile: activeProject.file,
+          source,
+          effectiveProjectInput: (file) => projectInputOverride(file),
+        });
+        if (!validation.accepted) return { ok: false, adopted: false, reason: validation.reason };
+        let prepared = null;
+        try {
+          prepared = await engine.canonical.prepareBuildGeneration({
+            ...validation,
+            source,
+            rev,
+            inputEpoch: engine.canonical.inputEpoch,
+            syncInputMap: validation.syncInputMap.map((entry) => ({
+              logicalPath: canonicalImportLogicalPath(activeProject, entry.logicalPath),
+              recordedPath: entry.recordedPath,
+            })),
+            inputManifest: (validation.inputManifest ?? []).map((entry) => ({
+              logicalPath: contextProjectPath(activeProject, entry.logicalPath),
+              sha256: entry.sha256,
+            })),
+          });
+          if (!currentCanonicalIdentityMatches(body.identity) || engine.getSource() !== source || engine.srcRev !== rev) {
+            return { ok: false, adopted: false, reason: 'source-identity-changed' };
+          }
+          // An active document may already have a matching canonical result
+          // and therefore no pending job. Create the exact current job while
+          // the owner lease still holds every full canonical start.
+          engine.canonical.schedule(source, rev);
+          const generation = await engine.canonical.commitBuildGeneration(prepared, source, rev);
+          prepared = null;
+          return {
+            ok: true,
+            adopted: true,
+            id: generation.id,
+            rev: generation.rev,
+            assumptions: validation.assumptions,
+            canonical: engine.canonical.info(),
+          };
+        } catch (error) {
+          return { ok: false, adopted: false, reason: String(error?.message || error) };
+        } finally {
+          engine.canonical.dropPreparedBuildGeneration(prepared);
+        }
+      });
+      return json(res, result, result.ok ? 200 : 409);
     }
     if (req.method === 'POST' && url.pathname === '/canonical/display-demand') {
       const body = JSON.parse(await readBody(req));
@@ -1175,6 +1878,9 @@ const server = http.createServer(async (req, res) => {
             demandId: body.demandId ?? null,
             residentImpossible: body.residentImpossible ?? false,
           });
+      // A held ShippingChain replay is the fastest exact answer to a viewer
+      // that could not paint the resident pages (tex64-internal #72).
+      if (body.fulfilled !== true) engine.noteDisplayDemand?.();
       return json(res, { ok: true, ...result, documentEpoch, srcRev: body.srcRev,
         demandId: body.demandId ?? null, scheduledInMs: engine.canonical.info().scheduledInMs });
     }
@@ -1244,9 +1950,80 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/warm') {
       const body = JSON.parse(await readBody(req));
       const offset = Number(body.offset);
-      if (!Number.isFinite(offset)) return json(res, { error: 'warm requires a finite offset' }, 400);
-      void engine.warmEditOffset(offset).catch((error) => {
-        engine.warmInfo = { status: 'error', message: error?.message ?? String(error) };
+      const page = Number(body.page);
+      if (!Number.isFinite(offset) && !(Number.isSafeInteger(page) && page > 0)) {
+        return json(res, { error: 'warm requires a finite offset or positive page' }, 400);
+      }
+      const filePath = typeof body.filePath === 'string' ? body.filePath : engine.file;
+      const requestedFile = path.resolve(activeProject.docDir, filePath);
+      if (Number.isFinite(offset)) anchorFocus = { offset, filePath };
+      const warmProofRequest = ++warmProofRequestSeq;
+      const warming = engine.canonical.waitForBuildLease().then(() => {
+        if (warmProofRequest !== warmProofRequestSeq) return { status: 'stale' };
+        return Number.isFinite(offset)
+          ? engine.warmEditOffset(offset, filePath)
+          : engine.warmPage(page);
+      });
+      void warming.then(async (result) => {
+        if (warmProofRequest !== warmProofRequestSeq || result?.status !== 'ready' || !Number.isFinite(offset)) return;
+        if (engine.warmInfo !== result) return;
+        const epoch = documentEpoch;
+        const anchorEpoch = terminalAnchorEpoch;
+        let prefetch;
+        const proofDiagnostics = {};
+        try { prefetch = prefetchWarmAnchorProof(offset, filePath, proofDiagnostics); }
+        catch { proofDiagnostics.reason = 'prefetch-error'; prefetch = null; }
+        if (!prefetch) {
+          const unavailable = {
+            ...result,
+            status: 'proof-unavailable',
+            reason: 'anchor-proof-ineligible',
+            proofReason: proofDiagnostics.reason ?? 'unknown',
+            offset,
+            file: requestedFile,
+          };
+          if (warmProofRequest === warmProofRequestSeq && engine.warmInfo === result) {
+            engine.warmInfo = unavailable;
+            broadcast({ kind: 'warm', warm: unavailable });
+          }
+          return;
+        }
+        const certificate = prefetch.base.certificate;
+        const proofing = { ...result, status: 'proofing', offset, file: requestedFile, canonicalId: certificate.id };
+        engine.warmInfo = proofing;
+        broadcast({ kind: 'warm', warm: proofing });
+        const [candidates, paintPages] = await Promise.all([
+          prefetch.rawCandidates.catch(() => null),
+          prefetch.paintPages.catch(() => null),
+        ]);
+        if (warmProofRequest !== warmProofRequestSeq || engine.warmInfo !== proofing) return;
+        const currentCertificate = engine.canonical.generationCertificate(certificate.id);
+        const currentCanonical = engine.canonical.info();
+        if (documentEpoch !== epoch || terminalAnchorEpoch !== anchorEpoch ||
+            engine.srcRev !== result.sourceRev || engine.canonical.inputEpoch !== certificate.inputEpoch ||
+            currentCanonical.id !== certificate.id || currentCanonical.rev !== certificate.rev ||
+            currentCertificate?.rev !== certificate.rev || currentCertificate?.pdfHash !== certificate.pdfHash ||
+            currentCertificate?.synctexHash !== certificate.synctexHash) {
+          const stale = { ...proofing, status: 'proof-unavailable', reason: 'proof-identity-stale' };
+          engine.warmInfo = stale;
+          broadcast({ kind: 'warm', warm: stale });
+          return;
+        }
+        const completed = {
+          ...result,
+          ...warmCanonicalProofOutcome(candidates, paintPages),
+          offset,
+          file: requestedFile,
+          canonicalId: certificate.id,
+        };
+        engine.warmInfo = completed;
+        broadcast({ kind: 'warm', warm: completed });
+      }, (error) => {
+        const failed = { status: 'error', message: error?.message ?? String(error), offset, file: requestedFile };
+        if (warmProofRequest === warmProofRequestSeq) {
+          engine.warmInfo = failed;
+          broadcast({ kind: 'warm', warm: failed });
+        }
       });
       return json(res, { scheduled: true, srcRev: engine.srcRev });
     }
@@ -1538,16 +2315,25 @@ const server = http.createServer(async (req, res) => {
       if (typeof start !== 'number' || typeof end !== 'number' || typeof text !== 'string') {
         return json(res, { error: 'edit requires {start, end, text}' }, 400);
       }
+      anchorFocus = { offset: start + text.length, filePath: typeof body.filePath === 'string' ? body.filePath : null };
+      let anchorEpoch = null;
       let resetEpoch = null;
       let anchorInputSafe = false;
       let anchorBaseSnapshot = null;
+      let anchorBaseCertificate = null;
+      let anchorLedger = null;
+      let anchorEdit = null;
+      let anchorMutation = false;
+      let anchorPriorLineage = null;
+      let inputUnchanged = false;
+      let anchorProofPrefetch = null;
+      const anchorDiagnostics = {};
       const anchorAcceptedAt = performance.now();
-      const rawClientEditAt = Number(body.clientEditAtEpochMs);
       const nowEpoch = Date.now();
-      const anchorClientEditAt = Number.isFinite(rawClientEditAt) &&
-        rawClientEditAt >= nowEpoch - 60_000 && rawClientEditAt <= nowEpoch + 1_000
-        ? rawClientEditAt
-        : null;
+      const anchorClientEditAt = canonicalAnchorClientEditTimestamp(
+        body.clientEditAtEpochMs,
+        nowEpoch
+      );
       try {
         lastReport = await withEngine(async () => {
           // optional optimistic-concurrency guard: a client that states the
@@ -1562,20 +2348,120 @@ const server = http.createServer(async (req, res) => {
           }
           const current = engine.getSource();
           const next = current.slice(0, start) + text + current.slice(end);
-          const overlayDelta = applyProjectOverlays(activeProject, body);
-          const changedInputs = [...overlayDelta.changed, ...overlayDelta.removed];
           const rootChanged = next !== current;
-          anchorInputSafe = rootChanged && changedInputs.length === 0;
-          if (ENABLE_CANONICAL_ANCHOR && anchorInputSafe) {
+          const childAnchorEdit = ENABLE_CANONICAL_ANCHOR && !rootChanged
+            ? childAnchorEditBeforeOverlay(
+                activeProject,
+                body,
+                current,
+                rootChanged,
+                anchorClientEditAt,
+                anchorDiagnostics
+              )
+            : null;
+          anchorEdit = rootChanged ? { start, end, text } : childAnchorEdit;
+          if (ENABLE_CANONICAL_ANCHOR && anchorEdit) {
             const certificate = engine.canonical.generationCertificate();
-            if (certificate && engine.canonical.sourceMatches(current, certificate.id)) {
+            if (certificate && certificate.rev === engine.srcRev &&
+                certificate.inputEpoch === engine.canonical.inputEpoch &&
+                engine.canonical.sourceMatches(current, certificate.id)) {
               anchorBaseSnapshot = captureCanonicalAnchorBase({
                 blocks: engine.blocks,
                 domBlocks: engine.getDOM().blocks,
-                edit: { start, end, text },
+                edit: anchorEdit,
                 certificate,
+                diagnostics: anchorDiagnostics,
               });
+              // The generation is the exact compile of every block right now:
+              // remember each block's identity so a later edit in another
+              // block can prove it still is what this generation typeset.
+              if (anchorBaseSnapshot) {
+                anchorLedger = anchorLedgerFor(certificate);
+                anchorBaseCertificate = { id: certificate.id, rev: certificate.rev };
+              }
+            } else if (certificate && terminalAnchorLineage &&
+                terminalAnchorLineage.baseGeneration === certificate.id &&
+                terminalAnchorLineage.baseRev === certificate.rev &&
+                terminalAnchorLineage.lastSrcRev === engine.srcRev &&
+                terminalAnchorLineage.ledger instanceof Map) {
+              // Another block joins an unbroken anchored lineage on the same
+              // base: admissible only while that block is byte-for-byte what
+              // the base generation typeset (source, galley and exit state),
+              // so its resident witness is the base witness for its lines.
+              const joinDiagnostics = {};
+              const candidate = captureCanonicalAnchorBase({
+                blocks: engine.blocks,
+                domBlocks: engine.getDOM().blocks,
+                edit: anchorEdit,
+                certificate,
+                diagnostics: joinDiagnostics,
+              });
+              const block = candidate ? engine.blocks.find((item) => item.id === candidate.blockId) : null;
+              if (candidate && ledgerAdmitsBlock(terminalAnchorLineage.ledger, block)) {
+                anchorBaseSnapshot = candidate;
+                anchorLedger = terminalAnchorLineage.ledger;
+                anchorBaseCertificate = { id: certificate.id, rev: certificate.rev };
+              } else {
+                anchorDiagnostics.reason = candidate ? 'ledger-mismatch' : joinDiagnostics.reason ?? 'canonical-behind';
+              }
+            } else {
+              anchorDiagnostics.reason = 'canonical-behind';
             }
+          }
+          const overlayDelta = applyProjectOverlays(activeProject, body);
+          // The autosave of this keystroke can reach the engine first, through
+          // the watcher, while this request waits behind an earlier edit: an
+          // overlay of the bytes the engine already read is no input change
+          // (measured: a second 4 s update behind a jump in the 316-page book).
+          overlayDelta.changed = overlayDelta.changed.filter((file) => {
+            if (!includeHoldsText(engine.includes, file, activeProject.overlays.get(file))) return true;
+            rebindIncludeRead(engine.includes, file,
+              path.join(activeProject.overlayDir, path.relative(activeProject.docDir, file)));
+            return false;
+          });
+          const changedInputs = [...overlayDelta.changed, ...overlayDelta.removed];
+          if (!rootChanged && !changedInputs.length) {
+            // Saving an overlay's bytes leaves every TeX input as it was: no
+            // new source revision, anchor epoch or canonical input epoch.
+            inputUnchanged = true;
+            return lastReport;
+          }
+          anchorMutation = rootChanged || changedInputs.length > 0;
+          if (anchorMutation) {
+            anchorEpoch = ++terminalAnchorEpoch;
+            anchorPriorLineage = terminalAnchorLineage;
+            terminalAnchorLineage = null;
+          }
+          let removalInputMatches = false;
+          if (anchorEdit?.inputTransition === 'remove-overlay') {
+            try { removalInputMatches = readFileSync(anchorEdit.file, 'utf8') === anchorEdit.inputText; }
+            catch { removalInputMatches = false; }
+          }
+          const childInputMatches = Boolean(anchorEdit?.file) && (
+            anchorEdit.inputTransition === 'overlay'
+              ? overlayDelta.changed.length === 1 && overlayDelta.removed.length === 0 &&
+                path.resolve(overlayDelta.changed[0]) === anchorEdit.file
+              : anchorEdit.inputTransition === 'remove-overlay'
+                ? overlayDelta.changed.length === 0 && overlayDelta.removed.length === 1 &&
+                  path.resolve(overlayDelta.removed[0]) === anchorEdit.file && removalInputMatches
+                : false
+          );
+          if (anchorEdit?.inputTransition === 'remove-overlay' && !removalInputMatches) {
+            anchorDiagnostics.reason = 'child-removal-effective-input-changed';
+          } else if (anchorEdit?.file && !childInputMatches) {
+            anchorDiagnostics.reason = 'child-input-apply-mismatch';
+          }
+          anchorInputSafe = Boolean(anchorEdit) && (
+            rootChanged
+              ? changedInputs.length === 0 && !anchorEdit.file
+              : childInputMatches
+          );
+          if (!anchorInputSafe) anchorBaseSnapshot = null;
+          if (anchorBaseSnapshot) {
+            anchorProofPrefetch = prefetchCanonicalAnchorProof(
+              anchorBaseSnapshot,
+              anchorAcceptedAt + WARM_PROOF_PREFETCH_MS
+            );
           }
           ensureProjectOutputDirectories(next);
           const nextBibliography = describeExternalBibliography(
@@ -1599,22 +2485,29 @@ const server = http.createServer(async (req, res) => {
             // Keep the last-good bibliography while the user is typing and
             // run only the latest snapshot after a short idle window.
             const report = rootChanged
-              ? await engine.edit(start, end, text)
+              ? await engine.edit(start, end, text, engine.file, {
+                  changed: overlayDelta.changed,
+                  removed: overlayDelta.removed,
+                })
               : changedInputs.length
-                ? await engine.refresh()
+                ? await engine.refresh({
+                    changed: overlayDelta.changed,
+                    removed: overlayDelta.removed,
+                  })
                 : await engine.edit(start, end, text);
             scheduleProjectBibliographyRefresh('unsaved biblatex input', 450);
             return report;
           }
           if (bibliographyNeedsReboot) {
             resetEpoch = beginDocumentReset('edit-bibliography-reboot');
+            await engine.canonical.waitForBuildLease();
             await engine.setDocumentContext({
               docDir: activeProject.docDir,
               overlayDir: activeProject.overlayDir,
               force: true,
             });
             await materializeProjectBibliography(next, activeProject);
-            const report = await engine.open(next, activeProject.file);
+            const report = await engine.open(next, activeProject.file, { projectSeeds: false });
             return report;
           }
           const preambleInputChanged = changedInputs.some((file) =>
@@ -1622,18 +2515,25 @@ const server = http.createServer(async (req, res) => {
           );
           if (preambleInputChanged) {
             resetEpoch = beginDocumentReset('edit-preamble-reboot');
+            await engine.canonical.waitForBuildLease();
             await engine.setDocumentContext({
               docDir: activeProject.docDir,
               overlayDir: activeProject.overlayDir,
               force: true,
             });
             await materializeProjectBibliography(next, activeProject);
-            const report = await engine.open(next, activeProject.file);
+            const report = await engine.open(next, activeProject.file, { projectSeeds: false });
             return report;
           }
           let primaryReport;
-          if (rootChanged) primaryReport = await engine.edit(start, end, text);
-          else if (changedInputs.length) primaryReport = await engine.refresh();
+          if (rootChanged) primaryReport = await engine.edit(start, end, text, engine.file, {
+            changed: overlayDelta.changed,
+            removed: overlayDelta.removed,
+          });
+          else if (changedInputs.length) primaryReport = await engine.refresh({
+            changed: overlayDelta.changed,
+            removed: overlayDelta.removed,
+          });
           else primaryReport = await engine.edit(start, end, text);
           if (!bibliographyChanged) return primaryReport;
 
@@ -1645,7 +2545,7 @@ const server = http.createServer(async (req, res) => {
           broadcast({ kind: 'update', report: primaryReport });
           await materializeProjectBibliography(next, activeProject);
           engine.invalidateProjectInputs?.([path.join(engine.workDir, 'driver.bbl')]);
-          return engine.refresh();
+          return engine.refresh({ changed: [path.join(engine.workDir, 'driver.bbl')] });
         });
       } catch (err) {
         if (err?.status === 409) {
@@ -1653,35 +2553,132 @@ const server = http.createServer(async (req, res) => {
         }
         throw err;
       }
+      if (inputUnchanged) return json(res, lastReport);
+      // when this keystroke reached the server and left the engine (epoch ms)
+      lastReport.timing = {
+        clientEditAtEpochMs: Number.isFinite(Number(body.clientEditAtEpochMs)) ? Number(body.clientEditAtEpochMs) : null,
+        receivedAtEpochMs: nowEpoch,
+        engineDoneAtEpochMs: Date.now(),
+        lock: engine.lastLock ?? null,
+        walk: engine.lastWalkTrace ?? null,
+        coldWalk: engine.coldWalkTrace?.slice(-24) ?? null,
+      };
       if (Number(lastAnchorPresentation?.srcRev) !== Number(lastReport.srcRev)) {
         lastAnchorPresentation = null;
       }
       lastReport.previewFallback = dirtyWithoutPatchFallback(lastReport);
-      const anchorPlan = ENABLE_CANONICAL_ANCHOR && anchorInputSafe
+      // A budgeted keystroke (docs/10 §10.4a): the edited block keeps its
+      // previous galley until the engine's deferred update. Nothing can be
+      // planned yet; the context waits for that update of this revision.
+      const coldEdit = (lastReport.stats?.coldPending?.length ?? 0) > 0;
+      // Why the base capture refused wins over the plan's resulting no-base.
+      const baseRefusal = anchorDiagnostics.reason ?? null;
+      const anchorPlan = ENABLE_CANONICAL_ANCHOR && !coldEdit && anchorInputSafe && lastReport.rebooted !== true
         ? planTerminalCanonicalAnchor({
             blocks: engine.blocks,
             domBlocks: engine.getDOM().blocks,
             report: lastReport,
             geometry: engine.getGeometry(),
-            lineage: terminalAnchorLineage,
-            edit: { start, end, text },
+            lineage: anchorPriorLineage,
+            edit: anchorEdit,
             baseSnapshot: anchorBaseSnapshot,
+            inputEpoch: engine.canonical.inputEpoch,
             acceptedAt: anchorAcceptedAt,
+            proofStartedAt: performance.now(),
             clientEditAtEpochMs: anchorClientEditAt,
+            paintContext: { fonts: engine.fonts, twinMetrics: engine.twinMetrics },
+            diagnostics: anchorDiagnostics,
           })
         : null;
+      if (coldEdit && ENABLE_CANONICAL_ANCHOR) {
+        lastReport.canonicalAnchorRefused = 'cold-prefix';
+        const coldBlockId = lastReport.dirtySourceNodes?.length === 1
+          ? String(lastReport.dirtySourceNodes[0]).replace(/^src-/, '')
+          : null;
+        pendingColdAnchor = anchorMutation && anchorInputSafe && coldBlockId ? {
+          srcRev: lastReport.srcRev,
+          documentEpoch,
+          anchorEpoch,
+          anchorEdit,
+          anchorBaseSnapshot,
+          anchorLedger,
+          anchorPriorLineage,
+          anchorAcceptedAt,
+          anchorClientEditAt,
+          anchorProofPrefetch,
+          anchorDiagnostics,
+        } : null;
+        if (anchorMutation) {
+          // Keep the lineage alive for the deferred plan and for the next
+          // keystroke in this block: either the base captured now or the
+          // entry the continued lineage already holds for the block.
+          const priorEntry = anchorPriorLineage && anchorPriorLineage.lastSrcRev === lastReport.srcRev - 1
+            ? anchorLineageEntry(anchorPriorLineage, coldBlockId)
+            : null;
+          const pending = anchorInputSafe && coldBlockId &&
+            (anchorBaseSnapshot?.blockId === coldBlockId && anchorBaseCertificate || priorEntry?.baseSnapshot)
+            ? pendingAnchorLineage({
+                blockId: coldBlockId,
+                baseSnapshot: anchorBaseSnapshot?.blockId === coldBlockId ? anchorBaseSnapshot : null,
+                baseGeneration: anchorBaseCertificate?.id ?? anchorPriorLineage.baseGeneration,
+                baseRev: anchorBaseCertificate?.rev ?? anchorPriorLineage.baseRev,
+                srcRev: lastReport.srcRev,
+                prior: anchorPriorLineage,
+                ledger: anchorLedger,
+              })
+            : null;
+          terminalAnchorLineage = pending;
+        }
+      } else if (!anchorPlan && ENABLE_CANONICAL_ANCHOR && anchorMutation) {
+        // Not a state the client acts on: the only record of why this edit
+        // waits for the canonical build instead of a certified overlay.
+        const planRefusal = anchorDiagnostics.reason;
+        lastReport.canonicalAnchorRefused = !anchorEdit ? anchorDiagnostics.reason ?? 'not-plain-text'
+          : !anchorInputSafe ? 'input-not-anchorable'
+          : lastReport.rebooted === true ? 'rebooted'
+          : planRefusal === 'no-base' && baseRefusal ? baseRefusal
+          : planRefusal ?? 'unknown';
+      }
       if (anchorPlan) {
         anchorPlan.public.acceptedElapsedMs = performance.now() - anchorAcceptedAt;
+        // A cumulative lineage: one entry per block edited since the base
+        // generation. Only an unbroken chain of anchored edits continues it.
+        adoptAnchorPlanLineage(anchorPlan, anchorPriorLineage, anchorLedger);
         lastReport.canonicalAnchor = anchorPlan.public;
-        terminalAnchorLineage = {
-          blockId: anchorPlan.blockId,
-          baseGeneration: anchorPlan.baseGeneration,
-          baseRev: anchorPlan.baseRev,
-          lastSrcRev: anchorPlan.srcRev,
-          baseSnapshot: anchorPlan.baseSnapshot,
+      } else if (!coldEdit && (anchorMutation || lastReport.dirtySourceNodes?.length)) {
+        // A refused edit (a box shifted by the keystroke, a reflowing line,
+        // an edit in an uncovered block, a cold walk elsewhere) leaves every
+        // certified overlay as true as it was: each is a proof against the
+        // same unchanged base page, and every later plan compares the block
+        // against that base again (changedMixedVisualCutLines), never against
+        // an intermediate keystroke. Keep the lineage at this revision so the
+        // next keystroke can continue it (an undo of the refused change, or a
+        // keystroke in another covered block) instead of dropping every
+        // overlay to the older base page until the next canonical build. A
+        // restore that rebinds the canonical (canonical-current), a reboot,
+        // or a new canonical generation retires it as before.
+        const refusal = lastReport.canonicalAnchorRefused;
+        const prior = anchorPriorLineage;
+        const survives = Boolean(prior) && anchorMutation && lastReport.rebooted !== true &&
+          refusal !== 'canonical-current' && prior.lastSrcRev === lastReport.srcRev - 1 &&
+          engine.canonical.info().id === prior.baseGeneration;
+        terminalAnchorLineage = survives ? { ...prior, lastSrcRev: lastReport.srcRev } : null;
+        if (survives) lastReport.canonicalAnchorLineageKept = [...(prior.blocks?.keys?.() ?? [prior.blockId])];
+      }
+      if (anchorDiagnostics.inputTransition || anchorDiagnostics.reason) {
+        // Bounded provenance and structural field paths only: enough to
+        // diagnose lifecycle/frame refusals without exposing source text,
+        // changed values or file names in the report/SSE stream.
+        lastReport.canonicalAnchorInputDiagnostic = {
+          transition: anchorDiagnostics.inputTransition ?? null,
+          readPathRole: anchorDiagnostics.readPathRole ?? null,
+          guardReason: anchorDiagnostics.reason ?? null,
+          mixedFrameDifference: anchorDiagnostics.mixedFrameDifference ?? null,
+          mixedFrameDumped: anchorDiagnostics.mixedFrameDumped ?? false,
+          visualCutRefusal: anchorDiagnostics.visualCutRefusal ?? null,
+          acceptedSrcRev: lastReport.srcRev,
+          inputEpoch: engine.canonical.inputEpoch,
         };
-      } else if (lastReport.dirtySourceNodes?.length) {
-        terminalAnchorLineage = null;
       }
       // one serialization for both consumers: the SSE fanout and the HTTP
       // response used to stringify the full report (all patches) twice
@@ -1690,7 +2687,7 @@ const server = http.createServer(async (req, res) => {
       broadcastRaw(`{"kind":"update","documentEpoch":${documentEpoch},"report":${reportJson}}`);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(reportJson);
-      if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch);
+      if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, anchorEpoch, anchorProofPrefetch);
       return;
     }
     if (req.method === 'POST' && url.pathname === '/open') {
@@ -1715,6 +2712,11 @@ const server = http.createServer(async (req, res) => {
           if (isPathInside(candidate, filePath)) projectRoot = candidate;
         }
       }
+      const openRequestId = body.openRequestId == null ? null : body.openRequestId;
+      if (openRequestId !== null &&
+          (typeof openRequestId !== 'string' || !/^[A-Za-z0-9:_-]{1,128}$/.test(openRequestId))) {
+        return json(res, { error: 'invalid openRequestId' }, 400);
+      }
       const docDir = projectRoot || path.dirname(filePath);
       const context = {
         docDir,
@@ -1724,26 +2726,123 @@ const server = http.createServer(async (req, res) => {
         overlays: new Map(),
         bibliography: null,
       };
-      applyProjectOverlays(context, body, true);
-      let resetEpoch = null;
-      lastReport = await withEngine(async () => {
-        resetEpoch = beginDocumentReset('open');
-        await engine.setDocumentContext({
-          docDir: context.docDir,
-          overlayDir: context.overlayDir,
-          force: true,
-        });
-        activeProject = context;
-        ensureProjectOutputDirectories(text);
-        await materializeProjectBibliography(text, activeProject);
-        return engine.open(text, context.file);
+      const identity = openRequestIdentity({
+        text,
+        filePath,
+        docDir,
+        overlays: body.overlays,
+        removeOverlays: body.removeOverlays,
+        canonicalBuild: body.canonicalBuild,
       });
-      // Keep the previous exact document intact while the new root boots,
-      // then tell every client to fetch one complete, already-adoptable
-      // snapshot. Broadcasting before engine.open completed let /doc return
-      // the old project and later overwrite newer SSE state.
-      completeDocumentReset(resetEpoch);
-      return json(res, docPayload());
+      let payload;
+      try {
+        payload = await openRequests.run(openRequestId, identity, () => withEngine(async () => {
+          const requestedImport = body.canonicalBuild ?? null;
+          if (requestedImport && !engine.canonical.ownsBuildLease(requestedImport.requestId, requestedImport.token)) {
+            const error = new Error('canonical Build import does not own the active Build lease');
+            error.code = 'BUILD_IMPORT_LEASE_MISMATCH';
+            throw error;
+          }
+          if (!requestedImport) await engine.canonical.waitForBuildLease();
+          const resetEpoch = beginDocumentReset('open');
+          applyProjectOverlays(context, body, true);
+          await engine.setDocumentContext({
+            docDir: context.docDir,
+            overlayDir: context.overlayDir,
+            force: true,
+          });
+          activeProject = context;
+          ensureProjectOutputDirectories(text);
+          await materializeProjectBibliography(text, activeProject);
+          let preparedImport = null;
+          let importStatus = requestedImport ? { requested: true, adopted: false, reason: 'not-prepared' } : null;
+          const expectedSrcRev = engine.srcRev + 1;
+          if (requestedImport) {
+            const validation = await validateCanonicalBuildImport({
+              candidate: requestedImport,
+              projectRoot: context.docDir,
+              mainFile: context.file,
+              source: text,
+              effectiveProjectInput: (file) => contextInputOverride(context, file),
+            });
+            if (validation.accepted) {
+              const syncInputMap = validation.syncInputMap.map((entry) => ({
+                logicalPath: canonicalImportLogicalPath(context, entry.logicalPath),
+                recordedPath: entry.recordedPath,
+              }));
+              try {
+                preparedImport = await engine.canonical.prepareBuildGeneration({
+                  ...validation,
+                  source: text,
+                  rev: expectedSrcRev,
+                  inputEpoch: engine.canonical.inputEpoch,
+                  syncInputMap,
+                });
+                importStatus = {
+                  requested: true,
+                  adopted: false,
+                  reason: 'prepared',
+                  assumptions: validation.assumptions,
+                };
+              } catch (error) {
+                importStatus = {
+                  requested: true,
+                  adopted: false,
+                  reason: `prepare-failed: ${String(error?.message || error)}`,
+                };
+              }
+            } else {
+              importStatus = { requested: true, adopted: false, reason: validation.reason };
+            }
+          }
+          let openCompleted = false;
+          try {
+            lastReport = await engine.open(text, context.file, { canonicalBaseline: !preparedImport });
+            openCompleted = true;
+            if (preparedImport) {
+              if (engine.srcRev !== expectedSrcRev || engine.getSource() !== text ||
+                  engine.canonical.inputEpoch !== preparedImport.inputEpoch) {
+                throw new Error('Build import source changed during open');
+              }
+              const adopted = await engine.canonical.commitBuildGeneration(preparedImport, text, expectedSrcRev);
+              preparedImport = null;
+              importStatus = {
+                requested: true,
+                adopted: true,
+                reason: null,
+                id: adopted.id,
+                rev: adopted.rev,
+                assumptions: importStatus.assumptions,
+              };
+              lastReport.canonical = engine.canonical.info();
+            }
+          } catch (error) {
+            if (preparedImport && openCompleted) {
+              importStatus = { requested: true, adopted: false, reason: String(error?.message || error) };
+            } else {
+              throw error;
+            }
+          } finally {
+            engine.canonical.dropPreparedBuildGeneration(preparedImport);
+          }
+          // Keep the previous exact document intact while the new root boots,
+          // then capture one complete, already-adoptable response before the
+          // next queued open can reset it again.
+          completeDocumentReset(resetEpoch);
+          return JSON.stringify({ ...docPayload(), canonicalBuild: importStatus });
+        }));
+      } catch (error) {
+        if (error?.code === 'OPEN_REQUEST_ID_CONFLICT') {
+          return json(res, { error: error.message }, 409);
+        }
+        if (error?.code === 'BUILD_IMPORT_LEASE_MISMATCH') {
+          return json(res, { error: error.message }, 409);
+        }
+        throw error;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(payload);
+      return;
     }
     res.writeHead(404);
     res.end('not found');

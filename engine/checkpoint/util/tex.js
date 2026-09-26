@@ -27,7 +27,10 @@ function startsAddvspace(text) {
  * \hyperref parse exactly five and typeset garbage otherwise.
  */
 function labelDefBody(key, val, hy, href) {
-  if (key.endsWith('@cref')) return `{{${val}}{[1][1][]1}}`;
+  // cleveref's companion uses the same field count as the plain label:
+  // under hyperref \@firstoffive reads it, and a two-group body broke every
+  // forward \cref in the resident run (tex64-internal #66).
+  if (key.endsWith('@cref')) return hy ? `{{${val}}{[1][1][]1}{}{${href ?? ''}}{}}` : `{{${val}}{[1][1][]1}}`;
   if (hy) return `{{${val}}{1}{}{${href ?? ''}}{}}`;
   return `{{${val}}{1}}`;
 }

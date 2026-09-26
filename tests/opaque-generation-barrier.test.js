@@ -11,6 +11,95 @@ const INDEX = readFileSync(fileURLToPath(new URL('../web/index.html', import.met
 const SERVER = readFileSync(fileURLToPath(new URL('../server.js', import.meta.url)), 'utf8');
 const STYLE = readFileSync(fileURLToPath(new URL('../web/style.css', import.meta.url)), 'utf8');
 
+const PAGE_COUNT_GATES = Function(`${APP.slice(
+  APP.indexOf('function currentCanonicalPageCount'),
+  APP.indexOf('function srcOf')
+)}; return { currentCanonicalPageCount, residentPageTransactionValid, provisionalCommitGroups };`)();
+
+test('staged pages commit in groups: a reflow, a moved or split paragraph and one edit stay together', () => {
+  const groupsOf = PAGE_COUNT_GATES.provisionalCommitGroups;
+  const stage = (page, ...srcs) => ({ dl: { page, commands: srcs.map((src) => ({ op: 'glyphs', src })) } });
+  const pages = (groups) => groups.map((group) => group.map((s) => s.dl.page)).sort((a, b) => a[0] - b[0]);
+  // consecutive pages reflow into each other; a far page is independent
+  assert.deepEqual(pages(groupsOf([stage(10, 'a'), stage(11, 'b'), stage(40, 'c')], new Map(), new Map())), [[10, 11], [40]]);
+  // one block painted on two non-adjacent pages
+  assert.deepEqual(pages(groupsOf([stage(10, 'x'), stage(14, 'x')], new Map(), new Map())), [[10, 14]]);
+  // a paragraph moving whole across an unchanged float page (51 → 53): the
+  // page it leaves still shows it
+  const shown = new Map([[51, new Set(['p', 'q'])], [53, new Set(['r'])]]);
+  assert.deepEqual(pages(groupsOf([stage(51, 'q'), stage(53, 'p', 'r')], shown, new Map())), [[51, 53]]);
+  // a split names the second half anew: the edit's pages stay together
+  assert.deepEqual(pages(groupsOf([stage(51, 'x'), stage(53, 'y')], new Map(), new Map([[51, 1], [53, 1]]))), [[51, 53]]);
+  // the previous keystroke's page does not hold back the current one
+  assert.deepEqual(pages(groupsOf([stage(30, 'a'), stage(80, 'b')], new Map(), new Map([[30, 1], [80, 2]]))), [[30], [80]]);
+  // page furniture ('_…') joins nothing
+  assert.deepEqual(pages(groupsOf([stage(10, '_hf', 'a'), stage(20, '_hf', 'b')], new Map(), new Map())), [[10], [20]]);
+  // first presentation: blank neighbours cannot disagree across a page break,
+  // so each page (or block spanning pages) commits on its own (#83)
+  const blank = () => false;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b'), stage(164, 'b')], new Map(), new Map(), blank)), [[162], [163, 164]]);
+  // a painted neighbour still ties the reflow
+  const paintedAt = (n) => (page) => page === n;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b')], new Map(), new Map(), paintedAt(162))), [[162, 163]]);
+  // the next keystroke on the presented page: blank neighbours still waiting
+  // for their ink stay blank and do not hold it back
+  const readyAt = (n) => (s) => s.dl.page === n;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b', 'c'), stage(164, 'c')], new Map(), new Map(), paintedAt(163), readyAt(163))),
+    [[162], [163], [164]]);
+  // …but a ready blank neighbour joins the painted page's reflow
+  const readyAll = () => true;
+  assert.deepEqual(pages(groupsOf([stage(162, 'a'), stage(163, 'b')], new Map(), new Map(), paintedAt(163), readyAll)), [[162, 163]]);
+});
+
+test('the VisualCut raster verifier is loaded and served by the preview origin', () => {
+  assert.match(INDEX, /<script src="\/canonical-anchor-raster\.js"><\/script>/);
+  assert.match(SERVER, /url\.pathname === '\/canonical-anchor-raster\.js'/);
+});
+
+test('only a decoded same-document empty shell admits the last-good canonical fallback', () => {
+  const source = APP.slice(
+    APP.indexOf('function emptyStructuredCanonicalFallback'),
+    APP.indexOf('function tryApplyPendingCanonicalAnchor')
+  );
+  const image = { complete: true, naturalWidth: 665 };
+  const page = { dataset: {} };
+  const canonical = { id: 7, rev: 11, pageCount: 20 };
+  const documentReset = { pending: false, adoptedEpoch: 3 };
+  let presented = {
+    image, src: '/canonical/12.svg?c=7', id: 7, rev: 11,
+    snapshot: { srcRev: 11, documentEpoch: 3 },
+  };
+  const gates = Function('usesCanonicalSurface', 'documentReset', 'canonical',
+    'presentedPageState', `${source}; return {
+      fallback: emptyStructuredCanonicalFallback,
+      marker: retainCanonicalFallbackMarker,
+    };`)(
+      () => false, documentReset, canonical, () => presented
+    );
+
+  assert.equal(gates.fallback(12, page, image), true);
+  page.dataset.prov = '1';
+  assert.equal(gates.fallback(12, page, image), false, 'committed provisional ink always wins');
+  delete page.dataset.prov;
+  presented = { ...presented, id: 6 };
+  assert.equal(gates.fallback(12, page, image), false, 'another canonical generation cannot be reused');
+  presented = { ...presented, id: 7, snapshot: { srcRev: 11, documentEpoch: 2 } };
+  assert.equal(gates.fallback(12, page, image), false, 'a prior document epoch cannot populate this shell');
+  presented = { ...presented, snapshot: { srcRev: 11, documentEpoch: 3 } };
+  image.complete = false;
+  assert.equal(gates.fallback(12, page, image), false, 'decode must finish before the bitmap is exposed');
+
+  assert.equal(gates.marker({ newlyEligible: false, previouslyMarked: true,
+    canonicalSurface: false, final: true, freshTargetPresented: false }), true,
+  'old fallback stays non-ready while a fresh target is decoding');
+  assert.equal(gates.marker({ newlyEligible: false, previouslyMarked: true,
+    canonicalSurface: false, final: true, freshTargetPresented: true }), false,
+  'the marker retires only after the fresh target commits');
+  assert.equal(gates.marker({ newlyEligible: false, previouslyMarked: true,
+    canonicalSurface: false, final: false, freshTargetPresented: false }), false,
+  'a committed provisional surface retires the fallback marker');
+});
+
 const targetSrc = '/canonical/2.svg?c=42';
 const base = {
   pageNumber: 2,
@@ -72,6 +161,34 @@ test('embedded Shipping pixels are read-only and rechecked after decode', () => 
   assert.match(APP, /if \(embeddedHost && shippingPresentationBlocked\(\)\)/);
   assert.match(APP, /function presentedShippingPageState\(page\)[\s\S]*?startsWith\('\/ship\/'\)/);
   assert.match(APP, /shipping\?\.rev === Number\(appliedSrcRev\)/);
+});
+
+test('provisional page-count transactions fail closed on holes and delayed tail pages', () => {
+  const valid = PAGE_COUNT_GATES.residentPageTransactionValid;
+  assert.equal(valid(2, [1, 2], [1, 2], [3]), true, 'a complete shrink commits its new paper atomically');
+  assert.equal(valid(2, [1, 2], [1, 2, 3], []), false, 'a delayed stage cannot resurrect the removed tail');
+  assert.equal(valid(2, [1, 2], [1], [2, 3]), false, 'a surviving resident page cannot also be removed');
+  assert.equal(valid(2, [0, 2], [2], []), false, 'page zero cannot disguise a missing first page');
+  assert.equal(valid(3, [1, 3], [1, 3], []), false, 'a sparse address space is never published');
+});
+
+test('resident page counts are checked against the newest canonical generation', () => {
+  const count = PAGE_COUNT_GATES.currentCanonicalPageCount;
+  assert.equal(count({ rev: 7, pageCount: 11 }, null, 3, 7), 11);
+  // tex64-internal #72: requiring the current revision turned every
+  // keystroke into a canonical display demand and a "/ —" toolbar.
+  assert.equal(count({ rev: 6, pageCount: 11 }, null, 3, 7), 11, 'the newest canonical is the reference while typing');
+  assert.equal(count({ rev: 0, pageCount: 0 }, null, 3, 7), null, 'no canonical yet is unknown');
+  assert.equal(count({ rev: 8, pageCount: 11 }, null, 3, 7), null, 'a generation ahead of the source is ignored');
+  assert.equal(count({ rev: 5, pageCount: 11 }, { rev: 6, pageCount: 12, epoch: 3 }, 3, 7), 12, 'the newer generation wins');
+  assert.equal(count(null, { rev: 7, pageCount: 11, epoch: 3 }, 3, 7), 11);
+  assert.equal(count(null, { rev: 7, pageCount: 11, epoch: 2 }, 3, 7), null, 'another document epoch is rejected');
+  assert.equal(
+    count({ rev: 7, pageCount: 11 }, { rev: 7, pageCount: 12, epoch: 3 }, 3, 7),
+    null,
+    'conflicting exact generations fail closed'
+  );
+  assert.match(APP, /let residentPageCountAuthoritative = false;/);
 });
 
 test('two-dimensional duplicate math tokens map by canonical reading order', () => {

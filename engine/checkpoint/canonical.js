@@ -20,9 +20,9 @@
 //     canonical result on screen and reports the TeX error.
 
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
-import { readFile } from 'node:fs/promises';
+import { copyFile, readFile } from 'node:fs/promises';
 import { gunzip } from 'node:zlib';
 import {
   mkdirSync,
@@ -32,16 +32,20 @@ import {
   existsSync,
   rmSync,
   copyFileSync,
+  renameSync,
   realpathSync,
+  statSync,
 } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { fnv1a } from '../hash.js';
-import { withProjectInputs } from '../project-inputs.js';
+import { withProjectInputs, isPathInside } from '../project-inputs.js';
+import { parseFlsFiles, MAX_FLS_INPUTS } from './fls.js';
 import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-index.js';
 import { pdfEditGlyphs } from './pdf-edit-geometry.js';
 import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
+import { prepareSyncTeXBatchHelper, querySyncTeXRange } from './synctex-batch.js';
 
 const execFileP = promisify(execFile);
 const gunzipP = promisify(gunzip);
@@ -53,6 +57,31 @@ const SVG_CACHE_MAX = 400; // pages kept as SVG strings (LRU)
 // The fixed window prevents a long editing session from retaining files
 // without bound.
 const GENERATION_MAX = 4;
+const BUILD_SEED_EXTENSIONS = ['aux', 'toc', 'lof', 'lot', 'out'];
+// Aux family of the last promoted compile per project, kept across engine
+// restarts (the app's workDir persists). `.json`, so neither the start-up
+// sweep nor the mutable-artifact cleanup (MUTABLE_COMPILE_ARTIFACT) sees it.
+const PROJECT_SEED_DIR = 'aux-seeds';
+const PROJECT_SEED_VERSION = 1;
+const PROJECT_SEED_MAX_FILES = 64;
+const PROJECT_SEED_MAX_BYTES = 32 * 1024 * 1024;
+
+function preambleHash(source) {
+  const text = String(source ?? '').replace(/\r\n?/g, '\n');
+  const begin = text.search(/\\begin\s*\{document\}/);
+  return createHash('sha256').update(begin < 0 ? text : text.slice(0, begin)).digest('hex').slice(0, 32);
+}
+
+// Input invalidations remembered for content identity (one per child edit,
+// external change or bibliography refresh). Older generations cannot be
+// proven current and compile again, exactly as before.
+const INPUT_INVALIDATION_MAX = 512;
+const INPUT_HASH_CACHE_MAX = 4096;
+const BUILD_LEASE_DEFAULT_MS = 660_000;
+const BUILD_LEASE_MAX_MS = 900_000;
+const SYNCTEX_HELPER_PREPARE_MS = 15_000;
+const INDEX_TOOL_TIMEOUT_MS = 60_000;
+const MUTABLE_COMPILE_ARTIFACT = /(?:^canon\.(?:fls|log|pdf|synctex\.gz)$|\.(?:aux|bcf|blg|idx|ind|ilg|glo|gls|glg|acn|acr|alg|lof|lot|nav|out|run\.xml|snm|toc|vrb)$)/;
 
 export class CanonicalRenderer {
   constructor({
@@ -92,6 +121,10 @@ export class CanonicalRenderer {
     this.timerDueAt = 0;
     this.running = null; // in-flight compile promise
     this.runningJob = null; // revision/input ownership for display demand
+    // Invalidates a compile which was already running when an exact normal
+    // Build generation was adopted. A stopped TeX child can otherwise resume
+    // after the Build lease and publish older pixels over the adopted result.
+    this.compileEpoch = 0;
     this.pendingJob = null; // {source, rev} superseding the in-flight compile
     this.displayDemand = null; // {rev, inputEpoch}, only for existing work
     this.displayDemandEpoch = null; // viewer document epoch for demand ownership
@@ -101,6 +134,11 @@ export class CanonicalRenderer {
     this.activeDisplayDemandIds = new Set();
     this.residentImpossibleDemandIds = new Set();
     this.seenDisplayDemandIds = new Set(); // at most 64 IDs for this revision
+    // One pending revision may inherit a short display-catch-up allowance
+    // from the first baseline. It survives the baseline's synchronous result
+    // broadcast because the viewer can escalate a soft demand only after
+    // observing those newly landed canonical pixels.
+    this.coldBaselineCatchup = null; // {baselineId, rev, inputEpoch, source}
     this.idSeq = 0;
     this.last = null; // last GOOD compile: {id, rev, srcHash, pdf, pageCount, paper, passes, ms}
     this.lastError = null; // {rev, message}
@@ -147,10 +185,13 @@ export class CanonicalRenderer {
     this.sourceBoxInFlight = new Set(); // source-box reads must finish before document reset removes artifacts
     this.svgOutputSeq = 0;
     this.onResult = null; // callback({...info}) after every compile attempt
+    this.projectSeedKey = null; // docDir + main file of the open document (restoreProjectSeeds)
+    this.projectSeedsPlaced = false; // the next compile starts from kept aux (retried without on failure)
     this.disposed = false;
     this.resetting = false;
     this._texts = null;
     this.children = new Set(); // in-flight lualatex/pdftocairo/pdftotext/pdfinfo
+    this.indexToolKeys = new Map(); // .ind path -> hash of the .idx it was made from
     // Authority-only lualatex children run in private process groups. A live
     // edit can stop those independent groups for the shipping foreground
     // lease without killing a half-written aux workdir. Export and opaque
@@ -159,16 +200,205 @@ export class CanonicalRenderer {
     this.authorityPausedPids = new Map(); // pid -> true when signalled as a process group
     this.authorityPausedUntil = 0;
     this.authorityResumeTimer = null;
+    this.buildLease = null; // {requestId, token, expiresAt, timer}
+    this.lastBuildLeaseRelease = null;
+    this.buildLeaseWaiters = new Set();
+    this.buildHeavyChildren = new Set();
+    this.buildPausedPids = new Set();
     // Source text is not the whole compilation input: images, \input files
     // and bibliographies can change without a byte changing in the main
     // buffer.  Capture this epoch in every queued job so those changes
     // invalidate the canonical cache without defeating normal source-hash
     // reuse.
     this.inputEpoch = 0;
+    // epoch -> Set of logical input paths that epoch invalidated, or null when
+    // the change set was unknown. Lets a generation prove that every input
+    // changed since its compile is back to the bytes it was compiled from.
+    this.inputInvalidations = new Map();
+    this.inputHashCache = new Map(); // readPath -> {size, mtimeMs, ino, sha256}
+    this.syncTeXHelperPreparation = null;
+    // The first anchor proof has a 700 ms post-typeset deadline, while a cold
+    // helper build can take longer. Compile its document-independent binary
+    // beside ordinary renderer initialization, before any canonical arrives.
+    void this.prepareSyncTeXHelper();
   }
 
   #sourceHash(source, inputEpoch = this.inputEpoch) {
     return fnv1a(`${inputEpoch}\0${source}`);
+  }
+
+  compilationIdentity(source) {
+    return { inputEpoch: this.inputEpoch, srcHash: this.#sourceHash(source) };
+  }
+
+  // ------------------------------------------------- content identity
+  //
+  // A generation is compiled from the root source text plus every project
+  // input TeX read. The root is covered by `srcHash`; the inputs by an
+  // `inputManifest` (logical path -> sha256 of the bytes TeX read) taken from
+  // the recorder file list. `inputEpoch` still advances on every child edit,
+  // external change or bibliography refresh, but a generation whose root
+  // matches and whose changed inputs all hash back to their manifest bytes is
+  // the exact compile of the current revision: it is rebound to that revision
+  // instead of being compiled again. Anything unprovable (no manifest, an
+  // unknown change set, a changed path the compile never read, an unreadable
+  // input) keeps the old fail-closed answer.
+
+  /** Normalize a project input to one spelling: real path, overlay -> logical. */
+  #inputIdentity(file) {
+    const resolved = path.resolve(file);
+    let real = resolved;
+    try {
+      real = realpathSync(resolved);
+    } catch {
+      try { real = path.join(realpathSync(path.dirname(resolved)), path.basename(resolved)); }
+      catch { real = resolved; }
+    }
+    if (this.overlayDir && isPathInside(this.overlayDir, real)) {
+      return path.join(this.docDir, path.relative(this.overlayDir, real));
+    }
+    return real;
+  }
+
+  /** The file TeX reads for a logical project input right now. */
+  #effectiveInputPath(logical) {
+    if (this.overlayDir && isPathInside(this.docDir, logical)) {
+      const overlay = path.join(this.overlayDir, path.relative(this.docDir, logical));
+      if (existsSync(overlay)) return overlay;
+    }
+    return logical;
+  }
+
+  /** sha256 of the bytes TeX would read for a logical input, or null. */
+  #effectiveInputHash(logical) {
+    const readPath = this.#effectiveInputPath(logical);
+    let stats;
+    try { stats = statSync(readPath); } catch { return null; }
+    if (!stats.isFile()) return null;
+    const cached = this.inputHashCache.get(readPath);
+    if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs && cached.ino === stats.ino) {
+      return cached.sha256;
+    }
+    let sha256;
+    try { sha256 = createHash('sha256').update(readFileSync(readPath)).digest('hex'); } catch { return null; }
+    if (this.inputHashCache.size >= INPUT_HASH_CACHE_MAX) {
+      this.inputHashCache.delete(this.inputHashCache.keys().next().value);
+    }
+    this.inputHashCache.set(readPath, { size: stats.size, mtimeMs: stats.mtimeMs, ino: stats.ino, sha256 });
+    return sha256;
+  }
+
+  /** Manifest of the project inputs the compile that just finished read. */
+  #inputManifestFromRecorder() {
+    let text;
+    try { text = readFileSync(path.join(this.workDir, 'canon.fls'), 'utf8'); } catch { return null; }
+    const files = parseFlsFiles(text, this.docDir);
+    if (!files) return null;
+    const rootTex = path.join(this.workDir, 'canon.tex');
+    const manifest = new Map();
+    for (const recorded of files.inputs) {
+      if (files.outputs.has(recorded)) continue;
+      const logical = this.#inputIdentity(recorded);
+      if (logical === rootTex || manifest.has(logical)) continue;
+      if (!isPathInside(this.docDir, logical) && !isPathInside(this.workDir, logical)) continue;
+      const sha256 = this.#effectiveInputHash(logical);
+      if (!sha256) return null;
+      manifest.set(logical, sha256);
+      if (manifest.size > MAX_FLS_INPUTS) return null;
+    }
+    return manifest;
+  }
+
+  /** Validate a manifest handed in by the Build import. */
+  #inputManifestFromRecords(records) {
+    if (!Array.isArray(records)) return null;
+    const manifest = new Map();
+    for (const record of records) {
+      if (typeof record?.logicalPath !== 'string' || !path.isAbsolute(record.logicalPath) ||
+          !/^[0-9a-f]{64}$/i.test(String(record.sha256 || ''))) return null;
+      manifest.set(this.#inputIdentity(record.logicalPath), String(record.sha256).toLowerCase());
+      if (manifest.size > MAX_FLS_INPUTS) return null;
+    }
+    return manifest;
+  }
+
+  /** Every input invalidated after the generation is back to its compiled bytes. */
+  #inputsUnchangedSince(generation) {
+    const manifest = generation.inputManifest;
+    if (!(manifest instanceof Map)) return false;
+    const changed = new Set();
+    for (let epoch = generation.inputEpoch + 1; epoch <= this.inputEpoch; epoch++) {
+      const paths = this.inputInvalidations.get(epoch);
+      if (!paths) return false; // unknown change set, or forgotten epoch
+      for (const file of paths) changed.add(file);
+    }
+    for (const logical of changed) {
+      const expected = manifest.get(logical);
+      if (!expected) return false; // a file this compile never read: unprovable
+      if (this.#effectiveInputHash(logical) !== expected) return false;
+    }
+    return true;
+  }
+
+  /** True when `generation` is the exact compile of `source` under the current inputs. */
+  #generationCurrent(generation, source) {
+    if (!generation || typeof source !== 'string') return false;
+    if (generation.srcHash !== this.#sourceHash(source, generation.inputEpoch)) return false;
+    if (generation.inputEpoch === this.inputEpoch) return true;
+    return this.#inputsUnchangedSince(generation);
+  }
+
+  /**
+   * Bind the last good generation to `rev` when it already is the exact
+   * compile of `source`, and drop any compile queued for that same content.
+   * Returns true when no compile is needed. Never moves a revision backwards
+   * and never runs under a Build lease, whose adoption owns the pending job.
+   */
+  #reconcile(source, rev) {
+    const last = this.last;
+    if (!last || this.disposed || this.resetting || !Number.isSafeInteger(rev) || rev < last.rev) return false;
+    if (!this.#generationCurrent(last, source)) return false;
+    if (last.rev !== rev || last.inputEpoch !== this.inputEpoch) {
+      last.rev = rev;
+      last.inputEpoch = this.inputEpoch;
+      last.srcHash = this.#sourceHash(source);
+      last.rebound = (last.rebound ?? 0) + 1;
+    }
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.timerDueAt = 0;
+    const job = this.pendingJob;
+    this.pendingJob = null;
+    this.lastError = null;
+    if (job) this.#clearDisplayDemand(job);
+    try {
+      this.onResult?.(this.info());
+    } catch {
+      /* observer errors must not break the edit path */
+    }
+    return true;
+  }
+
+  /** A compile whose result nobody wants any more: a rebind already made a
+   * newer revision current, or (for scheduled work) a newer edit is queued. */
+  #compileObsolete(rev, { pending = false } = {}) {
+    if (!this.last) return false; // the first baseline always lands
+    if (this.last.rev > rev) return true;
+    return pending && !!this.pendingJob && this.pendingJob.rev > rev;
+  }
+
+  ownsBuildLease(requestId, token) {
+    return Boolean(this.buildLease && this.buildLease.requestId === requestId && this.buildLease.token === token);
+  }
+
+  #syncInputPath(generation, file) {
+    const resolved = path.resolve(file);
+    return generation?.syncInputMap?.get(resolved) ?? resolved;
+  }
+
+  #logicalInputPath(generation, file) {
+    const resolved = path.resolve(file);
+    return generation?.syncOutputMap?.get(resolved) ?? resolved;
   }
 
   #resolveGeneration(id = null) {
@@ -219,9 +449,131 @@ export class CanonicalRenderer {
     if ((generation.readers ?? 0) === 0) this.#deleteGenerationFiles(generation);
   }
 
-  #registerGeneration(generation) {
+  #seedBuildAuxFiles(seedFiles) {
+    const seeds = seedFiles && typeof seedFiles === 'object' ? seedFiles : {};
+    try {
+      for (const ext of BUILD_SEED_EXTENSIONS) {
+        const file = path.join(this.workDir, `canon.${ext}`);
+        const content = seeds[ext];
+        if (typeof content === 'string') writeFileSync(file, content, 'utf8');
+        else rmSync(file, { force: true });
+      }
+    } catch {
+      // A half-written seed set must not survive: the next compile then runs
+      // its full fixpoint from nothing, exactly as before seeding existed.
+      for (const ext of BUILD_SEED_EXTENSIONS) {
+        try { rmSync(path.join(this.workDir, `canon.${ext}`), { force: true }); } catch { /* best effort */ }
+      }
+    }
+  }
+
+  /**
+   * Place the aux family the previous engine process converged on for this
+   * project (docDir + main file) before the first compile of an open, when
+   * the preamble is the one that wrote it. The 316-page book's first
+   * baseline then needs one pass instead of three. Seeds only save passes:
+   * the compile still reruns until the aux family stops changing, exactly as
+   * latexmk does with the aux files it finds, and a seeded compile that
+   * fails is repeated once from nothing (#compile). `place: false` only
+   * binds the project, for an open that adopts a Build generation and its
+   * own seeds or restarts its aux on purpose.
+   */
+  restoreProjectSeeds(mainFile, source, { place = true } = {}) {
+    this.projectSeedKey = typeof mainFile === 'string' && mainFile
+      ? createHash('sha256').update(`${this.docDir}\0${path.resolve(this.docDir, mainFile)}`).digest('hex').slice(0, 32)
+      : null;
+    this.projectSeedsPlaced = false;
+    if (!place || !this.projectSeedKey || process.env.TDOM_CANON_PROJECT_SEEDS === '0' ||
+        this.last || this.running || this.disposed) return false;
+    // A seed set already in place (a Build import) is newer than ours.
+    if (existsSync(path.join(this.workDir, 'canon.aux'))) return false;
+    let stored;
+    try {
+      stored = JSON.parse(readFileSync(path.join(this.workDir, PROJECT_SEED_DIR, `${this.projectSeedKey}.json`), 'utf8'));
+    } catch {
+      return false;
+    }
+    const seeds = stored?.version === PROJECT_SEED_VERSION && stored.seeds && typeof stored.seeds === 'object'
+      ? stored.seeds : null;
+    if (!seeds || typeof seeds.aux !== 'string') return false;
+    // Package code writes the aux (biblatex's \abx@aux@..., hyperref's
+    // five-field \newlabel): an aux from another preamble can stop the run
+    // under -halt-on-error. Only the preamble the seeds were made by.
+    if (stored.preamble !== preambleHash(source)) return false;
+    let bytes = 0;
+    for (const ext of BUILD_SEED_EXTENSIONS) {
+      if (seeds[ext] === undefined) continue;
+      if (typeof seeds[ext] !== 'string') return false;
+      bytes += Buffer.byteLength(seeds[ext]);
+    }
+    if (bytes > PROJECT_SEED_MAX_BYTES) return false;
+    this.#seedBuildAuxFiles(seeds);
+    this.projectSeedsPlaced = true;
+    return true;
+  }
+
+  #dropProjectSeeds() {
+    if (!this.projectSeedKey) return;
+    try { rmSync(path.join(this.workDir, PROJECT_SEED_DIR, `${this.projectSeedKey}.json`), { force: true }); } catch { /* best effort */ }
+  }
+
+  #persistProjectSeeds(seedFiles, source) {
+    if (!this.projectSeedKey || process.env.TDOM_CANON_PROJECT_SEEDS === '0') return;
+    // \include writes one aux per child, which canon.aux only \@input's and
+    // the pass loop's aux-family check does not hash: a restored canon.aux
+    // could read stale (or another project's) child aux files and stop after
+    // one pass. Such projects keep the fixpoint from nothing.
+    let childAux = true;
+    try {
+      const files = parseFlsFiles(readFileSync(path.join(this.workDir, 'canon.fls'), 'utf8'), this.docDir);
+      childAux = !files || [...files.outputs].some((file) =>
+        file.endsWith('.aux') && path.resolve(file) !== path.join(this.workDir, 'canon.aux'));
+    } catch { /* no recorder: treat as unknown */ }
+    if (childAux) {
+      this.#dropProjectSeeds();
+      return;
+    }
+    const seeds = {};
+    let bytes = 0;
+    for (const ext of BUILD_SEED_EXTENSIONS) {
+      if (typeof seedFiles?.[ext] !== 'string') continue;
+      seeds[ext] = seedFiles[ext];
+      bytes += Buffer.byteLength(seedFiles[ext]);
+    }
+    if (typeof seeds.aux !== 'string' || bytes > PROJECT_SEED_MAX_BYTES) return;
+    const dir = path.join(this.workDir, PROJECT_SEED_DIR);
+    const file = path.join(dir, `${this.projectSeedKey}.json`);
+    const tmp = `${file}.${process.pid}.tmp`;
+    try {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(tmp, JSON.stringify({ version: PROJECT_SEED_VERSION, preamble: preambleHash(source), seeds }), 'utf8');
+      renameSync(tmp, file);
+      const names = readdirSync(dir).filter((name) => name.endsWith('.json'));
+      if (names.length > PROJECT_SEED_MAX_FILES) {
+        const byAge = names
+          .map((name) => {
+            try { return { name, mtime: statSync(path.join(dir, name)).mtimeMs }; } catch { return null; }
+          })
+          .filter(Boolean)
+          .sort((a, b) => a.mtime - b.mtime);
+        for (const { name } of byAge.slice(0, byAge.length - PROJECT_SEED_MAX_FILES)) {
+          rmSync(path.join(dir, name), { force: true });
+        }
+      }
+    } catch {
+      // Seeds are an optimisation: a failed write leaves the next open to
+      // run its fixpoint from nothing.
+      try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    }
+  }
+
+  #registerGeneration(generation, { promote = true } = {}) {
+    if (this.coldBaselineCatchup &&
+        generation.id !== this.coldBaselineCatchup.baselineId) this.coldBaselineCatchup = null;
     this.generations.set(generation.id, generation);
-    this.last = generation;
+    // An export snapshot that a rebind overtook is retained for its caller
+    // but never promoted: canonical must not move to an older revision.
+    if (promote) this.last = generation;
     while (this.generations.size > GENERATION_MAX) {
       const oldestId = this.generations.keys().next().value;
       const oldest = this.generations.get(oldestId);
@@ -253,9 +605,26 @@ export class CanonicalRenderer {
 
   #removeWorkArtifacts() {
     for (const name of readFileNames(this.workDir)) {
-      if (/^canon(?:-\d+)?\.(?:aux|bbl|bcf|blg|log|lof|lot|out|pdf|run\.xml|svg|synctex\.gz|tex|toc)$/.test(name) ||
-          /^canon-\d+-p\d+(?:-\d+)?\.svg$/.test(name)) {
+      if (/^canon(?:-\d+)?\.(?:aux|bbl|bcf|blg|fls|log|lof|lot|out|pdf|run\.xml|svg|synctex\.gz|tex|toc)$/.test(name) ||
+          /^canon-\d+-p\d+(?:-\d+)?\.svg$/.test(name) ||
+          /^canon-import-[0-9a-f-]+\.(?:pdf|synctex\.gz)$/.test(name)) {
         rmSync(path.join(this.workDir, name), { force: true });
+      }
+    }
+  }
+
+  #removeMutableCompileArtifacts() {
+    const pending = [this.workDir];
+    while (pending.length) {
+      const dir = pending.pop();
+      let entries = [];
+      try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const entry of entries) {
+        const file = path.join(dir, entry.name);
+        if (entry.isDirectory()) pending.push(file);
+        else if (entry.isFile() && MUTABLE_COMPILE_ARTIFACT.test(entry.name)) {
+          rmSync(file, { force: true });
+        }
       }
     }
   }
@@ -269,29 +638,47 @@ export class CanonicalRenderer {
       ...this.paintPageInFlight.values(),
       ...this.syncTransformInFlight.values(),
       ...this.sourceBoxInFlight,
+      this.syncTeXHelperPreparation,
     ]);
+    jobs.delete(null);
     if (jobs.size) await Promise.allSettled([...jobs]);
   }
 
   /** execFile with child tracking, so dispose() can kill in-flight work —
    * an orphaned canonical lualatex otherwise burns a core for up to its
    * 5-minute timeout after the server exits. */
-  #exec(cmd, args, opts, { authority = false } = {}) {
+  #exec(cmd, args, opts, { authority = false, buildHeavy = false } = {}) {
     const p = execFileP(cmd, args, authority ? { ...opts, detached: true } : opts);
     if (p.child) {
       if (authority) {
         this.authorityChildren.add(p.child);
-        if (Date.now() < this.authorityPausedUntil) this.#pauseAuthorityChild(p.child);
+        if (this.buildLease || Date.now() < this.authorityPausedUntil) this.#pauseAuthorityChild(p.child);
+      } else if (buildHeavy) {
+        this.buildHeavyChildren.add(p.child);
+        if (this.buildLease) this.#pauseBuildHeavyChild(p.child);
       }
       const cleanup = () => {
         this.children.delete(p.child);
         this.authorityChildren.delete(p.child);
         this.authorityPausedPids.delete(p.child.pid);
+        this.buildHeavyChildren.delete(p.child);
+        this.buildPausedPids.delete(p.child.pid);
       };
       this.children.add(p.child);
       p.then(cleanup, cleanup);
     }
     return p;
+  }
+
+  #pauseBuildHeavyChild(child) {
+    const pid = Number(child?.pid);
+    if (!(pid > 0) || this.buildPausedPids.has(pid)) return;
+    try {
+      child.kill('SIGSTOP');
+      this.buildPausedPids.add(pid);
+    } catch {
+      /* the compile may have finished between spawn and lease acquisition */
+    }
   }
 
   #pauseAuthorityChild(child) {
@@ -317,11 +704,27 @@ export class CanonicalRenderer {
   #resumeAuthority() {
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = null;
+    if (this.buildLease) return;
+    const remaining = this.authorityPausedUntil - Date.now();
+    if (remaining > 0) {
+      this.authorityResumeTimer = setTimeout(() => this.#resumeAuthority(), remaining);
+      this.authorityResumeTimer.unref?.();
+      return;
+    }
     this.authorityPausedUntil = 0;
     for (const [pid, asGroup] of [...this.authorityPausedPids]) {
       try { process.kill(asGroup ? -pid : pid, 'SIGCONT'); } catch { /* already gone */ }
       this.authorityPausedPids.delete(pid);
     }
+  }
+
+  #resumeBuildHeavy() {
+    if (this.buildLease) return;
+    for (const pid of [...this.buildPausedPids]) {
+      try { process.kill(pid, 'SIGCONT'); } catch { /* already gone */ }
+      this.buildPausedPids.delete(pid);
+    }
+    this.#resumeAuthority();
   }
 
   /**
@@ -337,18 +740,337 @@ export class CanonicalRenderer {
     this.authorityPausedUntil = Math.max(this.authorityPausedUntil, Date.now() + delay);
     for (const child of this.authorityChildren) this.#pauseAuthorityChild(child);
     clearTimeout(this.authorityResumeTimer);
-    const resumeWhenDue = () => {
-      const remaining = this.authorityPausedUntil - Date.now();
-      if (remaining > 0) {
-        this.authorityResumeTimer = setTimeout(resumeWhenDue, remaining);
-        this.authorityResumeTimer.unref?.();
-        return;
-      }
-      this.#resumeAuthority();
-    };
-    this.authorityResumeTimer = setTimeout(resumeWhenDue, delay);
+    this.authorityResumeTimer = setTimeout(() => this.#resumeAuthority(), delay);
     this.authorityResumeTimer.unref?.();
     return true;
+  }
+
+  /** Release a shipping foreground lease after replay rejects the revision. */
+  releaseAuthorityDeferral() {
+    if (this.disposed || this.pressure !== 'authority') return false;
+    const deferred = this.authorityPausedUntil > Date.now() || this.authorityPausedPids.size > 0;
+    this.authorityPausedUntil = 0;
+    this.#resumeAuthority();
+    if (this.pendingJob && !this.running && !this.buildLease && this.#hasDisplayDemand(this.pendingJob)) {
+      this.#armPending(0, { keepEarlier: true });
+    }
+    return deferred;
+  }
+
+  acquireBuildLease(requestId, ttlMs = BUILD_LEASE_DEFAULT_MS) {
+    if (this.disposed || this.resetting || typeof requestId !== 'string' ||
+        !/^[A-Za-z0-9:_-]{1,128}$/.test(requestId)) {
+      return { acquired: false, reason: 'unavailable' };
+    }
+    if (this.buildLease) {
+      if (this.buildLease.requestId !== requestId) {
+        return { acquired: false, reason: 'lease-busy', expiresAt: this.buildLease.expiresAt };
+      }
+      return {
+        acquired: true,
+        idempotent: true,
+        requestId,
+        token: this.buildLease.token,
+        expiresAt: this.buildLease.expiresAt,
+      };
+    }
+    const duration = Math.min(BUILD_LEASE_MAX_MS, Math.max(1_000, Number(ttlMs) || BUILD_LEASE_DEFAULT_MS));
+    const token = randomUUID();
+    const expiresAt = Date.now() + duration;
+    const timer = setTimeout(() => this.#releaseBuildLease(requestId, token, 'expired'), duration);
+    timer.unref?.();
+    this.buildLease = { requestId, token, expiresAt, timer };
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.timerDueAt = 0;
+    for (const child of this.authorityChildren) this.#pauseAuthorityChild(child);
+    for (const child of this.buildHeavyChildren) this.#pauseBuildHeavyChild(child);
+    return { acquired: true, idempotent: false, requestId, token, expiresAt };
+  }
+
+  releaseBuildLease(requestId, token) {
+    return this.#releaseBuildLease(requestId, token, 'released');
+  }
+
+  renewBuildLease(requestId, token, ttlMs = BUILD_LEASE_DEFAULT_MS) {
+    if (!this.ownsBuildLease(requestId, token)) return { renewed: false, reason: 'lease-mismatch' };
+    const duration = Math.min(BUILD_LEASE_MAX_MS, Math.max(1_000, Number(ttlMs) || BUILD_LEASE_DEFAULT_MS));
+    clearTimeout(this.buildLease.timer);
+    this.buildLease.expiresAt = Date.now() + duration;
+    this.buildLease.timer = setTimeout(
+      () => this.#releaseBuildLease(requestId, token, 'expired'),
+      duration
+    );
+    this.buildLease.timer.unref?.();
+    return { renewed: true, requestId, token, expiresAt: this.buildLease.expiresAt };
+  }
+
+  #releaseBuildLease(requestId, token, reason) {
+    const lease = this.buildLease;
+    if (!lease) {
+      const previous = this.lastBuildLeaseRelease;
+      return previous?.requestId === requestId && previous?.token === token
+        ? { released: true, alreadyReleased: true, reason: previous.reason }
+        : { released: false, reason: 'lease-not-found' };
+    }
+    if (lease.requestId !== requestId || lease.token !== token) {
+      return { released: false, reason: 'lease-mismatch' };
+    }
+    clearTimeout(lease.timer);
+    this.buildLease = null;
+    this.lastBuildLeaseRelease = { requestId, token, reason };
+    this.#resumeBuildHeavy();
+    for (const resolve of this.buildLeaseWaiters) resolve();
+    this.buildLeaseWaiters.clear();
+    if (this.pendingJob && !this.running && !this.timer && !this.disposed && !this.resetting) {
+      this.#armPending(this.delayFor(this.pendingJob, { preserveIdleStart: true }));
+    }
+    return { released: true, alreadyReleased: false, reason };
+  }
+
+  async waitForBuildLease() {
+    while (this.buildLease) {
+      await new Promise((resolve) => this.buildLeaseWaiters.add(resolve));
+    }
+  }
+
+  /** Prepare the optional range accelerator through the renderer's tracked
+   * process runner. Missing build tools remain an ordinary CLI-fallback case. */
+  prepareSyncTeXHelper(timeoutMs = SYNCTEX_HELPER_PREPARE_MS) {
+    if (this.disposed || this.resetting) return Promise.resolve(false);
+    if (this.syncTeXHelperPreparation) return this.syncTeXHelperPreparation;
+    let job;
+    job = prepareSyncTeXBatchHelper({
+      workDir: this.workDir,
+      timeoutMs,
+      run: (cmd, args, opts) => this.#exec(cmd, args, opts),
+    }).then((executable) => Boolean(executable)).catch(() => false).finally(() => {
+      if (this.syncTeXHelperPreparation === job) this.syncTeXHelperPreparation = null;
+    });
+    this.syncTeXHelperPreparation = job;
+    return job;
+  }
+
+  async prepareBuildGeneration({
+    requestId,
+    token,
+    source,
+    rev,
+    inputEpoch = this.inputEpoch,
+    pdf,
+    pdfHash,
+    synctex,
+    synctexHash,
+    seedFiles = {},
+    syncInputMap = [],
+    inputManifest = [],
+    profile = null,
+    passes = 0,
+    ms = 0,
+  } = {}) {
+    if (!this.ownsBuildLease(requestId, token) || this.disposed || this.resetting ||
+        typeof source !== 'string' || !Number.isSafeInteger(rev) || rev < 0 ||
+        inputEpoch !== this.inputEpoch || typeof pdf !== 'string' || typeof synctex !== 'string' ||
+        !/^[0-9a-f]{64}$/i.test(pdfHash || '') || !/^[0-9a-f]{64}$/i.test(synctexHash || '')) {
+      throw new Error('invalid Build generation');
+    }
+    // Usually shared with constructor initialization. Starting here as well
+    // covers a helper build interrupted by document reset; artifact hashes,
+    // copies and geometry validation proceed in parallel with the C compile.
+    const helperPreparation = this.prepareSyncTeXHelper();
+    const inputEntries = Array.isArray(syncInputMap) ? syncInputMap : [];
+    if (!inputEntries.length || inputEntries.length > 4096) throw new Error('invalid Build SyncTeX input map');
+    const inputMap = new Map();
+    const outputMap = new Map();
+    for (const entry of inputEntries) {
+      if (typeof entry?.logicalPath !== 'string' || !path.isAbsolute(entry.logicalPath) ||
+          typeof entry?.recordedPath !== 'string' || !path.isAbsolute(entry.recordedPath)) {
+        throw new Error('invalid Build SyncTeX input path');
+      }
+      const logical = path.resolve(entry.logicalPath);
+      const recorded = path.resolve(entry.recordedPath);
+      if (inputMap.has(logical) && inputMap.get(logical) !== recorded ||
+          outputMap.has(recorded) && outputMap.get(recorded) !== logical) {
+        throw new Error('ambiguous Build SyncTeX input map');
+      }
+      inputMap.set(logical, recorded);
+      outputMap.set(recorded, logical);
+    }
+    const allowedSeeds = {};
+    let seedBytes = 0;
+    for (const [ext, content] of Object.entries(seedFiles ?? {})) {
+      if (!['aux', 'toc', 'lof', 'lot', 'out'].includes(ext) || typeof content !== 'string') continue;
+      seedBytes += Buffer.byteLength(content);
+      if (seedBytes > 32 * 1024 * 1024) throw new Error('Build aux seed limit exceeded');
+      allowedSeeds[ext] = content;
+    }
+    const importId = randomUUID();
+    const keptPdf = path.join(this.workDir, `canon-import-${importId}.pdf`);
+    const keptSynctex = path.join(this.workDir, `canon-import-${importId}.synctex.gz`);
+    try {
+      const [sourcePdfHash, sourceSynctexHash] = await Promise.all([
+        sha256FileAsync(pdf),
+        sha256FileAsync(synctex),
+      ]);
+      if (sourcePdfHash !== pdfHash.toLowerCase() || sourceSynctexHash !== synctexHash.toLowerCase()) {
+        throw new Error('Build artifact hash mismatch');
+      }
+      await Promise.all([copyFile(pdf, keptPdf), copyFile(synctex, keptSynctex)]);
+      const [copiedPdfHash, copiedSynctexHash] = await Promise.all([
+        sha256FileAsync(keptPdf),
+        sha256FileAsync(keptSynctex),
+      ]);
+      if (copiedPdfHash !== sourcePdfHash || copiedSynctexHash !== sourceSynctexHash) {
+        throw new Error('Build artifact changed while copying');
+      }
+      const info = await this.#exec('pdfinfo', [keptPdf], { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+      if (!/^(?:Creator|Producer):.*LuaTeX/im.test(info.stdout || '')) {
+        throw new Error('Build PDF was not produced by LuaTeX');
+      }
+      const pageCount = pdfInfoPageCount(info.stdout || '');
+      if (!pageCount) throw new Error('Build PDF has no pages');
+      const papers = await pageGeometries(
+        keptPdf,
+        pageCount,
+        (cmd, args, opts) => this.#exec(cmd, args, opts)
+      );
+      if (papers.length !== pageCount || papers.some((paper) => !paper)) {
+        throw new Error('Build PDF geometry is incomplete');
+      }
+      // A missing helper is non-fatal, but a usable imported generation must
+      // not expose its first proof until bounded initialization has settled.
+      await helperPreparation;
+      if (!this.ownsBuildLease(requestId, token) || this.disposed || this.resetting ||
+          inputEpoch !== this.inputEpoch) throw new Error('stale Build generation');
+      return {
+        requestId,
+        token,
+        sourceHash: this.#sourceHash(source, inputEpoch),
+        rev,
+        inputEpoch,
+        pdf: keptPdf,
+        synctex: keptSynctex,
+        pdfHash: copiedPdfHash,
+        synctexHash: copiedSynctexHash,
+        pageCount,
+        papers,
+        seedFiles: allowedSeeds,
+        syncInputMap: inputMap,
+        syncOutputMap: outputMap,
+        inputManifest: this.#inputManifestFromRecords(inputManifest),
+        profile: profile ? structuredClone(profile) : null,
+        passes: Number.isSafeInteger(passes) && passes >= 0 ? passes : 0,
+        ms: Number.isFinite(ms) && ms >= 0 ? Math.round(ms) : 0,
+      };
+    } catch (error) {
+      rmSync(keptPdf, { force: true });
+      rmSync(keptSynctex, { force: true });
+      throw error;
+    }
+  }
+
+  async commitBuildGeneration(prepared, source, rev) {
+    if (!prepared || !this.ownsBuildLease(prepared.requestId, prepared.token) ||
+        this.disposed || this.resetting || typeof source !== 'string' || rev !== prepared.rev ||
+        prepared.inputEpoch !== this.inputEpoch || prepared.sourceHash !== this.#sourceHash(source, prepared.inputEpoch)) {
+      throw new Error('stale Build generation');
+    }
+    const job = this.pendingJob;
+    if (!job || job.rev !== rev || job.inputEpoch !== prepared.inputEpoch ||
+        this.#sourceHash(job.source, job.inputEpoch) !== prepared.sourceHash) {
+      throw new Error('Build generation does not own the pending source');
+    }
+    // A Build lease may have stopped a canonical TeX process which began
+    // before the lease was acquired. Supersede and settle that exact process
+    // before publication. Its catch path is epoch-gated below, so neither a
+    // late success nor a timeout may replace/requeue the adopted generation.
+    const superseded = this.running;
+    this.compileEpoch++;
+    if (superseded) {
+      for (const child of this.authorityChildren) {
+        try {
+          if (child.pid) {
+            try { process.kill(-child.pid, 'SIGKILL'); }
+            catch { child.kill('SIGKILL'); }
+          }
+        } catch { /* already gone */ }
+      }
+      for (const child of this.buildHeavyChildren) {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }
+      await superseded.catch(() => {});
+    }
+    if (!this.ownsBuildLease(prepared.requestId, prepared.token) ||
+        this.disposed || this.resetting || rev !== prepared.rev ||
+        prepared.inputEpoch !== this.inputEpoch ||
+        prepared.sourceHash !== this.#sourceHash(source, prepared.inputEpoch)) {
+      throw new Error('stale Build generation');
+    }
+    const currentJob = this.pendingJob;
+    if (!currentJob || currentJob.rev !== rev || currentJob.inputEpoch !== prepared.inputEpoch ||
+        this.#sourceHash(currentJob.source, currentJob.inputEpoch) !== prepared.sourceHash) {
+      throw new Error('Build generation does not own the pending source');
+    }
+    const id = ++this.idSeq;
+    const keptPdf = path.join(this.workDir, `canon-${id}.pdf`);
+    const keptSynctex = path.join(this.workDir, `canon-${id}.synctex.gz`);
+    try {
+      renameSync(prepared.pdf, keptPdf);
+      renameSync(prepared.synctex, keptSynctex);
+    } catch (error) {
+      rmSync(keptPdf, { force: true });
+      rmSync(keptSynctex, { force: true });
+      this.dropPreparedBuildGeneration(prepared);
+      throw error;
+    }
+    const generation = {
+      id,
+      rev,
+      srcHash: prepared.sourceHash,
+      inputEpoch: prepared.inputEpoch,
+      pdf: keptPdf,
+      synctex: keptSynctex,
+      pdfHash: prepared.pdfHash,
+      synctexHash: prepared.synctexHash,
+      pageCount: prepared.pageCount,
+      paper: prepared.papers[0] ? { w: prepared.papers[0].w, h: prepared.papers[0].h } : null,
+      papers: prepared.papers,
+      passes: prepared.passes,
+      ms: prepared.ms,
+      readers: 0,
+      retired: false,
+      filesDeleted: false,
+      syncWarnings: [],
+      seedFiles: prepared.seedFiles,
+      syncInputMap: prepared.syncInputMap,
+      syncOutputMap: prepared.syncOutputMap,
+      inputManifest: prepared.inputManifest instanceof Map ? prepared.inputManifest : null,
+      importedBuildProfile: prepared.profile,
+    };
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.timerDueAt = 0;
+    this.pendingJob = null;
+    this.#clearDisplayDemand(currentJob);
+    // The Build already converged this document's aux family. Seed the
+    // canonical work directory with it so the first post-Build compile
+    // starts at that fixpoint (one pass for a body edit) instead of
+    // rebuilding the table of contents from an empty or stale aux over up to
+    // three full passes. Every seed extension the Build lacks is removed so
+    // no stale file from an older compile survives beside the new ones.
+    this.#seedBuildAuxFiles(prepared.seedFiles);
+    this.#registerGeneration(generation);
+    this.lastEndAt = Date.now();
+    this.lastError = null;
+    void this.prewarmPaintIndex(id);
+    try { this.onResult?.(this.info()); } catch { /* observer errors do not revoke a committed generation */ }
+    return generation;
+  }
+
+  dropPreparedBuildGeneration(prepared) {
+    if (!prepared) return;
+    if (typeof prepared.pdf === 'string') rmSync(prepared.pdf, { force: true });
+    if (typeof prepared.synctex === 'string') rmSync(prepared.synctex, { force: true });
   }
 
   /** Public snapshot for /doc payloads, reports and SSE events. */
@@ -361,8 +1083,12 @@ export class CanonicalRenderer {
       papers: this.last?.papers ?? (this.last?.paper ? [this.last.paper] : []),
       passes: this.last?.passes ?? 0,
       ms: this.last?.ms ?? 0,
+      rebound: this.last?.rebound ?? 0,
       inFlight: !!(this.running || this.timer || this.pendingJob),
       compiling: Boolean(this.running),
+      runningRev: this.runningJob?.rev ?? null,
+      scheduledRev: this.pendingJob?.rev ?? null,
+      fallbackReason: this.pendingJob?.fallbackReason ?? this.runningJob?.fallbackReason ?? null,
       scheduledInMs: this.timer ? Math.max(0, this.timerDueAt - Date.now()) : null,
       displayDemandRev: this.displayDemand?.rev ?? null,
       error: this.lastError?.message ?? null,
@@ -371,6 +1097,11 @@ export class CanonicalRenderer {
       authorityPaused: this.authorityPausedPids.size > 0,
       authorityChildren: this.authorityChildren.size,
       authorityPauseRemainingMs: Math.max(0, this.authorityPausedUntil - Date.now()),
+      buildLease: this.buildLease ? {
+        active: true,
+        requestId: this.buildLease.requestId,
+        expiresInMs: Math.max(0, this.buildLease.expiresAt - Date.now()),
+      } : { active: false },
     };
   }
 
@@ -379,12 +1110,42 @@ export class CanonicalRenderer {
    * touches, and it does nothing but store the newest source and arm a
    * timer. The compile itself never blocks an edit.
    */
-  schedule(source, rev) {
+  schedule(source, rev, { fallbackReason = null } = {}) {
     if (this.disposed) return;
     // audit runs (fuzz on CI) compare provisional state only — a full
     // lualatex per engine would OOM a 7GB hosted runner for nothing
     if (process.env.TDOM_NO_CANONICAL === '1') return;
-    this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now() };
+    // The edits round-tripped back to compiled content (a root undo, or a
+    // child file restored to its compiled bytes): the last generation is the
+    // exact compile of this revision and is rebound to it right here, so the
+    // edit response and the next anchor see canonical.rev === srcRev.
+    if (!this.buildLease && this.#reconcile(source, rev)) return;
+    // engine.open() schedules the opened source before its boot walk, and the
+    // walk ends by scheduling the same revision again. That second call must
+    // neither queue a second compile of the same bytes behind the running
+    // one (it would sit out the cost cooldown as a phantom pending job) nor
+    // restart the debounce of the one still waiting. It may only bring the
+    // start forward: an opaque document (display pressure) or a closure
+    // fallback starts sooner than the structured baseline debounce.
+    // A Build lease is exempt: the Build import owns the pending job it
+    // creates here (commitBuildGeneration), whatever is already running.
+    // A baseline that already failed for these bytes is not compiled again.
+    const srcHash = this.#sourceHash(source);
+    if (!this.buildLease && !this.pendingJob && (
+      this.runningJob?.rev === rev && this.runningJob.srcHash === srcHash ||
+      !this.running && this.lastError?.rev === rev && this.lastError.srcHash === srcHash
+    )) return;
+    const waiting = this.pendingJob;
+    if (!this.buildLease && waiting && this.timer && waiting.rev === rev && waiting.inputEpoch === this.inputEpoch &&
+        waiting.source === source) {
+      if (fallbackReason && !waiting.fallbackReason) waiting.fallbackReason = fallbackReason;
+      this.#armPending(this.delayFor(waiting), { keepEarlier: true });
+      return;
+    }
+    this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now(), fallbackReason };
+    if (this.coldBaselineCatchup && !this.#hasColdBaselineCatchup(this.pendingJob)) {
+      this.coldBaselineCatchup = null;
+    }
     if (!this.#hasDisplayDemand(this.pendingJob)) this.displayDemand = null;
     this.#armPending(this.delayFor());
   }
@@ -463,6 +1224,12 @@ export class CanonicalRenderer {
       job.inputEpoch === this.displayDemand.inputEpoch && this.activeDisplayDemandIds.size);
   }
 
+  #hasColdBaselineCatchup(job) {
+    const credit = this.coldBaselineCatchup;
+    return Boolean(job && credit && this.last?.id === credit.baselineId &&
+      job.rev === credit.rev && job.inputEpoch === credit.inputEpoch && job.source === credit.source);
+  }
+
   #clearDisplayDemand(job) {
     if (this.#hasDisplayDemand(job)) this.displayDemand = null;
     if (this.lastDisplayDemandRev === job.rev && this.displayDemandInputEpoch === job.inputEpoch) {
@@ -473,6 +1240,7 @@ export class CanonicalRenderer {
   }
 
   #armPending(delay, { keepEarlier = false } = {}) {
+    if (this.buildLease) return;
     const wait = Math.max(0, Number(delay) || 0);
     const dueAt = Date.now() + wait;
     if (keepEarlier && this.timer && this.timerDueAt <= dueAt) return;
@@ -496,7 +1264,17 @@ export class CanonicalRenderer {
    */
   delayFor(job = this.pendingJob, { preserveIdleStart = false } = {}) {
     const since = Date.now() - this.lastEndAt;
-    if (this.pressure !== 'authority' || this.#hasDisplayDemand(job)) {
+    // One bounded exception to the display cooldown: the first canonical
+    // baseline may land for revision N after an already-accepted edit made
+    // revision N+1 the only presentable source. If that edit has no resident
+    // display path, waiting another full long-document cooldown merely keeps
+    // old pixels on screen. #drain grants this only to the job immediately
+    // behind a successfully landed first baseline; later compiles retain the
+    // normal duty-cycle bound. The credit persists across the first
+    // baseline's result broadcast so a viewer's soft demand can escalate.
+    if (this.#hasColdBaselineCatchup(job) && this.#hasDisplayDemand(job) &&
+        this.residentImpossibleDemandIds.size) return this.displayDebounceMs;
+    if (this.pressure !== 'authority' || job?.fallbackReason || this.#hasDisplayDemand(job)) {
       // canonical is needed for display — stay responsive on small
       // documents, but never let a long document compile back-to-back
       if (!this.last?.ms) return this.displayDebounceMs;
@@ -520,20 +1298,21 @@ export class CanonicalRenderer {
    * during an export). Newer edits stay on the normal cadence timer.
    */
   async ensure(source, rev) {
-    let inputEpoch = this.inputEpoch;
-    let srcHash = this.#sourceHash(source, inputEpoch);
-    if (this.last && this.last.srcHash === srcHash) return this.last;
+    await this.waitForBuildLease();
+    if (this.#reconcile(source, rev)) return this.last;
     while (this.running) await this.running;
     if (this.disposed) throw new Error('renderer disposed');
-    inputEpoch = this.inputEpoch;
-    srcHash = this.#sourceHash(source, inputEpoch);
-    if (this.last && this.last.srcHash === srcHash) return this.last;
+    if (this.#reconcile(source, rev)) return this.last;
+    const inputEpoch = this.inputEpoch;
+    const srcHash = this.#sourceHash(source, inputEpoch);
     // No await between the check above and this assignment: #drain and
     // ensure both claim `running` synchronously, so two compiles can never
     // share the workdir.
+    const compileEpoch = this.compileEpoch;
     this.runningJob = { rev, inputEpoch };
-    this.running = this.#compile({ source, rev, inputEpoch })
+    this.running = this.#compile({ source, rev, inputEpoch, compileEpoch })
       .catch((err) => {
+        if (compileEpoch !== this.compileEpoch || err?.tdomSuperseded) return;
         this.lastError = { rev, message: String(err?.message || err) };
       })
       .finally(() => {
@@ -541,7 +1320,20 @@ export class CanonicalRenderer {
         this.runningJob = null;
         this.#clearDisplayDemand({ rev, inputEpoch });
       });
-    await this.running;
+    const compiled = await this.running;
+    if (compileEpoch !== this.compileEpoch) {
+      if (this.#generationCurrent(this.last, source)) return this.last;
+      throw new Error('canonical compile superseded');
+    }
+    if (compiled?.srcHash === srcHash && this.generations.has(compiled.id)) {
+      this.lastEndAt = Date.now();
+      try {
+        this.onResult?.(this.info());
+      } catch {
+        /* observer errors must not break the export path */
+      }
+      return compiled;
+    }
     this.lastEndAt = Date.now();
     try {
       this.onResult?.(this.info());
@@ -549,11 +1341,13 @@ export class CanonicalRenderer {
       /* observer errors must not break the export path */
     }
     if (this.last && this.last.srcHash === srcHash) return this.last;
+    if (this.#reconcile(source, rev)) return this.last;
     throw new Error(this.lastError?.message || 'canonical compile failed');
   }
 
   /** Wait until no compile is queued or running (tests / export). */
   async settle() {
+    await this.waitForBuildLease();
     while (this.timer || this.running || this.pendingJob) {
       if (this.timer) {
         clearTimeout(this.timer);
@@ -567,8 +1361,14 @@ export class CanonicalRenderer {
   async #drain({ waitForResident = false } = {}) {
     if (this.running) return this.running;
     if (!this.pendingJob) return;
+    if (this.buildLease) return;
     const job = this.pendingJob;
-    if (waitForResident && this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
+    if (this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
+        Date.now() < this.authorityPausedUntil) {
+      this.#armPending(this.authorityPausedUntil - Date.now());
+      return;
+    }
+    if (waitForResident && !job.fallbackReason && this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
         !this.residentImpossibleDemandIds.size && typeof this.residentDisplayState === 'function') {
       const state = this.residentDisplayState(job.rev);
       // Give only this foreground cohort a bounded chance to supply exact
@@ -582,30 +1382,48 @@ export class CanonicalRenderer {
         return;
       }
     }
+    if (this.#hasColdBaselineCatchup(job)) this.coldBaselineCatchup = null;
     this.pendingJob = null;
-    if (this.last && this.last.srcHash === this.#sourceHash(job.source, job.inputEpoch)) {
+    if (this.#generationCurrent(this.last, job.source)) {
       // the newest source is already compiled (an export ran it, or the
       // edits round-tripped back) — record the rev, skip the compile
-      this.last.rev = job.rev;
-      this.lastError = null;
       this.#clearDisplayDemand(job);
-      try {
-        this.onResult?.(this.info());
-      } catch {
-        /* observer errors must not break the drain loop */
-      }
+      this.#reconcile(job.source, job.rev);
       return;
     }
-    this.runningJob = { rev: job.rev, inputEpoch: job.inputEpoch };
+    const startedWithoutCanonical = !this.last;
+    const compileEpoch = this.compileEpoch;
+    this.runningJob = {
+      rev: job.rev,
+      inputEpoch: job.inputEpoch,
+      fallbackReason: job.fallbackReason,
+      srcHash: this.#sourceHash(job.source, job.inputEpoch),
+    };
     this.running = this.#compile({
       ...job,
+      compileEpoch,
       // Scheduled authority confirmation is intentionally below the live
       // complete-PDF path. Export, opaque display and demanded revisions stay
       // at normal priority because the user is directly waiting for them.
-      background: this.pressure === 'authority' && !this.#hasDisplayDemand(job),
+      background: this.pressure === 'authority' && !job.fallbackReason && !this.#hasDisplayDemand(job),
+      // Scheduled work yields between passes once a newer edit is queued or
+      // a rebind made a newer revision current; export/ensure never does.
+      superseding: true,
     })
       .catch((err) => {
-        this.lastError = { rev: job.rev, message: String(err?.message || err) };
+        if (compileEpoch !== this.compileEpoch || err?.tdomSuperseded) return;
+        this.lastError = {
+          rev: job.rev,
+          message: String(err?.message || err),
+          srcHash: this.#sourceHash(job.source, job.inputEpoch),
+        };
+        // execFile's wall timeout keeps advancing while SIGSTOP holds a
+        // pre-existing compile. Preserve that exact job for one normal
+        // post-Build retry; a newer edit remains latest-wins.
+        if (this.buildLease && job.inputEpoch === this.inputEpoch &&
+            (!this.pendingJob || this.pendingJob.rev <= job.rev)) {
+          this.pendingJob = job;
+        }
       })
       .finally(() => {
         this.running = null;
@@ -613,6 +1431,7 @@ export class CanonicalRenderer {
         this.#clearDisplayDemand(job);
       });
     await this.running;
+    if (compileEpoch !== this.compileEpoch) return;
     this.lastEndAt = Date.now();
     try {
       this.onResult?.(this.info());
@@ -625,12 +1444,46 @@ export class CanonicalRenderer {
     // which was the single biggest CPU sink on long documents. settle()
     // still converges promptly for exports/tests (it clears the timer and
     // drains directly).
-    if (this.pendingJob && !this.disposed && !this.timer) {
-      this.#armPending(this.delayFor());
+    if (this.pendingJob && !this.disposed) {
+      const landedFirstBaseline = startedWithoutCanonical &&
+        this.last?.rev === job.rev && this.last?.inputEpoch === job.inputEpoch;
+      if (landedFirstBaseline && this.pendingJob.rev > job.rev) {
+        this.coldBaselineCatchup = {
+          baselineId: this.last.id,
+          rev: this.pendingJob.rev,
+          inputEpoch: this.pendingJob.inputEpoch,
+          source: this.pendingJob.source,
+        };
+      }
+      if (!this.timer) this.#armPending(this.delayFor(this.pendingJob));
     }
   }
 
-  async #compile({ source, rev, inputEpoch = this.inputEpoch, background = false }) {
+  async #compile(job) {
+    // The first compile of an open may start from the project's kept aux
+    // (restoreProjectSeeds). If that run fails, the kept aux may be why (a
+    // package the preamble no longer loads wrote it): forget it and compile
+    // once more from nothing, which is exactly the unseeded behaviour. The
+    // failed run already removed its mutable aux files.
+    const seeded = this.projectSeedsPlaced === true;
+    this.projectSeedsPlaced = false;
+    try {
+      return await this.#compileOnce(job);
+    } catch (error) {
+      const epoch = job.compileEpoch ?? this.compileEpoch;
+      if (!seeded || error?.tdomSuperseded || this.disposed || epoch !== this.compileEpoch) throw error;
+      this.#dropProjectSeeds();
+      return this.#compileOnce(job);
+    }
+  }
+
+  async #compileOnce({ source, rev, inputEpoch = this.inputEpoch, background = false,
+    compileEpoch = this.compileEpoch, superseding = false }) {
+    const superseded = () => {
+      const err = new Error('canonical compile superseded');
+      err.tdomSuperseded = true;
+      return err;
+    };
     const t0 = performance.now();
     const srcHash = this.#sourceHash(source, inputEpoch);
     const tex = path.join(this.workDir, 'canon.tex');
@@ -649,17 +1502,30 @@ export class CanonicalRenderer {
     let passes = 0;
     let log = '';
     let before = auxState();
+    try {
     // aux fixpoint, the honest way latexmk does it: rerun while the aux
     // family keeps changing (toc page numbers, forward refs), capped
     while (passes < MAX_PASSES) {
       passes++;
       log = await this.#runLatex(tex, background);
       if (this.disposed) throw new Error('renderer disposed');
+      if (compileEpoch !== this.compileEpoch) throw new Error('canonical compile superseded');
+      const indexChanged = await this.#runIndexTools(background);
+      if (this.disposed) throw new Error('renderer disposed');
+      if (compileEpoch !== this.compileEpoch) throw new Error('canonical compile superseded');
       const after = auxState();
-      const changed = after !== before;
+      const changed = after !== before || indexChanged;
       before = after;
       if (!changed) break;
+      // Another pass of an obsolete snapshot only delays the revision the
+      // viewer is waiting for. The first baseline is exempt (#compileObsolete).
+      if (superseding && this.#compileObsolete(rev, { pending: true })) throw superseded();
     }
+    // A rebind made a newer revision current while this snapshot compiled:
+    // publishing it would move canonical backwards. Scheduled work stops
+    // here; an export keeps its bytes without promotion.
+    const obsolete = this.#compileObsolete(rev);
+    if (obsolete && superseding) throw superseded();
     const pdf = path.join(this.workDir, 'canon.pdf');
     const pageCount = pageCountFrom(log);
     if (!existsSync(pdf) || !pageCount) {
@@ -681,15 +1547,19 @@ export class CanonicalRenderer {
     );
     const firstPaper = papers[0] ?? null;
     const seedFiles = {};
-    for (const name of auxFiles) {
+    for (const name of [...auxFiles, 'canon.ind']) {
       const file = path.join(this.workDir, name);
       if (existsSync(file)) seedFiles[path.extname(name).slice(1)] = readFileSync(file, 'utf8');
     }
+    // Only a compile no input change interrupted can vouch for the bytes it
+    // read; otherwise the generation keeps epoch-only identity.
+    const inputManifest = inputEpoch === this.inputEpoch ? this.#inputManifestFromRecorder() : null;
     const generation = {
       id,
       rev,
       srcHash,
       inputEpoch,
+      inputManifest,
       pdf: kept,
       synctex: hasSynctex ? keptSynctex : null,
       pdfHash: sha256File(kept),
@@ -710,17 +1580,68 @@ export class CanonicalRenderer {
       // cannot be reconstructed from the renderer's scalar label table.
       seedFiles,
     };
-    if (this.disposed) {
+    if (this.disposed || compileEpoch !== this.compileEpoch) {
       this.#deleteGenerationFiles(generation);
-      throw new Error('renderer disposed');
+      throw new Error(this.disposed ? 'renderer disposed' : 'canonical compile superseded');
     }
-    this.#registerGeneration(generation);
+    this.#registerGeneration(generation, { promote: !obsolete });
+    if (!obsolete) this.#persistProjectSeeds(seedFiles, source);
     // Keep PDF import/open off the typing path. This intentionally does not
     // await: canonical pixels are already committed and the index is merely
     // an optional fast-proof accelerator.
     void this.prewarmPaintIndex(id);
-    this.lastError = null;
-    return generation;
+      this.lastError = null;
+      return generation;
+    } catch (error) {
+      try { this.#removeMutableCompileArtifacts(); } catch { /* preserve the compile error */ }
+      throw error;
+    }
+  }
+
+  /** makeindex, as latexmk runs it between passes.
+   *
+   * Canonical compiles with -output-directory, so imakeidx's own makeindex
+   * call (when shell escape allows it at all) looks for the .idx beside the
+   * document and finds nothing: the editing view lacked the index the Build
+   * has, with a different page count (issue #68 of tex64-internal).
+   * Bibliographies do not need this; the server materializes canon.bbl from
+   * the project's .bib files before compiling. makeindex runs only when an
+   * .idx changed since it last ran, so an edit that touches no index entry
+   * costs nothing. Returns whether any .ind changed (one more pass). */
+  async #runIndexTools(background) {
+    let files = null;
+    try { files = parseFlsFiles(readFileSync(path.join(this.workDir, 'canon.fls'), 'utf8'), this.docDir); } catch { /* no recorder */ }
+    const readText = (file) => { try { return readFileSync(file, 'utf8'); } catch { return null; } };
+    const requestedNice = Number(process.env.TDOM_CANON_NICE ?? 10);
+    const niceLevel = Number.isFinite(requestedNice) ? requestedNice : 10;
+    let changed = false;
+    for (const idx of files?.outputs ?? []) {
+      if (!idx.endsWith('.idx') || !isPathInside(this.workDir, idx)) continue;
+      const ind = `${idx.slice(0, -4)}.ind`;
+      const key = fnv1a(readText(idx) ?? '');
+      if (this.indexToolKeys.get(ind) === key && existsSync(ind)) continue;
+      const before = readText(ind);
+      const args = ['-q', '-o', path.basename(ind), path.basename(idx)];
+      try {
+        await this.#exec(
+          background ? 'nice' : 'makeindex',
+          background ? ['-n', String(niceLevel), 'makeindex', ...args] : args,
+          {
+            cwd: path.dirname(idx),
+            timeout: INDEX_TOOL_TIMEOUT_MS,
+            maxBuffer: 16 * 1024 * 1024,
+            env: withProjectInputs(process.env, { docDir: this.docDir, overlayDir: this.overlayDir, recursive: true }),
+          },
+          { authority: background, buildHeavy: !background }
+        );
+      } catch {
+        // A missing makeindex or a malformed entry leaves TeX to report the
+        // missing index, exactly as a latexmk run would.
+      }
+      this.indexToolKeys.set(ind, key);
+      if (readText(ind) !== before) changed = true;
+    }
+    return changed;
   }
 
   async #runLatex(tex, background = false) {
@@ -728,7 +1649,9 @@ export class CanonicalRenderer {
     try {
       const latexArgs = [
         '-synctex=1',
+        '-recorder',
         '-interaction=nonstopmode',
+        '-halt-on-error',
         '-output-directory',
         this.workDir,
         tex,
@@ -752,13 +1675,14 @@ export class CanonicalRenderer {
             recursive: true,
           }),
         },
-        { authority: background }
+        { authority: background, buildHeavy: !background }
       );
       out = (r.stdout || '') + (r.stderr || '');
     } catch (err) {
-      // nonstopmode exits non-zero on any error but often still ships a
-      // usable PDF — the caller decides based on the artifacts
       out = (err.stdout || '') + (err.stderr || '') || String(err.message || err);
+      // TeX can ship pages before failing. Those partial bytes must never
+      // replace the last successful generation or hide its error report.
+      throw new Error(texErrorFrom(out) || String(err.message || err));
     }
     return out;
   }
@@ -855,7 +1779,8 @@ export class CanonicalRenderer {
         maxBuffer: 4 * 1024 * 1024,
         env: process.env,
       });
-      return parseSynctexEditOutput(`${result.stdout || ''}\n${result.stderr || ''}`, this.docDir);
+      const hit = parseSynctexEditOutput(`${result.stdout || ''}\n${result.stderr || ''}`, this.docDir);
+      return hit ? { ...hit, file: this.#logicalInputPath(cur, hit.file) } : null;
     } catch {
       return null;
     } finally {
@@ -875,34 +1800,172 @@ export class CanonicalRenderer {
       outputs[0] ?? null;
   }
 
-  async forwardSyncAll({ file, line, column = 1, id = null } = {}) {
+  async forwardSyncAll({ file, line, column = 1, id = null, deadline = Infinity, strict = false } = {}) {
     if (!file || !Number.isFinite(line) || line < 1) return [];
     const cur = this.#acquireGeneration(id);
     if (!cur) return [];
     try {
       if (!cur.synctex) return [];
-      const input = `${Math.floor(line)}:${Math.max(1, Math.floor(Number(column) || 1))}:${path.resolve(file)}`;
-      const result = await this.#exec('synctex', ['view', '-i', input, '-o', cur.pdf], {
-        cwd: this.docDir,
-        timeout: 15_000,
-        maxBuffer: 4 * 1024 * 1024,
-        env: process.env,
-      });
-      const raw = parseSynctexViewOutputs(`${result.stdout || ''}\n${result.stderr || ''}`);
-      const transforms = new Map();
-      await Promise.all([...new Set(raw.map((item) => item.page))].map(async (pageNumber) => {
-        transforms.set(pageNumber, await this.#syncContentTransform(cur, pageNumber));
-      }));
-      return raw.flatMap((item) => {
-        const contentTransform = transforms.get(item.page);
-        return contentTransform == null ? [] : [syncTeXResultToDisplayed(
-          item,
-          cur.papers?.[item.page - 1] ?? null,
-          contentTransform ?? IDENTITY_AFFINE
-        )];
-      });
+      const input = `${Math.floor(line)}:${Math.max(1, Math.floor(Number(column) || 1))}:${this.#syncInputPath(cur, file)}`;
+      // One generation's SyncTeX never changes, and every CLI call re-reads
+      // the whole file: a long document's block proof (one query per source
+      // line) otherwise cannot fit the canonical-anchor budget. The caret
+      // warm prefetches through this cache; the edit's proof reuses it.
+      cur.forwardSyncCache ??= new Map();
+      let job = cur.forwardSyncCache.get(input);
+      if (!job) {
+        job = (async () => {
+          const remaining = Number.isFinite(deadline)
+            ? Math.max(0, Math.floor(deadline - performance.now()))
+            : 15_000;
+          if (remaining <= 0) throw new Error('SyncTeX query deadline exceeded');
+          const result = await this.#exec('synctex', ['view', '-i', input, '-o', cur.pdf], {
+            cwd: this.docDir,
+            timeout: Math.min(15_000, remaining),
+            maxBuffer: 4 * 1024 * 1024,
+            env: process.env,
+          });
+          const raw = parseSynctexViewOutputs(`${result.stdout || ''}\n${result.stderr || ''}`);
+          const transforms = new Map();
+          await Promise.all([...new Set(raw.map((item) => item.page))].map(async (pageNumber) => {
+            transforms.set(pageNumber, await this.#syncContentTransform(cur, pageNumber));
+          }));
+          return raw.flatMap((item) => {
+            const contentTransform = transforms.get(item.page);
+            return contentTransform == null ? [] : [syncTeXResultToDisplayed(
+              item,
+              cur.papers?.[item.page - 1] ?? null,
+              contentTransform ?? IDENTITY_AFFINE
+            )];
+          });
+        })();
+        job.catch(() => {
+          if (cur.forwardSyncCache?.get(input) === job) cur.forwardSyncCache.delete(input);
+        });
+        cur.forwardSyncCache.set(input, job);
+        while (cur.forwardSyncCache.size > 4096) {
+          cur.forwardSyncCache.delete(cur.forwardSyncCache.keys().next().value);
+        }
+      }
+      if (Number.isFinite(deadline)) {
+        const remaining = Math.max(0, Math.floor(deadline - performance.now()));
+        if (remaining <= 0) return strict ? null : [];
+        let timer;
+        const result = await Promise.race([
+          job,
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('SyncTeX query deadline exceeded')), remaining);
+          }),
+        ]).finally(() => clearTimeout(timer));
+        return [...result];
+      }
+      return [...await job];
     } catch {
-      return [];
+      return strict ? null : [];
+    } finally {
+      this.#releaseGeneration(cur);
+    }
+  }
+
+  /** Query a source-line range against one retained generation. The native
+   * helper parses that generation's SyncTeX once. It is only an acceleration:
+   * unavailable, malformed, partial, or late helper output falls back to the
+   * existing per-line CLI queries before the caller's absolute deadline. */
+  async forwardSyncRange({ file, firstLine, lastLine, firstColumn = 1, id = null, deadline = Infinity } = {}) {
+    if (!file || !Number.isInteger(firstLine) || !Number.isInteger(lastLine) || firstLine < 1 ||
+        lastLine < firstLine || lastLine - firstLine >= 512 ||
+        !Number.isInteger(firstColumn) || firstColumn < 1) return null;
+    const cur = this.#acquireGeneration(id);
+    if (!cur) return null;
+    try {
+      if (!cur.synctex) return null;
+      const remaining = () => Number.isFinite(deadline)
+        ? Math.max(0, Math.floor(deadline - performance.now()))
+        : 15_000;
+      const syncPath = this.#syncInputPath(cur, file);
+      cur.forwardSyncCache ??= new Map();
+      const inputs = Array.from({ length: lastLine - firstLine + 1 }, (_, index) => {
+        const line = firstLine + index;
+        const column = index === 0 ? firstColumn : 1;
+        return `${line}:${column}:${syncPath}`;
+      });
+      if (inputs.every((input) => cur.forwardSyncCache.has(input))) {
+        const cached = await Promise.all(inputs.map((input) => this.forwardSyncAll({
+          file,
+          line: Number(input.slice(0, input.indexOf(':'))),
+          column: input === inputs[0] ? firstColumn : 1,
+          id: cur.id,
+          deadline,
+          strict: true,
+        })));
+        if (cached.every((group) => Array.isArray(group))) return cached;
+        if (remaining() <= 0) return null;
+      }
+      const helperBudget = Math.min(5_000, remaining());
+      let groups = helperBudget > 0 ? await querySyncTeXRange({
+        workDir: this.workDir,
+        pdf: cur.pdf,
+        file: syncPath,
+        firstLine,
+        lastLine,
+        firstColumn,
+        timeoutMs: helperBudget,
+        run: (cmd, args, opts) => this.#exec(cmd, args, opts),
+      }) : null;
+      if (groups) {
+        const pages = [...new Set(groups.flat().map((item) => item.page))];
+        const transforms = new Map();
+        await Promise.all(pages.map(async (pageNumber) => {
+          transforms.set(pageNumber, await this.#syncContentTransform(cur, pageNumber));
+        }));
+        let transformIncomplete = false;
+        groups = groups.map((items) => items.map((item) => {
+          const contentTransform = transforms.get(item.page);
+          if (contentTransform == null) {
+            transformIncomplete = true;
+            return null;
+          }
+          return syncTeXResultToDisplayed(
+            item,
+            cur.papers?.[item.page - 1] ?? null,
+            contentTransform ?? IDENTITY_AFFINE
+          );
+        }));
+        if (transformIncomplete || remaining() <= 0) groups = null;
+      }
+      if (groups) {
+        for (let index = 0; index < groups.length; index++) {
+          const input = inputs[index];
+          if (!cur.forwardSyncCache.has(input)) cur.forwardSyncCache.set(input, Promise.resolve(groups[index]));
+        }
+        while (cur.forwardSyncCache.size > 4096) {
+          cur.forwardSyncCache.delete(cur.forwardSyncCache.keys().next().value);
+        }
+        return groups;
+      }
+
+      const lines = Array.from({ length: lastLine - firstLine + 1 }, (_, index) => firstLine + index);
+      groups = Array(lines.length);
+      let cursor = 0;
+      const workers = Array.from({ length: Math.min(8, lines.length) }, async () => {
+        while (cursor < lines.length) {
+          if (remaining() <= 0) return;
+          const index = cursor++;
+          groups[index] = await this.forwardSyncAll({
+            file,
+            line: lines[index],
+            column: index === 0 ? firstColumn : 1,
+            id: cur.id,
+            deadline,
+            strict: true,
+          });
+        }
+      });
+      await Promise.all(workers);
+      return groups.length === lines.length &&
+        lines.every((_, index) => Array.isArray(groups[index])) ? groups : null;
+    } catch {
+      return null;
     } finally {
       this.#releaseGeneration(cur);
     }
@@ -923,7 +1986,9 @@ export class CanonicalRenderer {
           const compressed = await readFile(cur.synctex);
           if (compressed.length > 8 * 1024 * 1024) return null;
           const text = await gunzipP(compressed, { maxOutputLength: 32 * 1024 * 1024 });
-          const boxes = parseSyncTeXSourceBoxes(text.toString('utf8'), { file, page, startLine, endLine });
+          const boxes = parseSyncTeXSourceBoxes(text.toString('utf8'), {
+            file: this.#syncInputPath(cur, file), page, startLine, endLine,
+          });
           if (!boxes || this.disposed || this.resetting) return null;
           const transform = await this.#syncContentTransform(cur, page);
           if (transform == null) return null;
@@ -942,8 +2007,7 @@ export class CanonicalRenderer {
   /** True only when the supplied resident source is byte-identical to the
    * source/input epoch that produced one retained canonical generation. */
   sourceMatches(source, id = null) {
-    const generation = this.#resolveGeneration(id);
-    return Boolean(generation && generation.srcHash === this.#sourceHash(source, generation.inputEpoch));
+    return this.#generationCurrent(this.#resolveGeneration(id), source);
   }
 
   /** Immutable identity used by anchor tickets and tests. */
@@ -1225,9 +2289,26 @@ export class CanonicalRenderer {
     return readFileSync(this.last.pdf);
   }
 
-  /** Mark non-source inputs dirty. The next schedule/ensure compiles again. */
-  invalidateInputs() {
+  /** Mark non-source inputs dirty. The next schedule/ensure compiles again
+   * unless every path in `changes` hashes back to the bytes the last
+   * generation was compiled from. No `changes` (or `unknown`) records an
+   * unprovable epoch. */
+  invalidateInputs(changes = null) {
     this.inputEpoch++;
+    let paths = null;
+    if (changes && changes.unknown !== true) {
+      paths = new Set();
+      for (const list of [changes.changed, changes.removed]) {
+        for (const file of Array.isArray(list) ? list : []) {
+          if (typeof file === 'string' && file) paths.add(this.#inputIdentity(file));
+        }
+      }
+    }
+    this.inputInvalidations.set(this.inputEpoch, paths);
+    while (this.inputInvalidations.size > INPUT_INVALIDATION_MAX) {
+      this.inputInvalidations.delete(this.inputInvalidations.keys().next().value);
+    }
+    this.coldBaselineCatchup = null;
     this.displayDemand = null;
     this.activeDisplayDemandIds.clear();
     this.residentImpossibleDemandIds.clear();
@@ -1242,6 +2323,7 @@ export class CanonicalRenderer {
    */
   async resetDocument(docDir = this.docDir, overlayDir = this.overlayDir) {
     this.resetting = true;
+    this.compileEpoch++;
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = null;
     this.authorityPausedUntil = 0;
@@ -1249,6 +2331,7 @@ export class CanonicalRenderer {
     this.timer = null;
     this.timerDueAt = 0;
     this.pendingJob = null;
+    this.coldBaselineCatchup = null;
     this.displayDemand = null;
     this.displayDemandEpoch = null;
     this.lastDisplayDemandRev = -1;
@@ -1270,27 +2353,37 @@ export class CanonicalRenderer {
       this.children.clear();
       this.authorityChildren.clear();
       this.authorityPausedPids.clear();
+      this.buildHeavyChildren.clear();
+      this.buildPausedPids.clear();
       this.docDir = path.resolve(docDir);
       this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
+      this.projectSeedKey = null;
+      this.projectSeedsPlaced = false;
       this.#clearGenerations();
       this.lastError = null;
       this.lastEndAt = 0;
       this.inputEpoch++;
+      this.inputInvalidations.clear();
+      this.inputHashCache.clear();
       this.#removeWorkArtifacts();
     } finally {
       this.resetting = false;
+      if (!this.disposed) void this.prepareSyncTeXHelper();
     }
   }
 
   dispose() {
     this.disposed = true;
+    this.compileEpoch++;
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = null;
     this.authorityPausedUntil = 0;
+    if (this.buildLease) this.#releaseBuildLease(this.buildLease.requestId, this.buildLease.token, 'disposed');
     clearTimeout(this.timer);
     this.timer = null;
     this.timerDueAt = 0;
     this.pendingJob = null;
+    this.coldBaselineCatchup = null;
     this.displayDemand = null;
     this.displayDemandEpoch = null;
     this.lastDisplayDemandRev = -1;
@@ -1311,6 +2404,8 @@ export class CanonicalRenderer {
     this.children.clear();
     this.authorityChildren.clear();
     this.authorityPausedPids.clear();
+    this.buildHeavyChildren.clear();
+    this.buildPausedPids.clear();
     this.#clearGenerations();
     this.#removeWorkArtifacts();
   }
@@ -1741,6 +2836,16 @@ async function pageGeometries(pdfPath, pageCount, exec = execFileP) {
 
 function sha256File(file) {
   return createHash('sha256').update(readFileSync(file)).digest('hex');
+}
+
+async function sha256FileAsync(file) {
+  return createHash('sha256').update(await readFile(file)).digest('hex');
+}
+
+function pdfInfoPageCount(output) {
+  const match = String(output || '').match(/^Pages:\s*(\d+)\s*$/im);
+  const count = Number(match?.[1]);
+  return Number.isSafeInteger(count) && count > 0 ? count : 0;
 }
 
 function texErrorFrom(log) {

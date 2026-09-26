@@ -27,6 +27,14 @@ export function buildDomSnapshot({
       : { line: base.line + lines.length - 1, column: lines.at(-1).length + 1 };
   };
   const editSource = (block, region) => {
+    if (block.sourceParts) {
+      const part = block.sourceParts.find(item => region.contentStart >= item.at && region.contentEnd <= item.to);
+      if (!part) return null;
+      const text = block.text.slice(part.at, part.to);
+      return { file: part.file,
+        start: relativePosition(part.sourceStart, text, region.contentStart - part.at),
+        end: relativePosition(part.sourceStart, text, region.contentEnd - part.at) };
+    }
     if (block.file && block.sourceStart) {
       return {
         file: block.file,
@@ -74,7 +82,7 @@ export function buildDomSnapshot({
           sourceValue: region.sourceValue,
           display: region.display,
           source: editSource(b, region),
-        })),
+        })).filter(region => region.source),
         ...preambleEditRegions
           .filter(() => /\\maketitle\b/.test(b.text))
           .map((region) => ({
@@ -105,6 +113,7 @@ export function buildDomSnapshot({
               start: position(file, b.start),
               end: position(file, b.end),
             },
+        sourceRanges: b.sourceParts?.map(part => ({ file: part.file, start: part.sourceStart, end: part.sourceEnd })),
         labels: (b.galley?.labels ?? []).map((l) => l.k),
         refs: b.galley?.refs ?? [],
         pages: blockPages.get(b.id) ?? [],

@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
-import { ShippingChain } from '../engine/checkpoint/shipping.js';
+import { ShippingChain, joinOpenBracketArguments } from '../engine/checkpoint/shipping.js';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 
 const execFileP = promisify(execFile);
@@ -30,6 +30,7 @@ const opts = available ? {} : { skip: 'lualatex not installed' };
 
 const source = readFileSync(DOC, 'utf8');
 const privatePdf = process.env.TDOM_SHIP_PRIVATE_PDF !== '0';
+const previousWaveCutoff = process.env.TDOM_SHIP_WAVE_CUTOFF;
 
 async function coldCompile(src, dir) {
   rmSync(dir, { recursive: true, force: true });
@@ -80,6 +81,9 @@ let truth0;
 let baselineOutcomes = [];
 before(async () => {
   if (!available) return;
+  if (process.env.TDOM_TEST_WAVE_CUTOFF) {
+    process.env.TDOM_SHIP_WAVE_CUTOFF = process.env.TDOM_TEST_WAVE_CUTOFF;
+  }
   rmSync(WORK, { recursive: true, force: true });
   mkdirSync(WORK, { recursive: true });
   truth0 = await coldCompile(source, path.join(WORK, 'truth0'));
@@ -90,6 +94,8 @@ before(async () => {
 });
 after(async () => {
   if (chain) await chain.close();
+  if (previousWaveCutoff === undefined) delete process.env.TDOM_SHIP_WAVE_CUTOFF;
+  else process.env.TDOM_SHIP_WAVE_CUTOFF = previousWaveCutoff;
 });
 
 test('slice 1: every page ships as a real PDF identical to a cold compile', opts, async () => {
@@ -187,6 +193,7 @@ test('unsafe syntax edits fail closed before a replay generation is forked', opt
   const gen = chain.gen;
   const at = current.indexOf('very rapid live citations');
   assert.ok(at > 0);
+  // Typing the math delimiters themselves changes the unit's syntax.
   const mathEdit = current.slice(0, at) + '$x$' + current.slice(at);
   assert.deepEqual(chain.resume(mathEdit), { mode: 'reboot-needed', reason: 'non-plain-edit' });
   assert.equal(chain.gen, gen, 'no speculative generation was created');
@@ -338,7 +345,10 @@ test('slice 3: engine integration — an edit lands a ship page event', opts, as
     assert.ok(Number.isFinite(hit.acceptedAt), 'renderer receives wave acceptance time');
     assert.ok(Number.isFinite(hit.deadlineAt), 'renderer receives the hard display deadline');
     assert.ok(hit.deadlineAt > hit.acceptedAt);
-    assert.equal(hit.deadlineAt - hit.acceptedAt, 1000, 'visible commit owns the full one-second SLA');
+    // #63: the presentation window follows the adaptive replay budget
+    // (at least the legacy one second, longer when canonical is slow).
+    assert.equal(hit.deadlineAt - hit.acceptedAt, eng.shipping.visibleCutoffMs(), 'visible commit owns the replay SLA');
+    assert.ok(hit.deadlineAt - hit.acceptedAt >= 1000);
     assert.ok(Array.isArray(hit.changedPages) && hit.changedPages.length > 0);
     console.log(`    engine wave: pages ${hit.pages.join(',')} in ${Date.now() - t1}ms after edit`);
     const svg = await eng.shipping.pageSVG(2);
@@ -347,6 +357,403 @@ test('slice 3: engine integration — an edit lands a ship page event', opts, as
   } finally {
     delete process.env.TDOM_SHIP;
     await eng.close();
+  }
+});
+
+test('beamer overlay labels and \\againframe certify the ship baseline (tex64-internal #76)', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  const work = path.join(WORK, 'beamer');
+  rmSync(work, { recursive: true, force: true });
+  const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
+  const deck = [
+    '\\documentclass{beamer}',
+    '\\begin{document}',
+    '\\begin{frame}{Opening}First slide body.\\end{frame}',
+    '\\begin{frame}[label=replay]{Replay}',
+    '\\only<1>{Overlay one text.}',
+    '\\only<2>{Overlay two text.}',
+    '\\end{frame}',
+    '\\begin{frame}{Plain}See frame \\ref{replay} and plain text here.\\label{plain}\\end{frame}',
+    '\\againframe<2>{replay}',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  try {
+    const arrivals = [];
+    eng.onShipWave = (info) => arrivals.push(info);
+    await eng.open(deck);
+    const t0 = Date.now();
+    while ((eng.shipRetry?.state !== 'ready' || eng.shipBooting) && Date.now() - t0 < 120_000) {
+      if (eng.shipRetry?.state === 'blocked-same-input') break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(!eng.diagnostics.some((d) => /label .* (diverged|left its written values)/.test(d)),
+      `no label reseed: ${eng.diagnostics.filter((d) => /shipping/.test(d)).join(' | ')}`);
+    assert.equal(eng.shipping?.info?.().baselineReady, true, 'the overlay deck certifies on the first boot');
+    const text = await pageText(eng.shipping.publishedPdf, 3);
+    assert.ok(!/2>|replay/.test(text), `overlay label syntax is not typeset: ${text}`);
+
+    const src = eng.getSource();
+    const at = src.indexOf('plain text here') + 'plain text'.length;
+    await eng.edit(at, at, 'X');
+    const rev = eng.srcRev;
+    const t1 = Date.now();
+    while (!arrivals.some((a) => a.srcRev === rev) && Date.now() - t1 < 30_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(arrivals.some((a) => a.srcRev === rev), 'an edit in the deck lands a ship wave');
+  } finally {
+    delete process.env.TDOM_SHIP;
+    await eng.close();
+  }
+});
+
+test('a replay keeps canonical\'s index: first-page edits do not lose \\printindex (tex64-internal #77)', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  const work = path.join(WORK, 'index');
+  rmSync(work, { recursive: true, force: true });
+  const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
+  const doc = [
+    '\\documentclass{article}',
+    '\\usepackage{makeidx}',
+    '\\makeindex',
+    '\\begin{document}',
+    'Opening paragraph on the first page.\\index{opening}',
+    '',
+    '\\clearpage',
+    'Second page body.\\index{second}',
+    '',
+    '\\printindex',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  try {
+    const arrivals = [];
+    eng.onShipWave = (info) => arrivals.push(info);
+    await eng.open(doc);
+    const t0 = Date.now();
+    while ((eng.shipRetry?.state !== 'ready' || eng.shipBooting) && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(eng.shipping?.info?.().baselineReady, true);
+    const baselinePages = eng.shipping.info().pages;
+    assert.equal(baselinePages, 3, 'the baseline carries the index page');
+
+    const src = eng.getSource();
+    const at = src.indexOf('first page') + 'first page'.length;
+    await eng.edit(at, at, 'X');
+    const rev = eng.srcRev;
+    const t1 = Date.now();
+    while (!arrivals.some((a) => a.srcRev === rev) &&
+           eng.shipping?.lastRejectReason !== 'page-count-changed' && Date.now() - t1 < 30_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.notEqual(eng.shipping?.lastRejectReason, 'page-count-changed', 'the replay found the index');
+    const hit = arrivals.find((a) => a.srcRev === rev);
+    assert.ok(hit, 'the first-page edit lands a ship wave');
+    assert.equal(hit.pages.length, baselinePages);
+    assert.match(await pageText(eng.shipping.publishedPdf, 3), /opening, 1/);
+  } finally {
+    delete process.env.TDOM_SHIP;
+    await eng.close();
+  }
+});
+
+const PACED_DOC = [
+  '\\documentclass{article}',
+  '\\begin{document}',
+  ...Array.from({ length: 14 }, (_, i) =>
+    `Paragraph ${i + 1} carries ordinary prose that the resident layer paints on its own, ` +
+    'so a keystroke here needs the replay only to upgrade the page to exact pixels. ' +
+    'It is long enough to wrap over several lines of the text block.\n'),
+  '\\end{document}',
+  '',
+].join('\n');
+
+async function openPaced(work) {
+  rmSync(work, { recursive: true, force: true });
+  const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
+  const arrivals = [];
+  eng.onShipWave = (info) => arrivals.push(info);
+  await eng.open(PACED_DOC);
+  const t0 = Date.now();
+  while ((eng.shipRetry?.state !== 'ready' || eng.shipBooting ||
+          eng.canonicalPageCount !== eng.pages.length) && Date.now() - t0 < 120_000) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.equal(eng.shipping?.info?.().baselineReady, true);
+  return { eng, arrivals };
+}
+
+async function typeAt(eng, marker, text) {
+  const at = eng.getSource().indexOf(marker) + marker.length;
+  await eng.edit(at, at, text);
+}
+
+test('a paintable keystroke holds its replay until typing pauses (tex64-internal #72)', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  process.env.TDOM_SHIP_CATCHUP_MS = '700';
+  const { eng, arrivals } = await openPaced(path.join(WORK, 'paced'));
+  try {
+    const gen0 = eng.shipping.gen;
+    await typeAt(eng, 'Paragraph 3 carries', 'X');
+    assert.ok(eng.shipDeferred, 'the replay is held');
+    assert.equal(eng.shipping.gen, gen0, 'no replay starts while the resident pages are paintable');
+    await typeAt(eng, 'Paragraph 3 carriesX', 'Y');
+    assert.equal(eng.shipping.gen, gen0, 'the next keystroke keeps holding');
+    const rev = eng.srcRev;
+    const t1 = Date.now();
+    while (!arrivals.some((a) => a.srcRev === rev) && Date.now() - t1 < 30_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(arrivals.some((a) => a.srcRev === rev), 'the pause catches the chain up to the newest source');
+    assert.equal(eng.shipping.gen, gen0 + 1, 'one replay for the whole burst');
+    assert.equal(eng.shipDeferred, null);
+
+    // A viewer that cannot paint asks for canonical: the held replay runs now.
+    await typeAt(eng, 'Paragraph 9 carries', 'Z');
+    assert.ok(eng.shipDeferred);
+    assert.equal(eng.noteDisplayDemand(), true);
+    assert.equal(eng.shipping.gen, gen0 + 2, 'a display demand releases the held replay at once');
+    await typeAt(eng, 'Paragraph 9 carriesZ', 'W');
+    assert.equal(eng.shipDeferred, null, 'after a demand, the passage replays immediately');
+  } finally {
+    delete process.env.TDOM_SHIP;
+    delete process.env.TDOM_SHIP_CATCHUP_MS;
+    await eng.close();
+  }
+});
+
+test('an idle chain retires and the next caret move boots it again (tex64-internal #72)', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  process.env.TDOM_SHIP_IDLE_MS = '2500';
+  const { eng } = await openPaced(path.join(WORK, 'idle'));
+  try {
+    const t0 = Date.now();
+    while (!eng.shipIdleRetired && Date.now() - t0 < 30_000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(eng.shipIdleRetired, true, 'a quiet document retires its chain');
+    assert.equal(eng.shipping.rootPeer, null, 'the retired chain holds no process');
+    assert.equal(eng.shipBootedFor, null);
+
+    const at = eng.getSource().indexOf('Paragraph 5');
+    await eng.warmEditOffset(at);
+    assert.equal(eng.shipIdleRetired, false);
+    const t1 = Date.now();
+    while (!(eng.shipping?.info?.().baselineReady && eng.shipRetry?.state === 'ready') && Date.now() - t1 < 60_000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(eng.shipping.info().baselineReady, true, 'a caret move boots the chain again');
+  } finally {
+    delete process.env.TDOM_SHIP;
+    delete process.env.TDOM_SHIP_IDLE_MS;
+    await eng.close();
+  }
+});
+
+test('pdflscape pages stay structured and ship in their own geometry (tex64-internal #64)', opts, async () => {
+  process.env.TDOM_SHIP = '1';
+  const work = path.join(WORK, 'landscape');
+  rmSync(work, { recursive: true, force: true });
+  const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
+  const doc = [
+    '\\documentclass{article}',
+    '\\usepackage{pdflscape}',
+    '\\begin{document}',
+    'Portrait opening page with ordinary prose.',
+    '',
+    '\\begin{landscape}',
+    'A wide landscape page whose text runs along the long edge.',
+    '\\end{landscape}',
+    '',
+    'Portrait closing page after the landscape section.',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  try {
+    const arrivals = [];
+    eng.onShipWave = (info) => arrivals.push(info);
+    await eng.open(doc);
+    assert.equal(eng.previewPolicy, 'shipping-exact');
+    const t0 = Date.now();
+    while ((eng.shipRetry?.state !== 'ready' || eng.shipBooting) && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(eng.mode, 'structured', 'the rotated canonical page does not demote the document');
+    const papers = eng.canonical.info().papers;
+    assert.equal(papers.length, 3);
+    assert.equal(papers[1].rotation, 90);
+
+    const src = eng.getSource();
+    const at = src.indexOf('long edge') + 'long edge'.length;
+    await eng.edit(at, at, 'X');
+    const rev = eng.srcRev;
+    const t1 = Date.now();
+    while (!arrivals.some((a) => a.srcRev === rev) && Date.now() - t1 < 30_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    const hit = arrivals.find((a) => a.srcRev === rev);
+    assert.ok(hit, 'an edit on the landscape page lands a ship wave');
+    assert.deepEqual(hit.papers?.map((paper) => paper.rotation), [0, 90, 0], 'the wave carries each page geometry');
+    assert.equal(hit.papers[1].w, papers[1].w);
+    assert.equal(hit.papers[1].h, papers[1].h);
+  } finally {
+    delete process.env.TDOM_SHIP;
+    await eng.close();
+  }
+});
+
+async function shipEditOutcome(work, doc, marker) {
+  rmSync(work, { recursive: true, force: true });
+  const chain = new ShippingChain({ workDir: work, docDir: path.dirname(DOC) });
+  const waves = [];
+  chain.onWave = (wave) => waves.push(wave);
+  try {
+    await chain.open(doc);
+    const t0 = Date.now();
+    while ((!chain.info().baselineReady || !chain.info().done) && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(chain.info().baselineReady, true);
+    const next = doc.replace(marker, `${marker} with a longer sentence that wraps onto one more line of the text block`);
+    assert.equal(chain.resume(next).mode, 'resumed');
+    const generation = chain.info().gen;
+    const t1 = Date.now();
+    while (!waves.some((wave) => wave.gen === generation) && !chain.info().rejectReason && Date.now() - t1 < 10_000) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return { wave: waves.find((wave) => wave.gen === generation), reject: chain.info().rejectReason };
+  } finally {
+    await chain.close();
+  }
+}
+
+test('unread TikZ position marks may drift under a replay (tex64-internal #64)', opts, async () => {
+  // mdframed's tikz frames are `remember picture`: every edit above them
+  // moves their \pgfsyspdfmark lines, but the frames never read them back.
+  const doc = [
+    '\\documentclass{article}',
+    '\\usepackage[framemethod=tikz]{mdframed}',
+    '\\begin{document}',
+    'Opening paragraph MOVEMARK before the framed material.',
+    '',
+    '\\begin{mdframed}Framed text inside a tikz frame.\\end{mdframed}',
+    '',
+    'Closing paragraph.',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const { wave, reject } = await shipEditOutcome(path.join(WORK, 'tikz-marks'), doc, 'MOVEMARK');
+  assert.ok(wave, `an unread mark does not reject the wave (${reject})`);
+});
+
+test('a TikZ position the document reads back still rejects a drifted replay', opts, async () => {
+  const doc = [
+    '\\documentclass{article}',
+    '\\usepackage{tikz}',
+    '\\begin{document}',
+    'Opening paragraph MOVEMARK before the overlay.',
+    '',
+    'Anchor text \\tikz[remember picture,overlay]\\node at (current page.north) {X};',
+    '',
+    'Closing paragraph.',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const { wave, reject } = await shipEditOutcome(path.join(WORK, 'tikz-read'), doc, 'MOVEMARK');
+  assert.equal(wave, undefined, 'a moved mark the page read keeps the wave out');
+  assert.equal(reject, 'output-manifest-changed');
+});
+
+test('an \\include from a subdirectory boots the chain and replays (tex64-internal #62)', opts, async () => {
+  // \include writes chapters/ch1.aux relative to the process's own
+  // directory: the root, each replay branch and each page child
+  const root = path.join(WORK, 'include-subdir');
+  rmSync(root, { recursive: true, force: true });
+  mkdirSync(path.join(root, 'project', 'chapters'), { recursive: true });
+  writeFileSync(path.join(root, 'project', 'chapters', 'ch1.tex'),
+    '\\section{Included}\\label{sec:inc}\nIncluded chapter text.\n');
+  const doc = [
+    '\\documentclass{article}',
+    '\\begin{document}',
+    'Opening paragraph MOVEMARK before the chapter, see section~\\ref{sec:inc}.',
+    '',
+    '\\include{chapters/ch1}',
+    '',
+    'Closing paragraph after the chapter.',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const chain = new ShippingChain({ workDir: path.join(root, 'work'), docDir: path.join(root, 'project') });
+  const waves = [];
+  chain.onWave = (wave) => waves.push(wave);
+  try {
+    await chain.open(doc);
+    const t0 = Date.now();
+    while ((!chain.info().baselineReady || !chain.info().done) && !chain.err && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(chain.err?.message ?? null, null, 'the root runs to the end');
+    assert.equal(chain.info().baselineReady, true);
+    const next = doc.replace('MOVEMARK', 'MOVEMARK with a few more words');
+    assert.equal(chain.resume(next).mode, 'resumed');
+    const generation = chain.info().gen;
+    const t1 = Date.now();
+    while (!waves.some((wave) => wave.gen === generation) && !chain.info().rejectReason && !chain.err &&
+        Date.now() - t1 < 10_000) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(chain.err?.message ?? null, null, 'the replay runs to the end');
+    assert.ok(waves.some((wave) => wave.gen === generation), `the replay publishes (${chain.info().rejectReason})`);
+  } finally {
+    await chain.close();
+  }
+});
+
+test('ship units never end inside a bracket argument', () => {
+  assert.deepEqual(joinOpenBracketArguments(['\\twocolumn[\n', '\\maketitle\n', 'abstract\n]\n\n', 'Body.\n']),
+    ['\\twocolumn[\n\\maketitle\nabstract\n]\n\n', 'Body.\n']);
+  assert.deepEqual(joinOpenBracketArguments(['a % \\foo[\n', '\\\\[2pt] b\n', '\\[ x \\]\n']),
+    ['a % \\foo[\n', '\\\\[2pt] b\n', '\\[ x \\]\n'], 'comments, \\\\[..] and display math open no argument');
+  assert.deepEqual(joinOpenBracketArguments(['\\foo[{]}\n', 'x]\n', 'y\n']), ['\\foo[{]}\nx]\n', 'y\n'],
+    'a braced ] does not close the argument');
+  const literal = ['\\foo[ never closed\n', ...Array.from({ length: 40 }, (_, i) => `p${i}\n`)];
+  assert.ok(joinOpenBracketArguments(literal).length > 2, 'an unclosed literal bracket folds a bounded run only');
+});
+
+test('a \\twocolumn[...] title block ships without a TeX error (tex64-internal #62)', opts, async () => {
+  const doc = [
+    '\\documentclass[twocolumn]{article}',
+    '\\title{Two columns}\\author{Stress}',
+    '\\begin{document}',
+    '',
+    '\\twocolumn[',
+    '\\maketitle',
+    '\\begin{abstract}',
+    'An abstract that spans the full width above both columns MOVEMARK.',
+    '\\end{abstract}',
+    ']',
+    '',
+    '\\section{Intro}',
+    'Body text in the first column.',
+    '\\end{document}',
+    '',
+  ].join('\n');
+  const work = path.join(WORK, 'twocolumn-title');
+  rmSync(work, { recursive: true, force: true });
+  const chain = new ShippingChain({ workDir: work, docDir: path.dirname(DOC) });
+  try {
+    await chain.open(doc);
+    const t0 = Date.now();
+    while ((!chain.info().baselineReady || !chain.info().done) && !chain.err && Date.now() - t0 < 120_000) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(chain.info().baselineReady, true);
+    const log = readFileSync(path.join(work, 'driver-ship.log'), 'utf8');
+    assert.doesNotMatch(log, /^! /m, 'the root reads the whole bracket argument from one unit');
+  } finally {
+    await chain.close();
   }
 });
 
@@ -360,6 +767,9 @@ test('four healthy structural rebaselines do not exhaust shipping recovery', opt
   // and canonical-seeded ShippingChain route.
   process.env.TDOM_CANON_IDLE = '10';
   process.env.TDOM_CANON_COOLDOWN = '0';
+  // Each '{}' edit must reach the chain at once; pacing (#72) would hold a
+  // paintable keystroke until typing pauses.
+  process.env.TDOM_SHIP_CATCHUP_MS = '0';
   const work = path.join(WORK, 'engine-rebaseline-recovery');
   rmSync(work, { recursive: true, force: true });
   const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(DOC) });
@@ -414,6 +824,7 @@ test('four healthy structural rebaselines do not exhaust shipping recovery', opt
     else process.env.TDOM_CANON_IDLE = previousCanonicalIdle;
     if (previousCanonicalCooldown === undefined) delete process.env.TDOM_CANON_COOLDOWN;
     else process.env.TDOM_CANON_COOLDOWN = previousCanonicalCooldown;
+    delete process.env.TDOM_SHIP_CATCHUP_MS;
     await eng.close();
   }
 });

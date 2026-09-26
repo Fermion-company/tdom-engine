@@ -14,6 +14,65 @@ function appendColumnState(L, state) {
   );
 }
 
+// imakeidx runs makeindex itself at \printindex when shell escape allows
+// it, and the resident and shipping drivers run with --shell-escape (the
+// fork shim needs it). Their own .idx is partial (checkpoint forks, pages
+// that never ship), so that run would overwrite the index the engine copied
+// from canonical's makeindex with a wrong one. Make \printindex just read
+// \jobname.ind, as it does without shell escape.
+export const IMAKEIDX_READ_ONLY =
+  '\\makeatletter\\@ifpackageloaded{imakeidx}{\\chardef\\imki@shellescape=\\z@}{}\\makeatother';
+
+/**
+ * \label capture that keeps the document's own \label syntax. The old
+ * `\renewcommand\label[1]` wrappers read beamer's \label<2>{key} as the key
+ * `<` and typeset `2>{key}` on the slide, so ShippingChain's pages never
+ * matched canonical (tex64-internal #76). Overlay (<...>) and cleveref
+ * ([type]) forms now reach the saved original untouched.
+ *
+ * Where the kernel's \label runs the `label` hook (LaTeX 2023-06+), the
+ * capture lives in that hook: it records exactly the labels the original
+ * really defines (beamer defines \label<2> on slide 2 only, and \againframe
+ * re-defines it). A \label that bypasses the hook still gets the wrapper's
+ * capture, so older kernels and foreign \label implementations keep the
+ * previous behaviour.
+ *
+ *   save    name for the saved original (no @: callers differ in catcodes)
+ *   capture (param) => TeX recording key `param` with \@currentlabel
+ *   after   (param) => TeX run after every call (cleveref companion)
+ *   ltx     name for amsmath's saved \ltx@label, or null
+ */
+export function labelCaptureShim({ save, capture, after = () => '', ltx = null }) {
+  const hit = `${save}hit`;
+  const seen = `${save}hookseen`;
+  const L = [];
+  L.push(`\\let\\${save}\\label`);
+  L.push(`\\newif\\if${hit}\\newif\\if${seen}`);
+  L.push(
+    `\\ifdefined\\AddToHookWithArguments\\AddToHookWithArguments{label}` +
+      `{\\global\\${hit}true\\global\\${seen}true${capture('#1')}}\\fi`
+  );
+  L.push(`\\def\\label{\\@ifnextchar<{\\${save}Overlay}{\\@ifnextchar[{\\${save}Typed}{\\${save}One}}}`);
+  L.push(`\\long\\def\\${save}One#1{\\global\\${hit}false\\${save}{#1}\\if${hit}\\else${capture('#1')}\\fi${after('#1')}}`);
+  L.push(`\\long\\def\\${save}Typed[#1]#2{\\global\\${hit}false\\${save}[#1]{#2}\\if${hit}\\else${capture('#2')}\\fi${after('#2')}}`);
+  // An overlay label that did not define anything this slide is silent;
+  // only a kernel whose \label never ran the hook falls back to capturing.
+  L.push(
+    `\\long\\def\\${save}Overlay<#1>#2{\\global\\${hit}false\\${save}<#1>{#2}` +
+      `\\if${hit}\\else\\if${seen}\\else${capture('#2')}\\fi\\fi${after('#2')}}`
+  );
+  if (ltx) {
+    // amsmath routes display-math labels through \ltx@label, saved at
+    // package load before this shim; it calls the kernel \label, whose
+    // hook already captured the key.
+    L.push(`\\ifdefined\\ltx@label\\let\\${ltx}\\ltx@label`);
+    L.push(
+      `\\def\\ltx@label#1{\\global\\${hit}false\\${ltx}{#1}\\if${hit}\\else${capture('#1')}\\fi${after('#1')}}\\fi`
+    );
+  }
+  return L;
+}
+
 export function buildDriverSource({
   preamble,
   daemonPath,
@@ -23,8 +82,17 @@ export function buildDriverSource({
   labelTable,
   hrefTable,
   geometry,
+  realRoot = false,
 }) {
   const L = [];
+  // Log every callback registration from the first line on, before any
+  // package can keep its own reference to add_to_callback: canonical-anchor
+  // needs every paint filter the document adds, even one it removes again
+  // (daemon.lua, scan_paint_callbacks).
+  L.push('\\directlua{if luatexbase and luatexbase.add_to_callback then ' +
+    'local add = luatexbase.add_to_callback TDOM_CALLBACK_LOG = {} ' +
+    'luatexbase.add_to_callback = function(name, func, description, ...) ' +
+    'table.insert(TDOM_CALLBACK_LOG, { name, description }) return add(name, func, description, ...) end end}');
   L.push(preamble.trimEnd());
   // hyperref writes PDF catalog/anchor objects from its begin-document
   // hook, opening driver.pdf in checkpoint 0. Every fork then inherits the
@@ -35,6 +103,7 @@ export function buildDriverSource({
   // it keeps identical text/boxes without opening the shared PDF. Canonical
   // compiles the untouched source and therefore retains the real links.
   L.push('\\makeatletter\\@ifpackageloaded{hyperref}{\\Hy@drafttrue}{}\\makeatother');
+  L.push(IMAKEIDX_READ_ONLY);
   L.push('\\begin{document}');
   L.push(`\\directlua{dofile('${luaStr(daemonPath)}')}`);
   L.push('\\makeatletter');
@@ -66,18 +135,12 @@ export function buildDriverSource({
         '\\endgroup\\@esphack}'
     );
   }
-  L.push('\\let\\TDOMlabel\\label');
-  L.push(
-    "\\renewcommand\\label[1]{\\TDOMlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}" +
-      crefCapture + '}'
-  );
-  // amsmath routes display-math labels through \ltx@label (captured at
-  // package load, before our shim) — intercept that path too
-  L.push('\\ifdefined\\ltx@label\\let\\TDOMltxlabel\\ltx@label');
-  L.push(
-    "\\def\\ltx@label#1{\\TDOMltxlabel{#1}\\directlua{tdom_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}')}" +
-      crefCapture + '}\\fi'
-  );
+  L.push(...labelCaptureShim({
+    save: 'TDOMlabel',
+    ltx: 'TDOMltxlabel',
+    capture: (key) => `\\directlua{tdom_label('\\luaescapestring{${key}}','\\luaescapestring{\\@currentlabel}')}`,
+    after: (key) => crefCapture.replaceAll('#1', key),
+  }));
   L.push('\\let\\TDOMref\\ref');
   L.push("\\renewcommand\\ref[1]{\\directlua{tdom_ref('\\luaescapestring{#1}')}\\TDOMref{#1}}");
   L.push('\\let\\TDOMpageref\\pageref');
@@ -273,6 +336,13 @@ export function buildDriverSource({
   // never discards inter-block glue. tdom_report() harvests the nodes.
   // The output routine only ever fires on force-ejects (\newpage & co);
   // tdom_absorb_output puts the material back and plants a break marker.
+  // Real-output root (daemon.lua tdom_real_root): a sibling of checkpoint 0
+  // forked HERE, before anything below touches the page builder, so its
+  // ISO children run splitting environments under LaTeX's real \output
+  // and \vsize exactly like a cold lualatex — with the preamble already
+  // loaded and COW-shared. Gated (TDOM_ISO_REAL_FORK) until the
+  // differential suite and the RSS measurement make it the default.
+  if (realRoot) L.push('\\directlua{tdom_real_root()}');
   L.push('\\vsize=\\maxdimen');
   L.push('\\holdinginserts=1');
   L.push('\\maxdeadcycles=200');
@@ -354,12 +424,14 @@ export function buildIsoCompileSource({
   prevLastskip,
   realOutput,
   strut,
+  runner = ck0 ? 'fork-absorb' : 'cold',
+  defsPrelude = '',
 }) {
   const L = [];
-  if (!ck0) {
+  if (runner === 'cold') {
     L.push(preamble.trimEnd());
     L.push('\\begin{document}');
-  } else {
+  } else if (runner === 'fork-absorb') {
     // the fork inherits the root's DORMANT regime (ckpt:0 is frozen right
     // after the dormant setup — \pagegoal=\maxdimen, seed material on the
     // page). Reset to the REAL height with TeX's own machinery: fire ONE
@@ -370,13 +442,32 @@ export function buildIsoCompileSource({
     // didn't use all of \box255".
     L.push(`\\vsize=${Math.max(1, geometry?.textheight ?? 550).toFixed(4)}bp`);
   }
+  // fork-real: the real-output root was forked BEFORE the dormant setup —
+  // real \output, real \vsize, empty page — so nothing needs resetting;
+  // the program below is exactly the cold one minus the preamble.
   L.push('\\makeatletter\\pagestyle{empty}\\hoffset=-1in\\voffset=-1in');
-  if (ck0) {
+  // a forked root holds the declarations it booted with (preamble-patch.js;
+  // the cold program's preamble already has them, re-running is harmless)
+  if (defsPrelude) L.push(defsPrelude.trimEnd());
+  if (runner !== 'cold') {
     // A real-height isolated child must use LaTeX's real output semantics,
     // not the marker-only enlargement inherited from the dormant driver.
     L.push('\\let\\enlargethispage\\TDOMenlarge');
-    L.push('\\output={\\global\\setbox\\voidb@x\\box255}');
-    L.push('\\hbox to0pt{}\\penalty-10000');
+    if (runner === 'fork-absorb') {
+      L.push('\\output={\\global\\setbox\\voidb@x\\box255}');
+      L.push('\\hbox to0pt{}\\penalty-10000');
+    } else {
+      // the driver's float capture (figure/table → \TDOMfloatbox +
+      // tdom_float) belongs to the resident's own float protocol; an
+      // isolated real-output run must place floats like the cold compile
+      // does, through LaTeX's original environments
+      for (const env of ['figure', 'table']) {
+        L.push(
+          `\\expandafter\\let\\csname ${env}\\expandafter\\endcsname\\csname TDOMorig${env}\\endcsname` +
+            `\\expandafter\\let\\csname end${env}\\endcsname\\end@float`
+        );
+      }
+    }
     // re-assert the job cwd right before the ship: package code in the
     // block body can wander the process cwd, and the PDF output file
     // opens wherever the FIRST \shipout finds it (observed: child PDFs
@@ -405,16 +496,12 @@ export function buildIsoCompileSource({
   // shims (\TDOMlabel & co, boot driver): a fork-mode iso inherits those
   // wrappers, and \let\TDOMlabel\label would overwrite the root's saved
   // original with the wrapper itself — infinite recursion on first \label
-  L.push('\\let\\TDOMisolabel\\label');
-  L.push(
-    "\\renewcommand\\label[1]{\\TDOMisolabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}'," + isoHref + ')}' +
-      isoCrefCapture + '}'
-  );
-  L.push('\\ifdefined\\ltx@label\\let\\TDOMisoltxlabel\\ltx@label');
-  L.push(
-    "\\def\\ltx@label#1{\\TDOMisoltxlabel{#1}\\directlua{tdom_iso_label('\\luaescapestring{#1}','\\luaescapestring{\\@currentlabel}'," + isoHref + ')}' +
-      isoCrefCapture + '}\\fi'
-  );
+  L.push(...labelCaptureShim({
+    save: 'TDOMisolabel',
+    ltx: 'TDOMisoltxlabel',
+    capture: (key) => `\\directlua{tdom_iso_label('\\luaescapestring{${key}}','\\luaescapestring{\\@currentlabel}',${isoHref})}`,
+    after: (key) => isoCrefCapture.replaceAll('#1', key),
+  }));
   // ref-use recording: a rescued block that references a label must be
   // re-rescued when that label's value changes (the cache key carries the
   // referenced values — see #rescueBlock)
@@ -491,7 +578,9 @@ export function buildIsoCompileSource({
       // bogus page context): material is DISCARDED, so the harvest must
       // not be trusted — count it and let the node side fail the compile
       'if tdom_iso.fires > 50 then tdom_iso.discarded = (tdom_iso.discarded or 0) + 1 tex.box[boxnum] = nil return end ' +
-      'tex.deadcycles = 0 ' +
+      // LuaTeX ignores a tex.deadcycles assignment: hand the reset to TeX
+      // (runs inside \output, right after this call)
+      'tex.sprint(string.char(92) .. "deadcycles=0" .. string.char(92) .. "relax") ' +
       'if tdom_iso.ships == 0 then tdom_iso.preabsorbs = (tdom_iso.preabsorbs or 0) + 1 end ' +
       'local b = tex.box[boxnum] ' +
       'local list = nil ' +

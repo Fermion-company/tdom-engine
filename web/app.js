@@ -56,10 +56,31 @@ let inFlight = false;
 const history = [];
 const pageDivs = new Map();
 const provisionalStages = new Map(); // latest unpublished display list per page
+// blocks each page shows now (its last committed display list): material
+// moving between two staged pages is found through the page it leaves
+const committedPageSrcs = new Map(); // page -> Set of block ids
+// pages of one edit: a report's pages that paint, or painted, a block the
+// edit changed, added or removed (a paragraph split or merged across an
+// unchanged float page keeps its halves in one transaction)
+const pageEditGroup = new Map(); // page -> report sequence
+let editGroupSeq = 0;
+// Stage timings for measurement drivers: recorded only after one sets
+// window.__tdomStageTrace = [] (epoch ms, comparable with the engine's).
+function traceStage(ev, page, extra = {}) {
+  const trace = globalThis.__tdomStageTrace;
+  if (Array.isArray(trace) && trace.length < 20000) trace.push({ ev, page, srcRev: appliedSrcRev, at: Date.now(), ...extra });
+}
 const provisionalRemovedPages = new Set();
 const provisionalDisplayLists = new Map(); // complete resident page layout, including unchanged pages
+// Resident pages held by a zero-layout placeholder (a page-wide pending-exact:
+// a block whose galley has not arrived). While any exist the resident page
+// count is not settled. A line-level pending-exact only waits for ink.
+const provisionalPendingLayout = new Set();
+let residentPageCountAuthoritative = false;
 let committedCanonicalGeneration = null;
 let lastEngineStatus = null;
+let viewportWarmTimer = null;
+let viewportWarmKey = '';
 let liveSearch = { query: '', results: [], current: -1 };
 let editDomCache = null;
 let directEditor = null;
@@ -562,8 +583,12 @@ function beginClientDocumentReset(epoch) {
   deferredDirectPresentationEvents.length = 0;
   deferredDirectPresentationCommits.clear();
   provisionalStages.clear();
+  committedPageSrcs.clear();
+  pageEditGroup.clear();
   provisionalRemovedPages.clear();
   provisionalDisplayLists.clear();
+  provisionalPendingLayout.clear();
+  residentPageCountAuthoritative = false;
   bootComplete = false;
   directEditClickEpoch++;
   cancelDirectOpenings();
@@ -599,8 +624,11 @@ function adoptDoc(doc) {
   pagesEl.textContent = '';
   pageDivs.clear();
   provisionalStages.clear();
+  committedPageSrcs.clear();
+  pageEditGroup.clear();
   provisionalRemovedPages.clear();
   provisionalDisplayLists.clear();
+  provisionalPendingLayout.clear();
   committedCanonicalGeneration = null;
   pageDirtyRev.clear();
   clearCanonicalAnchorPreview();
@@ -615,6 +643,8 @@ function adoptDoc(doc) {
   shipPages.clear();
   appliedRev = doc.report.rev;
   appliedSrcRev = doc.report.srcRev ?? doc.report.rev;
+  residentPageCountAuthoritative =
+    currentCanonicalPageCount(canonical, null, documentReset.adoptedEpoch, appliedSrcRev) === doc.pages.length;
   if (previewPolicy === 'structured') {
     stageProvisionalPatches(doc.pages.map(displayList => ({ type: 'replace-page', displayList })), false, doc.pages.length);
   }
@@ -629,21 +659,127 @@ function adoptDoc(doc) {
 
 // ---------------------------------------------------------------- pages
 
+// The newest exact generation of this document is the page-count reference.
+// Requiring one for the CURRENT revision made every keystroke's count
+// unknown until canonical caught up: the toolbar flickered to "/ —" and each
+// keystroke demanded a full canonical compile (tex64-internal #72). A
+// resident count that matches the newest canonical stays authoritative; a
+// mismatch still demands canonical and shows "/ —" (#67).
+function currentCanonicalPageCount(reported, committed, documentEpoch, srcRev) {
+  const generations = [];
+  const count = (value) => Number.isSafeInteger(Number(value)) && Number(value) >= 0;
+  if (Number(reported?.rev) > 0 && Number(reported.rev) <= Number(srcRev) && count(reported.pageCount)) {
+    generations.push({ rev: Number(reported.rev), pageCount: Number(reported.pageCount) });
+  }
+  if (Number(committed?.epoch) === Number(documentEpoch) &&
+      Number(committed?.rev) > 0 && Number(committed.rev) <= Number(srcRev) && count(committed.pageCount)) {
+    generations.push({ rev: Number(committed.rev), pageCount: Number(committed.pageCount) });
+  }
+  if (!generations.length) return null;
+  const newest = Math.max(...generations.map(generation => generation.rev));
+  const counts = generations.filter(generation => generation.rev === newest).map(generation => generation.pageCount);
+  return counts.every(value => value === counts[0]) ? counts[0] : null;
+}
+
+function residentPageTransactionValid(pageCount, residentPages, stagePages, removedPages) {
+  if (!Number.isSafeInteger(pageCount) || pageCount < 0) return false;
+  const resident = new Set(residentPages);
+  if (resident.size !== pageCount) return false;
+  for (let page = 1; page <= pageCount; page++) if (!resident.has(page)) return false;
+  return [...stagePages].every(page => Number.isSafeInteger(page) && page >= 1 && page <= pageCount) &&
+    [...removedPages].every(page => Number.isSafeInteger(page) && page > pageCount);
+}
+
+function displayListSrcs(dl) {
+  const srcs = new Set();
+  for (const cmd of dl?.commands ?? []) {
+    if (cmd.src && !String(cmd.src).startsWith('_')) srcs.add(cmd.src); // '_…' is page furniture
+  }
+  return srcs;
+}
+
+/** Staged pages that must change together (docs/04 §4.5): consecutive
+ * pages (material reflows across the page break), pages that paint or
+ * painted the same block (a paragraph moving across an unchanged float
+ * page), and the pages of one edit (a split or merge renames blocks).
+ * Consecutive pages are tied only while one of them shows a paper, and a
+ * blank page whose stage is not ready joins nothing: it stays blank, and
+ * next to a blank shell no reflow can duplicate or drop a line. On a
+ * document's first presentation every page is blank, and tying them made
+ * the whole document one group (tex64-internal #83). */
+function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () => true, ready = () => true) {
+  const root = new Map(stages.map(stage => [stage.dl.page, stage.dl.page]));
+  const find = page => {
+    while (root.get(page) !== page) page = root.get(page);
+    return page;
+  };
+  const join = (a, b) => root.set(find(a), find(b));
+  const pageOfSrc = new Map();
+  const pageOfEdit = new Map();
+  const note = (map, key, page) => {
+    if (map.has(key)) join(page, map.get(key));
+    else map.set(key, page);
+  };
+  const staged = new Map(stages.map(stage => [stage.dl.page, stage]));
+  const waiting = stage => !painted(stage.dl.page) && !ready(stage);
+  for (const stage of stages) {
+    const page = stage.dl.page;
+    if (waiting(stage)) continue;
+    if (root.has(page - 1) && !waiting(staged.get(page - 1)) && (painted(page) || painted(page - 1))) join(page, page - 1);
+    stage.srcs ??= displayListSrcs(stage.dl);
+    for (const src of stage.srcs) note(pageOfSrc, src, page);
+    for (const src of committedSrcs.get(page) ?? []) note(pageOfSrc, src, page);
+    const edit = editGroup.get(page);
+    if (edit !== undefined) note(pageOfEdit, edit, page);
+  }
+  const groups = new Map();
+  for (const stage of stages) {
+    const group = find(stage.dl.page);
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(stage);
+  }
+  return [...groups.values()];
+}
+
+function pagePainted(page) {
+  const div = pageDivs.get(page);
+  return Boolean(div) && (div.dataset.prov === '1' || div.dataset.canonPresentedRev !== undefined);
+}
+
 function srcOf(target) {
   const src = target?.dataset?.src ?? target?.closest?.('[data-src]')?.dataset?.src;
   if (!src || src.startsWith('_')) return null;
   return src;
 }
 
-function stageProvisionalPatches(patches, flash, pageCount = null) {
+function stageProvisionalPatches(patches, flash, pageCount = null, editIds = null) {
+  if (editIds?.size) {
+    const group = ++editGroupSeq;
+    for (const patch of patches) {
+      if (patch.type !== 'replace-page') continue;
+      const page = patch.displayList.page;
+      const shown = committedPageSrcs.get(page) ?? new Set();
+      if ([...displayListSrcs(patch.displayList)].some(id => editIds.has(id)) || [...shown].some(id => editIds.has(id))) {
+        pageEditGroup.set(page, group);
+      }
+    }
+  }
+  const delivered = patches.filter(patch => patch.type === 'replace-page').map(patch => patch.displayList.page);
+  if (delivered.length) traceStage('deliver', null, { pages: delivered });
   for (const patch of patches) {
-    if (patch.type === 'replace-page') provisionalDisplayLists.set(patch.displayList.page, patch.displayList);
-    else if (patch.type === 'remove-pages') {
+    if (patch.type === 'replace-page') {
+      const dl = patch.displayList;
+      provisionalDisplayLists.set(dl.page, dl);
+      if (dl.commands?.some(cmd => cmd.op === 'pending-exact' && cmd.wholePage)) provisionalPendingLayout.add(dl.page);
+      else provisionalPendingLayout.delete(dl.page);
+    } else if (patch.type === 'remove-pages') {
       for (const n of provisionalDisplayLists.keys()) if (n >= patch.from) provisionalDisplayLists.delete(n);
+      for (const n of provisionalPendingLayout) if (n >= patch.from) provisionalPendingLayout.delete(n);
     }
   }
   if (Number.isInteger(pageCount) && pageCount >= 0) {
     for (const n of provisionalDisplayLists.keys()) if (n > pageCount) provisionalDisplayLists.delete(n);
+    for (const n of provisionalPendingLayout) if (n > pageCount) provisionalPendingLayout.delete(n);
     if ([...pageDivs.keys(), ...provisionalStages.keys()].some(n => n > pageCount)) removePagesFrom(pageCount + 1);
   }
   if (usesCanonicalSurface()) {
@@ -685,6 +821,31 @@ function shippingPresentationBlocked() {
     queuedDirectOpenings.length > 0 || flushingDirectPresentation || opaqueBatchCommitDepth > 0;
 }
 
+function scheduleViewportWarm() {
+  window.clearTimeout(viewportWarmTimer);
+  viewportWarmTimer = window.setTimeout(() => {
+    if (documentReset.pending || usesCanonicalSurface() || directEditor || inFlight || composing) return;
+    const viewport = pagesEl.getBoundingClientRect();
+    const center = (viewport.top + viewport.bottom) / 2;
+    let nearest = null;
+    let distance = Infinity;
+    for (const [page, div] of pageDivs) {
+      const bounds = div.getBoundingClientRect();
+      if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) continue;
+      const gap = Math.abs((bounds.top + bounds.bottom) / 2 - center);
+      if (gap < distance) { nearest = page; distance = gap; }
+    }
+    if (nearest === null) return;
+    const key = `${documentReset.adoptedEpoch}:${appliedSrcRev}:${nearest}`;
+    if (viewportWarmKey === key) return;
+    viewportWarmKey = key;
+    void fetch('/warm', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ page: nearest }),
+    }).catch(() => { if (viewportWarmKey === key) viewportWarmKey = ''; });
+  }, 160);
+}
+
 function flushDirectPresentationUpdates() {
   if (openingDirectInput?.sink || flushingDirectPresentation || documentReset.pending) return;
   // Replay source events in order, while keeping their intermediate surfaces
@@ -710,29 +871,63 @@ function flushDirectPresentationUpdates() {
 
 function tryCommitProvisionalStages() {
   if (directPresentationBlocked()) return;
-  // A provisional shrink cannot decide which printed page disappears. Hold
-  // its replacements too, so moved ink does not appear on both old and new
-  // pages while the definitive PDF establishes the page count.
   if (usesCanonicalSurface() || documentReset.pending) return;
-  if (provisionalRemovedPages.size) {
-    requestCanonicalDisplay({ residentImpossible: true });
-    return;
-  }
-  if (!provisionalStages.size) return;
-  // Canonical can create pages the resident layout never had (for example
-  // an unbreakable display after a large fixed gap). Its old extra page has
-  // no resident remove-pages event. Never mix those two page address spaces.
-  if (committedCanonicalGeneration?.epoch === documentReset.adoptedEpoch &&
-      committedCanonicalGeneration.pageCount !== provisionalDisplayLists.size) {
-    requestCanonicalDisplay({ residentImpossible: true });
-    return;
-  }
+  if (!provisionalStages.size && !provisionalRemovedPages.size) return;
+  const residentPageCount = provisionalDisplayLists.size;
   const stages = [...provisionalStages.values()].sort((a, b) => a.dl.page - b.dl.page);
-  if (stages.some(stage => !stage.ready || stage.sourceRev !== appliedSrcRev ||
-      stage.documentEpoch !== documentReset.adoptedEpoch ||
-      Number(stage.snapshot?.srcRev) !== appliedSrcRev ||
-      Number(stage.snapshot?.documentEpoch) !== stage.documentEpoch)) return;
-  const editorStage = stages.find(stage => stage.dl.page === directEditor?.pageNumber);
+  // A report is the resident generation boundary. Refuse a malformed or
+  // incomplete address space, including delayed pages beyond its declared
+  // tail, rather than publishing a mixed paper.
+  if (!residentPageTransactionValid(
+    residentPageCount,
+    provisionalDisplayLists.keys(),
+    stages.map(stage => Number(stage.dl?.page)),
+    provisionalRemovedPages
+  )) {
+    requestCanonicalDisplay({ residentImpossible: true });
+    return;
+  }
+  // Removing the page that owns a live editor would disconnect its native
+  // focus/selection (and possibly an IME composition). Keep the exact path
+  // for that uncommon case; ordinary pagination changes remain provisional.
+  if (directEditor && provisionalRemovedPages.has(Number(directEditor.pageNumber))) {
+    requestCanonicalDisplay({ residentImpossible: true });
+    return;
+  }
+  const canonicalPageCount = currentCanonicalPageCount(
+    canonical, committedCanonicalGeneration, documentReset.adoptedEpoch, appliedSrcRev
+  );
+  const pageCountMismatch = canonicalPageCount !== null &&
+    canonicalPageCount !== residentPageCount;
+  if (canonicalPageCount === null || pageCountMismatch) requestCanonicalDisplay();
+  const stageReady = stage => stage.ready && stage.sourceRev === appliedSrcRev &&
+    stage.documentEpoch === documentReset.adoptedEpoch &&
+    Number(stage.snapshot?.srcRev) === appliedSrcRev &&
+    Number(stage.snapshot?.documentEpoch) === stage.documentEpoch;
+  // Before this document's first canonical the resident count is the only
+  // one. Once no resident page waits for a block's geometry (the boot walk
+  // compiled its rescues) it is settled, and a ready group need not wait for
+  // every page's exact ink: on the 316-page book that wait lasted until the
+  // first canonical, about four minutes after opening (tex64-internal #83).
+  const residentCountSettled = canonicalPageCount === null && !provisionalPendingLayout.size;
+  let committing = stages;
+  if (!stages.every(stageReady)) {
+    // While the page count is settled, a ready group (provisionalCommitGroups)
+    // does not wait for another: typically a page elsewhere still waiting for
+    // exact pixels (the previous keystroke's, or a running head the edit
+    // touched) would hold back the page being typed on now. Numbers on far
+    // pages may briefly lag until theirs land.
+    if (pageCountMismatch || (canonicalPageCount === null && !residentCountSettled) ||
+        provisionalRemovedPages.size || directEditor) return;
+    // no canonical has made the shells yet: the resident count does
+    if (residentCountSettled) for (let n = 1; n <= residentPageCount; n++) ensureShell(n);
+    if (stages.some(stage => !pageDivs.has(stage.dl.page))) return;
+    committing = provisionalCommitGroups(stages, committedPageSrcs, pageEditGroup, pagePainted, stageReady)
+      .filter(group => group.every(stageReady)).flat()
+      .sort((a, b) => a.dl.page - b.dl.page);
+    if (!committing.length) return;
+  }
+  const editorStage = committing.find(stage => stage.dl.page === directEditor?.pageNumber);
   const editorRegion = editorStage ? directEditorRegionInSnapshot(editorStage.snapshot, directEditor) : null;
   if (editorStage && !provisionalStageKeepsEditor(editorStage, editorRegion)) {
     const pending = directEditorSnapshotPending(editorStage.snapshot, directEditor, editorStage.sourceRev, editorRegion);
@@ -741,9 +936,15 @@ function tryCommitProvisionalStages() {
   }
   // All affected pages change within this synchronous transaction. A new
   // provisional page is also kept detached until its complete ink is ready.
-  provisionalStages.clear();
-  for (const stage of stages) {
+  if (committing === stages) {
+    provisionalStages.clear();
+    pageEditGroup.clear();
+  } else for (const stage of committing) provisionalStages.delete(stage.dl.page);
+  for (const stage of committing) {
     const { dl, staging, sourceRev, snapshot } = stage;
+    traceStage('commit', dl.page, { sourceRev });
+    committedPageSrcs.set(dl.page, stage.srcs ?? displayListSrcs(dl));
+    pageEditGroup.delete(dl.page);
     let div = pageDivs.get(dl.page);
     if (!div) div = ensureShell(dl.page);
     div.querySelector(':scope > svg:not(.tdom-canonical-delta)')?.remove();
@@ -756,13 +957,19 @@ function tryCommitProvisionalStages() {
     delete div.dataset.provPending;
     div.classList.remove('awaiting-canonical');
   }
-  for (const stage of stages) updateCanonState(stage.dl.page);
-  if (stages.every(stage => {
+  // Tail removal belongs to the same renderer transaction as the replacement
+  // pages above. The browser cannot paint old tail pages beside the new
+  // resident generation, even when its page count is only provisional.
+  if (provisionalRemovedPages.size) reconcilePageCount(residentPageCount);
+  provisionalRemovedPages.clear();
+  residentPageCountAuthoritative = canonicalPageCount === residentPageCount;
+  for (const stage of committing) updateCanonState(stage.dl.page);
+  if (residentPageCountAuthoritative && committing === stages && stages.every(stage => {
     const page = pageDivs.get(stage.dl.page);
     return !page.classList.contains('is-final') || Number(page.dataset.canonPresentedRev) >= stage.sourceRev;
   })) fulfillCanonicalDisplay();
   if (liveSearch.query) scheduleLiveSearchRefresh();
-  if (stages.some(stage => stage.dl.page === directEditor?.pageNumber)) {
+  if (committing.some(stage => stage.dl.page === directEditor?.pageNumber)) {
     repositionDirectEditor();
     void refreshDirectEditGeometry();
   }
@@ -817,8 +1024,9 @@ function provisionalStageKeepsEditor(stage, region) {
   if (!session) return true;
   if (!region) return false;
   const owners = (stage.snapshot.blocks ?? []).filter(block =>
-    sameSourceFile(block.source?.file, region.source.file) &&
-    sourceContainsPosition(block, region.source.start) && sourceContainsPosition(block, region.source.end));
+    (block.sourceRanges ?? [block.source]).some(source =>
+      sameSourceFile(source?.file, region.source.file) &&
+      sourceContainsPosition({ source }, region.source.start) && sourceContainsPosition({ source }, region.source.end)));
   if (owners.length !== 1) return false;
   const owner = owners[0];
   const identical = (owner.editRegions ?? []).filter(item => item.kind === session.kind &&
@@ -879,9 +1087,13 @@ function renderPage(dl, flash) {
   if (div) div.dataset.provPending = '1';
   if (dl.commands.some(cmd => cmd.op === 'canon' || cmd.op === 'pending-exact' ||
       cmd.op === 'glyphs' && cmd.math || cmd.op === 'chunk' && cmd.st)) {
+    traceStage('blocked', dl.page);
+    stage.srcs = displayListSrcs(dl);
+    committedPageSrcs.set(dl.page, new Set([...(committedPageSrcs.get(dl.page) ?? []), ...stage.srcs]));
     requestCanonicalDisplay({ residentImpossible: dl.commands.some(cmd => cmd.op === 'canon') });
     return;
   }
+  traceStage('stage', dl.page);
   const families = [...new Set(dl.commands.filter(cmd => cmd.op === 'glyphs' && cmd.fam).map(cmd => cmd.fam))];
   injectFonts(families);
   const staging = document.createElement('div');
@@ -906,11 +1118,15 @@ function renderPage(dl, flash) {
     staging.querySelectorAll('text[data-font-pending]').forEach(node => node.removeAttribute('data-font-pending'));
     stage.staging = staging;
     stage.ready = true;
+    traceStage('ready', dl.page);
     tryCommitProvisionalStages();
   };
   const images = [...staging.querySelectorAll('img')];
+  if (Array.isArray(globalThis.__tdomStageTrace)) {
+    void Promise.all(images.map(img => img.decode())).then(() => traceStage('decoded', dl.page, { images: images.length }), () => {});
+  }
   const pending = [
-    loadProvisionalSnapshot(sourceRev).then(snapshot => { stage.snapshot = snapshot; }),
+    loadProvisionalSnapshot(sourceRev).then(snapshot => { stage.snapshot = snapshot; traceStage('snapshot', dl.page); }),
     ...images.map(img => img.decode()),
     Promise.all(images.map(loadChunkInputGeometry)).then(chunks => {
       stage.glyphs = provisionalChunkGlyphs(dl.commands, chunks);
@@ -973,8 +1189,8 @@ function svgFor(dl, className = '') {
 }
 
 function removePagesFrom(from) {
-  // Resident pagination is provisional. A shrink must not erase the last
-  // printed page before the definitive PDF (including any moved ink) lands.
+  // Stage a resident shrink until every replacement page is ready, so the
+  // old tail and the new generation disappear in one browser transaction.
   lastRemoveRev = appliedSrcRev;
   for (const n of provisionalStages.keys()) if (n >= from) provisionalStages.delete(n);
   for (const [n, div] of pageDivs) if (n >= from) {
@@ -1033,13 +1249,60 @@ function applyReport(report) {
   // never let an offscreen load commit a patch from an older revision.
   canonicalAnchorPendingPatch = null;
   const closureDeferred = !!report.stats?.closureDeferred;
-  if (closureDeferred && canonicalAnchorPreview) {
+  // A canonical build for an intermediate keystroke retires the server's
+  // proof lineage, so the next keystroke in the same block gets no anchor
+  // (base-generation / canonical-behind). The overlay already on paper is
+  // still that earlier revision's certified page: keep it as the last good
+  // presentation rather than dropping to the older base page underneath.
+  const dirtyBlock = report.dirtySourceNodes?.length === 1
+    ? String(report.dirtySourceNodes[0]).replace(/^src-/, '')
+    : null;
+  // A cumulative overlay covers every block edited since its base; the
+  // server lists them so a refusal in any of them keeps the lease.
+  const previewBlocks = canonicalAnchorPreview
+    ? (Array.isArray(canonicalAnchorPreview.blockIds) ? canonicalAnchorPreview.blockIds : [canonicalAnchorPreview.blockId])
+    : [];
+  const intentBlocks = anchorIntent
+    ? (Array.isArray(anchorIntent.blockIds) ? anchorIntent.blockIds : [anchorIntent.blockId])
+    : [];
+  // A keystroke in a covered block got no anchor (its proof lineage was
+  // retired by a canonical build, or the change cannot be an overlay: a box
+  // shifted, a line reflowed). The overlay on paper is still that block's
+  // certified rendering over the same base page, one keystroke behind:
+  // keep it as the last good presentation rather than exposing the older
+  // base page. A restore that made the canonical current and a reboot
+  // retire it as before.
+  const canonicalCurrent = Boolean(report.canonical?.id) && report.canonical.rev >= (report.srcRev ?? 0);
+  const leased = !anchorIntent && canonicalAnchorPreview && !canonicalAnchorPreview.retiring &&
+    !!dirtyBlock && previewBlocks.includes(dirtyBlock) && report.rebooted !== true &&
+    report.canonicalAnchorRefused !== 'canonical-current' && !canonicalCurrent;
+  // An edit in a block the overlay does not cover got no anchor (a box, a
+  // reflowing line, a cold keystroke). The overlay is still the certified
+  // rendering of its own blocks over the same base page: keep it as the
+  // last good presentation instead of exposing the older base page. The
+  // overlay's own pages stay frozen while other pages may still take this
+  // edit's provisional patches.
+  const leasedOther = !leased && !anchorIntent && canonicalAnchorPreview && !canonicalAnchorPreview.retiring &&
+    !!dirtyBlock && !previewBlocks.includes(dirtyBlock) && report.rebooted !== true &&
+    report.canonicalAnchorRefused !== 'canonical-current' && !canonicalCurrent;
+  const overlayPages = new Set((canonicalAnchorPreview?.pages ?? []).map((entry) => Number(entry.page)));
+  if (canonicalAnchorPreview?.retiring) {
+    // A covering canonical is on its way to this page. Until that image
+    // commits (or a new anchor replaces the delta atomically), no report may
+    // clear the overlay or move its target: either would expose the older
+    // base page, or leave the delta over the covering one.
+  } else if (closureDeferred && canonicalAnchorPreview) {
     // The source revision advances while an unfinished TeX construct holds
     // the last successful pixels. Keep that exact previous overlay eligible
     // for the new revision; it will be replaced when native closure succeeds.
     canonicalAnchorPreview.targetSrcRev = appliedSrcRev;
+  } else if (leased || leasedOther) {
+    // Ownership, not currency: presentation stays pending (the overlay's own
+    // srcRev is older than appliedSrcRev) until a new anchor or a canonical
+    // page covering this revision is on paper.
+    canonicalAnchorPreview.targetSrcRev = appliedSrcRev;
   } else if (!anchorIntent || canonicalAnchorPreview && (
-    canonicalAnchorPreview.blockId !== anchorIntent.blockId ||
+    !previewBlocks.every((id) => intentBlocks.includes(id)) ||
     canonicalAnchorPreview.baseGeneration !== anchorIntent.baseGeneration
   )) {
     clearCanonicalAnchorPreview();
@@ -1048,13 +1311,20 @@ function applyReport(report) {
     // resolving, but make its convergence target the newest source revision.
     canonicalAnchorPreview.targetSrcRev = anchorIntent.srcRev;
   }
+  const frozen = leased || Boolean(canonicalAnchorPreview?.retiring);
   const provisionalPatches = [];
   for (const patch of report.patches) {
     if (previewPolicy !== 'structured') continue;
+    // A leased refusal came before the plan could prove that this edit
+    // leaves line breaks and page count alone, and a retiring delta still
+    // sits on its base image: publishing any provisional page beside either
+    // could compose no real revision.
+    if (frozen) continue;
+    if (leasedOther && patch.type === 'replace-page' && overlayPages.has(Number(patch.displayList?.page))) continue;
     if (patch.type === 'replace-page') {
       const dl = patch.displayList;
       if (anchorIntent && (anchorIntent.provisionalPages ?? [anchorIntent.provisionalPage]).includes(dl.page) &&
-          dl.commands?.some((command) => command.src === anchorIntent.blockId)) {
+          dl.commands?.some((command) => intentBlocks.includes(command.src))) {
         // The provisional page number belongs to the resident renderer's
         // local address space. While canonical anchoring resolves, retain
         // the unchanged physical page instead of repainting the unrelated
@@ -1069,7 +1339,13 @@ function applyReport(report) {
       provisionalPatches.push(patch);
     }
   }
-  stageProvisionalPatches(provisionalPatches, true, report.stats?.pageCount);
+  // Not even an empty call while frozen: it re-renders earlier staged pages
+  // for the new appliedSrcRev.
+  if (!frozen) {
+    const editIds = new Set([...(report.dirtySourceNodes ?? []), ...(report.removedSourceNodes ?? [])]
+      .map(node => String(node).replace(/^src-/, '')));
+    stageProvisionalPatches(provisionalPatches, true, report.stats?.pageCount, editIds);
+  }
   for (const patch of provisionalPatches) {
     if (patch.type === 'replace-page') updateCanonState(patch.displayList.page);
   }
@@ -1082,12 +1358,56 @@ function clearCanonicalAnchorPreview() {
   canonicalAnchorPendingPatch = null;
 }
 
+/** A new anchor that fails (proof not ready, background unproven, deadline
+ * passed) is dropped alone: the certified overlay already on paper stays the
+ * last good presentation. */
+function discardPendingCanonicalAnchor() {
+  canonicalAnchorPendingPatch = null;
+}
+
+/** Called in the same DOM step that puts a canonical image on a page: a
+ * retiring overlay leaves with the base image it was addressed against.
+ * Only the committed delta goes; a newer anchor still pending (addressed to
+ * this very image) is retried instead of being dropped with it. */
+function retireCanonicalAnchorOnPage(div, presentedRev) {
+  const anchor = canonicalAnchorPreview;
+  if (!anchor?.retiring || !(Number(presentedRev) >= Number(anchor.targetSrcRev ?? anchor.srcRev))) return;
+  div.querySelectorAll('svg.tdom-canonical-delta').forEach((node) => node.remove());
+  if (pagesEl.querySelector('svg.tdom-canonical-delta')) return;
+  canonicalAnchorPreview = null;
+  if (canonicalAnchorPendingPatch) queueMicrotask(() => tryApplyPendingCanonicalAnchor());
+}
+
 function canonicalAnchorForPage(pageNumber) {
   const candidate = canonicalAnchorPendingPatch ?? canonicalAnchorPreview;
   const pagePatch = canonicalAnchorPages(candidate).find((page) => Number(page.page) === Number(pageNumber));
-  if (!candidate || !pagePatch) return null;
+  if (!candidate || !pagePatch || candidate.retiring) return null;
   if (Number(candidate.targetSrcRev ?? candidate.srcRev) !== Number(appliedSrcRev)) return null;
   return { ...candidate, ...pagePatch };
+}
+
+/** A lazy canonical page may decode only after a distant toolbar jump. Keep
+ * that certified last-good paper visible when this shell has never committed
+ * provisional ink. The marker prevents the embed readiness contract from
+ * mistaking the fallback for current-source pixels. */
+function emptyStructuredCanonicalFallback(pageNumber, page, image) {
+  if (!page || !image || usesCanonicalSurface() || documentReset.pending ||
+      'prov' in page.dataset || !Number.isInteger(pageNumber) || pageNumber < 1 ||
+      pageNumber > Number(canonical?.pageCount)) return false;
+  const presented = presentedPageState(page);
+  const expectedSrc = `/canonical/${pageNumber}.svg?c=${Number(canonical?.id)}`;
+  return Boolean(
+    presented && presented.image === image && presented.src === expectedSrc &&
+    image.complete && image.naturalWidth > 0 &&
+    presented.id === Number(canonical?.id) && presented.rev === Number(canonical?.rev) &&
+    Number(presented.snapshot?.srcRev) === presented.rev &&
+    Number(presented.snapshot?.documentEpoch) === documentReset.adoptedEpoch
+  );
+}
+
+function retainCanonicalFallbackMarker({ newlyEligible, previouslyMarked,
+  canonicalSurface, final, freshTargetPresented }) {
+  return newlyEligible || previouslyMarked && !canonicalSurface && final && !freshTargetPresented;
 }
 
 function tryApplyPendingCanonicalAnchor() {
@@ -1097,6 +1417,11 @@ function tryApplyPendingCanonicalAnchor() {
   const pagePatches = canonicalAnchorPages(patch);
   const transactions = [];
   for (const pagePatch of pagePatches) {
+    if (patch.visualCut === true &&
+        !globalThis.TdomCanonicalAnchorRaster?.validateVisualCutPage(pagePatch)) {
+      discardPendingCanonicalAnchor();
+      return false;
+    }
     const pageNumber = Number(pagePatch.page);
     const page = pageDivs.get(pageNumber);
     const presented = page?.isConnected ? presentedPageState(page) : null;
@@ -1104,13 +1429,15 @@ function tryApplyPendingCanonicalAnchor() {
         presented?.id !== Number(patch.baseGeneration) ||
         presented?.rev !== Number(patch.baseRev)) return false;
     const rules = [];
-    for (const mask of pagePatch.masks ?? []) {
+    for (let index = 0; index < (pagePatch.masks ?? []).length; index++) {
+      const mask = pagePatch.masks[index];
       if (!mask || ![mask.left, mask.top, mask.right, mask.bottom].every(Number.isFinite)) return false;
-      const background = canonicalAnchorBackground(page, mask);
+      const baseMask = patch.visualCut === true ? pagePatch.baseMasks[index] : null;
+      const background = canonicalAnchorBackground(page, mask, baseMask);
       if (!background) {
         // A solid mask is exact only when the canonical ink sits on a locally
         // uniform background. Gradients, artwork, and frames fail closed.
-        clearCanonicalAnchorPreview();
+        discardPendingCanonicalAnchor();
         return false;
       }
       rules.push({
@@ -1128,7 +1455,7 @@ function tryApplyPendingCanonicalAnchor() {
   // The deadline is checked again immediately before the atomic DOM commit;
   // image decode or background probing is not allowed to publish a stale win.
   if (!canonicalAnchorWithinDeadline(patch)) {
-    clearCanonicalAnchorPreview();
+    discardPendingCanonicalAnchor();
     return false;
   }
   pagesEl.querySelectorAll('svg.tdom-canonical-delta').forEach((node) => node.remove());
@@ -1141,10 +1468,12 @@ function tryApplyPendingCanonicalAnchor() {
   const committedAt = performance.now();
   canonicalAnchorPreview = {
     blockId: patch.blockId,
+    blockIds: Array.isArray(patch.blockIds) ? [...patch.blockIds] : [patch.blockId],
     srcRev: patch.srcRev,
     targetSrcRev: patch.srcRev,
     baseGeneration: patch.baseGeneration,
     baseRev: patch.baseRev,
+    visualCut: patch.visualCut === true,
     pages: pagePatches.map((page) => ({ page: page.page })),
   };
   canonicalAnchorPendingPatch = null;
@@ -1197,7 +1526,9 @@ function canonicalAnchorPages(patch) {
   if (!patch) return [];
   if (Array.isArray(patch.pages)) return patch.pages;
   return Number.isInteger(Number(patch.page))
-    ? [{ page: Number(patch.page), masks: patch.mask ? [patch.mask] : [], commands: patch.commands ?? [] }]
+    ? [{ page: Number(patch.page), masks: patch.mask ? [patch.mask] : [],
+        ...(patch.visualCut === true ? { baseMasks: patch.baseMask ? [patch.baseMask] : [] } : {}),
+        commands: patch.commands ?? [] }]
     : [];
 }
 
@@ -1208,7 +1539,7 @@ function canonicalAnchorWithinDeadline(patch) {
     performance.now() - startedAt < limit;
 }
 
-function canonicalAnchorBackground(page, mask) {
+function canonicalAnchorBackground(page, mask, baseMask = null) {
   const image = page?.querySelector('img.canon');
   if (!image?.naturalWidth || !image?.naturalHeight) return null;
   let cached = canonicalAnchorCanvasCache.get(image);
@@ -1265,6 +1596,42 @@ function canonicalAnchorBackground(page, mask) {
   const rgb = [0, 1, 2].map((channel) =>
     Math.round(samples.reduce((sum, sample) => sum + sample[channel], 0) / samples.length)
   );
+  if (baseMask) {
+    const raster = globalThis.TdomCanonicalAnchorRaster;
+    if (!raster?.ringPixelsUniform || !raster.validateVisualCutPage({ masks: [mask], baseMasks: [baseMask] })) {
+      return null;
+    }
+    const pixelLeft = Math.floor(mask.left * sx);
+    const pixelTop = Math.floor(mask.top * sy);
+    const pixelRight = Math.ceil(mask.right * sx);
+    const pixelBottom = Math.ceil(mask.bottom * sy);
+    if (pixelLeft < 0 || pixelTop < 0 || pixelRight > cached.canvas.width ||
+        pixelBottom > cached.canvas.height || pixelRight <= pixelLeft || pixelBottom <= pixelTop ||
+        (pixelRight - pixelLeft) * (pixelBottom - pixelTop) > raster.DEFAULT_MAX_PIXELS) return null;
+    let imageData;
+    try {
+      imageData = cached.context.getImageData(
+        pixelLeft,
+        pixelTop,
+        pixelRight - pixelLeft,
+        pixelBottom - pixelTop
+      );
+    } catch {
+      return null;
+    }
+    if (!raster.ringPixelsUniform({
+      data: imageData.data,
+      width: imageData.width,
+      height: imageData.height,
+      originX: pixelLeft,
+      originY: pixelTop,
+      sx,
+      sy,
+      mask,
+      baseMask,
+      background: rgb,
+    })) return null;
+  }
   return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
 }
 
@@ -1273,11 +1640,12 @@ function cssColor(value) {
   return match ? match.slice(1, 4).map(Number) : null;
 }
 
-function applyCanonicalAnchorPatch(patch) {
+function applyCanonicalAnchorPatch(patch, { allowVisualCut = false } = {}) {
   if (!patch || patch.srcRev !== appliedSrcRev) return;
+  if (patch.visualCut === true && (!allowVisualCut || patch.authoritative !== false)) return;
   if (patch.baseGeneration !== canonical?.id || patch.baseRev !== canonical?.rev) return;
   if (patch.status !== 'ready') {
-    clearCanonicalAnchorPreview();
+    discardPendingCanonicalAnchor();
     return;
   }
   if (!canonicalAnchorWithinDeadline(patch)) return;
@@ -1286,6 +1654,9 @@ function applyCanonicalAnchorPatch(patch) {
     !Number.isInteger(Number(page.page)) || Number(page.page) < 1 ||
     !Array.isArray(page.masks) || !page.masks.length ||
     page.masks.some((mask) => !mask || ![mask.left, mask.top, mask.right, mask.bottom].every(Number.isFinite))
+  )) return;
+  if (patch.visualCut === true && pagePatches.some((page) =>
+    !globalThis.TdomCanonicalAnchorRaster?.validateVisualCutPage(page)
   )) return;
   canonicalAnchorPendingPatch = patch;
   for (const pagePatch of pagePatches) {
@@ -1836,13 +2207,15 @@ function dropOpaqueCanonicalBatchPage(registration) {
   tryCommitOpaqueCanonicalBatch(batch);
 }
 
-function reconcileOpaquePageCount(pageCount) {
+function reconcilePageCount(pageCount) {
   if (!Number.isInteger(pageCount) || pageCount < 0) return;
   for (const [pageNumber, page] of [...pageDivs]) {
     if (pageNumber <= pageCount) continue;
     canonicalStageObserver?.unobserve(page);
     page.remove();
     pageDivs.delete(pageNumber);
+    committedPageSrcs.delete(pageNumber);
+    pageEditGroup.delete(pageNumber);
     pageDirtyRev.delete(pageNumber);
     shipPages.delete(pageNumber);
     provisionalStages.delete(pageNumber);
@@ -2049,8 +2422,11 @@ function tryCommitOpaqueCanonicalBatch(batch) {
     entry.apply();
   }
   committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch, pageCount: batch.pageCount };
+  for (const [page, dl] of provisionalDisplayLists) committedPageSrcs.set(page, displayListSrcs(dl));
+  pageEditGroup.clear();
   provisionalStages.clear();
   provisionalRemovedPages.clear();
+  residentPageCountAuthoritative = true;
   for (const [n, rev] of pageDirtyRev) if (rev <= batch.rev) pageDirtyRev.delete(n);
   directEditClickEpoch++;
   opaqueBatchCommitDepth++;
@@ -2064,7 +2440,8 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   applyStagedDirectEditor(batch.editorStage, batch, editorScrollAnchor);
   // The editor can move from a removed tail page to a surviving page.
   // Transfer it while both ancestors are still connected.
-  reconcileOpaquePageCount(batch.pageCount);
+  reconcilePageCount(batch.pageCount);
+  scheduleViewportWarm();
   updateBadge();
 }
 
@@ -2201,6 +2578,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
           current.dataset.canonId = String(currentId);
           current.dataset.canonRev = String(currentRev);
           div.classList.remove('awaiting-canonical');
+          retireCanonicalAnchorOnPage(div, currentRev);
         });
       });
     } else if (shipRegistration) {
@@ -2292,6 +2670,7 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
       if (Number.isFinite(presentationRev)) {
         div.dataset.canonPresentedRev = String(presentationRev);
         candidate.dataset.canonRev = String(presentationRev);
+        retireCanonicalAnchorOnPage(div, presentationRev);
       } else {
         delete div.dataset.canonPresentedRev;
       }
@@ -2479,7 +2858,7 @@ function updateCanonState(n) {
       div,
       src,
       useShip
-        ? { w: geometry.paperwidth, h: geometry.paperheight }
+        ? ship.paper ?? { w: geometry.paperwidth, h: geometry.paperheight }
         : canonical.papers?.[n - 1] ?? canonical.paper,
       useShip
         ? {
@@ -2505,9 +2884,21 @@ function updateCanonState(n) {
   const retainingCanonical = img && div.classList.contains('is-final') && (
     div.dataset.provPending === '1' || targetSrc || canonical?.id && n > canonical.pageCount
   );
+  const emptyCanonicalFallback = !fresh &&
+    emptyStructuredCanonicalFallback(n, div, img);
   const state = usesCanonicalSurface()
     ? (img ? 'final' : 'provisional')
-    : ((fresh && targetPresented || retainingCanonical) ? 'final' : 'provisional');
+    : ((fresh && targetPresented || retainingCanonical || emptyCanonicalFallback)
+        ? 'final' : 'provisional');
+  const keepCanonicalFallback = retainCanonicalFallbackMarker({
+    newlyEligible: emptyCanonicalFallback,
+    previouslyMarked: div.dataset.canonFallback === '1',
+    canonicalSurface: usesCanonicalSurface(),
+    final: state === 'final',
+    freshTargetPresented: fresh && targetPresented,
+  });
+  if (keepCanonicalFallback) div.dataset.canonFallback = '1';
+  else delete div.dataset.canonFallback;
   if (img) img.style.clipPath = '';
   const previousFinal = div.classList.contains('is-final');
   div.classList.toggle('is-final', state === 'final');
@@ -6219,6 +6610,7 @@ window.addEventListener('resize', () => {
 });
 pagesEl.addEventListener('scroll', () => {
   if (directEditor) scheduleDirectEditorVisuals(true);
+  scheduleViewportWarm();
 }, { passive: true });
 // Embed mode (?embed=1): a host app (e.g. TeX64) shows only the pages —
 // no topbar, no pane title, no inspector — and owns the editor, pushing
@@ -6266,6 +6658,7 @@ pagesEl.addEventListener('scroll', () => {
     };
     const previewReady = (required) => {
       if (!bootComplete || !documentReset.acceptsReady(documentReset.adoptedEpoch) || !required.length) return false;
+      if (required.some(([, page]) => page.dataset.canonFallback === '1')) return false;
       if (usesCanonicalSurface()) {
         return required.every(([, page]) => {
           const shipping = presentedShippingPageState(page);
@@ -6312,6 +6705,9 @@ pagesEl.addEventListener('scroll', () => {
       });
     };
     let embedSnapshotRaf = null;
+    // The last host goto-sync this frame actually scrolled to. The host keeps
+    // its static page up until the frame confirms the handed-off viewport.
+    let embedViewportToken = null;
     const postEmbedSnapshot = () => {
       try {
         const visible = visiblePageSnapshot();
@@ -6331,8 +6727,11 @@ pagesEl.addEventListener('scroll', () => {
             ready: previewReady(visible.required),
             presentationPending: pending,
             pageCount: visible.entries.length,
+            pageCountAuthoritative: residentPageCountAuthoritative,
             zoom,
             page: visible.topPage,
+            srcRev: appliedSrcRev,
+            viewportToken: embedViewportToken,
             status: lastEngineStatus,
             search: {
               query: liveSearch.query,
@@ -6442,6 +6841,7 @@ pagesEl.addEventListener('scroll', () => {
         ? blockY + (Number.isFinite(blockHeight) ? blockHeight / 2 : 0)
         : Number(data.y);
       scrollPageToViewport(page, Number.isFinite(y) ? y : 0, true);
+      embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
       void refineSyncToSource(data);
       requestAnimationFrame(scheduleEmbedSnapshot);
     };
@@ -6685,7 +7085,13 @@ function receivePreviewEvent(msg) {
       const activeAnchor = canonicalAnchorPendingPatch ?? canonicalAnchorPreview;
       if (activeAnchor && (
         msg.canonical?.rev >= Number(activeAnchor.targetSrcRev ?? activeAnchor.srcRev)
-      )) clearCanonicalAnchorPreview();
+      )) {
+        // Retire the overlay when a covering page replaces its base image,
+        // not now: until that image decodes and commits, removing the delta
+        // would show the older base page underneath.
+        canonicalAnchorPendingPatch = null;
+        if (canonicalAnchorPreview) canonicalAnchorPreview.retiring = true;
+      }
       canonical = msg.canonical;
       if (msg.mode) setMode(msg.mode, msg.canonical?.modeReasons ?? modeReasons);
       syncCanonical();
@@ -6693,6 +7099,12 @@ function receivePreviewEvent(msg) {
     }
     if (msg.kind === 'canonical-anchor') {
       applyCanonicalAnchorPatch(msg.patch);
+      return;
+    }
+    if (msg.kind === 'canonical-visual-cut') {
+      if (msg.patch?.visualCut === true && globalThis.TdomCanonicalAnchorRaster) {
+        applyCanonicalAnchorPatch(msg.patch, { allowVisualCut: true });
+      }
       return;
     }
     if (msg.kind === 'ship-wave') {
@@ -6739,6 +7151,8 @@ function receivePreviewEvent(msg) {
           srcRev: batch.srcRev,
           batchKey: key,
           deadlineAt: batch.deadlineAt,
+          // Rotated/resized pages carry their own displayed box (#64).
+          paper: msg.papers?.[page - 1] ?? null,
         });
       }
       // There may be no visible page during a reset/resize. The backing

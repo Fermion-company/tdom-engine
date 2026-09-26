@@ -3,8 +3,9 @@
 // A positive result is deliberately modest: it only says that the source is
 // not *obviously* waiting for more input.  The resident LuaLaTeX JOB is the
 // semantic authority and supplies the second half of the certificate.  A
-// negative result is conclusive enough to avoid feeding invented closing
-// tokens to TeX while the user is still typing.
+// negative result holds the resident tree instead of feeding invented
+// closing tokens to TeX. Only canonical compilation can distinguish an
+// unfinished document from syntax hidden behind macro expansion.
 
 const LITERAL_ENVS = new Set([
   'verbatim',
@@ -14,12 +15,19 @@ const LITERAL_ENVS = new Set([
   'alltt',
   'filecontents',
   'filecontents*',
+  'Verbatim',
   'BVerbatim',
   'LVerbatim',
   'VVerbatim',
+  'Verbatim*',
   'BVerbatim*',
   'LVerbatim*',
   'VVerbatim*',
+  'SaveVerbatim',
+  'VerbatimOut',
+  'tcblisting',
+  'luacode',
+  'luacode*',
 ]);
 
 const CONDITIONALS = new Set([
@@ -73,9 +81,13 @@ function bracedArgument(text, at) {
   return null;
 }
 
-export function sourceClosure(text) {
+// `literalEnvs` names the literal environments the preamble declares
+// (\lstnewenvironment and friends, see literalEnvironmentNames): a
+// listing that quotes \end{document} or an unbalanced brace is closed.
+export function sourceClosure(text, { literalEnvs = null } = {}) {
   const envs = [];
   const conditionals = [];
+  const loops = [];
   const customConditionals = new Set();
   const math = [];
   let groups = 0;
@@ -143,6 +155,64 @@ export function sourceClosure(text) {
     while (end < text.length && /[A-Za-z@]/.test(text[end])) end++;
     const name = text.slice(i + 1, end);
 
+    // \string quotes the next token: `\string\verb` prints a name, it does
+    // not open a verbatim payload.
+    if (name === 'string') {
+      let p = skipSpace(text, end);
+      if (text[p] === '\\') {
+        p++;
+        if (/[A-Za-z@]/.test(text[p] ?? '')) while (p < text.length && /[A-Za-z@]/.test(text[p])) p++;
+        else p++;
+      } else {
+        p++;
+      }
+      i = p;
+      continue;
+    }
+
+    if (name === 'lstinline' || name === 'mintinline') {
+      let p = end;
+      if (text[p] === '[') {
+        const close = text.indexOf(']', p);
+        if (close < 0) return fail(`${name}-options`, i);
+        p = close + 1;
+      }
+      if (name === 'mintinline') {
+        const language = bracedArgument(text, p);
+        if (!language) return fail('mintinline-language', i);
+        p = language.end;
+      }
+      if (text[p] === '{') {
+        const payload = bracedArgument(text, p);
+        if (!payload) return fail('verb-payload', i);
+        i = payload.end;
+        continue;
+      }
+      const delim = text[p];
+      if (!delim || /[A-Za-z\s]/.test(delim)) return fail('verb-delimiter', i);
+      const close = text.indexOf(delim, p + 1);
+      const nl = text.indexOf('\n', p + 1);
+      if (close < 0 || (nl >= 0 && nl < close)) return fail('verb-payload', i);
+      i = close + 1;
+      continue;
+    }
+
+    // KKluaverb reads \KKverb|...| and \KKcodeS...\KKcodeE as literal text
+    // (a process_input_buffer rewrite; its default delimiters are | and |).
+    // The payload may span lines. A brace or a % inside it is data.
+    if (name === 'KKverb' || name === 'KKcodeS') {
+      const closer = name === 'KKverb' ? '|' : '\\KKcodeE';
+      if (name === 'KKverb' && text[end] !== '|') {
+        i = end;
+        continue;
+      }
+      const from = name === 'KKverb' ? end + 1 : end;
+      const close = text.indexOf(closer, from);
+      if (close < 0) return fail('verb-payload', i);
+      i = close + closer.length;
+      continue;
+    }
+
     if (name === 'verb') {
       let p = end;
       if (text[p] === '*') p++;
@@ -162,7 +232,7 @@ export function sourceClosure(text) {
       if (!env) return fail(`${name}-environment`, i);
       if (name === 'begin') {
         envs.push(env);
-        if (LITERAL_ENVS.has(env)) literal = env;
+        if (LITERAL_ENVS.has(env) || literalEnvs?.has(env)) literal = env;
       } else {
         if (envs.at(-1) !== env) return fail(`unexpected:end:${env}`, i);
         envs.pop();
@@ -182,7 +252,14 @@ export function sourceClosure(text) {
         continue;
       }
     }
-    if (CONDITIONALS.has(name) || customConditionals.has(name)) conditionals.push(name);
+    // Plain TeX's \repeat supplies the closing \fi for the loop test.
+    // Track the entry depth so nested loops cannot consume an outer test.
+    if (name === 'loop') loops.push(conditionals.length);
+    else if (name === 'repeat') {
+      if (!loops.length || conditionals.length !== loops.at(-1) + 1) return fail('loop-test', i);
+      loops.pop();
+      conditionals.pop();
+    } else if (CONDITIONALS.has(name) || customConditionals.has(name)) conditionals.push(name);
     else if (name === 'fi') {
       if (!conditionals.length) return fail('unexpected:fi', i);
       conditionals.pop();
@@ -194,6 +271,7 @@ export function sourceClosure(text) {
   if (envs.length) return fail(`environment:${envs.at(-1)}`, text.length);
   if (groups) return fail('group', text.length);
   if (math.length) return fail(`math:${math.at(-1)}`, text.length);
+  if (loops.length) return fail('loop', text.length);
   if (conditionals.length) return fail(`conditional:${conditionals.at(-1)}`, text.length);
   return { closed: true, reason: null, at: text.length };
 }

@@ -62,7 +62,9 @@ const surface = createLiveSurface({
   getTheme: () => (document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'),
   getBackground: () => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim(),
   onPhase: (phase) => document.body.classList.toggle('is-live', phase === 'active'),
-  onToolbar: ({ page, pageCount, zoom }) => renderToolbar(page, pageCount, zoom),
+  // pageCountAuthoritative=false: the count is provisional, show "/ —"
+  onToolbar: ({ page, pageCount, pageCountAuthoritative, zoom }) =>
+    renderToolbar(page, pageCountAuthoritative ? pageCount : null, zoom),
   onStatus: (view) => setStatus(view.message ?? translate(view.key), view.tone),
   onSource: (location) => bridge.postMessage({ type: 'live-source', payload: location }),
   onStaticRestore: ({ url, path }) => loadStaticPdf(url, path),

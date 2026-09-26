@@ -26,7 +26,69 @@ canonical scheduling は latest-wins である。compile 中に新しい source 
 
 structured mode では `pressure = 'authority'` で、基本 debounce に加えて前回 compile time に比例した cooldown を持つ。opaque mode では `pressure = 'display'` になり、canonical compile 自体が表示更新なので debounce 中心で動く。
 
+最初の baseline は resident の boot walk を待たない。`engine.open()` は walk の前に、open が公開する revision（`srcRev + 1`）でその source を予約する。canonical は resident tree を使わないので、walk と並んで走る（316 ページの実文書では walk 76 s と 3 pass の baseline 125 s が直列で、どちらも終わるまで打鍵を anchor できなかった）。walk の最後の `schedule()` は同じ revision・同じ bytes なので、走行中ならそのまま、着地済みなら `#reconcile` で終わり、2 本目の compile も待機中の debounce のやり直しも作らない（同じ bytes で失敗済みの revision も組み直さない）。walk より先に着地した世代は、その `#reconcile` が arrival hook（検証・crop・checkpoint 予算）を現行 revision で呼び直す。Build lease 中の `schedule()` はこの省略をせず、Build 取り込みが所有する pending job を必ず作る。Build を取り込む open では先行させない（`TDOM_CANON_EARLY_BASELINE=0` で従来どおり walk の後に予約）。初回の open では並走する 3 pass の compile の分だけ walk が遅くなる（316 ページの実文書で `/open` 88 s → 117 s）が、アプリの viewer は開いた直後、現在の revision の canonical が着地するまで live 面に切り替えない（web/app.js は開いた時点の全ページを一つの取引として段取りし、枠の exact chunk が揃わないページがある限り確定しない）ので、表示までの時間は `/open` と最初の canonical の遅い方で決まり、先行させた方が短い（最初の canonical は開始から 216 s → 153 s）。開き直しでは §8.2b' の aux で 1 pass になり、`/open` はほぼ変わらず（69 s → 70 s）、canonical は `/open` の完了時点で着地済みになる（109 s → 70 s）。open が例外で終わった場合は予約した revision を消費済みにし、後の編集が同じ revision 番号で別の source を公開しないようにする。
+
 `GET /pdf` は `engine.exportPDF()` 経由で `canonical.ensure()` を呼ぶ。表示用 checkpoint state から PDF を作る経路はない。
+
+### 8.2a content identity（世代の再束縛）
+
+generation の同一性は「root source のバイト列」と「compile が読んだ project input のバイト列」で決まる。
+root は `srcHash` が、input は `inputManifest`（logical path → sha256、`-recorder` の `canon.fls` から採取。
+Build 取り込みでは `.fls` 検証済みの records から受け取る）が担う。
+
+`inputEpoch` は子ファイル編集・外部変更（バイト列が変わった通知だけ。docs/13 §13.4）・bibliography 更新のたびに単調増加するが、その epoch ごとに
+「どの logical path を無効化したか」を `inputInvalidations` に記録する。ある generation について、
+
+1. root が `srcHash` と一致し、
+2. generation の epoch 以降に無効化された path がすべて既知で、
+3. その path がすべて manifest に含まれ、現在 TeX が読むバイト列（overlay があれば overlay、なければ disk）の sha256 が manifest と一致する
+
+とき、その generation は現在 revision の exact compile である。`schedule()` はこれを同期的に判定し、
+`last` を現在 rev / epoch に再束縛して pending job を捨てる（`info().rebound` が回数）。編集応答の
+`canonical.rev === srcRev` になり、次の anchor はどのブロックでも即座に certified base を持てる。
+Build 直後に別章を編集して元に戻す往復はこれで recompile を要しない。
+
+証明できない場合（manifest なし、`unknown` な変更集合、compile が読んでいない path の変更、読めない入力、
+記憶上限を超えた古い epoch）は従来どおり fail closed で再 compile する。再束縛は `last` にのみ行い、
+より古い retained generation へは戻さない。compile 中に入力が無効化された generation は manifest を持たない。
+
+### 8.2b Build seed の配置
+
+通常 Build を取り込む `commitBuildGeneration` は、検証済みの aux/toc/lof/lot/out を canonical の作業
+ディレクトリへ `canon.*` として配置し、Build に無い拡張子の古いファイルは消す。Build 後の最初の canonical
+compile は Build が収束させた aux 群から始まるので、本文編集なら 1 pass で fixpoint に達する。
+
+### 8.2b' 開き直したプロジェクトの aux
+
+最後に昇格した compile の aux 系（aux・toc・lof・lot・out）は、プロジェクト（`docDir` と main ファイル）ごとに
+canonical 作業ディレクトリの `aux-seeds/<key>.json` へ、その compile の preamble のハッシュと一緒に保存する。
+アプリの作業ディレクトリは起動をまたいで残るので、次に同じプロジェクトを開いたときは `engine.open()` が最初の
+compile の前に `restoreProjectSeeds()` でそれを `canon.*` として置き、最初の baseline は多くの場合 1 pass で
+fixpoint に達する（316 ページの実文書で 3 pass → 1 pass）。種は pass を省くだけで、compile は aux 系が
+変わらなくなるまで回り続ける（latexmk が既存の aux から始めるのと同じ）。
+
+aux にはパッケージ自身が命令を書く（biblatex の `\abx@aux@…` など）ので、別の preamble の aux は
+`-halt-on-error` の下で compile を止め得る。置くのは preamble が保存時と同じときだけで、それでも種ありの
+compile が失敗したら保存分を捨てて種なしで 1 回だけ compile し直す。`\include` は子ごとの aux を書き、
+pass ループの fixpoint 判定は `canon.*` しか見ないので、子 aux を書いた compile の種は保存しない
+（古い子 aux を読んだまま 1 pass で止まり得る）。Build を取り込む open は Build 自身の種を使い、
+参考文献や preamble 入力の変更による内部の開き直しは従来どおり空の aux から始める。
+`TDOM_CANON_PROJECT_SEEDS=0` で無効、保存は 64 プロジェクトまで（mtime の古い順に削除）。
+
+### 8.2c Build lease と resident bootstrap
+
+`POST /canonical/build-lease/acquire` は `pendingDocumentReset`（/open の resident 起動中）・`shipBooting`・
+`warming` の間は 409 `resident-bootstrap-active` を返し、`blockedBy` にどの段階かを載せる。`warming`
+だけが理由なら、先に `engine.yieldWarmForBuild()` でキャレット warm walk を次のブロック境界で止めてから
+判定する（到達境界は pin され、次の warm はそこから再開する）。/open の resident 起動そのものは中断しない
+（設計案は issue #52 の引き継ぎ §4A）。
+
+### 8.2d pass 間の譲り渡し
+
+`#drain` が起動した scheduled compile は、各 LuaLaTeX pass の正常終了時に「より新しい rev の pending job
+がある」か「再束縛で `last.rev` が自分の rev を追い越した」場合、追加 pass と publish を中止して最新へ進む
+（`tdomSuperseded`、エラーとして報告しない）。最初の baseline と `ensure()`（export・Build）は対象外で、
+依頼された snapshot を必ず組む。1 pass で fixpoint に達した compile はそのまま publish される。
 
 ## 8.3 client convergence
 
@@ -55,6 +117,16 @@ structured mode では `pressure = 'authority'` で、基本 debounce に加え�
 `engine-v3.js` の `OUTPUT_HIJACK_RE` に一致する block は、文書全体を opaque にせず exact block として扱われる。現在の対象は、`multicols`、`paracol`、`longtable`、`landscape`、`mdframed`、`framed`、`shaded`、breakable `tcolorbox`、`\includepdf` である。
 
 rescue block は stale-first で表示される。前回の galley/chunk があればそれを保持し、isolated exact compile は async queue で進む。
+
+前回の galley が無い初回 rescue は、測った箱を持たない placeholder になる。placeholder は後続のページ割りを動かし得るので、一つでも残っていれば組んだ全ページが表示不可（`pendingExact`）になる（`pagebuilder.js` `buildPages`）。そのため boot（reboot を含む）の walk は、fork runner（checkpoint 0 と real-output root）が生きている間、初回 rescue をその場で compile して採用する（`#bootIsoCompile`、compile 時間の合計で `TDOM_BOOT_RESCUE_MS` 既定 45 s まで。超えた分と fork が無い場合（cold compile は 1 件 5 s を超える）は従来どおり placeholder と async queue）。316 ページの実文書では multicols 31 個が fork-real で 1 件 約 1 s、`/open` が 70 s 台から 90 s 台に延びる代わりに、/open の時点で常駐側が 316 ページ・queue 0 になる（従来は placeholder が全ページを約 4 分塞ぎ、開いた直後の打鍵は最初の canonical まで表示されなかった）。boot walk は pagination 前（page offset 0）に compile するので、実際の offset が違う block はディスクキャッシュから採用した結果と同じく moved-offset pass が再 rescue する。
+
+async queue は文書順に進むが、編集した block と caret の block（`/warm`）を含むページにある queue 中の rescue（そのページの `pendingExact` と block）を `rescueFocus` として先に取り、打鍵後の静寂待ち（800 ms）も省く（compile は lock の外、採用の walk は打鍵に block 境界で譲るのは同じ）。採用が chain lock を待っている間は grid 充填 pass が次の block 境界で譲る（docs/03）。
+
+isolated compile の結果はプロセスを跨いで保持する（`iso-disk-cache.js`、`<workDir>/isocache/<epoch>/<key>.json`（`iso-` 始まりの名前は server 起動時の stale artifact sweep に消されるので使わない） + chunk の PDF）。rescue key は compile が依存する入力（block text・入口 state・preamble・参照 label の値・page offset）をすべて含むので、同じ入力なら後のエンジンが結果を再利用できる。再オープン時は boot walk がその block を inline で adopt し（`rescueBlock` の cache hit 経路 = state job 1 本）、cold compile の drain を待たずに resident のページ数が canonical と揃う（316 ページの実文書では multicols 31 block × cold 5.4 s + adopt walk ≈ 5 分が消える）。boot walk は pagination 前に key を作る（page offset 0、galley なし）ので、実 offset で保存した結果は見つからない。そのため各結果に offset を含まない base link（text・入口 state・preamble）も置き、galley のない初回 rescue は base の結果を（参照 label の値が当時と同じなら）その場で adopt する。着地した offset が `compiledOff` と違えば moved-offset pass が通常どおり再 rescue する。key（full・base とも）には直前 block の trailing glue（幅・stretch/shrink とその order。iso compile が `\addvspace` の合流のために再現する入力で、state vector には幅しか無い）も含める。base 採用時は cache の `refVals` を現在の label 値と照合し（未定義の forward ref は後の label pass が key を変えて再 rescue する）、名前空間 `epoch` は daemon.lua / shipd.lua と iso 関連 JS（context・render source・runner・compile・result・rescue-block・rescue-cache・disk-cache）のハッシュ・engine version・`lualatex --version` を含み、toolchain や cache の意味論の更新後は古い結果を使わない。`TDOM_ISO_DISK_CACHE=0` で無効、既定の上限は 512 entry（mtime の古い順に削除）。
+
+isolated compile の runner は三種（`iso-context.js`）。**fork-absorb** は checkpoint 0 の子で、dormant regime を受け継いだまま iso absorb 用の `\output` を入れ、galley 素材（分割しない block）を組む。**fork-real** は real-output root の子で、LaTeX 本来の `\output`・`\vsize` のまま分割系 env（multicols / multicols* / longtable / mdframed / breakable tcolorbox）と `\includepdf` を組む。**cold** は単独の lualatex（root が無い opaque mode・fork の infra 失敗・その block の fork 子が一度死んだ `isoForkBroken`）。`realOutput = includesPdf || splitMode` が fork-real か fork-absorb かを決め、fork 子が artifact を残さず死んだ場合はどちらも cold に自動で退避して `isoForkBroken` に記録する（`readIsoCompileResult` は三者共通）。
+
+real-output root（`daemon.lua` `tdom_real_root`、`TDOM_ISO_REAL_FORK=1` で有効、既定 off）は checkpoint 0 の**兄弟**プロセスで、driver が dormant 設定（`\vsize=\maxdimen`・absorb `\output`・seed box）を入れる**直前**に fork する。preamble は読込済みで、ページビルダーは一度も触られていないので、その子は cold と同じプログラム（preamble 抜き）で同じ結果を出す。checkpoint 0 から real output を走らせない理由は従来どおり（dormant のページ状態が luatexja で壊れる、tcolorbox が artifact も DISCARD も出さず待ち続ける）。メモリは COW 共有に依存するので、fork の直前に**親**側で full collect して heap を落ち着かせ（`tdom_seed` はこの floor を再利用して二度目の full collect をしない）、root 自身は待機中 `collectgarbage('stop')` で共有ページを汚さない（対話 job と同じ扱い）。job 子は `collectgarbage('restart')` して普通に組む。root は ISO / PING / DIE / FAULT しか受けず、JOB / STEP は無視する（checkpoint state を持たないプロセスでの in-place typeset を禁じる）。`/status.rescue.realRoot` と `rootPid` が計測用に pid を出す。小規模 fixture の差分スイート（`tests/engine-v3.test.js`「fork-real rescues …」: 5 env × page offset 3 点で state・items・labels・chunk 幾何・SVG・PNG 画素が一致）と 316 ページ実文書の計測を通した（2026-09-20、`sandbox-copy`、macOS `footprint`: root 待機中 2.4〜11 MB、fork-real の job 子はピーク 302 MB の一時増分、checkpoint 0 は on/off とも ≈2 GB。rescue compile は cold 中央値 ≈5.6 s → fork-real 中央値 823 ms（31 block 合計 200 s → 26 s）、multicols 内の新規編集の exact 着地は 5.7 s → 1.8 s。初回 open の drain は 465 s → 430 s にしか縮まない — rescue 1 件の `totalMs` 中央値 12 s のうち compile は 0.8 s で、残りは adopt walk と lock 待ち。これは boot walk の inline 採用 / rescue frontier の pin で別途扱う）。engine の既定は off のまま、TeX64 アプリ側（`electron/services/tdom-engine.cjs`）が `TDOM_ISO_REAL_FORK=1` を渡す。
 
 ## 8.6 verification
 

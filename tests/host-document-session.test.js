@@ -166,6 +166,9 @@ test('the root document stays open while unsaved child buffers ride as overlays'
     { filePath: path.join(projectRoot, 'refs.bib'), text: '@book{draft,title={Draft}}' },
   ]);
   assert.equal(changed.text, '', 'an overlay-only change does not rewrite the root document');
+  const filePath = path.join(projectRoot, 'sections', 'intro.tex');
+  await host.focus({ offset: 8, filePath });
+  assert.deepEqual((await requestJson(`${host.url}/doc`)).warms.at(-1), { offset: 8, filePath });
   assert.deepEqual(doc.edits.at(-1).removeOverlays, [
     path.join(projectRoot, 'sections', 'intro.tex'),
   ]);

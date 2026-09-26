@@ -1,5 +1,5 @@
 // Safety gate — decides what the STRUCTURED layer may touch.
-import { classifyStructuralAliases } from './structural-aliases.js';
+import { classifyStructuralAliases, maskStructuralDefinitions } from './structural-aliases.js';
 //
 // The structured/provisional layer runs the document's real preamble inside
 // a real lualatex, so unknown macros per se are not dangerous. What IS
@@ -40,13 +40,17 @@ const UNSAFE_PACKAGES = [
   'pagegrid',
   'fancytabs',
   'thumbs',
-  // These packages rotate complete shipped pages. The structured layer has
-  // one document-wide SVG viewport and cannot transform its source hit map
-  // into the per-page displayed coordinate system. Keep the exact page and
-  // SyncTeX/word-box resolver as the sole display/edit authority instead.
-  'pdflscape',
-  'lscape',
+  // NOT pdflscape/lscape: rotated pages keep the document structured under
+  // the shipping-exact policy (LANDSCAPE_PACKAGES below).
 ];
+
+// These packages turn complete physical pages. The resident renderer has
+// one viewport, but a shipping-exact document never shows resident pages:
+// its surface is canonical and ShippingChain pixels with per-page geometry,
+// and clicks resolve through the canonical page's own rotation
+// (tex64-internal #64).
+const LANDSCAPE_PACKAGES = ['pdflscape', 'lscape'];
+const LANDSCAPE_BODY_RE = /\\begin\s*\{\s*landscape\s*\}/;
 // NOT here: multicol/paracol/longtable/tcolorbox/mdframed — their
 // environments are single blocks (the segmenter never splits inside an
 // environment) and the isolated exact-render rescue shows real LuaLaTeX
@@ -55,12 +59,12 @@ const UNSAFE_PACKAGES = [
 
 // Preamble constructs that take over page production.
 const UNSAFE_PREAMBLE = [
-  [/\\output\s*=?\s*\{/, 'custom \\output routine'],
-  [/\\shipout\b/, 'raw \\shipout'],
-  [/\\AddToHook\s*\{\s*shipout/, 'shipout hook'],
-  [/\\At(?:Begin|Next|End)Shipout/, 'shipout hook (atbegshi API)'],
+  [/\\output\b\s*=?\s*\{/, 'custom \\output routine'],
+  [/\\(?:shipout|RawShipout)\b/, 'raw \\shipout'],
+  [/\\(?:AddToHook|AddToHookNext)\s*\{\s*shipout/, 'shipout hook'],
+  [/\\At(?:BeginShipout(?:Next)?|EndShipout|BeginDvi|EndDvi)\b/, 'shipout hook (compatibility API)'],
+  [/\\csname\s*(?:output|shipout|RawShipout)\s*\\endcsname/, 'custom \\output routine'],
   [/\\twocolumn\b/, '\\twocolumn'],
-  [/\\AtBeginDvi\b/, '\\AtBeginDvi'],
   [/\\(?:documentclass|LoadClass)\s*\[[^\]]*\blandscape\b[^\]]*\]/, 'landscape class option'],
 ];
 
@@ -71,12 +75,11 @@ const UNSAFE_PREAMBLE = [
 // entire line or column. Demote before creating that split coordinate system.
 const UNSAFE_PAGE_GEOMETRY = [
   [/\\(?:pagewidth|pageheight|pdfpagewidth|pdfpageheight)\b/, 'per-page paper size primitive'],
-  [/\\(?:paperwidth|paperheight)\s*=/, 'paper size assignment'],
-  [/\\setlength\s*\{\s*\\(?:paperwidth|paperheight)\s*\}/, 'paper size assignment'],
+  [/\\(?:paperwidth|paperheight|textwidth|textheight)\s*=/, 'page geometry assignment'],
+  [/\\setlength\s*\{\s*\\(?:paperwidth|paperheight|textwidth|textheight)\s*\}/, 'page geometry assignment'],
   [/\\pdfvariable\s+(?:pagewidth|pageheight)\b/, 'per-page PDF size assignment'],
   [/\\(?:pdfvariable\s+pageattr|pdfpageattr\b|pdfextension\s+pageattr\b)/, 'raw PDF page attributes'],
   [/\\special\s*\{[^}]*@thispage\b/i, 'raw PDF page special'],
-  [/\\begin\s*\{\s*landscape\s*\}/, 'landscape page environment'],
 ];
 
 // Body constructs the JS page assembly cannot represent even per block:
@@ -89,6 +92,11 @@ const UNSAFE_BODY = [
   // pixels come from the canonical layer instead of demoting the whole
   // document. Paper drafts carry \todo marks routinely.
   [/\\newgeometry\b/, '\\newgeometry (mid-document page geometry)'],
+  [/\\output\b\s*=?/, 'custom \\output routine'],
+  [/\\(?:shipout|RawShipout)\b/, 'raw \\shipout'],
+  [/\\(?:AddToHook|AddToHookNext)\s*\{\s*shipout/, 'shipout hook'],
+  [/\\At(?:BeginShipout(?:Next)?|EndShipout|BeginDvi|EndDvi)\b/, 'shipout hook (compatibility API)'],
+  [/\\csname\s*(?:output|shipout|RawShipout)\s*\\endcsname/, 'custom \\output routine'],
   // NOT \includepdf: block-level rescue ships its foreign pages exactly
   // (see OUTPUT_HIJACK_RE in engine-v3.js).
   [/\\balance\b/, 'column balancing'],
@@ -105,6 +113,52 @@ export function stripComments(text) {
   return String(text ?? '').replace(/(^|[^\\])%[^\n]*/g, '$1');
 }
 
+function maskInlineVerbs(line) {
+  return line.replace(/\\verb\*?([^A-Za-z\s]).*?\1/g, (match) => ' '.repeat(match.length));
+}
+
+// Literal payloads must be removed before TeX comments: `%` inside \verb or
+// verbatim is data, while alltt is deliberately excluded because commands in
+// it still execute.  Process line-by-line so a commented-out begin marker
+// cannot hide executable code on following lines.
+function safetySource(text) {
+  const literalBegin = /\\begin\{(verbatim\*?|lstlisting|minted|filecontents\*?|[BLV]Verbatim\*?)\}/;
+  let literal = null;
+  const out = [];
+  for (const rawLine of String(text ?? '').split('\n')) {
+    let line = rawLine;
+    let kept = '';
+    while (line.length) {
+      if (literal) {
+        const endToken = `\\end{${literal}}`;
+        const end = line.indexOf(endToken);
+        if (end < 0) {
+          line = '';
+          break;
+        }
+        line = line.slice(end + endToken.length);
+        literal = null;
+        continue;
+      }
+      const executable = stripComments(maskInlineVerbs(line));
+      const begin = literalBegin.exec(executable);
+      if (!begin) {
+        kept += executable;
+        break;
+      }
+      kept += executable.slice(0, begin.index);
+      literal = begin[1];
+      const endToken = `\\end{${literal}}`;
+      const end = executable.indexOf(endToken, begin.index + begin[0].length);
+      if (end < 0) break;
+      line = executable.slice(end + endToken.length);
+      literal = null;
+    }
+    out.push(kept);
+  }
+  return out.join('\n');
+}
+
 /**
  * Preamble half of the gate: unsafe packages + page-production takeovers.
  * Memoizable by preamble hash — the preamble does not change while the
@@ -113,20 +167,26 @@ export function stripComments(text) {
  */
 export function classifyPreamble(preamble) {
   const reasons = [];
-  const pre = stripComments(preamble);
+  const pre = safetySource(preamble);
+  const actions = maskStructuralDefinitions(pre);
   const pkgRe = /\\(?:usepackage|RequirePackage)\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}/g;
   let m;
-  while ((m = pkgRe.exec(pre))) {
+  let landscapePages = false;
+  while ((m = pkgRe.exec(actions))) {
     for (const raw of m[1].split(',')) {
       const name = raw.trim();
       if (UNSAFE_PACKAGES.includes(name)) reasons.push(`package ${name}`);
+      if (LANDSCAPE_PACKAGES.includes(name)) landscapePages = true;
     }
   }
   for (const [re, why] of UNSAFE_PREAMBLE) {
-    if (re.test(pre)) reasons.push(why);
+    if (re.test(actions)) reasons.push(why);
   }
   for (const [re, why] of UNSAFE_PAGE_GEOMETRY) {
-    if (re.test(pre)) reasons.push(why);
+    if (re.test(actions)) reasons.push(why);
+  }
+  if (/\\(?:def|gdef|edef|xdef)\s*\\(?:output|shipout|RawShipout)\b|\\let\s*\\(?:output|shipout|RawShipout)\b|\\(?:newcommand|renewcommand|providecommand|DeclareRobustCommand)\*?\s*\{?\\(?:output|shipout|RawShipout)\b/.test(pre)) {
+    reasons.push('page-production API redefinition');
   }
   // A standard class-level twocolumn layout still has a trustworthy hot
   // path: the resident process uses the class's real \columnwidth and line
@@ -137,8 +197,8 @@ export function classifyPreamble(preamble) {
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
-    previewPolicy: canonicalAnchor ? 'canonical-anchor' : 'structured',
-    previewReasons: canonicalAnchor ? ['twocolumn class option'] : [],
+    previewPolicy: landscapePages ? 'shipping-exact' : canonicalAnchor ? 'canonical-anchor' : 'structured',
+    previewReasons: landscapePages ? ['landscape pages'] : canonicalAnchor ? ['twocolumn class option'] : [],
   };
 }
 
@@ -150,7 +210,7 @@ export function classifyPreamble(preamble) {
  * content (which arrives here as expanded blocks).
  */
 export function classifyBodyBlock(text) {
-  const bod = stripComments(text);
+  const bod = safetySource(text);
   for (const [re, why] of UNSAFE_BODY) {
     if (re.test(bod)) return why;
   }
@@ -168,7 +228,7 @@ export function classifyBodyBlock(text) {
  * page/column address for the narrow text overlay.
  */
 export function bodyUsesColumnSwitch(text) {
-  return BODY_COLUMN_SWITCH_RE.test(stripComments(text));
+  return BODY_COLUMN_SWITCH_RE.test(safetySource(text));
 }
 
 /**
@@ -181,7 +241,7 @@ export function classifyDocument(preamble, body) {
   const reasons = [...pre.reasons];
   const aliases = classifyStructuralAliases(preamble, body);
   reasons.push(...aliases.reasons);
-  const bod = stripComments(body);
+  const bod = safetySource(body);
   for (const [re, why] of UNSAFE_BODY) {
     if (re.test(bod)) reasons.push(why);
   }
@@ -190,18 +250,21 @@ export function classifyDocument(preamble, body) {
   }
   const bodyColumnSwitch = BODY_COLUMN_SWITCH_RE.test(bod);
   const shippingExact = aliases.requiresShippingExact;
+  const landscapePages = pre.previewPolicy === 'shipping-exact' || LANDSCAPE_BODY_RE.test(bod);
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
-    previewPolicy: shippingExact
+    previewPolicy: shippingExact || landscapePages
       ? 'shipping-exact'
       : bodyColumnSwitch
         ? 'canonical-anchor'
         : pre.previewPolicy,
-    previewReasons: shippingExact
-      ? [...new Set(aliases.shippingExactUses.flatMap((use) =>
-          use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)
-        ))]
+    previewReasons: shippingExact || landscapePages
+      ? [...new Set([
+          ...(landscapePages ? ['landscape pages'] : []),
+          ...aliases.shippingExactUses.flatMap((use) =>
+            use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)),
+        ])]
       : bodyColumnSwitch
       ? [...new Set([...pre.previewReasons, 'body column switch'])]
       : pre.previewReasons,
