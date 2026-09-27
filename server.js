@@ -491,10 +491,44 @@ let queue = Promise.resolve();
 let engineBusy = 0;
 let engineBusySince = 0;
 const openRequests = new OpenRequestCache(8);
+// The viewer's source-mapping snapshot (/dom?srcRev=N) of the revision an
+// update just produced. Served from the queue it waited behind the NEXT
+// edit, and continuous typing always has one queued: it came back one
+// revision newer than the page it was for, which the viewer rejects, so no
+// provisional page committed until the typing stopped (tex64-internal #103).
+// While a viewer asks for snapshots, each update's is built at the end of
+// its own queue turn, before the next edit starts, and served as is.
+// Built when the NEXT queued operation starts, the last moment the update's
+// state is intact: the keystroke's own reply never waits for it, the next
+// edit pays it (as it paid the queued /dom request before). An async
+// repagination of the same source marks it dirty: its block spans still
+// hold, only the pages a block spans may have moved; it is still served
+// while an edit is running or queued (the alternative is the superseded
+// snapshot), and rebuilt through the queue otherwise.
+let domCache = null; // { srcRev, epoch, body, dirty }
+let domInterestUntil = 0;
+let lastQueueResult = null;
+function cacheDomBeforeNext() {
+  const result = lastQueueResult;
+  if (Date.now() > domInterestUntil || !result?.stats || !Number.isSafeInteger(result.srcRev)) return;
+  if (result.srcRev !== engine?.srcRev) return;
+  if (domCache?.srcRev === engine.srcRev && domCache.epoch === documentEpoch && !domCache.dirty) return;
+  try {
+    domCache = { srcRev: engine.srcRev, epoch: documentEpoch, body: JSON.stringify(domPayload(result)), dirty: false };
+  } catch {
+    domCache = null;
+  }
+}
+
 function withEngine(fn) {
   engineBusy++;
   if (engineBusy === 1) engineBusySince = Date.now();
-  const run = queue.then(fn).catch((error) => {
+  const run = queue.then(async () => {
+    cacheDomBeforeNext();
+    const result = await fn();
+    lastQueueResult = result;
+    return result;
+  }).catch((error) => {
     // A failed open/reboot must not strand both frames in reset-pending.
     // The reset event lets the child resnapshot the last state it can
     // honestly render; its ready gate still keeps the host's static PDF up
@@ -907,6 +941,7 @@ engine.onDocumentResetComplete = ({ report } = {}) => {
 
 // async patches (TikZ renders, late chain discoveries) from the checkpoint engine
 engine.onAsyncPatches = (partial) => {
+  if (domCache) domCache.dirty = true;
   broadcast({ kind: 'patches', rev: partial.rev, fonts: partial.fonts, patches: partial.patches });
 };
 engine.onExternalChange = (changedInput) => {
@@ -964,6 +999,7 @@ engine.onExternalChange = (changedInput) => {
 // like the edit response would have, including the anchor the keystroke
 // could not plan at the time (its context waited in pendingColdAnchor).
 engine.onDeferredUpdate = (report) => {
+  if (domCache) domCache.dirty = true; // a cold resume repaginated this source
   const stash = pendingColdAnchor;
   pendingColdAnchor = null;
   if (pendingDocumentReset || !report) return;
@@ -1252,12 +1288,12 @@ function bibliographySourceLocation(generatedText, generatedLine = null) {
   return null;
 }
 
-function domPayload() {
+function domPayload(report = lastReport) {
   const dom = engine.getDOM();
   dom.documentEpoch = documentEpoch;
   // An unfinished construct advances sourceRev while deliberately keeping
   // the previous block spans. It cannot supply a new editable ink snapshot.
-  dom.sourceCurrent = !lastReport.stats?.closureDeferred;
+  dom.sourceCurrent = !report?.stats?.closureDeferred;
   const sourceFiles = new Set((dom.blocks ?? []).flatMap(block =>
     (block.editRegions ?? []).map(region => region.source?.file).filter(Boolean)));
   dom.sources = dom.sourceCurrent ? [...sourceFiles].flatMap(file => {
@@ -2062,6 +2098,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/dom') {
       // Source and block ranges mutate at different points of an async
       // edit. Snapshot them together after the queued mutation completes.
+      domInterestUntil = Date.now() + 5_000;
+      const wantRev = Number(url.searchParams.get('srcRev'));
+      if (Number.isSafeInteger(wantRev) && domCache?.srcRev === wantRev && domCache.epoch === documentEpoch &&
+          (!domCache.dirty || engineBusy > 0)) {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(domCache.body);
+      }
       return json(res, await withEngine(() => domPayload()));
     }
     if (req.method === 'POST' && url.pathname === '/synctex') {

@@ -12,6 +12,11 @@ import { withReplaceablePreviewJob } from './build-lease-preview.js';
 export function preemptResidentRenders(engine) {
   for (const [requestId, pid] of [...(engine.renderPids ?? [])]) {
     if (!requestId.startsWith('rr@')) continue;
+    // a held RENDER of the block being typed into (tex64-internal #103):
+    // its pixels are shown until the newer text has its own. Only that
+    // block's: typing that moves on leaves no pile of spared renders.
+    const heldFor = engine.heldRenderIds?.get(requestId);
+    if (heldFor != null && heldFor === engine.heldFocus) continue;
     if (pid > 0) {
       try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
     } else {
@@ -73,14 +78,22 @@ function pumpRenders(engine, callbacks) {
         // Prioritize it over newer cold work, including changed neighbors
         // needed by the viewer's atomic page commit. Backlog retains the
         // shipping priority window; an edit only waits for its own debounce.
+        if (engine.closed) break;
         let id, interactive = false;
-        for (const [candidate, queued] of engine.renderWant) {
-          const current = Number.isSafeInteger(queued?.interactiveRev) && queued.interactiveRev > 0 &&
-            queued.interactiveRev === engine.srcRev;
-          if (current || !interactive) {
-            id = candidate;
-            interactive = current;
+        // A block already rendering (a held render the keystroke spared,
+        // #103) would park this lane behind it: take another block's first,
+        // and queue behind it only when every queued block is rendering.
+        for (const skipBusy of [true, false]) {
+          for (const [candidate, queued] of engine.renderWant) {
+            if (skipBusy && engine.renderBusy?.has(candidate)) continue;
+            const current = Number.isSafeInteger(queued?.interactiveRev) && queued.interactiveRev > 0 &&
+              queued.interactiveRev === engine.srcRev;
+            if (current || !interactive) {
+              id = candidate;
+              interactive = current;
+            }
           }
+          if (id !== undefined) break;
         }
         // Backlog (typically the previous keystroke's page) does not share the
         // machine with the current edit's own render: the page being typed on
@@ -120,7 +133,9 @@ function pumpRenders(engine, callbacks) {
               return;
             }
             if (!block.needsRender) return;
-            const ready = await renderBlock(engine, block, callbacks).catch((err) => {
+            // the edit's own block: the next keystroke spares its render (#103)
+            const hold = interactive && block.id === engine.heldFocus && !!callbacks.holdable?.(block);
+            const ready = await renderBlock(engine, block, callbacks, hold).catch((err) => {
               if (!err?.tdomSuperseded) engine.diagnostics.push(`render ${id}: ${err?.message ?? err}`);
               // An edit pre-empted it; its page still waits for these pixels
               // (typically the previous keystroke's). Only queued ids survive
@@ -152,12 +167,18 @@ function pumpRenders(engine, callbacks) {
   engine.renderTask = Promise.all([engine.renderTask.catch(() => {}), drain]).then(() => {});
 }
 
-function renderBlock(engine, block, callbacks) {
+function renderBlock(engine, block, callbacks, hold = false) {
   // Per-block serialization keeps two generations from sharing the same
   // job directory. Protocol replies themselves carry unique request ids.
   engine.renderLocks ??= new Map();
   const prev = engine.renderLocks.get(block.id) ?? Promise.resolve();
-  const run = prev.then(() => renderBlockInner(engine, block, callbacks));
+  engine.renderBusy ??= new Map();
+  engine.renderBusy.set(block.id, (engine.renderBusy.get(block.id) ?? 0) + 1);
+  const run = prev.then(() => renderBlockInner(engine, block, callbacks, hold)).finally(() => {
+    const left = (engine.renderBusy.get(block.id) ?? 1) - 1;
+    if (left > 0) engine.renderBusy.set(block.id, left);
+    else engine.renderBusy.delete(block.id);
+  });
   engine.renderLocks.set(
     block.id,
     run.catch(() => {})
@@ -165,10 +186,19 @@ function renderBlock(engine, block, callbacks) {
   return run;
 }
 
-async function renderBlockInner(engine, block, callbacks) {
+async function renderBlockInner(engine, block, callbacks, hold = false) {
   const { awaitRender, renderIsolated, asyncRepaginate, chunkTargets, releaseRenderHold } = callbacks;
   const idx = engine.blocks.indexOf(block);
   if (idx < 0 || !block.galley) return false; // superseded (reboot nulls galleys)
+  // A galley older than the block's text (a cold stop left it untypeset):
+  // RENDER would ship the NEW text's pixels under the OLD galley's hash, and
+  // a page laying the block out from that galley (stream.js, #103) would
+  // pair old lines with new pixels. The walk that typesets it queues it
+  // again; until then its checkpoint owes this render nothing.
+  if (block.sourceChanged) {
+    releaseRenderHold(idx);
+    return false;
+  }
   // one render per (block, content); stale results are discarded so a
   // fast typist never sees an outdated exact image over live glyphs
   const forGalley = block.galleyHash;
@@ -219,6 +249,9 @@ async function renderBlockInner(engine, block, callbacks) {
     await renderResidentBlock(engine, {
       block,
       idx,
+      // tex64-internal #103: the next keystroke spares it; its pixels paint
+      // this galley while the block's newer text renders (stream.js)
+      hold,
       ck,
       checkpointIndex,
       prelude,

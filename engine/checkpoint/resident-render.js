@@ -14,6 +14,7 @@ async function runShipCommand(engine, {
   checkpointIndex,
   awaitRender,
   renderIsolated,
+  hold = false,
 }) {
   // Renders are latency work, not correctness work (canonical always wins):
   // give up quickly on a spinning child rather than parking a pump lane.
@@ -21,6 +22,7 @@ async function runShipCommand(engine, {
   engine.activeResidentRenderCheckpoints ??= new Map();
   engine.renderPids.set(requestId, 0); // armed: FORKED will fill the pid
   engine.activeResidentRenderCheckpoints.set(requestId, { peer: ck, index: checkpointIndex });
+  if (hold) (engine.heldRenderIds ??= new Map()).set(requestId, block.id);
   const done = awaitRender('render:' + requestId, Number(process.env.TDOM_RENDER_TIMEOUT || 20_000));
   ck.send(command);
   if (body) ck.sendRaw(body);
@@ -41,6 +43,7 @@ async function runShipCommand(engine, {
   } finally {
     engine.renderPids.delete(requestId);
     engine.activeResidentRenderCheckpoints.delete(requestId);
+    if (hold) engine.heldRenderIds?.delete(requestId);
   }
 }
 
@@ -92,7 +95,7 @@ export async function renderResidentBlock(
   engine,
   {
     block, idx, ck, checkpointIndex = idx, prelude = null, targets, forGalley,
-    awaitRender, renderIsolated, asyncRepaginate, chunkTargets, releaseRenderHold, early = null,
+    awaitRender, renderIsolated, asyncRepaginate, chunkTargets, releaseRenderHold, early = null, hold = false,
   }
 ) {
   const inflightKey = block.id + ':' + forGalley;
@@ -124,6 +127,16 @@ export async function renderResidentBlock(
         if (err?.tdomSuperseded) throw err;
       }
     }
+    // A fallback RENDER/CAPTURE ships the block as it is NOW: only while that
+    // is still the galley this render is named for. A held early render
+    // (#103) may fail long after a newer keystroke replaced it; its own
+    // text's pixels are not what the block's current source would ship.
+    if (!shippedEarly && (engine.blocks[idx] !== block || block.galleyHash !== forGalley ||
+        (early && early.text !== block.text))) {
+      const err = new Error(`resident render of ${block.id} superseded while its early render ran`);
+      err.tdomSuperseded = true;
+      throw err;
+    }
     // a cold preview's checkpoint is not the block's own: its JOB prelude
     // re-seeds the entry state (and already ends with the primer). Otherwise
     // the prelude the galley's JOB used (label definitions and the primer;
@@ -153,6 +166,7 @@ export async function renderResidentBlock(
           checkpointIndex: idx + 1,
           awaitRender,
           renderIsolated,
+          hold,
         });
         shippedCapture = true;
         engine.renderStats.captureHits++;
@@ -190,6 +204,7 @@ export async function renderResidentBlock(
         checkpointIndex,
         awaitRender,
         renderIsolated,
+        hold,
       });
     }
     timing.doneMs = Date.now() - t0;
@@ -198,11 +213,26 @@ export async function renderResidentBlock(
     await waitForPdf(pdf);
     timing.pdfMs = Date.now() - t0;
     // the RENDER child wrote its padding file next to the PDF it shipped
+    // Crop beside the live map: a render of a galley a newer keystroke has
+    // replaced (a held one, #103) may land after the newer galley's own
+    // pixels, and must never overwrite them.
+    const staged = new Map(targets.map((target) => [target.key, engine.chunks.get(target.key)]));
     await cropRenderTargets({
-      jobdir: shippedEarly ? early.jobdir : jobdir, pdf, targets, chunks: engine.chunks, forGalley, prefix: 'chunk',
+      jobdir: shippedEarly ? early.jobdir : jobdir, pdf, targets, chunks: staged, forGalley, prefix: 'chunk',
     });
     timing.cropMs = Date.now() - t0;
-    if (block.galleyHash === forGalley) asyncRepaginate();
+    const live = engine.blocks.find((b) => b.id === block.id);
+    const landing = supersededLanding(live, engine.chunks, forGalley);
+    if (landing !== 'none') {
+      for (const target of targets) {
+        if (landing === 'held' && target.key !== block.id) continue;
+        const chunk = staged.get(target.key);
+        if (!chunk) continue;
+        chunk.v = Math.max(chunk.v ?? 0, (engine.chunks.get(target.key)?.v ?? 0) + 1);
+        engine.chunks.set(target.key, chunk);
+      }
+    }
+    if (landing === 'current' || landing === 'held') asyncRepaginate();
     timing.publishedMs = Date.now() - t0;
     engine.renderTimings ??= [];
     engine.renderTimings.push(timing);
@@ -222,4 +252,26 @@ export async function renderResidentBlock(
       releaseRenderHold(idx);
     }
   }
+}
+
+/**
+ * What a render of `forGalley` may still paint once it lands: 'current' (the
+ * block's galley), 'held' (an earlier galley the page lays the block out
+ * from while the current one renders; stream.js, #103), 'stale' (a galley
+ * nobody displays, registered as before, as stale pixels) or 'none' (the
+ * block's own newer pixels are in: never overwrite them).
+ */
+export function supersededLanding(live, chunks, forGalley) {
+  if (!live) return 'none'; // the block is gone: nothing to paint
+  if (live.galleyHash === forGalley) return 'current';
+  const current = chunks.get(live.id)?.forGalley;
+  if (current === live.galleyHash) return 'none';
+  if (live.exactHistory?.has(forGalley)) {
+    const order = [...live.exactHistory.keys()];
+    return current != null && order.indexOf(current) > order.indexOf(forGalley) ? 'none' : 'held';
+  }
+  // the page shows a held galley's pixels: an unrelated older render must
+  // not take them away
+  if (current != null && live.exactHistory?.has(current)) return 'none';
+  return 'stale';
 }

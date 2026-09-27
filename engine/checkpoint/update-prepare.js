@@ -207,6 +207,15 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
       patch = null;
     }
   }
+  // an earlier galley typeset under another preamble is no stand-in for a
+  // block's current one (stream.js exactHistory, tex64-internal #103)
+  if (preHash !== engine.preHash) {
+    for (const b of engine.blocks) {
+      if (!b.exactHistory) continue;
+      b.exactHistory = null;
+      b.units = null;
+    }
+  }
   if (patch) {
     engine.preHash = preHash;
     engine.defsPatch = patch.prelude ? patch : null;

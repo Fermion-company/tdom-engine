@@ -56,6 +56,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       ch: r2(chunkHeight),
       cv: meta?.v ?? 0,
       st: gfxOpen.stale ? 1 : undefined, // stale-exact: previous pixels held
+      held: gfxOpen.held ? 1 : undefined, // an earlier galley's own pixels: display only (#103)
       line: gfxOpen.units === 1 ? gfxOpen.line : undefined,
       src: gfxOpen.blockId,
     });
@@ -80,6 +81,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       if (gfxOpen && gfxOpen.blockId === c.blockId && Math.abs(gfxOpen.top - chunkTop) < 0.05) {
         gfxOpen.clip1 = Math.max(gfxOpen.clip1, clip1);
         gfxOpen.stale ||= !!c.stale;
+        gfxOpen.held ||= !!c.held;
         gfxOpen.units++;
         if (gfxOpen.line !== u.li) gfxOpen.line = null;
         gfxOpen.covered += unitExtent;
@@ -93,6 +95,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
           clip1,
           w: c.w,
           stale: !!c.stale,
+          held: !!c.held,
           line: u.li,
           units: 1,
           covered: unitExtent,

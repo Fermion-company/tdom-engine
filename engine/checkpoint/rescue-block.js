@@ -55,6 +55,11 @@ export async function rescueBlock(engine, idx, why, callbacks) {
   }
   // continuation checkpoint carrying the isolated run's exact exit state
   await jobBlock(idx, { id: block.id + '@state', body: stateJobBody(iso) });
+  return isoGalley(iso);
+}
+
+/** The galley an isolated compile result adopts as (its chunks included). */
+export function isoGalley(iso) {
   return {
     items: iso.items,
     floats: [],
@@ -65,6 +70,7 @@ export async function rescueBlock(engine, idx, why, callbacks) {
     state: iso.state,
     labels: iso.labels,
     toclines: iso.toclines,
+    events: iso.events ?? [],
     refs: iso.refs ?? [],
     fonts: {},
     tdomRefVals: iso.refVals ?? {},

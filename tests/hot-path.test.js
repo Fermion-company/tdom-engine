@@ -4065,3 +4065,56 @@ test('a cumulative patch carries every block of the lineage and refuses conflict
   // nothing to merge keeps the patch untouched
   assert.equal(mergeCumulativeAnchorPatch(own, []), own);
 });
+
+
+for (const [what, packages, typed] of [
+  ['a box', ['\\usepackage{tikz}'],
+    '\\begin{tikzpicture}\\draw[fill=blue!10] (0,0) rectangle (9,2); \\node[text width=8cm] at (4.5,1) {Typed label TEXT};\\end{tikzpicture}'],
+  ['a paragraph with inline math', [],
+    'A paragraph with $\\int_0^1 x^2\\,dx = \\frac{1}{3}$ inline, whose Typed label TEXT grows.'],
+]) test(`${what} typed into continuously keeps showing its last exact generation while the newer text renders (tex64-internal #103)`, opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-held-exact-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  const doc = [
+    '\\documentclass{article}', ...packages, '\\begin{document}',
+    'Opening paragraph before the drawing.', '',
+    typed, '',
+    'Closing paragraph after the drawing.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  try {
+    await e.open(doc);
+    await e.renderTask.catch(() => {});
+    const box = () => e.blocks.find((b) => b.text.includes('Typed label'));
+    assert.ok(box()?.needsRender, 'the block needs exact pixels');
+    assert.equal(e.chunks.get(box().id)?.forGalley, box().galleyHash, 'painted before the burst');
+    // a burst: keystrokes 120 ms apart, each typed while the last renders
+    let held = 0;
+    let blocked = 0;
+    const seen = (patches) => {
+      const id = box().id;
+      const cmds = patches.flatMap((patch) => patch.displayList?.commands ?? []).filter((c) => c.src === id);
+      if (cmds.some((c) => c.op === 'pending-exact' || (c.op === 'chunk' && c.st))) blocked++;
+      else if (cmds.some((c) => c.op === 'chunk') && e.chunks.get(id)?.forGalley !== box().galleyHash) held++;
+    };
+    // the landed pixels of an earlier keystroke reach the page between updates
+    e.onAsyncPatches = ({ patches }) => seen(patches);
+    for (let k = 0; k < 24; k++) {
+      const at = e.getSource().indexOf('label TEXT') + 'label TEXT'.length + k;
+      const report = await e.edit(at, at, String.fromCharCode(97 + (k % 26)));
+      seen(report.patches);
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    e.onAsyncPatches = null;
+    assert.ok(held > 0, `the page laid the box out from a painted earlier generation (held ${held}, blocked ${blocked})`);
+    assert.equal(blocked, 0, 'no keystroke page was left waiting on the box');
+    // once typing stops the current text gets its own pixels, and the history goes
+    await e.renderTask.catch(() => {});
+    const until = Date.now() + 20_000;
+    while (Date.now() < until && e.chunks.get(box().id)?.forGalley !== box().galleyHash) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(e.chunks.get(box().id)?.forGalley, box().galleyHash, 'the final text has its own pixels');
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
