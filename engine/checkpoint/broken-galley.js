@@ -6,6 +6,7 @@ export async function brokenBlockGalley(engine, idx, frozen, deferred, { jobBloc
       body: stateJobBody({ state: block.galley.state, labels: block.galley.labels ?? [] }),
     });
     const kept = { ...block.galley, tdomStale: true };
+    kept.tdomKeptOf = block.galley.tdomKeptOf ?? block.galley; // the galley this copy stands for
     delete kept.tdomColdPreview; // the held copy is no longer a preview (docs/10 §10.4b)
     delete kept.tdomEarlyRender; // nor rendered for its text
     delete kept.tdomRenderPrelude;

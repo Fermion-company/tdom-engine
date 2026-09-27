@@ -1181,8 +1181,9 @@ export class CheckpointEngine {
     const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) });
     const text = block.text;
     const seq = ++this.coldPreviewSeq;
-    // the galley it may replace: the one on the block now (or a preview)
-    const run = { seq, key, text, base: block.galley, unused: false, again: false, galley: null };
+    // the galley it may replace: the one on the block now (a stale-first copy
+    // of it counts as it: tdomKeptOf), or a preview adopted since
+    const run = { seq, key, text, base: block.galley?.tdomKeptOf ?? block.galley, unused: false, again: false, galley: null };
     this.coldRescuePreviews.set(block.id, run);
     const cached = this.#isoCacheGet(key);
     const compiled = cached != null ? Promise.resolve(cached)
@@ -1211,6 +1212,32 @@ export class CheckpointEngine {
     return run;
   }
 
+  /**
+   * A rescued block edited on a warm chain keeps its previous galley
+   * (stale-first, rescue-block.js); its isolated preview is compiled beside
+   * the walk and shown when it lands, like a cold one (#adoptLateColdPreview).
+   */
+  #warmRescuePreview(idx) {
+    const block = this.blocks[idx];
+    if (!block || !this.coldPreviewEnabled || this.mode !== 'structured' || this.previewPolicy !== 'structured') return;
+    // Only for the block a keystroke's own walk is typing into (its galley
+    // predates its text), within a burst: after a lone edit the pump
+    // compiles the same inputs at once, and a settle or resume walk passing
+    // a rescued block is no reason to compile ahead of the pump.
+    if (!block.sourceChanged || !this.updating || this.bgActive || (this.chainTimeouts ?? 0) > 0 ||
+        this.poisoned.get(block.id) === fnv1a(block.text)) return;
+    // (editGapMs is this keystroke's own: the time since the one before)
+    if (!(this.keystrokePending > 0) && !((this.editGapMs ?? Infinity) < 1500)) return;
+    this.coldRescuePreviews ??= new Map();
+    const flight = this.coldRescuePreviews.get(block.id);
+    if (flight) {
+      flight.again = true;
+      return;
+    }
+    const run = this.#startColdRescueCompile(block, idx);
+    if (run) run.unused = true;
+  }
+
   /** A rescue preview the walk did not wait for: show it once it lands. */
   #adoptLateColdPreview(blockId, run, galley) {
     void this.#locked(async () => {
@@ -1219,21 +1246,29 @@ export class CheckpointEngine {
       // the block's own walk typeset it (coldDirty cleared), or a newer
       // preview of it is already on the page
       this.coldPreviewAdopted ??= new Map();
-      if (!block || !this.coldDirty.has(blockId) || block.galley === galley ||
+      // (a block whose galley predates its text: a cold stop, or a warm
+      // stale-first rescue still waiting for its exact compile)
+      const wasCold = !!block && this.coldDirty.has(blockId);
+      if (!block || !(wasCold || block.sourceChanged) || block.galley === galley ||
           (this.coldPreviewAdopted.get(blockId) ?? 0) >= run.seq ||
           (block.galley?.tdomColdPreview?.seq ?? 0) >= run.seq) return;
       // never over a galley newer than the one the compile started from (an
       // exact rescue of later text that landed meanwhile)
-      if (block.galley !== run.base && !block.galley?.tdomColdPreview?.iso) return;
+      // (the same galley kept stale-first is a copy of it: tdomKeptOf); never
+      // over a frozen or deferred block's held output either
+      const current = block.galley;
+      if ((current?.tdomKeptOf ?? current) !== run.base && !current?.tdomColdPreview?.iso) return;
+      if (current?.tdomFrozen || current?.tdomDeferred) return;
       // Downstream blocks were typeset against the old exit state: keep it
       // (as the walk does for a preview it adopts, update-typeset-phase.js).
       const exitState = block.stateVec;
       this.#adoptGalley(block, galley);
       block.stateVec = exitState;
       this.coldPreviewAdopted.set(blockId, run.seq);
-      // still owes its own typeset in its own lineage (docs/10 §10.4a); a
-      // preview of text typed over since is older than the block's text
-      this.coldDirty.add(blockId);
+      // still owes its own typeset in its own lineage (docs/10 §10.4a), or
+      // its exact rescue (queued); a preview of text typed over since is
+      // older than the block's text
+      if (wasCold) this.coldDirty.add(blockId);
       if (run.text !== block.text) block.sourceChanged = true;
       this.coldPreviews = (this.coldPreviews ?? 0) + 1;
       this.#asyncRepaginate();
@@ -1252,7 +1287,7 @@ export class CheckpointEngine {
         !this.coldPreviewEnabled || this.previewPolicy !== 'structured' || (this.chainTimeouts ?? 0) > 0) return;
     const idx = this.blocks.findIndex((b) => b.id === blockId);
     const block = this.blocks[idx];
-    if (!block || block.text === compiledText || !this.coldDirty.has(blockId) ||
+    if (!block || block.text === compiledText || !(this.coldDirty.has(blockId) || block.sourceChanged) ||
         this.poisoned.get(block.id) === fnv1a(block.text) ||
         !this.#needsRescue(block.text, block.structuralSinks)) return;
     const run = this.#startColdRescueCompile(block, idx);
@@ -1334,6 +1369,7 @@ export class CheckpointEngine {
         stateJobBody: (iso) => this.#stateJobBody(iso),
         pumpRescues: () => this.#pumpRescues(),
         brokenBlockGalley: (blockIdx, frozen) => this.#brokenBlockGalley(blockIdx, frozen),
+        previewRescue: (blockIdx) => this.#warmRescuePreview(blockIdx),
       });
     } finally {
       this.rescuingIdx = null;

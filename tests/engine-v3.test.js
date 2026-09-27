@@ -1355,6 +1355,54 @@ test('a cold keystroke inside a rescued block shows the block through an isolate
   }
 });
 
+test('typing into a rescued block on a warm chain shows isolated previews while it goes on (tex64-internal #103)', opts, async () => {
+  const work = WORK + '-warm-rescue-preview';
+  rmSync(work, { recursive: true, force: true });
+  const doc = ['\\documentclass{article}', '\\usepackage{multicol}', '\\begin{document}',
+    'Opening paragraph.', '', '\\begin{multicols}{2}', 'Columns start here TYPED. ' + SPLIT_LOREM.repeat(3), '\\end{multicols}', '',
+    'Closing paragraph.', '', '\\end{document}', ''].join('\n');
+  process.env.TDOM_ISO_REAL_FORK = '1';
+  let e;
+  try {
+    e = new CheckpointEngine({ workDir: work });
+  } finally {
+    delete process.env.TDOM_ISO_REAL_FORK;
+  }
+  try {
+    await e.open(doc);
+    const drained = Date.now() + 120_000;
+    while (Date.now() < drained && (e.rescueQueue.size || e.rescuePumping)) await new Promise((r) => setTimeout(r, 50));
+    const cols = () => e.blocks.find((b) => b.text.includes('\\begin{multicols}'));
+    assert.ok(cols().rescued, 'the columns are a rescued block');
+    let previews = 0;
+    const seen = new Set();
+    e.onAsyncPatches = () => {
+      const g = cols().galley;
+      if (g?.tdomColdPreview?.iso && !seen.has(g)) {
+        seen.add(g);
+        previews++;
+      }
+    };
+    // keystrokes 150 ms apart for about four seconds: no pause for the pump
+    for (let k = 0; k < 26; k++) {
+      const at = e.getSource().indexOf('TYPED') + 'TYPED'.length + k;
+      await e.edit(at, at, String.fromCharCode(97 + k));
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    e.onAsyncPatches = null;
+    assert.ok(previews >= 3, `isolated previews of text typed during the burst kept reaching the page (${previews})`);
+    // the exact rescue of the final text replaces the previews
+    const until = Date.now() + 120_000;
+    while (Date.now() < until && (cols().galley?.tdomColdPreview || cols().sourceChanged || e.rescueQueue.size || e.rescuePumping)) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(!cols().galley?.tdomColdPreview, 'the exact rescue replaced the preview');
+    assert.ok(!cols().sourceChanged, 'the galley is the final text\'s');
+  } finally {
+    await e.close();
+  }
+});
+
 test('microtype expansion and protrusion keep resident glyphs where the PDF paints them (tex64-internal #66)', opts, async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-microtype-'));
   const eng = new CheckpointEngine({ workDir: path.join(root, 'work') });
