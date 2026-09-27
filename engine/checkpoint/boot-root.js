@@ -12,6 +12,14 @@ export async function bootRoot(
 ) {
   await ensureShim();
   await ensureServer();
+  // closeEngine may have run while this boot awaited the shim or the socket
+  // server: a root spawned now would be reachable by no kill (a caret move's
+  // boot racing the close left a resident lualatex pinning the host process)
+  if (engine.closed) {
+    const err = new Error('engine closed');
+    err.tdomInfra = true;
+    throw err;
+  }
   // tear down any previous tree — DIE for the well-behaved residents plus
   // SIGKILL by pid, because a child stuck in a TeX loop never reads DIE
   for (const peer of engine.peers) {
