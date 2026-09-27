@@ -401,6 +401,9 @@ export function diffBlocks(oldBlocks, segs, nextId) {
           // in for, docs/10 §10.4b)
           previousGalley: ob.galley?.tdomColdPreview ? (ob.previousGalley ?? null) : ob.galley,
           galleyHash: ob.galleyHash,
+          // (only for a block edited in place, never across a merge or split:
+          // its held galley would show another block's text, tex64-internal #103)
+          exactHistory: midOld === midNew ? ob.exactHistory ?? null : null,
           stateVec: ob.stateVec,
           units: ob.units,
           rescued: ob.rescued,

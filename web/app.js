@@ -1055,7 +1055,7 @@ function provisionalChunkGlyphs(commands, chunks) {
   for (const command of commands) {
     if (command.op !== 'chunk') continue;
     const data = chunks[index++];
-    if (!(data?.width > 0)) continue;
+    if (command.held || !(data?.width > 0)) continue;
     const scale = command.w / data.width;
     const top = command.y - command.sy;
     for (const glyph of data.glyphs) {
@@ -1105,7 +1105,7 @@ function renderPage(dl, flash) {
     const shiftPct = (cmd.sy / cmd.w) * 100;
     staging.insertAdjacentHTML(
       'beforeend',
-      `<div class="chunkwin${cmd.st ? ' stale' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
+      `<div class="chunkwin${cmd.st ? ' stale' : ''}${cmd.held ? ' held' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
         `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
     );
   }
@@ -3545,7 +3545,9 @@ async function loadProvisionalSnapshot(sourceRev) {
   const epoch = documentReset.adoptedEpoch;
   const key = `${epoch}:${sourceRev}`;
   if (!provisionalSnapshotCache.has(key)) {
-    const pending = fetch('/dom', { cache: 'no-store' }).then(async response => {
+    // the snapshot of this very revision (server.js domCache): a request
+    // queued behind the next keystroke would come back one revision newer
+    const pending = fetch(`/dom?srcRev=${encodeURIComponent(sourceRev)}`, { cache: 'no-store' }).then(async response => {
       if (!response.ok) throw new Error('Unready source mapping');
       const snapshot = await response.json();
       if (snapshot.sourceCurrent === false || Number(snapshot.srcRev) !== Number(sourceRev) ||
@@ -5081,7 +5083,8 @@ async function chunkGlyphsOnPage(page, sourceId) {
   };
   const src = CSS.escape(sourceId);
   const glyphs = [];
-  for (const chunk of page.querySelectorAll(`.chunkwin[data-src="${src}"]:not(.stale)`)) {
+  // (a held chunk shows an earlier generation: its glyphs map no current source)
+  for (const chunk of page.querySelectorAll(`.chunkwin[data-src="${src}"]:not(.stale):not(.held)`)) {
     const img = chunk.querySelector('img');
     if (!img?.complete || !img.naturalWidth) continue;
     const imageSrc = img.getAttribute('src');

@@ -73,6 +73,30 @@ export function labelCaptureShim({ save, capture, after = () => '', ltx = null }
   return L;
 }
 
+// Page-style events (tdom_event): the resident driver and a cold isolated
+// run both install these, so a rescued block reports the same events
+// whichever runner compiled it (the disk cache does not tell them apart).
+const PAGE_STYLE_EVENT_SHIMS = [
+  '\\let\\TDOMpagestyle\\pagestyle',
+  "\\renewcommand\\pagestyle[1]{\\TDOMpagestyle{#1}\\directlua{tdom_event('style','\\luaescapestring{#1}','')}}",
+  '\\let\\TDOMthispagestyle\\thispagestyle',
+  "\\renewcommand\\thispagestyle[1]{\\TDOMthispagestyle{#1}\\directlua{tdom_event('thisstyle','\\luaescapestring{#1}','')}}",
+  '\\let\\TDOMpagenumbering\\pagenumbering',
+  "\\renewcommand\\pagenumbering[1]{\\TDOMpagenumbering{#1}\\directlua{tdom_event('pagenum','\\luaescapestring{#1}','')}}",
+];
+// \markboth/\markright report their marks as page-style events too
+const MARK_EVENT_SHIMS = [
+  '\\let\\TDOMmarkboth\\markboth',
+  '\\renewcommand\\markboth[2]{\\TDOMmarkboth{#1}{#2}' +
+    '{\\protected@edef\\TDOM@mka{#1}\\protected@edef\\TDOM@mkb{#2}' +
+    "\\directlua{tdom_event('mark','\\luaescapestring{\\detokenize\\expandafter{\\TDOM@mka}}'," +
+    "'\\luaescapestring{\\detokenize\\expandafter{\\TDOM@mkb}}')}}}",
+  '\\let\\TDOMmarkright\\markright',
+  '\\renewcommand\\markright[1]{\\TDOMmarkright{#1}' +
+    '{\\protected@edef\\TDOM@mka{#1}' +
+    "\\directlua{tdom_event('markr','\\luaescapestring{\\detokenize\\expandafter{\\TDOM@mka}}','')}}}",
+];
+
 export function buildDriverSource({
   preamble,
   daemonPath,
@@ -184,31 +208,7 @@ export function buildDriverSource({
   // page-style layer events: the orchestrator reconstructs each page's
   // exact header/footer state from these (the boxes themselves are later
   // typeset by TeX in a header job — nothing is invented)
-  L.push('\\let\\TDOMpagestyle\\pagestyle');
-  L.push(
-    "\\renewcommand\\pagestyle[1]{\\TDOMpagestyle{#1}\\directlua{tdom_event('style','\\luaescapestring{#1}','')}}"
-  );
-  L.push('\\let\\TDOMthispagestyle\\thispagestyle');
-  L.push(
-    "\\renewcommand\\thispagestyle[1]{\\TDOMthispagestyle{#1}\\directlua{tdom_event('thisstyle','\\luaescapestring{#1}','')}}"
-  );
-  L.push('\\let\\TDOMpagenumbering\\pagenumbering');
-  L.push(
-    "\\renewcommand\\pagenumbering[1]{\\TDOMpagenumbering{#1}\\directlua{tdom_event('pagenum','\\luaescapestring{#1}','')}}"
-  );
-  L.push('\\let\\TDOMmarkboth\\markboth');
-  L.push(
-    '\\renewcommand\\markboth[2]{\\TDOMmarkboth{#1}{#2}' +
-      '{\\protected@edef\\TDOM@mka{#1}\\protected@edef\\TDOM@mkb{#2}' +
-      "\\directlua{tdom_event('mark','\\luaescapestring{\\detokenize\\expandafter{\\TDOM@mka}}'," +
-      "'\\luaescapestring{\\detokenize\\expandafter{\\TDOM@mkb}}')}}}"
-  );
-  L.push('\\let\\TDOMmarkright\\markright');
-  L.push(
-    '\\renewcommand\\markright[1]{\\TDOMmarkright{#1}' +
-      '{\\protected@edef\\TDOM@mka{#1}' +
-      "\\directlua{tdom_event('markr','\\luaescapestring{\\detokenize\\expandafter{\\TDOM@mka}}','')}}}"
-  );
+  L.push(...PAGE_STYLE_EVENT_SHIMS, ...MARK_EVENT_SHIMS);
   // \cleardoublepage decides on a blank verso via \ifodd\c@page — but the
   // dormant run never ships pages, so \c@page is meaningless here. Emit a
   // marker instead: the page builder OWNS folios and inserts the blank
@@ -445,7 +445,15 @@ export function buildIsoCompileSource({
   // fork-real: the real-output root was forked BEFORE the dormant setup —
   // real \output, real \vsize, empty page — so nothing needs resetting;
   // the program below is exactly the cold one minus the preamble.
-  L.push('\\makeatletter\\pagestyle{empty}\\hoffset=-1in\\voffset=-1in');
+  // Real pages (an output-hijack env's own \\shipout) go out at the print
+  // origin, exactly where the full document puts them: under \\hoffset=-1in
+  // a left margin narrower than 1in (\\oddsidemargin < 0) put the text
+  // block's left edge outside the PDF page, and pdftocairo dropped it
+  // (tex64-internal #102). The remainder galley sets its own origin below.
+  // (\\evensidemargin as the odd one: the preview lays every page out with
+  // \\oddsidemargin, display-list.js, and an isolated run's page counter
+  // starts afresh, so its even pages would shift by the difference)
+  L.push('\\makeatletter\\pagestyle{empty}\\hoffset=0pt\\voffset=0pt\\evensidemargin=\\oddsidemargin');
   // a forked root holds the declarations it booted with (preamble-patch.js;
   // the cold program's preamble already has them, re-running is harmless)
   if (defsPrelude) L.push(defsPrelude.trimEnd());
@@ -543,7 +551,8 @@ export function buildIsoCompileSource({
   // (comment) and no '#' (macro parameter) may appear in the Lua source.
   L.push(
     '\\directlua{' +
-      'tdom_iso = { labels = {}, counters = {}, toclines = {}, refs = {}, ntl = 0, fires = 0, ships = 0 } ' +
+      'tdom_iso = { labels = {}, counters = {}, toclines = {}, refs = {}, ntl = 0, fires = 0, ships = 0, ' +
+      'events = {}, nev = 0, shipitems = {} } ' +
       'tdom_iso_in_acl = false ' +
       // amsmath hands \ltx@label the key WITH braces — strip one pair
       'function tdom_iso_unbrace(s) ' +
@@ -571,6 +580,43 @@ export function buildIsoCompileSource({
       'local m = node.new("whatsit", node.subtype("special")) ' +
       'm.data = "tdom:tl:" .. (tdom_iso.ntl - 1) ' +
       'node.write(m) end) ' +
+      'end ' +
+      // page-style events (marks from \\section, \\pagestyle & co.): the
+      // driver's shims call tdom_event; in the isolated run they are
+      // recorded here with a stream marker, like the resident daemon does,
+      // so the header of each page a rescued block fills carries its marks
+      // (tex64-internal #102: a rescued multicols \\section left the
+      // previous section's running head on its pages)
+      // Only the block's own events (after tdom:isostart): the program's
+      // machinery (its \\pagestyle{empty}) is not the document's. Own tag:
+      // the daemon's tdom:ev specials of the forked root carry its indices.
+      'function tdom_event(k, a, b) ' +
+      'if not tdom_iso.started then return end ' +
+      'table.insert(tdom_iso.events, { k, a or "", b or "" }) ' +
+      'tdom_iso.nev = tdom_iso.nev + 1 ' +
+      'pcall(function() ' +
+      'local m = node.new("whatsit", node.subtype("special")) ' +
+      'm.data = "tdom:iev:" .. (tdom_iso.nev - 1) ' +
+      'node.write(m) end) ' +
+      'end ' +
+      // a real shipped page takes its markers with it: read them off the
+      // page box so the harvest can anchor them to that page
+      // the block's event markers anywhere in a node list (a \\section's
+      // mark sits inside a multicols column box), in order
+      'function tdom_iso_events_in(n, found) ' +
+      'local WHi = node.id("whatsit") local SPi = node.subtype("special") ' +
+      'local HLi = node.id("hlist") local VLi = node.id("vlist") ' +
+      'while n do ' +
+      'if n.id == WHi and n.subtype == SPi and n.data then ' +
+      'if n.data:sub(1, 9) == "tdom:iev:" then ' +
+      'table.insert(found, \'{"k":"ev","n":\' .. (tonumber(n.data:sub(10)) or 0) .. \'}\') end ' +
+      'elseif (n.id == HLi or n.id == VLi) and n.list then tdom_iso_events_in(n.list, found) end ' +
+      'n = n.next end ' +
+      'return found end ' +
+      'function tdom_iso_ship(bn) ' +
+      'tdom_iso.ships = tdom_iso.ships + 1 ' +
+      'local b = bn and tex.box[bn] ' +
+      'tdom_iso.shipitems[tdom_iso.ships] = b and tdom_iso_events_in(b.list, {}) or {} ' +
       'end ' +
       'function tdom_iso_absorb(boxnum) ' +
       'tdom_iso.fires = tdom_iso.fires + 1 ' +
@@ -610,10 +656,12 @@ export function buildIsoCompileSource({
   // material taller than the page inside an output-hijack env (multicols'
   // own routine) ships REAL pages — count them so the harvest knows the
   // pre-body machinery (and the isostart marker) left with page 1
-  L.push('\\AddToHook{shipout/before}{\\directlua{tdom_iso.ships = tdom_iso.ships + 1}}');
+  // the cold program has the preamble only, not the driver's shims
+  if (runner === 'cold') L.push('\\makeatletter', ...PAGE_STYLE_EVENT_SHIMS, ...MARK_EVENT_SHIMS, '\\makeatother');
+  L.push('\\AddToHook{shipout/before}{\\directlua{tdom_iso_ship(\\ifdefined\\ShipoutBox\\number\\ShipoutBox\\else nil\\fi)}}');
   L.push('\\hbox to0pt{}');
   if (strut > 0.01) L.push(`\\vskip ${strut.toFixed(4)}bp`);
-  L.push('\\special{tdom:isostart}');
+  L.push('\\special{tdom:isostart}\\directlua{tdom_iso.started = true}');
   L.push(`\\directlua{tex.nest[0].prevdepth=${Math.round(prevPd)}}`);
   // \lastskip primer: a rescued block opening an \addvspace-emitting env
   // (tcolorbox/mdframed before-skip) must MERGE against the previous block's
@@ -695,7 +743,9 @@ export function buildIsoCompileSource({
       'local items = {} ' +
       'local m = out ' +
       'while m do ' +
-      'if m.id == HL or m.id == VL then table.insert(items, \'{"k":"box","h":\' .. bp(m.height) .. \',"d":\' .. bp(m.depth) .. \'}\') ' +
+      'if m.id == HL or m.id == VL then ' +
+      'if m.list then for _, ev in ipairs(tdom_iso_events_in(m.list, {})) do table.insert(items, ev) end end ' +
+      'table.insert(items, \'{"k":"box","h":\' .. bp(m.height) .. \',"d":\' .. bp(m.depth) .. \'}\') ' +
       'elseif m.id == GL then local a = m.width or 0 ' +
       'local st = m.stretch or 0 local sh = m.shrink or 0 ' +
       'table.insert(items, \'{"k":"glue","a":\' .. bp(a) .. ' +
@@ -704,33 +754,51 @@ export function buildIsoCompileSource({
       'elseif m.id == KE then table.insert(items, \'{"k":"kern","a":\' .. bp(m.kern or 0) .. \'}\') ' +
       'elseif m.id == WH and m.subtype == SP and m.data and m.data:sub(1, 8) == "tdom:tl:" then ' +
       'table.insert(items, \'{"k":"tl","n":\' .. (tonumber(m.data:sub(9)) or 0) .. \'}\') ' +
+      'elseif m.id == WH and m.subtype == SP and m.data and m.data:sub(1, 9) == "tdom:iev:" then ' +
+      'table.insert(items, \'{"k":"ev","n":\' .. (tonumber(m.data:sub(10)) or 0) .. \'}\') ' +
       'elseif m.id == WH and m.subtype == SP and m.data and m.data:sub(1, 11) == "tdom:eject:" then ' +
       'table.insert(items, \'{"k":"eject","v":\' .. (tonumber(m.data:sub(12)) or -10000) .. \'}\') end ' +
       'm = m.next end ' +
       // empty remainder (env ended exactly at a page break): ship a
       // zero box so the last PDF page always exists for the node side
       'local b = out and node.vpack(out) or node.new("hlist") ' +
+      // the remainder ships at the text block's left edge plus the paper's
+      // side margins, so material overhanging the measure (a hanging
+      // section number, a margin rule) stays in the chunk (#102)
+      'local IN = tex.sp("1in") ' +
+      'local ml = IN + (tex.dimen.oddsidemargin or 0) ' +
+      // the PDF's own width (the viewer's paper is \\pagewidth, daemon.lua)
+      'local pw = (tex.pagewidth and tex.pagewidth > 0) and tex.pagewidth or (tex.dimen.paperwidth or 0) ' +
+      'local padl = math.max(0, ml) ' +
+      'local padr = math.max(0, pw - padl - (b.width or 0)) ' +
       'local f = io.open("state.json", "w") ' +
       'local labs = {} ' +
       'for _, kv in ipairs(tdom_iso.labels) do ' +
       'table.insert(labs, "[" .. jq(kv[1]) .. "," .. jq(kv[2]) .. ((kv[3] and kv[3] ~= "") and ("," .. jq(kv[3])) or "") .. "]") end ' +
       'local tls = {} ' +
       'for _, kv in ipairs(tdom_iso.toclines) do table.insert(tls, "[" .. jq(kv[1]) .. "," .. jq(kv[2]) .. "," .. jq(kv[3]) .. "]") end ' +
+      'local evs = {} ' +
+      'for _, kv in ipairs(tdom_iso.events) do table.insert(evs, "[" .. jq(kv[1]) .. "," .. jq(kv[2]) .. "," .. jq(kv[3]) .. "]") end ' +
+      'local sis = {} ' +
+      'for i = 1, tdom_iso.ships do table.insert(sis, "[" .. table.concat(tdom_iso.shipitems[i] or {}, ",") .. "]") end ' +
       'local rfs = {} ' +
       'for _, k in ipairs(tdom_iso.refs) do table.insert(rfs, jq(k)) end ' +
       'local cnts = {} ' +
       'for k, v in pairs(tdom_iso.counters) do table.insert(cnts, jq(k) .. ":" .. v) end ' +
       'f:write(\'{"w":\' .. bp(b.width) .. \',"h":\' .. bp(b.height) .. \',"d":\' .. bp(b.depth) .. ' +
       '\',"ships":\' .. tdom_iso.ships .. ' +
+      '\',"padl":\' .. bp(padl) .. \',"padr":\' .. bp(padr) .. \',"pw":\' .. bp(pw) .. \',"ml":\' .. bp(ml) .. ' +
       '\',"discarded":\' .. (tdom_iso.discarded or 0) .. ' +
       '\',"preabsorbs":\' .. (tdom_iso.preabsorbs or 0) .. ' +
       '\',"labels":[\' .. table.concat(labs, ",") .. \'],"toclines":[\' .. table.concat(tls, ",") .. ' +
+      '\'],"events":[\' .. table.concat(evs, ",") .. \'],"shipitems":[\' .. table.concat(sis, ",") .. ' +
       '\'],"refs":[\' .. table.concat(rfs, ",") .. ' +
       '\'],"state":{\' .. table.concat(cnts, ",") .. ' +
       '\'},"items":[\' .. table.concat(items, ",") .. \']}\') ' +
       'f:close() ' +
       'tex.box[255] = b ' +
-      'tex.pagewidth = math.max(b.width or 0, 65536) ' +
+      'tex.hoffset = padl - IN tex.voffset = -IN ' +
+      'tex.pagewidth = math.max((b.width or 0) + padl + padr, 65536) ' +
       'tex.pageheight = math.max((b.height or 0) + (b.depth or 0), 65536)}'
   );
   L.push('\\shipout\\box255');

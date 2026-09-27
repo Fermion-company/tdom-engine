@@ -1,6 +1,7 @@
 export async function rescueBlock(engine, idx, why, callbacks) {
   const {
     rescueCacheKey, isoCacheGet, isoBaseGet, bootIsoCompile, jobBlock, stateJobBody, pumpRescues, brokenBlockGalley,
+    previewRescue = null,
   } = callbacks;
   const block = engine.blocks[idx];
   const cacheKey = rescueCacheKey(block, idx);
@@ -22,7 +23,18 @@ export async function rescueBlock(engine, idx, why, callbacks) {
       });
       engine.rescueQueue.set(block.id, cacheKey);
       pumpRescues();
+      // The pump waits for a pause in the typing and drops a result whose
+      // text has moved on: typed continuously, a multicols showed nothing
+      // new until the typing stopped. An isolated preview of this text runs
+      // now (one at a time) and is shown when it lands (tex64-internal #103).
+      try {
+        previewRescue?.(idx);
+      } catch (err) {
+        engine.diagnostics?.push(`rescue preview of ${block.id}: ${err?.message ?? err}`);
+      }
       const kept = { ...block.galley, tdomStale: true };
+      // the galley this copy stands for (a late preview compares by it)
+      kept.tdomKeptOf = block.galley.tdomKeptOf ?? block.galley;
       delete kept.tdomColdPreview; // the held copy is no longer a preview (docs/10 §10.4b)
       delete kept.tdomEarlyRender; // nor rendered for its text
       delete kept.tdomRenderPrelude;
@@ -55,6 +67,11 @@ export async function rescueBlock(engine, idx, why, callbacks) {
   }
   // continuation checkpoint carrying the isolated run's exact exit state
   await jobBlock(idx, { id: block.id + '@state', body: stateJobBody(iso) });
+  return isoGalley(iso);
+}
+
+/** The galley an isolated compile result adopts as (its chunks included). */
+export function isoGalley(iso) {
   return {
     items: iso.items,
     floats: [],
@@ -65,6 +82,7 @@ export async function rescueBlock(engine, idx, why, callbacks) {
     state: iso.state,
     labels: iso.labels,
     toclines: iso.toclines,
+    events: iso.events ?? [],
     refs: iso.refs ?? [],
     fonts: {},
     tdomRefVals: iso.refVals ?? {},

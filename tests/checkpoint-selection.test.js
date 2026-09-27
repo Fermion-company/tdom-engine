@@ -407,8 +407,36 @@ test('a walk step is killed for an edit only when its remaining time outweighs t
   assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 400, retainedIdx: 0, warm: true }), true);
   assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 400, retainedIdx: 0 }), false);
   assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 50, retainedIdx: 0, warm: true }), false);
+  // a step already running past twice its replay speed (a loaded machine):
+  // its remaining time is unknown, kill (tex64-internal #103)
+  assert.equal(walkKillPaysOff({ blocks, jobIdx: 2, jobElapsedMs: 1600, retainedIdx: 0 }), true);
+  assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 1700, retainedIdx: 19 }), true);
+  // ... unless the replay behind it since its retained boundary is the larger loss
+  assert.equal(walkKillPaysOff({ blocks: long, jobIdx: 20, jobElapsedMs: 1700, retainedIdx: 0 }), false);
+  assert.equal(walkKillPaysOff({ blocks, jobIdx: 3, jobElapsedMs: 250, retainedIdx: 1 }), false, 'a light step is not killed early');
   // an unknown cost after a replay, or no job: never
   assert.equal(walkKillPaysOff({ blocks, jobIdx: 4, jobElapsedMs: 10, retainedIdx: 2 }), false);
   assert.equal(walkKillPaysOff({ blocks, jobIdx: -1, jobElapsedMs: 10, retainedIdx: 0 }), false);
 });
 
+
+test('an edited block keeps its exact-render history only when it was edited in place (tex64-internal #103)', async () => {
+  const { diffBlocks } = await import('../engine/segmenter.js');
+  const history = new Map([['hA', { galley: { items: [] }, fidelity: null }]]);
+  const block = (id, hash, text) => ({ id, hash, text, start: 0, end: text.length, galley: { items: [] }, galleyHash: 'h' + id,
+    exactHistory: id === 'A' ? history : null });
+  const seg = (hash, text) => ({ hash, text, start: 0, end: text.length });
+  let n = 0;
+  // A edited in place, B unchanged: A keeps what it painted
+  const inPlace = diffBlocks([block('A', 'a', 'box'), block('B', 'b', 'para')], [seg('a2', 'box!'), seg('b', 'para')], () => ++n);
+  assert.equal(inPlace.blocks[0].id, 'A');
+  assert.equal(inPlace.blocks[0].exactHistory, history);
+  // A and B merged into one block (a blank line removed): the held galley
+  // would show the box without the paragraph
+  const merged = diffBlocks([block('A', 'a', 'box'), block('B', 'b', 'para')], [seg('ab', 'box\npara')], () => ++n);
+  assert.equal(merged.blocks.length, 1);
+  assert.equal(merged.blocks[0].exactHistory, null);
+  // A split in two: the held galley would show the paragraph twice
+  const split = diffBlocks([block('A', 'a', 'box\npara')], [seg('a1', 'box'), seg('a2', 'para')], () => ++n);
+  assert.equal(split.blocks[0].exactHistory, null);
+});

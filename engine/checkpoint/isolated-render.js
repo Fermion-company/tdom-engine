@@ -1,3 +1,4 @@
+import { supersededLanding } from './resident-render.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
@@ -71,12 +72,15 @@ export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, as
     // counters/prevdepth typeset into the exact chunk). Re-locate it.
     idx = engine.blocks.indexOf(block);
     if (!block.galley || idx < 0) return; // superseded (reboot nulls galleys)
+    // a galley older than the text (a cold stop): its pixels would be the
+    // new text's under the old galley's name (render-pump.js)
+    if (block.sourceChanged) return;
     const forGalley = block.galleyHash;
     // a full-preamble compile is minutes on package-heavy documents: never
     // pay it when every chunk is already fresh (idle-gate wait races)
-    if (!chunkTargets(block).some((t) => engine.chunks.get(t.key)?.forGalley !== forGalley)) {
-      return;
-    }
+    // the galley this compile is for, fixed before it runs
+    const targets = chunkTargets(block).filter((t) => engine.chunks.get(t.key)?.forGalley !== forGalley);
+    if (!targets.length) return;
     const inflightKey = 'iso:' + block.id + ':' + forGalley;
     engine.rendering ??= new Set();
     if (engine.rendering.has(inflightKey)) return;
@@ -132,12 +136,23 @@ export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, as
         const pdf = path.join(jobdir, 'iso.pdf');
         if (!existsSync(pdf)) throw new Error('isolated render produced no PDF');
         await waitForPdf(pdf); // %%EOF flushed before pdftocairo reads it
-        // same page map as the resident RENDER path: galley, floats, feet
-        const targets = chunkTargets(block).filter(
-          (t) => engine.chunks.get(t.key)?.forGalley !== forGalley
-        );
-        await cropRenderTargets({ jobdir, pdf, targets, chunks: engine.chunks, forGalley, prefix: 'iso' });
-        if (block.galleyHash === forGalley) asyncRepaginate();
+        // same page map as the resident RENDER path: galley, floats, feet —
+        // of the galley compiled, crop beside the live map and land it the
+        // way a resident render lands (resident-render.js supersededLanding:
+        // never over the block's newer own pixels, #103)
+        const staged = new Map(targets.map((t) => [t.key, engine.chunks.get(t.key)]));
+        await cropRenderTargets({ jobdir, pdf, targets, chunks: staged, forGalley, prefix: 'iso' });
+        const landing = supersededLanding(engine.blocks.find((b) => b.id === block.id), engine.chunks, forGalley);
+        if (landing !== 'none') {
+          for (const t of targets) {
+            if (landing === 'held' && t.key !== block.id) continue;
+            const chunk = staged.get(t.key);
+            if (!chunk) continue;
+            chunk.v = Math.max(chunk.v ?? 0, (engine.chunks.get(t.key)?.v ?? 0) + 1);
+            engine.chunks.set(t.key, chunk);
+          }
+        }
+        if (landing === 'current' || landing === 'held') asyncRepaginate();
       } finally {
         // failure paths used to leak the whole job dir (PDF + SVGs) on disk
         rmSync(jobdir, { recursive: true, force: true });

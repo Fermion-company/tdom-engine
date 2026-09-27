@@ -68,6 +68,14 @@ export function resetOpenState(engine, text, file) {
   engine.renderHold = new Map();
   engine.coldPreviewHolds = new Map();
   engine.coldDirty = new Set(); // a cold keystroke of the previous document never resumes here
+  // the previous document's rescue previews and held renders (#103)
+  engine.coldRescuePreviews = new Map();
+  engine.coldPreviewAdopted = new Map();
+  engine.heldRenders = new Map();
+  engine.heldRenderIds = new Map();
+  engine.heldFocus = null;
+  // the previous document's isolated compiles do not hold this one's up
+  engine.isoSerial = null;
   engine.coldTrace = null;
   engine.rescueQueue = new Map();
   engine.rescueFocus = new Set();

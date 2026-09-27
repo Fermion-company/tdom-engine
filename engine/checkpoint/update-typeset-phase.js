@@ -30,6 +30,9 @@ export async function runUpdateTypesetPhase(engine, {
     queueMovedOffsets,
     coldPreview = null,
   } = callbacks;
+  // The block typed into (one source-dirty block): its renders are the ones
+  // the next keystroke spares (render-pump.js, tex64-internal #103)
+  if (!coldResume && dirtySource.size === 1) engine.heldFocus = [...dirtySource][0];
   const dirtyBlocks = [];
   const depDirty = [];
   const changedLabels = new Set();
@@ -121,6 +124,8 @@ export async function runUpdateTypesetPhase(engine, {
         };
         preview.cancel = started.cancel;
         preview.release = started.release;
+        // a rescue preview is shown when it lands; the walk never waits on it
+        preview.noWait = !!started.noWait;
         engine.coldPreviewActive = started;
         preview.compile = started.galley.catch(() => null).then((galley) => {
           preview.galley = galley;
@@ -158,7 +163,7 @@ export async function runUpdateTypesetPhase(engine, {
     const previewEtaMs = preview
       ? Math.max(0, (Number(preview.block.typesetCostMs) || 300) + 100 - (performance.now() - preview.startedAt))
       : 0;
-    if (preview && !previewAwaited && atCleanBoundary && i < firstDirty &&
+    if (preview && !preview.noWait && !previewAwaited && atCleanBoundary && i < firstDirty &&
         previewEtaMs < (engine.coldPreviewWaitMs ?? 1000) &&
         costTo(i) - previewEtaMs > (engine.coldPreviewFromMs ?? 500) / 2) {
       previewAwaited = true;
@@ -317,7 +322,8 @@ export async function runUpdateTypesetPhase(engine, {
     // the resume walk still typesets it in its own lineage and replaces it.
     // Not while a newer keystroke waits for the lock: it carries newer text.
     let timer = null;
-    const galley = preview.galley !== undefined ? preview.galley : engine.keystrokePending > 0 ? null : await Promise.race([
+    const galley = preview.galley !== undefined ? preview.galley
+      : engine.keystrokePending > 0 || preview.noWait ? null : await Promise.race([
       preview.compile,
       new Promise((resolve) => { timer = setTimeout(() => resolve(null), engine.coldPreviewWaitMs ?? 1000); }),
     ]);

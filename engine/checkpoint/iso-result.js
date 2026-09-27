@@ -54,13 +54,24 @@ export async function readIsoCompileResult(
     // occupied by the PRECEDING blocks' material, so representing it as a
     // chunk would mint a phantom page. Keep the break, drop the box.
     const blank = !/<(path|image|text)\b/.test(svg);
+    // page-style events the shipped page carried (read off the page box in
+    // the shipout hook): they belong to this page
+    for (const it of st.shipitems?.[k - 1] ?? []) items.push(it);
     if (blank) {
       items.push({ k: 'eject', v: -10000 });
       continue;
     }
-    const x0 = geo.oddsidemargin ?? 0;
-    const y0 = (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
+    // real pages ship at the print origin (tex-templates.js): the text
+    // block sits at 1in + \oddsidemargin. Crop the paper's full width so
+    // material outside the measure (a hanging section number) survives;
+    // the chunk is drawn from the paper's left edge (xBp = -margin).
+    const margin = Number.isFinite(st.ml) ? st.ml : 72 + (geo.oddsidemargin ?? 0);
+    const paper = st.pw > 0 ? st.pw : geo.paperwidth > 0 ? geo.paperwidth : null;
+    const x0 = paper ? 0 : margin;
+    const y0 = 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
     const w = geo.textwidth ?? st.w;
+    const cw = paper ?? w;
+    const xBp = paper ? -margin : 0;
     const key = `${block.id}@p${k}`;
     if (splitMode) {
       // a split box's shipped page is a REGULAR document page: page 1
@@ -80,14 +91,14 @@ export async function readIsoCompileResult(
       const topskipW = typeof geo.topskip === 'object' ? geo.topskip?.w ?? 0 : geo.topskip ?? 0;
       const cut = k === 1 && strut > 0.01 ? strut + topskipW : 0;
       const h = (geo.textheight ?? st.h) - cut - (cut > 0 ? 0.25 : 0);
-      chunks.push({ key, svg: cropSvgAt(svg, x0, y0 + cut, w, h), wBp: w, hBp: h,
+      chunks.push({ key, svg: cropSvgAt(svg, x0, y0 + cut, cw, h), wBp: cw, logicalWBp: w, xBp, hBp: h,
         editPage: k, editX: x0, editY: y0 + cut });
       items.push({ k: 'box', h, d: 0, chunk: key, coff: 0 });
       items.push({ k: 'eject', v: -10000 });
       continue;
     }
     const h = geo.textheight ?? st.h;
-    chunks.push({ key, svg: cropSvgAt(svg, x0, y0, w, h), wBp: w, hBp: h,
+    chunks.push({ key, svg: cropSvgAt(svg, x0, y0, cw, h), wBp: cw, logicalWBp: w, xBp, hBp: h,
       editPage: k, editX: x0, editY: y0 });
     // full: a REAL shipped page — it owns its page style (pdfpages sets
     // \thispagestyle{empty}), so the preview must not stamp a folio on it
@@ -105,10 +116,16 @@ export async function readIsoCompileResult(
   );
   const remainderKey = block.id;
   if ((st.h ?? 0) + (st.d ?? 0) > 0.01) {
+    // the remainder ships padded by the paper's side margins (padl/padr,
+    // tex-templates.js), so overhanging material is not cut at the measure
+    const padl = st.padl > 0 ? st.padl : 0;
+    const padr = st.padr > 0 ? st.padr : 0;
     chunks.push({
       key: remainderKey,
-      svg: cropSvg(readFileSync(svgPath, 'utf8'), st.w, st.h + st.d),
-      wBp: st.w,
+      svg: cropSvg(readFileSync(svgPath, 'utf8'), padl + st.w + padr, st.h + st.d),
+      wBp: padl + st.w + padr,
+      logicalWBp: st.w,
+      xBp: -padl,
       hBp: st.h + st.d,
       editPage: ships + 1,
     });
@@ -151,6 +168,7 @@ export async function readIsoCompileResult(
     items,
     labels: (st.labels ?? []).map(([k, v, h]) => (h != null ? { k, v, h } : { k, v })),
     toclines: (st.toclines ?? []).map(([e, l, t]) => ({ e, l, t })),
+    events: (st.events ?? []).map(([k, a, b]) => ({ k, a, b })),
     refs: st.refs ?? [],
     refVals: Object.fromEntries((st.refs ?? []).map((k) => [k, labelSnap.get(k)])),
     compiledOff,

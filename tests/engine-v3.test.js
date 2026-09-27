@@ -1220,6 +1220,189 @@ test('fork-real rescues from the real-output root match the cold compile bit for
     `close retires the real-output root with the rest of the tree (state ${processState(realRootPid)})`);
 });
 
+// glyph x positions (pdf pt, the chunk's own viewBox space) of a pdftocairo SVG
+const svgGlyphXs = (svg) => [...svg.matchAll(/<use[^>]*xlink:href="#glyph[^"]*"[^>]*x="([-\d.]+)"/g)].map((m) => Number(m[1]));
+const svgViewBox = (svg) => svg.match(/viewBox="([-\d.]+) ([-\d.]+) ([-\d.]+) ([-\d.]+)"/).slice(1).map(Number);
+
+test('rescued pages keep the text block and its overhang when the margin is narrower than an inch, and carry their marks (tex64-internal #102)', opts, async () => {
+  const work = WORK + '-narrow-margin';
+  rmSync(work, { recursive: true, force: true });
+  const doc = [
+    '\\documentclass{article}', '\\usepackage[margin=0.5in]{geometry}', '\\usepackage{multicol}', '\\usepackage[most]{tcolorbox}',
+    '\\pagestyle{headings}', '\\begin{document}',
+    'Plain paragraph before the columns.', '',
+    '\\begin{multicols}{2}[\\section{Columns heading}]', '\\llap{\\textbf{MARGIN}\\quad}' + SPLIT_LOREM.repeat(14), '\\end{multicols}', '',
+    'Plain paragraph between.', '',
+    '\\begin{tcolorbox}[breakable]', '\\llap{\\textbf{BOXNOTE}\\quad}Box text. ' + SPLIT_LOREM, '\\end{tcolorbox}', '',
+    '\\end{document}', '',
+  ].join('\n');
+  process.env.TDOM_ISO_REAL_FORK = '1';
+  let e;
+  try {
+    e = new CheckpointEngine({ workDir: work });
+  } finally {
+    delete process.env.TDOM_ISO_REAL_FORK;
+  }
+  try {
+    await e.open(doc);
+    const drained = Date.now() + 120_000;
+    while (Date.now() < drained && (e.rescueQueue.size || e.rescuePumping)) await new Promise((r) => setTimeout(r, 50));
+    const margin = 72 + (e.geometry.oddsidemargin ?? 0);
+    assert.ok(margin < 40, `a half-inch margin (${margin}bp)`);
+    const textwidth = e.geometry.textwidth;
+    const check = (label, iso, { edgeLines = true } = {}) => {
+      assert.ok(iso.chunks.length >= 1, `${label}: chunks`);
+      for (const c of iso.chunks) {
+        assert.ok(Math.abs(c.logicalWBp - textwidth) < 1 || c.logicalWBp <= textwidth + 0.5, `${label} ${c.key}: logical width ${c.logicalWBp}`);
+        assert.ok(Math.abs(c.xBp + margin) < 0.5, `${label} ${c.key}: drawn from the paper edge (xBp ${c.xBp})`);
+        assert.ok(c.wBp >= c.logicalWBp + margin - 0.5, `${label} ${c.key}: wBp ${c.wBp}`);
+        const [vx] = svgViewBox(c.svg);
+        const xs = svgGlyphXs(c.svg).map((x) => x - vx);
+        assert.ok(xs.length > 20, `${label} ${c.key}: glyphs`);
+        // lines start at the text block's left edge, not cut short of it
+        if (edgeLines) assert.ok(xs.filter((x) => Math.abs(x - margin) < 1).length >= 5, `${label} ${c.key}: lines at the left edge`);
+      }
+      // the \llap material left of the measure survives in the first chunk
+      const first = iso.chunks[0];
+      const [vx] = svgViewBox(first.svg);
+      assert.ok(svgGlyphXs(first.svg).some((x) => x - vx < margin - 5 && x - vx >= 0), `${label}: overhang kept`);
+    };
+    const cols = e.blocks.findIndex((b) => b.text.includes('\\begin{multicols}'));
+    const box = e.blocks.findIndex((b) => b.text.includes('\\begin{tcolorbox}'));
+    const textheight = e.geometry.textheight;
+    for (const off of [0, Math.round(textheight * 0.7)]) {
+      e.blocks[cols].pageOffset = off;
+      const fork = await e.compileIsolatedBlock(cols, { forceCold: false });
+      assert.equal(fork.runner, 'fork-real');
+      check(`multicols@${off}`, fork.iso);
+      // \section inside the block sets the running head of its pages
+      const marks = (fork.iso.events ?? []).filter((ev) => ev.k === 'mark' || ev.k === 'markr');
+      assert.ok(marks.some((ev) => /Columns heading/.test(`${ev.a} ${ev.b}`)), JSON.stringify(fork.iso.events));
+      assert.ok(fork.iso.items.some((it) => it.k === 'ev'), 'the mark is anchored in the item stream');
+      const cold = await e.compileIsolatedBlock(cols, { forceCold: true });
+      assert.deepEqual(cold.iso.events, fork.iso.events, 'the cold compile records the same marks');
+      check(`multicols-cold@${off}`, cold.iso);
+      e.blocks[box].pageOffset = off;
+      // a box's text sits inside its frame: only the overhang is checked
+      check(`tcolorbox@${off}`, (await e.compileIsolatedBlock(box, { forceCold: false })).iso, { edgeLines: false });
+    }
+    // the provisional pages carry the mark the rescued block set (pageSpecs
+    // builds the running head from page.evs)
+    e.blocks[cols].pageOffset = 0;
+    const iso = (await e.compileIsolatedBlock(cols, { forceCold: false })).iso;
+    const markIndex = iso.events.findIndex((ev) => ev.k === 'mark' || ev.k === 'markr');
+    const { pageSpecs } = await import('../engine/checkpoint/page-metadata.js');
+    const fake = { id: 'cols', galley: { events: iso.events } };
+    const specs = pageSpecs([{ number: 1, evs: [{ bid: 'cols', i: markIndex }] }], [fake], 'headings');
+    assert.match(JSON.stringify(specs[0]), /Columns heading|COLUMNS HEADING/i, JSON.stringify(specs[0]));
+  } finally {
+    await e.close();
+  }
+});
+
+test('a cold keystroke inside a rescued block shows the block through an isolated preview, and the resume reuses it (tex64-internal #103)', opts, async () => {
+  const work = WORK + '-cold-rescue-preview';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the cold rescue fixture keeps the resident chain walking for a while.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+    if (i === 150) paragraphs.push('\\begin{multicols}{2}', 'Columns start here. ' + SPLIT_LOREM.repeat(2), '\\end{multicols}', '');
+  }
+  const doc = ['\\documentclass{article}', '\\usepackage{multicol}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  process.env.TDOM_ISO_REAL_FORK = '1';
+  let e;
+  try {
+    e = new CheckpointEngine({ workDir: work });
+  } finally {
+    delete process.env.TDOM_ISO_REAL_FORK;
+  }
+  e.checkpointCeiling = 4; // the columns are far from every boundary
+  const gridFill = process.env.TDOM_GRID_FILL;
+  process.env.TDOM_GRID_FILL = '0';
+  try {
+    await e.open(doc);
+    const drained = Date.now() + 120_000;
+    while (Date.now() < drained && (e.rescueQueue.size || e.rescuePumping)) await new Promise((r) => setTimeout(r, 50));
+    e.coldPrefixBudgetMs = 1;
+    e.coldPreviewFromMs = 0;
+    const cols = () => e.blocks.find((b) => b.text.includes('\\begin{multicols}'));
+    const shown = [];
+    e.onAsyncPatches = ({ patches }) => {
+      const block = cols();
+      const painted = patches.some((p) => (p.displayList?.commands ?? []).some((c) => c.op === 'chunk' && c.src === block.id && !c.st));
+      shown.push({ preview: !!block.galley?.tdomColdPreview?.iso, painted, text: block.text });
+    };
+    const at = e.getSource().indexOf('Columns start here.');
+    const cold = await e.edit(at, at + 'Columns'.length, 'Wide columns');
+    assert.equal(cold.stats.chainVerdict, 'cold');
+    const until = Date.now() + 120_000;
+    while (Date.now() < until && (e.pendingChain || e.coldDirty.size || e.bgActive || e.updating || e.rescueQueue.size || e.rescuePumping)) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(e.coldDirty.size, 0, 'the cold resume landed');
+    const preview = shown.find((s) => s.preview && s.painted);
+    assert.ok(preview, `the preview painted the columns before the resume: ${JSON.stringify(shown)}`);
+    assert.ok(preview.text.startsWith('\\begin{multicols}{2}\nWide columns'), 'the preview is of the edited text');
+    const native = cols();
+    assert.ok(!native.galley.tdomColdPreview, 'the resume replaced the preview');
+    assert.ok(native.rescued, 'the columns stay a rescued block');
+  } finally {
+    await e.close();
+    if (gridFill === undefined) delete process.env.TDOM_GRID_FILL;
+    else process.env.TDOM_GRID_FILL = gridFill;
+  }
+});
+
+test('typing into a rescued block on a warm chain shows isolated previews while it goes on (tex64-internal #103)', opts, async () => {
+  const work = WORK + '-warm-rescue-preview';
+  rmSync(work, { recursive: true, force: true });
+  const doc = ['\\documentclass{article}', '\\usepackage{multicol}', '\\begin{document}',
+    'Opening paragraph.', '', '\\begin{multicols}{2}', 'Columns start here TYPED. ' + SPLIT_LOREM.repeat(3), '\\end{multicols}', '',
+    'Closing paragraph.', '', '\\end{document}', ''].join('\n');
+  process.env.TDOM_ISO_REAL_FORK = '1';
+  let e;
+  try {
+    e = new CheckpointEngine({ workDir: work });
+  } finally {
+    delete process.env.TDOM_ISO_REAL_FORK;
+  }
+  try {
+    await e.open(doc);
+    const drained = Date.now() + 120_000;
+    while (Date.now() < drained && (e.rescueQueue.size || e.rescuePumping)) await new Promise((r) => setTimeout(r, 50));
+    const cols = () => e.blocks.find((b) => b.text.includes('\\begin{multicols}'));
+    assert.ok(cols().rescued, 'the columns are a rescued block');
+    let previews = 0;
+    const seen = new Set();
+    e.onAsyncPatches = () => {
+      const g = cols().galley;
+      if (g?.tdomColdPreview?.iso && !seen.has(g)) {
+        seen.add(g);
+        previews++;
+      }
+    };
+    // keystrokes 150 ms apart for about four seconds: no pause for the pump
+    for (let k = 0; k < 26; k++) {
+      const at = e.getSource().indexOf('TYPED') + 'TYPED'.length + k;
+      await e.edit(at, at, String.fromCharCode(97 + k));
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    e.onAsyncPatches = null;
+    assert.ok(previews >= 3, `isolated previews of text typed during the burst kept reaching the page (${previews})`);
+    // the exact rescue of the final text replaces the previews
+    const until = Date.now() + 120_000;
+    while (Date.now() < until && (cols().galley?.tdomColdPreview || cols().sourceChanged || e.rescueQueue.size || e.rescuePumping)) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(!cols().galley?.tdomColdPreview, 'the exact rescue replaced the preview');
+    assert.ok(!cols().sourceChanged, 'the galley is the final text\'s');
+  } finally {
+    await e.close();
+  }
+});
+
 test('microtype expansion and protrusion keep resident glyphs where the PDF paints them (tex64-internal #66)', opts, async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-microtype-'));
   const eng = new CheckpointEngine({ workDir: path.join(root, 'work') });

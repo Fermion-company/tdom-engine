@@ -139,3 +139,26 @@ test('two viewers can fetch the same uncached canonical page concurrently', { sk
   assert.match(firstSvg, /<svg\b/);
   assert.equal(secondSvg, firstSvg, 'both viewers receive the same generation pixels');
 });
+
+test('a viewer gets the source snapshot of the revision it staged while the next edit is queued (tex64-internal #103)', { skip: !texReady && 'lualatex not installed' }, async (t) => {
+  const base = await startServer(t);
+  const post = (body) => fetch(`${base}/edit`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((res) => res.json());
+  const doc = await fetch(`${base}/doc`).then((res) => res.json());
+  const at = doc.source.indexOf('watch the inspector') + 'watch'.length;
+  assert.ok(at > 'watch'.length);
+  // a viewer that stages pages asks for snapshots
+  await fetch(`${base}/dom`).then((res) => res.json());
+  const first = await post({ start: at, end: at, text: 'X' });
+  // the next keystroke is sent at once; the snapshot of the first follows it
+  const second = post({ start: at + 1, end: at + 1, text: 'Y' });
+  const snapshot = await fetch(`${base}/dom?srcRev=${first.srcRev}`).then((res) => res.json());
+  assert.equal(snapshot.srcRev, first.srcRev, 'the snapshot of the staged revision, not of the queued edit');
+  assert.ok(snapshot.blocks?.length > 0);
+  const next = await second;
+  assert.equal(next.srcRev, first.srcRev + 1);
+  // an unknown revision still takes the queue and answers the current state
+  const current = await fetch(`${base}/dom?srcRev=1`).then((res) => res.json());
+  assert.equal(current.srcRev, next.srcRev);
+});

@@ -1,4 +1,5 @@
 import { parsePlacement } from './pagebuilder.js';
+import { exactFallbackCompatible } from './galley-adoption.js';
 
 /**
  * galley items -> the page builder's input stream. The items ARE the real
@@ -8,18 +9,28 @@ import { parsePlacement } from './pagebuilder.js';
  * cached per block (unitsSig), so page identity survives unrelated edits.
  */
 export function buildStream(block, chunks) {
-  const galley = block.galley;
-  const items = galley?.items ?? [];
-  const floats = galley?.floats ?? [];
-  const fid = block.fidelity;
   // Fidelity display policy (best available first):
   //   fresh chunk > STALE chunk (the previous edit's TeX pixels — old but
   //   clean) > glyph bridge (only where every glyph is at least mappable)
   //   > blank (no-bridge lines, canonical-only blocks).
   // A fast-but-wrong display is never an option; a ~100ms-old exact one is.
   const bc = chunks.get(block.id);
-  const bcFresh = !!bc && bc.forGalley === block.galleyHash;
-  const blockExact = !!(block.gfx || fid?.blockExact);
+  // A block whose current galley is still being rendered is laid out from
+  // the newest earlier galley whose pixels have landed (galley-adoption
+  // holdExactGalley): lines, pixels and fidelity of one generation, a
+  // keystroke behind the text, instead of a page held until the typing
+  // stops (#103).
+  if (bc?.forGalley === block.galleyHash && block.exactHistory) block.exactHistory = null; // its own pixels are in
+  const candidate = block.needsRender && !block.rescued && bc && bc.forGalley !== block.galleyHash
+    ? block.exactHistory?.get(bc.forGalley) : null;
+  const held = candidate && exactFallbackCompatible(candidate.galley, block.galley) ? candidate : null;
+  const galley = held?.galley ?? block.galley;
+  const galleyHash = held ? bc.forGalley : block.galleyHash;
+  const fid = held ? held.fidelity : block.fidelity;
+  const blockExact = !!((held ? galley.gfx : block.gfx) || fid?.blockExact);
+  const items = galley?.items ?? [];
+  const floats = galley?.floats ?? [];
+  const bcFresh = !!bc && bc.forGalley === galleyHash;
   const canonicalOnly = !!fid?.canonicalOnly;
 
   const stream = [];
@@ -126,10 +137,12 @@ export function buildStream(block, chunks) {
         ((flags & 3) === 0 || (flags & 4) !== 0) && hasRuns;
       let gfxChunk = null;
       if (it.chunk) {
-        gfxChunk = { blockId: it.chunk, yOff: it.coff ?? 0, w: chunks.get(it.chunk)?.wBp ?? galley.w };
+        gfxChunk = { blockId: it.chunk, yOff: it.coff ?? 0, w: chunks.get(it.chunk)?.logicalWBp ?? chunks.get(it.chunk)?.wBp ?? galley.w };
         if (it.full) gfxChunk.full = 1; // real shipped page: owns folio/hf
       } else if (wantExact && bc && !useCurrentSafeLine) {
-        gfxChunk = { blockId: block.id, yOff, w: galley.w, stale: bcFresh ? undefined : 1 };
+        // held: an earlier generation's lines and pixels (display only: its
+        // glyph geometry is not the current source's, #103)
+        gfxChunk = { blockId: block.id, yOff, w: galley.w, stale: bcFresh ? undefined : 1, held: held ? 1 : undefined };
       }
       // no exact pixels yet: mappable glyphs may bridge the render latency;
       // unmappable ones (and verification-demoted blocks) show nothing
