@@ -181,7 +181,7 @@ body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironm
 | `settle` | counter などの動いた exit state を下流へ追い、clean block で一致したら止まる |
 | `rebuild` | suffix を信用せず、下流を serial に再組版する |
 
-`#scheduleBackground()` は、編集後 300ms の idle gate を待ってから `#runChainPass()` を lock 内で走らせる。次の編集が来ると `bgAbort` で止まり、進捗位置から後で再開する。
+`#scheduleBackground()` は、編集後 300ms の idle gate を待ってから `#runChainPass()` を lock 内で走らせる。次の編集が来ると `bgAbort` で止まり、進捗位置から後で再開する。最後の round の後に仕事が残り、pass が前に進んでいれば（grid は境界を実体化した数で見る）、同じ gate の後ろで次の task を走らせる（無操作のまま 8 回まで）。進んでいない grid の計画は捨て、次の予約で `gridMissing` から立て直す（以前は残った仕事を次の編集まで誰も走らせず、chain を待つ呼び出しが止まった）。
 
 settle は `from`（入口 state が古い最初の block）より前の block では収束を判定しない。`from` の境界が退役していると pass はその手前の checkpoint から再生するが、そこで galley と exit state が一致しても、foreground が更新済みの block を再現しただけで、動いた state が収まった証拠にはならない（cold resume が何度か走ると、その pin が `editHold` から押し出されて起きる）。
 
