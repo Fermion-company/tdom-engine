@@ -481,7 +481,11 @@ async function openPaced(work) {
           eng.canonicalPageCount !== eng.pages.length) && Date.now() - t0 < 120_000) {
     await new Promise((r) => setTimeout(r, 100));
   }
-  assert.equal(eng.shipping?.info?.().baselineReady, true);
+  if (eng.shipping?.info?.().baselineReady !== true) {
+    // a failed open must not leave its chain holding the test file open
+    await eng.close();
+    assert.fail('the paced document opens with its shipping baseline');
+  }
   return { eng, arrivals };
 }
 
@@ -526,9 +530,13 @@ test('a paintable keystroke holds its replay until typing pauses (tex64-internal
 
 test('an idle chain retires and the next caret move boots it again (tex64-internal #72)', opts, async () => {
   process.env.TDOM_SHIP = '1';
-  process.env.TDOM_SHIP_IDLE_MS = '2500';
+  // The short quiet period starts after the open: armed at the open itself,
+  // it retired the chain while the canonical pass was still arriving, and
+  // the open found no baseline (under load; the chain then leaked)
   const { eng } = await openPaced(path.join(WORK, 'idle'));
   try {
+    process.env.TDOM_SHIP_IDLE_MS = '2500';
+    await eng.warmEditOffset(eng.getSource().indexOf('Paragraph 2'));
     const t0 = Date.now();
     while (!eng.shipIdleRetired && Date.now() - t0 < 30_000) {
       await new Promise((r) => setTimeout(r, 100));
