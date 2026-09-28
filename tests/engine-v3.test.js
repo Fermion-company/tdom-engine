@@ -461,6 +461,77 @@ test('a cold keystroke shows its block through a preview typeset from the far ch
   }
 });
 
+test('a cold walk waits for its preview instead of replaying a heavy block it would stop after (tex64-internal #104)', opts, async () => {
+  const work = WORK + '-cold-preview-heavy';
+  rmSync(work, { recursive: true, force: true });
+  const paragraphs = [];
+  for (let i = 1; i <= 160; i += 1) {
+    paragraphs.push(`Paragraph ${i} of the heavy-step fixture keeps the resident chain walking for a while.`);
+    if (i % 4 === 0) paragraphs.push('\\newpage');
+    paragraphs.push('');
+  }
+  const doc = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}', ''].join('\n');
+  const e = new CheckpointEngine({ workDir: work });
+  e.checkpointCeiling = 4;
+  const gridFill = process.env.TDOM_GRID_FILL;
+  process.env.TDOM_GRID_FILL = '0';
+  try {
+    await e.open(doc);
+    e.coldPrefixBudgetMs = 1500;
+    e.coldPreviewFromMs = 0;
+    e.coldPreviewWaitMs = 1; // the ordinary wait never catches it
+    const at = e.getSource().indexOf('Paragraph 150 ');
+    const target = e.blocks.findIndex((b) => b.text.startsWith('Paragraph 150 '));
+    const start = Math.max(...[...e.checkpoints.keys()].filter((k) => k <= target));
+    assert.ok(target - start > 3, 'the edited block is far from its checkpoint');
+    // the first block the walk would replay is heavy (as under load)
+    e.blocks[start].typesetCostMs = 5_000;
+    // and the preview is slow: its JOB goes out 300 ms late
+    for (const peer of new Set(e.checkpoints.values())) {
+      const send = peer.send.bind(peer);
+      const sendRaw = peer.sendRaw.bind(peer);
+      let held = null;
+      peer.send = (line) => {
+        if (line.startsWith('JOB ') && line.includes('~cold')) {
+          held = line;
+          return undefined;
+        }
+        return send(line);
+      };
+      peer.sendRaw = (body) => {
+        if (held == null) return sendRaw(body);
+        const line = held;
+        held = null;
+        setTimeout(() => { send(line); sendRaw(body); }, 300);
+        return undefined;
+      };
+    }
+    const cold = await e.edit(at, at + 'Paragraph'.length, 'Heavy');
+    assert.equal(cold.stats.chainVerdict, 'cold');
+    assert.equal(cold.stats.coldPreview?.adopted, true, JSON.stringify(cold.stats.coldPreview));
+    assert.ok(!e.lastWalkTrace.blocks.some(([idx, , flags]) => idx === start && flags !== 'w'),
+      `the heavy block was not replayed: ${JSON.stringify(e.lastWalkTrace.blocks)}`);
+    assert.ok(e.lastWalkTrace.blocks.some(([idx, , flags]) => idx === start && flags === 'w'), 'the wait is traced');
+    const block = e.blocks[target];
+    assert.ok(block.galley.tdomColdPreview && block.text.startsWith('Heavy 150 '));
+    // the next keystroke of the burst does not wait there again: it steps
+    // the block (or starts past it), so the walk moves on
+    const again = e.getSource().indexOf('Heavy 150 ') + 'Heavy'.length;
+    await e.edit(again, again, 'x');
+    assert.ok(!e.lastWalkTrace.blocks.some(([idx, , flags]) => idx === start && flags === 'w'),
+      `waited at the heavy block twice: ${JSON.stringify(e.lastWalkTrace.blocks)}`);
+    const until = Date.now() + 90_000;
+    while (Date.now() < until && (e.pendingChain || e.coldDirty.size || e.bgActive || e.updating)) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(!e.blocks[target].galley.tdomColdPreview, 'the resume replaced the preview');
+  } finally {
+    await e.close();
+    if (gridFill === undefined) delete process.env.TDOM_GRID_FILL;
+    else process.env.TDOM_GRID_FILL = gridFill;
+  }
+});
+
 test('a cold preview of a block with exact pixels renders them from the checkpoint it was typeset from', opts, async () => {
   const work = WORK + '-cold-preview-gfx';
   rmSync(work, { recursive: true, force: true });

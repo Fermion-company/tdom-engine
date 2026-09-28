@@ -178,6 +178,51 @@ export async function runUpdateTypesetPhase(engine, {
         break;
       }
     }
+    // A heavy clean block next, with the preview still out, and a budget the
+    // walk would overrun on it (so it stops cold right after it anyway):
+    // stepping it only holds the keystroke, and its replay competes with the
+    // preview's child for the cores. Wait for the preview instead, no longer
+    // than the step would take (by its estimate), then stop cold here either
+    // way: a preview that landed is shown in this reply, one still out gets
+    // the ordinary post-walk wait, and the step is the cold pass's to replay
+    // behind its idle gate (a keystroke then waits for no more than the
+    // rest of it). A failed preview leaves the walk to go on. On the
+    // 316-page book a box replayed for 3.1 s under load while its preview
+    // landed (tex64-internal #104).
+    // Once per block: the next walk that reaches it steps it. In a burst
+    // each keystroke queues behind the last reply, the cold pass never gets
+    // its idle gate, and every keystroke waited at the same boundary while
+    // the walk never moved on (six in a row on the 316-page book).
+    const nextReplayMs = 2 * (Number(engine.blocks[i]?.typesetCostMs) || 0);
+    const heavyMs = engine.coldHeavyStepMs ?? 500;
+    const waitedHere = engine.heavyWaitId != null && engine.heavyWaitId === engine.blocks[i]?.id;
+    if (waitedHere) engine.heavyWaitId = null;
+    if (preview && !preview.noWait && preview.galley === undefined && !coldResume && coldBudgetMs > 0 && !waitedHere &&
+        (engine.coldPreviewWaitMs ?? 1000) > 0 && atCleanBoundary && i < firstDirty && nextReplayMs > heavyMs &&
+        performance.now() - walkStartedAt + nextReplayMs > coldBudgetMs) {
+      const sinceStart = performance.now() - preview.startedAt;
+      const waitMs = Math.min(nextReplayMs, (engine.coldPreviewTimeoutMs ?? 15_000) - sinceStart - 500);
+      if (waitMs > 0) {
+        const waitedAt = performance.now();
+        let timer = null;
+        let poll = null;
+        await Promise.race([
+          preview.compile,
+          new Promise((resolve) => { timer = setTimeout(resolve, waitMs); }),
+          new Promise((resolve) => {
+            poll = setInterval(() => { if (engine.keystrokePending > 0) resolve(); }, 25);
+          }),
+        ]);
+        clearTimeout(timer);
+        clearInterval(poll);
+        if (walkTrace.length < 48) walkTrace.push([i, Math.round(performance.now() - waitedAt), 'w']);
+        if (preview.galley !== null) {
+          engine.heavyWaitId = engine.blocks[i]?.id ?? null;
+          verdict = 'cold';
+          break;
+        }
+      }
+    }
     // /status liveness marker: which block the foreground pass is on —
     // a long boot walk shows movement instead of silence
     engine.progress = { phase: 'typeset', at: i + 1, total: engine.blocks.length };
