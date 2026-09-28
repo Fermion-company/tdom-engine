@@ -104,8 +104,11 @@ test('fork failure escalates to a full rebuild and heals', opts, async () => {
 test('a job nothing answers (no child announced) escalates and heals', opts, async () => {
   await settle();
   await armFault('SILENT', 99);
+  const asyncPatches = [];
+  eng.onAsyncPatches = (partial) => asyncPatches.push(...partial.patches);
   const t0 = Date.now();
   const report = await editAppend('SILENT RECOVERY MARKER');
+  eng.onAsyncPatches = null;
   const took = Date.now() - t0;
   assert.equal(eng.mode, 'structured');
   assert.ok(source.includes('SILENT RECOVERY MARKER'));
@@ -113,7 +116,10 @@ test('a job nothing answers (no child announced) escalates and heals', opts, asy
   // the silent job must actually burn its (shortened) timeout first
   assert.ok(took > 1_200, `the silent wait was real (${took}ms)`);
   assert.ok(took < 60_000, `healed in ${took}ms`);
-  assert.ok((report.patches?.length ?? 0) >= 1);
+  // the rebuilt pages reach the host in the report, or through the async
+  // channel when a render landing during the rebuild repaginated first
+  // (then the report's diff is empty: 1 run in 3)
+  assert.ok((report.patches?.length ?? 0) + asyncPatches.length >= 1, 'rebuilt pages were patched');
 });
 
 test('a fully wedged lineage ends healed, not permanently frozen', opts, async () => {

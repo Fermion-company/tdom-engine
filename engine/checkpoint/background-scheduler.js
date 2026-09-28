@@ -1,7 +1,7 @@
 import { performance } from 'node:perf_hooks';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 
-export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive = false, pageRenderIds = [] } = {}) {
+export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive = false, pageRenderIds = [], idleRound = 0 } = {}) {
   const { locked, runChainPass, chunkTargets, queueRender, enforceCheckpointCap, coldResume, queueGrid, gridWanted } = callbacks;
   // Deferred chain work is the ONLY background chain activity (docs/10
   // §I3): nothing runs while the user is typing. The pass starts after a
@@ -53,6 +53,36 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
     engine.diagnostics.push('chain pass failed: ' + (err?.message ?? err));
     return null;
   });
+  // Work left after the last round (a grid pass stops at its step budget)
+  // had nobody to run it until the next edit: the keep-set boundaries went
+  // unfilled while the document sat idle, and a caller draining the chain
+  // waited forever (tests/hot-path.test.js 'cold native prefix replay',
+  // intermittent). Run the next task behind the same idle gate while the
+  // passes make progress: a grid pass only by the boundaries it
+  // materialized (the last round queues a fresh grid plan every time, and
+  // a target the cap retires at once is no progress), other chain work by
+  // moving on. Bounded like the passes themselves, in case a moving keep
+  // set keeps offering boundaries the cap then retires.
+  const before = engine.pendingChain;
+  const beforeFrom = before?.from;
+  const materializedBefore = engine.gridFill?.materialized ?? 0;
+  const task = engine.bgTask;
+  void task.then((work) => {
+    if (work || engine.closed || engine.bgTask !== task || engine.bgAbort || engine.editPending) return;
+    const left = engine.pendingChain;
+    if (!left) return;
+    if (idleRound >= 8) {
+      if (left.kind === 'grid') engine.pendingChain = null;
+      return;
+    }
+    const moved = left.kind === 'grid'
+      ? (engine.gridFill?.materialized ?? 0) > materializedBefore
+      : left !== before || left.from !== beforeFrom;
+    if (moved) scheduleBackground(engine, [], callbacks, { idleRound: idleRound + 1 });
+    // a grid plan nobody runs: the next task re-plans it from gridMissing
+    // (a pinned reach stays), and a caller draining the chain is not held
+    else if (left.kind === 'grid') engine.pendingChain = null;
+  }, () => {});
   if (coldResume) {
     void engine.bgTask.then((work) => (work ? coldResume(work) : undefined)).catch((err) => {
       engine.diagnostics.push('cold resume failed: ' + (err?.message ?? err));

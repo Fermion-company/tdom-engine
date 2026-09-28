@@ -1074,13 +1074,19 @@ export class CheckpointEngine {
     // and an unused one is killed
     this.renderPids ??= new Map();
     this.renderPids.set(jobId, 0);
+    let gone = false;
     const poll = setInterval(() => {
       const pid = this.renderPids.get(jobId);
       if (!(pid > 0)) return;
-      try { process.kill(pid, 0); } catch { this._reject(key, new Error(`cold preview child of ${block.id} exited`)); }
+      try { process.kill(pid, 0); } catch {
+        gone = true;
+        this._reject(key, new Error(`cold preview child of ${block.id} exited`));
+      }
     }, 200);
     let settled = false;
+    let reported = false;
     const galley = galleyP.then((g) => {
+      reported = true;
       if (g.closure === 'error') {
         release();
         return null;
@@ -1095,6 +1101,18 @@ export class CheckpointEngine {
     }).finally(() => {
       settled = true;
       clearInterval(poll);
+      // no galley (its wait timed out, the walk gave up on it): the child
+      // may still be spinning, and nobody would kill it later (#104)
+      if (!reported && !gone) {
+        const pid = this.renderPids.get(jobId);
+        if (pid > 0) {
+          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        } else {
+          this.cancelledJobIds ??= new Set();
+          this.cancelledJobIds.add(jobId); // killed when FORKED arrives
+          setTimeout(() => this.cancelledJobIds?.delete(jobId), 30_000).unref?.();
+        }
+      }
       this.renderPids.delete(jobId);
     });
     const cancel = () => {
