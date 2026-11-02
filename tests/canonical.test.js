@@ -1218,6 +1218,59 @@ test('scheduled compiles yield between passes to a newer revision', opts, async 
   }
 });
 
+test('display cadence: continuous edits keep the first due time instead of re-arming it', () => {
+  const work = WORK + '-display-cadence';
+  rmSync(work, { recursive: true, force: true });
+  const c = new CanonicalRenderer({ workDir: work, debounceMs: 0, displayDebounceMs: 300 });
+  try {
+    // A landed generation makes later revisions ordinary (non-baseline) work.
+    c.last = { id: 1, rev: 1, ms: 50, inputEpoch: c.inputEpoch };
+    c.lastEndAt = Date.now() - 10_000;
+    c.pressure = 'display';
+    c.schedule(DOC1.replace('Page one', 'Edit a'), 2);
+    const due = c.timerDueAt;
+    assert.ok(due > Date.now(), 'the first edit arms the display debounce');
+    // Keystrokes every few ms: the due time must not move later.
+    for (let rev = 3; rev < 8; rev++) c.schedule(DOC1.replace('Page one', `Edit ${rev}`), rev);
+    assert.equal(c.timerDueAt, due, 'later edits keep the earliest due time');
+    assert.equal(c.pendingJob.rev, 7, 'the timer compiles the newest pending source');
+
+    // Authority mode stays an idle gate: every edit pushes the compile back.
+    c.pressure = 'authority';
+    clearTimeout(c.timer); c.timer = null; c.pendingJob = null;
+    c.schedule(DOC1.replace('Page one', 'Quiet a'), 8);
+    const idleDue = c.timerDueAt;
+    const spin = Date.now() + 5; while (Date.now() < spin) { /* let the clock move */ }
+    c.schedule(DOC1.replace('Page one', 'Quiet b'), 9);
+    assert.ok(c.timerDueAt > idleDue, 'authority re-arms on every edit');
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test('display starvation: a stale display paper lets a compile finish instead of yielding to newer edits', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-display-starved');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0, displayDebounceMs: 0, displayMaxWaitMs: 0 });
+  try {
+    const gen = await c.ensure(MULTI_PASS_ROOT, 1);
+    assert.ok(gen.passes >= 2, `table of contents needs a second pass (got ${gen.passes})`);
+    c.pressure = 'display';
+    c.schedule(MULTI_PASS_ROOT.replace('\\section{First}', '\\section{First, revised}'), 2);
+    await untilRunning(c);
+    assert.equal(c.runningJob?.rev, 2);
+    // A newer edit lands during pass one; the paper is already past its
+    // staleness budget, so revision 2 is published rather than abandoned.
+    c.schedule(MULTI_PASS_ROOT.replace('Body two.', 'Body two, newest.'), 3);
+    await c.settle();
+    const revs = [...c.generations.values()].map((g) => g.rev);
+    assert.ok(revs.includes(2), `revision 2 landed while edits kept coming (generations ${revs})`);
+    assert.equal(c.info().rev, 3, 'and the newest edit followed it');
+  } finally {
+    c.dispose();
+  }
+});
+
 test('Build seeds let the first post-Build canonical reach its fixpoint in one pass', opts, async () => {
   const { docDir, overlayDir, canonDir } = identityFixture('-build-seeds');
   writeFileSync(path.join(docDir, 'main.tex'), MULTI_PASS_ROOT);

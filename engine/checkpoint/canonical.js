@@ -101,6 +101,11 @@ export class CanonicalRenderer {
     debounceMs = Number(process.env.TDOM_CANON_DEBOUNCE ?? 2500),
     idleMs = Number(process.env.TDOM_CANON_IDLE ?? 30_000),
     displayDebounceMs = Number(process.env.TDOM_CANON_DISPLAY_DEBOUNCE ?? 350),
+    // When canonical is the display (opaque mode, a fallback, or a viewer that
+    // demanded a revision), continuous typing must not keep the paper still:
+    // once the paper is this old, a running compile is no longer abandoned
+    // between passes for a newer edit; it lands, and the newer edit follows.
+    displayMaxWaitMs = Number(process.env.TDOM_CANON_DISPLAY_MAX_WAIT ?? 1000),
     residentDisplayState = null,
   }) {
     const resolvedWorkDir = path.resolve(workDir);
@@ -116,6 +121,9 @@ export class CanonicalRenderer {
     this.debounceMs = debounceMs;
     this.idleMs = idleMs;
     this.displayDebounceMs = displayDebounceMs;
+    this.displayMaxWaitMs = displayMaxWaitMs;
+    // First edit not yet on canonical paper (null once a generation lands).
+    this.displayStaleSince = null;
     this.residentDisplayState = residentDisplayState;
     this.timer = null;
     this.timerDueAt = 0;
@@ -370,6 +378,7 @@ export class CanonicalRenderer {
     const job = this.pendingJob;
     this.pendingJob = null;
     this.lastError = null;
+    this.displayStaleSince = null;
     if (job) this.#clearDisplayDemand(job);
     try {
       this.onResult?.(this.info());
@@ -573,7 +582,10 @@ export class CanonicalRenderer {
     this.generations.set(generation.id, generation);
     // An export snapshot that a rebind overtook is retained for its caller
     // but never promoted: canonical must not move to an older revision.
-    if (promote) this.last = generation;
+    if (promote) {
+      this.last = generation;
+      this.displayStaleSince = null;
+    }
     while (this.generations.size > GENERATION_MAX) {
       const oldestId = this.generations.keys().next().value;
       const oldest = this.generations.get(oldestId);
@@ -586,6 +598,7 @@ export class CanonicalRenderer {
     for (const generation of this.generations.values()) this.#retireGeneration(generation);
     this.generations.clear();
     this.last = null;
+    this.displayStaleSince = null;
     this.svgCache.clear();
     this.svgInFlight.clear();
     this.textCache.clear();
@@ -1143,11 +1156,24 @@ export class CanonicalRenderer {
       return;
     }
     this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now(), fallbackReason };
+    this.displayStaleSince ??= Date.now();
     if (this.coldBaselineCatchup && !this.#hasColdBaselineCatchup(this.pendingJob)) {
       this.coldBaselineCatchup = null;
     }
     if (!this.#hasDisplayDemand(this.pendingJob)) this.displayDemand = null;
-    this.#armPending(this.delayFor());
+    // Authority mode is an idle gate on purpose (re-armed by every edit).
+    // When canonical is the display, re-arming on every keystroke starved it:
+    // typing faster than displayDebounceMs never let a compile start, so the
+    // paper only moved once the hands stopped. Keep the earliest due time;
+    // the newest pending source is what the timer compiles when it fires.
+    const displayCadence = this.pressure !== 'authority' || Boolean(fallbackReason);
+    this.#armPending(this.delayFor(), { keepEarlier: displayCadence });
+  }
+
+  /** The display paper has waited past displayMaxWaitMs for canonical. */
+  #displayStarved() {
+    if (this.pressure === 'authority' && !this.displayDemand) return false;
+    return this.displayStaleSince !== null && Date.now() - this.displayStaleSince >= this.displayMaxWaitMs;
   }
 
   /** Promote existing work while one or more viewers cannot present this revision. */
@@ -1519,7 +1545,7 @@ export class CanonicalRenderer {
       if (!changed) break;
       // Another pass of an obsolete snapshot only delays the revision the
       // viewer is waiting for. The first baseline is exempt (#compileObsolete).
-      if (superseding && this.#compileObsolete(rev, { pending: true })) throw superseded();
+      if (superseding && this.#compileObsolete(rev, { pending: true }) && !this.#displayStarved()) throw superseded();
     }
     // A rebind made a newer revision current while this snapshot compiled:
     // publishing it would move canonical backwards. Scheduled work stops
