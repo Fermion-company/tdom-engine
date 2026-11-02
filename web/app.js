@@ -3235,7 +3235,18 @@ pagesEl.addEventListener('click', async (ev) => {
   if (src) {
     const dom = await fetch('/dom').then((r) => r.json());
     block = dom.blocks.find((b) => b.id === src);
-    if (block) location = block.source;
+    if (block) {
+      location = block.source;
+      // Typeset nodes carry their line within the block: answer the line
+      // that was clicked, not the block's first line.
+      const relative = Number(ev.target?.closest?.('[data-line]')?.dataset?.line);
+      const start = Number(block.source?.start?.line);
+      const end = Number(block.source?.end?.line);
+      if (Number.isInteger(relative) && relative >= 0 && Number.isFinite(start) &&
+          (!Number.isFinite(end) || start + relative <= end)) {
+        location = { file: block.source.file, line: start + relative, column: 1 };
+      }
+    }
   }
   if (!location && embeddedHost) location = await syncLocationForClick(ev, clickedPage);
   if (!location || !stillCurrent()) return;
@@ -6777,7 +6788,7 @@ pagesEl.addEventListener('scroll', () => {
       if (!entry) return;
       scrollPageToViewport(entry[1]);
     };
-    const refineSyncToSource = async (data) => {
+    const refineSyncToSource = async (data, wantsMarker = false) => {
       const file = String(data.sourceFile ?? '');
       const line = Number(data.sourceLine);
       if (!file || !Number.isFinite(line)) return false;
@@ -6828,11 +6839,58 @@ pagesEl.addEventListener('scroll', () => {
             top: Math.max(0, pagesEl.scrollTop + (top + bottom) / 2 - viewport.top - pagesEl.clientHeight / 2),
             behavior: 'auto',
           });
+          if (wantsMarker) {
+            // The live paper's own ink for that line beats the last Build's
+            // SyncTeX box: it already reflects unsaved edits.
+            const pageRect = page.getBoundingClientRect();
+            const placed = ink.map((node) => node.getBoundingClientRect());
+            const left = Math.min(...placed.map((rect) => rect.left));
+            const right = Math.max(...placed.map((rect) => rect.right));
+            const inkTop = Math.min(...placed.map((rect) => rect.top));
+            const inkBottom = Math.max(...placed.map((rect) => rect.bottom));
+            placeSyncMarker(page, {
+              left: left - pageRect.left - 2, top: inkTop - pageRect.top - 2,
+              width: right - left + 4, height: inkBottom - inkTop + 4,
+            });
+          }
           scheduleEmbedSnapshot();
           return true;
         }
       }
       return false;
+    };
+    // The host's Jump marks where it landed, as the static PDF viewer does:
+    // a box over the typeset source line that fades out.
+    let syncMarkerTimer = null;
+    const clearSyncMarker = () => {
+      clearTimeout(syncMarkerTimer);
+      syncMarkerTimer = null;
+      for (const node of document.querySelectorAll('.tdom-sync-marker')) node.remove();
+    };
+    const placeSyncMarker = (page, box) => {
+      clearSyncMarker();
+      if (!page?.isConnected || !box || !(box.width > 0) || !(box.height > 0)) return;
+      const marker = document.createElement('div');
+      marker.className = 'tdom-sync-marker';
+      marker.style.left = `${box.left}px`;
+      marker.style.top = `${box.top}px`;
+      marker.style.width = `${box.width}px`;
+      marker.style.height = `${box.height}px`;
+      page.appendChild(marker);
+      syncMarkerTimer = setTimeout(clearSyncMarker, 2600);
+    };
+    // SyncTeX's block (paper points from the top) on this page, in page pixels.
+    const syncBlockBox = (page, data) => {
+      const paper = activePaperGeometry(page);
+      const scale = page.clientWidth / Math.max(1, Number(paper.width));
+      const blockX = Number(data.blockX), blockY = Number(data.blockY);
+      const blockWidth = Number(data.blockWidth), blockHeight = Number(data.blockHeight);
+      if ([blockX, blockY, blockWidth, blockHeight].every(Number.isFinite) && blockWidth > 0 && blockHeight > 0) {
+        return { left: blockX * scale - 2, top: blockY * scale - 2, width: blockWidth * scale + 4, height: blockHeight * scale + 4 };
+      }
+      const x = Number(data.x), y = Number(data.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      return { left: x * scale - 10, top: y * scale - 10, width: 20, height: 20 };
     };
     const scrollToSync = (data) => {
       const entry = pageEntryFor(Number(data.page));
@@ -6845,7 +6903,9 @@ pagesEl.addEventListener('scroll', () => {
         : Number(data.y);
       scrollPageToViewport(page, Number.isFinite(y) ? y : 0, true);
       embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
-      void refineSyncToSource(data);
+      const wantsMarker = data.marker !== false;
+      if (wantsMarker) placeSyncMarker(page, syncBlockBox(page, data));
+      void refineSyncToSource(data, wantsMarker);
       requestAnimationFrame(scheduleEmbedSnapshot);
     };
     pagesEl.addEventListener('scroll', scheduleEmbedSnapshot, { passive: true });

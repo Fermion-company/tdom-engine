@@ -1352,6 +1352,82 @@ function activeSourceLine(file, line) {
   return String(text).split(/\r?\n/)[line - 1] ?? '';
 }
 
+// SyncTeX records glue and boxes, not characters: a click on the first word
+// of a source line returns the line above (that word follows the previous
+// line's end-of-line space), and a paragraph's first word or a page box can
+// return the paragraph's last line or another file. The canonical PDF's word
+// boxes name the clicked word and its neighbours; the source line that holds
+// them is the answer. Returns null to keep SyncTeX's own location.
+const syncWord = (value) => {
+  const text = String(value ?? '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+  return text.slice(0, 64);
+};
+const syncSourceWords = (line) => String(line ?? '')
+  .replace(/(^|[^\\])%.*$/, '$1')
+  .replace(/\\[A-Za-z@]+\*?/g, ' ')
+  .split(/[\s{}[\]()~]+/)
+  .map(syncWord)
+  .filter(Boolean);
+async function wordsAtPaperPoint({ page, x, y, id }) {
+  const pages = await engine.canonical.pageTextBoxes(id).catch(() => null);
+  const boxes = pages?.[page - 1];
+  if (!Array.isArray(boxes) || !boxes.length) return null;
+  const hit = boxes.find((box) => x >= box.left - 1 && x <= box.right + 1 && y >= box.top - 1 && y <= box.bottom + 1);
+  if (!hit) return null;
+  const mid = (box) => (box.top + box.bottom) / 2;
+  const height = Math.max(1, hit.bottom - hit.top);
+  const line = boxes.filter((box) => Math.abs(mid(box) - mid(hit)) < height / 2).sort((a, b) => a.left - b.left);
+  const at = line.indexOf(hit);
+  const center = (box) => box ? { x: (box.left + box.right) / 2, y: mid(box) } : null;
+  return {
+    word: hit.text, prev: line[at - 1]?.text ?? null, next: line[at + 1]?.text ?? null,
+    prevPoint: center(line[at - 1]), nextPoint: center(line[at + 1]),
+  };
+}
+async function refineSyncHitByWords({ page, x, y, id, hit, resolveFile }) {
+  const context = await wordsAtPaperPoint({ page, x, y, id });
+  const word = syncWord(context?.word);
+  if (!word) return null;
+  const prev = syncWord(context.prev);
+  const next = syncWord(context.next);
+  const candidates = new Map();
+  const add = (file, line, near) => {
+    if (!file || !Number.isInteger(line) || line < 1) return;
+    const key = `${file}\0${line}`;
+    const existing = candidates.get(key);
+    if (!existing || near < existing.near) candidates.set(key, { file, line, near });
+  };
+  for (let delta = -15; delta <= 3; delta += 1) add(hit.file, hit.line + delta, Math.abs(delta));
+  // Neighbouring words on the same typeset line are a second opinion on the
+  // file when the point itself fell onto a page or column box.
+  for (const point of [context.nextPoint, context.prevPoint]) {
+    if (!point) continue;
+    const other = await engine.canonical.reverseSync({ page, x: point.x, y: point.y, id }).catch(() => null);
+    const file = other ? resolveFile(other.file) : null;
+    if (file) for (let delta = -2; delta <= 2; delta += 1) add(file, other.line + delta, 20 + Math.abs(delta));
+  }
+  const score = (text) => {
+    const words = syncSourceWords(text);
+    let best = 0;
+    words.forEach((item, i) => {
+      if (item !== word) return;
+      best = Math.max(best, 1);
+      if (prev && words[i - 1] === prev) best = Math.max(best, 2);
+      if (next && words[i + 1] === next) best = Math.max(best, 2);
+      if (prev && next && words[i - 1] === prev && words[i + 1] === next) best = 3;
+    });
+    return best;
+  };
+  let best = null;
+  for (const candidate of candidates.values()) {
+    const value = score(activeSourceLine(candidate.file, candidate.line));
+    if (value && (!best || value > best.value || (value === best.value && candidate.near < best.near))) best = { ...candidate, value };
+  }
+  if (!best || (best.value === 1 && word.length < 4)) return null;
+  if (score(activeSourceLine(hit.file, hit.line)) >= best.value) return null;
+  return { file: best.file, line: best.line };
+}
+
 async function validatedForwardSyncAll(location, id) {
   const file = canonicalInputForProjectFile(location?.file);
   const line = Number(location?.line);
@@ -2146,13 +2222,28 @@ const server = http.createServer(async (req, res) => {
       if (!isPathInside(activeProject.docDir, file)) {
         return json(res, { error: 'source location is outside the project' }, 404);
       }
+      const resolveFile = (candidate) => {
+        let resolved = path.resolve(String(candidate ?? ''));
+        if (resolved === canonicalSource) resolved = activeProject.filePath;
+        else if (activeProject.overlayDir && isPathInside(activeProject.overlayDir, resolved)) {
+          resolved = path.join(activeProject.docDir, path.relative(activeProject.overlayDir, resolved));
+        }
+        return isPathInside(activeProject.docDir, resolved) ? resolved : null;
+      };
+      const refined = await refineSyncHitByWords({
+        page, x: px, y: py, id: body.id == null ? null : Number(body.id),
+        hit: { file, line: hit.line }, resolveFile,
+      }).catch(() => null);
+      const line = refined?.line ?? hit.line;
+      if (refined) file = refined.file;
       return json(res, {
         file,
-        line: hit.line,
-        column: hit.column,
-        lineText: activeSourceLine(file, hit.line),
+        line,
+        column: refined ? 1 : hit.column,
+        lineText: activeSourceLine(file, line),
         anchor,
         anchors,
+        ...(refined ? { refinedByText: true } : {}),
       });
     }
     if (req.method === 'POST' && url.pathname === '/synctex/forward') {

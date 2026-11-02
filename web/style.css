@@ -776,3 +776,19 @@ body.no-inspector #insp-reopen { display: none; }
     max-width: 100%;
   }
 }
+
+/* The host's Jump target (scrollToSync), matching TeX64's static viewer. */
+.tdom-sync-marker {
+  position: absolute;
+  z-index: 6;
+  background: rgba(255, 220, 60, 0.35);
+  border: 1.5px solid rgba(220, 180, 0, 0.6);
+  border-radius: 3px;
+  pointer-events: none;
+  animation: tdom-sync-marker-fade 2.4s ease-out forwards;
+}
+@keyframes tdom-sync-marker-fade {
+  0% { opacity: 1; background: rgba(255, 220, 60, 0.45); }
+  70% { opacity: 1; background: rgba(255, 220, 60, 0.35); }
+  100% { opacity: 0; background: rgba(255, 220, 60, 0); }
+}
