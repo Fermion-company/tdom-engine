@@ -1271,6 +1271,58 @@ test('display starvation: a stale display paper lets a compile finish instead of
   }
 });
 
+test('demanded paper: a viewer that keeps demanding while typing goes on gets canonical within the resident grace', opts, async () => {
+  const work = WORK + '-demand-cadence';
+  rmSync(work, { recursive: true, force: true });
+  // The resident exact pixels never arrive while edits keep coming (a page
+  // waiting on a stale chunk); the viewer demands every revision it gets.
+  const c = new CanonicalRenderer({ workDir: work, debounceMs: 0, displayDebounceMs: 50,
+    residentDisplayState: () => ({ pending: true }) });
+  try {
+    await c.ensure(DOC1, 1);
+    c.lastEndAt = Date.now() - 60_000;
+    const t0 = Date.now();
+    // A keystroke every 150 ms used to restart the 2 s grace (and the idle
+    // gate) each time, and renewed the shipping foreground lease the demanded
+    // compile yielded to, so no compile started until the hands stopped.
+    for (let rev = 2; !c.running && Date.now() - t0 < 4000; rev++) {
+      c.deferAuthority(900);
+      c.schedule(DOC1.replace('Page one', `Typed ${rev}`), rev);
+      assert.deepEqual(c.requestDisplay(rev, 0, { demandId: `viewer-${rev}` }), { accepted: true, duplicate: false });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    assert.ok(c.running, 'canonical started while the edits kept coming');
+    assert.ok(Date.now() - t0 < 3000, `within the grace of the first demand (${Date.now() - t0} ms)`);
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test('demanded paper: a revision the viewer lets pass undemanded returns canonical to the idle gate', async () => {
+  const work = WORK + '-demand-released';
+  rmSync(work, { recursive: true, force: true });
+  const c = new CanonicalRenderer({ workDir: work, debounceMs: 0, displayDebounceMs: 50,
+    residentDisplayState: () => ({ pending: true }) });
+  try {
+    c.last = { id: 1, rev: 1, ms: 50, inputEpoch: c.inputEpoch };
+    c.lastEndAt = Date.now() - 60_000;
+    c.schedule(DOC1.replace('Page one', 'Blocked'), 2);
+    c.requestDisplay(2, 0, { demandId: 'viewer-2' });
+    assert.notEqual(c.info().viewerWaitingMs, null, 'the demand starts the viewer wait');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    // The next revision's pages painted from resident ink: no demand follows.
+    c.schedule(DOC1.replace('Page one', 'Painted'), 3);
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    assert.equal(c.info().viewerWaitingMs, null, 'the wait ends without a renewed demand');
+    assert.equal(c.running, null, 'no compile started for the undemanded revision');
+    assert.ok(c.info().scheduledInMs > 10_000, 'it waits out the authority idle gate again');
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
 test('Build seeds let the first post-Build canonical reach its fixpoint in one pass', opts, async () => {
   const { docDir, overlayDir, canonDir } = identityFixture('-build-seeds');
   writeFileSync(path.join(docDir, 'main.tex'), MULTI_PASS_ROOT);

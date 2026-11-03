@@ -81,6 +81,9 @@ const BUILD_LEASE_DEFAULT_MS = 660_000;
 const BUILD_LEASE_MAX_MS = 900_000;
 const SYNCTEX_HELPER_PREPARE_MS = 15_000;
 const INDEX_TOOL_TIMEOUT_MS = 60_000;
+// How long a waiting viewer has to renew its display demand for the revision
+// that replaced the one it demanded (it does so as the update reaches it).
+const DEMAND_RENEW_MS = 500;
 const MUTABLE_COMPILE_ARTIFACT = /(?:^canon\.(?:fls|log|pdf|synctex\.gz)$|\.(?:aux|bcf|blg|idx|ind|ilg|glo|gls|glg|acn|acr|alg|lof|lot|nav|out|run\.xml|snm|toc|vrb)$)/;
 
 export class CanonicalRenderer {
@@ -124,6 +127,11 @@ export class CanonicalRenderer {
     this.displayMaxWaitMs = displayMaxWaitMs;
     // First edit not yet on canonical paper (null once a generation lands).
     this.displayStaleSince = null;
+    // When a viewer first demanded paper it still has not got. Carried across
+    // edits while each replaced revision was demanded too, so continuous
+    // typing cannot restart the viewer's wait (null once a generation lands,
+    // the viewer paints resident ink, or a revision goes undemanded).
+    this.viewerWaitSince = null;
     this.residentDisplayState = residentDisplayState;
     this.timer = null;
     this.timerDueAt = 0;
@@ -379,6 +387,7 @@ export class CanonicalRenderer {
     this.pendingJob = null;
     this.lastError = null;
     this.displayStaleSince = null;
+    this.viewerWaitSince = null;
     if (job) this.#clearDisplayDemand(job);
     try {
       this.onResult?.(this.info());
@@ -585,6 +594,9 @@ export class CanonicalRenderer {
     if (promote) {
       this.last = generation;
       this.displayStaleSince = null;
+      // The paper just moved. A viewer still demanding the newer pending
+      // revision waits for that one from now.
+      this.viewerWaitSince = this.#hasDisplayDemand(this.pendingJob) ? Date.now() : null;
     }
     while (this.generations.size > GENERATION_MAX) {
       const oldestId = this.generations.keys().next().value;
@@ -599,6 +611,7 @@ export class CanonicalRenderer {
     this.generations.clear();
     this.last = null;
     this.displayStaleSince = null;
+    this.viewerWaitSince = null;
     this.svgCache.clear();
     this.svgInFlight.clear();
     this.textCache.clear();
@@ -1104,6 +1117,7 @@ export class CanonicalRenderer {
       fallbackReason: this.pendingJob?.fallbackReason ?? this.runningJob?.fallbackReason ?? null,
       scheduledInMs: this.timer ? Math.max(0, this.timerDueAt - Date.now()) : null,
       displayDemandRev: this.displayDemand?.rev ?? null,
+      viewerWaitingMs: this.viewerWaitSince === null ? null : Date.now() - this.viewerWaitSince,
       error: this.lastError?.message ?? null,
       errorRev: this.lastError?.rev ?? 0,
       syncWarnings: this.last?.syncWarnings ?? [],
@@ -1155,6 +1169,9 @@ export class CanonicalRenderer {
       this.#armPending(this.delayFor(waiting), { keepEarlier: true });
       return;
     }
+    // A viewer that demanded the revision this edit replaces is still waiting
+    // for paper; one that let that revision pass undemanded painted it itself.
+    if (waiting && !this.#hasDisplayDemand(waiting)) this.viewerWaitSince = null;
     this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now(), fallbackReason };
     this.displayStaleSince ??= Date.now();
     if (this.coldBaselineCatchup && !this.#hasColdBaselineCatchup(this.pendingJob)) {
@@ -1166,14 +1183,20 @@ export class CanonicalRenderer {
     // typing faster than displayDebounceMs never let a compile start, so the
     // paper only moved once the hands stopped. Keep the earliest due time;
     // the newest pending source is what the timer compiles when it fires.
-    const displayCadence = this.pressure !== 'authority' || Boolean(fallbackReason);
+    // A viewer waiting on demanded paper is the same case in authority mode:
+    // each keystroke reset the idle gate before its demand came back, so a
+    // page that needed canonical never got it while typing went on.
+    const displayCadence = this.pressure !== 'authority' || Boolean(fallbackReason) ||
+      this.viewerWaitSince !== null;
     this.#armPending(this.delayFor(), { keepEarlier: displayCadence });
   }
 
   /** The display paper has waited past displayMaxWaitMs for canonical. */
   #displayStarved() {
-    if (this.pressure === 'authority' && !this.displayDemand) return false;
-    return this.displayStaleSince !== null && Date.now() - this.displayStaleSince >= this.displayMaxWaitMs;
+    // In authority mode only a waiting viewer makes the paper due, and its
+    // wait, not the first edit, is what has gone on too long.
+    const since = this.pressure === 'authority' ? this.viewerWaitSince : this.displayStaleSince;
+    return since !== null && Date.now() - since >= this.displayMaxWaitMs;
   }
 
   /** Promote existing work while one or more viewers cannot present this revision. */
@@ -1218,6 +1241,7 @@ export class CanonicalRenderer {
     this.activeDisplayDemandIds.add(demandId);
     if (residentImpossible) this.residentImpossibleDemandIds.add(demandId);
     this.displayDemand = { rev, inputEpoch: job.inputEpoch };
+    this.viewerWaitSince ??= Date.now();
     this.#armPending(this.delayFor(job), { keepEarlier: true });
     return { accepted: true, duplicate: false };
   }
@@ -1235,6 +1259,7 @@ export class CanonicalRenderer {
     this.residentImpossibleDemandIds.delete(demandId);
     if (this.activeDisplayDemandIds.size) return { released: true, pendingViewers: this.activeDisplayDemandIds.size };
     this.displayDemand = null;
+    this.viewerWaitSince = null;
     // Preserve the last edit's idle deadline. Never cancel a running compile
     // or create another job; a prior revision may be running independently.
     if (this.pressure === 'authority') this.#armPending(this.delayFor(job, { preserveIdleStart: true }));
@@ -1389,9 +1414,28 @@ export class CanonicalRenderer {
     if (!this.pendingJob) return;
     if (this.buildLease) return;
     const job = this.pendingJob;
+    // Every keystroke renews the shipping foreground lease, so while typing
+    // goes on it never ends. Once the viewer has waited past
+    // displayMaxWaitMs the replay has had its chance and the paper is still
+    // missing: the demanded compile stops yielding to it.
     if (this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
-        Date.now() < this.authorityPausedUntil) {
+        Date.now() < this.authorityPausedUntil && !this.#displayStarved()) {
       this.#armPending(this.authorityPausedUntil - Date.now());
+      return;
+    }
+    if (waitForResident && !job.fallbackReason && this.pressure === 'authority' && !this.#hasDisplayDemand(job) &&
+        this.viewerWaitSince !== null) {
+      // The timer was kept for a viewer that demanded the revision this one
+      // replaced. It renews the demand as soon as this revision's pages reach
+      // it; without a renewal it painted them itself, and the job is ordinary
+      // authority work again.
+      const renew = job.scheduledAt + DEMAND_RENEW_MS - Date.now();
+      if (renew > 0) {
+        this.#armPending(Math.min(25, renew));
+        return;
+      }
+      this.viewerWaitSince = null;
+      this.#armPending(this.delayFor(job, { preserveIdleStart: true }));
       return;
     }
     if (waitForResident && !job.fallbackReason && this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
@@ -1400,7 +1444,9 @@ export class CanonicalRenderer {
       // Give only this foreground cohort a bounded chance to supply exact
       // pixels, then allow its viewer's fulfillment to arrive. Cold queues,
       // isolated fallback, export/settle and canonical-only work never wait.
-      const remaining = job.scheduledAt + 2000 - Date.now();
+      // The bound runs from when the viewer began waiting: measured from each
+      // newest edit, typing faster than it renewed the chance forever.
+      const remaining = Math.min(job.scheduledAt, this.viewerWaitSince ?? Infinity) + 2000 - Date.now();
       const ack = Number.isFinite(state?.settledAt) ? state.settledAt + 500 - Date.now() : 0;
       const wait = state?.pending ? Math.min(25, remaining) : Math.min(ack, remaining);
       if (wait > 0) {
