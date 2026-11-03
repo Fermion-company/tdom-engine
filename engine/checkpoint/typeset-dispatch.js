@@ -1,5 +1,9 @@
 import { performance } from 'node:perf_hooks';
 import { fnv1a } from '../hash.js';
+import { stripComments } from './safety.js';
+
+// The floats the resident driver captures (tex-templates.js, figure and table).
+const FLOAT_ENV_RE = /\\begin\s*\{(?:figure|table)\}/;
 
 /**
  * Rescue-aware typeset: the in-chain fork path for normal blocks, the
@@ -109,7 +113,14 @@ export async function typesetBlock(engine, idx, callbacks) {
     TRACE?.('rescue(context)', T0);
     return g;
   }
-  if (engine.poisoned.get(block.id) === sig) {
+  // The isolated rescue places figure and table floats through the real
+  // output routine of its own run, so its galley has none: a figure that
+  // failed in-chain once (a timeout on a busy machine) vanished from the
+  // resident pages for the rest of the session and everything after it
+  // moved up. Such a block tries the chain again and, failing, keeps its
+  // last good galley.
+  const holdsFloats = FLOAT_ENV_RE.test(stripComments(block.text));
+  if (engine.poisoned.get(block.id) === sig && !holdsFloats) {
     return rescueSafely('previous in-chain failure');
   }
   // Established deep-lineage wall: don't even attempt the doomed in-chain
@@ -117,8 +128,10 @@ export async function typesetBlock(engine, idx, callbacks) {
   // still tries, so the chain recovers automatically if the wall lifts.
   if ((engine.chainTimeouts ?? 0) >= 3 && !block.galley && idx % 25 !== 0) {
     engine.poisoned.set(block.id, sig);
-    engine.rescueQueue.set(block.id, rescueCacheKey(block, idx));
-    pumpRescues();
+    if (!holdsFloats) {
+      engine.rescueQueue.set(block.id, rescueCacheKey(block, idx));
+      pumpRescues();
+    }
     return brokenBlockGalley(idx);
   }
   try {
@@ -154,6 +167,12 @@ export async function typesetBlock(engine, idx, callbacks) {
     engine.poisoned.set(block.id, sig);
     const isTimeout = isTimeoutErr(err) || /timeout/.test(err.message);
     engine.chainTimeouts = isTimeout ? (engine.chainTimeouts ?? 0) + 1 : 0;
+    if (holdsFloats) {
+      engine.diagnostics.push(
+        `${block.id}: in-chain typeset failed (${err.message}) — holding its last good output (the isolated rescue has no floats)`
+      );
+      return brokenBlockGalley(idx);
+    }
     engine.diagnostics.push(
       `${block.id}: in-chain typeset failed (${err.message}) — isolated exact-render rescue`
     );

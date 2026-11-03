@@ -12,6 +12,7 @@ import { promisify } from 'node:util';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 import { includeHoldsText, includeReadCurrent, inputReadCurrent } from '../engine/checkpoint/include-cache.js';
 import { watchInclude } from '../engine/checkpoint/include-expander.js';
+import { fnv1a } from '../engine/hash.js';
 
 const DEMO = readFileSync(fileURLToPath(new URL('../samples/demo-lua.tex', import.meta.url)), 'utf8');
 const WORK = fileURLToPath(new URL('../.tdom-v3-test', import.meta.url));
@@ -241,6 +242,46 @@ test('figure floats are placed by the live output routine with real captions', o
   assert.equal(dom.labels['fig:plot'], '1', 'real figure counter');
   const floated = eng.pages.some((p) => p.topFloats.length + p.botFloats.length > 0);
   assert.ok(floated, 'float placed in a top/bottom area');
+});
+
+test('a figure that failed in-chain keeps its float instead of a rescue that drops it', opts, async () => {
+  const work = WORK + '-float-poison';
+  rmSync(work, { recursive: true, force: true });
+  const e = new CheckpointEngine({ workDir: work });
+  try {
+    await e.open([
+      '\\documentclass{article}',
+      '\\begin{document}',
+      'Text before the figure.',
+      '',
+      '\\begin{figure}[htbp]',
+      '  \\centering',
+      '  \\rule{4cm}{2cm}',
+      '  \\caption{A plot}\\label{fig:plot}',
+      '\\end{figure}',
+      '',
+      'Figure~\\ref{fig:plot} follows.',
+      '\\end{document}',
+      '',
+    ].join('\n'));
+    const figure = () => e.blocks.find((b) => /\\begin\{figure\}/.test(b.text));
+    const placed = () => e.getDOM().blocks.find((b) => b.id === figure().id).pages;
+    assert.equal(figure().galley.floats.length, 1, 'the figure is a captured float');
+    assert.deepEqual(placed(), [1]);
+    // Its in-chain job failed before for the text it is about to have (a
+    // timeout on a busy machine), so its next typeset is not the plain chain.
+    const src = e.getSource();
+    const at = src.indexOf('A plot') + 'A plot'.length;
+    const block = figure();
+    e.poisoned.set(block.id, fnv1a(src.slice(block.start, at) + 's' + src.slice(at, block.end)));
+    await e.edit(at, at, 's');
+    assert.ok(!figure().rescued, 'not replaced by the isolated rescue');
+    assert.equal(figure().galley.floats.length, 1, 'the float is still there');
+    assert.deepEqual(placed(), [1], 'and still on its page');
+  } finally {
+    await e.close();
+    rmSync(work, { recursive: true, force: true });
+  }
 });
 
 test('the table of contents typesets live with page numbers', opts, () => {
