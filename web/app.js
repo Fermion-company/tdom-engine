@@ -6835,10 +6835,15 @@ pagesEl.addEventListener('scroll', () => {
           const exact = nodes.filter((node) => Number(node.dataset.line) === targetLine);
           const ink = exact.filter((node) =>
             !node.classList.contains('tdom-source-hit') &&
-            !node.classList.contains('tdom-edit-hit')
+            !node.classList.contains('tdom-edit-hit') &&
+            !node.classList.contains('chunkwin')
           );
           // Rescue/source-hit rectangles can cover a whole tcolorbox. They
           // are useful for click mapping but too broad for a precise jump.
+          // So is an exact-render chunk: its window is the whole block as a
+          // strip up to three pages wide, and every line of a box drawn
+          // only as a chunk was marked with that strip. Such a line keeps
+          // the Build's SyncTeX box.
           if (!ink.length) continue;
           const rects = ink.map((node) => node.getBoundingClientRect());
           const top = Math.min(...rects.map((rect) => rect.top));
