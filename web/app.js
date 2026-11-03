@@ -6792,7 +6792,11 @@ pagesEl.addEventListener('scroll', () => {
       if (!entry) return;
       scrollPageToViewport(entry[1]);
     };
+    // A newer Jump or the reader's own move makes a pending refinement stale:
+    // it must neither scroll back nor bring the marker back.
+    let syncRefineGeneration = 0;
     const refineSyncToSource = async (data, wantsMarker = false) => {
+      const generation = syncRefineGeneration;
       const file = String(data.sourceFile ?? '');
       const line = Number(data.sourceLine);
       if (!file || !Number.isFinite(line)) return false;
@@ -6804,6 +6808,7 @@ pagesEl.addEventListener('scroll', () => {
       } catch {
         return false;
       }
+      if (generation !== syncRefineGeneration) return false;
       const blocks = (dom?.blocks ?? []).filter((block) =>
         block?.id && sameSourceFile(block.source?.file, file) &&
         Number(block.source?.start?.line) <= line && Number(block.source?.end?.line) >= line
@@ -6888,6 +6893,7 @@ pagesEl.addEventListener('scroll', () => {
       syncMarkerTimer = setTimeout(clearSyncMarker, 2600);
     };
     dismissSyncMarker = () => {
+      syncRefineGeneration += 1;
       if (syncMarkerTimer !== null) clearSyncMarker();
     };
     for (const type of ['wheel', 'pointerdown', 'touchstart']) {
@@ -6931,6 +6937,7 @@ pagesEl.addEventListener('scroll', () => {
       embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
       const wantsMarker = data.marker !== false;
       if (wantsMarker) placeSyncMarker(page, syncBlockBox(page, data));
+      syncRefineGeneration += 1;
       void refineSyncToSource(data, wantsMarker);
       requestAnimationFrame(scheduleEmbedSnapshot);
     };
