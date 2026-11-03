@@ -780,6 +780,7 @@ body.no-inspector #insp-reopen { display: none; }
 /* The host's Jump target (scrollToSync), matching TeX64's static viewer. */
 .tdom-sync-marker {
   position: absolute;
+  box-sizing: border-box;
   z-index: 6;
   background: rgba(255, 220, 60, 0.35);
   border: 1.5px solid rgba(220, 180, 0, 0.6);

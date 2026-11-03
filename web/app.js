@@ -6544,7 +6544,11 @@ function findZoomAnchorPage(clientX, clientY) {
   }, null)?.page ?? null;
 }
 
+// The Jump marker ends with any operation of the reader's own; setZoom is
+// shared by the toolbar, pinch and Cmd+wheel.
+let dismissSyncMarker = () => {};
 function setZoom(z, origin = null) {
+  dismissSyncMarker();
   const anchorPage = origin && Number.isFinite(origin.x) && Number.isFinite(origin.y)
     ? findZoomAnchorPage(origin.x, origin.y)
     : null;
@@ -6849,8 +6853,8 @@ pagesEl.addEventListener('scroll', () => {
             const inkTop = Math.min(...placed.map((rect) => rect.top));
             const inkBottom = Math.max(...placed.map((rect) => rect.bottom));
             placeSyncMarker(page, {
-              left: left - pageRect.left - 2, top: inkTop - pageRect.top - 2,
-              width: right - left + 4, height: inkBottom - inkTop + 4,
+              left: left - pageRect.left - 2, top: inkTop - pageRect.top - 1,
+              width: right - left + 4, height: inkBottom - inkTop + 2,
             });
           }
           scheduleEmbedSnapshot();
@@ -6867,26 +6871,48 @@ pagesEl.addEventListener('scroll', () => {
       syncMarkerTimer = null;
       for (const node of document.querySelectorAll('.tdom-sync-marker')) node.remove();
     };
-    const placeSyncMarker = (page, box) => {
+    const placeSyncMarker = (page, boxOrBoxes) => {
       clearSyncMarker();
-      if (!page?.isConnected || !box || !(box.width > 0) || !(box.height > 0)) return;
-      const marker = document.createElement('div');
-      marker.className = 'tdom-sync-marker';
-      marker.style.left = `${box.left}px`;
-      marker.style.top = `${box.top}px`;
-      marker.style.width = `${box.width}px`;
-      marker.style.height = `${box.height}px`;
-      page.appendChild(marker);
+      const boxes = (Array.isArray(boxOrBoxes) ? boxOrBoxes : [boxOrBoxes])
+        .filter((box) => box && box.width > 0 && box.height > 0);
+      if (!page?.isConnected || !boxes.length) return;
+      for (const box of boxes) {
+        const marker = document.createElement('div');
+        marker.className = 'tdom-sync-marker';
+        marker.style.left = `${box.left}px`;
+        marker.style.top = `${box.top}px`;
+        marker.style.width = `${box.width}px`;
+        marker.style.height = `${box.height}px`;
+        page.appendChild(marker);
+      }
       syncMarkerTimer = setTimeout(clearSyncMarker, 2600);
     };
+    dismissSyncMarker = () => {
+      if (syncMarkerTimer !== null) clearSyncMarker();
+    };
+    for (const type of ['wheel', 'pointerdown', 'touchstart']) {
+      pagesEl.addEventListener(type, () => dismissSyncMarker(), { passive: true, capture: true });
+    }
+    document.addEventListener('keydown', () => dismissSyncMarker(), true);
+    window.addEventListener('resize', () => dismissSyncMarker());
     // SyncTeX's block (paper points from the top) on this page, in page pixels.
     const syncBlockBox = (page, data) => {
       const paper = activePaperGeometry(page);
       const scale = page.clientWidth / Math.max(1, Number(paper.width));
+      // Several rectangles (one per run of typeset lines) when the host sent them.
+      const blocks = Array.isArray(data.blocks)
+        ? data.blocks.filter((block) => block && ['x', 'y', 'width', 'height'].every((key) => Number.isFinite(Number(block[key]))))
+        : [];
+      if (blocks.length > 1) {
+        return blocks.slice(0, 32).map((block) => ({
+          left: Number(block.x) * scale - 2, top: Number(block.y) * scale - 1,
+          width: Number(block.width) * scale + 4, height: Number(block.height) * scale + 2,
+        }));
+      }
       const blockX = Number(data.blockX), blockY = Number(data.blockY);
       const blockWidth = Number(data.blockWidth), blockHeight = Number(data.blockHeight);
       if ([blockX, blockY, blockWidth, blockHeight].every(Number.isFinite) && blockWidth > 0 && blockHeight > 0) {
-        return { left: blockX * scale - 2, top: blockY * scale - 2, width: blockWidth * scale + 4, height: blockHeight * scale + 4 };
+        return { left: blockX * scale - 2, top: blockY * scale - 1, width: blockWidth * scale + 4, height: blockHeight * scale + 2 };
       }
       const x = Number(data.x), y = Number(data.y);
       if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
