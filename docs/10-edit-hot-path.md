@@ -89,13 +89,14 @@ pixels を保持する。source acceptance と新しい文字の即時描画は�
 
 ## 10.3 diff と checkpoint rekey
 
-body は `segmentBody()` と `#expandIncludes()` で block 列になる。`diffBlocks()` は旧 block 列と新 block 列の hash を比較し、dirty block、removed block、共通 prefix/suffix を返す。
+body は `segmentBody()` と `#expandIncludes()` で block 列になる。`diffBlocks()` は旧 block 列と新 block 列の hash を比較し、dirty block、removed block、共通 prefix/suffix と、編集 window 内の未変更 block の対応を返す。
 
 現在の checkpoint 処理は次である。
 
 - prefix 内の checkpoint はそのまま残す。
-- suffix 内の checkpoint は index delta だけ移動し、`vstale` として残す。
-- 編集 window 内の checkpoint は `DIE` で捨てる。
+- suffix と、離れた編集領域の間の未変更 block の入口は `boundaryMap` の新 index へ移動し、`vstale` として残す。
+- 置換領域の入口も残す。直前の未変更 block の出口なので、次の block の本文が変わっても入口まで捨てる必要はない。削除だけの領域には入口を追加せず、後続 block の対応と衝突させない。
+- 対応のない編集領域内部の checkpoint は `DIE` で捨てる。
 - `pendingChain`、`renderHold`、`editHold` も同じ index 移動に追従する。
 
 つまり、現行実装は「編集位置以降を常に全破棄」ではない。suffix を残せる場合は残し、信用できないと分かった時点で async rebuild に回す。
@@ -117,6 +118,14 @@ foreground は nearest checkpoint から始まる。各 block について `#typ
 | `walked` | 文書末尾まで必要な foreground walk をした |
 
 現在の budget は、layout-coupled galley divergence が 8、local state ripple が 4 である。budget を超えた伝播は hot path で文書末尾まで追わず、`pendingChain` に入る。
+
+複数領域の編集では、途中の clean block の galley と exit state が一致し、定義変更・label 移動がなければ、次に必要な block の手前の保存済み checkpoint へ飛ぶ。実際に exact chunk が欠け、保持済み入口からの RENDER でも用意できない block だけが、このスキップを止める。編集ページ上にあるという理由だけで、描画済みの数式や graphics を再組版しない。state が変わった区間は引き続き順番に歩く。
+
+### 複数編集領域の計測
+
+複数領域の変更も文書順に処理する。キャレット warming は保存地点と exact pixel の準備に使い、編集領域の順番は変えない。未変更区間を飛ばす上記の条件は、warming の有無によらず同じである。
+
+`tools/bench-multi-locus.mjs /tmp/long12.tex --caret=0.5` はキャレット位置を事前に warm し、`--caret=none` は warm せず計測する。`wallMs` は編集応答、`caretPublishMs` と `lastPublishMs` はキャレット領域と全編集領域の新しい block が実際の patch に出るまでの時間である。本文未処理・cold preview・frozen・旧 chunk の block は数えない。block が公開されても、ページ上の別 block に exact pixel が欠ければ viewer はページを差し替えられないため、`caretPagePublishMs` / `lastPagePublishMs` と `pageUnpublishedAtNextEdit` を別に報告する。ページ側は viewer と同じく `pending-exact`・canonical-only・math glyph・未準備／旧 chunk を拒否し、canonical display demand と同じ source revision の成功した canonical event も観測する。両指標に公開経路の件数を付け、ブラウザの画像取得・raster・paint 時間は含めない。各標本は全編集 block の公開または timeout を待ち、次の編集は `edit()` 完了から最低120ms後に送る。timeout 件数と最後の drain までを含む `totalNativeJobs` も報告する。
 
 ## 10.4a cold prefix の時間予算
 
@@ -174,7 +183,7 @@ body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironm
 
 ## 10.6 deferred chain
 
-`#queueChainWork(kind, from, labels, queuedAt)` は `settle` または `rebuild` を `pendingChain` に登録する。
+`#queueChainWork(kind, from, labels, queuedAt, through = from)` は `settle` または `rebuild` を `pendingChain` に登録する。
 
 | kind | 内容 |
 | --- | --- |
@@ -183,7 +192,7 @@ body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironm
 
 `#scheduleBackground()` は、編集後 300ms の idle gate、または最初の登録から `TDOM_CHAIN_MAX_STALE`（既定2000ms）の期限を待って `#runChainPass()` を lock 内で走らせる。登録時刻 `queuedAt` は仕事の合流・中断・cold carry の再登録でも引き継ぐ。期限を過ぎた仕事は打鍵間の空き時間で再開し、新しい打鍵による preemption と lock の優先順位は維持する。期限は開始の待機上限で、伝播全体の完了時間ではない。最低優先の grid 充填には期限を適用しない。次の編集が来ると `bgAbort` で止まり、進捗位置から後で再開する。最後の round の後に仕事が残り、pass が前に進んでいれば（grid は境界を実体化した数で見る）、同じ gate の後ろで次の task を走らせる（無操作のまま 8 回まで）。進んでいない grid の計画は捨て、次の予約で `gridMissing` から立て直す（以前は残った仕事を次の編集まで誰も走らせず、chain を待つ呼び出しが止まった）。
 
-settle は `from`（入口 state が古い最初の block）より前の block では収束を判定しない。`from` の境界が退役していると pass はその手前の checkpoint から再生するが、そこで galley と exit state が一致しても、foreground が更新済みの block を再現しただけで、動いた state が収まった証拠にはならない（cold resume が何度か走ると、その pin が `editHold` から押し出されて起きる）。
+settle は再開位置 `from` に加え、合流した伝播の最も後ろの未検証位置 `through` を保持する。新しい仕事との合流では `from` の最小値と `through` の最大値を残し、両方を編集による index 変更と cold carry に引き継ぐ。収束は両位置を通過してから判定する。早い位置で再現できた clean block だけでは、離れた後続の伝播が完了した証拠にならない。`from` の境界が退役していると pass はその手前の checkpoint から再生するが、そこで galley と exit state が一致しても、foreground が更新済みの block を再現しただけで、動いた state が収まった証拠にはならない（cold resume が何度か走ると、その pin が `editHold` から押し出されて起きる）。
 
 ## 10.7 references と toc
 

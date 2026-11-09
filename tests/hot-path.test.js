@@ -34,7 +34,9 @@ import { ShippingChain } from '../engine/checkpoint/shipping.js';
 import { makeShippingChain, shippingInputState } from '../engine/checkpoint/shipping-manager.js';
 import { renderIsolatedBlock } from '../engine/checkpoint/isolated-render.js';
 import { isoCompile } from '../engine/checkpoint/iso-compile.js';
-import { segmentBody } from '../engine/segmenter.js';
+import { segmentBody, diffBlocks } from '../engine/segmenter.js';
+import { preserveCheckpointSuffix } from '../engine/checkpoint/checkpoint-preservation.js';
+import { runUpdateTypesetPhase } from '../engine/checkpoint/update-typeset-phase.js';
 import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finalize.js';
 import { classifyResidentEdit } from '../engine/checkpoint/resident-edit-admission.js';
 import { plainPreviewWitness, canDeferPlainVerification } from '../engine/checkpoint/plain-preview.js';
@@ -79,6 +81,133 @@ const available = await promisify(execFile)('lualatex', ['--version'], { timeout
 const opts = available ? {} : { skip: 'lualatex not installed' };
 
 const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+function multiLocusFixture(indices = [2, 9, 16]) {
+  const oldBlocks = Array.from({ length: 20 }, (_, index) => ({
+    id: `b${index}`, text: `Paragraph ${index} with $x+1$ inline.`, hash: `h${index}`,
+    start: index * 100, end: index * 100 + 99,
+    galley: { closure: 'native', items: [], labels: [] },
+    galleyHash: `g${index}`, stateVec: '[0,0,0,0]', closure: { native: true },
+  }));
+  const segs = oldBlocks.map((block, index) => ({ ...block,
+    text: block.text + (indices.includes(index) ? 'x' : ''),
+    hash: block.hash + (indices.includes(index) ? 'x' : ''),
+  }));
+  const diff = diffBlocks(oldBlocks, segs, () => { throw new Error('unexpected new block'); });
+  const checkpoints = new Map(oldBlocks.map((_, index) => [index, { send() {} }]));
+  const preserved = preserveCheckpointSuffix({ checkpoints, renderHold: new Map(), editHold: indices,
+    bounds: diff.bounds });
+  const engine = { blocks: diff.blocks, ...preserved, pages: [], previewPolicy: 'structured',
+    coldDirty: new Set(), pendingChain: null, warmFocus: { id: 'b9' },
+    chunks: new Map(), maxCheckpoints: 8, labelTable: new Map(), hrefTable: new Map(),
+    labelCount: new Map(), vanishedLabels: new Set(), refIndex: new Map(), tocHash: 'toc',
+    foregroundRenderIds: new Set(diff.dirty), diagnostics: [] };
+  const visited = [];
+  const callbacks = {
+    nearestCheckpoint: (index) => Math.max(...[...engine.checkpoints.keys()].filter(key => key <= index)),
+    typesetBlock: async (index) => {
+      visited.push(index);
+      engine.checkpoints.set(index + 1, { send() {} });
+      return { ...engine.blocks[index].galley, hash: `g${index}${indices.includes(index) ? 'x' : ''}`,
+        stateVec: '[0,0,0,0]' };
+    },
+    adoptGalley: (block, galley) => {
+      block.galley = galley;
+      block.galleyHash = galley.hash;
+      block.stateVec = galley.stateVec;
+      engine.coldDirty.delete(block.id);
+    },
+    queueChainWork: () => { throw new Error('unexpected propagation'); },
+    retypesetChain: () => { throw new Error('unexpected dependency'); },
+    paginateNow: () => [], computeToc: () => ({ hash: 'toc' }), queueMovedOffsets() {},
+  };
+  const options = { oldBlocks, diff, dirtySource: diff.dirty, firstDirty: indices[0],
+    timer: { lap() {} }, defRe: /\\def\b/, callbacks };
+  return { engine, options, visited };
+}
+
+test('multi-locus: every changed region retains its input checkpoint', () => {
+  const { engine } = multiLocusFixture();
+  for (const index of [2, 9, 16]) {
+    assert.ok(engine.checkpoints.has(index), `input ${index} survived`);
+    assert.equal(!!engine.checkpoints.get(index).vstale, index !== 2);
+  }
+});
+
+test('multi-locus: fresh exact neighbors do not force replay between converged regions', async () => {
+  const { engine, options, visited } = multiLocusFixture();
+  for (const index of [5, 12]) {
+    Object.assign(engine.blocks[index], { needsRender: true, fidelity: { blockExact: true } });
+    engine.foregroundRenderIds.add(`b${index}`);
+    engine.chunks.set(`b${index}`, { forGalley: `g${index}` });
+  }
+  await runUpdateTypesetPhase(engine, options);
+  assert.deepEqual(visited, [2, 3, 9, 10, 16, 17]);
+  assert.equal(engine._typesetResult.verdict, 'clean');
+});
+
+test('multi-locus: missing exact neighbors still require replay unless their input is held', async () => {
+  for (const held of [false, true]) {
+    const { engine, options, visited } = multiLocusFixture();
+    Object.assign(engine.blocks[5], { needsRender: true, fidelity: { blockExact: true } });
+    engine.foregroundRenderIds.add('b5');
+    if (held) engine.editHold.push(5);
+    await runUpdateTypesetPhase(engine, options);
+    assert.equal(visited.includes(5), !held);
+  }
+});
+
+test('multi-locus: a real state ripple must cross clean blocks before skipping', async () => {
+  const { engine, options, visited } = multiLocusFixture();
+  const typeset = options.callbacks.typesetBlock;
+  options.callbacks.typesetBlock = async (index) => ({ ...await typeset(index),
+    stateVec: index >= 2 && index < 8 ? '[1,0,0,0]' : '[0,0,0,0]' });
+  await runUpdateTypesetPhase(engine, options);
+  assert.deepEqual(visited, [2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17]);
+});
+
+test('multi-locus native edits drain to a fresh engine after an intervening keystroke', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-multi-locus-'));
+  const paragraphs = Array.from({ length: 24 }, (_, index) =>
+    `Locus${index} ordinary prose with $x+1$ inline. ` + 'A sentence to fill the line. '.repeat(8) +
+    (index === 7 || index === 15 ? '\n\n\\newpage' : ''));
+  const source = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}'].join('\n\n');
+  const engine = new CheckpointEngine({ workDir: path.join(root, 'edited') });
+  let finalSource, signature;
+  try {
+    await engine.open(source);
+    await drain(engine);
+    await engine.warmEditOffset(source.indexOf('Locus18'));
+    const ids = [2, 10, 18].map(index => engine.blocks.find(block => block.text.includes(`Locus${index} `)).id);
+    const oldHashes = ids.map(id => engine.blocks.find(block => block.id === id).galleyHash);
+    const edited = source.replace('Locus2 ', 'Locus2X ').replace('Locus10 ', 'Locus10X ').replace('Locus18 ', 'Locus18X ');
+    const report = await engine.edit(0, source.length, edited);
+    assert.equal(report.stats.multiLocus, undefined);
+    for (let index = 0; index < ids.length; index++) {
+      assert.notEqual(engine.blocks.find(block => block.id === ids[index]).galleyHash, oldHashes[index]);
+    }
+    const at = engine.getSource().indexOf('Locus18X') + 'Locus18X'.length;
+    const next = await engine.edit(at, at, 'Y');
+    await drain(engine);
+    assert.equal(engine.srcRev, next.srcRev, 'deferred work creates no source generation');
+    assert.equal(engine.coldDirty.size, 0);
+    finalSource = engine.getSource();
+    signature = engine.blocks.map(block => [block.galleyHash, block.stateVec]);
+  } finally {
+    await engine.close();
+    if (finalSource === undefined) rmSync(root, { recursive: true, force: true });
+  }
+  // One resident engine at a time on the shared 16GB development machine.
+  const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh') });
+  try {
+    await fresh.open(finalSource);
+    await drain(fresh);
+    assert.deepEqual(signature, fresh.blocks.map(block => [block.galleyHash, block.stateVec]));
+  } finally {
+    await fresh.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('propagation deadline survives repeated edits and resumes without another idle gate', async (t) => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });

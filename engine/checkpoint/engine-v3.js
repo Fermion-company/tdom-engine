@@ -2100,7 +2100,7 @@ export class CheckpointEngine {
     // the settle/rebuild it carried, which the document still owes.
     if (coldResume && !dirtySource.size) {
       if (chainCarry?.kind) {
-        this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels, chainCarry.queuedAt);
+        this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels, chainCarry.queuedAt, chainCarry.through);
         this.#kickPendingChain();
       }
       return null;
@@ -2215,7 +2215,7 @@ export class CheckpointEngine {
     this.bootRescueBudgetMs = 0;
     // The settle/rebuild a cold walk carried through its resume is queued
     // again behind this update's own verdict (docs/10 §10.6 merging).
-    if (chainCarry?.kind) this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels, chainCarry.queuedAt);
+    if (chainCarry?.kind) this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels, chainCarry.queuedAt, chainCarry.through);
     return finalizeUpdate(this, {
       text,
       editLabel,
@@ -2652,9 +2652,10 @@ export class CheckpointEngine {
    * the moving exit state converges (trusting the same verification the
    * foreground uses); 'rebuild' distrusts the suffix entirely (definition
    * edits, untracked-state leaks) and never converges early. rebuild
-   * subsumes settle; overlapping requests keep the earliest start.
+   * subsumes settle; merged requests keep every unfinished frontier.
    */
-  #queueChainWork(kind, from, labels, queuedAt = Date.now()) {
+  #queueChainWork(kind, from, labels, queuedAt = Date.now(), through = from) {
+    through = Math.max(from, through);
     let cur = this.pendingChain;
     // Grid materialization is the lowest priority: any other chain work
     // replaces it (the scheduler re-queues it once the queue drains).
@@ -2679,12 +2680,12 @@ export class CheckpointEngine {
         phase: 'blocks',
         labels: new Set(),
         coldIds: new Set(this.coldDirty),
-        carry: cur ? { kind: cur.kind, from: cur.from, labels: new Set(cur.labels), queuedAt: cur.queuedAt } : null,
+        carry: cur ? { kind: cur.kind, from: cur.from, through: cur.through ?? cur.from, labels: new Set(cur.labels), queuedAt: cur.queuedAt } : null,
       };
       return;
     }
     if (!cur) {
-      this.pendingChain = { kind, from, phase: 'blocks', labels: new Set(labels), queuedAt };
+      this.pendingChain = { kind, from, through, phase: 'blocks', labels: new Set(labels), queuedAt };
       return;
     }
     if (cur.kind === 'cold') {
@@ -2693,14 +2694,18 @@ export class CheckpointEngine {
         ? {
             kind: carry.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle',
             from: Math.min(carry.from, from),
+            through: Math.max(carry.from, carry.through ?? carry.from, through),
             labels: new Set([...carry.labels, ...(labels ?? [])]),
             queuedAt: Math.min(carry.queuedAt ?? queuedAt, queuedAt),
           }
-        : { kind, from, labels: new Set(labels), queuedAt };
+        : { kind, from, through, labels: new Set(labels), queuedAt };
       return;
     }
     cur.kind = cur.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle';
     delete cur.plainBlockId;
+    // A clean island before another pending frontier cannot prove that
+    // later propagation finished. Keep both ends when merging requests.
+    cur.through = Math.max(cur.from, cur.through ?? cur.from, through);
     cur.from = Math.min(cur.from, from);
     cur.phase = 'blocks';
     for (const k of labels ?? []) cur.labels.add(k);

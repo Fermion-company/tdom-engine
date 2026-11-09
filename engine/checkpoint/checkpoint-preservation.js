@@ -39,9 +39,13 @@ export function preserveCheckpointSuffix({
     .filter((idx) => idx >= 0);
   const rekey = (f) => move(f)?.to ?? prefixLen;
   if (pendingChain) {
+    if (pendingChain.through != null) pendingChain.through = rekey(pendingChain.through);
     pendingChain.from = rekey(pendingChain.from);
     // the settle/rebuild a cold walk carries starts from a block index too
-    if (pendingChain.carry) pendingChain.carry.from = rekey(pendingChain.carry.from);
+    if (pendingChain.carry) {
+      if (pendingChain.carry.through != null) pendingChain.carry.through = rekey(pendingChain.carry.through);
+      pendingChain.carry.from = rekey(pendingChain.carry.from);
+    }
   }
   return { checkpoints: rekeyed, renderHold: holds, editHold: nextEditHold, kept, died };
 }

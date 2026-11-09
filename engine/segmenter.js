@@ -356,6 +356,7 @@ export function diffBlocks(oldBlocks, segs, nextId) {
   // position as before: a block edited in place keeps its id.
   const anchors = middleAnchors(oldBlocks, segs, p, so, p, sn);
   const matchedOld = new Map(); // old index -> new index, for every kept block
+  const regionInputs = new Map();
   for (let i = 0; i < p; i++) matchedOld.set(i, i);
   let regions = 0;
   let oi = p;
@@ -366,6 +367,9 @@ export function diffBlocks(oldBlocks, segs, nextId) {
     if (midOld || midNew) regions++;
     const shared = Math.min(midOld, midNew);
     const base = { o: oi, n: ni };
+    // Pure deletion has no new input: its boundary would collide with the
+    // following kept block's mapping and orphan one of the resident peers.
+    if (midOld && midNew) regionInputs.set(base.o, base.n);
     for (let i = 0; i < shared; i++) {
       const ob = oldBlocks[base.o + i];
       const sg = segs[base.n + i];
@@ -473,7 +477,9 @@ export function diffBlocks(oldBlocks, segs, nextId) {
   }
   // Checkpoint re-keying (checkpoint-preservation.js): the boundary before
   // old block k survives at the boundary before its new position when that
-  // block is kept. Prefix boundaries (k <= prefixLen) hold exactly the old
+  // block is kept. The exit of a kept predecessor also survives: it is the
+  // input of the next changed region, even though that block is not kept.
+  // Prefix boundaries (k <= prefixLen) hold exactly the old
   // state; the others follow an edit and survive as volatile-stale, the
   // rule the suffix always had. The end of the document follows the end.
   const boundaryMap = new Map();
@@ -481,6 +487,7 @@ export function diffBlocks(oldBlocks, segs, nextId) {
     if (k <= p) boundaryMap.set(k, { to: k, exact: true });
     else if (k === nOld) boundaryMap.set(k, { to: nNew, exact: false });
     else if (matchedOld.has(k)) boundaryMap.set(k, { to: matchedOld.get(k), exact: false });
+    else if (regionInputs.has(k)) boundaryMap.set(k, { to: regionInputs.get(k), exact: false });
   }
   // the blocks of the window that did change, on each side
   const keptNew = new Set(matchedOld.values());

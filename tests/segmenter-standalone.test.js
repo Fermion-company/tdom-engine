@@ -88,7 +88,18 @@ test('diffBlocks keeps the unchanged blocks between two changed regions (#96)', 
   // the boundary before c (old 2) survives before its new place (3), after an edit
   assert.deepEqual(d.bounds.boundaryMap.get(2), { to: 3, exact: false });
   assert.deepEqual(d.bounds.boundaryMap.get(1), { to: 1, exact: true });
-  assert.equal(d.bounds.boundaryMap.has(8), false, 'the boundary before an edited block does not');
+  assert.deepEqual(d.bounds.boundaryMap.get(8), { to: 9, exact: false },
+    'the exit of unchanged h remains the input of edited I');
   assert.deepEqual(d.bounds.changedOld, [1, 8]);
   assert.deepEqual(d.bounds.changedNew, [1, 2, 9]);
+});
+
+test('a later pure deletion adds no competing checkpoint input', async () => {
+  const { diffBlocks } = await import('../engine/segmenter.js');
+  const blocks = text => text.split('').map((hash, index) => ({ id: `b${index}`, hash, text: hash, start: index, end: index + 1 }));
+  const diff = diffBlocks(blocks('abcdefghij'), blocks('aBcdfghiJ'), () => 99);
+  assert.equal(diff.bounds.boundaryMap.has(4), false, 'deleted e has no replacement input');
+  assert.deepEqual(diff.bounds.boundaryMap.get(5), { to: 4, exact: false });
+  const targets = [...diff.bounds.boundaryMap.values()].map(boundary => boundary.to);
+  assert.equal(new Set(targets).size, targets.length, 'no peer is overwritten by the new input mapping');
 });

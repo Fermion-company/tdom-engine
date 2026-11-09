@@ -178,9 +178,9 @@ export async function runChainPass(engine, callbacks) {
         }
       }
       let j = nearestCheckpoint(Math.min(work.from, engine.blocks.length));
-      // Blocks below `from` only replay up to the first stale entry state
-      // (its boundary can have retired): reproducing one proves nothing.
-      const staleFrom = work.from;
+      // A retired boundary needs prefix replay; merged work can also have
+      // clean islands before its last frontier. Neither proves convergence.
+      const staleFrom = Math.max(work.from, work.through ?? work.from);
       while (j < engine.blocks.length) {
         if (engine.bgAbort) {
           work.from = Math.min(work.from, j);

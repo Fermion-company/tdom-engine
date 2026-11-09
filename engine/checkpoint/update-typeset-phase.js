@@ -74,6 +74,7 @@ export async function runUpdateTypesetPhase(engine, {
   // a usable stopping point while later exact pixels on that page are cold.
   let firstDisplay = firstDirty;
   let lastDisplay = lastDirty;
+  const displayReplay = new Set();
   if (engine.previewPolicy === 'structured' && engine.foregroundRenderIds) {
     for (let k = 0; k < engine.blocks.length; k++) {
       const block = engine.blocks[k];
@@ -83,6 +84,7 @@ export async function runUpdateTypesetPhase(engine, {
       // replay merely because its exact pixels have not been requested yet.
       if (engine.checkpoints.has(k) && (engine.blocks.length + 1 <= engine.maxCheckpoints ||
           engine.editHold.includes(k) || engine.renderHold.has(k))) continue;
+      displayReplay.add(k);
       firstDisplay = Math.min(firstDisplay, k);
       lastDisplay = Math.max(lastDisplay, k);
     }
@@ -295,8 +297,7 @@ export async function runUpdateTypesetPhase(engine, {
       if (wasClean && !changed && !defEdit && !changedLabels.size && !preview) {
         let next = i;
         while (next < engine.blocks.length && !dirtySource.has(engine.blocks[next].id) &&
-          engine.blocks[next].galley && !(next >= firstDisplay && next <= lastDisplay &&
-            engine.foregroundRenderIds?.has(engine.blocks[next].id) && next !== i)) next++;
+          engine.blocks[next].galley && !displayReplay.has(next)) next++;
         // the nearest kept boundary at or before that block (the walk
         // replays from it up to the dirty block, as from its start)
         let to = Math.min(next, engine.blocks.length - 1);
