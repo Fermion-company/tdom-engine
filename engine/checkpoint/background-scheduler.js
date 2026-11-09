@@ -1,11 +1,13 @@
 import { performance } from 'node:perf_hooks';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 
+const CHAIN_MAX_STALE_MS = Number(process.env.TDOM_CHAIN_MAX_STALE ?? 2000);
+
 export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive = false, pageRenderIds = [], idleRound = 0 } = {}) {
   const { locked, runChainPass, chunkTargets, queueRender, enforceCheckpointCap, coldResume, queueGrid, gridWanted } = callbacks;
   // Deferred chain work is the ONLY background chain activity (docs/10
-  // §I3): nothing runs while the user is typing. The pass starts after a
-  // short idle gate, aborts between blocks on the next edit (#update sets
+  // §I3): the pass starts after a short idle gate or its oldest work's
+  // deadline, and aborts on the next edit (#update sets
   // bgAbort and SIGKILLs the in-flight job) and resumes where it left
   // off. With no pending work the engine is completely idle between
   // keystrokes. Graphics renders stay fire-and-forget — an edit never
@@ -27,8 +29,10 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
         (engine.updating || engine.warming ||
           // the cold resume is owed to the keystroke: it does not wait out
           // the shipping priority window like deferred settle work does
-          Date.now() - (engine.lastEditAt ?? 0) <
-            (engine.pendingChain?.kind === 'cold' ? 300 : shippingPriorityQuietMs(engine, 300)))
+          (Date.now() - (engine.lastEditAt ?? 0) <
+            (engine.pendingChain?.kind === 'cold' ? 300 : shippingPriorityQuietMs(engine, 300)) &&
+            (engine.pendingChain?.queuedAt == null || engine.pendingChain.kind === 'grid' ||
+              Date.now() - engine.pendingChain.queuedAt < CHAIN_MAX_STALE_MS)))
       ) {
         await new Promise((r) => setTimeout(r, 25));
       }
@@ -36,7 +40,7 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
       if (!engine.pendingChain && !queueGrid?.()) return null;
       if (process.env.TDOM_TRACE_GRID) console.error('[grid] sched', JSON.stringify({ round, kind: engine.pendingChain?.kind, t: Math.round(performance.now()) }));
       if (engine.pendingChain.kind === 'cold' && engine.coldTrace) engine.coldTrace.gateAt = performance.now();
-      await locked(() => runChainPass());
+      await locked(() => engine.bgAbort || engine.editPending ? null : runChainPass());
       // A cold walk that reached its block hands the rest to a full update.
       // That update takes the chain lock itself and waits for bgTask, so it
       // must not be part of this promise: return the work and let the

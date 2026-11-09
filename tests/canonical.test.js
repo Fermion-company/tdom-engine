@@ -220,7 +220,7 @@ test('authority pressure: fast baseline, then deep idle + cost cooldown', () => 
     // no compile yet: base debounce only (fast first exactness)
     assert.equal(c.delayFor(), c.debounceMs);
     // an 8s compile just finished: the next one waits at least factor× its
-    // cost AND the writing-idle gate — active writing never pays a compile
+    // cost AND the writing-idle gate when no edit has started the stale clock
     c.last = { ms: 8000 };
     c.lastEndAt = Date.now();
     assert.ok(
@@ -234,8 +234,7 @@ test('authority pressure: fast baseline, then deep idle + cost cooldown', () => 
     c.last = { ms: 600_000 };
     assert.ok(c.delayFor() <= c.cooldownCapMs, 'cooldown capped');
     assert.ok(c.cooldownCapMs >= 8 * 60_000 || process.env.TDOM_CANON_COOLDOWN_CAP, 'cap far above real compiles');
-    // once the cooldown has elapsed, the writing-idle gate remains: a
-    // recompile happens only after the user has actually stopped writing
+    // Without an uncompiled edit's deadline the writing-idle gate remains.
     c.last = { ms: 8000 };
     c.lastEndAt = Date.now() - 8000 * c.cooldownFactor - 1000;
     assert.equal(c.delayFor(), c.idleMs);
@@ -278,6 +277,93 @@ test('authority pressure: fast baseline, then deep idle + cost cooldown', () => 
     );
   } finally {
     c.dispose();
+  }
+});
+
+test('authority staleness: idle, deadline and cooldown use independent clocks', (t) => {
+  t.mock.method(CanonicalRenderer.prototype, 'prepareSyncTeXHelper', async () => false);
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  const c = new CanonicalRenderer({ workDir: WORK + '-staleness', idleMs: 1000, maxStaleMs: 2000 });
+  try {
+    c.last = { id: 1, rev: 1, ms: 100, inputEpoch: c.inputEpoch };
+    c.lastEndAt = 90_000;
+    c.schedule('first edit', 2);
+    assert.equal(c.delayFor(), 1000, 'the ordinary idle delay is unchanged');
+    t.mock.timers.setTime(100_400);
+    assert.equal(c.delayFor(c.pendingJob, { preserveIdleStart: true }), 600);
+    c.schedule('second edit', 3);
+    assert.equal(c.timerDueAt, 101_400, 'idle restarts after another edit');
+    t.mock.timers.setTime(101_500);
+    c.schedule('third edit', 4);
+    assert.equal(c.pendingJob.staleSince, 100_000, 'replacement keeps the oldest edit');
+    assert.equal(c.timerDueAt, 102_000, 'continuous edits cannot move the deadline');
+    t.mock.timers.setTime(102_000);
+    assert.equal(c.delayFor(), 0, 'max staleness expires without a quiet pause');
+    c.lastEndAt = Date.now();
+    c.last.ms = 5000;
+    c.cooldownFactor = 2;
+    c.cooldownCapMs = 6000;
+    assert.equal(c.delayFor(), 6000, 'even an overdue edit waits for the capped cost cooldown');
+    t.mock.timers.setTime(108_000);
+    assert.equal(c.delayFor(), 0);
+
+    c.pressure = 'display';
+    assert.equal(c.delayFor(), c.displayDebounceMs, 'opaque cadence ignores the authority deadline');
+    c.pressure = 'authority';
+    c.requestDisplay(4, 0, { demandId: 'viewer' });
+    assert.equal(c.delayFor(), c.displayDebounceMs, 'display demand keeps its own cadence');
+  } finally {
+    c.dispose();
+    rmSync(WORK + '-staleness', { recursive: true, force: true });
+  }
+});
+
+test('authority staleness: the first baseline also starts during continuous editing', (t) => {
+  t.mock.method(CanonicalRenderer.prototype, 'prepareSyncTeXHelper', async () => false);
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  const c = new CanonicalRenderer({ workDir: WORK + '-baseline-staleness', debounceMs: 2500, maxStaleMs: 20_000 });
+  try {
+    c.schedule('first', 1);
+    assert.equal(c.delayFor(), 2500);
+    t.mock.timers.setTime(119_500);
+    c.schedule('newest', 2);
+    assert.equal(c.delayFor(), 500);
+    assert.equal(c.timerDueAt, 120_000);
+  } finally {
+    c.dispose();
+    rmSync(WORK + '-baseline-staleness', { recursive: true, force: true });
+  }
+});
+
+test('authority staleness: shipping cannot keep a background compile paused past the deadline', (t) => {
+  t.mock.method(CanonicalRenderer.prototype, 'prepareSyncTeXHelper', async () => false);
+  const signals = [];
+  t.mock.method(process, 'kill', (pid, signal) => signals.push([pid, signal]));
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  const c = new CanonicalRenderer({ workDir: WORK + '-paused-staleness', maxStaleMs: 2000 });
+  try {
+    c.authorityStaleSince = Date.now();
+    c.authorityChildren.add({ pid: 123 });
+    assert.equal(c.deferAuthority(900), true);
+    assert.deepEqual(signals, [[-123, 'SIGSTOP']]);
+    t.mock.timers.setTime(101_500);
+    assert.equal(c.deferAuthority(900), true);
+    assert.equal(c.authorityPausedUntil, 102_000);
+    t.mock.timers.tick(500);
+    assert.deepEqual(signals.at(-1), [-123, 'SIGCONT']);
+    assert.equal(c.deferAuthority(900), false, 'subsequent keystrokes cannot pause overdue authority');
+    // A normal Build still owns exclusive heavy-TeX time.
+    c.buildLease = { requestId: 'build' };
+    c.authorityPausedPids.set(123, true);
+    const count = signals.length;
+    c.deferAuthority(900);
+    assert.equal(signals.length, count, 'a Build lease is never bypassed');
+    c.buildLease = null;
+    c.authorityPausedPids.clear();
+    c.authorityChildren.clear();
+  } finally {
+    c.dispose();
+    rmSync(WORK + '-paused-staleness', { recursive: true, force: true });
   }
 });
 
@@ -1218,10 +1304,43 @@ test('scheduled compiles yield between passes to a newer revision', opts, async 
   }
 });
 
+test('authority staleness: an overdue compile lands and paces edits received during its passes', opts, async () => {
+  const { docDir, overlayDir, canonDir } = identityFixture('-authority-starved');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, maxStaleMs: 0 });
+  try {
+    await c.ensure(MULTI_PASS_ROOT, 1);
+    c.lastEndAt = Date.now() - c.last.ms * c.cooldownFactor - 1000;
+    c.schedule(MULTI_PASS_ROOT.replace('\\section{First}', '\\section{First, revised}'), 2);
+    await untilRunning(c);
+    assert.equal(c.runningJob?.rev, 2, 'the stale deadline starts work without idle');
+    c.schedule(MULTI_PASS_ROOT.replace('Body two.', 'Body two, newer.'), 3);
+    const firstPendingAt = c.pendingJob.staleSince;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    c.schedule(MULTI_PASS_ROOT.replace('Body two.', 'Body two, newest.'), 4);
+    const deadline = Date.now() + 20_000;
+    while (c.running || c.last.rev < 2) {
+      assert.ok(Date.now() < deadline, 'the overdue multi-pass compile must finish');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(c.last.rev, 2, 'new edits do not discard the overdue snapshot');
+    assert.ok(c.last.passes >= 2, 'the changed TOC converged across passes');
+    assert.equal(c.authorityStaleSince, firstPendingAt, 'landing retains the oldest still-uncompiled edit');
+    assert.equal(c.pendingJob.rev, 4);
+    assert.equal(c.pendingJob.staleSince, firstPendingAt, 'replacement did not restart the next deadline');
+    const cooldown = Math.min(c.last.ms * c.cooldownFactor, c.cooldownCapMs);
+    assert.ok(c.timerDueAt >= c.lastEndAt + cooldown, 'the pending timer uses the just-finished compile cost');
+    await c.settle();
+    assert.equal(c.last.rev, 4);
+    assert.equal(c.authorityStaleSince, null, 'current canonical paper clears the stale clock');
+  } finally {
+    c.dispose();
+  }
+});
+
 test('display cadence: continuous edits keep the first due time instead of re-arming it', () => {
   const work = WORK + '-display-cadence';
   rmSync(work, { recursive: true, force: true });
-  const c = new CanonicalRenderer({ workDir: work, debounceMs: 0, displayDebounceMs: 300 });
+  const c = new CanonicalRenderer({ workDir: work, debounceMs: 0, displayDebounceMs: 300, maxStaleMs: 60_000 });
   try {
     // A landed generation makes later revisions ordinary (non-baseline) work.
     c.last = { id: 1, rev: 1, ms: 50, inputEpoch: c.inputEpoch };

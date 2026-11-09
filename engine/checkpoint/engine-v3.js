@@ -2100,7 +2100,7 @@ export class CheckpointEngine {
     // the settle/rebuild it carried, which the document still owes.
     if (coldResume && !dirtySource.size) {
       if (chainCarry?.kind) {
-        this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels);
+        this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels, chainCarry.queuedAt);
         this.#kickPendingChain();
       }
       return null;
@@ -2215,7 +2215,7 @@ export class CheckpointEngine {
     this.bootRescueBudgetMs = 0;
     // The settle/rebuild a cold walk carried through its resume is queued
     // again behind this update's own verdict (docs/10 §10.6 merging).
-    if (chainCarry?.kind) this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels);
+    if (chainCarry?.kind) this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels, chainCarry.queuedAt);
     return finalizeUpdate(this, {
       text,
       editLabel,
@@ -2654,7 +2654,7 @@ export class CheckpointEngine {
    * edits, untracked-state leaks) and never converges early. rebuild
    * subsumes settle; overlapping requests keep the earliest start.
    */
-  #queueChainWork(kind, from, labels) {
+  #queueChainWork(kind, from, labels, queuedAt = Date.now()) {
     let cur = this.pendingChain;
     // Grid materialization is the lowest priority: any other chain work
     // replaces it (the scheduler re-queues it once the queue drains).
@@ -2663,6 +2663,7 @@ export class CheckpointEngine {
       if (!cur) this.pendingChain = { kind: 'grid', from: 0, phase: 'blocks', labels: new Set(), budget: 16 };
       return;
     }
+    if (cur) cur.queuedAt = Math.min(cur.queuedAt ?? queuedAt, queuedAt);
     if (kind === 'cold') {
       // The cold walk outranks deferred chain work: its resume update
       // re-queues whatever settle/rebuild was pending (carry).
@@ -2674,15 +2675,16 @@ export class CheckpointEngine {
       this.pendingChain = {
         kind: 'cold',
         from,
+        queuedAt: cur?.queuedAt ?? queuedAt,
         phase: 'blocks',
         labels: new Set(),
         coldIds: new Set(this.coldDirty),
-        carry: cur ? { kind: cur.kind, from: cur.from, labels: new Set(cur.labels) } : null,
+        carry: cur ? { kind: cur.kind, from: cur.from, labels: new Set(cur.labels), queuedAt: cur.queuedAt } : null,
       };
       return;
     }
     if (!cur) {
-      this.pendingChain = { kind, from, phase: 'blocks', labels: new Set(labels) };
+      this.pendingChain = { kind, from, phase: 'blocks', labels: new Set(labels), queuedAt };
       return;
     }
     if (cur.kind === 'cold') {
@@ -2692,8 +2694,9 @@ export class CheckpointEngine {
             kind: carry.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle',
             from: Math.min(carry.from, from),
             labels: new Set([...carry.labels, ...(labels ?? [])]),
+            queuedAt: Math.min(carry.queuedAt ?? queuedAt, queuedAt),
           }
-        : { kind, from, labels: new Set(labels) };
+        : { kind, from, labels: new Set(labels), queuedAt };
       return;
     }
     cur.kind = cur.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle';

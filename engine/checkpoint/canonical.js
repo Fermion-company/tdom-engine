@@ -91,18 +91,19 @@ export class CanonicalRenderer {
     workDir,
     docDir,
     overlayDir = null,
-    // Structured mode: canonical is the AUTHORITY, consumed when the user
-    // is DONE writing for a while or asks for it (export). While a complete
+    // Structured mode: canonical is the AUTHORITY, refreshed after a pause,
+    // at the staleness deadline, or on request (export). While a complete
     // provisional page is available, canonical is a background confirmation
     // pass. If the viewer has to retain an older page, requestDisplay()
     // promotes only that pending source revision to the display cadence.
     // Background cadence:
     //   - no compile yet: debounceMs (fast first baseline, one compile)
-    //   - after that: idleMs of continuous quiet (a real writing pause,
-    //     not a glance at the preview) AND the cost cooldown below.
+    //   - after that: idleMs of quiet OR maxStaleMs since the oldest
+    //     uncompiled edit, AND the cost cooldown below.
     // Opaque mode uses displayDebounceMs (canonical IS the display there).
     debounceMs = Number(process.env.TDOM_CANON_DEBOUNCE ?? 2500),
     idleMs = Number(process.env.TDOM_CANON_IDLE ?? 30_000),
+    maxStaleMs = Number(process.env.TDOM_CANON_MAX_STALE ?? 20_000),
     displayDebounceMs = Number(process.env.TDOM_CANON_DISPLAY_DEBOUNCE ?? 350),
     // When canonical is the display (opaque mode, a fallback, or a viewer that
     // demanded a revision), continuous typing must not keep the paper still:
@@ -123,6 +124,8 @@ export class CanonicalRenderer {
     this.overlayDir = overlayDir ? existingRealpath(overlayDir) : null;
     this.debounceMs = debounceMs;
     this.idleMs = idleMs;
+    this.maxStaleMs = maxStaleMs;
+    this.authorityStaleSince = null;
     this.displayDebounceMs = displayDebounceMs;
     this.displayMaxWaitMs = displayMaxWaitMs;
     // First edit not yet on canonical paper (null once a generation lands).
@@ -159,8 +162,8 @@ export class CanonicalRenderer {
     this.last = null; // last GOOD compile: {id, rev, srcHash, pdf, pageCount, paper, passes, ms}
     this.lastError = null; // {rev, message}
     // Demand-paced authority (docs/10 §I3): in structured mode the canonical
-    // output normally confirms a completed provisional view after a writing
-    // pause or export. Display demand can promote one pending revision.
+    // output confirms a provisional view after a pause or at its staleness
+    // deadline. Display demand can promote one pending revision.
     // Recompiles are paced by their own cost (a cooldown of
     // cooldownFactor × last compile time), which bounds canonical's CPU duty
     // cycle at ~1/(1+factor). The cap exists only so a pathological compile
@@ -388,6 +391,7 @@ export class CanonicalRenderer {
     this.lastError = null;
     this.displayStaleSince = null;
     this.viewerWaitSince = null;
+    this.authorityStaleSince = null;
     if (job) this.#clearDisplayDemand(job);
     try {
       this.onResult?.(this.info());
@@ -594,6 +598,11 @@ export class CanonicalRenderer {
     if (promote) {
       this.last = generation;
       this.displayStaleSince = null;
+      // Edits queued during this compile still owe paper. Keep the first
+      // one's age, not the latest keystroke's or the compile's finish time.
+      this.authorityStaleSince = this.pendingJob &&
+        (this.pendingJob.rev > generation.rev || this.pendingJob.inputEpoch > generation.inputEpoch)
+        ? (this.pendingJob.staleSince ?? this.pendingJob.scheduledAt) : null;
       // The paper just moved. A viewer still demanding the newer pending
       // revision waits for that one from now.
       this.viewerWaitSince = this.#hasDisplayDemand(this.pendingJob) ? Date.now() : null;
@@ -611,6 +620,7 @@ export class CanonicalRenderer {
     this.generations.clear();
     this.last = null;
     this.displayStaleSince = null;
+    this.authorityStaleSince = null;
     this.viewerWaitSince = null;
     this.svgCache.clear();
     this.svgInFlight.clear();
@@ -678,7 +688,9 @@ export class CanonicalRenderer {
     if (p.child) {
       if (authority) {
         this.authorityChildren.add(p.child);
-        if (this.buildLease || Date.now() < this.authorityPausedUntil) this.#pauseAuthorityChild(p.child);
+        if (this.buildLease || (Date.now() < this.authorityPausedUntil && this.#authorityStaleIn() > 0)) {
+          this.#pauseAuthorityChild(p.child);
+        }
       } else if (buildHeavy) {
         this.buildHeavyChildren.add(p.child);
         if (this.buildLease) this.#pauseBuildHeavyChild(p.child);
@@ -731,7 +743,7 @@ export class CanonicalRenderer {
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = null;
     if (this.buildLease) return;
-    const remaining = this.authorityPausedUntil - Date.now();
+    const remaining = Math.min(this.authorityPausedUntil - Date.now(), this.#authorityStaleIn());
     if (remaining > 0) {
       this.authorityResumeTimer = setTimeout(() => this.#resumeAuthority(), remaining);
       this.authorityResumeTimer.unref?.();
@@ -761,9 +773,14 @@ export class CanonicalRenderer {
    */
   deferAuthority(delayMs) {
     if (this.disposed || this.pressure !== 'authority') return false;
-    const delay = Math.max(0, Number(delayMs) || 0);
+    const staleIn = this.#authorityStaleIn();
+    if (staleIn <= 0) {
+      this.#resumeAuthority();
+      return false;
+    }
+    const delay = Math.min(Math.max(0, Number(delayMs) || 0), staleIn);
     if (!delay) return false;
-    this.authorityPausedUntil = Math.max(this.authorityPausedUntil, Date.now() + delay);
+    this.authorityPausedUntil = Math.min(Math.max(this.authorityPausedUntil, Date.now() + delay), Date.now() + staleIn);
     for (const child of this.authorityChildren) this.#pauseAuthorityChild(child);
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = setTimeout(() => this.#resumeAuthority(), delay);
@@ -1172,13 +1189,16 @@ export class CanonicalRenderer {
     // A viewer that demanded the revision this edit replaces is still waiting
     // for paper; one that let that revision pass undemanded painted it itself.
     if (waiting && !this.#hasDisplayDemand(waiting)) this.viewerWaitSince = null;
-    this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now(), fallbackReason };
+    const now = Date.now();
+    this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: now,
+      staleSince: waiting?.staleSince ?? now, fallbackReason };
+    this.authorityStaleSince ??= now;
     this.displayStaleSince ??= Date.now();
     if (this.coldBaselineCatchup && !this.#hasColdBaselineCatchup(this.pendingJob)) {
       this.coldBaselineCatchup = null;
     }
     if (!this.#hasDisplayDemand(this.pendingJob)) this.displayDemand = null;
-    // Authority mode is an idle gate on purpose (re-armed by every edit).
+    // Authority re-arms the idle gate, but never the oldest edit's deadline.
     // When canonical is the display, re-arming on every keystroke starved it:
     // typing faster than displayDebounceMs never let a compile start, so the
     // paper only moved once the hands stopped. Keep the earliest due time;
@@ -1197,6 +1217,13 @@ export class CanonicalRenderer {
     // wait, not the first edit, is what has gone on too long.
     const since = this.pressure === 'authority' ? this.viewerWaitSince : this.displayStaleSince;
     return since !== null && Date.now() - since >= this.displayMaxWaitMs;
+  }
+
+  #authorityStaleIn() {
+    const job = this.pendingJob ?? this.runningJob;
+    if (this.pressure !== 'authority' || job?.fallbackReason || this.#hasDisplayDemand(job) ||
+        this.authorityStaleSince === null) return Infinity;
+    return this.maxStaleMs - (Date.now() - this.authorityStaleSince);
   }
 
   /** Promote existing work while one or more viewers cannot present this revision. */
@@ -1308,9 +1335,9 @@ export class CanonicalRenderer {
    * Delay before the next compile may start, measured from the LAST edit
    * (schedule() re-arms the timer on every edit, so this is an idle gate).
    * Authority (structured) mode: one fast baseline compile per document,
-   * then nothing until the user has been quiet for idleMs AND the
-   * cost-proportional cooldown has passed — active writing never pays a
-   * full compile. Opaque mode and a revision explicitly needed for display
+   * then idleMs of quiet OR maxStaleMs since the oldest uncompiled edit,
+   * always behind the cost-proportional cooldown. Opaque mode and a revision
+   * explicitly needed for display
    * use a short debounce plus a half-duty cost cooldown. Public for tests.
    */
   delayFor(job = this.pendingJob, { preserveIdleStart = false } = {}) {
@@ -1334,9 +1361,10 @@ export class CanonicalRenderer {
     }
     const elapsed = preserveIdleStart && Number.isFinite(job?.scheduledAt)
       ? Math.max(0, Date.now() - job.scheduledAt) : 0;
-    if (!this.last?.ms) return Math.max(0, this.debounceMs - elapsed); // fast first baseline
+    const stale = this.#authorityStaleIn();
+    if (!this.last?.ms) return Math.max(0, Math.min(this.debounceMs - elapsed, stale)); // fast first baseline
     const cooldown = Math.min(this.last.ms * this.cooldownFactor, this.cooldownCapMs);
-    return Math.max(0, this.idleMs - elapsed, cooldown - since);
+    return Math.max(0, Math.min(this.idleMs - elapsed, stale), cooldown - since);
   }
 
   /**
@@ -1527,7 +1555,13 @@ export class CanonicalRenderer {
           source: this.pendingJob.source,
         };
       }
-      if (!this.timer) this.#armPending(this.delayFor(this.pendingJob));
+      // A timer armed during the compile used the previous compile's cost
+      // and end time. Rebase ordinary authority work onto the new cooldown.
+      const authority = this.pressure === 'authority' && !this.pendingJob.fallbackReason &&
+        !this.#hasDisplayDemand(this.pendingJob) && this.viewerWaitSince === null;
+      if (authority || !this.timer) {
+        this.#armPending(this.delayFor(this.pendingJob, { preserveIdleStart: authority }));
+      }
     }
   }
 
@@ -1591,7 +1625,8 @@ export class CanonicalRenderer {
       if (!changed) break;
       // Another pass of an obsolete snapshot only delays the revision the
       // viewer is waiting for. The first baseline is exempt (#compileObsolete).
-      if (superseding && this.#compileObsolete(rev, { pending: true }) && !this.#displayStarved()) throw superseded();
+      if (superseding && this.#compileObsolete(rev, { pending: true }) && !this.#displayStarved() &&
+          !(background && this.#authorityStaleIn() <= 0)) throw superseded();
     }
     // A rebind made a newer revision current while this snapshot compiled:
     // publishing it would move canonical backwards. Scheduled work stops

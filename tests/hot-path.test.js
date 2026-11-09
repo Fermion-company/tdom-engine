@@ -26,6 +26,7 @@ import {
   withReplaceablePreviewJob,
 } from '../engine/checkpoint/build-lease-preview.js';
 import { abortBackgroundJob } from '../engine/checkpoint/abort-background-job.js';
+import { scheduleBackground } from '../engine/checkpoint/background-scheduler.js';
 import { classifyDocument } from '../engine/checkpoint/safety.js';
 import { sourceClosure } from '../engine/checkpoint/closure.js';
 import { classifyStructuralAliases } from '../engine/checkpoint/structural-aliases.js';
@@ -78,6 +79,69 @@ const available = await promisify(execFile)('lualatex', ['--version'], { timeout
 const opts = available ? {} : { skip: 'lualatex not installed' };
 
 const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+test('propagation deadline survives repeated edits and resumes without another idle gate', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  const work = { kind: 'settle', from: 2, phase: 'blocks', labels: new Set(), queuedAt: Date.now() };
+  const engine = { pendingChain: work, bgAbort: false, editPending: 0, lastEditAt: Date.now(),
+    blocks: [], renderHold: new Map(), renderWant: new Set(), diagnostics: [] };
+  const starts = [];
+  const callbacks = {
+    locked: (fn) => fn(),
+    runChainPass: () => { starts.push(Date.now()); engine.bgAbort = true; },
+    enforceCheckpointCap() {},
+  };
+  // Every keystroke aborts and replaces the scheduler, as #update does.
+  for (let edit = 0; edit < 17; edit++) {
+    engine.bgAbort = false;
+    engine.lastEditAt = Date.now();
+    scheduleBackground(engine, [], callbacks);
+    assert.equal(starts.length, 0, 'the quiet gate still applies before the bound');
+    engine.bgAbort = true;
+    t.mock.timers.tick(120);
+    await engine.bgTask;
+  }
+  engine.bgAbort = false;
+  engine.lastEditAt = Date.now();
+  scheduleBackground(engine, [], callbacks);
+  assert.deepEqual(starts, [102_040], 'overdue work runs while keystrokes are still arriving');
+  await engine.bgTask;
+  engine.bgAbort = false;
+  scheduleBackground(engine, [], callbacks);
+  await engine.bgTask;
+  assert.equal(starts.length, 2, 'preemption does not restart the stale clock');
+  assert.deepEqual(engine.diagnostics, []);
+});
+
+test('propagation deadline keeps edit priority and leaves grid work idle-gated', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  const engine = { pendingChain: { kind: 'rebuild', queuedAt: 90_000 }, bgAbort: false,
+    editPending: 1, lastEditAt: Date.now(), blocks: [], renderHold: new Map(), renderWant: new Set(), diagnostics: [] };
+  let runs = 0;
+  const callbacks = { locked: (fn) => fn(), runChainPass: () => { runs++; }, enforceCheckpointCap() {} };
+  scheduleBackground(engine, [], callbacks);
+  await engine.bgTask;
+  assert.equal(runs, 0, 'an overdue pass cannot run ahead of a waiting keystroke');
+  engine.editPending = 0;
+  let grantLock;
+  callbacks.locked = (fn) => new Promise((resolve) => { grantLock = () => resolve(fn()); });
+  scheduleBackground(engine, [], callbacks);
+  engine.editPending = 1;
+  grantLock();
+  await engine.bgTask;
+  assert.equal(runs, 0, 'an edit arriving while the pass waits for the lock also wins');
+  engine.editPending = 0;
+  callbacks.locked = (fn) => fn();
+  engine.pendingChain = { kind: 'grid', queuedAt: 90_000 };
+  callbacks.runChainPass = () => { runs++; engine.pendingChain = null; };
+  scheduleBackground(engine, [], callbacks);
+  t.mock.timers.tick(299);
+  await Promise.resolve();
+  assert.equal(runs, 0, 'grid materialization gets no propagation deadline');
+  t.mock.timers.tick(25);
+  await engine.bgTask;
+  assert.equal(runs, 1, 'the ordinary idle gate still opens');
+});
 
 test('Build lease settles active preview jobs and gates queued replacements', async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-preview-build-lease-'));

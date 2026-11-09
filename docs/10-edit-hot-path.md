@@ -174,14 +174,14 @@ body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironm
 
 ## 10.6 deferred chain
 
-`#queueChainWork(kind, from, labels)` は `settle` または `rebuild` を `pendingChain` に登録する。
+`#queueChainWork(kind, from, labels, queuedAt)` は `settle` または `rebuild` を `pendingChain` に登録する。
 
 | kind | 内容 |
 | --- | --- |
 | `settle` | counter などの動いた exit state を下流へ追い、clean block で一致したら止まる |
 | `rebuild` | suffix を信用せず、下流を serial に再組版する |
 
-`#scheduleBackground()` は、編集後 300ms の idle gate を待ってから `#runChainPass()` を lock 内で走らせる。次の編集が来ると `bgAbort` で止まり、進捗位置から後で再開する。最後の round の後に仕事が残り、pass が前に進んでいれば（grid は境界を実体化した数で見る）、同じ gate の後ろで次の task を走らせる（無操作のまま 8 回まで）。進んでいない grid の計画は捨て、次の予約で `gridMissing` から立て直す（以前は残った仕事を次の編集まで誰も走らせず、chain を待つ呼び出しが止まった）。
+`#scheduleBackground()` は、編集後 300ms の idle gate、または最初の登録から `TDOM_CHAIN_MAX_STALE`（既定2000ms）の期限を待って `#runChainPass()` を lock 内で走らせる。登録時刻 `queuedAt` は仕事の合流・中断・cold carry の再登録でも引き継ぐ。期限を過ぎた仕事は打鍵間の空き時間で再開し、新しい打鍵による preemption と lock の優先順位は維持する。期限は開始の待機上限で、伝播全体の完了時間ではない。最低優先の grid 充填には期限を適用しない。次の編集が来ると `bgAbort` で止まり、進捗位置から後で再開する。最後の round の後に仕事が残り、pass が前に進んでいれば（grid は境界を実体化した数で見る）、同じ gate の後ろで次の task を走らせる（無操作のまま 8 回まで）。進んでいない grid の計画は捨て、次の予約で `gridMissing` から立て直す（以前は残った仕事を次の編集まで誰も走らせず、chain を待つ呼び出しが止まった）。
 
 settle は `from`（入口 state が古い最初の block）より前の block では収束を判定しない。`from` の境界が退役していると pass はその手前の checkpoint から再生するが、そこで galley と exit state が一致しても、foreground が更新済みの block を再現しただけで、動いた state が収まった証拠にはならない（cold resume が何度か走ると、その pin が `editHold` から押し出されて起きる）。
 
@@ -222,7 +222,7 @@ hot path の最後に `#shipUpdate(source)`、`canonical.schedule(source, srcRev
 
 `#scheduleBackground()` は chain と resident render を予約する。
 
-- pending chain があれば idle 後に chain pass を走らせる。
+- pending chain があれば idle または伝播の待機期限後に chain pass を走らせる。
 - 編集した source block と同じページの exact block は、foreground walk の前に input/capture 境界を最大8個保持する。walk 後にも未変更の exact neighbor を描画 queue に加える。boot で queue に入らなかった render hold と、描画済みの hold は通常の checkpoint 上限へ戻し、保持を再作成しない。
 - dirty block 数が `TDOM_RENDER_HOT_MAX` 以下なら、needsRender な hot block を resident exact-render queue に積む。display math と native closure 済みの graphics（float/insert/eject を含まないもの）は foreground JOB の node list を post-block checkpoint に世代付きで保持し、queue 側は CAPTURE を先に試す。これにより block source の二重組版を避ける。保持 list が退役・世代不一致なら、pre-block checkpoint の従来 RENDER へ自動 fallback する。
 - resident の PDF descriptor は boot で読み書き可能にし、各 JOB/CAPTURE/RENDER/ISO fork の直前に現在の bytes と位置を匿名ファイルへ複製する。子だけが複製先を継続し、出力時に専用 job directory へ移す。TikZ/hyperref が先に PDF object を作っていても cold compile は不要。装飾は過去画像を再利用せず、その編集で組版した node list を ship する。graphics の chunk identity には source hash も含め、寸法を変えない色・underlay 編集でも再描画する。エラーで凍結した galley は以前の paint identity を維持する。
@@ -234,7 +234,7 @@ display list は本文 glyph と行単位の exact chunk を別素材として�
 
 各 edit report と async patch は、その時点の font manifest を page patch と同時に送る。client は新しい `@font-face` を登録し、face の decode が完了するまでページ群の提示を待つ。画面外の準備中に該当 run が透明でも、表示中の完成ページは保持する。
 
-`canonical.schedule()` は source/rev を保存して timer を張るだけで、full `lualatex` compile は edit response を待たせない。完成した provisional 面を提示できる structured モードでは、初回だけ `debounceMs`（既定2500ms）で baseline を取得し、以降は最終編集後の `idleMs`（既定30s）とコスト比例 cooldown（factor 2、cap 600s）を満たしてから確定する。opaque モードでは `displayDebounceMs`（既定350ms）と display cooldown（factor 1、cap 60s）を使い、長文書の連続再組版を抑える。
+`canonical.schedule()` は source/rev を保存して timer を張るだけで、full `lualatex` compile は edit response を待たせない。完成した provisional 面を提示できる structured モードでは、初回だけ `debounceMs`（既定2500ms）で baseline を取得し、以降は最終編集後の `idleMs`（既定30s）か、正本に未反映の最古の編集から `maxStaleMs`（`TDOM_CANON_MAX_STALE`、既定20s）の早い方で予約する。いずれもコスト比例 cooldown（factor 2、cap 600s）を満たしてから開始する。20s は通常の打鍵ごとの再コンパイルを避けつつ、連続編集でも番号・参照・目次の更新機会を確保する間隔である。長い compile では cooldown が優先され、完了までには組版時間も加わる。初回 baseline の debounce にも同じ待機期限を掛ける。期限後の通常 authority compile は、新しい編集が来ても aux fixed point までの pass を打ち切らず、shipping の優先窓による停止も期限で解除する。実行中に届いた編集は、その最初の到着時刻を次の待機期限に引き継ぎ、次回 timer は完了時点の実測コストから cooldown を計算し直す。opaque モードでは `displayDebounceMs`（既定350ms）と display cooldown（factor 1、cap 60s）を使い、長文書の連続再組版を抑える。
 
 欠けた数式・不一致のページ構成・編集位置の未証明などで新しい紙面を提示できない場合、client は `POST /canonical/display-demand` に現在の `documentEpoch`・`srcRev`・表示側の `demandId` を送る。その版の既存予約だけを display cadence へ早め、追加の組版は作らない。完成したresidentページ群を実際に提示できたら同IDの `fulfilled: true` を送り、全表示側の需要が解消した未開始予約だけを通常のauthority cadenceへ戻す。待機の起点は最終編集時刻を保つ。同版を再び保留した場合やiframeを再作成した場合は新IDで再取得でき、遅延したfulfilledは別表示側の需要を消さない。IDは128文字、現在の版の既出IDは最大64件とし、同IDの重複はtimerを延長・再有効化しない。開始済み・成功済み・失敗済みの組版を需要通知から追加・取消・再試行しない。需要は対象の完了・失敗・別版への更新・文書resetで終わり、後続の無関係な編集は通常のauthority cadenceに戻る。`canonical.info()` の `scheduledInMs` は予約までの残り時間、`compiling` は実組版中、`displayDemandRev` は需要対象の版を示す。`ensure()`（export 経路）は渡された snapshot だけを compile し、途中の打鍵を連続して追いかけない。
 
