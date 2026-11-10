@@ -788,7 +788,11 @@ function stageProvisionalPatches(patches, flash, pageCount = null, editIds = nul
     return;
   }
   if (committedCanonicalGeneration?.rev === appliedSrcRev &&
-      committedCanonicalGeneration.epoch === documentReset.adoptedEpoch) return;
+      committedCanonicalGeneration.epoch === documentReset.adoptedEpoch) {
+    committedCanonicalGeneration.residentLayoutCompatible =
+      provisionalDisplayLists.size === committedCanonicalGeneration.pageCount && !provisionalPendingLayout.size;
+    return;
+  }
   // An async chunk patch may replace only one page of an unfinished reflow.
   // Carry every other unpublished DL, including across a new source edit;
   // otherwise the first ready page can erase ink still waiting on another.
@@ -872,6 +876,16 @@ function flushDirectPresentationUpdates() {
 function tryCommitProvisionalStages() {
   if (directPresentationBlocked()) return;
   if (usesCanonicalSurface() || documentReset.pending) return;
+  // Canonical may have replaced an incomplete or differently paginated
+  // resident layout and cleared its stages. Its next delta cannot certify
+  // physical page addresses, even if every delivered chunk is drawable.
+  if (committedCanonicalGeneration?.epoch === documentReset.adoptedEpoch &&
+      committedCanonicalGeneration.rev < appliedSrcRev &&
+      committedCanonicalGeneration.residentLayoutCompatible === false) {
+    for (const page of pageDivs.keys()) pageDirtyRev.set(page, appliedSrcRev);
+    requestCanonicalDisplay({ residentImpossible: true });
+    return;
+  }
   if (!provisionalStages.size && !provisionalRemovedPages.size) return;
   const residentPageCount = provisionalDisplayLists.size;
   const stages = [...provisionalStages.values()].sort((a, b) => a.dl.page - b.dl.page);
@@ -899,6 +913,13 @@ function tryCommitProvisionalStages() {
   );
   const pageCountMismatch = canonicalPageCount !== null &&
     canonicalPageCount !== residentPageCount;
+  if ((canonical?.rev === appliedSrcRev && pageCountMismatch) ||
+      (provisionalPendingLayout.size && (pageCountMismatch || provisionalRemovedPages.size)) ||
+      (provisionalRemovedPages.size && !stages.length)) {
+    for (const page of pageDivs.keys()) pageDirtyRev.set(page, appliedSrcRev);
+    requestCanonicalDisplay({ residentImpossible: true });
+    return;
+  }
   if (canonicalPageCount === null || pageCountMismatch) requestCanonicalDisplay();
   const stageReady = stage => stage.ready && stage.sourceRev === appliedSrcRev &&
     stage.documentEpoch === documentReset.adoptedEpoch &&
@@ -2421,7 +2442,8 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   for (const [, entry] of [...batch.expected].sort((a, b) => a[0] - b[0])) {
     entry.apply();
   }
-  committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch, pageCount: batch.pageCount };
+  committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch, pageCount: batch.pageCount,
+    residentLayoutCompatible: provisionalDisplayLists.size === batch.pageCount && !provisionalPendingLayout.size };
   for (const [page, dl] of provisionalDisplayLists) committedPageSrcs.set(page, displayListSrcs(dl));
   pageEditGroup.clear();
   provisionalStages.clear();

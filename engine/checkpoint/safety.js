@@ -51,6 +51,10 @@ const UNSAFE_PACKAGES = [
 // (tex64-internal #64).
 const LANDSCAPE_PACKAGES = ['pdflscape', 'lscape'];
 const LANDSCAPE_BODY_RE = /\\begin\s*\{\s*landscape\s*\}/;
+// Frames reset \vsize and run the real output routine, including overlays
+// and frame-local furniture. Only complete TeX page output retains these
+// slide boundaries and their cross-frame state.
+const BEAMER_CLASS_RE = /\\(?:documentclass|LoadClass|LoadClassWithOptions)\s*(?:\[[^\]]*\]\s*)?\{\s*beamer\s*\}/;
 // NOT here: multicol/paracol/longtable/tcolorbox/mdframed — their
 // environments are single blocks (the segmenter never splits inside an
 // environment) and the isolated exact-render rescue shows real LuaLaTeX
@@ -194,11 +198,13 @@ export function classifyPreamble(preamble) {
   // Keep the exact canonical PDF as the page surface and permit only
   // canonical-addressed, fail-closed text overlays on top of it.
   const canonicalAnchor = /\\(?:documentclass|LoadClass)\s*\[[^\]]*\btwocolumn\b[^\]]*\]/.test(pre);
+  const beamer = BEAMER_CLASS_RE.test(actions);
+  const exactReasons = [...(landscapePages ? ['landscape pages'] : []), ...(beamer ? ['beamer frame output routine'] : [])];
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
-    previewPolicy: landscapePages ? 'shipping-exact' : canonicalAnchor ? 'canonical-anchor' : 'structured',
-    previewReasons: landscapePages ? ['landscape pages'] : canonicalAnchor ? ['twocolumn class option'] : [],
+    previewPolicy: exactReasons.length ? 'shipping-exact' : canonicalAnchor ? 'canonical-anchor' : 'structured',
+    previewReasons: exactReasons.length ? exactReasons : canonicalAnchor ? ['twocolumn class option'] : [],
   };
 }
 
@@ -250,17 +256,19 @@ export function classifyDocument(preamble, body) {
   }
   const bodyColumnSwitch = BODY_COLUMN_SWITCH_RE.test(bod);
   const shippingExact = aliases.requiresShippingExact;
-  const landscapePages = pre.previewPolicy === 'shipping-exact' || LANDSCAPE_BODY_RE.test(bod);
+  const landscapePages = pre.previewReasons.includes('landscape pages') || LANDSCAPE_BODY_RE.test(bod);
+  const exactPages = pre.previewPolicy === 'shipping-exact' || landscapePages;
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
-    previewPolicy: shippingExact || landscapePages
+    previewPolicy: shippingExact || exactPages
       ? 'shipping-exact'
       : bodyColumnSwitch
         ? 'canonical-anchor'
         : pre.previewPolicy,
-    previewReasons: shippingExact || landscapePages
+    previewReasons: shippingExact || exactPages
       ? [...new Set([
+          ...pre.previewReasons,
           ...(landscapePages ? ['landscape pages'] : []),
           ...aliases.shippingExactUses.flatMap((use) =>
             use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)),

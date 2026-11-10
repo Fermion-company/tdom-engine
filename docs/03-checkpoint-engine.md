@@ -132,6 +132,8 @@ resident RENDER / CAPTURE と isolated RENDER の PDF は、TeX の論理幅の�
 13. dirty block の high-fidelity render と deferred chain を schedule する。
 14. `canonical.schedule(source, srcRev)` で正本 compile を予約する。
 
+beamer class は frame ごとに実ページ高と output routine を使うため、dormant galley のページ割りを表示できない。safety gate は `shipping-exact` 表示を選び、編集時は直前の canonical slides を保持する。差し替えには完成した Shipping 出力、または新しい canonical を使う。
+
 structured safety は raw 本文だけでは判定しない。preamble と展開済み project body にある
 ローカル定義（`newcommand` / primitive `def` / `let` / `newenvironment` / xparse 系）を軽量 lexer で読み、
 `multicols`・`paracol`・`longtable`・`twocolumn` / `onecolumn`・強制列/改ページ・output routine

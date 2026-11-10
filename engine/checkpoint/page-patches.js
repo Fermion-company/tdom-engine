@@ -10,6 +10,13 @@ export function buildPagePatches(pages, prevPages, hfSig, displayList) {
     }
   }
   if (pages.length < prevPages.length) {
+    // A shrink needs a drawable surviving tail, even when its ink did not
+    // change. A count alone cannot replace the viewer's last good pages.
+    const tail = pages.at(-1);
+    if (tail && !dirtyPages.includes(tail.number)) {
+      dirtyPages.push(tail.number);
+      patches.push({ type: 'replace-page', page: tail.number, displayList: tail.dl });
+    }
     patches.push({ type: 'remove-pages', from: pages.length + 1 });
   }
   return { patches, dirtyPages };
