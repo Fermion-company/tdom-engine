@@ -1,6 +1,7 @@
 import { readFileSync, rmSync } from 'node:fs';
 import { cropSvg, cropSvgAt } from './util/svg.js';
 import { renderIsoPages } from './iso-pages.js';
+import { IsoPageCache } from './iso-page-cache.js';
 
 export async function readIsoCompileResult(
   engine,
@@ -25,7 +26,8 @@ export async function readIsoCompileResult(
     throw new Error(msg);
   }
   const ships = st.ships ?? 0;
-  const svgPaths = await renderIsoPages(jobdir, pdf, ships + 1);
+  const pageCache = process.env.TDOM_ISO_PAGE_CACHE === '0' ? null : (engine.isoPageCache ??= new IsoPageCache());
+  const svgPaths = await renderIsoPages(jobdir, pdf, ships + 1, undefined, pageCache);
   const geo = engine.geometry ?? {};
   const chunks = [];
   const items = [];

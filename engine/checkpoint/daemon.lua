@@ -1970,15 +1970,18 @@ function iso_fork(id, jobdir, body)
     reconnect('iso', 0)
     assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish isolated PDF')
     lfs.chdir(jobdir)
+    -- stop_run follows PDF finalization; finish_pdffile precedes the
+    -- font streams and EOF, forcing the receiver to poll an unfinished PDF.
     local notify = function()
+      fk.flush()
       pcall(function()
         conn:send('DONE ' .. id .. '\n')
       end)
     end
     if luatexbase and luatexbase.add_to_callback then
-      pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdom')
+      pcall(luatexbase.add_to_callback, 'stop_run', notify, 'tdom')
     else
-      pcall(callback.register, 'finish_pdffile', notify)
+      pcall(callback.register, 'stop_run', notify)
     end
     inject_raw(body)
     return true
@@ -2019,6 +2022,20 @@ function tdom_real_root()
     return
   end
   collectgarbage('stop')
+  -- Warm the common heading faces only in the isolated-output sibling.
+  -- Doing this before the fork changes resident font attribute identities.
+  if os.getenv('TDOM_ISO_FONT_WARM') == '0' or not token.is_defined('Large') then
+    tdom_real_ready()
+    return
+  end
+  tex.print({
+    '\\begingroup\\setbox0=\\hbox{\\large large \\sffamily sans \\bfseries bold ' ..
+      '\\normalfont\\Large large \\sffamily sans \\bfseries bold}\\endgroup',
+    '\\directlua{tdom_real_ready()}',
+  })
+end
+
+function tdom_real_ready()
   reconnect('realroot', 0)
   tdom_real_wait()
   -- only an ISO child returns here: TeX resumes on the injected program

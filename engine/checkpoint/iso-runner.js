@@ -11,7 +11,7 @@ const execFileP = promisify(execFile);
 export async function runForkIsoCompile(engine, { ck0, block, jobdir, pdf, isoTex, awaitRender }) {
   // fork path: the ISO child chdir's to the jobdir, its lazily-opened
   // PDF (\jobname = driver) and state.json land there, and DONE fires
-  // from finish_pdffile like the RENDER protocol
+  // from stop_run after the PDF has been finalized
   const isoId = `iso@${fnv1a(jobdir + ':' + Date.now())}`;
   const body = Buffer.from(isoTex, 'utf8');
   engine.renderPids ??= new Map();

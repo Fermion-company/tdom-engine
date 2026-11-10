@@ -65,11 +65,13 @@ syncBuiltinESMExports();
 const { CheckpointEngine } = await import('../engine/checkpoint/engine-v3.js');
 const { Peer } = await import('../engine/checkpoint/peer.js');
 const send = Peer.prototype.send;
+const isoJobs = new Map();
 Peer.prototype.send = function (line) {
   const command = line.split(' ')[0];
   if (['JOB', 'STEP', 'ISO', 'RENDER', 'CAPTURE'].includes(command)) {
     if (counts) counts[command] = (counts[command] ?? 0) + 1;
     trace('send', { command, id: line.split(' ')[1], pid: this.pid });
+    if (command === 'ISO') isoJobs.set(line.split(' ')[1], decodeURIComponent(line.split(' ')[2]));
   }
   return send.call(this, line);
 };
@@ -77,7 +79,13 @@ const engine = new CheckpointEngine({ workDir: work, docDir: path.dirname(file) 
 const message = engine._onMessage.bind(engine);
 engine._onMessage = (peer, report) => {
   if (['GALLEY', 'CKPT', 'DONE', 'FORKED'].includes(report.kind)) {
-    trace(report.kind, { id: report.id, pid: report.pid ?? peer.pid });
+    let pdfComplete;
+    if (report.kind === 'DONE' && isoJobs.has(report.id)) {
+      try { pdfComplete = readFileSync(path.join(isoJobs.get(report.id), 'driver.pdf')).subarray(-32).includes('%%EOF'); }
+      catch { pdfComplete = false; }
+      isoJobs.delete(report.id);
+    }
+    trace(report.kind, { id: report.id, pid: report.pid ?? peer.pid, pdfComplete });
   }
   return message(peer, report);
 };
@@ -87,7 +95,11 @@ function targetKeys() {
   return new Set([targetId, ...(block?.galley?.items ?? []).map(item => item.chunk).filter(Boolean)]);
 }
 function targetPixels() {
-  return createHash('sha256').update(JSON.stringify([...targetKeys()].sort().map(key => engine.chunks.get(key)?.svg ?? null))).digest('hex');
+  const block = engine.blocks.find(b => b.id === targetId);
+  return createHash('sha256').update(JSON.stringify([
+    block?.rescued ? null : block?.galleyHash,
+    [...targetKeys()].sort().map(key => engine.chunks.get(key)?.svg ?? null),
+  ])).digest('hex');
 }
 function publish(report) {
   trace('publish', { rev: engine.srcRev, pages: report.patches?.filter(p => p.type === 'replace-page').map(p => p.displayList.page) });
@@ -133,7 +145,7 @@ try {
     blocks: engine.blocks.map(b => ({ id: b.id, startLine: source.slice(0, b.start).split('\n').length,
       endLine: source.slice(0, b.end).split('\n').length, rescued: b.rescued })), signature: snapshot() }));
   for (const line of lines) {
-    for (const burst of [false, true]) {
+    for (const burst of args.includes('--singles-only') ? [false] : [false, true]) {
       let pos = engine.getSource().split('\n').slice(0, line).join('\n').length;
       await engine.warmEditOffset(pos);
       await drain(engine);
@@ -143,6 +155,7 @@ try {
       paintedTarget = targetPixels();
       viewer = provisionalViewer(engine.getDisplayLists(), engine.pages.length);
       events = []; counts = {}; commits = []; started = performance.now();
+      const cacheBefore = { ...engine.isoPageCache?.stats };
       const cpu = process.cpuUsage(), threadCpu = process.threadCpuUsage?.();
       let peakPeers = 0, peakCheckpoints = 0, peakRss = 0;
       const monitor = setInterval(() => {
@@ -175,6 +188,8 @@ try {
         cpuMs: { user: usage.user / 1000, system: usage.system / 1000 },
         mainThreadCpuMs: threadUsage && { user: threadUsage.user / 1000, system: threadUsage.system / 1000 },
         jobs: counts, peakPeers, peakCheckpoints, nodePeakRssMiB: peakRss / 1048576,
+        pageCache: engine.isoPageCache && Object.fromEntries(Object.entries(engine.isoPageCache.stats)
+          .map(([key, value]) => [key, value - (cacheBefore[key] ?? 0)])),
         commits, events: args.includes('--trace') ? events : undefined, diagnostics: engine.diagnostics.slice(-10) }));
       events = null; counts = null;
       await drain(engine);

@@ -51,4 +51,5 @@ export async function closeEngine(engine) {
   if (engine.server) engine.server.close();
   engine.checkpoints.clear();
   engine.peers.clear();
+  engine.isoPageCache = null;
 }

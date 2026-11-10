@@ -350,6 +350,11 @@ static int l_close_fd(lua_State *L) {
   return 1;
 }
 
+static int l_flush(lua_State *L) {
+  lua_pushboolean(L, fflush(NULL) == 0);
+  return 1;
+}
+
 int luaopen_tdomfork(lua_State *L) {
   lua_createtable(L, 0, 8);
   lua_pushcclosure(L, l_fork, 0);
@@ -382,5 +387,7 @@ int luaopen_tdomfork(lua_State *L) {
   lua_setfield(L, -2, "adopt_read_fd");
   lua_pushcclosure(L, l_close_fd, 0);
   lua_setfield(L, -2, "close_fd");
+  lua_pushcclosure(L, l_flush, 0);
+  lua_setfield(L, -2, "flush");
   return 1;
 }

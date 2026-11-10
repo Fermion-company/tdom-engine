@@ -216,6 +216,14 @@ rescue pump は一度に一件だけ処理する。編集・caret の対象ペ�
 
 multicols の内側は段落や textbox ごとに分割せず、一つの layout block として実 output routine で組み直す。この rescue は resident RENDER の120ms gate、isolated **render** の3秒 gateとは別経路である。救済PDFが完了した後の SVG 変換は `iso-pages.js` の2レーンで処理し、全ページが揃ってから従来どおり galley/chunk を採択する。変換失敗時も実行中のもう一件を待ってから失敗を返すため、cold retry やディレクトリ削除と競合しない。ページ数によらず converter は最大2本、ISO組版は直列のままである。
 
+real-output root は接続を通知する前に、その sibling 内の捨てる box で標準の `large`・`Large` の roman/sans/bold を準備する。ISO child が毎回見出し用フォントを初期化する費用を起動時へ移す。通常の resident checkpoint はこの準備を通らず、font attribute の識別子も従来どおりである。root の前文・寿命・保持数は変えず、本文の箱・counter・label・列幅を再利用する機構ではない。`TDOM_ISO_FONT_WARM=0` で停止できる。
+
+ISO の `DONE` は `stop_run` で stdio を flush してから送る。`finish_pdffile` は font stream と EOF の生成より前なので完了通知には使わない。受信側の EOF 検査は残すが、正常終了では25msのreadiness pollを待たない。
+
+複数ページの救済PDFは、`iso-page-cache.js` が `qpdf` のJSONからページごとの完全な描画入力を照合する。内容streamだけでなく、font本体、image、form、継承されたresources・用紙寸法・crop・rotationと、その間接参照先をSHA-256に含める。counter・label・列幅・fontの変更は、今回LuaLaTeXが生成したPDFの変化として判定する。任意のTeX状態から未変更を推測しない。未知のcatalog機能、循環・欠損参照、解析の上限超過、`qpdf`不在・失敗は全ページ変換へ戻る。再利用するのは同じページ番号のSVG bytesだけで、今回のPDF・編集座標・galleyと完成bundleの採択は従来どおり更新する。
+
+cache はengineごとに最大8MiB・64ページで、終了時に解放する。`TDOM_ISO_PAGE_CACHE=0` は無効化、`TDOM_ISO_PAGE_CACHE_VERIFY=1` はcache hitも再変換し、全SVG bytesの一致を検査する。`tools/bench-rescue-latency.mjs` は変換数・cache hit/miss・DONE時のEOFを記録し、`--import ./tools/profile-iso.mjs` は計測専用の環境・font・shipout別wall/CPU/heap標本を残す。
+
 ## 10.9 壊れた TeX の凍結と決定性の境界
 
 chain と isolated rescue の両方に失敗する block（実 LuaLaTeX 自身が emergency stop するソース — 例: tikz node 内の壊れた色名が pgf 内部でカスケードして子プロセスを殺す）は `#brokenBlockGalley()` で凍結する。未閉鎖の条件文のような軽い破壊は daemon が job 境界で回復するので、ここには来ない。凍結は二形態ある。

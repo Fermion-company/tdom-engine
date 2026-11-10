@@ -23,8 +23,8 @@ export function isoCacheEpoch() {
   // result is read: the Lua daemons and the JS that builds the job, runs
   // it and reads it back. A change to any of them must not reuse results.
   // tex-templates.js builds the isolated program itself (buildIsoCompileSource).
-  const semantic = ['daemon.lua', 'shipd.lua', 'iso-context.js', 'isolated-render-source.js', 'iso-runner.js',
-    'iso-compile.js', 'iso-result.js', 'iso-pages.js', 'rescue-block.js', 'rescue-cache.js', 'iso-disk-cache.js', 'tex-templates.js'];
+  const semantic = ['daemon.lua', 'shipd.lua', 'tdomfork.c', 'iso-context.js', 'isolated-render-source.js', 'iso-runner.js',
+    'iso-compile.js', 'iso-result.js', 'iso-pages.js', 'iso-page-cache.js', 'rescue-block.js', 'rescue-cache.js', 'iso-disk-cache.js', 'tex-templates.js'];
   for (const name of semantic) {
     try { parts.push(fnv1a(readFileSync(path.join(DIR, name), 'utf8'))); } catch { parts.push('-'); }
   }
