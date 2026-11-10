@@ -632,13 +632,17 @@ export function buildIsoCompileSource({
       'local list = nil ' +
       'if b then list = b.list b.list = nil tex.box[boxnum] = nil end ' +
       'if list then ' +
-      // an absorbed fire IS a real page break: leave an eject marker at
-      // the boundary so the harvested stream carries the break position
+      // Preserve the output protocol: -10001 discards clearpage's empty
+      // marker box and flushes floats; it must not become a printed page.
+      // Lower penalties signal floats, not page breaks (as in the daemon).
+      'local pen = tex.outputpenalty or -10000 ' +
+      'local t0 = node.tail(list) ' +
+      'if pen > -10002 then ' +
       'local mk = node.new("whatsit", node.subtype("special")) ' +
-      'mk.data = "tdom:eject:-10000" ' +
-      'local t0 = node.tail(list) t0.next = mk mk.prev = t0 ' +
+      'mk.data = "tdom:eject:" .. pen ' +
+      't0.next = mk mk.prev = t0 t0 = mk end ' +
       'local oldc = tex.lists.contrib_head ' +
-      'if oldc then mk.next = oldc oldc.prev = mk end ' +
+      'if oldc then t0.next = oldc oldc.prev = t0 end ' +
       'tex.lists.contrib_head = list ' +
       'end ' +
       'pcall(function() tex.pagetotal = 0 end) ' +
