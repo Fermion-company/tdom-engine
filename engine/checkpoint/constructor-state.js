@@ -164,6 +164,7 @@ export function initializeEngineState(
   engine.shipping = process.env.TDOM_SHIP === '1' ? makeShipping() : null;
   engine.mode = 'structured'; // 'structured' | 'opaque'
   engine.modeReasons = [];
+  engine.structuredBootError = null;
   engine.previewPolicy = 'structured'; // 'structured' | 'canonical-anchor' | 'shipping-exact'
   engine.previewReasons = [];
   engine.opaqueStickyPre = null; // preamble hash a dynamic demotion sticks to

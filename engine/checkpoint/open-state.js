@@ -43,6 +43,7 @@ export function resetOpenState(engine, text, file) {
   // a fresh document gets a fresh chance at the structured layer
   engine.mode = 'structured';
   engine.modeReasons = [];
+  engine.structuredBootError = null;
   engine.previewPolicy = 'structured';
   engine.previewReasons = [];
   // An opaque predecessor left the canonical at display pressure; the new

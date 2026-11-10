@@ -255,7 +255,15 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
     engine.progress = { phase: 'boot' }; // /status: preamble reload running
     try {
       await bootRoot();
+      engine.structuredBootError = null;
     } catch (err) {
+      engine.structuredBootError = {
+        code: err.code === 'TDOM_SHIM_UNAVAILABLE' ? err.code : 'TDOM_STRUCTURED_BOOT_FAILED',
+        message: err.message,
+        ...(err.code === 'TDOM_SHIM_UNAVAILABLE' ? {
+          platform: err.platform, arch: err.arch, sourceHash: err.sourceHash, attempts: err.attempts,
+        } : {}),
+      };
       engine.opaqueStickyPre = preHash;
       scheduleStructuredReprobe(preHash);
       return { response: opaqueUpdate(editLabel, timer, [`structured boot failed: ${err.message}`]) };

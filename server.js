@@ -1788,6 +1788,7 @@ const server = http.createServer(async (req, res) => {
         queued: engineBusy,
         busyMs: engineBusy > 0 ? Date.now() - engineBusySince : 0,
         mode: engine.mode,
+        structuredBootError: engine.structuredBootError ?? null,
         previewPolicy: engine.previewPolicy,
         rev: engine.rev,
         srcRev: engine.srcRev,

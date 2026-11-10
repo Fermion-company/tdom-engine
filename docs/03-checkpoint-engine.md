@@ -9,7 +9,7 @@
 | `engine/checkpoint/engine-v3.js` | Node.js 側の orchestration。差分 block、checkpoint、page build、exact chunk、opaque/canonical 連携を扱う |
 | `engine/checkpoint/daemon.lua` | resident `lualatex` 内で動く Lua daemon。JOB/RENDER を受け、real MVL と metadata を返す |
 | `engine/checkpoint/tdomfork.c` | LuaTeX から POSIX `fork()` / `_exit()` / `waitpid()` などを呼ぶ C shim |
-| `engine/checkpoint/forkshim.js` | `tdomfork.c` を workDir に build する helper |
+| `engine/checkpoint/forkshim.js` / `forkshim-probe.lua` | 同梱・キャッシュ shim の検査と、必要時の build |
 | `engine/checkpoint/pagebuilder.js` | 収穫した node stream からページを組む JavaScript page builder |
 | `engine/checkpoint/canonical.js` | full `lualatex` の正本 compile と PDF/SVG/text 取得 |
 | `engine/checkpoint/shipping.js` / `shipd.lua` | `TDOM_SHIP=1` で動く任意の増分 canonical 経路 |
@@ -23,6 +23,26 @@
 ShippingChain は root bytes に加えて、現在の静的 expander が実際に読んだ project input の logical path・bytes・read order を revision snapshot に固定する。過去の include cache は snapshot/mirror に持ち込まない。既知の単一 brace-literal `\input` の plain-text 変更だけは、その input を読む root feed unit より前の page checkpoint から再開する。chain 専用 mirror が同じ logical path を immutable bytes で shadow し、変更前 child の input buffer を持つ unit 内 checkpoint は再利用しない。root と child の両方に既存の replay safety profile を適用する。未知 reader、`\include`、複数・削除・構造変更は baseline/canonical へ戻し、旧 shipping generation を新 `srcRev` に付け替えない。
 
 編集 wave の通常期限は700msである。直近 canonical の実測時間より500ms以上短い場合だけ最大3000msまで延長し、その表示猶予中は display-demand canonical を開始しない。これにより遅い ship と全文 compile を同時に走らせず、ship が拒否された時点では待機を即解除する。完全PDFの検証、ページ数、出力manifest、source snapshotの各 gateは期限を延長しても省略しない。
+
+`ensureShim` は `engine/checkpoint/prebuilt/tdomfork-<platform>-<arch>.so`、workDir の
+`tdomfork.so`、ローカル `cc` の順に試す。同梱版とキャッシュは隣の `.so.sha256` が
+現在の `tdomfork.c` の SHA-256 と一致することを確認する。どの経路でも
+`lualatex --luaonly forkshim-probe.lua <library>` でロードと全 API（`flush` を含む）を
+検査する。同梱版は workDir の一時ファイルにも検査を行い、検査済みのバイナリだけを
+rename してから stamp を書く。壊れたキャッシュは削除する。同一 workDir の同時取得は合流する。
+
+macOS の runtime build は通常の環境で失敗した場合、`xcrun --sdk macosx --show-sdk-path`、
+`xcode-select -p` 配下の MacOSX SDK、CommandLineTools の versioned SDK（新しい順）を試す。
+明示的な `SDKROOT` がある場合はその選択だけを使う。全体60秒、コンパイル1回15秒、
+SDK探索1回2秒、ロード検査1回5秒を上限とし、各試行をログに残す。
+`buildPrebuiltShim` は配布ビルド用の入口で、指定された platform/arch のバイナリと source stamp を作る。
+macOS 配布用の deployment target は既定11.0（明示指定を優先）とし、runner の OS バージョンに依存させない。
+ビルド環境には TeX を要求せず、利用前のロード検査は実際に使う LuaTeX で行う。
+
+shim 取得失敗は `TDOM_SHIM_UNAVAILABLE` と試行結果を持つ例外になる。
+`GET /status` の `structuredBootError` は成功時・文書再オープン時に `null`、boot 失敗時に
+`{ code, message }`（shim 失敗では `platform`, `arch`, `sourceHash`, `attempts` も含む）を返す。
+失敗後は従来どおり opaque 表示を続け、再オープンで structured boot を再試行する。
 
 ## 3.2 プロセスモデル
 
