@@ -82,3 +82,49 @@ export function provisionalViewer(pages, canonicalCount = pages.length) {
   state.appliedSrcRev++;
   return state;
 }
+
+// The embed Jump code runs against the same presentation shells as the
+// transaction harness. Only browser layout, network and time are supplied.
+export function jumpViewer({ fetch, pages = 2 } = {}) {
+  const state = provisionalViewer(Array.from({ length: pages }, (_, n) => pageList(n + 1)));
+  const listeners = new Map(), timers = new Map();
+  let timerId = 0;
+  Object.assign(state, {
+    fetch, CSS: { escape: String }, embedViewportToken: null, dismissSyncMarker() {},
+    sameSourceFile: (a, b) => a === b, scheduleEmbedSnapshot() {},
+    requestAnimationFrame(fn) { fn(); },
+    canonicalIdFromSrc: src => Number(/\?c=(\d+)/.exec(src)?.[1]),
+    presentedShippingPageState: page => page?.dataset.canonPresentedSrc?.startsWith('/ship/'),
+    activePaperGeometry: () => ({ width: 600, height: 800 }),
+    sortedPages: () => [...state.pageDivs].sort((a, b) => a[0] - b[0]),
+    setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    document: {
+      addEventListener() {},
+      querySelectorAll: () => [...state.pageDivs.values()].flatMap(page => page.markers),
+      createElement: () => ({ dataset: {}, style: {}, remove() { this.parent.markers = this.parent.markers.filter(m => m !== this); } }),
+    },
+    window: { addEventListener() {} },
+    pagesEl: {
+      scrollTop: 0, clientHeight: 500,
+      getBoundingClientRect: () => ({ top: 0, width: 600, height: 500 }),
+      scrollTo({ top }) { this.scrollTop = top; },
+      addEventListener(type, fn) { listeners.set(type, fn); },
+    },
+  });
+  for (const [number, page] of state.pageDivs) {
+    page.markers = []; page.clientWidth = 600;
+    page.getBoundingClientRect = () => ({ top: (number - 1) * 820 - state.pagesEl.scrollTop, left: 0, width: 600, height: 800 });
+    page.appendChild = marker => { marker.parent = page; page.markers.push(marker); };
+  }
+  vm.runInContext(span('    const pageEntryFor =', "    window.addEventListener('message',") +
+    '\nthis.jump = scrollToSync; this.refine = refineSyncToSource;', state);
+  state.flush = async () => { for (let i = 0; i < 15; i++) await Promise.resolve(); };
+  state.tick = async () => {
+    for (const [id, timer] of [...timers]) if (timer.ms === 250) { timers.delete(id); timer.fn(); }
+    await state.flush();
+  };
+  state.dispatch = type => listeners.get(type)?.();
+  state.markers = () => [...state.pageDivs.values()].flatMap(page => page.markers);
+  return state;
+}

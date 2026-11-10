@@ -6798,6 +6798,7 @@ pagesEl.addEventListener('scroll', () => {
         Math.abs(entry[0] - wanted) < Math.abs(best[0] - wanted) ? entry : best
       );
     };
+    let syncScrollTop = null;
     const scrollPageToViewport = (page, paperY = 0, center = false) => {
       const viewport = pagesEl.getBoundingClientRect();
       const pageRect = page.getBoundingClientRect();
@@ -6807,9 +6808,11 @@ pagesEl.addEventListener('scroll', () => {
       const target = pagesEl.scrollTop + pageRect.top - viewport.top + withinPage -
         (center ? pagesEl.clientHeight / 2 : 0);
       pagesEl.scrollTo({ top: Math.max(0, target), behavior: 'auto' });
+      syncScrollTop = pagesEl.scrollTop;
       scheduleEmbedSnapshot();
     };
     const scrollToPage = (n) => {
+      dismissSyncMarker();
       const entry = pageEntryFor(Number(n));
       if (!entry) return;
       scrollPageToViewport(entry[1]);
@@ -6817,81 +6820,112 @@ pagesEl.addEventListener('scroll', () => {
     // A newer Jump or the reader's own move makes a pending refinement stale:
     // it must neither scroll back nor bring the marker back.
     let syncRefineGeneration = 0;
+    const syncPaperCurrent = (page, rev, id) => {
+      if (!page?.classList.contains('is-final')) return false;
+      return Number(page?.dataset.canonPresentedRev) === rev &&
+        canonicalIdFromSrc(page.dataset.canonPresentedSrc) === id;
+    };
     const refineSyncToSource = async (data, wantsMarker = false) => {
       const generation = syncRefineGeneration;
+      const documentEpoch = documentReset.adoptedEpoch;
+      const srcRev = appliedSrcRev;
       const file = String(data.sourceFile ?? '');
       const line = Number(data.sourceLine);
-      if (!file || !Number.isFinite(line)) return false;
+      const current = () => generation === syncRefineGeneration && !documentReset.pending &&
+        documentEpoch === documentReset.adoptedEpoch && srcRev === appliedSrcRev;
+      if (!file || !Number.isInteger(line) || line < 1) return false;
       let dom;
       try {
         const response = await fetch('/dom', { cache: 'no-store' });
-        if (!response.ok) return false;
-        dom = await response.json();
-      } catch {
-        return false;
-      }
-      if (generation !== syncRefineGeneration) return false;
-      const blocks = (dom?.blocks ?? []).filter((block) =>
-        block?.id && sameSourceFile(block.source?.file, file) &&
-        Number(block.source?.start?.line) <= line && Number(block.source?.end?.line) >= line
-      ).sort((a, b) =>
-        (Number(a.source.end.line) - Number(a.source.start.line)) -
-        (Number(b.source.end.line) - Number(b.source.start.line))
-      );
-      for (const block of blocks) {
+        if (response.ok) dom = await response.json();
+      } catch { /* the canonical lookup can still succeed */ }
+      if (!current()) return false;
+      const blocks = (dom?.sourceCurrent !== false && Number(dom?.srcRev) === srcRev &&
+        Number(dom?.documentEpoch) === documentEpoch ? dom.blocks ?? [] : []).flatMap(block =>
+          (block.sourceRanges ?? [block.source]).filter(source => sameSourceFile(source?.file, file))
+            .map(source => ({ ...block, source }))
+        ).sort((a, b) => {
+          const distance = block => Math.max(Number(block.source.start.line) - line, line - Number(block.source.end.line), 0);
+          return distance(a) - distance(b) ||
+            (a.source.end.line - a.source.start.line) - (b.source.end.line - b.source.start.line);
+        });
+      let estimated = false;
+      for (const block of blocks.slice(0, 3)) {
         const relativeLine = line - Number(block.source.start.line);
+        const candidates = [];
         for (const [, page] of sortedPages()) {
-          const nodes = [...page.querySelectorAll(`[data-src="${CSS.escape(String(block.id))}"][data-line]`)]
-            .filter((node) => {
-              const rect = node.getBoundingClientRect();
-              return rect.width > 0 && rect.height > 0;
-            });
-          if (!nodes.length) continue;
-          const values = [...new Set(nodes.map((node) => Number(node.dataset.line)).filter(Number.isFinite))];
-          if (!values.length) continue;
-          const targetLine = values.includes(relativeLine)
-            ? relativeLine
-            : values.reduce((best, value) =>
-              Math.abs(value - relativeLine) < Math.abs(best - relativeLine) ? value : best
-            );
-          const exact = nodes.filter((node) => Number(node.dataset.line) === targetLine);
-          const ink = exact.filter((node) =>
-            !node.classList.contains('tdom-source-hit') &&
-            !node.classList.contains('tdom-edit-hit') &&
-            !node.classList.contains('chunkwin')
-          );
-          // Rescue/source-hit rectangles can cover a whole tcolorbox. They
-          // are useful for click mapping but too broad for a precise jump.
-          // So is an exact-render chunk: its window is the whole block as a
-          // strip up to three pages wide, and every line of a box drawn
-          // only as a chunk was marked with that strip. Such a line keeps
-          // the Build's SyncTeX box.
-          if (!ink.length) continue;
-          const rects = ink.map((node) => node.getBoundingClientRect());
-          const top = Math.min(...rects.map((rect) => rect.top));
-          const bottom = Math.max(...rects.map((rect) => rect.bottom));
-          const viewport = pagesEl.getBoundingClientRect();
-          pagesEl.scrollTo({
-            top: Math.max(0, pagesEl.scrollTop + (top + bottom) / 2 - viewport.top - pagesEl.clientHeight / 2),
-            behavior: 'auto',
-          });
-          if (wantsMarker) {
-            // The live paper's own ink for that line beats the last Build's
-            // SyncTeX box: it already reflects unsaved edits.
-            const pageRect = page.getBoundingClientRect();
-            const placed = ink.map((node) => node.getBoundingClientRect());
-            const left = Math.min(...placed.map((rect) => rect.left));
-            const right = Math.max(...placed.map((rect) => rect.right));
-            const inkTop = Math.min(...placed.map((rect) => rect.top));
-            const inkBottom = Math.max(...placed.map((rect) => rect.bottom));
-            placeSyncMarker(page, {
-              left: left - pageRect.left - 2, top: inkTop - pageRect.top - 1,
-              width: right - left + 4, height: inkBottom - inkTop + 2,
-            });
+          if (page.classList.contains('is-final')) continue;
+          for (const node of page.querySelectorAll(`[data-src="${CSS.escape(String(block.id))}"][data-line]`)) {
+            const rect = node.getBoundingClientRect();
+            if (!(rect.width > 0 && rect.height > 0)) continue;
+            const ink = !node.classList.contains('tdom-source-hit') && !node.classList.contains('tdom-edit-hit') &&
+              !node.classList.contains('chunkwin') && ['text', 'tspan', 'use'].includes(node.tagName?.toLowerCase());
+            candidates.push({ page, node, ink, distance: Math.abs(Number(node.dataset.line) - relativeLine) });
           }
-          scheduleEmbedSnapshot();
-          return true;
         }
+        candidates.sort((a, b) => a.distance - b.distance || Number(b.ink) - Number(a.ink));
+        const first = candidates[0];
+        if (!first) continue;
+        const nodes = candidates.filter(c => c.page === first.page && c.distance === first.distance && c.ink === first.ink);
+        const rects = nodes.map(c => c.node.getBoundingClientRect());
+        const top = Math.min(...rects.map(r => r.top)), bottom = Math.max(...rects.map(r => r.bottom));
+        const pageRect = first.page.getBoundingClientRect();
+        const scale = pageRect.height / activePaperGeometry(first.page).height;
+        const knownInk = first.ink && first.distance === 0 && Number(first.page.dataset.provRev) === srcRev;
+        scrollPageToViewport(first.page, (knownInk ? (top + bottom) / 2 - pageRect.top : top - pageRect.top) / scale, true);
+        if (wantsMarker) {
+          const rect = first.node.getBoundingClientRect(), paperRect = first.page.getBoundingClientRect();
+          placeSyncMarker(first.page, knownInk ? {
+            left: Math.min(...rects.map(r => r.left)) - pageRect.left - 2,
+            top: top - pageRect.top - 1,
+            width: Math.max(...rects.map(r => r.right)) - Math.min(...rects.map(r => r.left)) + 4,
+            height: bottom - top + 2,
+          } : { left: rect.left - paperRect.left, top: rect.top - paperRect.top, width: 20, height: 20 }, false);
+        }
+        estimated = true;
+        break;
+      }
+      if (!estimated && wantsMarker) clearSyncMarker();
+      let hit = null, awaitingPage = null;
+      while (current()) {
+        if (hit && canonical?.rev === srcRev && canonical.id !== hit.id) hit = null;
+        if (!hit) {
+          try {
+            const response = await fetch('/synctex/jump', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ file, line, documentEpoch, srcRev }),
+            });
+            if (!response.ok) return false;
+            const result = await response.json();
+            if (!current()) return false;
+            if (result.documentEpoch !== documentEpoch || result.srcRev !== srcRev) return false;
+            if (result.boxes?.length) hit = result;
+            else if (!result.pending) return false;
+            else requestCanonicalDisplay({ residentImpossible: true });
+          } catch { return false; }
+        }
+        if (hit) {
+          const page = pageDivs.get(Number(hit.page));
+          const boxes = hit.boxes;
+          const y = (Math.min(...boxes.map(b => b.top)) + Math.max(...boxes.map(b => b.bottom))) / 2;
+          if (page && awaitingPage !== page) {
+            awaitingPage = page;
+            scrollPageToViewport(page, y, true);
+            updateCanonState(Number(hit.page));
+          }
+          // A new mapping must not be painted on old canonical pixels or on
+          // a resident pagination that the authority has yet to replace.
+          if (syncPaperCurrent(page, srcRev, hit.id)) {
+            scrollPageToViewport(page, y, true);
+            if (wantsMarker) {
+              const scale = page.clientWidth / activePaperGeometry(page).width;
+              placeSyncMarker(page, boxes.map(b => ({ left: b.left * scale - 2, top: b.top * scale - 1,
+                width: (b.right - b.left) * scale + 4, height: (b.bottom - b.top) * scale + 2 })), true);
+            }
+            return true;
+          }
+        }
+        await new Promise(resolve => setTimeout(resolve, 250));
       }
       return false;
     };
@@ -6903,7 +6937,7 @@ pagesEl.addEventListener('scroll', () => {
       syncMarkerTimer = null;
       for (const node of document.querySelectorAll('.tdom-sync-marker')) node.remove();
     };
-    const placeSyncMarker = (page, boxOrBoxes) => {
+    const placeSyncMarker = (page, boxOrBoxes, exact = true) => {
       clearSyncMarker();
       const boxes = (Array.isArray(boxOrBoxes) ? boxOrBoxes : [boxOrBoxes])
         .filter((box) => box && box.width > 0 && box.height > 0);
@@ -6911,6 +6945,7 @@ pagesEl.addEventListener('scroll', () => {
       for (const box of boxes) {
         const marker = document.createElement('div');
         marker.className = 'tdom-sync-marker';
+        marker.dataset.exact = String(exact);
         marker.style.left = `${box.left}px`;
         marker.style.top = `${box.top}px`;
         marker.style.width = `${box.width}px`;
@@ -6921,6 +6956,7 @@ pagesEl.addEventListener('scroll', () => {
     };
     dismissSyncMarker = () => {
       syncRefineGeneration += 1;
+      syncScrollTop = null;
       if (syncMarkerTimer !== null) clearSyncMarker();
     };
     for (const type of ['wheel', 'pointerdown', 'touchstart']) {
@@ -6963,12 +6999,16 @@ pagesEl.addEventListener('scroll', () => {
       scrollPageToViewport(page, Number.isFinite(y) ? y : 0, true);
       embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
       const wantsMarker = data.marker !== false;
-      if (wantsMarker) placeSyncMarker(page, syncBlockBox(page, data));
+      clearSyncMarker();
+      if (wantsMarker && !data.sourceFile) placeSyncMarker(page, syncBlockBox(page, data));
       syncRefineGeneration += 1;
       void refineSyncToSource(data, wantsMarker);
       requestAnimationFrame(scheduleEmbedSnapshot);
     };
-    pagesEl.addEventListener('scroll', scheduleEmbedSnapshot, { passive: true });
+    pagesEl.addEventListener('scroll', () => {
+      if (syncScrollTop !== null && Math.abs(pagesEl.scrollTop - syncScrollTop) > 1) dismissSyncMarker();
+      scheduleEmbedSnapshot();
+    }, { passive: true });
     window.addEventListener('message', (ev) => {
       const d = ev.data;
       if (!d || d.source !== 'tdom-host') return;

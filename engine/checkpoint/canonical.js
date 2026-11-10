@@ -46,6 +46,7 @@ import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-in
 import { pdfEditGlyphs } from './pdf-edit-geometry.js';
 import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
 import { prepareSyncTeXBatchHelper, querySyncTeXRange } from './synctex-batch.js';
+import { parseJumpText, parseJumpTsv, parseJumpRecords, jumpRecords, jumpAnchor, locateJump } from './jump-sync.js';
 
 const execFileP = promisify(execFile);
 const gunzipP = promisify(gunzip);
@@ -2073,6 +2074,63 @@ export class CanonicalRenderer {
         lines.every((_, index) => Array.isArray(groups[index])) ? groups : null;
     } catch {
       return null;
+    } finally {
+      this.#releaseGeneration(cur);
+    }
+  }
+
+  /** Jump never compiles or relabels an old PDF as the editor's revision.
+   * Its lazy index is owned (and retired) by the immutable generation. */
+  async jumpToSource({ file, line, source, rootSource = source, rev } = {}) {
+    if (!file || !Number.isInteger(line) || line < 1 || typeof source !== 'string') return null;
+    const cur = this.#acquireGeneration(null);
+    if (!cur) return null;
+    try {
+      const current = () => cur.rev === rev && this.sourceMatches(rootSource, cur.id);
+      if (!current() || !cur.synctex) return null;
+      const syncFile = existingRealpath(file);
+      if (syncFile === path.join(this.workDir, 'canon.tex')) {
+        if (source !== rootSource) return null;
+      } else if (cur.inputManifest?.get(this.#inputIdentity(syncFile)) !==
+          createHash('sha256').update(source).digest('hex')) return null;
+      cur.jumpIndex ??= (async () => {
+        const textOptions = { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 };
+        const [compressed, rows] = await Promise.all([
+          readFile(cur.synctex),
+          this.#exec('pdftotext', ['-bbox-layout', cur.pdf, '-'], textOptions).then(result => parseJumpText(result.stdout))
+            .catch(async () => parseJumpTsv((await this.#exec('pdftotext', ['-tsv', cur.pdf, '-'], textOptions)).stdout)),
+        ]);
+        if (compressed.length > 8 * 1024 * 1024) return null;
+        const sync = await gunzipP(compressed, { maxOutputLength: 32 * 1024 * 1024 });
+        return { rows, records: parseJumpRecords(sync.toString('utf8'), this.workDir) };
+      })().catch(() => null);
+      const index = await cur.jumpIndex;
+      if (!index || !current()) return null;
+      const lines = source.split(/\r?\n/);
+      let anchor = jumpAnchor(lines, line);
+      const input = this.#syncInputPath(cur, syncFile);
+      const ownRaw = anchor.line !== line ? jumpRecords(index.records, input, line) : [];
+      const raw = jumpRecords(index.records, input, anchor.line);
+      const transforms = new Map();
+      await Promise.all([...new Set([...raw, ...ownRaw].map(r => r.page))].map(async page => {
+        transforms.set(page, await this.#syncContentTransform(cur, page));
+      }));
+      const displayed = records => records.flatMap(record => {
+        const transform = transforms.get(record.page);
+        if (!transform) return [];
+        const box = record.box ?? { left: record.x, right: record.x, top: record.y, bottom: record.y };
+        return [{ ...record, ...syncTeXResultToDisplayed({ ...record, box }, cur.papers?.[record.page - 1], transform) }];
+      });
+      // Opening/rule lines can carry their own title, caption or table row.
+      // Only an inkless line borrows the neighbouring source anchor.
+      let hit = anchor.line !== line && locateJump(index.rows, lines[line - 1] ?? '', displayed(ownRaw), false, true);
+      if (hit) anchor = { line, toEnd: false };
+      else hit = locateJump(index.rows, lines[anchor.line - 1] ?? '', displayed(raw), anchor.toEnd);
+      if (!hit) {
+        const candidates = await this.forwardSyncAll({ file: syncFile, line: anchor.line, column: 1, id: cur.id });
+        hit = locateJump(index.rows, lines[anchor.line - 1] ?? '', candidates.map(c => ({ ...c, ink: true })), anchor.toEnd);
+      }
+      return current() && hit ? { ...hit, id: cur.id, srcRev: rev, line: anchor.line } : null;
     } finally {
       this.#releaseGeneration(cur);
     }

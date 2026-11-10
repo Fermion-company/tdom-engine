@@ -74,6 +74,7 @@ canonical は aux fixed point を最大 3 pass で追う。`GET /pdf` は checkp
 | `POST /edit` | `{start,end,text}` の範囲編集 |
 | `POST /open` | source/template で文書を開き直す |
 | `GET /dom` | engine 観測用 JSON |
+| `POST /synctex/jump` | 現在の source revision と document epoch に一致する canonical PDF 上の行位置 |
 | `GET /canonical/:n.svg?c=<id>` | canonical page SVG |
 | `GET /ship/:n.svg?g=<gen>&r=<srcRev>` | shipping chain の page SVG |
 | `GET /chunk/:id.svg` | exact chunk SVG |
@@ -85,6 +86,13 @@ canonical は aux fixed point を最大 3 pass で追う。`GET /pdf` は checkp
 | `GET /status` | queue/canonical/mode の lightweight status |
 
 フロントエンドは `web/` 配下にあり、DOM chunk を絶対配置に近い形で描画する。UI の仕様はこの engine docs の対象外である。
+
+Jump の行位置は `jump-sync.js` が同一 canonical generation の SyncTeX leaf と PDF の文字行から解決する。
+macro が本文をまとめて読んで閉じ行に記録した場合は PDF 内の literal text で区別し、同じ文面が複数ある場合は
+SyncTeX の位置で絞る。索引は最初の Jump 時に作り、generation と一緒に破棄する。打鍵処理には追加しない。
+開始・罫線行でも自身の見出しやセルの文字を先に照合し、文字がない場合に隣接行を使う。表は同じ行のセルを
+まとめ、引用・脚注と本文のように離れた文字も同じソース行なら保持する。空行・終了行は本文の連続した文字列の末尾を使う。
+viewer は精密な位置と表示中の紙面の版を照合し、未完了時は現在のブロックを仮の位置として使う。
 
 ## 2.6 テストの地図
 

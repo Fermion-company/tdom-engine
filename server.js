@@ -2246,6 +2246,25 @@ const server = http.createServer(async (req, res) => {
         ...(refined ? { refinedByText: true } : {}),
       });
     }
+    if (req.method === 'POST' && url.pathname === '/synctex/jump') {
+      const body = JSON.parse(await readBody(req));
+      const epoch = documentEpoch, rev = engine.srcRev;
+      const file = canonicalInputForProjectFile(body.file);
+      const line = Number(body.line);
+      if (!file || !Number.isSafeInteger(line) || line < 1) return json(res, { error: 'invalid source location' }, 400);
+      const pending = () => ({ pending: true, documentEpoch, srcRev: engine.srcRev });
+      if (pendingDocumentReset || engineBusy || Number(body.documentEpoch) !== epoch || Number(body.srcRev) !== rev) {
+        return json(res, pending());
+      }
+      const rootSource = engine.getSource();
+      const projectFile = path.resolve(activeProject.docDir, body.file);
+      let source = projectFile === path.resolve(activeProject.filePath) ? rootSource : projectInputOverride(projectFile);
+      if (source == null) { try { source = readFileSync(projectFile, 'utf8'); } catch { return json(res, { found: false }); } }
+      const hit = await engine.canonical.jumpToSource({ file, line, source, rootSource, rev });
+      if (documentEpoch !== epoch || engine.srcRev !== rev || engineBusy || pendingDocumentReset) return json(res, pending());
+      if (hit) return json(res, { ...hit, documentEpoch: epoch });
+      return json(res, { ...pending(), pending: engine.canonical.info().errorRev !== rev && !engine.canonical.sourceMatches(rootSource) });
+    }
     if (req.method === 'POST' && url.pathname === '/synctex/forward') {
       const body = JSON.parse(await readBody(req));
       const locations = Array.isArray(body.locations) ? body.locations.slice(0, 24) : [];
