@@ -142,6 +142,7 @@ import {
   buildVolatilePrelude,
 } from './tex-templates.js';
 import { isoCompile as isoCompileHelper } from './iso-compile.js';
+import { rescueWaitMs, waitForRescueChange, wakeRescues } from './rescue-scheduling.js';
 import { fnv1a } from '../hash.js';
 import { buildJobBlockBody } from './job-body.js';
 import { classifyPlainPreviewEdit } from './plain-preview.js';
@@ -332,7 +333,10 @@ export class CheckpointEngine {
     const targetId = this.blocks[target].id;
     // and bring the caret page's queued rescues to the front of the pump
     const focus = focusRescueIds(this.pages, new Set([targetId]), this.rescueQueue);
-    if (focus.size) this.rescueFocus = focus;
+    if (focus.size) {
+      this.rescueFocus = focus;
+      wakeRescues(this);
+    }
     const pageIds = new Set(this.pages.filter(page => page.draw?.some(draw => draw.u?.blockId === targetId))
       .flatMap(page => page.draw.map(draw => draw.u?.blockId)));
     const missing = this.blocks.map((block, index) => ({ block, index })).filter(({ block }) =>
@@ -1984,6 +1988,7 @@ export class CheckpointEngine {
           this.updating = false;
           this.foregroundRenderIds = null;
           this.progress = null; // /status liveness marker
+          wakeRescues(this);
         }
       });
       if (documentResetPending) this.onDocumentResetComplete?.({ report });
@@ -2468,12 +2473,9 @@ export class CheckpointEngine {
             // re-typesets the same path, and the resume would only re-show
             // the held galley (tex64-internal #94: 2.4-3.0 s edits waited
             // for it).
-            const resumeOnlyFor = this.coldDirty.size > 0 && [...this.coldDirty].every((id) => id === bid);
-            const coldAhead = (this.coldDirty.size > 0 || this.pendingChain?.kind === 'cold') && !resumeOnlyFor;
-            const waiting = this.editPending > 0 || coldAhead ||
-              !this.rescueFocus.has(bid) && Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800);
-            if (!waiting) break;
-            await new Promise((r) => setTimeout(r, 200));
+            const waitMs = rescueWaitMs(this, bid);
+            if (!waitMs) break;
+            await waitForRescueChange(this, waitMs);
           }
           await withReplaceablePreviewJob(this, 'async-rescue', async () => {
             // Keep the latest-wins entry while the Build gate is closed. A

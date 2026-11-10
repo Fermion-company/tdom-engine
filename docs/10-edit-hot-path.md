@@ -212,6 +212,10 @@ label が動いたとき、後方で定義された label を前方 block が参
 
 現行実装は foreground で長い re-rescue chain を走らせない。`#queueMovedOffsets()` が offset 差分を見て rescue queue に積み、exact pipeline が async に fixed point へ近づける。表示中は stale galley/chunk と canonical overlay が残る。
 
+rescue pump は一度に一件だけ処理する。編集・caret の対象ページの rescue は quiet gate を通らず、foreground 完了と caret focus の更新で待機を即座に解除する（`rescue-scheduling.js`）。起床後に対象 id と最新の cache key を読み直し、待機中の編集や別 block の cold resume があれば再び譲る。backlog は従来の800ms（有効な shipping baseline があれば shipping 優先窓）を保持する。200ms の poll は通知のない状態変更のための上限であり、編集完了後に必ず払う待ち時間ではない。
+
+multicols の内側は段落や textbox ごとに分割せず、一つの layout block として実 output routine で組み直す。この rescue は resident RENDER の120ms gate、isolated **render** の3秒 gateとは別経路である。救済PDFが完了した後の SVG 変換は `iso-pages.js` の2レーンで処理し、全ページが揃ってから従来どおり galley/chunk を採択する。変換失敗時も実行中のもう一件を待ってから失敗を返すため、cold retry やディレクトリ削除と競合しない。ページ数によらず converter は最大2本、ISO組版は直列のままである。
+
 ## 10.9 壊れた TeX の凍結と決定性の境界
 
 chain と isolated rescue の両方に失敗する block（実 LuaLaTeX 自身が emergency stop するソース — 例: tikz node 内の壊れた色名が pgf 内部でカスケードして子プロセスを殺す）は `#brokenBlockGalley()` で凍結する。未閉鎖の条件文のような軽い破壊は daemon が job 境界で回復するので、ここには来ない。凍結は二形態ある。

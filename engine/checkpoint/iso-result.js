@@ -1,10 +1,6 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { readFileSync, rmSync } from 'node:fs';
-import path from 'node:path';
 import { cropSvg, cropSvgAt } from './util/svg.js';
-
-const execFileP = promisify(execFile);
+import { renderIsoPages } from './iso-pages.js';
 
 export async function readIsoCompileResult(
   engine,
@@ -29,6 +25,7 @@ export async function readIsoCompileResult(
     throw new Error(msg);
   }
   const ships = st.ships ?? 0;
+  const svgPaths = await renderIsoPages(jobdir, pdf, ships + 1);
   const geo = engine.geometry ?? {};
   const chunks = [];
   const items = [];
@@ -43,11 +40,7 @@ export async function readIsoCompileResult(
   // output-hijack env): one full-textheight chunk per page + a forced
   // break — the preview page sequence mirrors print exactly
   for (let k = 1; k <= ships; k++) {
-    const svgPath = path.join(jobdir, `page-${k}.svg`);
-    await execFileP('pdftocairo', ['-svg', '-f', String(k), '-l', String(k), pdf, svgPath], {
-      timeout: 30_000,
-    });
-    const svg = readFileSync(svgPath, 'utf8');
+    const svg = readFileSync(svgPaths[k - 1], 'utf8');
     // A BLANK shipped page is a break, not content: with the real output
     // routine in place (\includepdf), the leading \clearpage ships the
     // near-empty current page — in the full document that position is
@@ -107,13 +100,7 @@ export async function readIsoCompileResult(
   }
   // remainder galley = the LAST pdf page (our manual shipout); its items
   // carry chunk-local offsets so page breaks inside it clip correctly
-  const lastPage = ships + 1;
-  const svgPath = path.join(jobdir, 'iso.svg');
-  await execFileP(
-    'pdftocairo',
-    ['-svg', '-f', String(lastPage), '-l', String(lastPage), pdf, svgPath],
-    { timeout: 30_000 }
-  );
+  const svgPath = svgPaths[ships];
   const remainderKey = block.id;
   if ((st.h ?? 0) + (st.d ?? 0) > 0.01) {
     // the remainder ships padded by the paper's side margins (padl/padr,
