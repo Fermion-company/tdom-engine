@@ -27,7 +27,7 @@ const eng = new CheckpointEngine({ workDir: work, docDir: path.dirname(file) });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const summary = values => {
   const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
-  return sorted.length ? Object.fromEntries([50, 90, 100].map(p =>
+  return sorted.length ? Object.fromEntries([50, 90, 95, 100].map(p =>
     [p === 100 ? 'max' : `p${p}`, Math.round(percentile(sorted, p))])) : null;
 };
 const at = (text, fraction) => {
@@ -61,6 +61,7 @@ try {
     publish: 'caretPublishMs/lastPublishMs: fresh edited blocks in actual patches; *PagePublishMs: paintable whole pages or canonical events; excludes browser paint', timeoutMs }));
   for (const fractions of [[0.5], [0.2, 0.5], [0.2, 0.5, 0.8], [0.8, 0.5, 0.2]]) {
     const walls = [], caretTimes = [], lastTimes = [], typed = [], rebuilt = [], typesetMs = [];
+    const walks = [];
     let missed = 0, pageMissed = 0, priority = 0;
     const caretPageTimes = [], lastPageTimes = [];
     const channels = { resident: 0, canonical: 0 };
@@ -88,6 +89,7 @@ try {
       const report = await eng.edit(positions[0], positions.at(-1),
         next.slice(positions[0], positions.at(-1) + positions.length));
       const finished = performance.now();
+      if (args.includes('--raw')) walks.push(structuredClone(eng.lastWalkTrace));
       walls.push(finished - sample.started);
       typed.push(report.stats.blocksTypeset);
       rebuilt.push(report.stats.pagesRebuilt);
@@ -124,7 +126,8 @@ try {
       unpublishedWithinTimeout: missed, publicationChannels: channels, caretSamples: caretTimes.length, lastSamples: lastTimes.length,
       blocksTypesetP50: summary(typed)?.p50, pagesRebuiltP50: summary(rebuilt)?.p50,
       typesetMsP50: summary(typesetMs)?.p50, totalNativeJobs: jobs - jobsBefore,
-      nativeJobsPerEdit: (jobs - jobsBefore) / keys }));
+      nativeJobsPerEdit: (jobs - jobsBefore) / keys,
+      ...(args.includes('--raw') ? { raw: { walls, typed, typesetMs, caretTimes, lastTimes, walks } } : {}) }));
     if (missed) process.exitCode = 1;
   }
 } finally {

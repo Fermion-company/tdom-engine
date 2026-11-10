@@ -39,6 +39,7 @@ export function preserveCheckpointSuffix({
     .filter((idx) => idx >= 0);
   const rekey = (f) => move(f)?.to ?? prefixLen;
   if (pendingChain) {
+    if (pendingChain.render) pendingChain.render.from = rekey(pendingChain.render.from);
     if (pendingChain.through != null) pendingChain.through = rekey(pendingChain.through);
     pendingChain.from = rekey(pendingChain.from);
     // the settle/rebuild a cold walk carries starts from a block index too

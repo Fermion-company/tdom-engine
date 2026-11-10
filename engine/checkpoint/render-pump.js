@@ -37,7 +37,7 @@ export function preemptResidentRenders(engine) {
  * storm — CPU saturation slows the resident fork jobs by orders of
  * magnitude), paused while a foreground update runs.
  */
-export function queueRender(engine, blockId, callbacks, { interactiveRev = null } = {}) {
+export function queueRender(engine, blockId, callbacks, { interactiveRev = null, propagation = false } = {}) {
   // audits compare block identity (galleyHash + stateVec) — the exact
   // preview chunks the RENDER tier produces never enter the equation,
   // while its fork holds cost ~500MB each on Linux (the Lua GC dirties
@@ -50,7 +50,8 @@ export function queueRender(engine, blockId, callbacks, { interactiveRev = null 
   const currentInteractive = currentRev !== null &&
     (interactiveRev === currentRev || previous?.interactiveRev === currentRev) ? currentRev : null;
   engine.renderWant.delete(blockId); // re-insertion moves it to the back = newest
-  engine.renderWant.set(blockId, { interactiveRev: currentInteractive });
+  engine.renderWant.set(blockId, { interactiveRev: currentInteractive,
+    propagation: propagation || previous?.propagation || false });
   if (currentInteractive !== null) {
     if (engine.interactiveRenderCohort?.rev !== currentInteractive) {
       engine.interactiveRenderCohort = {
@@ -74,12 +75,15 @@ function pumpRenders(engine, callbacks) {
           await new Promise((r) => setTimeout(r, 25));
           continue;
         }
+        // Propagation owns a live JOB/CAPTURE boundary until its pixels
+        // land; serve it before that owner is lost to another keystroke.
+        // It shares these same lanes with the foreground cohort.
         // The foreground's complete cohort supplies the next editable ink.
         // Prioritize it over newer cold work, including changed neighbors
         // needed by the viewer's atomic page commit. Backlog retains the
         // shipping priority window; an edit only waits for its own debounce.
         if (engine.closed) break;
-        let id, interactive = false;
+        let id, interactive = false, propagation = false, priority = -1;
         // A block already rendering (a held render the keystroke spared,
         // #103) would park this lane behind it: take another block's first,
         // and queue behind it only when every queued block is rendering.
@@ -88,9 +92,12 @@ function pumpRenders(engine, callbacks) {
             if (skipBusy && engine.renderBusy?.has(candidate)) continue;
             const current = Number.isSafeInteger(queued?.interactiveRev) && queued.interactiveRev > 0 &&
               queued.interactiveRev === engine.srcRev;
-            if (current || !interactive) {
+            const rank = queued?.propagation ? 2 : current ? 1 : 0;
+            if (rank > priority || (rank === priority && rank < 2)) {
               id = candidate;
               interactive = current;
+              propagation = !!queued?.propagation;
+              priority = rank;
             }
           }
           if (id !== undefined) break;
@@ -99,13 +106,13 @@ function pumpRenders(engine, callbacks) {
         // machine with the current edit's own render: the page being typed on
         // waits for that one.
         const cohort = engine.interactiveRenderCohort;
-        if (!interactive && cohort?.rev === engine.srcRev && cohort.active.size > 0) {
+        if (!interactive && !propagation && cohort?.rev === engine.srcRev && cohort.active.size > 0) {
           await new Promise((r) => setTimeout(r, 25));
           continue;
         }
         const configuredQuiet = Number(process.env.TDOM_RENDER_QUIET_MS ?? 120);
         const renderQuiet = Number.isFinite(configuredQuiet) ? Math.max(0, configuredQuiet) : 120;
-        const quietMs = interactive ? renderQuiet : shippingPriorityQuietMs(engine, renderQuiet);
+        const quietMs = propagation ? 0 : interactive ? renderQuiet : shippingPriorityQuietMs(engine, renderQuiet);
         const remaining = quietMs - (Date.now() - (engine.lastEditAt ?? 0));
         if (remaining > 0) {
           await new Promise((r) => setTimeout(r, Math.min(25, remaining)));
@@ -140,7 +147,9 @@ function pumpRenders(engine, callbacks) {
               // An edit pre-empted it; its page still waits for these pixels
               // (typically the previous keystroke's). Only queued ids survive
               // preemption, so put it back behind the edit's own cohort.
-              else if (!engine.renderWant.has(id)) engine.renderWant.set(id, { interactiveRev: null });
+              else if (!engine.renderWant.has(id)) engine.renderWant.set(id, {
+                interactiveRev: null, propagation: !!queued.propagation,
+              });
               return false;
             });
             if (cohort && !ready) cohort.unavailable = true;

@@ -117,6 +117,7 @@ import {
   enforceCheckpointCap as enforceCheckpointCapHelper,
   retireOffGrid as retireOffGridHelper,
   sharedCheckpointBudget,
+  propagationCheckpointHold,
 } from './checkpoint-retirement.js';
 import {
   bootShipping as bootShippingHelper,
@@ -766,7 +767,7 @@ export class CheckpointEngine {
       // the pump takes it only for this galley (render-pump.js)
       if (early) galley.tdomEarlyRender = early;
       // the pump's own RENDER of this galley uses the same label definitions
-      if (!override && !ck.vstale) galley.tdomRenderPrelude = jobPrelude;
+      if (!override) galley.tdomRenderPrelude = jobPrelude;
       return galley;
     } catch (err) {
       early?.discard();
@@ -1621,7 +1622,7 @@ export class CheckpointEngine {
       editHold: [0, ...this.editHold, ...active, ...(continuation === null ? [] : [continuation])],
       coveragePins: this.editHold,
       renderHold: this.renderHold,
-      activeHold: [...activeRender, ...this.#coldPreviewHeld()],
+      activeHold: [...activeRender, ...this.#coldPreviewHeld(), ...propagationCheckpointHold(this.pendingChain)],
       maxPeers: budget.residentLimit,
       dyingPids: this.dyingPids,
     });
@@ -1637,7 +1638,7 @@ export class CheckpointEngine {
       idx,
       keep: this.#checkpointKeepSet(),
       checkpoints: this.checkpoints,
-      editHold: [...this.editHold, ...this.#coldPreviewHeld()],
+      editHold: [...this.editHold, ...this.#coldPreviewHeld(), ...propagationCheckpointHold(this.pendingChain)],
       renderHold: this.renderHold,
       block: this.foregroundRenderIds && !this.foregroundRenderIds.has(this.blocks[idx]?.id)
         ? null : this.blocks[idx],
@@ -2779,7 +2780,7 @@ export class CheckpointEngine {
       nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
       typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),
       adoptGalley: (block, galley) => this.#adoptGalley(block, galley),
-      queueRender: (blockId) => this.#queueRender(blockId),
+      queueRender: (blockId, options) => this.#queueRender(blockId, options),
       asyncRepaginate: () => this.#asyncRepaginate(),
       chainAfterPass: (work) => this.#chainAfterPass(work),
       enforceCheckpointCap: () => this.#enforceCheckpointCap(),

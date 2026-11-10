@@ -194,6 +194,10 @@ body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironm
 
 settle は再開位置 `from` に加え、合流した伝播の最も後ろの未検証位置 `through` を保持する。新しい仕事との合流では `from` の最小値と `through` の最大値を残し、両方を編集による index 変更と cold carry に引き継ぐ。収束は両位置を通過してから判定する。早い位置で再現できた clean block だけでは、離れた後続の伝播が完了した証拠にならない。`from` の境界が退役していると pass はその手前の checkpoint から再生するが、そこで galley と exit state が一致しても、foreground が更新済みの block を再現しただけで、動いた state が収まった証拠にはならない（cold resume が何度か走ると、その pin が `editHold` から押し出されて起きる）。
 
+`settle` / `rebuild` の blocks phase は `from` の continuation を所有し、cap と off-grid 回収の両方から保護する（`propagationCheckpointHold`）。Shipping 有効時は共有予算の optional coverage を先に減らし、無効時は既存の grid・edit/render hold に追加して保持する。次の編集がページ内の境界で `editHold` の 8 枠を埋めても、この所有権は残る。数値の `from` だけを保存すると、その continuation の回収後は古い grid 境界から同じ区間を再生する。低い ceiling で打鍵間に次の grid 境界まで届かない場合、この再生が入力停止まで繰り返されていた。再生途中で中断し `from` を手前へ戻すときは、元の `from` を `through` にも残す。更新済みの prefix を再現しただけで未検証の suffix まで収束したと判定しないためである。打鍵による JOB の中断と lock の優先順位は変わらない。
+
+label が動いた伝播中に CAPTURE 可能な block の exact chunk が古い／未作成なら、`work.render` に block id・galley hash・入口境界を記録し、入口と出口を保持する。既存 render pump の `propagation` 項目は idle gate と通常の編集 cohort の待機を通らず、既存の並列数制限内で先に処理する。chain は 5ms ごとに中断を確認しながらその項目を待ち、次の打鍵が中断したら同じ所有者から再開する。CAPTURE が中断され RENDER へ戻る場合も、galley の JOB が使った volatile state・label 定義を含む prelude を再利用する。入口も出口も先に回収してしまうと、番号を更新した galley の画素が「入力停止から 3 秒後」の isolated render に回っていた。すでに foreground が galley を更新した block も、画素が古ければこの対象になる。
+
 ## 10.7 references と toc
 
 label が動いたとき、後方で定義された label を前方 block が参照していることがある。foreground 中に `pendingChain` が無ければ、ref index から候補 block を取り、必要なものだけ再組版する。
