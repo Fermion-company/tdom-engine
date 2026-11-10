@@ -466,16 +466,33 @@ export class CheckpointEngine {
   async yieldWarmForBuild({ timeoutMs = 3000 } = {}) {
     if (!this.warming) return { yielded: false, warming: false };
     this.bgAbort = true;
-    const walk = this.bgTask.catch(() => {}).then(() => 'done');
+    const task = this.bgTask;
+    if (this.buildWarmYield?.task !== task) {
+      const warmSeq = this.warmSeq, updateSeq = this.updateSeq;
+      const info = this.warmInfo;
+      const yielding = { task };
+      this.buildWarmYield = yielding;
+      void task.catch(() => {}).then(async () => {
+        // Allow the acquire handler to install its lease before resuming.
+        // This continuation also runs when the HTTP yield timed out.
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await this.canonical.waitForBuildLease();
+        if (this.closed || this.warming || this.updating || this.editPending > 0 ||
+            this.warmSeq !== warmSeq || this.updateSeq !== updateSeq) return;
+        this.bgAbort = false;
+        if (info?.sourceRev === this.srcRev && Number.isFinite(info?.offset)) {
+          await this.warmEditOffset(info.offset, info.file);
+        } else this.#kickPendingChain();
+      }).catch(err => this.diagnostics.push(err.message)).finally(() => {
+        if (this.buildWarmYield === yielding) this.buildWarmYield = null;
+      });
+    }
+    let timer;
     const outcome = await Promise.race([
-      walk,
-      new Promise((resolve) => setTimeout(() => resolve('timeout'), timeoutMs)),
+      task.catch(() => {}).then(() => 'done'),
+      new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), timeoutMs); }),
     ]);
-    // The superseded walk leaves the abort flag set (warmEditOffset and
-    // #update reset it for their own runs). Clear it here as they do, so the
-    // deferred chain is not stalled until the next edit; an update that set
-    // it meanwhile resets it again inside its own lock.
-    if (outcome === 'done' && !this.warming && !this.updating) this.bgAbort = false;
+    clearTimeout(timer);
     return { yielded: outcome === 'done', warming: this.warming };
   }
 

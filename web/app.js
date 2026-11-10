@@ -6998,7 +6998,10 @@ pagesEl.addEventListener('scroll', () => {
         : Number(data.y);
       scrollPageToViewport(page, Number.isFinite(y) ? y : 0, true);
       embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
-      const wantsMarker = data.marker !== false;
+      // A viewport handoff (the host mirroring where the static PDF was
+      // scrolled when Live takes over, e.g. at the first keystroke) is not
+      // a Jump: it carries a viewportToken and must never draw a marker.
+      const wantsMarker = data.marker !== false && typeof data.viewportToken !== 'string';
       clearSyncMarker();
       if (wantsMarker && !data.sourceFile) placeSyncMarker(page, syncBlockBox(page, data));
       syncRefineGeneration += 1;

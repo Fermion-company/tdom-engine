@@ -41,7 +41,7 @@ import {
 import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
 import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read-proof.js';
 import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
-import { buildLeasePreviewSettlement } from './engine/checkpoint/build-lease-preview.js';
+import { acquirePreviewBuildLease } from './engine/checkpoint/build-lease-preview.js';
 import { watchInclude } from './engine/checkpoint/include-expander.js';
 import { includeHoldsText, inputReadCurrent, rebindIncludeRead } from './engine/checkpoint/include-cache.js';
 import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
@@ -1854,28 +1854,13 @@ const server = http.createServer(async (req, res) => {
           ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs < 1_000 || ttlMs > 900_000)) {
         return json(res, { error: 'invalid build lease' }, 400);
       }
-      // A lease normally arrives before /open through the host's local gate.
-      // Never grant an orphaned lease after a client timeout when a reset has
-      // already entered its resident bootstrap. The host retries this explicit
-      // busy response before spawning TeX; old/unreachable engines remain its
-      // separate compatibility fallback.
-      if (!pendingDocumentReset && !engine.shipBooting && engine.warming) {
-        // A caret warm walk (up to tens of seconds on a long document) is
-        // resumable: let it stop at its next block boundary instead of
-        // making the explicit Build retry until the whole walk finishes.
-        await engine.yieldWarmForBuild?.({ timeoutMs: 3000 });
-      }
-      if (pendingDocumentReset || engine.shipBooting || engine.warming) {
-        // Name the phase so a slow Build can be attributed to the exact
-        // bootstrap stage that held its lease.
-        const blockedBy = pendingDocumentReset ? 'document-reset' : engine.shipBooting ? 'shipping-boot' : 'warming';
-        return json(res, { ok: false, acquired: false, reason: 'resident-bootstrap-active', blockedBy, retryAfterMs: 250 }, 409);
-      }
-      const result = engine.canonical.acquireBuildLease(requestId, ttlMs);
-      if (!result.acquired) return json(res, { ok: false, ...result }, result.reason === 'lease-busy' ? 409 : 503);
-      const settlement = buildLeasePreviewSettlement(result, engine.buildLeasePreviewJobs);
-      if (settlement) return json(res, settlement, 503);
-      const identity = binding.bound ? {
+      const result = await acquirePreviewBuildLease(engine, {
+        requestId, ttlMs, documentReset: () => pendingDocumentReset,
+      });
+      if (!result.acquired) return json(res, { ok: false, ...result },
+        ['lease-busy', 'resident-bootstrap-active'].includes(result.reason) ? 409 : 503);
+      const bound = buildLeaseBinding(body.projectRoot, body.mainFile)?.bound === true;
+      const identity = bound ? {
         documentEpoch,
         srcRev: engine.srcRev,
         ...engine.canonical.compilationIdentity(engine.getSource()),
@@ -1883,8 +1868,8 @@ const server = http.createServer(async (req, res) => {
       return json(res, {
         ok: true,
         ...result,
-        bound: binding.bound,
-        reason: binding.bound ? null : 'document-mismatch',
+        bound,
+        reason: bound ? null : 'document-mismatch',
         identity,
       });
     }
