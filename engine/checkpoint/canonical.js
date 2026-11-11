@@ -19,6 +19,7 @@
 //   - a failed compile (mid-typing syntax errors) keeps the last good
 //     canonical result on screen and reports the TeX error.
 
+import { projectIndexCommand } from './index-tool.js';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -1729,13 +1730,16 @@ export class CanonicalRenderer {
       const key = fnv1a(readText(idx) ?? '');
       if (this.indexToolKeys.get(ind) === key && existsSync(ind)) continue;
       const before = readText(ind);
-      const args = ['-q', '-o', path.basename(ind), path.basename(idx)];
+      // the project's own processor and style when its latexmkrc names one
+      const project = projectIndexCommand(this.docDir, idx, ind);
+      const tool = project?.command ?? 'makeindex';
+      const args = project?.args ?? ['-q', '-o', path.basename(ind), path.basename(idx)];
       try {
         await this.#exec(
-          background ? 'nice' : 'makeindex',
-          background ? ['-n', String(niceLevel), 'makeindex', ...args] : args,
+          background ? 'nice' : tool,
+          background ? ['-n', String(niceLevel), tool, ...args] : args,
           {
-            cwd: path.dirname(idx),
+            cwd: project?.cwd ?? path.dirname(idx),
             timeout: INDEX_TOOL_TIMEOUT_MS,
             maxBuffer: 16 * 1024 * 1024,
             env: withProjectInputs(process.env, { docDir: this.docDir, overlayDir: this.overlayDir, recursive: true }),
@@ -1775,7 +1779,11 @@ export class CanonicalRenderer {
         args,
         {
           cwd: this.docDir,
-          timeout: Number(process.env.TDOM_CANON_TIMEOUT || 300_000),
+          // One pass of a 389-page book takes about three minutes alone and
+          // longer at background priority beside the resident boot; at five
+          // minutes it was killed every time and the document never got a
+          // canonical page (Live stayed off for the whole session).
+          timeout: Number(process.env.TDOM_CANON_TIMEOUT || 900_000),
           maxBuffer: 64 * 1024 * 1024,
           env: withProjectInputs(process.env, {
             docDir: this.docDir,
