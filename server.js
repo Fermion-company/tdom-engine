@@ -944,6 +944,18 @@ engine.onAsyncPatches = (partial) => {
   if (domCache) domCache.dirty = true;
   broadcast({ kind: 'patches', rev: partial.rev, fonts: partial.fonts, patches: partial.patches });
 };
+// The index canonical made reached the resident job (engine-v3.js
+// #syncResidentIndex): typeset the index block now and publish it.
+engine.onResidentInputChange = () => {
+  withEngine(async () => {
+    if (!engine.refreshResidentInputs) return lastReport;
+    lastReport = await engine.refreshResidentInputs();
+    broadcast({ kind: 'update', report: lastReport });
+    return lastReport;
+  }).catch((error) => {
+    console.warn('[tdom] resident input refresh failed:', error?.message || error);
+  });
+};
 engine.onExternalChange = (changedInput) => {
   const changedFile = typeof changedInput === 'string' ? path.resolve(changedInput) : null;
   if (diskChangeShadowedByOverlay(activeProject, changedFile)) return;

@@ -2439,7 +2439,14 @@ export class CheckpointEngine {
       const staged = `${target}.${process.pid}.tmp`;
       writeFileSync(staged, next, 'utf8');
       renameSync(staged, target);
-    } catch { /* the resident keeps its last index; canonical still shows the right one */ }
+    } catch { return; /* the resident keeps its last index; canonical still shows the right one */ }
+    // Typeset the index now, as a changed project input, instead of on the
+    // next keystroke: until it is in, the resident paper is pages shorter
+    // than canonical and the first edits after opening a book could not be
+    // shown (and the keystroke itself paid for the index).
+    if (this.blocks.some((block) => /\\printindex\b/.test(block.text))) {
+      setTimeout(() => { if (!this.closed) this.onResidentInputChange?.(target); }, 0);
+    }
   }
 
   async #cropCanonicalChunks(info) {
@@ -2990,6 +2997,17 @@ export class CheckpointEngine {
     announceResourceReads(this.resourceReads, [...changed, ...removed]);
     this.canonical.invalidateInputs(projectInputChanges);
     return this.#update({ editLabel: 'external-include', projectInputChanges });
+  }
+
+  /** Re-read what only the resident job reads (driver.ind): the source and
+   * the project's files are unchanged, so canonical is left alone — telling
+   * it otherwise made it compile again, deliver the same index and ask for
+   * this refresh once more. */
+  async refreshResidentInputs() {
+    return this.#update({
+      editLabel: 'resident-input',
+      projectInputChanges: { changed: [], removed: [], unknown: false },
+    });
   }
 
   invalidateProjectInputs(paths = []) {
