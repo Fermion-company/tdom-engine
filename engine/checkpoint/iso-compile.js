@@ -1,5 +1,5 @@
 import { importPathTeX } from './subfile.js';
-import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { prepareIsoCompileJob } from './iso-context.js';
 import { readIsoCompileResult } from './iso-result.js';
@@ -43,6 +43,17 @@ export async function isoCompile(
   rmSync(pdf, { force: true });
   rmSync(statePath, { force: true });
   writeFileSync(path.join(jobdir, 'iso.tex'), isoTex);
+  // \printindex reads \jobname.ind beside the job: the index canonical made
+  // (engine-v3.js #syncResidentIndex), under both names an isolated run has.
+  if (/\\printindex\b/.test(block.text)) {
+    const index = path.join(engine.workDir, 'driver.ind');
+    for (const name of ['iso.ind', 'driver.ind']) {
+      try {
+        if (existsSync(index)) copyFileSync(index, path.join(jobdir, name));
+        else rmSync(path.join(jobdir, name), { force: true });
+      } catch { /* the block prints without an index, as on a first run */ }
+    }
+  }
   if (ck0) {
     const forked = await runForkIsoCompile(engine, {
       ck0,

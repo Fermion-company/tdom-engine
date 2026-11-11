@@ -16,6 +16,11 @@ function trailingGlueKey(blocks, idx) {
   return `${g.widthSp}/${g.stretchSp}/${g.shrinkSp}/${g.stretchOrder}/${g.shrinkOrder}`;
 }
 
+// An index block's text never changes while its index does: the block hash
+// carries the .ind's signature (include-expander.js), so a result compiled
+// with yesterday's index is not found for today's.
+const readsIndex = (block) => (/\\printindex\b/.test(block.text) ? [block.hash ?? ''] : []);
+
 /**
  * The rescue cache key carries every input the isolated compile depends
  * on: the block text, the previous block's exit state, the preamble, the
@@ -31,7 +36,7 @@ export function rescueCacheKey(block, idx, { blocks, labelTable, preHash }) {
   // same 0.25bp quantum as the iso strut — see #isoCompile
   const pageOff = Math.round((block.pageOffset ?? 0) * 4) / 4;
   return fnv1a(
-    JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, refVals, pageOff, trailingGlueKey(blocks, idx)])
+    JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, refVals, pageOff, trailingGlueKey(blocks, idx), ...readsIndex(block)])
   );
 }
 
@@ -42,7 +47,7 @@ export function rescueCacheKey(block, idx, { blocks, labelTable, preHash }) {
  * then re-rescues the block if the offset it lands on differs.
  */
 export function rescueBaseKey(block, idx, { blocks, preHash }) {
-  return fnv1a(JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, trailingGlueKey(blocks, idx)]));
+  return fnv1a(JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, trailingGlueKey(blocks, idx), ...readsIndex(block)]));
 }
 
 export function isoCacheGet(isoCache, key) {

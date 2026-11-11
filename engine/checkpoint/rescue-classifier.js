@@ -22,8 +22,11 @@ import { stripComments } from './safety.js';
 // algorithm[H] is exempt: an H placement never enters the float queue (it
 // typesets inline like any box), so the fast path already shows it — only
 // FLOATING algorithm blocks need the rescue.
+// \printindex reads an environment the source does not show: theindex is
+// \twocolumn in the standard classes and multicols in most others, pages
+// of it. On the dormant page it came out as one unbroken column set.
 const OUTPUT_HIJACK_RE =
-  /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded|wrapfigure|wraptable|sidewaysfigure|sidewaystable)\}|\\begin\{algorithm\*?\}(?!\[[^\]]*H)|\\begin\{tcolorbox\}\[[^\]]*breakable|\\includepdf\b/;
+  /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded|wrapfigure|wraptable|sidewaysfigure|sidewaystable)\}|\\begin\{algorithm\*?\}(?!\[[^\]]*H)|\\begin\{tcolorbox\}\[[^\]]*breakable|\\includepdf\b|\\printindex\b/;
 
 // Ordinary forced breaks are retained by the native output absorb, including
 // material before/after the break. Isolating them loses page context and can

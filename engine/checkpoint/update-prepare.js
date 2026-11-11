@@ -18,6 +18,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   const bounds = documentBounds(text);
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
   engine.literalEnvs = bounds.literalEnvs;
+  engine.documentConditionals = bounds.conditionals ?? null;
   const preHash = fnv1a(preamble);
 
   // Keep both the old page tree and its block boundaries while the user is
@@ -80,8 +81,11 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
     ...expandedStructuralGate.shippingExactUses,
   ];
   if (engine.blocks.length) {
+    let carried = 0;
     for (const seg of segs) {
-      const closure = sourceClosure(seg.text, { literalEnvs: bounds.literalEnvs });
+      const closure = sourceClosure(seg.text, {
+        literalEnvs: bounds.literalEnvs, documentConditionals: bounds.conditionals, carried });
+      carried = closure.closed ? closure.carry ?? 0 : carried;
       if (!closure.closed) {
         timer.lap('closure');
         return {

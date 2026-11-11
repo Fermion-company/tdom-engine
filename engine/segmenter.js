@@ -36,7 +36,7 @@ const FORCED_START = /^\s*\\(par|chapter|section|subsection|subsubsection|paragr
 // \maketitle shared its block, and once that block froze every keystroke
 // there degraded to canonical-latency updates).
 const STANDALONE_LINE =
-  /^\s*\\(?:(?:maketitle|tableofcontents|listoffigures|listoftables)\s*|(?:input|include|subfile|bibliography)\s*\{[^}]+\}\s*|printbibliography\s*(?:\[[^\]]*\])?\s*)$/;
+  /^\s*\\(?:(?:maketitle|tableofcontents|listoffigures|listoftables)\s*|(?:input|include|subfile|bibliography)\s*\{[^}]+\}\s*|print(?:bibliography|index)\s*(?:\[[^\]]*\])?\s*)$|^\s*\\ifSubfilesClassLoaded\s*\{\s*\}\s*\{\s*\\printindex\s*(?:\[[^\]]*\])?\s*\}\s*$/;
 
 // Environments whose content is LITERAL: no comments, no macro calls, no
 // brace/environment structure. Without this awareness an unbalanced `{`
@@ -233,10 +233,18 @@ let boundsMemo = { text: null, value: null };
 export function documentBounds(text) {
   if (boundsMemo.text !== text) boundsMemo = { text, value: scanDocumentBounds(text) };
   const { preamble, body, hasBegin, literalEnvs } = boundsMemo.value;
-  return { preamble: { ...preamble }, body: { ...body }, hasBegin, literalEnvs };
+  return { preamble: { ...preamble }, body: { ...body }, hasBegin, literalEnvs, conditionals: boundsMemo.value.conditionals };
 }
 
 function scanDocumentBounds(text) {
+  const bounds = scanDocumentMarkers(text);
+  // the document's own switches (\newif\ifdraft), for closure.js
+  const conditionals = new Set();
+  for (const match of text.slice(bounds.preamble.start, bounds.preamble.end).matchAll(/\\newif\s*\\(if[A-Za-z@]+)/g)) conditionals.add(match[1]);
+  return { ...bounds, conditionals };
+}
+
+function scanDocumentMarkers(text) {
   const literalEnvs = literalEnvironmentNames(text);
   const { begin, end } = plainDocumentMarkers(text, literalEnvs) ?? findDocumentMarkers(text, literalEnvs);
   if (begin < 0) {
@@ -605,9 +613,14 @@ function braceDelta(s) {
   let d = 0;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
-    if ((c === '{' || c === '}') && (i === 0 || s[i - 1] !== '\\')) {
-      d += c === '{' ? 1 : -1;
-    }
+    if (c !== '{' && c !== '}') continue;
+    // \{ is a printed brace, \\} is a line break followed by a real one:
+    // only an odd run of backslashes escapes it. A table-like argument that
+    // ends in `\\}` left the depth open, and everything up to the end of
+    // the document (44 pages of a book) became one block.
+    let slashes = 0;
+    for (let j = i - 1; j >= 0 && s[j] === '\\'; j--) slashes++;
+    if (slashes % 2 === 0) d += c === '{' ? 1 : -1;
   }
   return d;
 }

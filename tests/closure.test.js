@@ -61,3 +61,21 @@ test('KKluaverb payloads are literal: braces and % inside do not hold the block'
   assert.equal(sourceClosure('A \\KKverb|still typing').reason, 'verb-payload');
   assert.equal(sourceClosure('\\KKcodeS\n{').reason, 'verb-payload');
 });
+
+test('a document switch may open in one block and close in a later one', async () => {
+  const { carriedConditionals, declaredConditionals } = await import('../engine/checkpoint/closure.js');
+  const documentConditionals = declaredConditionals('\\documentclass{book}\n\\newif\\ifshortbuild\n\\shortbuildfalse\n');
+  assert.deepEqual([...documentConditionals], ['ifshortbuild']);
+  const blocks = ['Chapter one.', '\\ifshortbuild\\else', 'Chapter two.', 'Last paragraph.\n\\fi\n\\printindex', 'After.']
+    .map((text) => ({ text }));
+  const carried = carriedConditionals(blocks, { documentConditionals });
+  assert.deepEqual(carried, [0, 0, 1, 1, 0]);
+  blocks.forEach((block, i) => {
+    assert.equal(sourceClosure(block.text, { documentConditionals, carried: carried[i] }).closed, true, block.text);
+  });
+  // without the context the same \fi is unfinished typing, and so is a
+  // conditional of TeX's own left open
+  assert.equal(sourceClosure('Last paragraph.\n\\fi', { documentConditionals }).reason, 'unexpected:fi');
+  assert.equal(sourceClosure('\\ifx a', { documentConditionals }).reason, 'conditional:ifx');
+  assert.equal(sourceClosure('x \\fi \\fi', { documentConditionals, carried: 1 }).reason, 'unexpected:fi');
+});

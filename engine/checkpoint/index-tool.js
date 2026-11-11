@@ -3,7 +3,7 @@
 // file there; plain makeindex then writes an .ind the book's own macros
 // cannot read, and the compile stops at \printindex.
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 // Only the processors an index is made with: the rc file is the project's
@@ -44,12 +44,21 @@ export function projectIndexCommand(docDir, idx, ind) {
     try { rc = readFileSync(path.join(docDir, name), 'utf8'); } catch { continue; }
     const parsed = parseLatexmkMakeindex(rc, docDir);
     if (!parsed) continue;
-    const base = idx.replace(/\.idx$/i, '');
-    const fill = { S: idx, D: ind, B: base, R: path.basename(base), O: '' };
+    // The processor runs beside the .idx and is given bare file names: TeX
+    // Live's openout_any refuses an absolute output path (upmendex then
+    // prints the index to the terminal and writes no file). latexmk runs it
+    // from the project folder instead, so a style named relative to that
+    // folder is made absolute.
+    const base = path.basename(idx).replace(/\.idx$/i, '');
+    const fill = { S: path.basename(idx), D: path.basename(ind), B: base, R: base, O: '' };
     const args = parsed.template
-      .map((word) => word.replace(/%([SDBRO])/g, (_, key) => fill[key]))
+      .map((word) => {
+        if (/%[SDBRO]/.test(word)) return word.replace(/%([SDBRO])/g, (_, key) => fill[key]);
+        if (!word.startsWith('-') && !path.isAbsolute(word) && existsSync(path.join(docDir, word))) return path.join(docDir, word);
+        return word;
+      })
       .filter((word) => word !== '');
-    return { command: parsed.command, args, cwd: docDir };
+    return { command: parsed.command, args, cwd: path.dirname(idx) };
   }
   return null;
 }

@@ -103,3 +103,10 @@ test('a later pure deletion adds no competing checkpoint input', async () => {
   const targets = [...diff.bounds.boundaryMap.values()].map(boundary => boundary.to);
   assert.equal(new Set(targets).size, targets.length, 'no peer is overwritten by the new input mapping');
 });
+
+test('a group that ends in a line break and a brace closes', () => {
+  // `\\}` is \\ followed by a real closing brace, not an escaped one
+  const src = '\\funcentry{a\\\\\nb}{}%\n{c \\meta{box} \\\\}\n\\index{q}%\n\nNext paragraph.\n\nThird \\{ printed \\} braces.\n\nLast.\n';
+  assert.deepEqual(texts(src).map((t) => t.trim().split('\n')[0]),
+    ['\\funcentry{a\\\\', 'Next paragraph.', 'Third \\{ printed \\} braces.', 'Last.']);
+});

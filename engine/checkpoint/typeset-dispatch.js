@@ -1,3 +1,4 @@
+import { carriedConditionals } from './closure.js';
 import { performance } from 'node:perf_hooks';
 import { fnv1a } from '../hash.js';
 import { stripComments } from './safety.js';
@@ -47,7 +48,13 @@ export async function typesetBlock(engine, idx, callbacks) {
   const aborted = () => engine.bgAbort && engine.bgActive;
   const isInfra = (e) => e?.tdomInfra === true;
   const isTimeoutErr = (e) => e?.tdomTimeout === true;
-  const lexical = sourceClosure(block.text, { literalEnvs: engine.literalEnvs });
+  const closureOptions = { literalEnvs: engine.literalEnvs, documentConditionals: engine.documentConditionals };
+  // conditionals of the document an earlier block left open, once per block list
+  if (engine.conditionalCarry?.blocks !== engine.blocks || engine.conditionalCarry.rev !== engine.srcRev) {
+    engine.conditionalCarry = { blocks: engine.blocks, rev: engine.srcRev,
+      carried: carriedConditionals(engine.blocks, closureOptions) };
+  }
+  const lexical = sourceClosure(block.text, { ...closureOptions, carried: engine.conditionalCarry.carried[idx] ?? 0 });
   block.nativeClosureRequired = !sourceRequiresCanonicalOnly(block.text);
   block.closure = { ...lexical, native: false };
   if (!lexical.closed) {
