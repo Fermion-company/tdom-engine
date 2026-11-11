@@ -1149,6 +1149,16 @@ end
 -- block past that point died in-chain and fell back to the isolated rescue,
 -- which is exactly the "long documents crawl" wall.
 local function reseed_page()
+  -- The dormant page is \vsize=\maxdimen, set once by the boot template,
+  -- and a class may put the real height back in the middle of a document:
+  -- jlreq's \tableofcontents leaves \vsize at \textheight. From there on
+  -- the builder filled a real page across blocks and fired the absorb about
+  -- once per page of content, each time planting an eject marker the
+  -- document does not have (a 72-page book paginated to 74), and a block
+  -- taller than the page fired it until the runaway guard killed its fork.
+  -- The goal of the page seeded below is read from \vsize, so restore it
+  -- first.
+  pcall(tex.set, 'global', 'vsize', 1073741823) -- \maxdimen
   local d = new_dummy()
   local oldc = tex.lists.contrib_head
   d.next = oldc
@@ -1174,12 +1184,26 @@ local function reseed_page()
   pcall(function()
     tex.pagetotal = 0
     tex.pagestretch = 0
+    tex.pagefistretch = 0
     tex.pagefilstretch = 0
     tex.pagefillstretch = 0
     tex.pagefilllstretch = 0
     tex.pageshrink = 0
     tex.pagedepth = 0
   end)
+  -- The builder also remembers where it would break and what the inserts
+  -- on this page cost, and none of that is reset either (the page never
+  -- becomes empty, so freeze_page_specs never runs). Once the accumulated
+  -- insert height of some class passes its \dimen, every later insert adds
+  -- its \floatingpenalty to \insertpenalties; at 10000 the cost is
+  -- awful_bad and the builder fires at best_page_break, a node of a page
+  -- harvested long ago. fire_up then walks the page list for a pointer that
+  -- is not on it and never returns (a silent C spin: every in-chain job of a
+  -- book timed out from the third list item of its first chapter on).
+  pcall(function() tex.insertpenalties = 0 end)
+  pcall(function() tex.lists.best_page_break = nil end)
+  pcall(function() tex.lists.least_page_cost = 1073741823 end) -- awful_bad
+  pcall(function() tex.lists.page_ins_head = nil end)
 end
 
 -- The engine keeps this file in the work directory while a keystroke waits
@@ -1255,6 +1279,9 @@ end
 -- page builder has not moved yet), as one continuous node list COPY-FREE.
 local function harvest_nodes()
   pcall(function() tex.triggerbuildpage() end)
+  if os.getenv('TDOM_TRACE_OUTPUT') then
+    texio.write_nl('term and log', 'TDOMTRACE harvest job=' .. tostring(JOB and JOB.id) .. ' vsize=' .. tostring(tex.vsize) .. ' goal=' .. tostring(tex.pagegoal) .. ' total=' .. tostring(tex.pagetotal) .. ' inspen=' .. tostring(tex.insertpenalties))
+  end
   local head = tex.lists.page_head
   local contrib = tex.lists.contrib_head
   -- detach both lists from TeX first, then reseed through the builder

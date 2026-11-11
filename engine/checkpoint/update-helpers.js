@@ -50,7 +50,16 @@ export function editPageRenderIds(blocks, pages, dirtySource) {
     if (!page.draw?.some(draw => dirtySource.has(draw.u?.blockId))) continue;
     for (const draw of page.draw) nearby.add(draw.u?.blockId);
   }
-  return blocks.filter(block => nearby.has(block.id) && block.needsRender).map(block => block.id);
+  // A block that runs over the page boundary ties the next page to this one:
+  // the viewer shows both or neither. In a long document the boot leaves far
+  // blocks without exact pixels (background-scheduler.js), so a code box on
+  // that neighbour held the page being typed on until the next canonical.
+  const tied = new Set(nearby);
+  for (const page of pages) {
+    if (!page.draw?.some(draw => nearby.has(draw.u?.blockId))) continue;
+    for (const draw of page.draw) tied.add(draw.u?.blockId);
+  }
+  return blocks.filter(block => tied.has(block.id) && block.needsRender).map(block => block.id);
 }
 
 /**

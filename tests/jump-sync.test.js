@@ -14,18 +14,24 @@ const response = data => ({ ok: true, json: async () => data });
 const jump = { page: 1, y: 70, sourceFile: '/paper/main.tex', sourceLine: 5 };
 const exact = (page = 2, top = 270) => ({ id: 2, srcRev: 2, documentEpoch: 1, page, boxes: [box(top)] });
 
-test('Jump waits for current paper and never paints the old Build rectangle', async () => {
+test('the old Build position is only an approximate band until current paper answers', async () => {
   let ready = false;
   const viewer = jumpViewer({ fetch: async url => response(url === '/dom'
     ? { srcRev: 2, documentEpoch: 1, blocks: [] }
     : ready ? exact() : { pending: true, srcRev: 2, documentEpoch: 1 }) });
   viewer.jump({ ...jump, blockX: 60, blockY: 70, blockWidth: 400, blockHeight: 500 });
   await viewer.flush();
-  assert.equal(viewer.markers().length, 0);
+  // "about here": a band across the page, never a rectangle around a line
+  const band = viewer.markers();
+  assert.equal(band.length, 1);
+  assert.equal(band[0].dataset.exact, 'false');
+  assert.equal(band[0].style.left, '0px');
+  assert.equal(band[0].style.width, '600px');
   assert.equal(viewer.demands.at(-1).residentImpossible, true);
   ready = true;
   await viewer.tick();
-  assert.equal(viewer.markers().length, 0, 'new map must wait for the old raster to be replaced');
+  assert.ok(viewer.markers().every(marker => marker.dataset.exact === 'false'),
+    'new map must wait for the old raster to be replaced');
   viewer.commitCanonical(2, 2);
   await viewer.tick();
   const marker = viewer.markers()[0];
@@ -51,7 +57,12 @@ test('an exact chunk supplies a current block estimate, never a box-sized precis
   const marker = viewer.markers()[0];
   assert.equal(marker.parent.dataset.page, '2');
   assert.equal(marker.dataset.exact, 'false');
-  assert.equal(marker.style.height, '20px');
+  // line 5 of a block spanning lines 4-12 drawn from 120px to 520px: one
+  // eighth of the way down, as a band across the page
+  assert.equal(marker.style.left, '0px');
+  assert.equal(marker.style.width, '600px');
+  assert.equal(marker.style.height, '36px');
+  assert.equal(marker.style.top, '152.5px');
   viewer.dispatch('wheel');
   await viewer.tick();
   assert.equal(viewer.markers().length, 0);

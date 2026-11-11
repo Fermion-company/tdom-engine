@@ -1,3 +1,4 @@
+import { subfileOpenTeX, subfileCloseTeX } from './subfile.js';
 import { labelDefBody, startsAddvspace } from './util/tex.js';
 import { trailingGlueSpec } from './util/galley.js';
 import { instrumentEditRegions } from '../edit-regions.js';
@@ -94,5 +95,12 @@ export function buildJobBlockBody({
     body = Buffer.from(prelude + edit.text, 'utf8');
     jobId = block.id;
   }
-  return { body, jobId, refSnapshot, prelude };
+  // A \subfile chapter's group and paths belong to every job of its first
+  // and last block, the state continuation of a rescued block included: a
+  // group opened by one and never closed (or the reverse) would unbalance
+  // the whole lineage.
+  const open = subfileOpenTeX(block);
+  const close = subfileCloseTeX(block);
+  if (open || close) body = Buffer.concat([Buffer.from(open, 'utf8'), body, Buffer.from(close, 'utf8')]);
+  return { body, jobId, refSnapshot, prelude: open + prelude };
 }

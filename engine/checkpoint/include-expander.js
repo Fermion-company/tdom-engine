@@ -5,6 +5,7 @@ import { segmentBody } from '../segmenter.js';
 import { resolveProjectInput } from '../project-inputs.js';
 import { expandInputParagraphs } from './mapped-inputs.js';
 import { cacheIncludeRead, resourceContentSig } from './include-cache.js';
+import { documentBodyRange } from './subfile.js';
 
 export function expandIncludes(segs, depth, context) {
   if (depth > 3) return segs;
@@ -26,7 +27,7 @@ export function expandIncludes(segs, depth, context) {
         continue;
       }
     }
-    const m = seg.text.match(/^\s*\\(input|include)\s*\{([^}]+)\}\s*$/);
+    const m = seg.text.match(/^\s*\\(input|include|subfile)\s*\{([^}]+)\}\s*$/);
     if (!m) {
       out.push(decorateExternalResources(seg, context));
       continue;
@@ -49,7 +50,8 @@ export function expandIncludes(segs, depth, context) {
           context,
           resolved.readPath,
           resolved.overlay,
-          depth === 0 ? segmentIndex + 1 : context.rootUnit
+          depth === 0 ? segmentIndex + 1 : context.rootUnit,
+          command === 'subfile'
         )
       : null;
     if (resolved) {
@@ -68,7 +70,13 @@ export function expandIncludes(segs, depth, context) {
       out.push(seg);
       continue;
     }
-    if (command === 'include') {
+    if (command === 'subfile') {
+      // subfiles.sty: the chapter's own preamble and \end{document} are
+      // skipped, the body runs in a group with the chapter's folder on the
+      // input paths. Without the expansion a book made of \subfile lines was
+      // one block, and every keystroke re-typeset all of it.
+      out.push(...wrapSubfileBlocks(expanded, rel, path.dirname(resolved.actualPath) + path.sep));
+    } else if (command === 'include') {
       // LaTeX's \include is an input bracketed by page flushes.  Record the
       // two edges as block metadata; buildStream injects the same page-builder
       // ejects without asking an isolated block compile to ship the previous
@@ -91,7 +99,7 @@ function normalizeIncludeName(value) {
   return String(value || '').trim().replace(/\\/g, '/').replace(/\.tex$/i, '').replace(/^\.\//, '');
 }
 
-function expandTextFile(full, depth, context, readPath = full, overlay = false, rootUnit = null) {
+function expandTextFile(full, depth, context, readPath = full, overlay = false, rootUnit = null, documentBody = false) {
   try {
     const st = statSync(readPath);
     const cached = context.includes.get(full);
@@ -100,8 +108,13 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
       : readFileSync(readPath, 'utf8');
     cacheIncludeRead(context.includes, full, { mtime: st.mtimeMs, readPath, text });
     context.watchInclude(readPath);
+    // A \subfile contributes only its document body; offsets stay those of
+    // the whole file so every block still maps to its real lines.
+    const range = documentBody ? documentBodyRange(text) : null;
+    const bodyStart = range ? range.start : 0;
+    const bodyText = range ? text.slice(range.start, range.end) : text;
     const subs = expandIncludes(
-      expandInputParagraphs(segmentBody(text, 0, { literalEnvs: context.literalEnvs }), {
+      expandInputParagraphs(segmentBody(bodyText, bodyStart, { literalEnvs: context.literalEnvs }), {
         ...context,
         source: text,
         file: full,
@@ -126,6 +139,17 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
   } catch {
     return null;
   }
+}
+
+function wrapSubfileBlocks(expanded, rel, dir) {
+  if (!expanded.length) return [];
+  const blocks = expanded.map((block) => ({ ...block, importDir: block.importDir ?? dir }));
+  blocks[0].subfileStart = true;
+  blocks[0].hash = fnv1a(`subfile-open|${rel}|${blocks[0].hash}`);
+  const last = blocks.length - 1;
+  blocks[last].subfileEnd = true;
+  blocks[last].hash = fnv1a(`subfile-close|${rel}|${blocks[last].hash}`);
+  return blocks;
 }
 
 function wrapIncludedBlocks(expanded, rel) {

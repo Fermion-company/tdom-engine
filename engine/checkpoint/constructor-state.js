@@ -60,7 +60,7 @@ export function initializeEngineState(
   engine.refIndex = new Map(); // label key -> Set<blockId> of referencing blocks
   engine.vanishedLabels = new Set(); // keys whose defining count dropped to 0
   engine.fonts = new Map(); // fid -> {file,name,size,fmt, family, remap}
-  engine.fontFiles = new Map(); // familyKey -> absolute path
+  engine.fontFiles = new Map(); // familyKey -> absolute path, or { collection, face } for one face of a .ttc
   engine.pages = [];
   engine.chunks = makeChunkMap(); // chunkKey -> {svg, wBp, hBp, v} exact renders
   engine.isoCache = new Map(); // rescue key -> isolated compile result

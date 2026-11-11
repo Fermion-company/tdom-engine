@@ -36,7 +36,7 @@ const FORCED_START = /^\s*\\(par|chapter|section|subsection|subsubsection|paragr
 // \maketitle shared its block, and once that block froze every keystroke
 // there degraded to canonical-latency updates).
 const STANDALONE_LINE =
-  /^\s*\\(?:(?:maketitle|tableofcontents|listoffigures|listoftables)\s*|(?:input|include|bibliography)\s*\{[^}]+\}\s*|printbibliography\s*(?:\[[^\]]*\])?\s*)$/;
+  /^\s*\\(?:(?:maketitle|tableofcontents|listoffigures|listoftables)\s*|(?:input|include|subfile|bibliography)\s*\{[^}]+\}\s*|printbibliography\s*(?:\[[^\]]*\])?\s*)$/;
 
 // Environments whose content is LITERAL: no comments, no macro calls, no
 // brace/environment structure. Without this awareness an unbalanced `{`
@@ -423,6 +423,9 @@ export function diffBlocks(oldBlocks, segs, nextId) {
           sourceParts: sg.sourceParts ?? null,
           includeStart: !!sg.includeStart,
           includeEnd: !!sg.includeEnd,
+          subfileStart: !!sg.subfileStart,
+          subfileEnd: !!sg.subfileEnd,
+          importDir: sg.importDir ?? null,
           externalGraphics: !!sg.externalGraphics,
           structuralSinks: sg.structuralSinks ?? [],
           sourceChanged: true,
@@ -451,6 +454,9 @@ export function diffBlocks(oldBlocks, segs, nextId) {
         sourceParts: sg.sourceParts ?? null,
         includeStart: !!sg.includeStart,
         includeEnd: !!sg.includeEnd,
+        subfileStart: !!sg.subfileStart,
+        subfileEnd: !!sg.subfileEnd,
+        importDir: sg.importDir ?? null,
         externalGraphics: !!sg.externalGraphics,
         structuralSinks: sg.structuralSinks ?? [],
         sourceChanged: true,
@@ -551,6 +557,9 @@ function refresh(block, seg) {
   block.sourceParts = seg.sourceParts ?? null;
   block.includeStart = !!seg.includeStart;
   block.includeEnd = !!seg.includeEnd;
+  block.subfileStart = !!seg.subfileStart;
+  block.subfileEnd = !!seg.subfileEnd;
+  block.importDir = seg.importDir ?? null;
   block.externalGraphics = !!seg.externalGraphics;
   block.structuralSinks = seg.structuralSinks ?? [];
   return block;

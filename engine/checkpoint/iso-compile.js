@@ -1,3 +1,4 @@
+import { importPathTeX } from './subfile.js';
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { prepareIsoCompileJob } from './iso-context.js';
@@ -32,7 +33,8 @@ export async function isoCompile(
       needsRescue,
       breakableRe: () => engine._breakableRe,
       packageBreakableRe: () => engine._packageBreakableRe,
-      defsPrelude: engine.defsPatch?.touches(block.text) ? engine.defsPatch.prelude : '',
+      defsPrelude: (engine.defsPatch?.touches(block.text) ? engine.defsPatch.prelude : '') +
+        (block.importDir ? importPathTeX(block.importDir) : ''),
     });
   // a preview (noCold) never pays a cold compile: no fork runner now, none
   if (noCold && !ck0) return null;

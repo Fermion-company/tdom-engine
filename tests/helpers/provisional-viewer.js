@@ -113,7 +113,7 @@ export function jumpViewer({ fetch, pages = 2 } = {}) {
     },
   });
   for (const [number, page] of state.pageDivs) {
-    page.markers = []; page.clientWidth = 600;
+    page.markers = []; page.clientWidth = 600; page.clientHeight = 800;
     page.getBoundingClientRect = () => ({ top: (number - 1) * 820 - state.pagesEl.scrollTop, left: 0, width: 600, height: 800 });
     page.appendChild = marker => { marker.parent = page; page.markers.push(marker); };
   }

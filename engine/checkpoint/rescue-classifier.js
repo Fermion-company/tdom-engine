@@ -111,6 +111,43 @@ export function collectBreakableTcolorboxNames(preamble) {
     const options = readBalanced(source, at, '{', '}');
     if (options && /\bbreakable\b(?!\s*=\s*false\b)/.test(options.value)) names.push(name.value);
   }
+  // An environment that only wraps a breakable box splits like one. Books
+  // define their code and example boxes this way when the box needs
+  // arguments a tcolorbox declaration cannot take:
+  //   \NewDocumentEnvironment{codebox}{ O{} }{\begin{tcolorbox}[breakable,...]}{\end{tcolorbox}}
+  // A wrapper of a wrapper is found on the next round.
+  const wrappers =
+    /\\(NewDocumentEnvironment|DeclareDocumentEnvironment|RenewDocumentEnvironment|ProvideDocumentEnvironment|newenvironment|renewenvironment)\*?/g;
+  const opensBreakable = (code) => {
+    for (const open of code.matchAll(/\\(?:begin\s*\{tcolorbox\}|tcolorbox\b)\s*/g)) {
+      const options = readBalanced(code, open.index + open[0].length, '[', ']');
+      if (options && /\bbreakable\b(?!\s*=\s*false\b)/.test(options.value)) return true;
+    }
+    return names.some((known) => code.includes(`\\begin{${known}}`) || new RegExp(`\\\\${known.replace(/[@]/g, '\\$&')}(?![A-Za-z@])`).test(code));
+  };
+  for (let round = 0; round < 3; round++) {
+    const before = names.length;
+    for (const match of source.matchAll(wrappers)) {
+      let at = skipSpace(source, match.index + match[0].length);
+      const name = readBalanced(source, at, '{', '}');
+      if (!name || !/^[A-Za-z@0-9]+$/.test(name.value) || names.includes(name.value)) continue;
+      at = skipSpace(source, name.end);
+      if (/DocumentEnvironment$/.test(match[1])) {
+        const spec = readBalanced(source, at, '{', '}');
+        if (!spec) continue;
+        at = skipSpace(source, spec.end);
+      } else {
+        while (source[at] === '[') {
+          const optional = readBalanced(source, at, '[', ']');
+          if (!optional) break;
+          at = skipSpace(source, optional.end);
+        }
+      }
+      const begin = readBalanced(source, at, '{', '}');
+      if (begin && opensBreakable(begin.value)) names.push(name.value);
+    }
+    if (names.length === before) break;
+  }
   return [...new Set(names)];
 }
 

@@ -289,11 +289,11 @@ export function buildDriverSource({
   L.push('\\directlua{tdom_num(\'bottomfraction\',\\bottomfraction)}');
   L.push('\\directlua{tdom_num(\'textfraction\',\\textfraction)}');
   L.push('\\directlua{tdom_num(\'floatpagefraction\',\\floatpagefraction)}');
-  L.push('\\directlua{tdom_num(\'topnumber\',\\value{topnumber})}');
-  L.push('\\directlua{tdom_num(\'bottomnumber\',\\value{bottomnumber})}');
-  L.push('\\directlua{tdom_num(\'totalnumber\',\\value{totalnumber})}');
-  L.push('\\directlua{tdom_num(\'interlinepenalty\',\\interlinepenalty)}');
-  L.push('\\directlua{tdom_num(\'footinsfactor\',\\count\\footins)}');
+  L.push('\\directlua{tdom_num(\'topnumber\',\\number\\value{topnumber})}');
+  L.push('\\directlua{tdom_num(\'bottomnumber\',\\number\\value{bottomnumber})}');
+  L.push('\\directlua{tdom_num(\'totalnumber\',\\number\\value{totalnumber})}');
+  L.push('\\directlua{tdom_num(\'interlinepenalty\',\\number\\interlinepenalty)}');
+  L.push('\\directlua{tdom_num(\'footinsfactor\',\\number\\count\\footins)}');
   L.push('\\directlua{tdom_dim(\'atmaxdepth\',\\number\\dimexpr\\@maxdepth\\relax)}');
   // \raggedbottom leaves \@textbottom = \vskip\z@\@plus.0001fil; flushbottom
   // keeps it \relax — the page builder needs to know which world it's in
@@ -656,6 +656,14 @@ export function buildIsoCompileSource({
     L.push('\\newbox\\TDOMisoabsorbbox');
     L.push('\\output={\\global\\setbox\\TDOMisoabsorbbox=\\box255\\relax' +
       '\\directlua{tdom_iso_absorb(\\number\\TDOMisoabsorbbox)}}');
+    // The absorb regime is the dormant page: nothing may break a page on
+    // its own. A fork child inherits \\vsize=\\maxdimen from checkpoint 0,
+    // but the cold program ran with the class's real \\vsize, so a block
+    // taller than the page (a long paragraph followed by a list) fired the
+    // routine at the same place until the runaway cap discarded it. A first
+    // rescue that fails leaves a block with no layout, and the engine then
+    // holds every provisional page of the document.
+    if (runner === 'cold') L.push('\\vsize=\\maxdimen');
   }
   // material taller than the page inside an output-hijack env (multicols'
   // own routine) ships REAL pages — count them so the harvest knows the

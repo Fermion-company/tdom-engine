@@ -874,8 +874,8 @@ function flushDirectPresentationUpdates() {
 }
 
 function tryCommitProvisionalStages() {
-  if (directPresentationBlocked()) return;
-  if (usesCanonicalSurface() || documentReset.pending) return;
+  if (directPresentationBlocked()) return traceStage('hold', null, { why: 'direct-presentation' });
+  if (usesCanonicalSurface() || documentReset.pending) return traceStage('hold', null, { why: 'canonical-surface' });
   // Canonical may have replaced an incomplete or differently paginated
   // resident layout and cleared its stages. Its next delta cannot certify
   // physical page addresses, even if every delivered chunk is drawable.
@@ -884,7 +884,7 @@ function tryCommitProvisionalStages() {
       committedCanonicalGeneration.residentLayoutCompatible === false) {
     for (const page of pageDivs.keys()) pageDirtyRev.set(page, appliedSrcRev);
     requestCanonicalDisplay({ residentImpossible: true });
-    return;
+    return traceStage('hold', null, { why: 'layout-incompatible' });
   }
   if (!provisionalStages.size && !provisionalRemovedPages.size) return;
   const residentPageCount = provisionalDisplayLists.size;
@@ -899,7 +899,7 @@ function tryCommitProvisionalStages() {
     provisionalRemovedPages
   )) {
     requestCanonicalDisplay({ residentImpossible: true });
-    return;
+    return traceStage('hold', null, { why: 'page-transaction', residentPageCount });
   }
   // Removing the page that owns a live editor would disconnect its native
   // focus/selection (and possibly an IME composition). Keep the exact path
@@ -918,7 +918,8 @@ function tryCommitProvisionalStages() {
       (provisionalRemovedPages.size && !stages.length)) {
     for (const page of pageDivs.keys()) pageDirtyRev.set(page, appliedSrcRev);
     requestCanonicalDisplay({ residentImpossible: true });
-    return;
+    return traceStage('hold', null, { why: 'page-count', residentPageCount, canonicalPageCount,
+      pendingLayout: provisionalPendingLayout.size, removed: provisionalRemovedPages.size });
   }
   if (canonicalPageCount === null || pageCountMismatch) requestCanonicalDisplay();
   const stageReady = stage => stage.ready && stage.sourceRev === appliedSrcRev &&
@@ -939,14 +940,21 @@ function tryCommitProvisionalStages() {
     // touched) would hold back the page being typed on now. Numbers on far
     // pages may briefly lag until theirs land.
     if (pageCountMismatch || (canonicalPageCount === null && !residentCountSettled) ||
-        provisionalRemovedPages.size || directEditor) return;
+        provisionalRemovedPages.size || directEditor) {
+      return traceStage('hold', null, { why: 'not-all-ready', residentPageCount, canonicalPageCount,
+        pendingLayout: provisionalPendingLayout.size, removed: provisionalRemovedPages.size, editor: !!directEditor,
+        waiting: stages.filter(stage => !stageReady(stage)).map(stage => stage.dl.page).slice(0, 12) });
+    }
     // no canonical has made the shells yet: the resident count does
     if (residentCountSettled) for (let n = 1; n <= residentPageCount; n++) ensureShell(n);
-    if (stages.some(stage => !pageDivs.has(stage.dl.page))) return;
+    if (stages.some(stage => !pageDivs.has(stage.dl.page))) return traceStage('hold', null, { why: 'no-shell' });
     committing = provisionalCommitGroups(stages, committedPageSrcs, pageEditGroup, pagePainted, stageReady)
       .filter(group => group.every(stageReady)).flat()
       .sort((a, b) => a.dl.page - b.dl.page);
-    if (!committing.length) return;
+    if (!committing.length) {
+      return traceStage('hold', null, { why: 'no-ready-group',
+        waiting: stages.filter(stage => !stageReady(stage)).map(stage => stage.dl.page).slice(0, 12) });
+    }
   }
   const editorStage = committing.find(stage => stage.dl.page === directEditor?.pageNumber);
   const editorRegion = editorStage ? directEditorRegionInSnapshot(editorStage.snapshot, directEditor) : null;
@@ -1133,7 +1141,9 @@ function renderPage(dl, flash) {
   const ready = () => {
     if (provisionalStages.get(dl.page) !== stage || usesCanonicalSurface() ||
         sourceRev !== appliedSrcRev || stage.documentEpoch !== documentReset.adoptedEpoch) return;
-    if (families.some(family => !readyFonts.has(family))) return;
+    if (families.some(family => !readyFonts.has(family))) {
+      return traceStage('fonts-waiting', dl.page, { families: families.filter(family => !readyFonts.has(family)) });
+    }
     // Font promises can resolve while the SVG is still detached. Its
     // pending markers must be cleared here as well as in injectFonts().
     staging.querySelectorAll('text[data-font-pending]').forEach(node => node.removeAttribute('data-font-pending'));
@@ -1154,7 +1164,8 @@ function renderPage(dl, flash) {
     }),
     ...families.map(family => fontLoads.get(family)),
   ];
-  void Promise.all(pending).then(ready).catch(() => {
+  void Promise.all(pending).then(ready).catch((error) => {
+    traceStage('load-failed', dl.page, { error: String(error?.message ?? error).slice(0, 160) });
     // A failed load can be a superseded source/chunk response. It cannot
     // prove resident impossibility; the bounded canonical grace still ends
     // if a persistent failure prevents the next page from committing.
@@ -6872,20 +6883,24 @@ pagesEl.addEventListener('scroll', () => {
         const pageRect = first.page.getBoundingClientRect();
         const scale = pageRect.height / activePaperGeometry(first.page).height;
         const knownInk = first.ink && first.distance === 0 && Number(first.page.dataset.provRev) === srcRev;
-        scrollPageToViewport(first.page, (knownInk ? (top + bottom) / 2 - pageRect.top : top - pageRect.top) / scale, true);
+        // Without the line's own ink the block is all there is to go by: the
+        // line sits about as far down the block as it does in its source.
+        const blockLines = Math.max(1, Number(block.source.end.line) - Number(block.source.start.line));
+        const fraction = Math.max(0, Math.min(1, relativeLine / blockLines));
+        const estimateTop = top + (bottom - top) * fraction;
+        const estimateBox = { left: 0, top: estimateTop - pageRect.top, width: pageRect.width, height: 1 };
+        scrollPageToViewport(first.page, (knownInk ? (top + bottom) / 2 - pageRect.top : estimateTop - pageRect.top) / scale, true);
         if (wantsMarker) {
-          const rect = first.node.getBoundingClientRect(), paperRect = first.page.getBoundingClientRect();
           placeSyncMarker(first.page, knownInk ? {
             left: Math.min(...rects.map(r => r.left)) - pageRect.left - 2,
             top: top - pageRect.top - 1,
             width: Math.max(...rects.map(r => r.right)) - Math.min(...rects.map(r => r.left)) + 4,
             height: bottom - top + 2,
-          } : { left: rect.left - paperRect.left, top: rect.top - paperRect.top, width: 20, height: 20 }, false);
+          } : estimateBox, false);
         }
         estimated = true;
         break;
       }
-      if (!estimated && wantsMarker) clearSyncMarker();
       let hit = null, awaitingPage = null;
       while (current()) {
         if (hit && canonical?.rev === srcRev && canonical.id !== hit.id) hit = null;
@@ -6942,6 +6957,19 @@ pagesEl.addEventListener('scroll', () => {
       const boxes = (Array.isArray(boxOrBoxes) ? boxOrBoxes : [boxOrBoxes])
         .filter((box) => box && box.width > 0 && box.height > 0);
       if (!page?.isConnected || !boxes.length) return;
+      if (!exact) {
+        // Only roughly known (the last Build's position after edits, or a
+        // place inside a block drawn as one picture): say "about here" with a
+        // soft band across the page, never with a box around a line that
+        // may not be the right one.
+        const top = Math.min(...boxes.map(b => b.top)), bottom = Math.max(...boxes.map(b => b.top + b.height));
+        const pageHeight = page.clientHeight || 1;
+        const height = Math.min(pageHeight, Math.max(bottom - top, pageHeight * 0.045));
+        const middle = (top + bottom) / 2;
+        boxes.length = 0;
+        boxes.push({ left: 0, top: Math.max(0, Math.min(pageHeight - height, middle - height / 2)),
+          width: page.clientWidth, height });
+      }
       for (const box of boxes) {
         const marker = document.createElement('div');
         marker.className = 'tdom-sync-marker';
@@ -7003,7 +7031,10 @@ pagesEl.addEventListener('scroll', () => {
       // a Jump: it carries a viewportToken and must never draw a marker.
       const wantsMarker = data.marker !== false && typeof data.viewportToken !== 'string';
       clearSyncMarker();
-      if (wantsMarker && !data.sourceFile) placeSyncMarker(page, syncBlockBox(page, data));
+      // The host's position comes from the last Build. It is exact only for
+      // a line this frame cannot look up at all; for a source line it is a
+      // first approximation that the current revision confirms or replaces.
+      if (wantsMarker) placeSyncMarker(page, syncBlockBox(page, data), !data.sourceFile && data.approximate !== true);
       syncRefineGeneration += 1;
       void refineSyncToSource(data, wantsMarker);
       requestAnimationFrame(scheduleEmbedSnapshot);
