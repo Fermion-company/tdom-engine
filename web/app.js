@@ -722,10 +722,17 @@ function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () 
   };
   const staged = new Map(stages.map(stage => [stage.dl.page, stage]));
   const waiting = stage => !painted(stage.dl.page) && !ready(stage);
+  // A page still waiting for exact pixels that no edit touched (the replay
+  // towards a keystroke re-delivers such pages of a long document) ties its
+  // neighbour only through what the two actually share, not by standing
+  // next to it: otherwise the page being typed on waited for every picture
+  // of the chapter before it.
+  const loose = stage => !ready(stage) && !editGroup.has(stage.dl.page);
   for (const stage of stages) {
     const page = stage.dl.page;
     if (waiting(stage)) continue;
-    if (root.has(page - 1) && !waiting(staged.get(page - 1)) && (painted(page) || painted(page - 1))) join(page, page - 1);
+    if (root.has(page - 1) && !waiting(staged.get(page - 1)) && (painted(page) || painted(page - 1)) &&
+        !loose(stage) && !loose(staged.get(page - 1))) join(page, page - 1);
     stage.srcs ??= displayListSrcs(stage.dl);
     for (const src of stage.srcs) note(pageOfSrc, src, page);
     for (const src of committedSrcs.get(page) ?? []) note(pageOfSrc, src, page);

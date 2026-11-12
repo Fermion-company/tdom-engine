@@ -16,6 +16,23 @@ const PAGE_COUNT_GATES = Function(`${APP.slice(
   APP.indexOf('function srcOf')
 )}; return { currentCanonicalPageCount, residentPageTransactionValid, provisionalCommitGroups };`)();
 
+test('a page waiting for exact pixels that no edit touched does not hold the page next to it', () => {
+  const groupsOf = PAGE_COUNT_GATES.provisionalCommitGroups;
+  const stage = (page, ...srcs) => ({ dl: { page, commands: srcs.map((src) => ({ op: 'glyphs', src })) } });
+  const pages = (groups) => groups.map((group) => group.map((s) => s.dl.page)).sort((a, b) => a[0] - b[0]);
+  const painted = () => true;
+  const readyOnly = (...ready) => (s) => ready.includes(s.dl.page);
+  // the replay towards a keystroke re-delivered 38 and 39 (pictures still
+  // owed); the keystroke itself is on 40
+  const stages = [stage(38, 'a'), stage(39, 'b'), stage(40, 'c'), stage(41, 'd')];
+  assert.deepEqual(pages(groupsOf(stages, new Map(), new Map([[40, 7]]), painted, readyOnly(40, 41))), [[38], [39], [40, 41]]);
+  // what the two pages share still ties them: a paragraph running over the break
+  const shared = [stage(39, 'b', 'c'), stage(40, 'c')];
+  assert.deepEqual(pages(groupsOf(shared, new Map(), new Map([[40, 7]]), painted, readyOnly(40))), [[39, 40]]);
+  // and so does the edit itself, when it changed the neighbour too
+  assert.deepEqual(pages(groupsOf([stage(39, 'b'), stage(40, 'c')], new Map(), new Map([[39, 7], [40, 7]]), painted, readyOnly(40))), [[39, 40]]);
+});
+
 test('staged pages commit in groups: a reflow, a moved or split paragraph and one edit stay together', () => {
   const groupsOf = PAGE_COUNT_GATES.provisionalCommitGroups;
   const stage = (page, ...srcs) => ({ dl: { page, commands: srcs.map((src) => ({ op: 'glyphs', src })) } });
