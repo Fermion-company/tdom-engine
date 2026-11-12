@@ -1525,6 +1525,22 @@ export class CanonicalRenderer {
         if (this.buildLease && job.inputEpoch === this.inputEpoch &&
             (!this.pendingJob || this.pendingJob.rev <= job.rev)) {
           this.pendingJob = job;
+        } else if (/^Command failed/.test(this.lastError.message) && this.killedRetryRev !== job.rev &&
+            !this.disposed && job.inputEpoch === this.inputEpoch &&
+            (!this.pendingJob || this.pendingJob.rev <= job.rev)) {
+          // The compile was ended from outside and TeX reported nothing (a
+          // Build that took over, a busy machine). Nothing else would start
+          // it again before the next edit, and until then the document has no
+          // canonical page: Live stayed behind the Build PDF. Once per revision.
+          this.killedRetryRev = job.rev;
+          this.pendingJob = job;
+          clearTimeout(this.timer);
+          this.timerDueAt = Date.now() + 2000;
+          this.timer = setTimeout(() => {
+            this.timer = null;
+            this.timerDueAt = 0;
+            this.#drain({ waitForResident: true });
+          }, 2000);
         }
       })
       .finally(() => {
