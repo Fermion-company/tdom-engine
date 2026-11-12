@@ -62,7 +62,7 @@ import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
 import { computeToc, pageSpecs, hfJobBody } from './page-metadata.js';
 import { chunkTargets } from './chunk-targets.js';
-import { focusRescueIds } from './update-helpers.js';
+import { editPageRenderIds, focusRescueIds } from './update-helpers.js';
 import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, includeOnlyFromSource, watchInclude } from './include-expander.js';
 import { announceIncludeReads, announceResourceReads, inputReadCurrent } from './include-cache.js';
@@ -107,7 +107,7 @@ import {
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
 import { adoptGalleyBlock, exactFallbackEligible } from './galley-adoption.js';
 import { cropRenderTargets } from './render-chunks.js';
-import { checkpointBudgetFor, checkpointKeepSet, nearestCheckpoint,
+import { checkpointBudgetFor, checkpointKeepSet, memoryCheckpointCeiling, nearestCheckpoint,
   nextTypesetCost,
   gridMissingBoundaries,
 } from './checkpoint-selection.js';
@@ -302,6 +302,11 @@ export class CheckpointEngine {
     return this.warmEditOffset(block.start, block.file ?? this.file);
   }
 
+  /** Exact-pixel chunks a block publishes (status reporting). */
+  chunkTargetsOf(block) {
+    return this.#chunkTargets(block);
+  }
+
   async warmEditOffset(offset, file = this.file) {
     // A caret move is the earliest sign of editing: it boots a retired chain.
     if (!this.closed) this.#noteShipActivity();
@@ -337,8 +342,16 @@ export class CheckpointEngine {
       this.rescueFocus = focus;
       wakeRescues(this);
     }
-    const pageIds = new Set(this.pages.filter(page => page.draw?.some(draw => draw.u?.blockId === targetId))
-      .flatMap(page => page.draw.map(draw => draw.u?.blockId)));
+    // (the pages an edit of this block will publish together: its own and
+    // the ones a straddling block ties to it. A keystroke replays from the
+    // checkpoint before the first block there whose exact pixels are stale,
+    // so a tied page left out of the warm sent the first keystrokes of a
+    // book back to a distant checkpoint: 2.3 s each, measured)
+    const pageIds = new Set([
+      ...this.pages.filter(page => page.draw?.some(draw => draw.u?.blockId === targetId))
+        .flatMap(page => page.draw.map(draw => draw.u?.blockId)),
+      ...editPageRenderIds(this.blocks, this.pages, new Set([targetId])),
+    ]);
     const missing = this.blocks.map((block, index) => ({ block, index })).filter(({ block }) =>
       pageIds.has(block.id) && block.needsRender && this.#chunkTargets(block).some(chunk =>
         this.chunks.get(chunk.key)?.forGalley !== block.galleyHash));
@@ -372,9 +385,15 @@ export class CheckpointEngine {
       // Pin before walking: #jobBlock retires off-grid parents as soon as a
       // successor exists, so a late pin would lose the exact boundary we are
       // warming for the first keystroke.
-      this.editHold = [...new Set([target, target + 1, ...this.editHold])]
+      // The page's blocks that still lack exact pixels are pinned too: their
+      // render runs after the walk has passed them, from the checkpoint in
+      // front of each. Left unpinned, a document that affords three
+      // checkpoints retired those before the render started, the warm ended
+      // "ready" with the headings of the page still unrendered, and the first
+      // keystrokes replayed from the start of the book to draw them.
+      this.editHold = [...new Set([target, target + 1, ...missing.map(item => item.index), ...this.editHold])]
         .filter((idx) => idx >= 0 && idx <= this.blocks.length)
-        .slice(0, 8);
+        .slice(0, 8 + Math.min(16, missing.length));
       if (!missing.length && this.checkpoints.has(target) && this.checkpoints.has(target + 1)) {
         this.#enforceCheckpointCap();
         const ready = {
@@ -425,7 +444,15 @@ export class CheckpointEngine {
         this.#kickPendingChain();
         return { status: 'superseded', sourceRev, target };
       }
-      this.editHold = [...new Set([target, target + 1, from + replayed, ...this.editHold])].slice(0, 8);
+      // (still pinned while their render is queued; the next edit's own
+      // pins replace these)
+      const unrendered = missing.map(item => item.index).filter((idx) => {
+        const block = this.blocks[idx];
+        return block?.needsRender && this.#chunkTargets(block).some(chunk =>
+          this.chunks.get(chunk.key)?.forGalley !== block.galleyHash);
+      }).slice(0, 16);
+      this.editHold = [...new Set([target, target + 1, from + replayed, ...unrendered, ...this.editHold])]
+        .slice(0, 8 + unrendered.length);
       this.#enforceCheckpointCap();
       // A cached rescue can replace its PDF chunk without changing any
       // measured boxes or exit state. Its new version must reach page DLs.
@@ -1650,7 +1677,7 @@ export class CheckpointEngine {
     const budget = sharedCheckpointBudget({
       maxCheckpoints: this.maxCheckpoints,
       checkpoints: this.checkpoints,
-      shippingEnabled: !!this.shipping,
+      shippingEnabled: this.#shippingAffordable(),
       currentJob: this.currentJob,
       activeResidentRenders: this.activeResidentRenderCheckpoints,
     });
@@ -1660,7 +1687,8 @@ export class CheckpointEngine {
       editHold: [0, ...this.editHold, ...active, ...(continuation === null ? [] : [continuation])],
       coveragePins: this.editHold,
       renderHold: this.renderHold,
-      activeHold: [...activeRender, ...this.#coldPreviewHeld(), ...propagationCheckpointHold(this.pendingChain)],
+      activeHold: [...activeRender, ...this.#coldPreviewHeld(), ...propagationCheckpointHold(this.pendingChain),
+        ...(Number.isInteger(this.rescueCursor) ? [this.rescueCursor] : [])],
       maxPeers: budget.residentLimit,
       dyingPids: this.dyingPids,
     });
@@ -1703,9 +1731,28 @@ export class CheckpointEngine {
     return mayNeedRender(block);
   }
 
+  /**
+   * A caret warm pins the checkpoints of the page's unrendered blocks past
+   * the usual eight (warmEditOffset). Each is let go once its block has its
+   * exact pixels, so the extra forks live for the seconds the renders take.
+   */
+  #releaseWarmPins() {
+    if (this.editHold.length <= 8) return;
+    const waiting = (idx) => {
+      const block = this.blocks[idx];
+      return !!block?.needsRender && this.#chunkTargets(block).some(chunk =>
+        this.chunks.get(chunk.key)?.forGalley !== block.galleyHash);
+    };
+    const kept = this.editHold.filter((idx, position) => position < 8 || waiting(idx));
+    if (kept.length === this.editHold.length) return;
+    this.editHold = kept;
+    this.#enforceCheckpointCap();
+  }
+
   /** A held checkpoint has served its render (or the hold went stale):
    * resume normal measured-skeleton retirement. */
   #releaseRenderHold(idx) {
+    this.#releaseWarmPins();
     if (!releaseRenderHold(this.renderHold, idx)) return;
     this.#enforceCheckpointCap();
   }
@@ -2321,7 +2368,24 @@ export class CheckpointEngine {
     });
   }
 
+  /** True while memory, not the document, bounds the checkpoint budget (a
+   * preamble holding more than a gigabyte live on a 16 GB machine). */
+  #memoryBound() {
+    return memoryCheckpointCeiling(this.confirmedLiveHeapKb) < this.checkpointCeiling;
+  }
+
+  /** The shipping chain is a second lineage of forks with heaps of its own,
+   * and it shares the checkpoint budget: under a memory bound of three it
+   * left the resident chain two, so every keystroke replayed the blocks of
+   * its page again (0.4-0.8 s where 0.17-0.24 s is possible) and the pages
+   * beside it never got their exact pixels. A document that depends on
+   * shipped pages (shipping-exact) keeps the chain. */
+  #shippingAffordable() {
+    return !!this.shipping && (this.previewPolicy === 'shipping-exact' || !this.#memoryBound());
+  }
+
   #queueShipBoot() {
+    if (!this.#shippingAffordable()) return;
     queueShipBootHelper(this, () => this.#bootShipping());
   }
 
@@ -2506,7 +2570,7 @@ export class CheckpointEngine {
           for (;;) {
             if (this.closed || !this.rescueQueue.size) return;
             bid = [...this.rescueFocus].find((id) => this.rescueQueue.has(id)) ??
-              this.rescueQueue.keys().next().value;
+              this.#nextRescueInOrder();
             // A cold keystroke's resume (docs/10 §10.4a) outranks isolated
             // rescue adoption: the adopt walk holds the chain lock for seconds
             // and the keystroke's page is not on screen until the resume runs.
@@ -2540,8 +2604,33 @@ export class CheckpointEngine {
         }
       } finally {
         this.rescuePumping = false;
+        if (Number.isInteger(this.rescueCursor)) {
+          this.rescueCursor = null;
+          if (!this.closed) this.#enforceCheckpointCap();
+        }
       }
     })();
+  }
+
+  /** The queued rescue to adopt next: the first one at or after the boundary
+   * the last adoption left (rescueCursor), in document order, so one pass
+   * over the document adopts the backlog. Re-queued entries (an offset that
+   * moved) sit at the end of the queue and would send the walk back. */
+  #nextRescueInOrder() {
+    const first = this.rescueQueue.keys().next().value;
+    if (this.rescueQueue.size < 2) return first;
+    const from = Number.isInteger(this.rescueCursor) ? this.rescueCursor : 0;
+    let ahead = null;
+    let aheadIdx = Infinity;
+    let lowest = null;
+    let lowestIdx = Infinity;
+    for (let i = 0; i < this.blocks.length; i++) {
+      const id = this.blocks[i].id;
+      if (!this.rescueQueue.has(id)) continue;
+      if (i < lowestIdx) { lowest = id; lowestIdx = i; }
+      if (i >= from && i < aheadIdx) { ahead = id; aheadIdx = i; break; }
+    }
+    return ahead ?? lowest ?? first;
   }
 
   async #asyncRescueOne(bid, key) {
@@ -2650,6 +2739,18 @@ export class CheckpointEngine {
         this.#asyncRepaginate();
       }
       this.#queueMovedOffsets();
+      // The boot backlog is adopted in document order. Keep the boundary
+      // just behind this block while more wait: the next adoption resumes
+      // from here instead of replaying from the grid. With the grid a heavy
+      // document affords (three checkpoints for a book on 16 GB) each of 77
+      // adoptions replayed about a thousand blocks, half an hour in all.
+      // (the walk verifies a block or two past the adopted one: the boundary
+      // it stopped at is the newest checkpoint just behind them)
+      let frontier = null;
+      if (this.rescueQueue.size) {
+        for (let k = idx + 4; k > idx; k--) if (this.checkpoints.has(k)) { frontier = k; break; }
+      }
+      this.rescueCursor = frontier;
       // the resume walk left checkpoints at the blocks it re-typeset — collapse
       // back to the grid so the boot rescue storm can't creep the live set
       this.#enforceCheckpointCap();

@@ -882,7 +882,16 @@ function flushDirectPresentationUpdates() {
 
 // Why the paper is or is not following the source, for a diagnostic session:
 // call window.__tdomViewerState() in the frame's console.
-globalThis.__tdomViewerState = () => ({
+globalThis.__tdomViewerState = (pages = []) => ({
+  pages: pages.map((n) => {
+    const stage = provisionalStages.get(n);
+    const dl = stage?.dl ?? provisionalDisplayLists.get(n);
+    const owed = (dl?.commands ?? []).filter(cmd => cmd.op === 'canon' || cmd.op === 'pending-exact' ||
+      cmd.op === 'glyphs' && cmd.math || cmd.op === 'chunk' && cmd.st);
+    return { page: n, staged: !!stage, ready: !!stage?.ready, rev: stage?.sourceRev ?? null,
+      painted: pageDivs.get(n)?.className ?? null, owed: owed.length,
+      owedBy: [...new Set(owed.map(cmd => `${cmd.op}${cmd.st ? ':stale' : ''}:${cmd.src}`))].slice(0, 8) };
+  }),
   appliedSrcRev,
   residentPages: provisionalDisplayLists.size,
   pendingLayout: [...provisionalPendingLayout].slice(0, 20),
@@ -3645,21 +3654,65 @@ function loadMathWysiwyg() {
   return mathWysiwygModulePromise;
 }
 
+// The newest snapshot received, the base the next one is a change from.
+let provisionalSnapshotHeld = null; // { epoch, snapshot }
+const snapshotBlockIndex = new WeakMap(); // snapshot -> Map(block id -> block)
+
+/** A full snapshot from an earlier one and the server's change list; null when they do not fit. */
+function applySnapshotDelta(base, delta) {
+  let byId = snapshotBlockIndex.get(base);
+  if (!byId) {
+    byId = new Map((base.blocks ?? []).map(block => [String(block.id), block]));
+    snapshotBlockIndex.set(base, byId);
+  }
+  const changed = new Map((delta.blocks ?? []).map(block => [String(block.id), block]));
+  const blocks = [];
+  for (const id of delta.order ?? []) {
+    const block = changed.get(id) ?? byId.get(id);
+    if (!block) return null;
+    blocks.push(block);
+  }
+  const sourceByFile = new Map((base.sources ?? []).map(source => [source.file, source]));
+  for (const source of delta.sources ?? []) sourceByFile.set(source.file, source);
+  const sources = [];
+  for (const file of delta.files ?? []) {
+    const source = sourceByFile.get(file);
+    if (!source) return null;
+    sources.push(source);
+  }
+  const { delta: _delta, order: _order, files: _files, ...rest } = delta;
+  return { ...rest, blocks, sources };
+}
+
 async function loadProvisionalSnapshot(sourceRev) {
   const epoch = documentReset.adoptedEpoch;
   const key = `${epoch}:${sourceRev}`;
   if (!provisionalSnapshotCache.has(key)) {
     // the snapshot of this very revision (server.js domCache): a request
     // queued behind the next keystroke would come back one revision newer
-    const pending = fetch(`/dom?srcRev=${encodeURIComponent(sourceRev)}`, { cache: 'no-store' }).then(async response => {
+    // The snapshot is the whole document. With an earlier revision of it in
+    // hand, ask only for what changed since (server.js domDeltaBody).
+    const held = provisionalSnapshotHeld?.epoch === epoch && Number.isSafeInteger(provisionalSnapshotHeld.snapshot.domStamp)
+      ? provisionalSnapshotHeld.snapshot : null;
+    const request = (base) => fetch(`/dom?srcRev=${encodeURIComponent(sourceRev)}${base ? `&base=${encodeURIComponent(base.domStamp)}` : ''}`,
+      { cache: 'no-store' }).then(async response => {
       if (!response.ok) throw new Error('Unready source mapping');
-      const snapshot = await response.json();
+      let snapshot = await response.json();
+      if (snapshot.delta) {
+        snapshot = base && Number(snapshot.delta.base) === Number(base.domStamp) ? applySnapshotDelta(base, snapshot) : null;
+        if (!snapshot) return request(null);
+      }
       if (snapshot.sourceCurrent === false || Number(snapshot.srcRev) !== Number(sourceRev) ||
           Number(snapshot.documentEpoch) !== epoch || documentReset.adoptedEpoch !== epoch) {
         throw new Error('Superseded source mapping');
       }
+      if (!provisionalSnapshotHeld || provisionalSnapshotHeld.epoch !== epoch ||
+          Number(provisionalSnapshotHeld.snapshot.srcRev) <= Number(snapshot.srcRev)) {
+        provisionalSnapshotHeld = { epoch, snapshot };
+      }
       return snapshot;
     });
+    const pending = request(held);
     provisionalSnapshotCache.set(key, pending);
     pending.catch(() => {
       if (provisionalSnapshotCache.get(key) === pending) provisionalSnapshotCache.delete(key);

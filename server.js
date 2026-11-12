@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from './engine/checkpoint/engine-v3.js';
+import { editPageRenderIds } from './engine/checkpoint/update-helpers.js';
 import {
   buildTerminalCanonicalPatch,
   captureCanonicalAnchorBase,
@@ -514,10 +515,54 @@ function cacheDomBeforeNext() {
   if (result.srcRev !== engine?.srcRev) return;
   if (domCache?.srcRev === engine.srcRev && domCache.epoch === documentEpoch && !domCache.dirty) return;
   try {
-    domCache = { srcRev: engine.srcRev, epoch: documentEpoch, body: JSON.stringify(domPayload(result)), dirty: false };
+    rememberDom(domPayload(result));
   } catch {
     domCache = null;
   }
+}
+
+// The snapshot is the whole document (a 389-page book: about 10 MB), and the
+// viewer asks for one per keystroke. It is serialized block by block so a
+// viewer that holds an earlier revision can be sent only what changed since.
+// A revision repaginated in place is serialized again under the same number,
+// so a base is named by the stamp of the serialization the viewer received.
+const domEarlier = []; // serializations before domCache's, newest last
+let domStamp = 0;
+function serializeDom(payload) {
+  const { blocks = [], sources = [], ...rest } = payload;
+  const order = blocks.map((block) => String(block.id));
+  const blockText = blocks.map((block) => JSON.stringify(block));
+  const files = sources.map((source) => source.file);
+  const sourceText = sources.map((source) => JSON.stringify(source));
+  const tail = JSON.stringify(rest).slice(1); // `"rev":…}`
+  const unique = new Set(order).size === order.length;
+  const stamp = ++domStamp;
+  return {
+    srcRev: payload.srcRev, stamp, order, files, tail, unique,
+    blocks: new Map(order.map((id, i) => [id, blockText[i]])),
+    sources: new Map(files.map((file, i) => [file, sourceText[i]])),
+    body: `{"domStamp":${stamp},"blocks":[${blockText.join(',')}],"sources":[${sourceText.join(',')}]${tail.length > 1 ? ',' : ''}${tail}`,
+  };
+}
+function rememberDom(payload) {
+  const parts = serializeDom(payload);
+  if (domCache && domCache.epoch !== documentEpoch) domEarlier.length = 0;
+  else if (domCache?.parts) {
+    domEarlier.push(domCache.parts);
+    while (domEarlier.length > 4) domEarlier.shift();
+  }
+  domCache = { srcRev: payload.srcRev, epoch: documentEpoch, body: parts.body, dirty: false, parts };
+  return parts;
+}
+/** The snapshot as a change from the serialization stamped `base`, or null when that one is not held. */
+function domDeltaBody(parts, base) {
+  if (!Number.isSafeInteger(base) || base === parts.stamp || !parts.unique) return null;
+  const earlier = domEarlier.findLast((item) => item.stamp === base);
+  if (!earlier?.unique) return null;
+  const blocks = parts.order.filter((id) => earlier.blocks.get(id) !== parts.blocks.get(id)).map((id) => parts.blocks.get(id));
+  const sources = parts.files.filter((file) => earlier.sources.get(file) !== parts.sources.get(file)).map((file) => parts.sources.get(file));
+  return `{"domStamp":${parts.stamp},"delta":{"base":${base}},"order":${JSON.stringify(parts.order)},"files":${JSON.stringify(parts.files)},` +
+    `"blocks":[${blocks.join(',')}],"sources":[${sources.join(',')}]${parts.tail.length > 1 ? ',' : ''}${parts.tail}`;
 }
 
 function withEngine(fn) {
@@ -1219,6 +1264,14 @@ function geometry() {
     : { paperwidth: 612, paperheight: 792 };
 }
 
+// The block the edit-page report is about: the caret's while it was warmed
+// for the current source, else the last keystroke's.
+function editPageFocus() {
+  const warm = engine.warmInfo;
+  if (Number.isInteger(warm?.target) && warm.sourceRev === engine.srcRev) return warm.target;
+  return engine.lastWalkTrace?.firstDirty ?? null;
+}
+
 function docPayload() {
   return {
     documentEpoch,
@@ -1811,6 +1864,15 @@ const server = http.createServer(async (req, res) => {
         preamblePatches: engine.preamblePatches ?? 0,
         lastPreamblePatch: engine.lastPreamblePatch ?? null,
         // the last foreground walk, without its per-block rows
+        // the last keystroke's phases (engine timer) and its way through the server
+        lastEdit: lastReport?.timing ? {
+          srcRev: lastReport.srcRev,
+          queueMs: lastReport.timing.clientEditAtEpochMs ? lastReport.timing.receivedAtEpochMs - lastReport.timing.clientEditAtEpochMs : null,
+          engineMs: lastReport.timing.engineDoneAtEpochMs - lastReport.timing.receivedAtEpochMs,
+          phases: Object.fromEntries(Object.entries(lastReport.stats ?? {})
+            .filter(([key, value]) => /(Ms|Us)$/.test(key) && Number.isFinite(value))
+            .map(([key, value]) => (key.endsWith('Us') ? [key.slice(0, -2), Math.round(value / 1000)] : [key.slice(0, -2), Math.round(value)]))),
+        } : null,
         lastWalk: engine.lastWalkTrace ? {
           from: engine.lastWalkTrace.from, firstDirty: engine.lastWalkTrace.firstDirty,
           lastDirty: engine.lastWalkTrace.lastDirty, typeset: engine.lastWalkTrace.typeset ?? null,
@@ -1819,6 +1881,21 @@ const server = http.createServer(async (req, res) => {
           skips: (engine.lastWalkTrace.blocks ?? []).filter(([, , f]) => String(f).startsWith('skip>')).map(([k, , f]) => `${k}${f.slice(4)}`),
         } : null,
         progress: engine.progress ?? null,
+        // where an edit can resume from, and what the caret pinned
+        checkpoints: [...(engine.checkpoints?.keys() ?? [])].sort((x, y) => x - y),
+        // the blocks the last edit publishes with its page, and why a walk
+        // would start before the edited one (measurement drivers)
+        editPage: [...(engine.foregroundRenderIds ?? (Number.isInteger(editPageFocus()) && engine.blocks[editPageFocus()]
+          ? new Set([engine.blocks[editPageFocus()].id,
+            ...editPageRenderIds(engine.blocks, engine.pages, new Set([engine.blocks[editPageFocus()].id]))]) : []))].map((id) => {
+          const idx = engine.blocks.findIndex((b) => b.id === id); const b = engine.blocks[idx];
+          return b ? { id, idx, render: !!b.needsRender, rescued: !!b.rescued, galley: !!b.galley,
+            stale: !!b.needsRender && (engine.chunkTargetsOf?.(b) ?? []).some((t) => engine.chunks.get(t.key)?.forGalley !== b.galleyHash),
+            ckpt: engine.checkpoints.has(idx), held: engine.editHold.includes(idx) || engine.renderHold.has(idx), want: engine.renderWant?.has(id) ?? false,
+            chunks: (engine.chunkTargetsOf?.(b) ?? []).map((t) => (engine.chunks.get(t.key) ? (engine.chunks.get(t.key).forGalley === b.galleyHash ? 'fresh' : 'old') : 'none')).join(','), head: String(b.text ?? '').trim().slice(0, 24) } : { id };
+        }).sort((x, y) => (x.idx ?? 0) - (y.idx ?? 0)),
+        checkpointBudget: engine.maxCheckpoints ?? null,
+        editHold: engine.editHold ?? [],
         // pages the resident layout has right now (async rescues and
         // repaginations move it between edit reports)
         residentPages: engine.pages?.length ?? null,
@@ -2174,12 +2251,24 @@ const server = http.createServer(async (req, res) => {
       // edit. Snapshot them together after the queued mutation completes.
       domInterestUntil = Date.now() + 5_000;
       const wantRev = Number(url.searchParams.get('srcRev'));
+      const baseRev = url.searchParams.has('base') ? Number(url.searchParams.get('base')) : NaN;
+      const send = (parts) => {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(domDeltaBody(parts, baseRev) ?? parts.body);
+      };
       if (Number.isSafeInteger(wantRev) && domCache?.srcRev === wantRev && domCache.epoch === documentEpoch &&
           (!domCache.dirty || engineBusy > 0)) {
+        if (domCache.parts) return send(domCache.parts);
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         return res.end(domCache.body);
       }
-      return json(res, await withEngine(() => domPayload()));
+      const payload = await withEngine(() => domPayload());
+      // a revision asked for by number is kept: the next one is sent as a change from it
+      if (Number.isSafeInteger(wantRev) && payload.srcRev === wantRev && payload.srcRev === engine.srcRev &&
+          payload.documentEpoch === documentEpoch) {
+        return send(rememberDom(payload));
+      }
+      return json(res, payload);
     }
     if (req.method === 'POST' && url.pathname === '/synctex') {
       const body = JSON.parse(await readBody(req));

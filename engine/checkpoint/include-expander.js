@@ -99,6 +99,11 @@ function normalizeIncludeName(value) {
   return String(value || '').trim().replace(/\\/g, '/').replace(/\.tex$/i, '').replace(/^\.\//, '');
 }
 
+// Per project (keyed by its include cache): the expansion of each file that
+// reads no other file, for as long as its text stays the same.
+const leafExpansions = new WeakMap();
+const READS_ANOTHER_FILE = /\\(?:input|include|includeonly|subfile|subfileinclude|import|subimport|inputfrom|subinputfrom|includefrom|subincludefrom|InputIfFileExists|IfFileExists|printindex|bibliography|printbibliography|verbatiminput|lstinputlisting|inputminted)(?![A-Za-z@])/;
+
 function expandTextFile(full, depth, context, readPath = full, overlay = false, rootUnit = null, documentBody = false) {
   try {
     const st = statSync(readPath);
@@ -113,6 +118,17 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
     const range = documentBody ? documentBodyRange(text) : null;
     const bodyStart = range ? range.start : 0;
     const bodyText = range ? text.slice(range.start, range.end) : text;
+    // A keystroke re-expands the whole project. A file that reads no other
+    // file expands to the same blocks while its text is the same: a book of
+    // thirty chapters re-segmented all of them (1.6 MB) for one letter.
+    const leaf = !READS_ANOTHER_FILE.test(bodyText);
+    const memoKey = leaf ? `${readPath}|${documentBody ? 1 : 0}|${depth}|${JSON.stringify([...(context.literalEnvs ?? [])])}` : null;
+    const memos = leaf ? leafExpansions.get(context.includes) ?? leafExpansions.set(context.includes, new Map()).get(context.includes) : null;
+    const memo = memos?.get(full);
+    if (memo && memo.key === memoKey && memo.text === text && memo.rootUnit === rootUnit) {
+      return memo.segs.map((seg) => ({ ...seg }));
+    }
+    const diagnosticsBefore = context.diagnostics?.length ?? 0;
     const subs = expandIncludes(
       expandInputParagraphs(segmentBody(bodyText, bodyStart, { literalEnvs: context.literalEnvs }), {
         ...context,
@@ -126,7 +142,7 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
       { ...context, file: full, rootUnit }
     );
     const starts = lineStarts(text);
-    return subs.map((s) => {
+    const expanded = subs.map((s) => {
       const direct = !s.file;
       return {
         ...s,
@@ -136,6 +152,15 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
         hash: fnv1a(`${full}|${s.hash}`),
       };
     });
+    if (memos) {
+      // only what came from this file's own text, and said nothing while it did
+      if (subs.every((seg) => !seg.file) && (context.diagnostics?.length ?? 0) === diagnosticsBefore) {
+        memos.set(full, { key: memoKey, text, rootUnit, segs: expanded.map((seg) => ({ ...seg })) });
+      } else {
+        memos.delete(full);
+      }
+    }
+    return expanded;
   } catch {
     return null;
   }

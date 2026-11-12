@@ -174,3 +174,62 @@ test('a contents list redefined to run in columns takes the real output routine'
   const plain = '\\documentclass{article}\n\\begin{document}\n\\tableofcontents\n\\end{document}\n';
   assert.equal(needsRescue('\\tableofcontents\n', { ...options, source: () => plain }).needs, false);
 });
+
+test('a chapter that reads no other file is segmented once while its text stays the same', () => {
+  const docDir = mkdtempSync(path.join(tmpdir(), 'tdom-leaf-'));
+  mkdirSync(path.join(docDir, 'tex'));
+  const one = path.join(docDir, 'tex', 'one.tex');
+  const two = path.join(docDir, 'tex', 'two.tex');
+  const sub = path.join(docDir, 'tex', 'sub.tex');
+  writeFileSync(one, 'First of one.\n\nSecond of one.\n');
+  writeFileSync(two, 'Before.\n\n\\input{tex/sub}\n\nAfter.\n');
+  writeFileSync(sub, 'Inside sub.\n');
+  const context = { docDir, workDir: docDir, includes: new Map(), diagnostics: [], watchInclude: () => {} };
+  const expand = () => expandIncludes(segmentBody('\\input{tex/one}\n\n\\input{tex/two}\n', 0), 0, context);
+  try {
+    const first = expand();
+    const again = expand();
+    assert.deepEqual(again, first);
+    assert.ok(again.every((seg, i) => seg !== first[i]), 'a kept expansion is handed out as copies');
+    again[0].text = 'changed by the caller';
+    assert.equal(expand()[0].text, first[0].text, 'what a caller writes into a block stays out of the kept copy');
+    // the file's own text changes: its blocks follow (same mtime or not)
+    context.includes.set(one, { ...context.includes.get(one), text: 'Rewritten.\n' });
+    writeFileSync(one, 'Rewritten.\n');
+    assert.equal(expand()[0].text.trim(), 'Rewritten.');
+    // a file read through another one is never kept with it
+    writeFileSync(sub, 'Inside sub, edited and longer.\n');
+    assert.ok(expand().some((seg) => seg.text.includes('edited and longer')));
+  } finally {
+    rmSync(docDir, { recursive: true, force: true });
+  }
+});
+
+test('the structural verdict of a body given as blocks is the joined text\'s', async () => {
+  const { classifyStructuralAliases, classifyStructuralAliasesOfBlocks } =
+    await import('../engine/checkpoint/structural-aliases.js');
+  const preamble = String.raw`\documentclass{article}
+\usepackage{multicol}
+\newenvironment{twocol}{\begin{multicols}{2}}{\end{multicols}}
+\newcommand{\cols}{\begin{multicols}{3}}
+`;
+  const blocks = [
+    'Plain text.',
+    '\\begin{twocol}\nInside.\n\\end{twocol}',
+    'More text with \\emph{emphasis}.',
+    '\\cols',
+    'Tail.',
+  ];
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+  const same = () => assert.deepEqual(
+    plain(classifyStructuralAliasesOfBlocks(preamble, blocks)),
+    plain(classifyStructuralAliases(preamble, blocks.join('\n\n'))));
+  same();
+  blocks[2] += ' One more letter';
+  same(); // every other block's scan is kept
+  blocks[4] = '\\newcommand{\\late}{\\begin{multicols}{2}}\n\\late';
+  same(); // a definition in the body changes what every block's uses mean
+  blocks[4] = 'Tail.';
+  blocks[0] = '\\def\\twocol{x}\\newenvironment{twocol}{}{}';
+  same(); // the same name defined again another way
+});

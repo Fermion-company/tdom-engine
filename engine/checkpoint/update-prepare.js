@@ -1,7 +1,7 @@
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch } from './safety.js';
-import { classifyStructuralAliases } from './structural-aliases.js';
+import { classifyStructuralAliases, classifyStructuralAliasesOfBlocks } from './structural-aliases.js';
 import { firstDirtyIndex, nextEditHold, editPageRenderIds } from './update-helpers.js';
 import { checkpointBudgetFor } from './checkpoint-selection.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
@@ -68,10 +68,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   // segmenter and block rescue classifier. Analyse the expanded project body
   // before granting structured display; an exact canonical page is the only
   // honest surface when a locally-defined structural alias is actually used.
-  const expandedStructuralGate = classifyStructuralAliases(
-    preamble,
-    segs.map((seg) => seg.text).join('\n\n')
-  );
+  const expandedStructuralGate = classifyStructuralAliasesOfBlocks(preamble, segs.map((seg) => seg.text));
   const structuralReasons = [
     ...rawStructuralGate.reasons,
     ...expandedStructuralGate.reasons,
