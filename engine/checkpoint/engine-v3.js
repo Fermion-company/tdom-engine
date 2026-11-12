@@ -1669,6 +1669,19 @@ export class CheckpointEngine {
    * Idempotent — safe to call after any checkpoint-creating pass.
    */
   #enforceCheckpointCap(continuation = null) {
+    // A render hold keeps a checkpoint warm for a block that may want exact
+    // pixels later. Where memory sets the budget that is a fork the document
+    // cannot afford to keep for nothing: a book that affords three
+    // checkpoints sat on nine more after its boot, each holding a block no
+    // render was queued for. Keep only the ones a render is waiting on.
+    if (this.renderHold.size && this.#memoryBound()) {
+      for (const [idx, id] of [...this.renderHold]) {
+        const block = this.blocks[idx];
+        const wanted = this.renderWant.has(id) || this.foregroundRenderIds?.has(id) ||
+          this.rendering?.has(id + ':' + block?.galleyHash);
+        if (!wanted) this.renderHold.delete(idx);
+      }
+    }
     const active = [...this.checkpoints].filter(([, peer]) => peer === this.jobInput).map(([index]) => index);
     const activeRender = checkpointIndicesForPeers(
       this.checkpoints,
