@@ -210,6 +210,24 @@ const namesRe = (names) => names.length
  * environments the PREAMBLE defines (\newtcolorbox/\newtcbtheorem with
  * a `breakable` option create page-splitting envs under custom names).
  */
+/** True when the document redefines \tableofcontents (or a list of figures or
+ * tables) to set it in columns: `\begin{multicols}{2}\@starttoc{toc}…`. The
+ * source line shows none of it, and on the dormant page a five-page contents
+ * list came out as one page. */
+export function tocTakesRealPage(text) {
+  const source = stripComments(text);
+  const redefinition =
+    /\\(?:RenewDocumentCommand|DeclareDocumentCommand|renewcommand\*?|def|gdef)\s*\{?\s*\\(?:tableofcontents|listoffigures|listoftables)\b/g;
+  for (const match of source.matchAll(redefinition)) {
+    const body = source.slice(match.index, match.index + 2000);
+    const stop = body.search(/\n\s*\n\s*\\(?:RenewDocumentCommand|DeclareDocumentCommand|NewDocumentCommand|renewcommand|newcommand|def)\b/);
+    if (/\\begin\s*\{(?:multicols\*?|paracol)\}|\\twocolumn\b/.test(stop > 0 ? body.slice(0, stop) : body)) return true;
+  }
+  return false;
+}
+
+const TOC_RE = /\\(?:tableofcontents|listoffigures|listoftables)\b/;
+
 export function needsRescue(text, {
   preHash,
   breakableFor,
@@ -218,6 +236,7 @@ export function needsRescue(text, {
   source,
   packageText = () => '',
   structuralSinks = [],
+  tocRealPage = false,
 }) {
   const live = stripComments(text); // `% \begin{longtable}` must not cost a rescue
   const aliasNeedsRescue = structuralSinks.some((sink) => RESCUE_STRUCTURAL_SINKS.has(sink));
@@ -235,9 +254,11 @@ export function needsRescue(text, {
     const packageNames = collectBreakableTcolorboxNames(packageText(pre))
       .filter((name) => !names.includes(name));
     packageBreakableRe = namesRe(packageNames);
+    tocRealPage = tocTakesRealPage(pre) || tocTakesRealPage(packageText(pre));
     breakableFor = preHash;
   }
-  const state = { breakableFor, breakableRe, packageBreakableRe };
+  const state = { breakableFor, breakableRe, packageBreakableRe, tocRealPage };
+  if (tocRealPage && TOC_RE.test(live)) return { needs: true, ...state };
   if (aliasNeedsRescue || OUTPUT_HIJACK_RE.test(live) || TITLE_RE.test(live)) {
     return { needs: true, ...state };
   }

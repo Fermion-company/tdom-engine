@@ -45,6 +45,18 @@ export async function isoCompile(
   writeFileSync(path.join(jobdir, 'iso.tex'), isoTex);
   // \printindex reads \jobname.ind beside the job: the index canonical made
   // (engine-v3.js #syncResidentIndex), under both names an isolated run has.
+  // … and a contents list reads \jobname.toc (lof, lot) the same way.
+  if (/\\(?:tableofcontents|listoffigures|listoftables)\b/.test(block.text)) {
+    for (const ext of ['toc', 'lof', 'lot']) {
+      const list = path.join(engine.workDir, `driver.${ext}`);
+      for (const name of [`iso.${ext}`, `driver.${ext}`]) {
+        try {
+          if (existsSync(list)) copyFileSync(list, path.join(jobdir, name));
+          else rmSync(path.join(jobdir, name), { force: true });
+        } catch { /* printed without it, as on a first run */ }
+      }
+    }
+  }
   if (/\\printindex\b/.test(block.text)) {
     const index = path.join(engine.workDir, 'driver.ind');
     for (const name of ['iso.ind', 'driver.ind']) {

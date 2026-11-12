@@ -957,7 +957,9 @@ export class CheckpointEngine {
       source: () => this.store.get(this.file) ?? '',
       packageText: (preamble) => projectPackageText(preamble, { docDir: this.docDir, overlayDir: this.overlayDir }),
       structuralSinks,
+      tocRealPage: this._tocRealPage === true,
     });
+    this._tocRealPage = result.tocRealPage === true;
     if (result.breakableFor !== this._breakableFor) this._breakableFor = result.breakableFor;
     if (result.breakableRe !== this._breakableRe) this._breakableRe = result.breakableRe;
     if (result.packageBreakableRe !== this._packageBreakableRe) this._packageBreakableRe = result.packageBreakableRe;
@@ -979,6 +981,7 @@ export class CheckpointEngine {
       blocks: this.blocks,
       labelTable: this.labelTable,
       preHash: this.#rescuePre(block),
+      tocHash: this.tocHash,
     });
   }
 
@@ -1218,7 +1221,7 @@ export class CheckpointEngine {
     if (!this.realRoot?.pid || this.isoForkBroken.has(block.id)) return null;
     const key = this.#rescueCacheKey(block, idx);
     if (this.isoFailCache.has(key)) return null;
-    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) });
+    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block), tocHash: this.tocHash });
     const text = block.text;
     const seq = ++this.coldPreviewSeq;
     // the galley it may replace: the one on the block now (a stale-first copy
@@ -1358,7 +1361,7 @@ export class CheckpointEngine {
         outcome = 'boot-skipped'; // its inputs moved while it waited: the async pump takes it
         return null;
       }
-      this.#isoCacheSet(cacheKey, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) }));
+      this.#isoCacheSet(cacheKey, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block), tocHash: this.tocHash }));
       outcome = 'boot';
       return iso;
     } finally {
@@ -1382,7 +1385,7 @@ export class CheckpointEngine {
   #isoBaseGet(block, idx) {
     const disk = this.#isoDiskCache();
     if (!disk) return undefined;
-    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) });
+    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block), tocHash: this.tocHash });
     const found = disk.getBase(baseKey);
     if (process.env.TDOM_TRACE_ISO_CACHE) {
       console.error('[iso-cache] lookup', block.id, 'idx', idx, 'base', baseKey, 'prev', this.blocks[idx - 1]?.id,
@@ -2553,7 +2556,7 @@ export class CheckpointEngine {
       rescueCached = false;
       // the disk index of the inputs the key names (read before the compile
       // waits for its turn, like the key itself)
-      const baseKeyNow = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) });
+      const baseKeyNow = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block), tocHash: this.tocHash });
       const iso = await this.#isoCompile(block, idx, 'async exact rescue', false, { expectKey: key });
       if (!iso) {
         // its inputs moved while it waited for its turn: queue the current key

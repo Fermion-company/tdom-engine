@@ -138,3 +138,39 @@ Last block.
     rmSync(workDir, { recursive: true, force: true });
   }
 });
+
+test('an edit renders its own page and the page a straddling block ties to it, no further', async () => {
+  const { editPageRenderIds } = await import('../engine/checkpoint/update-helpers.js');
+  const blocks = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6'].map((id) => ({ id, needsRender: true }));
+  const draw = (...ids) => ids.map((blockId) => ({ u: { blockId } }));
+  const pages = [
+    { number: 1, draw: [{ u: {} }, ...draw('head', 'b1', 'b2')] },
+    { number: 2, draw: [{ u: {} }, ...draw('head', 'b2', 'b3', 'b4')] }, // edited: b3
+    { number: 3, draw: [{ u: {} }, ...draw('head', 'b4', 'b5')] },       // b4 runs over the boundary
+    { number: 4, draw: [{ u: {} }, ...draw('head', 'b6')] },
+  ];
+  // "head" is on every page but is not a block of the document; neither is a
+  // draw with no block at all. Either one, counted, tied the whole chapter.
+  assert.deepEqual(editPageRenderIds(blocks, pages, new Set(['b3'])), ['b1', 'b2', 'b3', 'b4', 'b5']);
+  assert.deepEqual(editPageRenderIds(blocks, pages, new Set(['b6'])), ['b6']);
+  assert.deepEqual(editPageRenderIds(blocks, pages, new Set()), []);
+});
+
+test('a contents list redefined to run in columns takes the real output routine', async () => {
+  const { tocTakesRealPage, needsRescue } = await import('../engine/checkpoint/rescue-classifier.js');
+  const columns = String.raw`\RenewDocumentCommand{\tableofcontents}{}{%
+  \begin{multicols}{2}%
+    \@starttoc{toc}%
+  \end{multicols}%
+  \clearpage
+}`;
+  assert.equal(tocTakesRealPage(columns), true);
+  assert.equal(tocTakesRealPage(String.raw`\renewcommand{\tableofcontents}{\section*{Contents}\@starttoc{toc}}`), false);
+  assert.equal(tocTakesRealPage(String.raw`% \renewcommand{\tableofcontents}{\begin{multicols}{2}\@starttoc{toc}\end{multicols}}`), false);
+  const source = columns + '\n\\begin{document}\n\\tableofcontents\nText.\n\\end{document}\n';
+  const options = { preHash: 'p', breakableFor: null, breakableRe: null, source: () => source };
+  assert.equal(needsRescue('\\tableofcontents\n', options).needs, true);
+  assert.equal(needsRescue('Text.\n', options).needs, false);
+  const plain = '\\documentclass{article}\n\\begin{document}\n\\tableofcontents\n\\end{document}\n';
+  assert.equal(needsRescue('\\tableofcontents\n', { ...options, source: () => plain }).needs, false);
+});

@@ -45,10 +45,17 @@ export function hasDefinitionEdit(oldBlocks, blocks, bounds, defRe) {
 }
 
 export function editPageRenderIds(blocks, pages, dirtySource) {
+  // Only the document's own blocks tie pages together. A draw can also name
+  // something every page carries (the running head's source): counted as a
+  // block it tied the whole chapter to the edited page, and each keystroke
+  // replayed from the chapter's first picture.
+  const real = new Set(blocks.map(block => block.id));
+  const idsOf = page => (page.draw ?? []).map(draw => draw.u?.blockId).filter(id => real.has(id));
   const nearby = new Set();
   for (const page of pages) {
-    if (!page.draw?.some(draw => dirtySource.has(draw.u?.blockId))) continue;
-    for (const draw of page.draw) nearby.add(draw.u?.blockId);
+    const ids = idsOf(page);
+    if (!ids.some(id => dirtySource.has(id))) continue;
+    for (const id of ids) nearby.add(id);
   }
   // A block that runs over the page boundary ties the next page to this one:
   // the viewer shows both or neither. In a long document the boot leaves far
@@ -56,8 +63,9 @@ export function editPageRenderIds(blocks, pages, dirtySource) {
   // that neighbour held the page being typed on until the next canonical.
   const tied = new Set(nearby);
   for (const page of pages) {
-    if (!page.draw?.some(draw => nearby.has(draw.u?.blockId))) continue;
-    for (const draw of page.draw) tied.add(draw.u?.blockId);
+    const ids = idsOf(page);
+    if (!ids.some(id => nearby.has(id))) continue;
+    for (const id of ids) tied.add(id);
   }
   return blocks.filter(block => tied.has(block.id) && block.needsRender).map(block => block.id);
 }
