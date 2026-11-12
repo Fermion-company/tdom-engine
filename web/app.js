@@ -6990,6 +6990,13 @@ pagesEl.addEventListener('scroll', () => {
         candidates.sort((a, b) => a.distance - b.distance || Number(b.ink) - Number(a.ink));
         const first = candidates[0];
         if (!first) continue;
+        // A block that begins by clearing the page (\chapter) leaves an
+        // inkless trace on the page it closes and its heading on the next.
+        // When that next page already shows canonical pixels it is not among
+        // the candidates, and the trace alone put the band one page early, at
+        // the end of the chapter before (389-page book, measured). The trace
+        // of a block that runs over several pages is no position.
+        if (!first.ink && (block.pages?.length ?? 0) > 1) continue;
         const nodes = candidates.filter(c => c.page === first.page && c.distance === first.distance && c.ink === first.ink);
         const rects = nodes.map(c => c.node.getBoundingClientRect());
         const top = Math.min(...rects.map(r => r.top)), bottom = Math.max(...rects.map(r => r.bottom));
