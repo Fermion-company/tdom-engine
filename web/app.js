@@ -880,7 +880,23 @@ function flushDirectPresentationUpdates() {
   for (const commit of commits) commit();
 }
 
+// Why the paper is or is not following the source, for a diagnostic session:
+// call window.__tdomViewerState() in the frame's console.
+globalThis.__tdomViewerState = () => ({
+  appliedSrcRev,
+  residentPages: provisionalDisplayLists.size,
+  pendingLayout: [...provisionalPendingLayout].slice(0, 20),
+  staged: provisionalStages.size,
+  stagedReady: [...provisionalStages.values()].filter(stage => stage.ready).length,
+  removed: provisionalRemovedPages.size,
+  canonical: committedCanonicalGeneration && { ...committedCanonicalGeneration },
+  reported: canonical && { rev: canonical.rev, pageCount: canonical.pageCount },
+  canonicalSurface: usesCanonicalSurface(),
+  resetPending: documentReset.pending,
+});
+
 function tryCommitProvisionalStages() {
+  resyncPendingLayout();
   if (directPresentationBlocked()) return traceStage('hold', null, { why: 'direct-presentation' });
   if (usesCanonicalSurface() || documentReset.pending) return traceStage('hold', null, { why: 'canonical-surface' });
   // Canonical may have replaced an incomplete or differently paginated
@@ -1010,6 +1026,42 @@ function tryCommitProvisionalStages() {
     void refreshDirectEditGeometry();
   }
   updateBadge();
+}
+
+// A page marked "no layout yet" (a block whose first galley had not arrived
+// when this viewer read the document) is cleared by the patch that brings
+// the layout. A viewer that loads while a long document is still booting can
+// miss that patch: the engine sent it before the snapshot was applied. The
+// mark then stayed for the whole session, the resident page count never
+// counted as settled, and no keystroke was shown before the next canonical
+// (a 389-page book: 20 pages marked, the engine holding none). While marks
+// remain, ask the engine again and take the pages it has laid out since.
+let pendingLayoutResyncAt = 0;
+let pendingLayoutResyncing = false;
+function resyncPendingLayout() {
+  if (pendingLayoutResyncing || !provisionalPendingLayout.size) return;
+  if (usesCanonicalSurface() || documentReset.pending) return;
+  if (typeof fetch !== 'function' || typeof performance === 'undefined') return;
+  const now = performance.now();
+  if (now - pendingLayoutResyncAt < 4000) return;
+  pendingLayoutResyncAt = now;
+  pendingLayoutResyncing = true;
+  const rev = appliedSrcRev;
+  const epoch = documentReset.adoptedEpoch;
+  fetch('/doc').then(response => response.json()).then((doc) => {
+    if (appliedSrcRev !== rev || documentReset.adoptedEpoch !== epoch || documentReset.pending) return;
+    if (Number(doc.report?.srcRev ?? doc.report?.rev) !== Number(rev)) return;
+    if (doc.documentEpoch != null && epoch != null && Number(doc.documentEpoch) !== Number(epoch)) return;
+    const laidOut = (doc.pages ?? []).filter(dl => provisionalPendingLayout.has(dl.page) &&
+      !dl.commands?.some(cmd => cmd.op === 'pending-exact' && cmd.wholePage));
+    if (!laidOut.length) return;
+    stageProvisionalPatches(laidOut.map(displayList => ({ type: 'replace-page', displayList })), false, doc.pages.length);
+    if (committedCanonicalGeneration && committedCanonicalGeneration.epoch === documentReset.adoptedEpoch &&
+        provisionalDisplayLists.size === committedCanonicalGeneration.pageCount && !provisionalPendingLayout.size) {
+      committedCanonicalGeneration.residentLayoutCompatible = true;
+    }
+    tryCommitProvisionalStages();
+  }).catch(() => {}).finally(() => { pendingLayoutResyncing = false; });
 }
 
 let lastCanonicalDisplayDemand = '';
@@ -2462,6 +2514,7 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   }
   committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch, pageCount: batch.pageCount,
     residentLayoutCompatible: provisionalDisplayLists.size === batch.pageCount && !provisionalPendingLayout.size };
+  resyncPendingLayout();
   for (const [page, dl] of provisionalDisplayLists) committedPageSrcs.set(page, displayListSrcs(dl));
   pageEditGroup.clear();
   provisionalStages.clear();

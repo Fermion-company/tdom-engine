@@ -107,6 +107,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   engine.maxCheckpoints = checkpointBudgetFor(engine.blocks.length, {
     ceiling: engine.checkpointCeiling,
     pageCount: engine.canonicalPageCount,
+    heapFloorKb: engine.confirmedLiveHeapKb,
   });
   if (shippingExactUses.length) {
     engine.previewPolicy = 'shipping-exact';

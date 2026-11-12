@@ -103,6 +103,7 @@ export function initializeEngineState(
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
   engine.confirmedLiveHeapKb = 0;
+  engine.budgetedHeapKb = 0;
   engine.calibrateInitialHeap = false;
 
   // canonical layer: the exact-output authority (see file header)

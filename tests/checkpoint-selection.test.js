@@ -440,3 +440,17 @@ test('an edited block keeps its exact-render history only when it was edited in 
   const split = diffBlocks([block('A', 'a', 'box\npara')], [seg('a1', 'box'), seg('a2', 'para')], () => ++n);
   assert.equal(split.blocks[0].exactHistory, null);
 });
+
+test('the checkpoint budget stays inside the machine for a heavy preamble', async () => {
+  const { checkpointBudgetFor, memoryCheckpointCeiling } = await import('../engine/checkpoint/checkpoint-selection.js');
+  const GiB = 2 ** 30;
+  // a book whose preamble keeps 1 GB live: a quarter of 16 GB carries three forks
+  assert.equal(checkpointBudgetFor(3415, { ceiling: 12, heapFloorKb: 1_060_000, totalBytes: 16 * GiB }), 3);
+  assert.equal(checkpointBudgetFor(3415, { ceiling: 48, heapFloorKb: 1_060_000, totalBytes: 64 * GiB }), 15);
+  // ordinary documents keep the ceiling, and so does a heap not yet measured
+  assert.equal(checkpointBudgetFor(3415, { ceiling: 12, heapFloorKb: 200_000, totalBytes: 16 * GiB }), 12);
+  assert.equal(checkpointBudgetFor(3415, { ceiling: 12, totalBytes: 16 * GiB }), 12);
+  assert.equal(memoryCheckpointCeiling(0), Infinity);
+  // never below three: the root, one behind the caret and one ahead
+  assert.equal(memoryCheckpointCeiling(8_000_000, { totalBytes: 8 * GiB }), 3);
+});

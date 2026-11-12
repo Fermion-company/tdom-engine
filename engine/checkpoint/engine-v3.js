@@ -751,6 +751,20 @@ export class CheckpointEngine {
       const [galley, nextCheckpoint] = await Promise.all([galleyP, ckptP]);
       nextCheckpoint.replayToken = replayToken;
       this.confirmedLiveHeapKb = Math.max(this.confirmedLiveHeapKb || 0, nextCheckpoint.gcFloorKb || 0);
+      // the live heap is first known here, during the boot walk, and it
+      // grows with the document: keep the checkpoint budget inside memory
+      if (this.confirmedLiveHeapKb > (this.budgetedHeapKb || 0) * 1.1) {
+        this.budgetedHeapKb = this.confirmedLiveHeapKb;
+        const bounded = checkpointBudgetFor(this.blocks.length, {
+          ceiling: this.checkpointCeiling,
+          pageCount: this.canonicalPageCount,
+          heapFloorKb: this.confirmedLiveHeapKb,
+        });
+        if (bounded < this.maxCheckpoints) {
+          this.maxCheckpoints = bounded;
+          this.checkpointKeepCache = null;
+        }
+      }
       if (process.env.TDOM_TRACE_JOB) console.error('[job-gc]', jobId, JSON.stringify({ interactive, gcMs: nextCheckpoint.gcMs, ...galley.tm }));
       // a keystroke waiting on this background step waited for its collect
       // too (report timing: lock.gcWaitedMs)
@@ -2391,6 +2405,7 @@ export class CheckpointEngine {
       this.maxCheckpoints = checkpointBudgetFor(this.blocks.length, {
         ceiling: this.checkpointCeiling,
         pageCount: this.canonicalPageCount,
+        heapFloorKb: this.confirmedLiveHeapKb,
       });
       if (this.maxCheckpoints !== prior) {
         this.checkpointKeepCache = null;

@@ -31,6 +31,7 @@ export async function bootRoot(
   engine.checkpoints.clear();
   engine.realRoot = null;
   engine.confirmedLiveHeapKb = 0;
+  engine.budgetedHeapKb = 0;
   engine.calibrateInitialHeap = true;
   if (engine.root) {
     try { engine.root.kill('SIGKILL'); } catch { /* gone */ }
