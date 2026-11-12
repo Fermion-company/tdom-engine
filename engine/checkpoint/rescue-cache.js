@@ -1,5 +1,5 @@
 import { fnv1a } from '../hash.js';
-import { trailingGlueSpec } from './util/galley.js';
+import { trailingGlueSpec, compileOffset } from './util/galley.js';
 
 /**
  * The glue the isolated compile re-creates before the block (iso-context.js
@@ -38,7 +38,7 @@ export function rescueCacheKey(block, idx, { blocks, labelTable, preHash, tocHas
     (k) => k + '=' + (labelTable.get(k) ?? '')
   );
   // same 0.25bp quantum as the iso strut — see #isoCompile
-  const pageOff = Math.round((block.pageOffset ?? 0) * 4) / 4;
+  const pageOff = compileOffset(block);
   return fnv1a(
     JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, refVals, pageOff, trailingGlueKey(blocks, idx), ...readsIndex(block), ...readsToc(block, tocHash)])
   );

@@ -417,7 +417,14 @@ class PageBuilder {
       // an engine settles on depends on edit history (stress seed-21). With
       // the given position, the isolated real-routine compile is the single
       // authority for the break and the fixpoint is unique.
-      if (e.first && e.bid && !this.blockEntry.has(e.bid)) {
+      // Not while the page is already past its goal, though: the lines above
+      // that do not fit are cut off at the next breakpoint, and this node is
+      // then given again on the page they move to. \pagetotal here is no
+      // position at all (603.5pt on a 596pt page, measured): a splitting box
+      // behind a paragraph that crosses the page was compiled as if it began
+      // at the very foot, broke after one line and left most of a page empty.
+      const pastGoal = !this.shrinkInf && this.total - this.shrink > this.goal + 0.01;
+      if (e.first && e.bid && !pastGoal && !this.blockEntry.has(e.bid)) {
         this.blockEntry.set(e.bid, this.textheight - this.goal + this.total + this.depth);
       }
       switch (e.t) {

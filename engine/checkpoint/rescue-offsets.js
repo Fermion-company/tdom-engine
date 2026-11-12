@@ -1,5 +1,6 @@
 import { fnv1a } from '../hash.js';
 import { opensPackageBreakable } from './rescue-classifier.js';
+import { opensOnFreshPage } from './util/galley.js';
 
 export function queueMovedOffsets(engine, { paginateNow, rescueCacheKey, pumpRescues }) {
   if (engine.mode !== 'structured') return;
@@ -33,7 +34,7 @@ export function queueMovedOffsets(engine, { paginateNow, rescueCacheKey, pumpRes
     // 0.25bp quantum shared with the rescue key and the iso strut: a
     // want/have pair inside one quantum compiles to the same galley by
     // construction, so only a real grid step queues work
-    const want = Math.round((entry.get(block.id) ?? 0) * 4) / 4;
+    const want = opensOnFreshPage(block) ? 0 : Math.round((entry.get(block.id) ?? 0) * 4) / 4;
     // "have" is the galley's compile PROVENANCE, not block.pageOffset —
     // the latter is set optimistically when a re-rescue is queued, so a
     // compile that never lands (failed, superseded) would otherwise lock

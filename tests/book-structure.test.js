@@ -233,3 +233,14 @@ test('the structural verdict of a body given as blocks is the joined text\'s', a
   blocks[0] = '\\def\\twocol{x}\\newenvironment{twocol}{}{}';
   same(); // the same name defined again another way
 });
+
+test('an index is compiled from the top of a page, whatever stood above it', async () => {
+  const { compileOffset, opensOnFreshPage } = await import('../engine/checkpoint/util/galley.js');
+  const index = { text: '\\ifSubfilesClassLoaded{}{\\printindex}\n', pageOffset: 582.53 };
+  assert.equal(opensOnFreshPage(index), true);
+  assert.equal(compileOffset(index), 0);
+  const box = { text: '\\begin{codebox}\nx\n\\end{codebox}\n', pageOffset: 120.13 };
+  assert.equal(opensOnFreshPage(box), false);
+  assert.equal(compileOffset(box), 120.25, 'every other block keeps its offset, on the quarter-point grid');
+  assert.equal(compileOffset({ text: 'Text.' }), 0);
+});
