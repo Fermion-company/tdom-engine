@@ -10,12 +10,17 @@ const gunzip = promisify(gunzipCallback);
 const SHA256 = /^[0-9a-f]{64}$/;
 const REQUEST_ID = /^[A-Za-z0-9:_-]{1,128}$/;
 const TOKEN = /^[0-9a-f-]{36}$/i;
-const SEED_EXTENSIONS = new Set(['aux', 'toc', 'lof', 'lot', 'out']);
+// ind: the resident's \printindex reads the index the Build made. Without it
+// a book taken from its Build stayed pages short of that Build for good
+// (376 against 389: no canonical compile of the engine's own ran to make one).
+const SEED_EXTENSIONS = new Set(['aux', 'toc', 'lof', 'lot', 'out', 'ind']);
 const TEX_SOURCE_EXTENSIONS = new Set(['.tex', '.sty', '.cls', '.def', '.cfg', '.lua']);
 const MAX_ARTIFACT_BYTES = 256 * 1024 * 1024;
 const MAX_FLS_BYTES = 8 * 1024 * 1024;
-const MAX_SYNCTEX_COMPRESSED_BYTES = 8 * 1024 * 1024;
-const MAX_SYNCTEX_BYTES = 32 * 1024 * 1024;
+// A 389-page book: 5.4 MB compressed, 43.8 MB of text. The former 32 MB
+// ceiling refused it ("synctex-unreadable") and the Build was compiled again.
+const MAX_SYNCTEX_COMPRESSED_BYTES = 48 * 1024 * 1024;
+const MAX_SYNCTEX_BYTES = 256 * 1024 * 1024;
 const MAX_INPUTS = 8192;
 const MAX_PROJECT_INPUT_BYTES = 512 * 1024 * 1024;
 
@@ -118,7 +123,7 @@ export async function validateCanonicalBuildImport({
       !Array.isArray(candidate.provenance?.unknownInputs) || candidate.provenance.unknownInputs.length !== 0 ||
       candidate.provenance?.systemInputsStable !== true) return reject('profile-or-provenance-incompatible');
   if (!Number.isFinite(candidate.metrics?.durationMs) || candidate.metrics.durationMs <= 0 ||
-      candidate.metrics.durationMs > 900_000) return reject('build-metrics-invalid');
+      candidate.metrics.durationMs > 1_800_000) return reject('build-metrics-invalid');
 
   let realRoot, realRootFile;
   try {
@@ -176,8 +181,15 @@ export async function validateCanonicalBuildImport({
     projectInputBytes += bytes.length;
     if (projectInputBytes > MAX_PROJECT_INPUT_BYTES) return reject('project-input-budget-exceeded');
     if (sha256(bytes) !== record.sha256) return reject('project-input-changed');
+    // A shell escape can read and write anything, unseen by the recorder.
+    // Lua (\directlua, \lua_now) used to be refused here as well: it can
+    // open a file the recorder does not list. But the engine's own canonical
+    // compile reads that file just as unseen, and a document that merely
+    // prints such a command (a book about expl3) was compiled a second time
+    // in full for it, 389 pages beside the resident boot. The next source
+    // revision compiles afresh either way.
     if (TEX_SOURCE_EXTENSIONS.has(path.extname(record.file).toLowerCase()) &&
-        /\\(?:directlua|lua_now(?::[A-Za-z]+)?|write18|ShellEscape)\b/.test(bytes.toString('utf8'))) {
+        /\\(?:write18|ShellEscape)\b/.test(bytes.toString('utf8'))) {
       return reject('dynamic-input-command-unsupported');
     }
   }

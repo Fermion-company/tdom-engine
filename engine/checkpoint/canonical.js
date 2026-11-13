@@ -944,7 +944,7 @@ export class CanonicalRenderer {
     const allowedSeeds = {};
     let seedBytes = 0;
     for (const [ext, content] of Object.entries(seedFiles ?? {})) {
-      if (!['aux', 'toc', 'lof', 'lot', 'out'].includes(ext) || typeof content !== 'string') continue;
+      if (!['aux', 'toc', 'lof', 'lot', 'out', 'ind'].includes(ext) || typeof content !== 'string') continue;
       seedBytes += Buffer.byteLength(content);
       if (seedBytes > 32 * 1024 * 1024) throw new Error('Build aux seed limit exceeded');
       allowedSeeds[ext] = content;
@@ -2125,7 +2125,7 @@ export class CanonicalRenderer {
             .catch(async () => parseJumpTsv((await this.#exec('pdftotext', ['-tsv', cur.pdf, '-'], textOptions)).stdout)),
         ]);
         if (compressed.length > 8 * 1024 * 1024) return null;
-        const sync = await gunzipP(compressed, { maxOutputLength: 32 * 1024 * 1024 });
+        const sync = await gunzipP(compressed, { maxOutputLength: 256 * 1024 * 1024 });
         return { rows, records: parseJumpRecords(sync.toString('utf8'), this.workDir) };
       })().catch(() => null);
       const index = await cur.jumpIndex;
@@ -2174,7 +2174,7 @@ export class CanonicalRenderer {
         job = (async () => {
           const compressed = await readFile(cur.synctex);
           if (compressed.length > 8 * 1024 * 1024) return null;
-          const text = await gunzipP(compressed, { maxOutputLength: 32 * 1024 * 1024 });
+          const text = await gunzipP(compressed, { maxOutputLength: 256 * 1024 * 1024 });
           const boxes = parseSyncTeXSourceBoxes(text.toString('utf8'), {
             file: this.#syncInputPath(cur, file), page, startLine, endLine,
           });
