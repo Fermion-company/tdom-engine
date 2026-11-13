@@ -1048,7 +1048,15 @@ function tryCommitProvisionalStages() {
 let pendingLayoutResyncAt = 0;
 let pendingLayoutResyncing = false;
 function resyncPendingLayout() {
-  if (pendingLayoutResyncing || !provisionalPendingLayout.size) return;
+  // Also while canonical found the resident paper paginated differently. That
+  // verdict is taken once, when the generation is committed; a Build taken as
+  // canonical arrives while the boot's rescues are still landing (387 pages
+  // against 389), and the pages that follow come as patches of single pages,
+  // which never say how many pages there are now. The book then held every
+  // keystroke as "layout-incompatible" although the engine had all 389.
+  const mismatched = committedCanonicalGeneration?.epoch === documentReset.adoptedEpoch &&
+    committedCanonicalGeneration.residentLayoutCompatible === false;
+  if (pendingLayoutResyncing || (!provisionalPendingLayout.size && !mismatched)) return;
   if (usesCanonicalSurface() || documentReset.pending) return;
   if (typeof fetch !== 'function' || typeof performance === 'undefined') return;
   const now = performance.now();
@@ -1061,8 +1069,10 @@ function resyncPendingLayout() {
     if (appliedSrcRev !== rev || documentReset.adoptedEpoch !== epoch || documentReset.pending) return;
     if (Number(doc.report?.srcRev ?? doc.report?.rev) !== Number(rev)) return;
     if (doc.documentEpoch != null && epoch != null && Number(doc.documentEpoch) !== Number(epoch)) return;
-    const laidOut = (doc.pages ?? []).filter(dl => provisionalPendingLayout.has(dl.page) &&
-      !dl.commands?.some(cmd => cmd.op === 'pending-exact' && cmd.wholePage));
+    const settled = dl => !dl.commands?.some(cmd => cmd.op === 'pending-exact' && cmd.wholePage);
+    const recount = mismatched && (doc.pages ?? []).length !== provisionalDisplayLists.size &&
+      (doc.pages ?? []).every(settled);
+    const laidOut = (doc.pages ?? []).filter(dl => recount || (provisionalPendingLayout.has(dl.page) && settled(dl)));
     if (!laidOut.length) return;
     stageProvisionalPatches(laidOut.map(displayList => ({ type: 'replace-page', displayList })), false, doc.pages.length);
     if (committedCanonicalGeneration && committedCanonicalGeneration.epoch === documentReset.adoptedEpoch &&
