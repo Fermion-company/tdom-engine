@@ -2733,8 +2733,11 @@ export class CheckpointEngine {
       if (waiting) this.rescueAdoptWaiting--;
       waiting = false;
     };
+    const lockAskedAt = performance.now();
+    const timing = { lockMs: 0, walkMs: 0, walked: null, from: null, at: null };
     const outcome = await this.#locked(async () => {
       stopWaiting();
+      timing.lockMs = Math.round(performance.now() - lockAskedAt);
       if (this.mode !== 'structured') return 'done';
       idx = this.blocks.findIndex((b) => b.id === bid);
       if (idx < 0) return 'done';
@@ -2755,10 +2758,33 @@ export class CheckpointEngine {
       // job instead of waiting out a deep-lineage spin (#update).
       this.bgActive = true;
       let n;
+      const walkFrom = this.#nearestCheckpoint(idx);
+      // Queued rescues further on whose result is already compiled (a
+      // reopened document finds them on disk) ride this walk: it typesets
+      // every block up to the last of them and each adopts its result as the
+      // walk reaches it. One at a time, each paid its own replay from the
+      // nearest checkpoint: reopening the 72-page book adopted 23 stored
+      // results in 60 s, of which the same 253 blocks were replayed twice
+      // (8.7 s each) and another 170-180 twice more.
+      const riders = [];
+      if (this.rescueQueue.size) {
+        const at = new Map(this.blocks.map((item, index) => [item.id, index]));
+        for (const [otherId, otherKey] of this.rescueQueue) {
+          const index = at.get(otherId);
+          if (!(index > idx) || this.#rescueCacheKey(this.blocks[index], index) !== otherKey) continue;
+          if (this.#isoCacheGet(otherKey) === undefined) continue;
+          riders.push({ id: otherId, key: otherKey, index });
+        }
+      }
+      const walkTo = riders.reduce((last, rider) => Math.max(last, rider.index), idx);
+      const walkStartedAt = performance.now();
+      timing.from = walkFrom;
+      timing.at = idx;
+      timing.riders = riders.length;
       try {
         n = await this.#retypesetChain(
-          this.#nearestCheckpoint(idx),
-          idx,
+          walkFrom,
+          walkTo,
           (index, changed) => {
             const successor = this.blocks[index];
             if (changed && successor.needsRender) this.#queueRender(successor.id);
@@ -2772,20 +2798,35 @@ export class CheckpointEngine {
         throw err;
       } finally {
         this.bgActive = false;
+        timing.walkMs = Math.round(performance.now() - walkStartedAt);
+        timing.walked = n ?? null;
       }
       // retypesetChain swallows a killed job into an early break — treat
       // any abort-flagged pass as pre-empted so the queue entry retries
       if (n < 0 || this.bgAbort) return 'aborted';
-      for (const l of block.galley?.labels ?? []) {
-        if (l.v !== undefined) {
-          this.labelTable.set(l.k, l.v);
-          if (l.h != null) this.hrefTable.set(l.k, l.h);
+      const adopted = [block];
+      for (const rider of riders) {
+        const other = this.blocks[rider.index];
+        // adopted by the walk: the block now carries the result its queue
+        // entry asked for (a kept, stale copy means the walk met other inputs)
+        if (other?.id !== rider.id || this.rescueQueue.get(rider.id) !== rider.key ||
+            !other.galley || other.galley.tdomStale || this.#rescueCacheKey(other, rider.index) !== rider.key) continue;
+        this.rescueQueue.delete(rider.id);
+        adopted.push(other);
+      }
+      timing.adopted = adopted.length;
+      for (const item of adopted) {
+        for (const l of item.galley?.labels ?? []) {
+          if (l.v !== undefined) {
+            this.labelTable.set(l.k, l.v);
+            if (l.h != null) this.hrefTable.set(l.k, l.h);
+          }
         }
       }
       // Re-adopting identical geometry still registers a new chunk version.
       // Publishing only layout changes leaves the page requesting a retired
       // SVG/glyph version, so an atomic viewer waits for it indefinitely.
-      if (before !== block.galleyHash + '|' + block.stateVec || this.chunks.rev !== beforeChunksRev) {
+      if (before !== block.galleyHash + '|' + block.stateVec || this.chunks.rev !== beforeChunksRev || adopted.length > 1) {
         this.#asyncRepaginate();
       }
       this.#queueMovedOffsets();
@@ -2798,7 +2839,7 @@ export class CheckpointEngine {
       // it stopped at is the newest checkpoint just behind them)
       let frontier = null;
       if (this.rescueQueue.size) {
-        for (let k = idx + 4; k > idx; k--) if (this.checkpoints.has(k)) { frontier = k; break; }
+        for (let k = walkTo + 4; k > walkTo; k--) if (this.checkpoints.has(k)) { frontier = k; break; }
       }
       this.rescueCursor = frontier;
       // the resume walk left checkpoints at the blocks it re-typeset — collapse
@@ -2815,6 +2856,9 @@ export class CheckpointEngine {
       outcome,
       at: Date.now(),
       queued: this.rescueQueue.size,
+      // where the time of an adoption goes: waiting for the chain lock, then
+      // the walk from the nearest checkpoint to the block and on to convergence
+      ...timing,
     });
     if (this.rescueLog.length > 200) this.rescueLog.splice(0, this.rescueLog.length - 200);
     if (outcome === 'aborted') {
