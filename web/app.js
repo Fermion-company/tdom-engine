@@ -7399,6 +7399,14 @@ function receivePreviewEvent(msg) {
       // /doc is the single atomic snapshot adopted after both sides agree.
       return;
     }
+    if (msg.kind === 'warm' && msg.warm && !['scheduled', 'running', 'superseded', 'rejected', 'error'].includes(msg.warm.status) &&
+        Number(msg.warm.sourceRev) === Number(appliedSrcRev)) {
+      // The caret has settled on a block: fetch the source mapping now. The
+      // first keystroke there otherwise fetches the whole document's mapping
+      // (10 MB for a book, 170 ms) before its page may be shown; with this
+      // one in hand it asks only for what the keystroke changed.
+      void loadProvisionalSnapshot(appliedSrcRev).catch(() => {});
+    }
     if (Number.isInteger(Number(msg.documentEpoch)) &&
         Number(msg.documentEpoch) !== documentReset.adoptedEpoch) {
       return;

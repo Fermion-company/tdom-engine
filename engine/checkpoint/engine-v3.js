@@ -434,6 +434,43 @@ export class CheckpointEngine {
         this.bgWalkTarget = null;
         endWalkRetain(this);
       }
+      // A block the walk typeset for the first time on the resident path only
+      // now knows it wants exact pixels: it was not among the pins above, the
+      // checkpoint in front of it is gone again, and its render fell to the
+      // slow isolated queue. On the 389-page book two such blocks (a
+      // paragraph with a footnote, one with a quote) were still unrendered
+      // 30 s after the caret arrived, and the first keystroke waited for
+      // them (1.0 to 1.3 s). Walk the page once more, with those pinned.
+      const stillOwed = () => this.blocks.map((block, index) => ({ block, index })).filter(({ block, index }) =>
+        pageIds.has(block.id) && block.needsRender && !this.checkpoints.has(index) &&
+        this.#chunkTargets(block).some(chunk => this.chunks.get(chunk.key)?.forGalley !== block.galleyHash))
+        .map(item => item.index);
+      const late = replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev ? [] : stillOwed();
+      if (late.length) {
+        this.editHold = [...new Set([target, target + 1, ...late, ...this.editHold])].slice(0, 24);
+        const again = this.#nearestCheckpoint(Math.min(...late));
+        this.bgActive = true;
+        this.warming = true;
+        this.bgWalkTarget = target;
+        try {
+          const more = await this.#retypesetChain(
+            again,
+            Math.max(...late),
+            (idx, blockChanged) => {
+              changed ||= blockChanged;
+              const block = this.blocks[idx];
+              if (pageIds.has(block.id) && block.needsRender) this.#queueRender(block.id, { interactiveRev: sourceRev });
+            },
+            () => this.bgAbort || this.editPending > 0 || request !== this.warmSeq || sourceRev !== this.srcRev
+          );
+          if (more < 0) replayed = more;
+        } finally {
+          this.bgActive = false;
+          this.warming = false;
+          this.bgWalkTarget = null;
+        }
+        for (const index of late) if (!missing.some(item => item.index === index)) missing.push({ block: this.blocks[index], index });
+      }
       if (replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev) {
         // Pin the boundary this walk reached so the warm that superseded it
         // resumes there rather than at the walk's starting checkpoint.
