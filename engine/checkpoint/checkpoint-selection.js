@@ -50,12 +50,30 @@ export function memoryCheckpointCeiling(heapFloorKb, { totalBytes = totalmem(), 
   return Math.max(3, Math.floor((Number(totalBytes) * share) / live));
 }
 
+/**
+ * The checkpoints kept for a document whose heap the ceiling above bounds.
+ * That ceiling counts every fork as a heap of its own, which is what a fork
+ * costs once it has run a full collection. A kept checkpoint mostly has not:
+ * measured on the 389-page book (1.5 GB live), the six forks left after its
+ * boot held 13 to 307 MB each and those minted by keystrokes about 40 MB,
+ * against 1.6 GB for the root. Three checkpoints made every caret move
+ * replay from the start of the book (272 blocks, 9 to 13 s). As many are
+ * kept as quarter-heaps fit in a quarter of the memory, eight at most.
+ */
+export function memoryCheckpointBudget(heapFloorKb, options = {}) {
+  const ceiling = memoryCheckpointCeiling(heapFloorKb, options);
+  if (!Number.isFinite(ceiling)) return Infinity;
+  const live = Number(heapFloorKb) * 1024;
+  const total = Number(options.totalBytes ?? totalmem());
+  return Math.max(ceiling, Math.min(8, Math.floor(total / live)));
+}
+
 export function checkpointBudgetFor(blockCount, { ceiling = 64, pageCount = null, heapFloorKb = 0, totalBytes = undefined } = {}) {
   const count = Math.max(0, Math.floor(Number(blockCount) || 0));
   const top = Math.max(1, Math.floor(Number(ceiling) || 1));
   const pages = Math.floor(Number(pageCount));
   const pageBudget = Number.isFinite(pages) && pages > 0 ? pages + 1 : Infinity;
-  const memory = memoryCheckpointCeiling(heapFloorKb, totalBytes === undefined ? {} : { totalBytes });
+  const memory = memoryCheckpointBudget(heapFloorKb, totalBytes === undefined ? {} : { totalBytes });
   return Math.max(1, Math.min(top, count + 1, pageBudget, memory));
 }
 
