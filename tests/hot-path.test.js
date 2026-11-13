@@ -146,15 +146,24 @@ test('multi-locus: fresh exact neighbors do not force replay between converged r
   assert.equal(engine._typesetResult.verdict, 'clean');
 });
 
-test('multi-locus: missing exact neighbors still require replay unless their input is held', async () => {
+test('multi-locus: a missing exact neighbor whose input is resident is held for its render, not replayed', async () => {
   for (const held of [false, true]) {
     const { engine, options, visited } = multiLocusFixture();
     Object.assign(engine.blocks[5], { needsRender: true, fidelity: { blockExact: true } });
     engine.foregroundRenderIds.add('b5');
     if (held) engine.editHold.push(5);
     await runUpdateTypesetPhase(engine, options);
-    assert.equal(visited.includes(5), !held);
+    assert.equal(visited.includes(5), false);
+    // an input nothing pinned yet is pinned now, so it outlives the walk
+    assert.equal(engine.renderHold.has(5), !held);
   }
+  // without the checkpoint in front of it the block is replayed, as before
+  const { engine, options, visited } = multiLocusFixture();
+  Object.assign(engine.blocks[5], { needsRender: true, fidelity: { blockExact: true } });
+  engine.foregroundRenderIds.add('b5');
+  engine.checkpoints.delete(5);
+  await runUpdateTypesetPhase(engine, options);
+  assert.equal(visited.includes(5), true);
 });
 
 test('multi-locus: a real state ripple must cross clean blocks before skipping', async () => {

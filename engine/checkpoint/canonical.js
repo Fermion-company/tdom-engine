@@ -47,7 +47,7 @@ import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-in
 import { pdfEditGlyphs } from './pdf-edit-geometry.js';
 import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
 import { prepareSyncTeXBatchHelper, querySyncTeXRange } from './synctex-batch.js';
-import { parseJumpText, parseJumpTsv, parseJumpRecords, jumpRecords, jumpAnchor, locateJump } from './jump-sync.js';
+import { parseJumpText, parseJumpTsv, parseJumpRecords, jumpRecords, jumpAnchor, locateJump, indexStartRecords } from './jump-sync.js';
 
 const execFileP = promisify(execFile);
 const gunzipP = promisify(gunzip);
@@ -2131,6 +2131,17 @@ export class CanonicalRenderer {
       const index = await cur.jumpIndex;
       if (!index || !current()) return null;
       const lines = source.split(/\r?\n/);
+      if (/\\printindex\b/.test(String(lines[line - 1] ?? '').replace(/(^|[^\\])%.*$/, '$1'))) {
+        // the line that prints the index: where the index starts
+        const start = indexStartRecords(index.records);
+        if (start.length) {
+          const transform = await this.#syncContentTransform(cur, start[0].page);
+          const shown = !transform ? [] : start.map(record =>
+            syncTeXResultToDisplayed(record, cur.papers?.[record.page - 1], transform)).filter(record => record.box);
+          const top = shown.reduce((best, record) => (!best || record.box.top < best.box.top ? record : best), null);
+          if (top && current()) return { page: top.page, boxes: [top.box], id: cur.id, srcRev: rev, line };
+        }
+      }
       let anchor = jumpAnchor(lines, line);
       const input = this.#syncInputPath(cur, syncFile);
       const ownRaw = anchor.line !== line ? jumpRecords(index.records, input, line) : [];

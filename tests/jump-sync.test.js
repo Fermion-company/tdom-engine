@@ -419,3 +419,26 @@ LandscapeBody
     rmSync(workDir, { recursive: true, force: true });
   }
 });
+
+test('the index starts on the first page its file fills, not on the page stamped before it', async () => {
+  const { parseJumpRecords, indexStartRecords } = await import('../engine/checkpoint/jump-sync.js');
+  const row = (tag, line, v, glyphs) => [`(${tag},${line}:4000000,${v}:26000000,600000,150000`,
+    ...Array.from({ length: glyphs }, (_, i) => `x${tag},${line}:${4000000 + i * 400000},${v}`), ')'];
+  const page = (number, rows) => [`{${number}`, '[1,1:4000000,50000000:26000000,46000000,0', ...rows.flat(), ']', `}${number}`];
+  const text = ['SyncTeX Version:1', 'Input:1:/doc/main.tex', 'Input:2:/doc/out/main.ind', 'Output:pdf',
+    'Magnification:1000', 'Unit:1', 'X Offset:0', 'Y Offset:0', 'Content:',
+    // the last page of the text: what it draws while shipping is stamped with line 1 of the index file
+    ...page(7, [...Array.from({ length: 20 }, (_, i) => row(1, 40 + i, 5000000 + i * 2000000, 30)), row(2, 1, 4500000, 6), row(2, 1, 44000000, 6)]),
+    // the index: two full pages and a short last one
+    ...page(8, Array.from({ length: 30 }, (_, i) => row(2, 3 + i, 5000000 + i * 1400000, 12))),
+    ...page(9, Array.from({ length: 30 }, (_, i) => row(2, 40 + i, 5000000 + i * 1400000, 12))),
+    ...page(10, [row(2, 80, 5000000, 12)]),
+    'Postamble:', 'Count:0', ''].join('\n');
+  const index = parseJumpRecords(text, '/');
+  assert.ok(index);
+  const start = indexStartRecords(index);
+  assert.equal(start[0].page, 8);
+  assert.ok(start.every((record) => record.page === 8));
+  // a document without an index file has no such place
+  assert.deepEqual(indexStartRecords(parseJumpRecords(text.replace('main.ind', 'other.tex'), '/')), []);
+});

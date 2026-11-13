@@ -111,6 +111,40 @@ export function jumpRecords(index, file, line) {
   })));
 }
 
+/**
+ * Where the index begins: the records of the first page the generated index
+ * file (.ind) put ink on. \printindex prints nothing of its own, and the
+ * records filed under its line belong to other pages (a Jump from it landed
+ * 83 pages before the index of a 389-page book).
+ */
+export function indexStartRecords(index) {
+  if (!index) return [];
+  const tags = [...index.inputs].filter(([, input]) => /\.ind$/i.test(input)).map(([tag]) => `${tag}:`);
+  if (!tags.length) return [];
+  // The page that ships just before the index is stamped with the index
+  // file's first line as well (what it draws while shipping: 85 records on
+  // the book's page 370, the index itself starting on 371). The index's own
+  // pages carry far more: the first page with at least half as many records
+  // as the fullest one.
+  const byPage = new Map();
+  for (const [key, records] of index.records) {
+    if (!tags.some(tag => key.startsWith(tag))) continue;
+    for (const record of records) {
+      if (!record.ink || !record.box) continue;
+      if (!byPage.has(record.page)) byPage.set(record.page, []);
+      byPage.get(record.page).push(record);
+    }
+  }
+  if (!byPage.size) return [];
+  const fullest = Math.max(...[...byPage.values()].map(records => records.length));
+  const first = Math.min(...[...byPage].filter(([, records]) => records.length >= fullest / 2).map(([page]) => page));
+  const found = byPage.get(first);
+  return found.map(r => ({ ...r,
+    x: r.x * index.scale, y: r.y * index.scale,
+    box: Object.fromEntries(Object.entries(r.box).map(([key, value]) => [key, value * index.scale])),
+  }));
+}
+
 function tableRowBoxes(rows, literal, seeds) {
   // Short/numeric cells need row-local evidence; sweeping the page at
   // this y would also highlight an unrelated table in the other column.

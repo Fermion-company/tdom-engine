@@ -82,8 +82,18 @@ export async function runUpdateTypesetPhase(engine, {
       if (!chunkTargets(block).some(target => engine.chunks.get(target.key)?.forGalley !== block.galleyHash)) continue;
       // RENDER can use a retained input directly; it needs no foreground
       // replay merely because its exact pixels have not been requested yet.
-      if (engine.checkpoints.has(k) && (engine.blocks.length + 1 <= engine.maxCheckpoints ||
-          engine.editHold.includes(k) || engine.renderHold.has(k))) continue;
+      if (engine.checkpoints.has(k)) {
+        // The checkpoint in front of the block is still there: hold it for
+        // the render instead of replaying up to the block. An edit keeps
+        // only eight pins, so a page with more blocks than that dropped the
+        // pin of its last ones, and the first keystroke after a caret warm
+        // re-typeset fifteen blocks (0.4 s on the 389-page book) to draw one.
+        if (!(engine.blocks.length + 1 <= engine.maxCheckpoints ||
+            engine.editHold.includes(k) || engine.renderHold.has(k))) {
+          engine.renderHold.set(k, block.id);
+        }
+        continue;
+      }
       displayReplay.add(k);
       firstDisplay = Math.min(firstDisplay, k);
       lastDisplay = Math.max(lastDisplay, k);
