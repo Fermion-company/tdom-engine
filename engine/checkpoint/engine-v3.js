@@ -481,6 +481,18 @@ export class CheckpointEngine {
         this.#kickPendingChain();
         return { status: 'superseded', sourceRev, target };
       }
+      // The walk asks for a render as it typesets a block, and it stops in
+      // front of the last one it was sent to: that block kept its checkpoint
+      // and never got its render (the last block of the caret's pages on the
+      // 389-page book, every time; the first keystroke then waited 0.45 s
+      // for it). Ask for every page block that is still without its pixels.
+      for (let index = 0; index < this.blocks.length; index++) {
+        const item = this.blocks[index];
+        if (!pageIds.has(item.id) || !item.needsRender || !this.checkpoints.has(index)) continue;
+        if (!this.#chunkTargets(item).some(chunk => this.chunks.get(chunk.key)?.forGalley !== item.galleyHash)) continue;
+        this.#queueRender(item.id, { interactiveRev: sourceRev });
+        if (!missing.some(entry => entry.index === index)) missing.push({ block: item, index });
+      }
       // (still pinned while their render is queued; the next edit's own
       // pins replace these)
       const unrendered = missing.map(item => item.index).filter((idx) => {
