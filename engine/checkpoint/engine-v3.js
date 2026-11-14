@@ -92,6 +92,7 @@ import { instrumentEditRegions } from '../edit-regions.js';
 import { scheduleBackground as scheduleBackgroundHelper } from './background-scheduler.js';
 import { typesetBlock as typesetBlockHelper } from './typeset-dispatch.js';
 import { rescueBlock as rescueBlockHelper, isoGalley } from './rescue-block.js';
+import { trailingGlueSpec } from './util/galley.js';
 import { runChainPass as runChainPassHelper, chainAfterPass as chainAfterPassHelper } from './chain-pass.js';
 import { runUpdateTypesetPhase } from './update-typeset-phase.js';
 import { prepareUpdate } from './update-prepare.js';
@@ -105,7 +106,7 @@ import {
   verifyAgainstCanonical as verifyAgainstCanonicalHelper,
 } from './canonical-arrival.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
-import { adoptGalleyBlock, exactFallbackEligible } from './galley-adoption.js';
+import { adoptGalleyBlock, exactFallbackEligible, exitStateVec } from './galley-adoption.js';
 import { cropRenderTargets } from './render-chunks.js';
 import { checkpointBudgetFor, checkpointKeepSet, memoryCheckpointCeiling, nearestCheckpoint,
   nextTypesetCost,
@@ -2763,6 +2764,19 @@ export class CheckpointEngine {
       }
       const before = block.galleyHash + '|' + block.stateVec;
       const beforeChunksRev = this.chunks.rev;
+      if (this.#adoptRescueInPlace(block, key)) {
+        timing.inPlace = true;
+        timing.adopted = 1;
+        for (const l of block.galley?.labels ?? []) {
+          if (l.v !== undefined) {
+            this.labelTable.set(l.k, l.v);
+            if (l.h != null) this.hrefTable.set(l.k, l.h);
+          }
+        }
+        this.#asyncRepaginate();
+        this.#queueMovedOffsets();
+        return 'done';
+      }
       // cache hit inside → the exact galley adopts in milliseconds; the
       // chain continues to convergence exactly like a foreground edit,
       // but YIELDS to an incoming edit and re-queues so the propagation
@@ -2883,6 +2897,34 @@ export class CheckpointEngine {
       }
       if (this.closed) this.rescueQueue.delete(bid);
     }
+  }
+
+  /**
+   * A rescue result that leaves the block's exit exactly as the chain already
+   * has it (same state vector, same labels, same trailing glue) replaces the
+   * block's galley where it stands: everything after the block was typeset
+   * from that exit, so no checkpoint moves and nothing is replayed. A code
+   * box that breaks at another height on its page is the usual case. Paid
+   * through the walk, each such result replayed from the nearest checkpoint:
+   * reopening the 389-page book spent 487 s of its 737 s in eight walks of
+   * up to 3,383 blocks, most of them for boxes whose exit had not moved.
+   */
+  #adoptRescueInPlace(block, key) {
+    const held = block.galley;
+    const iso = this.#isoCacheGet(key);
+    if (!iso || !held?.state || !block.stateVec) return false;
+    if (held.tdomFrozen || held.tdomDeferred || held.tdomColdPreview || held.tdomPendingPaint) return false;
+    if (this.coldDirty?.has(block.id) || this.poisoned.has(block.id)) return false;
+    if (exitStateVec(iso, this.counters) !== block.stateVec) return false;
+    const labelKey = (labels) => JSON.stringify((labels ?? []).map((l) => [l.k, l.v ?? null, l.h ?? null]));
+    if (labelKey(iso.labels) !== labelKey(held.labels)) return false;
+    let widthSp = 0;
+    try { widthSp = JSON.parse(block.stateVec).at(-1) ?? 0; } catch { widthSp = 0; }
+    if (JSON.stringify(trailingGlueSpec(iso, widthSp)) !== JSON.stringify(trailingGlueSpec(held, widthSp))) return false;
+    const exit = block.stateVec;
+    this.#adoptGalley(block, isoGalley(iso));
+    block.stateVec = exit;
+    return true;
   }
 
   /**
