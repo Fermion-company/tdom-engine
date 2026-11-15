@@ -34,7 +34,19 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
             (engine.pendingChain?.queuedAt == null || engine.pendingChain.kind === 'grid' ||
               Date.now() - engine.pendingChain.queuedAt < CHAIN_MAX_STALE_MS)))
       ) {
-        await new Promise((r) => setTimeout(r, 25));
+        // An edit or a warm that waits for this task ends the sleep at once
+        // (engine #wakeBackgroundGate). Left to run out, it held the next
+        // keystroke behind any pending chain work for the rest of the 25 ms:
+        // 19 to 26 ms measured on every keystroke of a burst.
+        await new Promise((resolve) => {
+          const done = () => {
+            clearTimeout(timer);
+            if (engine.bgGateWake === done) engine.bgGateWake = null;
+            resolve();
+          };
+          const timer = setTimeout(done, 25);
+          engine.bgGateWake = done;
+        });
       }
       if (engine.bgAbort || engine.editPending) return null;
       if (!engine.pendingChain && !queueGrid?.()) return null;

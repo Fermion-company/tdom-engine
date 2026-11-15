@@ -5,7 +5,13 @@ import { discoverEditRegions } from '../edit-regions.js';
 // What a keystroke of prose never contains: anything TeX reads as syntax.
 const PROSE_BARRIER = /[\\$%{}&#^_~\r\n]/;
 // A neighbour is worth keeping off the response path from this cost on (ms
-// of its own typesetting; exact graphics always are).
+// of its own typesetting; exact graphics always are). This bounds only the
+// preview that is painted without waiting for TeX (classifyResidentEdit's
+// probe). A prose keystroke defers whatever the neighbour costs: typesetting
+// it again is one more job on the response path, and a job is never cheap
+// (fork, harvest and transfer cost as much as the paragraph itself). A plain
+// article of three-line paragraphs answered in 35.5 ms with the neighbour
+// verified first and in 23.2 ms without (median of 27 keystrokes).
 const HEAVY_NEIGHBOUR_MS = 6;
 
 /**
@@ -136,31 +142,58 @@ export function proseBoundaryWitness(block) {
   return JSON.stringify(['prose', block.stateVec, g.state, g.w, g.h, g.d, layout]);
 }
 
+// TDOM_TRACE_PLAIN=1: why a keystroke was or was not answered before its
+// neighbour was typeset again.
+const tracePlain = process.env.TDOM_TRACE_PLAIN
+  ? (why, detail = '') => { console.error('[plain]', why, detail); return null; }
+  : () => null;
+
 export function classifyPlainPreviewEdit(engine, options) {
-  if (engine.previewPolicy !== 'structured') return null;
-  const pending = engine.pendingChain;
+  if (engine.previewPolicy !== 'structured') return tracePlain('policy', engine.previewPolicy);
+  // (grid materialization is no pending verification: any other chain work
+  // replaces it, engine #queueChainWork. Counted as one, it kept every
+  // keystroke after a reflow on the slow path for as long as the typing
+  // lasted, because the pass yields to each keystroke and stays queued.)
+  const pending = engine.pendingChain?.kind === 'grid' ? null : engine.pendingChain;
   const id = options.dirtySource.size === 1 ? [...options.dirtySource][0] : null;
   const idx = engine.blocks.findIndex(b => b.id === id);
-  // Scope this latency path to prose immediately before a neighbour that is
-  // slow to typeset again: exact graphics, or a block whose own typesetting
-  // was measured heavy (a 35 ms box after the paragraph cost every keystroke
-  // in that paragraph 35 ms of verification before anything was shown).
   const next = engine.blocks[idx + 1];
-  if (idx < 0 || !(next?.gfx || Number(next?.typesetCostMs) >= HEAVY_NEIGHBOUR_MS)) return null;
+  if (idx < 0) return tracePlain('not-one-block', `${options.dirtySource.size} dirty`);
+  if (!next) return tracePlain('last-block');
   if (pending && (pending.kind !== 'settle' || pending.phase !== 'blocks' ||
-      pending.plainBlockId !== id || pending.from <= idx || pending.labels.size)) return null;
+      pending.plainBlockId !== id || pending.from <= idx || pending.labels.size)) {
+    return tracePlain('pending', `${pending.kind}/${pending.phase} from ${pending.from} plain ${pending.plainBlockId} labels ${pending.labels?.size}`);
+  }
   const old = options.oldBlocks.find(b => b.id === id);
   const admitted = classifyResidentEdit({ ...engine, pendingChain: null }, options);
-  const prose = admitted.kind === 'probe' || options.rebooted ? null : proseKeystroke(old, engine.blocks[idx]);
-  if (admitted.kind !== 'probe' && !prose) return null;
-  if (prose && (touchesActive(old?.galley?.tdomActive, prose.removed) || touchesActive(old?.galley?.tdomActive, prose.inserted))) return null;
+  // The probe's path stays scoped to a neighbour that is slow to typeset
+  // again: exact graphics, or a block whose own typesetting was measured
+  // heavy (a 35 ms box after the paragraph cost every keystroke in that
+  // paragraph 35 ms of verification before anything was shown). Before any
+  // other neighbour the same edit is judged as a prose keystroke.
+  const probe = admitted.kind === 'probe' && (next.gfx || Number(next.typesetCostMs) >= HEAVY_NEIGHBOUR_MS);
+  const prose = probe || options.rebooted ? null : proseKeystroke(old, engine.blocks[idx]);
+  if (!probe && !prose) return tracePlain('not-prose', admitted.kind);
+  if (prose && (touchesActive(old?.galley?.tdomActive, prose.removed) || touchesActive(old?.galley?.tdomActive, prose.inserted))) {
+    return tracePlain('active-character');
+  }
   const witness = prose ? proseBoundaryWitness(old) : plainPreviewWitness(old);
-  return witness ? { blockId: id, witness, galley: old.galley, stateVec: old.stateVec, prose } : null;
+  if (!witness) return tracePlain('no-witness', prose ? 'prose' : 'plain');
+  tracePlain('admitted', prose ? 'prose' : 'probe');
+  return { blockId: id, witness, galley: old.galley, stateVec: old.stateVec, prose };
 }
 
 export function canDeferPlainVerification(admission, before, block) {
-  if (!admission || admission.blockId !== block.id || before !== admission.witness) return false;
+  if (!admission || admission.blockId !== block.id || before !== admission.witness) {
+    if (admission) tracePlain('witness-before', admission.blockId !== block.id ? 'other block' : 'changed since admission');
+    return false;
+  }
   // the block as just typeset says which of its characters are active
-  if (admission.prose && touchesActive(block.galley?.tdomActive, admission.prose.inserted)) return false;
-  return (admission.prose ? proseBoundaryWitness(block) : plainPreviewWitness(block)) === admission.witness;
+  if (admission.prose && touchesActive(block.galley?.tdomActive, admission.prose.inserted)) {
+    tracePlain('active-after');
+    return false;
+  }
+  const same = (admission.prose ? proseBoundaryWitness(block) : plainPreviewWitness(block)) === admission.witness;
+  if (!same) tracePlain('witness-after', 'the paragraph left TeX differently');
+  return same;
 }

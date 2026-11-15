@@ -2573,11 +2573,20 @@ sharedTest('steady-state keystrokes stay fork-once (edit-locus pin)', opts, asyn
     const r = await eng.edit(p, p + cur.length, next);
     worstWall = Math.max(worstWall, performance.now() - t0);
     worstBlocks = Math.max(worstBlocks, r.stats.blocksTypeset);
-    assert.equal(r.stats.chainVerdict, 'clean', 'a plain word edit must not queue chain work');
+    // A plain word edit queues no chain work beyond the verification of the
+    // block after it, which a prose keystroke leaves for after its answer
+    // (plain-preview.js).
+    assert.ok(r.stats.chainVerdict === 'clean' || r.stats.chainVerdict === 'verify',
+      `a plain word edit must not queue chain work (got ${r.stats.chainVerdict})`);
+    if (r.stats.chainVerdict === 'verify') {
+      assert.equal(eng.pendingChain?.plainBlockId, eng.blocks.find((b) => b.text.includes(next))?.id,
+        'only the neighbour verification is left');
+    }
   }
   assert.ok(worstBlocks <= 4, `edited + verification only (got ${worstBlocks})`);
   assert.ok(worstWall < 1500, `steady-state keystroke took ${worstWall.toFixed(0)}ms`);
   await drain(eng);
+  assert.equal(eng.pendingChain, null, 'the verification left behind finishes');
 });
 
 sharedTest('a tail edit right after a mid edit is NOT charged the distance', opts, async () => {
@@ -2592,6 +2601,7 @@ sharedTest('a tail edit right after a mid edit is NOT charged the distance', opt
   const mid = src.indexOf('MIDWORD');
   assert.ok(mid >= 0);
   await eng.edit(mid, mid + 'MIDWORD'.length, 'MIDWORQ');
+  const midBlock = eng.blocks.find((block) => block.text.includes('MIDWORQ'));
   // immediately — the old design would replay every block from mid to tail
   const tail = eng.getSource().indexOf('TAILWORD');
   assert.ok(tail >= 0);
@@ -2609,10 +2619,13 @@ sharedTest('a tail edit right after a mid edit is NOT charged the distance', opt
   // an edit in the LAST block hits end-of-document instead of a clean
   // verification block — that is convergence too, as long as nothing is
   // deferred
+  // (the mid edit's own neighbour verification may still be waiting: a
+  // prose keystroke leaves it for after its answer, plain-preview.js)
+  const onlyMidVerification = eng.pendingChain?.plainBlockId === midBlock?.id;
   assert.ok(
     r.stats.chainVerdict === 'clean' ||
-      (r.stats.chainVerdict === 'walked' && !r.stats.chainPending),
-    `no deferred work for a plain tail edit (got ${r.stats.chainVerdict})`
+      (r.stats.chainVerdict === 'walked' && (!r.stats.chainPending || onlyMidVerification)),
+    `no deferred work for a plain tail edit (got ${r.stats.chainVerdict}, pending ${JSON.stringify(r.stats.chainPending)})`
   );
   // revert both
   const t2 = eng.getSource().indexOf('TAILWORQ');

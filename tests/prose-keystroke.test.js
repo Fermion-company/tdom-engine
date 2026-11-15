@@ -111,3 +111,52 @@ Last.
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+test('a prose keystroke in a plain single-file article leaves the paragraph after it for later, and the next one does not wait',
+  { skip: !texReady && 'lualatex not installed' }, async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'tdom-prose-plain-'));
+    const paragraphs = Array.from({ length: 8 }, (_, i) =>
+      `Paragraph ${i + 1} of an ordinary article, PlainWord${i + 1} here, long enough to run over a second line of the text block when it is typeset.`);
+    const source = ['\\documentclass{article}', '\\begin{document}', paragraphs.join('\n\n'), '\\end{document}', ''].join('\n');
+    const engine = new CheckpointEngine({ workDir: path.join(root, 'work') });
+    try {
+      await engine.open(source);
+      await drain(engine);
+      const original = engine.blocks.find((block) => block.text.includes('PlainWord4'));
+      const waits = [];
+      for (let k = 0; k < 9; k++) {
+        const at = engine.getSource().indexOf('PlainWord4') + 'PlainWord4'.length;
+        const report = k % 3 === 2 ? await engine.edit(at, at + 1, '') : await engine.edit(at, at, 'x');
+        assert.equal(report.stats.chainVerdict, 'verify', JSON.stringify(report.stats));
+        assert.equal(report.stats.blocksTypeset, 1, 'the paragraph after it is not on the response path');
+        assert.equal(engine.pendingChain?.plainBlockId, original.id, 'its verification is still owed');
+        // The verification waits behind an idle gate that sleeps 25 ms at a
+        // time; the keystroke that follows ends the sleep instead of waiting
+        // it out (background-scheduler.js).
+        if (k > 0) waits.push(engine.lastLock.lockedAtEpochMs - engine.lastLock.entryAtEpochMs);
+      }
+      waits.sort((a, b) => a - b);
+      assert.ok(waits[waits.length >> 1] < 12, `keystrokes waited for the chain: ${waits.join(', ')} ms`);
+      await drain(engine);
+      assert.equal(engine.pendingChain, null, 'the verification is done once the typing stops');
+      // one that adds a line is verified before it is answered
+      const at = engine.getSource().indexOf('PlainWord4');
+      const wrap = await engine.edit(at, at, 'several more words that push the paragraph over into another line of text ');
+      assert.notEqual(wrap.stats.chainVerdict, 'verify');
+      await drain(engine);
+      const incremental = signature(engine);
+      const finalSource = engine.getSource();
+      await engine.close();
+      const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh') });
+      try {
+        await fresh.open(finalSource);
+        await drain(fresh);
+        assert.deepEqual(signature(fresh), incremental, 'the result is that of a fresh engine on the final text');
+      } finally {
+        await fresh.close();
+      }
+    } finally {
+      await engine.close().catch(() => {});
+      rmSync(root, { recursive: true, force: true });
+    }
+  });

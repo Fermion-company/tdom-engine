@@ -631,7 +631,8 @@ test('the first keystroke after a pause sends the edited block RENDER beside its
     e.lastEditAt = 0; // a pause before this keystroke
     const at = e.getSource().indexOf('$x^2$') + '$x^2$'.length;
     const r = await e.edit(at, at, ' X');
-    assert.equal(r.stats.chainVerdict, 'clean', 'a plain hot edit');
+    // (clean, or its neighbour's verification left for after the answer: plain-preview.js)
+    assert.ok(['clean', 'verify'].includes(r.stats.chainVerdict), `a plain hot edit (got ${r.stats.chainVerdict})`);
     const id = String(r.dirtySourceNodes[0]).replace(/^src-/, '');
     const edited = e.blocks.find((b) => b.id === id);
     assert.ok(edited.needsRender, 'the fixture block needs exact pixels');

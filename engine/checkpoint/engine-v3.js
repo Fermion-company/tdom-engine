@@ -230,6 +230,8 @@ export class CheckpointEngine {
     if (this.bgActive && !this.coldWalking) {
       abortBackgroundJob(this, 'background pass pre-empted by a document switch');
     }
+    // (the task may be asleep in its idle gate: background-scheduler.js)
+    this.bgGateWake?.();
     await this.bgTask.catch(() => {});
     return this.#locked(async () => {
       await this.canonical.resetDocument(nextDir, nextOverlay);
@@ -384,6 +386,8 @@ export class CheckpointEngine {
     // it threw the replay away (viewer page, file focus and caret warms for
     // one region each restarted from the same distant checkpoint).
     if (!this.warming && !this.coldWalking) abortBackgroundJob(this, 'background pass pre-empted by edit-locus warming');
+    // (the task may be asleep in its idle gate: background-scheduler.js)
+    this.bgGateWake?.();
     await this.bgTask.catch(() => {});
     // A keystroke that arrived meanwhile owns the next turn of the lock: it
     // set bgAbort and is waiting for the same task this warm waited for.
@@ -2132,6 +2136,8 @@ export class CheckpointEngine {
         abortBackgroundJob(this, 'background walk pre-empted by an edit');
       }
     } else abortBackgroundJob(this);
+    // (the task may be asleep in its idle gate: background-scheduler.js)
+    this.bgGateWake?.();
     await this.bgTask.catch(() => {});
     try {
       const report = await this.#locked(async () => {
