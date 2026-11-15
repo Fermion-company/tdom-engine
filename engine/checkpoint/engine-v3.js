@@ -300,7 +300,7 @@ export class CheckpointEngine {
     const ids = new Set(page?.draw?.map(draw => draw.u?.blockId));
     const block = this.blocks.find(item => ids.has(item.id));
     if (!block) return { status: 'rejected', reason: 'unknown-page' };
-    return this.warmEditOffset(block.start, block.file ?? this.file);
+    return this.warmEditOffset(block.start, block.file ?? this.file, { caret: false });
   }
 
   /** Exact-pixel chunks a block publishes (status reporting). */
@@ -308,7 +308,9 @@ export class CheckpointEngine {
     return this.#chunkTargets(block);
   }
 
-  async warmEditOffset(offset, file = this.file) {
+  // `caret`: the offset is where the editor's caret is (the host's focus),
+  // not the top of a page the viewer is showing (warmPage).
+  async warmEditOffset(offset, file = this.file, { caret = true } = {}) {
     // A caret move is the earliest sign of editing: it boots a retired chain.
     if (!this.closed) this.#noteShipActivity();
     const sourceFile = path.resolve(this.docDir, file);
@@ -333,6 +335,17 @@ export class CheckpointEngine {
       return index === this.blocks.length - 1 && numericOffset >= end;
     });
     if (target < 0) return { status: 'rejected', reason: 'outside-body' };
+    if (caret) this.caretWarm = { target, sourceRev };
+    // The caret's own boundaries outlive a later warm for a page the viewer
+    // shows. That warm pins the page's first block and its unrendered ones;
+    // the caret's pins came after them and fell off the end of the list, the
+    // checkpoint in front of the caret's block was retired, and the first
+    // keystroke replayed from the top of the page (7 blocks, 0.3 s measured,
+    // every time the paper had been scrolled or a canonical had landed after
+    // the caret was placed).
+    const caretTarget = this.caretWarm?.sourceRev === sourceRev && this.caretWarm.target !== target &&
+      this.caretWarm.target < this.blocks.length ? this.caretWarm.target : null;
+    const caretPins = caretTarget === null ? [] : [caretTarget, caretTarget + 1];
 
     // A page is published atomically. Warm its missing exact neighbors too;
     // a fast edited chunk alone cannot replace an otherwise unpaintable page.
@@ -356,8 +369,11 @@ export class CheckpointEngine {
     const missing = this.blocks.map((block, index) => ({ block, index })).filter(({ block }) =>
       pageIds.has(block.id) && block.needsRender && this.#chunkTargets(block).some(chunk =>
         this.chunks.get(chunk.key)?.forGalley !== block.galleyHash));
-    const first = Math.min(target, ...missing.map(item => item.index));
-    const last = Math.max(target, ...missing.map(item => item.index));
+    // (a caret on this page whose boundaries are gone is walked to as well)
+    const caretOwed = caretTarget !== null && pageIds.has(this.blocks[caretTarget].id) &&
+      !(this.checkpoints.has(caretTarget) && this.checkpoints.has(caretTarget + 1)) ? [caretTarget] : [];
+    const first = Math.min(target, ...caretOwed, ...missing.map(item => item.index));
+    const last = Math.max(target, ...caretOwed, ...missing.map(item => item.index));
     this.warmInfo = { status: 'scheduled', sourceRev, target, offset: numericOffset, file: sourceFile };
     // Cursor movement outranks background rescue/settle work, but never an
     // edit. Reuse the established abort path so a deep LuaTeX-ja job cannot
@@ -392,10 +408,10 @@ export class CheckpointEngine {
       // checkpoints retired those before the render started, the warm ended
       // "ready" with the headings of the page still unrendered, and the first
       // keystrokes replayed from the start of the book to draw them.
-      this.editHold = [...new Set([target, target + 1, ...missing.map(item => item.index), ...this.editHold])]
+      this.editHold = [...new Set([target, target + 1, ...caretPins, ...missing.map(item => item.index), ...this.editHold])]
         .filter((idx) => idx >= 0 && idx <= this.blocks.length)
-        .slice(0, 8 + Math.min(16, missing.length));
-      if (!missing.length && this.checkpoints.has(target) && this.checkpoints.has(target + 1)) {
+        .slice(0, 8 + caretPins.length + Math.min(16, missing.length));
+      if (!missing.length && !caretOwed.length && this.checkpoints.has(target) && this.checkpoints.has(target + 1)) {
         this.#enforceCheckpointCap();
         const ready = {
           status: 'ready',
@@ -448,7 +464,7 @@ export class CheckpointEngine {
         .map(item => item.index);
       const late = replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev ? [] : stillOwed();
       if (late.length) {
-        this.editHold = [...new Set([target, target + 1, ...late, ...this.editHold])].slice(0, 24);
+        this.editHold = [...new Set([target, target + 1, ...caretPins, ...late, ...this.editHold])].slice(0, 24 + caretPins.length);
         const again = this.#nearestCheckpoint(Math.min(...late));
         this.bgActive = true;
         this.warming = true;
