@@ -38,6 +38,18 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
     // chunks — registered here so forGalley matches the adopted hash
     for (const c of galley.tdomIsoChunks) {
       const prev = chunks.get(c.key);
+      // A rescue re-adopted with the pixels it already had (the walk that
+      // verifies a keystroke passes over the code box after the paragraph
+      // and takes its result from the cache) is the same chunk, not a new
+      // version of it: a new version made the viewer fetch and decode the
+      // picture again on every keystroke (202 KB for one box), and the
+      // server read its glyph positions from the PDF again.
+      if (prev && prev.svg === c.svg && prev.wBp === c.wBp && prev.logicalWBp === c.logicalWBp &&
+          prev.xBp === c.xBp && prev.hBp === c.hBp && prev.editPdf === c.editPdf && prev.editPage === c.editPage &&
+          prev.editX === c.editX && prev.editY === c.editY) {
+        prev.forGalley = block.galleyHash;
+        continue;
+      }
       chunks.set(c.key, {
         svg: c.svg,
         wBp: c.wBp,
