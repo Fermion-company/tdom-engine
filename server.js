@@ -2007,6 +2007,13 @@ const server = http.createServer(async (req, res) => {
           srcRev: lastReport.srcRev,
           queueMs: lastReport.timing.clientEditAtEpochMs ? lastReport.timing.receivedAtEpochMs - lastReport.timing.clientEditAtEpochMs : null,
           engineMs: lastReport.timing.engineDoneAtEpochMs - lastReport.timing.receivedAtEpochMs,
+          // of that: before the engine took the edit (the request queue, the
+          // overlay files), and waiting for the chain lock and who held it
+          enterMs: lastReport.timing.lock?.entryAtEpochMs
+            ? lastReport.timing.lock.entryAtEpochMs - lastReport.timing.receivedAtEpochMs : null,
+          lockMs: lastReport.timing.lock?.lockedAtEpochMs
+            ? lastReport.timing.lock.lockedAtEpochMs - lastReport.timing.lock.entryAtEpochMs : null,
+          heldBy: lastReport.timing.lock?.heldBy ?? null,
           planMs: lastReport.timing.plannedAtEpochMs ? lastReport.timing.plannedAtEpochMs - lastReport.timing.engineDoneAtEpochMs : null,
           sendMs: lastReport.timing.sentAtEpochMs ? lastReport.timing.sentAtEpochMs - lastReport.timing.plannedAtEpochMs : null,
           reportKb: lastReport.timing.reportBytes ? Math.round(lastReport.timing.reportBytes / 1024) : null,
