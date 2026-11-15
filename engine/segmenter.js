@@ -71,18 +71,25 @@ function literalBegin(stripped, literalEnvs) {
   return builtin;
 }
 
-export function segmentBody(text, baseOffset, { structuralEvents = [], literalEnvs = null } = {}) {
+// The scan itself, from the line that starts at `from` to the end of the
+// text. `sync[i]` says that segs[i] began on a line the scan reached with
+// nothing open (no environment, group, display, literal run or pending
+// block): from such a line on, the result depends on the rest of the text
+// alone. `resync(lineStart)` is asked on every such line and may name the
+// place in an earlier result from which that result holds again; the scan
+// stops there (`spliceFrom`).
+function scanSegments(text, baseOffset, from, aliasEvents, literalEnvs, resync) {
   const segs = [];
-  const lines = splitLines(text);
-  const aliasEvents = [...structuralEvents].sort((a, b) => a.at - b.at);
+  const sync = [];
   let aliasEventIndex = 0;
+  while (aliasEventIndex < aliasEvents.length && aliasEvents[aliasEventIndex].at < from) aliasEventIndex++;
   let envDepth = 0;
   let braceDepth = 0;
   let inDisplay = false;
   let inVerbatim = null; // env name while inside a literal environment
   let inAlltt = false; // commands/braces execute; unlike normal TeX, % is data
   let inKKcode = false; // inside \KKcodeS...\KKcodeE (KKluaverb)
-  let cur = null; // { start, end }
+  let cur = null; // { start, sync }
   let curStructuralSinks = new Set();
 
   const flush = (endOffset) => {
@@ -94,24 +101,37 @@ export function segmentBody(text, baseOffset, { structuralEvents = [], literalEn
           end: baseOffset + endOffset,
           text: raw,
           structuralSinks: [...curStructuralSinks],
+          hash: fnv1a(raw),
         });
+        sync.push(cur.sync);
       }
       cur = null;
       curStructuralSinks = new Set();
     }
   };
 
-  for (const ln of lines) {
+  const ln = { start: 0, end: 0, text: '' };
+  for (let lineStart = from; lineStart <= text.length; lineStart = ln.end + 1) {
+    const newline = text.indexOf('\n', lineStart);
+    ln.start = lineStart;
+    ln.end = newline < 0 ? text.length : newline;
+    ln.text = text.slice(ln.start, ln.end);
+    const settled = cur === null && envDepth === 0 && braceDepth === 0 && !inDisplay && inVerbatim === null &&
+      !inAlltt && !inKKcode && curStructuralSinks.size === 0;
+    if (settled && resync) {
+      const spliceFrom = resync(ln.start);
+      if (spliceFrom >= 0) return { segs, sync, spliceFrom };
+    }
     // KKluaverb's \KKcodeS...\KKcodeE: literal lines, like a verbatim env
     if (inKKcode) {
-      if (cur === null) cur = { start: ln.start };
+      if (cur === null) cur = { start: ln.start, sync: settled };
       if (ln.text.includes('\\KKcodeE')) inKKcode = false;
       continue;
     }
     if (inVerbatim) {
       // literal content: no comment stripping, no depth tracking, no
       // blank-line flush (blank lines inside a listing stay in the block)
-      if (cur === null) cur = { start: ln.start };
+      if (cur === null) cur = { start: ln.start, sync: settled };
       if (ln.text.includes(`\\end{${inVerbatim}}`)) inVerbatim = null;
       continue;
     }
@@ -133,7 +153,7 @@ export function segmentBody(text, baseOffset, { structuralEvents = [], literalEn
     if (atTop && cur !== null && (FORCED_START.test(stripped) || STANDALONE_LINE.test(stripped))) {
       flush(ln.start);
     }
-    if (cur === null && !blank) cur = { start: ln.start };
+    if (cur === null && !blank) cur = { start: ln.start, sync: settled };
     if (atTop && STANDALONE_LINE.test(stripped)) {
       // close the standalone command's block right after its line; the next
       // non-blank line starts a fresh block even without a blank line
@@ -193,10 +213,99 @@ export function segmentBody(text, baseOffset, { structuralEvents = [], literalEn
     // state in the continuous run, so it belongs to the same \par unit.
   }
   flush(text.length);
-
-  for (const s of segs) s.hash = fnv1a(s.text);
-  return segs;
+  return { segs, sync, spliceFrom: -1 };
 }
+
+const SCAN_BLOCK = 8192;
+function commonPrefixLength(a, b) {
+  const limit = Math.min(a.length, b.length);
+  let at = 0;
+  while (at + SCAN_BLOCK <= limit && a.substring(at, at + SCAN_BLOCK) === b.substring(at, at + SCAN_BLOCK)) at += SCAN_BLOCK;
+  while (at < limit && a.charCodeAt(at) === b.charCodeAt(at)) at++;
+  return at;
+}
+function commonSuffixLength(a, b, limit) {
+  let n = 0;
+  while (n + SCAN_BLOCK <= limit &&
+      a.substring(a.length - n - SCAN_BLOCK, a.length - n) === b.substring(b.length - n - SCAN_BLOCK, b.length - n)) n += SCAN_BLOCK;
+  while (n < limit && a.charCodeAt(a.length - n - 1) === b.charCodeAt(b.length - n - 1)) n++;
+  return n;
+}
+
+// The text differs from the one `prior` was made from in one stretch. The
+// blocks before the last settled block start above that stretch are kept;
+// the scan restarts there and stops at the first settled line below the
+// stretch where the earlier result has a block starting too. Everything
+// from that block on is the earlier result, moved by the change in length.
+function resegment(text, baseOffset, literalEnvs, prior) {
+  const old = prior.text;
+  if (old === text) return { segs: prior.segs, sync: prior.sync };
+  const prefix = commonPrefixLength(old, text);
+  const suffix = commonSuffixLength(old, text, Math.min(old.length, text.length) - prefix);
+  const delta = text.length - old.length;
+  const changedLine = prefix === 0 ? 0 : old.lastIndexOf('\n', prefix - 1) + 1;
+  const { segs, sync } = prior;
+  // the last block that starts on an earlier line than the change
+  let lo = 0;
+  let hi = segs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (segs[mid].start - baseOffset < changedLine) lo = mid + 1;
+    else hi = mid;
+  }
+  let keep = lo - 1;
+  while (keep >= 0 && !sync[keep]) keep--;
+  const from = keep >= 0 ? segs[keep].start - baseOffset : 0;
+  const unchangedFrom = text.length - suffix;
+  let starts = prior.starts;
+  if (!starts) {
+    starts = prior.starts = new Map();
+    for (let i = 0; i < segs.length; i++) if (sync[i]) starts.set(segs[i].start - baseOffset, i);
+  }
+  const scanned = scanSegments(text, baseOffset, from, [], literalEnvs, (lineStart) => {
+    if (lineStart < unchangedFrom) return -1;
+    const index = starts.get(lineStart - delta);
+    return index !== undefined && index > keep ? index : -1;
+  });
+  const head = keep > 0 ? segs.slice(0, keep) : [];
+  const headSync = keep > 0 ? sync.slice(0, keep) : [];
+  if (scanned.spliceFrom < 0) return { segs: head.concat(scanned.segs), sync: headSync.concat(scanned.sync) };
+  const tail = segs.slice(scanned.spliceFrom);
+  if (delta !== 0) {
+    for (let i = 0; i < tail.length; i++) tail[i] = { ...tail[i], start: tail[i].start + delta, end: tail[i].end + delta };
+  }
+  return { segs: head.concat(scanned.segs, tail), sync: headSync.concat(scanned.sync, sync.slice(scanned.spliceFrom)) };
+}
+
+const literalEnvKey = (literalEnvs) => (literalEnvs?.size ? [...literalEnvs].sort().join('\u0000') : '');
+
+/**
+ * Split a body into blocks. `memo` (an object the caller keeps for one text
+ * that changes a little between calls: a document's body, a book's joined
+ * chapters) lets the next call scan only around what changed: a keystroke
+ * in a 389-page book scanned all 1.6 MB of it. The result is the same as a
+ * scan of the whole text.
+ */
+export function segmentBody(text, baseOffset, { structuralEvents = [], literalEnvs = null, memo = null } = {}) {
+  const aliasEvents = [...structuralEvents].sort((a, b) => a.at - b.at);
+  if (!memo) return scanSegments(text, baseOffset, 0, aliasEvents, literalEnvs, null).segs;
+  const envKey = literalEnvKey(literalEnvs);
+  // structural events sit at offsets of their own: such a text is scanned whole
+  const prior = !aliasEvents.length && memo.plain === true && memo.baseOffset === baseOffset && memo.envKey === envKey
+    ? memo : null;
+  const result = (prior && resegment(text, baseOffset, literalEnvs, prior)) ||
+    scanSegments(text, baseOffset, 0, aliasEvents, literalEnvs, null);
+  memo.text = text;
+  memo.baseOffset = baseOffset;
+  memo.envKey = envKey;
+  memo.plain = aliasEvents.length === 0;
+  memo.segs = result.segs;
+  memo.sync = result.sync;
+  memo.starts = null;
+  // the caller's own objects: what it does to them must not reach the memo
+  return result.segs.map((seg) => ({ ...seg, structuralSinks: [...seg.structuralSinks] }));
+}
+
 
 // Environments TeX reads as literal characters, for the document bounds.
 // Unlike VERBATIM_BEGIN_RE this leaves out alltt: \, { and } keep their
@@ -571,18 +680,6 @@ function refresh(block, seg) {
   block.externalGraphics = !!seg.externalGraphics;
   block.structuralSinks = seg.structuralSinks ?? [];
   return block;
-}
-
-function splitLines(text) {
-  const out = [];
-  let start = 0;
-  for (let i = 0; i <= text.length; i++) {
-    if (i === text.length || text[i] === '\n') {
-      out.push({ start, end: i, text: text.slice(start, i) });
-      start = i + 1;
-    }
-  }
-  return out;
 }
 
 function stripComment(line) {

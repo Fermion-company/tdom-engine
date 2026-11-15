@@ -6,6 +6,8 @@ import { resolveProjectInput } from '../project-inputs.js';
 import { cacheIncludeRead } from './include-cache.js';
 import { documentBodyRange, subfileGroupOpen, subfileGroupClose } from './subfile.js';
 
+const joinedSegmentMemos = new WeakMap(); // include cache -> file -> segmentBody memo of its joined text
+
 // An input is token substitution, not a paragraph boundary. Segment the
 // substituted body and keep a source map for regions crossing file edges.
 export function expandInputParagraphs(segs, context) {
@@ -110,7 +112,15 @@ export function expandInputParagraphs(segs, context) {
   // joins the segment before it, or waits for the next one.
   let carry = '';
   const mapped = [];
-  for (const seg of segmentBody(text, 0, { structuralEvents: events, literalEnvs: context.literalEnvs })) {
+  // The joined text of a book is megabytes and changes by a keystroke: one
+  // memo per file that joins others (the root, a chapter that reads its
+  // sections), kept with the project's include cache, scans only around it.
+  let memo = null;
+  if (context.includes) {
+    const memos = joinedSegmentMemos.get(context.includes) ?? joinedSegmentMemos.set(context.includes, new Map()).get(context.includes);
+    memo = memos.get(root) ?? memos.set(root, {}).get(root);
+  }
+  for (const seg of segmentBody(text, 0, { structuralEvents: events, literalEnvs: context.literalEnvs, memo })) {
     const out = mapSegment(seg);
     if (out) {
       if (carry) {

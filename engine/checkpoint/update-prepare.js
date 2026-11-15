@@ -69,6 +69,8 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   let segs = segmentBody(bodyText, bounds.body.start, {
     structuralEvents: rawStructuralGate.segmentEvents,
     literalEnvs: bounds.literalEnvs,
+    // (a keystroke scans only around what it changed)
+    memo: engine.bodySegmentMemo ??= {},
   });
   segs = expandIncludes(segs, 0, {
     structuralEvents: rawStructuralGate.segmentEvents,
