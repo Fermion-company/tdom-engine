@@ -568,7 +568,7 @@ function rememberDom(payload) {
 // a viewer is listening, the edit's own update carries the change from the
 // serialization before it; a viewer holding that one applies it, any other
 // asks as before.
-function updateDomPush(report) {
+function updateDomPush(report, raw) {
   if (Date.now() > domInterestUntil || !sseClients.size || !report?.stats ||
       !Number.isSafeInteger(report.srcRev) || report.srcRev !== engine?.srcRev) return '';
   try {
@@ -576,7 +576,7 @@ function updateDomPush(report) {
     // repagination since (an exact render landing, the settle pass) makes a
     // newer one that no viewer has seen.
     const base = domServed?.stamp;
-    const parts = rememberDom(domPayload(report));
+    const parts = rememberDom(domPayload(report, raw));
     const delta = domDeltaBody(parts, base);
     if (delta) {
       domInterestUntil = Date.now() + 5_000;
@@ -1449,14 +1449,29 @@ function bibliographySourceLocation(generatedText, generatedLine = null) {
   return null;
 }
 
-function domPayload(report = lastReport) {
-  const dom = engine.getDOM();
+// The files a block's edit regions point into, kept with the regions (the
+// same array for as long as the block's regions are the same, inspector.js).
+const regionFiles = new WeakMap();
+function filesOfRegions(regions) {
+  let files = regionFiles.get(regions);
+  if (!files) {
+    files = [...new Set(regions.map((region) => region.source?.file).filter(Boolean))];
+    regionFiles.set(regions, files);
+  }
+  return files;
+}
+// `raw` is the engine's snapshot and may be shared with other readers of the
+// same state: it is left as it is.
+function domPayload(report = lastReport, raw = engine.getDOM()) {
+  const dom = { ...raw };
   dom.documentEpoch = documentEpoch;
   // An unfinished construct advances sourceRev while deliberately keeping
   // the previous block spans. It cannot supply a new editable ink snapshot.
   dom.sourceCurrent = !report?.stats?.closureDeferred;
-  const sourceFiles = new Set((dom.blocks ?? []).flatMap(block =>
-    (block.editRegions ?? []).map(region => region.source?.file).filter(Boolean)));
+  const sourceFiles = new Set();
+  for (const block of dom.blocks ?? []) {
+    if (block.editRegions?.length) for (const file of filesOfRegions(block.editRegions)) sourceFiles.add(file);
+  }
   dom.sources = dom.sourceCurrent ? [...sourceFiles].flatMap(file => {
     // Root text is never expanded. Included files retain the exact original
     // text read during segmentation, including unsaved overlay contents.
@@ -1465,23 +1480,33 @@ function domPayload(report = lastReport) {
       : engine.includes?.get(file)?.text;
     return typeof text === 'string' ? [{ file, text }] : [];
   }) : [];
-  const byId = new Map(engine.blocks.map((block) => [block.id, block]));
-  for (const item of dom.blocks ?? []) {
-    if (path.resolve(item.source?.file || '') !== path.join(engine.workDir, 'driver.bbl')) continue;
+  const bbl = path.join(engine.workDir, 'driver.bbl');
+  let byId = null;
+  let blocks = null;
+  for (let index = 0; index < (dom.blocks ?? []).length; index++) {
+    const item = dom.blocks[index];
+    const file = item.source?.file;
+    if (typeof file !== 'string' || !file.endsWith('driver.bbl') || path.resolve(file) !== bbl) continue;
     // A .bbl is generated output.  Its rendered prose can be navigated back
     // to the owning .bib entry, but it must never be offered as inline text:
     // replacing a title/author fragment in driver.bbl would be overwritten
     // by the next Biber run and could target the wrong field.
-    item.editRegions = [];
+    byId ??= new Map(engine.blocks.map((block) => [block.id, block]));
+    blocks ??= dom.blocks.slice();
     const location = bibliographySourceLocation(byId.get(item.id)?.text || '');
-    if (!location) continue;
-    item.source = {
+    const { editRegions: _regions, ...rest } = item;
+    blocks[index] = location ? {
+      ...rest,
+      source: {
+        file: location.file,
+        start: { line: location.line, column: location.column },
+        end: { line: location.line, column: location.column },
+      },
       file: location.file,
-      start: { line: location.line, column: location.column },
-      end: { line: location.line, column: location.column },
-    };
-    item.file = location.file;
+      editRegions: [],
+    } : { ...rest, editRegions: [] };
   }
+  if (blocks) dom.blocks = blocks;
   return dom;
 }
 
@@ -2728,6 +2753,11 @@ const server = http.createServer(async (req, res) => {
       const anchorAcceptedAt = performance.now();
       const nowEpoch = Date.now();
       let domPush = '';
+      // One snapshot of the engine's blocks before the edit and one after,
+      // for everything in this request that reads them.
+      let domBefore = null;
+      let domAfter = null;
+      const blocksBefore = () => (domBefore ??= engine.getDOM()).blocks;
       const anchorClientEditAt = canonicalAnchorClientEditTimestamp(
         body.clientEditAtEpochMs,
         nowEpoch
@@ -2765,7 +2795,7 @@ const server = http.createServer(async (req, res) => {
                 engine.canonical.sourceMatches(current, certificate.id)) {
               anchorBaseSnapshot = captureCanonicalAnchorBase({
                 blocks: engine.blocks,
-                domBlocks: engine.getDOM().blocks,
+                domBlocks: blocksBefore(),
                 edit: anchorEdit,
                 certificate,
                 diagnostics: anchorDiagnostics,
@@ -2789,7 +2819,7 @@ const server = http.createServer(async (req, res) => {
               const joinDiagnostics = {};
               const candidate = captureCanonicalAnchorBase({
                 blocks: engine.blocks,
-                domBlocks: engine.getDOM().blocks,
+                domBlocks: blocksBefore(),
                 edit: anchorEdit,
                 certificate,
                 diagnostics: joinDiagnostics,
@@ -2953,7 +2983,7 @@ const server = http.createServer(async (req, res) => {
           // Still this edit's turn of the queue, its state intact: the source
           // map the viewer needs before it shows this revision goes out with
           // the update instead of being asked for afterwards.
-          domPush = updateDomPush(report);
+          domPush = updateDomPush(report, domAfter = engine.getDOM());
           editTrace?.push(['dom', performance.now()]);
           return report;
         });
@@ -2986,7 +3016,7 @@ const server = http.createServer(async (req, res) => {
       const anchorPlan = ENABLE_CANONICAL_ANCHOR && !coldEdit && anchorInputSafe && lastReport.rebooted !== true
         ? planTerminalCanonicalAnchor({
             blocks: engine.blocks,
-            domBlocks: engine.getDOM().blocks,
+            domBlocks: (domAfter ?? engine.getDOM()).blocks,
             report: lastReport,
             geometry: engine.getGeometry(),
             lineage: anchorPriorLineage,
