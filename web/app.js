@@ -763,8 +763,15 @@ function displayListSrcs(dl) {
  * blank page whose stage is not ready joins nothing: it stays blank, and
  * next to a blank shell no reflow can duplicate or drop a line. On a
  * document's first presentation every page is blank, and tying them made
- * the whole document one group (tex64-internal #83). */
-function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () => true, ready = () => true) {
+ * the whole document one group (tex64-internal #83). A page the reader
+ * cannot see (`away`) whose stage is not ready joins nothing either: it
+ * keeps what it shows until its own pixels land. A keystroke that adds a
+ * line moves one line across every page break of the chapter, which tied
+ * every page of it to the one being typed on; the pages never scrolled to
+ * have no exact pixels yet, and the paper stood still until the next
+ * canonical compile (measured: all 14 keystrokes of a run unanswered). */
+function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () => true, ready = () => true,
+  away = () => false) {
   const root = new Map(stages.map(stage => [stage.dl.page, stage.dl.page]));
   const find = page => {
     while (root.get(page) !== page) page = root.get(page);
@@ -778,7 +785,7 @@ function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () 
     else map.set(key, page);
   };
   const staged = new Map(stages.map(stage => [stage.dl.page, stage]));
-  const waiting = stage => !painted(stage.dl.page) && !ready(stage);
+  const waiting = stage => !ready(stage) && (!painted(stage.dl.page) || away(stage.dl.page));
   // A page still waiting for exact pixels that no edit touched (the replay
   // towards a keystroke re-delivers such pages of a long document) ties its
   // neighbour only through what the two actually share, not by standing
@@ -803,6 +810,29 @@ function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () 
     groups.get(group).push(stage);
   }
   return [...groups.values()];
+}
+
+// What keeps a staged page from being shown as it is: canonical-only ink,
+// exact pixels not rendered yet, browser math, a stale picture.
+const owesExactInk = cmd => cmd.op === 'canon' || cmd.op === 'pending-exact' ||
+  cmd.op === 'glyphs' && cmd.math || cmd.op === 'chunk' && cmd.st;
+
+// The pages whose paper crosses the pane now. Read once per turn of the
+// event loop: an update stages every page it delivers in one go.
+let sightMemo = null;
+function pagesInSight() {
+  if (sightMemo) return sightMemo;
+  const sight = new Set();
+  const viewport = pagesEl.getBoundingClientRect();
+  if (viewport.height > 0) {
+    for (const [page, div] of pageDivs) {
+      const bounds = div.getBoundingClientRect();
+      if (bounds.bottom > viewport.top && bounds.top < viewport.bottom) sight.add(page);
+    }
+  }
+  sightMemo = sight;
+  queueMicrotask(() => { sightMemo = null; });
+  return sight;
 }
 
 function pagePainted(page) {
@@ -942,21 +972,40 @@ function scheduleChunkPrefetch() {
   }, 200);
 }
 
-function scheduleViewportWarm() {
+// `owedOnly`: asked because a page in sight holds a commit back, not because
+// the reader moved; then only such a page is worth a warm.
+function scheduleViewportWarm({ owedOnly = false } = {}) {
   scheduleChunkPrefetch();
+  if (owedOnly && viewportWarmTimer !== null) return;
   window.clearTimeout(viewportWarmTimer);
   viewportWarmTimer = window.setTimeout(() => {
+    viewportWarmTimer = null;
     if (documentReset.pending || usesCanonicalSurface() || directEditor || inFlight || composing) return;
     const viewport = pagesEl.getBoundingClientRect();
     const center = (viewport.top + viewport.bottom) / 2;
     let nearest = null;
     let distance = Infinity;
+    // A page in sight still waiting for exact pixels that the edit in hand
+    // did not touch (the engine renders the edit's own pages itself): a page
+    // left stale while it was out of sight and now scrolled to, or one that
+    // took a block from the page after it. It is warmed before the page at
+    // the centre, and it asks for the canonical compile it did not ask for
+    // while out of sight.
+    let owed = null;
+    let owedDistance = Infinity;
     for (const [page, div] of pageDivs) {
       const bounds = div.getBoundingClientRect();
       if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) continue;
       const gap = Math.abs((bounds.top + bounds.bottom) / 2 - center);
       if (gap < distance) { nearest = page; distance = gap; }
+      const stage = provisionalStages.get(page);
+      if (stage && !stage.ready && !pageEditGroup.has(page) && stage.dl.commands.some(owesExactInk)) {
+        requestCanonicalDisplay({ residentImpossible: stage.dl.commands.some(cmd => cmd.op === 'canon') });
+        if (gap < owedDistance) { owed = page; owedDistance = gap; }
+      }
     }
+    if (owed !== null) nearest = owed;
+    else if (owedOnly) return;
     if (nearest === null) return;
     const key = `${documentReset.adoptedEpoch}:${appliedSrcRev}:${nearest}`;
     if (viewportWarmKey === key) return;
@@ -1076,28 +1125,45 @@ function tryCommitProvisionalStages() {
   // first canonical, about four minutes after opening (tex64-internal #83).
   const residentCountSettled = canonicalPageCount === null && !provisionalPendingLayout.size;
   let committing = stages;
+  // (the pages a partial commit leaves staged on purpose: out of sight, not ready)
+  let sight = null;
   if (!stages.every(stageReady)) {
     // While the page count is settled, a ready group (provisionalCommitGroups)
     // does not wait for another: typically a page elsewhere still waiting for
     // exact pixels (the previous keystroke's, or a running head the edit
     // touched) would hold back the page being typed on now. Numbers on far
     // pages may briefly lag until theirs land.
-    if (pageCountMismatch || (canonicalPageCount === null && !residentCountSettled) ||
-        provisionalRemovedPages.size || directEditor) {
+    // A page count that differs from canonical's, or a tail being removed,
+    // waits for every page the reader can see; pages out of sight that still
+    // owe exact pixels keep what they show until they are scrolled to
+    // (scheduleViewportWarm) or the next canonical lands.
+    sight = pagesInSight();
+    const owedInSight = stages.filter(stage => !stageReady(stage) && sight.has(stage.dl.page));
+    const tailInSight = [...provisionalRemovedPages].some(page => sight.has(page));
+    if (((pageCountMismatch || provisionalRemovedPages.size) && (owedInSight.length || tailInSight)) ||
+        (canonicalPageCount === null && !residentCountSettled) || directEditor) {
+      if (owedInSight.length) scheduleViewportWarm({ owedOnly: true });
       return traceStage('hold', null, { why: 'not-all-ready', residentPageCount, canonicalPageCount,
         pendingLayout: provisionalPendingLayout.size, removed: provisionalRemovedPages.size, editor: !!directEditor,
         waiting: stages.filter(stage => !stageReady(stage)).map(stage => stage.dl.page).slice(0, 12) });
     }
     // no canonical has made the shells yet: the resident count does
     if (residentCountSettled) for (let n = 1; n <= residentPageCount; n++) ensureShell(n);
-    if (stages.some(stage => !pageDivs.has(stage.dl.page))) return traceStage('hold', null, { why: 'no-shell' });
-    committing = provisionalCommitGroups(stages, committedPageSrcs, pageEditGroup, pagePainted, stageReady)
+    // (a count canonical does not have yet: its new pages get their shells
+    // when they are committed, as when every page is ready)
+    if (!pageCountMismatch && stages.some(stage => !pageDivs.has(stage.dl.page))) {
+      return traceStage('hold', null, { why: 'no-shell' });
+    }
+    committing = provisionalCommitGroups(stages, committedPageSrcs, pageEditGroup, pagePainted, stageReady,
+      page => !sight.has(page))
       .filter(group => group.every(stageReady)).flat()
       .sort((a, b) => a.dl.page - b.dl.page);
     if (!committing.length) {
+      if (owedInSight.length) scheduleViewportWarm({ owedOnly: true });
       return traceStage('hold', null, { why: 'no-ready-group',
         waiting: stages.filter(stage => !stageReady(stage)).map(stage => stage.dl.page).slice(0, 12) });
     }
+    if (owedInSight.length) scheduleViewportWarm({ owedOnly: true });
   }
   const editorStage = committing.find(stage => stage.dl.page === directEditor?.pageNumber);
   const editorRegion = editorStage ? directEditorRegionInSnapshot(editorStage.snapshot, directEditor) : null;
@@ -1136,7 +1202,10 @@ function tryCommitProvisionalStages() {
   provisionalRemovedPages.clear();
   residentPageCountAuthoritative = canonicalPageCount === residentPageCount;
   for (const stage of committing) updateCanonState(stage.dl.page);
-  if (residentPageCountAuthoritative && committing === stages && stages.every(stage => {
+  // (what a partial commit left staged is out of the reader's sight)
+  const shown = committing === stages ||
+    stages.every(stage => committing.includes(stage) || !sight.has(stage.dl.page));
+  if (residentPageCountAuthoritative && shown && committing.every(stage => {
     const page = pageDivs.get(stage.dl.page);
     return !page.classList.contains('is-final') || Number(page.dataset.canonPresentedRev) >= stage.sourceRev;
   })) fulfillCanonicalDisplay();
@@ -1313,12 +1382,16 @@ function renderPage(dl, flash) {
   // while its neighboring page reveals this provisional transaction.
   pageDirtyRev.set(dl.page, sourceRev);
   if (div) div.dataset.provPending = '1';
-  if (dl.commands.some(cmd => cmd.op === 'canon' || cmd.op === 'pending-exact' ||
-      cmd.op === 'glyphs' && cmd.math || cmd.op === 'chunk' && cmd.st)) {
+  if (dl.commands.some(owesExactInk)) {
     traceStage('blocked', dl.page);
     stage.srcs = displayListSrcs(dl);
     committedPageSrcs.set(dl.page, new Set([...(committedPageSrcs.get(dl.page) ?? []), ...stage.srcs]));
-    requestCanonicalDisplay({ residentImpossible: dl.commands.some(cmd => cmd.op === 'canon') });
+    // A page the reader cannot see waits without asking for a canonical
+    // compile: three pages of a 72-page book that owed exact pixels asked on
+    // every keystroke, and LuaLaTeX compiled the whole book back to back for
+    // as long as the typing lasted. The page asks when it is scrolled to.
+    const impossible = dl.commands.some(cmd => cmd.op === 'canon');
+    if (impossible || pagesInSight().has(dl.page)) requestCanonicalDisplay({ residentImpossible: impossible });
     return;
   }
   traceStage('stage', dl.page);

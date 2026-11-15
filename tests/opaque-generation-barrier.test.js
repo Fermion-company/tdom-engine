@@ -33,6 +33,28 @@ test('a page waiting for exact pixels that no edit touched does not hold the pag
   assert.deepEqual(pages(groupsOf([stage(39, 'b'), stage(40, 'c')], new Map(), new Map([[39, 7], [40, 7]]), painted, readyOnly(40))), [[39, 40]]);
 });
 
+test('a page out of sight that still waits for exact pixels does not hold the pages in sight', () => {
+  const groupsOf = PAGE_COUNT_GATES.provisionalCommitGroups;
+  const stage = (page, ...srcs) => ({ dl: { page, commands: srcs.map((src) => ({ op: 'glyphs', src })) } });
+  const pages = (groups) => groups.map((group) => group.map((s) => s.dl.page)).sort((a, b) => a[0] - b[0]);
+  const painted = () => true;
+  const readyOnly = (...ready) => (s) => ready.includes(s.dl.page);
+  const awayFrom = (...sight) => (page) => !sight.includes(page);
+  // a keystroke on page 1 added a line: one line crossed every page break of
+  // the chapter, so each page now shows a block the page before it showed
+  const stages = [stage(1, 'a', 'b'), stage(2, 'b', 'c', 'd'), stage(3, 'd', 'e'), stage(4, 'e', 'f')];
+  const shown = new Map([[1, new Set(['a', 'b', 'c'])], [2, new Set(['c', 'd'])], [3, new Set(['d', 'e'])], [4, new Set(['f'])]]);
+  const edit = new Map([[1, 7]]);
+  // pages 3 and 4 were never scrolled to and have no exact pixels yet
+  assert.deepEqual(pages(groupsOf(stages, shown, edit, painted, readyOnly(1, 2))), [[1, 2, 3, 4]],
+    'as before when nothing says where the reader is');
+  assert.deepEqual(pages(groupsOf(stages, shown, edit, painted, readyOnly(1, 2), awayFrom(1, 2))), [[1, 2], [3], [4]]);
+  // a page in sight that is not ready still holds what it shares
+  assert.deepEqual(pages(groupsOf(stages, shown, edit, painted, readyOnly(1), awayFrom(1, 2))), [[1, 2], [3], [4]]);
+  // and one out of sight that is ready goes with its neighbours
+  assert.deepEqual(pages(groupsOf(stages, shown, edit, painted, readyOnly(1, 2, 3), awayFrom(1, 2))), [[1, 2, 3], [4]]);
+});
+
 test('staged pages commit in groups: a reflow, a moved or split paragraph and one edit stay together', () => {
   const groupsOf = PAGE_COUNT_GATES.provisionalCommitGroups;
   const stage = (page, ...srcs) => ({ dl: { page, commands: srcs.map((src) => ({ op: 'glyphs', src })) } });
