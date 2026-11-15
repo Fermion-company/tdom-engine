@@ -64,6 +64,14 @@ export function queueRender(engine, blockId, callbacks, { interactiveRev = null,
   pumpRenders(engine, callbacks);
 }
 
+// The RENDER that left beside a block's own JOB (engine #jobBlock, docs/10
+// §10.4b/c) and is still this block's: the pump has only its PDF to crop.
+function sentRender(block) {
+  const cold = block?.galley?.tdomColdPreview;
+  const sent = cold ? cold.early : block?.galley?.tdomEarlyRender;
+  return sent && !sent.used && !sent.discarded && !sent.failure && sent.text === block.text ? sent : null;
+}
+
 function pumpRenders(engine, callbacks) {
   const MAX = Number(process.env.TDOM_RENDER_CONCURRENCY || 2);
   if (engine.renderPumping >= MAX) return;
@@ -72,7 +80,11 @@ function pumpRenders(engine, callbacks) {
     try {
       while (engine.renderWant.size) {
         if (engine.updating) {
-          await new Promise((r) => setTimeout(r, 25));
+          // (the update that queued this edit's block ends within
+          // milliseconds: look again soon when its RENDER is already out)
+          const waiting = [...engine.renderWant.keys()].some((queuedId) =>
+            sentRender(engine.blocks.find((b) => b.id === queuedId)));
+          await new Promise((r) => setTimeout(r, waiting ? 2 : 25));
           continue;
         }
         // Propagation owns a live JOB/CAPTURE boundary until its pixels
@@ -112,7 +124,16 @@ function pumpRenders(engine, callbacks) {
         }
         const configuredQuiet = Number(process.env.TDOM_RENDER_QUIET_MS ?? 120);
         const renderQuiet = Number.isFinite(configuredQuiet) ? Math.max(0, configuredQuiet) : 120;
-        const quietMs = propagation ? 0 : interactive ? renderQuiet : shippingPriorityQuietMs(engine, renderQuiet);
+        // The quiet period keeps an edit burst from forking a lualatex per
+        // keystroke. A block whose RENDER already left beside its JOB forks
+        // nothing here: its PDF only has to be cropped. Held behind the
+        // quiet period, the typed character reached the paper 142 ms after
+        // the keystroke (120 ms of it this wait) although its pixels were
+        // typeset within the first 50, and in a burst it never did: the page
+        // showed the previous keystroke's picture until the typing stopped.
+        const cropOnly = interactive && !!sentRender(engine.blocks.find((b) => b.id === id));
+        const quietMs = propagation || cropOnly ? 0
+          : interactive ? renderQuiet : shippingPriorityQuietMs(engine, renderQuiet);
         const remaining = quietMs - (Date.now() - (engine.lastEditAt ?? 0));
         if (remaining > 0) {
           await new Promise((r) => setTimeout(r, Math.min(25, remaining)));
@@ -245,8 +266,7 @@ async function renderBlockInner(engine, block, callbacks, hold = false) {
   // the RENDER that went out beside the preview's JOB (docs/10 §10.4b) or
   // beside the edited block's own JOB (§10.4c): the galley it was sent for
   // carries it, so a later state change (a new galley) never takes its PDF
-  const sent = cold ? cold.early : block.galley?.tdomEarlyRender;
-  const early = sent && !sent.used && !sent.discarded && !sent.failure && sent.text === block.text ? sent : null;
+  const early = sentRender(block);
   if (!ck && !captureCk && !early) {
     // checkpoint retired off the grid (long documents keep ~64): the
     // Neither exact path has a resident owner: RENDER needs the state AT the

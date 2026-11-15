@@ -824,6 +824,14 @@ export class CheckpointEngine {
       const pause = (this.editGapMs ?? 0) > 400 && !(this.keystrokePending > 0);
       const holdable = this.#holdableRender(block);
       const hold = holdable && !this.heldRenders?.has(block.id);
+      // TDOM_TRACE_RENDER=1: whether the edited block's exact RENDER left with its JOB, and why not
+      if (process.env.TDOM_TRACE_RENDER && block.sourceChanged && block.needsRender && this.updating) {
+        console.error('[early-render]', block.id, JSON.stringify({
+          override: !!override, advance, capture: capture !== '-', mayCapture: mayCaptureNativeBlock(block),
+          vstale: !!ck.vstale, bgActive: !!this.bgActive, already: this.earlyRenderUpdate === this.updateSeq,
+          holdable, heldInFlight: !!this.heldRenders?.has(block.id), pause, gap: this.editGapMs,
+        }));
+      }
       if (!override && !advance && !(capture !== '-' && mayCaptureNativeBlock(block)) &&
           block.sourceChanged && block.needsRender && !ck.vstale &&
           this.updating && !this.bgActive && this.coldPreviewEarlyRender && this.earlyRenderUpdate !== this.updateSeq &&

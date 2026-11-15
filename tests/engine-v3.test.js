@@ -640,6 +640,10 @@ test('the first keystroke after a pause sends the edited block RENDER beside its
     await e.renderTask;
     const timing = (e.renderTimings ?? []).find((t) => t.block === id && t.earlyMs != null);
     assert.ok(timing && !timing.previewPeer, 'the pump cropped the early PDF');
+    // The pump took it as soon as the update ended. It has no lualatex to
+    // fork for this block, so the quiet period that spaces an edit burst's
+    // renders (120 ms after the keystroke) does not apply (render-pump.js).
+    assert.ok(timing.earlyMs < 90, `the early PDF waited ${timing.earlyMs} ms for the pump`);
     const chunk = e.chunks.get(id);
     assert.equal(chunk?.forGalley, edited.galleyHash, 'for the galley the JOB returned');
     assert.ok(chunk.xBp < 0 && chunk.wBp > chunk.logicalWBp, JSON.stringify({ xBp: chunk.xBp, wBp: chunk.wBp }));

@@ -1180,7 +1180,11 @@ function tryCommitProvisionalStages() {
   } else for (const stage of committing) provisionalStages.delete(stage.dl.page);
   for (const stage of committing) {
     const { dl, staging, sourceRev, snapshot } = stage;
-    traceStage('commit', dl.page, { sourceRev });
+    // (for a diagnostic session: the blocks this page shows from an earlier
+    // galley's pixels, i.e. not yet what the source says now)
+    traceStage('commit', dl.page, Array.isArray(globalThis.__tdomStageTrace)
+      ? { sourceRev, held: [...new Set(dl.commands.filter(cmd => cmd.op === 'chunk' && cmd.held).map(cmd => cmd.src))] }
+      : { sourceRev });
     committedPageSrcs.set(dl.page, stage.srcs ?? displayListSrcs(dl));
     pageEditGroup.delete(dl.page);
     let div = pageDivs.get(dl.page);

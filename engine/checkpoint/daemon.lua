@@ -332,6 +332,14 @@ function tdom_boot(port, workdir, counters)
   pdf.immediateobj('<<>>')
   PDF_FD = fk.prepare_pdf(workdir .. '/driver.pdf')
   assert(PDF_FD >= 0, 'cannot privatize resident PDF output')
+  -- Read the default font map file (pdftex.map) here, once, if the preamble
+  -- has left it to be read at the first font the PDF backend meets. No
+  -- resident process ships a page, so every render child met its first font
+  -- anew and read the whole file again: 33 to 56 ms of each exact render,
+  -- more than typesetting and shipping the block. '+' with no name reads
+  -- the pending default and adds nothing (LuaTeX process_map_item); the PDF
+  -- a child writes is byte for byte the same.
+  pcall(pdf.mapfile, '+')
   sock = require('socket')
   conn = assert(sock.connect('127.0.0.1', PORT))
   conn:setoption('tcp-nodelay', true)
