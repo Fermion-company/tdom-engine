@@ -1,6 +1,12 @@
 import { SAFE_GLYPH } from './fidelity.js';
 import { instrumentEditRegions } from '../edit-regions.js';
 
+// A snapshot covers every block, and a viewer asks for one per keystroke
+// (a 389-page book: 26,000 regions). A block's own regions are a function
+// of its text, its region list and where its source sits; they are kept on
+// the block while those stay the same.
+const blockRegionMemo = new WeakMap(); // block -> { text, editRegions, anchor, regions }
+
 export function buildDomSnapshot({
   rev,
   srcRev,
@@ -48,6 +54,39 @@ export function buildDomSnapshot({
       end: position(file, block.start + region.contentEnd),
     };
   };
+  // Where the block's source sits, as far as a region's position depends on it.
+  const regionAnchor = (b) => {
+    if (b.sourceParts) {
+      return b.sourceParts.map((part) =>
+        `${part.file}|${part.at}|${part.to}|${part.sourceStart?.line}|${part.sourceStart?.column}`).join('\n');
+    }
+    if (b.file && b.sourceStart) return `${b.file}|${b.sourceStart.line}|${b.sourceStart.column}`;
+    // a root block's text is the root's own slice; anything else is not kept
+    if (b.end - b.start !== b.text.length) return null;
+    const start = position(file, b.start);
+    return `${file}|${b.start}|${start.line}|${start.column}`;
+  };
+  const ownRegions = (b) => {
+    const anchor = regionAnchor(b);
+    const kept = blockRegionMemo.get(b);
+    if (kept && anchor !== null && kept.anchor === anchor && kept.editRegions === b.editRegions && kept.text === b.text) {
+      return kept.regions;
+    }
+    // Canonical snapshots can arrive before an isolated rescue's
+    // resident metadata. Source spans are lexical and already known;
+    // never freeze a temporarily empty editing map into that PDF.
+    const regions = (b.editRegions ?? instrumentEditRegions(b.text).regions).map((region) => ({
+      id: `${b.id}:${region.id}`,
+      kind: region.kind,
+      value: region.value,
+      sourceValue: region.sourceValue,
+      display: region.display,
+      source: editSource(b, region),
+    })).filter(region => region.source);
+    if (anchor !== null) blockRegionMemo.set(b, { text: b.text, editRegions: b.editRegions, anchor, regions });
+    else blockRegionMemo.delete(b);
+    return regions;
+  };
   const blockPages = new Map();
   for (const page of pages) {
     for (const d of page.draw ?? []) {
@@ -71,33 +110,22 @@ export function buildDomSnapshot({
     checkpoints: [...checkpoints.keys()].sort((a, b) => a - b),
     blocks: blocks.map((b, i) => {
       const chunkKeys = chunkTargets(b).map((t) => t.key);
-      const blockRegions = [
-        // Canonical snapshots can arrive before an isolated rescue's
-        // resident metadata. Source spans are lexical and already known;
-        // never freeze a temporarily empty editing map into that PDF.
-        ...(b.editRegions ?? instrumentEditRegions(b.text).regions).map((region) => ({
+      const own = ownRegions(b);
+      const titleRegions = preambleEditRegions
+        .filter(() => /\\maketitle\b/.test(b.text))
+        .map((region) => ({
           id: `${b.id}:${region.id}`,
           kind: region.kind,
           value: region.value,
           sourceValue: region.sourceValue,
           display: region.display,
-          source: editSource(b, region),
-        })).filter(region => region.source),
-        ...preambleEditRegions
-          .filter(() => /\\maketitle\b/.test(b.text))
-          .map((region) => ({
-            id: `${b.id}:${region.id}`,
-            kind: region.kind,
-            value: region.value,
-            sourceValue: region.sourceValue,
-            display: region.display,
-            source: {
-              file,
-              start: position(file, region.contentStart),
-              end: position(file, region.contentEnd),
-            },
-          })),
-      ];
+          source: {
+            file,
+            start: position(file, region.contentStart),
+            end: position(file, region.contentEnd),
+          },
+        }));
+      const blockRegions = titleRegions.length ? [...own, ...titleRegions] : own;
       return {
         id: b.id,
         index: i,
@@ -150,4 +178,19 @@ export function buildFidelitySummary({ blocks, fidelityDemoted, demotedFamilies,
     demotedFonts: [...demotedFamilies],
     pendingRenders: renderWant.size,
   };
+}
+
+// A block's edit regions are most of its bytes, and buildDomSnapshot hands
+// out the same array for as long as the block's regions are the same: their
+// text is serialized once. `editRegions` is the block's last key, so the
+// result is JSON.stringify(block) to the byte.
+const regionJson = new WeakMap();
+export function serializeDomBlock(block) {
+  const regions = block.editRegions;
+  const keys = Object.keys(block);
+  if (!Array.isArray(regions) || !regions.length || keys.length < 2 || keys.at(-1) !== 'editRegions') return JSON.stringify(block);
+  let text = regionJson.get(regions);
+  if (text === undefined) regionJson.set(regions, text = JSON.stringify(regions));
+  const { editRegions: _regions, ...rest } = block;
+  return `${JSON.stringify(rest).slice(0, -1)},"editRegions":${text}}`;
 }

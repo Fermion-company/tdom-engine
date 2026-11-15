@@ -60,6 +60,7 @@ import {
   prepareExternalBibliography,
 } from './engine/project-bibliography.js';
 import { isPathInside } from './engine/project-inputs.js';
+import { serializeDomBlock } from './engine/checkpoint/inspector.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 4633);
@@ -506,7 +507,7 @@ const openRequests = new OpenRequestCache(8);
 // hold, only the pages a block spans may have moved; it is still served
 // while an edit is running or queued (the alternative is the superseded
 // snapshot), and rebuilt through the queue otherwise.
-let domCache = null; // { srcRev, epoch, body, dirty }
+let domCache = null; // { srcRev, epoch, dirty, parts }
 let domInterestUntil = 0;
 let lastQueueResult = null;
 function cacheDomBeforeNext() {
@@ -531,7 +532,7 @@ let domStamp = 0;
 function serializeDom(payload) {
   const { blocks = [], sources = [], ...rest } = payload;
   const order = blocks.map((block) => String(block.id));
-  const blockText = blocks.map((block) => JSON.stringify(block));
+  const blockText = blocks.map(serializeDomBlock);
   const files = sources.map((source) => source.file);
   const sourceText = sources.map((source) => JSON.stringify(source));
   const tail = JSON.stringify(rest).slice(1); // `"rev":…}`
@@ -541,7 +542,12 @@ function serializeDom(payload) {
     srcRev: payload.srcRev, stamp, order, files, tail, unique,
     blocks: new Map(order.map((id, i) => [id, blockText[i]])),
     sources: new Map(files.map((file, i) => [file, sourceText[i]])),
-    body: `{"domStamp":${stamp},"blocks":[${blockText.join(',')}],"sources":[${sourceText.join(',')}]${tail.length > 1 ? ',' : ''}${tail}`,
+    // the whole document as one string, only for a viewer that holds no earlier one
+    get body() {
+      const body = `{"domStamp":${stamp},"blocks":[${blockText.join(',')}],"sources":[${sourceText.join(',')}]${tail.length > 1 ? ',' : ''}${tail}`;
+      Object.defineProperty(this, 'body', { value: body });
+      return body;
+    },
   };
 }
 function rememberDom(payload) {
@@ -551,7 +557,7 @@ function rememberDom(payload) {
     domEarlier.push(domCache.parts);
     while (domEarlier.length > 4) domEarlier.shift();
   }
-  domCache = { srcRev: payload.srcRev, epoch: documentEpoch, body: parts.body, dirty: false, parts };
+  domCache = { srcRev: payload.srcRev, epoch: documentEpoch, dirty: false, parts };
   return parts;
 }
 /** The snapshot as a change from the serialization stamped `base`, or null when that one is not held. */
@@ -2258,9 +2264,7 @@ const server = http.createServer(async (req, res) => {
       };
       if (Number.isSafeInteger(wantRev) && domCache?.srcRev === wantRev && domCache.epoch === documentEpoch &&
           (!domCache.dirty || engineBusy > 0)) {
-        if (domCache.parts) return send(domCache.parts);
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        return res.end(domCache.body);
+        return send(domCache.parts);
       }
       const payload = await withEngine(() => domPayload());
       // a revision asked for by number is kept: the next one is sent as a change from it
