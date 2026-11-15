@@ -897,7 +897,9 @@ function shippingPresentationBlocked() {
 // pictures of the pages the reader is looking at are asked for ahead of that,
 // so they come from the browser's cache when the page is staged. Only
 // pictures with a fixed address are kept there (chunkImageSrc).
-const prefetchedChunks = new Set();
+// (the picture objects are kept: one that is let go has to be read from the
+// cache and parsed again when its page is staged, 20 ms for eight of them)
+const prefetchedChunks = new Map(); // src -> Image, most recently asked for last
 let chunkPrefetchTimer = null;
 function prefetchVisibleChunks() {
   if (typeof serverBootId !== 'string' || documentReset.pending || usesCanonicalSurface()) return;
@@ -908,16 +910,21 @@ function prefetchVisibleChunks() {
     if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) continue;
     for (const n of [page - 1, page, page + 1]) visible.add(n);
   }
-  if (prefetchedChunks.size > 4096) prefetchedChunks.clear();
   for (const n of visible) {
     for (const cmd of provisionalDisplayLists.get(n)?.commands ?? []) {
       if (cmd.op !== 'chunk') continue;
       const src = chunkImageSrc(cmd);
-      if (prefetchedChunks.has(src)) continue;
-      prefetchedChunks.add(src);
-      new Image().src = src;
+      let image = prefetchedChunks.get(src);
+      if (image) prefetchedChunks.delete(src);
+      else {
+        image = new Image();
+        image.src = src;
+        void image.decode?.().catch(() => {});
+      }
+      prefetchedChunks.set(src, image);
     }
   }
+  while (prefetchedChunks.size > 256) prefetchedChunks.delete(prefetchedChunks.keys().next().value);
   // The source map too: the next keystroke's update brings only the change
   // from the one this viewer holds (adoptPushedSnapshot). Held as of now,
   // that change is the edited block; held from before the pages settled, it
