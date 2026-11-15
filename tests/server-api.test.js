@@ -162,3 +162,34 @@ test('a viewer gets the source snapshot of the revision it staged while the next
   const current = await fetch(`${base}/dom?srcRev=1`).then((res) => res.json());
   assert.equal(current.srcRev, next.srcRev);
 });
+
+test('a host names an outer paper: its sheets around the chapter are served, the chapter\'s own are not', { skip: !texReady && 'lualatex not installed' }, async (t) => {
+  const base = await startServer(t);
+  const post = (body) => fetch(`${base}/outer`, { method: 'POST', body: JSON.stringify(body) }).then(async (r) => [r.status, await r.json()]);
+  // any PDF stands in for the paper of a full Build: here the demo's own
+  await waitForCanonical(base);
+  const pdfBytes = Buffer.from(await (await fetch(`${base}/canonical.pdf`)).arrayBuffer());
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(path.join(tmpdir(), 'tdom-outer-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const pdfPath = path.join(dir, 'paper.pdf');
+  writeFileSync(pdfPath, pdfBytes);
+  const { stdout } = await execFileP('pdfinfo', [pdfPath]);
+  const pages = Number(/Pages:\s+(\d+)/.exec(stdout)[1]);
+  assert.ok(pages >= 2);
+
+  assert.equal((await post({ pdfPath, pages, before: pages + 1, afterFrom: pages + 2 }))[0], 400);
+  assert.equal((await post({ pdfPath: 'relative.pdf', pages, before: 0, afterFrom: 1 }))[0], 400);
+  const [status, answer] = await post({ pdfPath, pages, before: 1, afterFrom: pages + 1 });
+  assert.equal(status, 200);
+  const outer = (await (await fetch(`${base}/status`)).json()).outer;
+  assert.deepEqual(outer, { key: answer.key, before: 1, afterFrom: pages + 1, pages });
+  const sheet = await fetch(`${base}/outer/1.svg?k=${encodeURIComponent(outer.key)}`);
+  assert.equal(sheet.status, 200);
+  assert.match(await sheet.text(), /<svg/);
+  assert.equal((await fetch(`${base}/outer/2.svg?k=${encodeURIComponent(outer.key)}`)).status, 404, 'a sheet of the chapter itself');
+  assert.equal((await fetch(`${base}/outer/1.svg?k=stale`)).status, 404, 'another paper\'s key');
+  assert.equal((await post({ clear: true }))[0], 200);
+  assert.equal((await (await fetch(`${base}/status`)).json()).outer, null);
+});

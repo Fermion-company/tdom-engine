@@ -61,6 +61,7 @@ import {
 } from './engine/project-bibliography.js';
 import { isPathInside } from './engine/project-inputs.js';
 import { serializeDomBlock } from './engine/checkpoint/inspector.js';
+import { fnv1a } from './engine/hash.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 4633);
@@ -569,6 +570,65 @@ function domDeltaBody(parts, base) {
   const sources = parts.files.filter((file) => earlier.sources.get(file) !== parts.sources.get(file)).map((file) => parts.sources.get(file));
   return `{"domStamp":${parts.stamp},"delta":{"base":${base}},"order":${JSON.stringify(parts.order)},"files":${JSON.stringify(parts.files)},` +
     `"blocks":[${blocks.join(',')}],"sources":[${sources.join(',')}]${parts.tail.length > 1 ? ',' : ''}${parts.tail}`;
+}
+
+// ---- outer paper -------------------------------------------------------
+// A host that keeps only one chapter of a long document live (the other
+// chapter files arrive as empty overlays) names the paper of the document's
+// last full Build: its sheets before `before + 1` and from `afterFrom` on
+// are shown around the live pages, as pictures. They are not this
+// document's output and nothing here typesets or verifies them.
+let outerPaper = null; // { key, pdf, before, afterFrom, pages, dir }
+const outerRenders = new Map(); // sheet -> Promise<svg path>
+let outerRendering = 0;
+const outerWaiters = [];
+function setOuterPaper(spec) {
+  outerRenders.clear();
+  if (!spec) {
+    outerPaper = null;
+    return null;
+  }
+  const pdf = typeof spec.pdfPath === 'string' && path.isAbsolute(spec.pdfPath) ? path.resolve(spec.pdfPath) : null;
+  const pages = Number(spec.pages);
+  const before = Number(spec.before);
+  const afterFrom = Number(spec.afterFrom);
+  if (!pdf || !Number.isInteger(pages) || pages < 1 || !Number.isInteger(before) || before < 0 || before > pages ||
+      !Number.isInteger(afterFrom) || afterFrom <= before || afterFrom > pages + 1) {
+    throw new Error('outer paper requires {pdfPath, pages, before, afterFrom}');
+  }
+  const st = statSync(pdf);
+  const paper = `${fnv1a(pdf)}-${Math.round(st.mtimeMs)}-${st.size}`;
+  const dir = path.join(engine.workDir, 'outer-paper', paper);
+  mkdirSync(dir, { recursive: true });
+  outerPaper = { key: `${paper}-${before}-${afterFrom}`, pdf, before, afterFrom, pages, dir };
+  return outerPaper;
+}
+async function outerPageSvg(sheet) {
+  const paper = outerPaper;
+  if (!paper || !Number.isInteger(sheet) || sheet < 1 || sheet > paper.pages ||
+      (sheet > paper.before && sheet < paper.afterFrom)) return null;
+  const file = path.join(paper.dir, `${sheet}.svg`);
+  if (existsSync(file)) return file;
+  let pending = outerRenders.get(sheet);
+  if (!pending) {
+    pending = (async () => {
+      // a reader scrolling through a book asks for many sheets at once
+      if (outerRendering >= 2) await new Promise((resolve) => outerWaiters.push(resolve));
+      outerRendering++;
+      try {
+        const tmp = `${file}.${process.pid}.tmp`;
+        await execFileP('pdftocairo', ['-svg', '-f', String(sheet), '-l', String(sheet), paper.pdf, tmp], { timeout: 30_000 });
+        renameSync(tmp, file);
+        return file;
+      } finally {
+        outerRendering--;
+        outerWaiters.shift()?.();
+        outerRenders.delete(sheet);
+      }
+    })();
+    outerRenders.set(sheet, pending);
+  }
+  return pending;
 }
 
 function withEngine(fn) {
@@ -1864,6 +1924,7 @@ const server = http.createServer(async (req, res) => {
         rev: engine.rev,
         srcRev: engine.srcRev,
         documentEpoch,
+        outer: outerPaper && { key: outerPaper.key, before: outerPaper.before, afterFrom: outerPaper.afterFrom, pages: outerPaper.pages },
         unchangedInputEvents: engine.unchangedInputEvents,
         diffStats: engine.diffStats ?? null,
         // preamble edits served without a reboot (tex64-internal #93)
@@ -2416,6 +2477,26 @@ const server = http.createServer(async (req, res) => {
         'Cache-Control': 'no-store',
       });
       return res.end(svg);
+    }
+    if (req.method === 'POST' && url.pathname === '/outer') {
+      const body = JSON.parse((await readBody(req)) || '{}');
+      try {
+        const paper = setOuterPaper(body.clear === true ? null : body);
+        return json(res, { ok: true, key: paper?.key ?? null });
+      } catch (error) {
+        return json(res, { error: error.message }, 400);
+      }
+    }
+    if (req.method === 'GET' && url.pathname.startsWith('/outer/')) {
+      const sheet = Number(url.pathname.slice('/outer/'.length).replace(/\.svg$/, ''));
+      const file = url.searchParams.get('k') === outerPaper?.key ? await outerPageSvg(sheet).catch(() => null) : null;
+      if (!file) {
+        res.writeHead(404, { 'Cache-Control': 'no-store' });
+        return res.end('no outer page');
+      }
+      // the key names the Build paper by its bytes' time and size
+      res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'private, max-age=86400' });
+      return res.end(readFileSync(file));
     }
     if (req.method === 'GET' && url.pathname === '/ship-glyphs') {
       const chain = engine.shipping;
@@ -2995,6 +3076,8 @@ const server = http.createServer(async (req, res) => {
             overlayDir: context.overlayDir,
             force: true,
           });
+          // another document's Build paper is not this one's; the host names it again
+          if (context.filePath !== activeProject.filePath) setOuterPaper(null);
           activeProject = context;
           ensureProjectOutputDirectories(text);
           await materializeProjectBibliography(text, activeProject);

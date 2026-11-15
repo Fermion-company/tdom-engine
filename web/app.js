@@ -18,6 +18,60 @@
 const editor = document.getElementById('editor');
 const editorHighlightEl = document.getElementById('editor-highlight');
 const pagesEl = document.getElementById('pages');
+
+// ---- outer paper ---------------------------------------------------------
+// When the host keeps one chapter of a long document live, the server names
+// the paper of its last full Build (/status `outer`, server.js). Its sheets
+// before and after the chapter stand around the live pages as pictures, so
+// the reader scrolls one paper. They are no pages of this document: nothing
+// below edits, stages or verifies them.
+let outerPaper = null;
+const outerBeforeEl = document.createElement('div');
+const outerAfterEl = document.createElement('div');
+outerBeforeEl.className = outerAfterEl.className = 'outer-run';
+pagesEl.append(outerBeforeEl, outerAfterEl);
+let outerAspect = '';
+function outerSheet(sheet, key) {
+  const div = document.createElement('div');
+  div.className = 'outer-page';
+  div.dataset.sheet = sheet;
+  if (outerAspect) div.style.aspectRatio = outerAspect;
+  const img = document.createElement('img');
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  img.draggable = false;
+  img.alt = '';
+  img.src = `/outer/${sheet}.svg?k=${encodeURIComponent(key)}`;
+  div.appendChild(img);
+  return div;
+}
+function applyOuterPaper(next) {
+  const paper = activePaperGeometry();
+  const aspect = paper.width > 0 && paper.height > 0 ? `${paper.width} / ${paper.height}` : outerAspect;
+  const key = next?.key ?? null;
+  const sameSheets = (outerPaper?.key ?? null) === key;
+  if (sameSheets && aspect === outerAspect) return;
+  // the live page on screen stays where it is while sheets appear above it
+  const anchor = pagesEl.querySelector('.page');
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  outerAspect = aspect;
+  if (sameSheets) {
+    for (const div of pagesEl.querySelectorAll('.outer-page')) div.style.aspectRatio = aspect;
+  } else {
+    outerPaper = next ?? null;
+    const before = [];
+    const after = [];
+    if (outerPaper) {
+      for (let sheet = 1; sheet <= outerPaper.before; sheet++) before.push(outerSheet(sheet, key));
+      for (let sheet = outerPaper.afterFrom; sheet <= outerPaper.pages; sheet++) after.push(outerSheet(sheet, key));
+    }
+    outerBeforeEl.replaceChildren(...before);
+    outerAfterEl.replaceChildren(...after);
+  }
+  if (anchor?.isConnected && Number.isFinite(anchorTop)) {
+    pagesEl.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+  }
+}
 const statusEl = document.getElementById('status');
 const inspectorEl = document.getElementById('inspector');
 const layoutViewEl = document.getElementById('layout-view');
@@ -622,6 +676,8 @@ function adoptDoc(doc) {
   editor.value = doc.source;
   syncEditorHighlight();
   pagesEl.textContent = '';
+  // the outer paper's sheets are not this document's pages: they stay
+  pagesEl.append(outerBeforeEl, outerAfterEl);
   pageDivs.clear();
   provisionalStages.clear();
   committedPageSrcs.clear();
@@ -2867,7 +2923,7 @@ function ensureShell(n) {
   no.textContent = `page ${n}`;
   div.appendChild(no);
   const after = [...pageDivs.entries()].filter(([k]) => k > n).sort((a, b) => a[0] - b[0])[0];
-  pagesEl.insertBefore(div, after ? after[1] : null);
+  pagesEl.insertBefore(div, after ? after[1] : outerAfterEl);
   pageDivs.set(n, div);
   return div;
 }
@@ -3191,6 +3247,7 @@ async function pollStatus() {
     if (!r.ok) throw new Error(String(r.status));
     const s = await r.json();
     lastEngineStatus = s;
+    applyOuterPaper(s.outer ?? null);
     const statusDocumentEpoch = Number(s.documentEpoch);
     if (documentReset.adoptedEpoch > 0 &&
         Number.isInteger(statusDocumentEpoch) && statusDocumentEpoch > documentReset.adoptedEpoch) {
@@ -6817,6 +6874,37 @@ pagesEl.addEventListener('scroll', () => {
       }
       return sortedPages()[0]?.[0] ?? 1;
     };
+    // With an outer paper the host counts sheets of the whole paper: the
+    // sheets before the chapter, the live pages, the sheets after it.
+    const firstBelowTop = (run, top) => {
+      let lo = 0, hi = run.childElementCount;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (run.children[mid].getBoundingClientRect().bottom - top > 4) hi = mid;
+        else lo = mid + 1;
+      }
+      return lo;
+    };
+    const paperPageCount = () => outerBeforeEl.childElementCount + sortedPages().length + outerAfterEl.childElementCount;
+    const paperTopPage = () => {
+      const top = pagesEl.getBoundingClientRect().top;
+      const before = outerBeforeEl.childElementCount;
+      const inBefore = firstBelowTop(outerBeforeEl, top);
+      if (inBefore < before) return inBefore + 1;
+      const entries = sortedPages();
+      const live = entries.findIndex(([, div]) => div.getBoundingClientRect().bottom - top > 4);
+      if (live >= 0) return before + live + 1;
+      const after = outerAfterEl.childElementCount;
+      return before + entries.length + Math.max(1, Math.min(after, firstBelowTop(outerAfterEl, top) + 1));
+    };
+    const paperPageElement = (n) => {
+      const wanted = Math.max(1, Math.min(paperPageCount(), Number.isFinite(n) ? Math.round(n) : 1));
+      const before = outerBeforeEl.childElementCount;
+      if (wanted <= before) return outerBeforeEl.children[wanted - 1];
+      const entries = sortedPages();
+      if (wanted <= before + entries.length) return entries[wanted - before - 1][1];
+      return outerAfterEl.children[wanted - before - entries.length - 1] ?? null;
+    };
     const visiblePageSnapshot = () => {
       const entries = sortedPages();
       const viewport = pagesEl.getBoundingClientRect();
@@ -6900,10 +6988,10 @@ pagesEl.addEventListener('scroll', () => {
             documentEpoch: documentReset.adoptedEpoch,
             ready: previewReady(visible.required),
             presentationPending: pending,
-            pageCount: visible.entries.length,
+            pageCount: outerPaper ? paperPageCount() : visible.entries.length,
             pageCountAuthoritative: residentPageCountAuthoritative,
             zoom,
-            page: visible.topPage,
+            page: outerPaper ? paperTopPage() : visible.topPage,
             srcRev: appliedSrcRev,
             viewportToken: embedViewportToken,
             status: lastEngineStatus,
@@ -6947,6 +7035,11 @@ pagesEl.addEventListener('scroll', () => {
     };
     const scrollToPage = (n) => {
       dismissSyncMarker();
+      if (outerPaper) {
+        const element = paperPageElement(Number(n));
+        if (element) scrollPageToViewport(element);
+        return;
+      }
       const entry = pageEntryFor(Number(n));
       if (!entry) return;
       scrollPageToViewport(entry[1]);
@@ -7146,6 +7239,30 @@ pagesEl.addEventListener('scroll', () => {
       return { left: x * scale - 10, top: y * scale - 10, width: 20, height: 20 };
     };
     const scrollToSync = (data) => {
+      if (outerPaper) {
+        // The host's page is a sheet of the Build paper. Outside the chapter
+        // it is the place itself: this frame has no source there to refine it.
+        const sheet = Math.round(Number(data.page));
+        const outside = sheet <= outerPaper.before ? outerBeforeEl.children[sheet - 1]
+          : sheet >= outerPaper.afterFrom ? outerAfterEl.children[sheet - outerPaper.afterFrom] : null;
+        if (outside) {
+          const blockY = Number(data.blockY);
+          const blockHeight = Number(data.blockHeight);
+          const y = Number.isFinite(blockY)
+            ? blockY + (Number.isFinite(blockHeight) ? blockHeight / 2 : 0)
+            : Number(data.y);
+          scrollPageToViewport(outside, Number.isFinite(y) ? y : 0, true);
+          embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
+          clearSyncMarker();
+          if (data.marker !== false && typeof data.viewportToken !== 'string') {
+            placeSyncMarker(outside, syncBlockBox(outside, data), data.approximate !== true);
+          }
+          syncRefineGeneration += 1;
+          requestAnimationFrame(scheduleEmbedSnapshot);
+          return;
+        }
+        data = { ...data, page: sheet - outerPaper.before };
+      }
       const entry = pageEntryFor(Number(data.page));
       if (!entry) return;
       const [, page] = entry;
@@ -7190,8 +7307,8 @@ pagesEl.addEventListener('scroll', () => {
       else if (d.action === 'zoom-fit') setZoom(1);
       else if (d.action === 'goto-page') scrollToPage(Number(d.page));
       else if (d.action === 'goto-sync') scrollToSync(d);
-      else if (d.action === 'page-prev') scrollToPage(currentTopPage() - 1);
-      else if (d.action === 'page-next') scrollToPage(currentTopPage() + 1);
+      else if (d.action === 'page-prev') scrollToPage((outerPaper ? paperTopPage() : currentTopPage()) - 1);
+      else if (d.action === 'page-next') scrollToPage((outerPaper ? paperTopPage() : currentTopPage()) + 1);
       else if (d.action === 'search') runLiveSearch(d.query, d.findPrevious === true);
     });
     setInterval(postEmbedSnapshot, 400);
