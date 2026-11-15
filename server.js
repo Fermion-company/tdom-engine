@@ -530,7 +530,7 @@ function cacheDomBeforeNext() {
 // so a base is named by the stamp of the serialization the viewer received.
 const domEarlier = []; // serializations before domCache's, newest last
 let domStamp = 0;
-let domServedStamp = NaN; // the serialization last handed to a viewer
+let domServed = null; // the serialization last handed to a viewer (kept whatever was made since)
 function serializeDom(payload) {
   const { blocks = [], sources = [], ...rest } = payload;
   const order = blocks.map((block) => String(block.id));
@@ -575,12 +575,12 @@ function updateDomPush(report) {
     // From the serialization a viewer was last given, not the newest one: a
     // repagination since (an exact render landing, the settle pass) makes a
     // newer one that no viewer has seen.
-    const base = domServedStamp;
+    const base = domServed?.stamp;
     const parts = rememberDom(domPayload(report));
     const delta = domDeltaBody(parts, base);
     if (delta) {
       domInterestUntil = Date.now() + 5_000;
-      domServedStamp = parts.stamp;
+      domServed = parts;
     }
     return delta ?? '';
   } catch {
@@ -590,7 +590,7 @@ function updateDomPush(report) {
 /** The snapshot as a change from the serialization stamped `base`, or null when that one is not held. */
 function domDeltaBody(parts, base) {
   if (!Number.isSafeInteger(base) || base === parts.stamp || !parts.unique) return null;
-  const earlier = domEarlier.findLast((item) => item.stamp === base);
+  const earlier = domServed?.stamp === base ? domServed : domEarlier.findLast((item) => item.stamp === base);
   if (!earlier?.unique) return null;
   const blocks = parts.order.filter((id) => earlier.blocks.get(id) !== parts.blocks.get(id)).map((id) => parts.blocks.get(id));
   const sources = parts.files.filter((file) => earlier.sources.get(file) !== parts.sources.get(file)).map((file) => parts.sources.get(file));
@@ -2369,9 +2369,10 @@ const server = http.createServer(async (req, res) => {
       const wantRev = Number(url.searchParams.get('srcRev'));
       const baseRev = url.searchParams.has('base') ? Number(url.searchParams.get('base')) : NaN;
       const send = (parts) => {
-        domServedStamp = parts.stamp;
+        const body = domDeltaBody(parts, baseRev) ?? parts.body;
+        domServed = parts;
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        return res.end(domDeltaBody(parts, baseRev) ?? parts.body);
+        return res.end(body);
       };
       if (Number.isSafeInteger(wantRev) && domCache?.srcRev === wantRev && domCache.epoch === documentEpoch &&
           (!domCache.dirty || engineBusy > 0)) {
