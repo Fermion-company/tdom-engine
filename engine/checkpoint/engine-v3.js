@@ -779,6 +779,7 @@ export class CheckpointEngine {
       // the largest live heap measured in this root (reset with the root: a
       // galley kept from an older root does not carry its floor over)
       const liveFloor = this.confirmedLiveHeapKb || 0;
+      const sentAt = process.env.TDOM_TRACE_JOB ? performance.timeOrigin + performance.now() : 0;
       ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}\n`);
       ck.sendRaw(body);
       // The block this edit changed ships its exact RENDER beside its JOB,
@@ -842,7 +843,10 @@ export class CheckpointEngine {
           this.checkpointKeepCache = null;
         }
       }
-      if (process.env.TDOM_TRACE_JOB) console.error('[job-gc]', jobId, JSON.stringify({ interactive, gcMs: nextCheckpoint.gcMs, ...galley.tm }));
+      if (process.env.TDOM_TRACE_JOB) {
+        console.error('[job-gc]', jobId, JSON.stringify({ interactive, gcMs: nextCheckpoint.gcMs, ...galley.tm, sentAt,
+          bothAt: performance.timeOrigin + performance.now(), step: advance, bodyBytes: body.length }));
+      }
       // a keystroke waiting on this background step waited for its collect
       // too (report timing: lock.gcWaitedMs)
       if (!interactive) this.bgGcMsTotal = (this.bgGcMsTotal ?? 0) + (nextCheckpoint.gcMs ?? 0);

@@ -215,42 +215,103 @@ end
 
 -- ---------------------------------------------------------------- json
 
+-- A galley is tens of kilobytes of small tables, encoded once per JOB while
+-- the keystroke waits (5 ms of a 14 ms job on a 72-page book). The output
+-- is written into one list instead of a string per table, a string with
+-- nothing to escape is taken as it is, and key names are escaped once.
+-- The bytes are the same as before for every value: galley hashes rest on
+-- them.
 local function jstr(s)
   s = tostring(s)
+  if not s:find('[%z\1-\31\\"]') then return '"' .. s .. '"' end
   s = s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', ''):gsub('\t', '\\t')
   s = s:gsub('[%z\1-\31]', '')
   return '"' .. s .. '"'
 end
 
-local function jenc(v)
+local jkey_cache, jkey_count = {}, 0
+local function jkey(k)
+  local s = jkey_cache[k]
+  if not s then
+    s = jstr(k) .. ':'
+    -- names are a small vocabulary; a document that makes them up (label
+    -- keys used as table keys) must not grow this for ever
+    if jkey_count >= 4096 then jkey_cache, jkey_count = {}, 0 end
+    jkey_cache[k] = s
+    jkey_count = jkey_count + 1
+  end
+  return s
+end
+
+local function by_string(a, b) return tostring(a) < tostring(b) end
+
+local function jput(out, n, v)
   local t = type(v)
   if t == 'number' then
-    if v ~= v or v == math.huge or v == -math.huge then return '0' end
-    return string.format('%.10g', v)
-  elseif t == 'boolean' then
-    return tostring(v)
+    n = n + 1
+    if math.type(v) == 'integer' and v > -10000000000 and v < 10000000000 then
+      out[n] = tostring(v)
+    elseif v ~= v or v == math.huge or v == -math.huge then
+      out[n] = '0'
+    else
+      out[n] = string.format('%.10g', v)
+    end
   elseif t == 'string' then
-    return jstr(v)
+    n = n + 1
+    out[n] = jstr(v)
+  elseif t == 'boolean' then
+    n = n + 1
+    out[n] = v and 'true' or 'false'
   elseif t == 'table' then
     if v[1] ~= nil or next(v) == nil then
-      local parts = {}
-      for i = 1, #v do parts[#parts + 1] = jenc(v[i]) end
-      return '[' .. table.concat(parts, ',') .. ']'
+      n = n + 1
+      out[n] = '['
+      for i = 1, #v do
+        if i > 1 then
+          n = n + 1
+          out[n] = ','
+        end
+        n = jput(out, n, v[i])
+      end
+      n = n + 1
+      out[n] = ']'
     else
       -- SORTED keys: pairs() order depends on the Lua hash seed, which
       -- differs per process — two lineages typesetting identical content
       -- would otherwise emit differently-ordered JSON, making every galley
       -- hash (and thus page identity) a per-lineage artifact. Deterministic
       -- bytes here are what make "same output ⇒ same hash" true end to end.
-      local keys = {}
-      for k in pairs(v) do keys[#keys + 1] = k end
-      table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-      local parts = {}
-      for _, k in ipairs(keys) do parts[#parts + 1] = jstr(k) .. ':' .. jenc(v[k]) end
-      return '{' .. table.concat(parts, ',') .. '}'
+      local keys, count, strings = {}, 0, true
+      for k in pairs(v) do
+        count = count + 1
+        keys[count] = k
+        if type(k) ~= 'string' then strings = false end
+      end
+      if count > 1 then
+        if strings then table.sort(keys) else table.sort(keys, by_string) end
+      end
+      n = n + 1
+      out[n] = '{'
+      for i = 1, count do
+        local k = keys[i]
+        n = n + 1
+        out[n] = i > 1 and (',' .. jkey(k)) or jkey(k)
+        n = jput(out, n, v[k])
+      end
+      n = n + 1
+      out[n] = '}'
     end
+  else
+    n = n + 1
+    out[n] = 'null'
   end
-  return 'null'
+  return n
+end
+
+local function jenc(v)
+  local out = {}
+  jput(out, 0, v)
+  return table.concat(out)
 end
 
 -- ---------------------------------------------------------------- boot
@@ -1546,6 +1607,14 @@ function tdom_report()
       typeset = math.floor((TR0 - (T_JOB or TR0)) * 100000 + 0.5) / 100,
       harvest = math.floor((TR1 - TR0) * 100000 + 0.5) / 100,
       heapKb = collectgarbage('count'),
+      -- epoch ms, to place the job between the orchestrator's own stamps
+      -- (seconds and the fraction apart: the encoder keeps few digits)
+      forkMs = T_RECV and T_FORKED and (T_FORKED - T_RECV) * 1000 or nil,
+      setupMs = T_FORKED and T_JOB and (T_JOB - T_FORKED) * 1000 or nil,
+      recvSec = T_RECV and math.floor(T_RECV) or nil,
+      recvFrac = T_RECV and (T_RECV - math.floor(T_RECV)) * 1000 or nil,
+      doneSec = os.gettimeofday and math.floor(TR1) or nil,
+      doneFrac = os.gettimeofday and (TR1 - math.floor(TR1)) * 1000 or nil,
       gcFloorKb = TDOM_GC_FLOOR,
       interactive = JOB.interactive,
     }
@@ -1813,6 +1882,7 @@ function tdom_wait()
     elseif cmd == 'JOB' or cmd == 'STEP' then
       -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B|C> <liveFloorKb>
       local id = a
+      T_RECV = os.gettimeofday and os.gettimeofday() or nil
       local newckpt = tonumber(b) or (CKPT + 1)
       local len = tonumber(c) or 0
       local capture = d ~= '' and d ~= '-' and d or nil
@@ -1832,6 +1902,7 @@ function tdom_wait()
         -- Do not propagate a previous block's retained nodes into the next
         -- checkpoint generation. The parent keeps its own COW copy until
         -- CAPTURE or checkpoint retirement.
+        T_FORKED = os.gettimeofday and os.gettimeofday() or nil
         drop_capture()
         JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F', calibrate = mode == 'C' }
         fk.set_interactive(JOB.interactive and 1 or 0)
