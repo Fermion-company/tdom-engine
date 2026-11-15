@@ -829,6 +829,8 @@ function stageProvisionalPatches(patches, flash, pageCount = null, editIds = nul
   }
   const delivered = patches.filter(patch => patch.type === 'replace-page').map(patch => patch.displayList.page);
   if (delivered.length) traceStage('deliver', null, { pages: delivered });
+  // (a warm or an exact render that lands gives the page's pictures new versions)
+  if (delivered.length) scheduleChunkPrefetch();
   for (const patch of patches) {
     if (patch.type === 'replace-page') {
       const dl = patch.displayList;
@@ -888,7 +890,52 @@ function shippingPresentationBlocked() {
     queuedDirectOpenings.length > 0 || flushingDirectPresentation || opaqueBatchCommitDepth > 0;
 }
 
+// The first keystroke on a page stages it from its display list, and every
+// chunk picture on it is then loaded for the first time: 8 pictures and
+// 25-35 ms on a page of code boxes, on top of the keystroke itself. The
+// pictures of the pages the reader is looking at are asked for ahead of that,
+// so they come from the browser's cache when the page is staged. Only
+// pictures with a fixed address are kept there (chunkImageSrc).
+const prefetchedChunks = new Set();
+let chunkPrefetchTimer = null;
+function prefetchVisibleChunks() {
+  if (typeof lastEngineStatus?.boot !== 'string' || documentReset.pending || usesCanonicalSurface()) return;
+  const viewport = pagesEl.getBoundingClientRect();
+  const visible = new Set();
+  for (const [page, div] of pageDivs) {
+    const bounds = div.getBoundingClientRect();
+    if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) continue;
+    for (const n of [page - 1, page, page + 1]) visible.add(n);
+  }
+  if (prefetchedChunks.size > 4096) prefetchedChunks.clear();
+  for (const n of visible) {
+    for (const cmd of provisionalDisplayLists.get(n)?.commands ?? []) {
+      if (cmd.op !== 'chunk') continue;
+      const src = chunkImageSrc(cmd);
+      if (prefetchedChunks.has(src)) continue;
+      prefetchedChunks.add(src);
+      new Image().src = src;
+    }
+  }
+  // The source map too: the next keystroke's update brings only the change
+  // from the one this viewer holds (adoptPushedSnapshot). Held as of now,
+  // that change is the edited block; held from before the pages settled, it
+  // was every block of the document (1.4 MB on a 72-page book).
+  if (Number.isSafeInteger(appliedSrcRev) && appliedSrcRev > 0) {
+    provisionalSnapshotCache.delete(`${documentReset.adoptedEpoch}:${appliedSrcRev}`);
+    void loadProvisionalSnapshot(appliedSrcRev).catch(() => {});
+  }
+}
+function scheduleChunkPrefetch() {
+  if (chunkPrefetchTimer !== null) return;
+  chunkPrefetchTimer = window.setTimeout(() => {
+    chunkPrefetchTimer = null;
+    prefetchVisibleChunks();
+  }, 200);
+}
+
 function scheduleViewportWarm() {
+  scheduleChunkPrefetch();
   window.clearTimeout(viewportWarmTimer);
   viewportWarmTimer = window.setTimeout(() => {
     if (documentReset.pending || usesCanonicalSurface() || directEditor || inFlight || composing) return;

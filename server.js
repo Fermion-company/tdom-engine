@@ -2703,7 +2703,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === 'POST' && url.pathname === '/edit') {
+      const editTrace = process.env.TDOM_TRACE_HTTP ? [['start', performance.now()]] : null;
       const body = JSON.parse(await readBody(req));
+      editTrace?.push(['body', performance.now()]);
       const { start, end, text } = body;
       if (typeof start !== 'number' || typeof end !== 'number' || typeof text !== 'string') {
         return json(res, { error: 'edit requires {start, end, text}' }, 400);
@@ -2941,12 +2943,16 @@ const server = http.createServer(async (req, res) => {
           engine.invalidateProjectInputs?.([path.join(engine.workDir, 'driver.bbl')]);
           return engine.refresh({ changed: [path.join(engine.workDir, 'driver.bbl')] });
         };
+        editTrace?.push(['prepared', performance.now()]);
         lastReport = await withEngine(async () => {
+          editTrace?.push(['queue', performance.now()]);
           const report = await editInQueue();
+          editTrace?.push(['engine', performance.now()]);
           // Still this edit's turn of the queue, its state intact: the source
           // map the viewer needs before it shows this revision goes out with
           // the update instead of being asked for afterwards.
           domPush = updateDomPush(report);
+          editTrace?.push(['dom', performance.now()]);
           return report;
         });
       } catch (err) {
@@ -3092,6 +3098,11 @@ const server = http.createServer(async (req, res) => {
       completeDocumentReset(resetEpoch);
       broadcastRaw(`{"kind":"update","documentEpoch":${documentEpoch}${domPush ? `,"dom":${domPush}` : ''},"report":${reportJson}}`);
       lastReport.timing.sentAtEpochMs = Date.now();
+      if (editTrace) {
+        editTrace.push(['sent', performance.now()]);
+        console.log('[http-trace] /edit ' + editTrace.slice(1).map(([name, at], i) => `${name} ${(at - editTrace[i][1]).toFixed(1)}`).join(' ') +
+          ` | engine phases ${JSON.stringify(Object.fromEntries(Object.entries(lastReport.stats ?? {}).filter(([k]) => /Us$/.test(k)).map(([k, v]) => [k.slice(0, -2), Math.round(v / 100) / 10])))}`);
+      }
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(reportJson);
       if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, anchorEpoch, anchorProofPrefetch);
