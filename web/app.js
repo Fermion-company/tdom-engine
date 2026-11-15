@@ -589,6 +589,7 @@ async function boot(expectedDocumentEpoch = null) {
   const eventEpoch = stateEventEpoch;
   bootComplete = false;
   const doc = await fetch('/doc', { cache: 'no-store' }).then((r) => r.json());
+  if (typeof doc.boot === 'string') serverBootId = doc.boot;
   if (requestEpoch !== bootRequestEpoch) return;
   if (expectedDocumentEpoch !== null && Number(doc.documentEpoch) !== Number(expectedDocumentEpoch)) {
     if (documentReset.canAdopt(expectedDocumentEpoch)) {
@@ -899,7 +900,7 @@ function shippingPresentationBlocked() {
 const prefetchedChunks = new Set();
 let chunkPrefetchTimer = null;
 function prefetchVisibleChunks() {
-  if (typeof lastEngineStatus?.boot !== 'string' || documentReset.pending || usesCanonicalSurface()) return;
+  if (typeof serverBootId !== 'string' || documentReset.pending || usesCanonicalSurface()) return;
   const viewport = pagesEl.getBoundingClientRect();
   const visible = new Set();
   for (const [page, div] of pageDivs) {
@@ -1282,8 +1283,9 @@ function provisionalChunkGlyphs(commands, chunks) {
 
 // One version of a chunk in one document of one server process is one
 // picture (server.js /chunk): with all three in the URL the browser keeps it.
+let serverBootId = null; // from /doc and /status: known before the first page is staged
 function chunkImageSrc(cmd) {
-  const boot = lastEngineStatus?.boot;
+  const boot = serverBootId;
   const fixed = typeof boot === 'string' && boot
     ? `&e=${documentReset.adoptedEpoch}&b=${encodeURIComponent(boot)}` : '';
   return `/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}${fixed}`;
@@ -3327,6 +3329,7 @@ async function pollStatus() {
     if (!r.ok) throw new Error(String(r.status));
     const s = await r.json();
     lastEngineStatus = s;
+    if (typeof s.boot === 'string') serverBootId = s.boot;
     applyOuterPaper(s.outer ?? null);
     const statusDocumentEpoch = Number(s.documentEpoch);
     if (documentReset.adoptedEpoch > 0 &&

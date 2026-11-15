@@ -1370,6 +1370,7 @@ function editPageFocus() {
 function docPayload() {
   return {
     documentEpoch,
+    boot: BOOT_ID,
     backend,
     mode: engine.mode,
     modeReasons: engine.modeReasons,
