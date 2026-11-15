@@ -1233,6 +1233,15 @@ function provisionalChunkGlyphs(commands, chunks) {
   return glyphs;
 }
 
+// One version of a chunk in one document of one server process is one
+// picture (server.js /chunk): with all three in the URL the browser keeps it.
+function chunkImageSrc(cmd) {
+  const boot = lastEngineStatus?.boot;
+  const fixed = typeof boot === 'string' && boot
+    ? `&e=${documentReset.adoptedEpoch}&b=${encodeURIComponent(boot)}` : '';
+  return `/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}${fixed}`;
+}
+
 function renderPage(dl, flash) {
   if (usesCanonicalSurface()) return;
   const div = pageDivs.get(dl.page);
@@ -1269,7 +1278,7 @@ function renderPage(dl, flash) {
     staging.insertAdjacentHTML(
       'beforeend',
       `<div class="chunkwin${cmd.st ? ' stale' : ''}${cmd.held ? ' held' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
-        `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
+        `<img class="chunk" src="${chunkImageSrc(cmd)}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
     );
   }
   const ready = () => {
@@ -1287,15 +1296,39 @@ function renderPage(dl, flash) {
     tryCommitProvisionalStages();
   };
   const images = [...staging.querySelectorAll('img')];
+  // one decode per picture: the trace reads the same promises the stage waits for
+  const decodes = images.map(img => img.decode());
+  // Where each glyph of a chunk's picture sits decides one thing here:
+  // whether an editor open on the paper stays with this stage
+  // (provisionalStageKeepsEditor). The server reads it from the chunk's PDF,
+  // tens of milliseconds for a chunk it has not read yet, and the edited
+  // block's chunk is new on every keystroke. With no editor on the paper the
+  // stage does not wait for it; a click loads a chunk's geometry when it
+  // needs it (loadChunkInputGeometry).
+  const chunkGeometry = directEditor ? Promise.all(images.map(loadChunkInputGeometry)).then(chunks => {
+    stage.glyphs = provisionalChunkGlyphs(dl.commands, chunks);
+  }) : null;
   if (Array.isArray(globalThis.__tdomStageTrace)) {
-    void Promise.all(images.map(img => img.decode())).then(() => traceStage('decoded', dl.page, { images: images.length }), () => {});
+    const shown = new Set([...(div?.querySelectorAll('img.chunk') ?? [])].map(img => img.getAttribute('src')));
+    const freshImages = images.filter(img => !shown.has(img.getAttribute('src')));
+    const fresh = freshImages.length;
+    const stagedAt = performance.now();
+    void Promise.all(decodes).then(() => {
+      const detail = freshImages.slice(0, 3).map(img => {
+        const entry = performance.getEntriesByName(new URL(img.getAttribute('src'), location.href).href).pop();
+        return { src: img.getAttribute('src'), win: img.parentElement?.className, fetchStart: entry ? Math.round(entry.startTime - stagedAt) : null,
+          fetchMs: entry ? Math.round(entry.duration) : null, wait: entry ? Math.round(entry.responseStart - entry.requestStart) : null,
+          kb: entry ? Math.round(entry.encodedBodySize / 1024) : null, cached: entry ? entry.transferSize === 0 : null };
+      });
+      traceStage('decoded', dl.page, { images: images.length, fresh, detail, ms: Math.round(performance.now() - stagedAt) });
+    }, () => {});
+    void chunkGeometry?.then(() => traceStage('geometry', dl.page), () => {});
+    void Promise.all(families.map(family => fontLoads.get(family))).then(() => traceStage('fonts', dl.page), () => {});
   }
   const pending = [
     loadProvisionalSnapshot(sourceRev).then(snapshot => { stage.snapshot = snapshot; traceStage('snapshot', dl.page); }),
-    ...images.map(img => img.decode()),
-    Promise.all(images.map(loadChunkInputGeometry)).then(chunks => {
-      stage.glyphs = provisionalChunkGlyphs(dl.commands, chunks);
-    }),
+    ...decodes,
+    ...(chunkGeometry ? [chunkGeometry] : []),
     ...families.map(family => fontLoads.get(family)),
   ];
   void Promise.all(pending).then(ready).catch((error) => {
@@ -3751,6 +3784,22 @@ function applySnapshotDelta(base, delta) {
   return { ...rest, blocks, sources };
 }
 
+// The update that brings a revision also brings its source map, as a change
+// from the one before (server.js updateDomPush). Applied when this viewer
+// holds that one; otherwise loadProvisionalSnapshot asks as usual.
+function adoptPushedSnapshot(delta, eventEpoch) {
+  const epoch = documentReset.adoptedEpoch;
+  const held = provisionalSnapshotHeld?.epoch === epoch ? provisionalSnapshotHeld.snapshot : null;
+  if (!held || Number(eventEpoch) !== epoch || !Number.isSafeInteger(held.domStamp) ||
+      Number(delta?.delta?.base) !== Number(held.domStamp)) return;
+  const snapshot = applySnapshotDelta(held, delta);
+  if (!snapshot || snapshot.sourceCurrent === false || Number(snapshot.documentEpoch) !== epoch ||
+      !Number.isSafeInteger(Number(snapshot.srcRev)) || Number(snapshot.srcRev) < Number(held.srcRev)) return;
+  provisionalSnapshotHeld = { epoch, snapshot };
+  provisionalSnapshotCache.set(`${epoch}:${Number(snapshot.srcRev)}`, Promise.resolve(snapshot));
+  while (provisionalSnapshotCache.size > 4) provisionalSnapshotCache.delete(provisionalSnapshotCache.keys().next().value);
+}
+
 async function loadProvisionalSnapshot(sourceRev) {
   const epoch = documentReset.adoptedEpoch;
   const key = `${epoch}:${sourceRev}`;
@@ -5275,7 +5324,12 @@ async function loadChunkInputGeometry(img) {
   const key = decodeURIComponent(url.pathname.slice('/chunk/'.length).replace(/\.svg$/, ''));
   const version = url.searchParams.get('v');
   const cacheKey = `${epoch}:${key}:${version}`;
-  if (!chunkGlyphCache.has(cacheKey)) {
+  // most recently used last: a page of code boxes holds more than a few
+  const known = chunkGlyphCache.get(cacheKey);
+  if (known) {
+    chunkGlyphCache.delete(cacheKey);
+    chunkGlyphCache.set(cacheKey, known);
+  } else {
     const pending = fetch(`/chunk-glyphs?key=${encodeURIComponent(key)}&v=${version}&e=${epoch}`)
       .then(async response => {
         if (!response.ok) throw new Error('Unready chunk mapping');
@@ -5290,7 +5344,7 @@ async function loadChunkInputGeometry(img) {
     pending.catch(() => {
       if (chunkGlyphCache.get(cacheKey) === pending) chunkGlyphCache.delete(cacheKey);
     });
-    while (chunkGlyphCache.size > 24) chunkGlyphCache.delete(chunkGlyphCache.keys().next().value);
+    while (chunkGlyphCache.size > 512) chunkGlyphCache.delete(chunkGlyphCache.keys().next().value);
   }
   const pending = chunkGlyphCache.get(cacheKey);
   // The node owns this immutable geometry for as long as its ink is on
@@ -7338,6 +7392,8 @@ function chips(list, cls = '') {
 }
 
 function renderInspector(report, rtt) {
+  // the inspector pane is not shown inside a host
+  if (embeddedHost) return;
   const s = report.stats;
   const deps = report.dirtyDependencies.map((d) => `${d.kind}:${d.key} → ${d.affected.join(', ')}`);
   const phases = Object.entries(s)
@@ -7495,7 +7551,11 @@ const sse = new EventSource('/events');
 sse.onmessage = (ev) => {
   try {
     stateEventEpoch++;
-    receivePreviewEvent(JSON.parse(ev.data));
+    const tracing = Array.isArray(globalThis.__tdomStageTrace);
+    if (tracing) traceStage('event', null, { bytes: ev.data.length });
+    const msg = JSON.parse(ev.data);
+    if (tracing) traceStage('parsed', null, { kind: msg.kind });
+    receivePreviewEvent(msg);
   } catch { /* ignore malformed events */ }
 };
 function receivePreviewEvent(msg) {
@@ -7637,6 +7697,7 @@ function receivePreviewEvent(msg) {
       return;
     }
     if (msg.kind === 'update' && msg.report.rev > appliedRev) {
+      if (msg.dom) adoptPushedSnapshot(msg.dom, msg.documentEpoch);
       applyReport(msg.report);
       renderInspector(msg.report, null);
       // Editor-source sync exists for OTHER clients' edits (a second tab
@@ -7645,7 +7706,12 @@ function receivePreviewEvent(msg) {
       // every page's display list) once per keystroke. While we are the
       // editing client (focused editor or an in-flight POST of ours), the
       // patches in this report are all we need.
-      if (document.activeElement !== editor && !inFlight) {
+      // Embedded in a host there is no editor of this page to keep in step:
+      // the host owns the source. There this fetch ran on every keystroke
+      // (the whole document, every page's display list: 11 MB for a
+      // 389-page book), holding the server's one thread while the pictures
+      // of the page just edited waited behind it.
+      if (!embeddedHost && document.activeElement !== editor && !inFlight) {
         fetch('/doc')
           .then((r) => r.json())
           .then((doc) => {

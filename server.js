@@ -530,6 +530,7 @@ function cacheDomBeforeNext() {
 // so a base is named by the stamp of the serialization the viewer received.
 const domEarlier = []; // serializations before domCache's, newest last
 let domStamp = 0;
+let domServedStamp = NaN; // the serialization last handed to a viewer
 function serializeDom(payload) {
   const { blocks = [], sources = [], ...rest } = payload;
   const order = blocks.map((block) => String(block.id));
@@ -561,6 +562,31 @@ function rememberDom(payload) {
   domCache = { srcRev: payload.srcRev, epoch: documentEpoch, dirty: false, parts };
   return parts;
 }
+// A viewer that stages provisional pages asks /dom for every revision before
+// it shows it: one round trip per keystroke, behind whatever else this
+// thread is doing (13 ms of a 65 ms keystroke on a 72-page book). While such
+// a viewer is listening, the edit's own update carries the change from the
+// serialization before it; a viewer holding that one applies it, any other
+// asks as before.
+function updateDomPush(report) {
+  if (Date.now() > domInterestUntil || !sseClients.size || !report?.stats ||
+      !Number.isSafeInteger(report.srcRev) || report.srcRev !== engine?.srcRev) return '';
+  try {
+    // From the serialization a viewer was last given, not the newest one: a
+    // repagination since (an exact render landing, the settle pass) makes a
+    // newer one that no viewer has seen.
+    const base = domServedStamp;
+    const parts = rememberDom(domPayload(report));
+    const delta = domDeltaBody(parts, base);
+    if (delta) {
+      domInterestUntil = Date.now() + 5_000;
+      domServedStamp = parts.stamp;
+    }
+    return delta ?? '';
+  } catch {
+    return '';
+  }
+}
 /** The snapshot as a change from the serialization stamped `base`, or null when that one is not held. */
 function domDeltaBody(parts, base) {
   if (!Number.isSafeInteger(base) || base === parts.stamp || !parts.unique) return null;
@@ -578,6 +604,9 @@ function domDeltaBody(parts, base) {
 // last full Build: its sheets before `before + 1` and from `afterFrom` on
 // are shown around the live pages, as pictures. They are not this
 // document's output and nothing here typesets or verifies them.
+// Names this server process in URLs whose content is fixed for its lifetime
+// (the same localhost port is reused across restarts).
+const BOOT_ID = `${process.pid.toString(36)}${Date.now().toString(36)}`;
 let outerPaper = null; // { key, pdf, before, afterFrom, pages, dir }
 const outerRenders = new Map(); // sheet -> Promise<svg path>
 let outerRendering = 0;
@@ -1879,8 +1908,23 @@ async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch
   });
 }
 
+// TDOM_TRACE_HTTP=1: every request with how long it took, and every stretch
+// in which this process's one thread answered nothing (for latency work).
+if (process.env.TDOM_TRACE_HTTP) {
+  let last = performance.now();
+  setInterval(() => {
+    const now = performance.now();
+    if (now - last > 6) console.log(`[http-trace] blocked ${Math.round(now - last - 1)} ms until ${Math.round(now)}`);
+    last = now;
+  }, 1).unref();
+}
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
+  if (process.env.TDOM_TRACE_HTTP) {
+    const startedAt = performance.now();
+    res.on('finish', () => console.log(
+      `[http-trace] ${req.method} ${url.pathname.slice(0, 40)} ${Math.round(startedAt)} +${Math.round(performance.now() - startedAt)} ms`));
+  }
   try {
     if (req.method === 'GET' && url.pathname === '/') return serveStatic(res, 'index.html');
     if (req.method === 'GET' && url.pathname.startsWith('/host/web/')) {
@@ -1914,6 +1958,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, {
         up: true,
         pid: process.pid,
+        boot: BOOT_ID,
         port: PORT,
         busy: engineBusy > 0,
         queued: engineBusy,
@@ -1936,6 +1981,9 @@ const server = http.createServer(async (req, res) => {
           srcRev: lastReport.srcRev,
           queueMs: lastReport.timing.clientEditAtEpochMs ? lastReport.timing.receivedAtEpochMs - lastReport.timing.clientEditAtEpochMs : null,
           engineMs: lastReport.timing.engineDoneAtEpochMs - lastReport.timing.receivedAtEpochMs,
+          planMs: lastReport.timing.plannedAtEpochMs ? lastReport.timing.plannedAtEpochMs - lastReport.timing.engineDoneAtEpochMs : null,
+          sendMs: lastReport.timing.sentAtEpochMs ? lastReport.timing.sentAtEpochMs - lastReport.timing.plannedAtEpochMs : null,
+          reportKb: lastReport.timing.reportBytes ? Math.round(lastReport.timing.reportBytes / 1024) : null,
           phases: Object.fromEntries(Object.entries(lastReport.stats ?? {})
             .filter(([key, value]) => /(Ms|Us)$/.test(key) && Number.isFinite(value))
             .map(([key, value]) => (key.endsWith('Us') ? [key.slice(0, -2), Math.round(value / 1000)] : [key.slice(0, -2), Math.round(value)]))),
@@ -2320,6 +2368,7 @@ const server = http.createServer(async (req, res) => {
       const wantRev = Number(url.searchParams.get('srcRev'));
       const baseRev = url.searchParams.has('base') ? Number(url.searchParams.get('base')) : NaN;
       const send = (parts) => {
+        domServedStamp = parts.stamp;
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         return res.end(domDeltaBody(parts, baseRev) ?? parts.body);
       };
@@ -2327,11 +2376,20 @@ const server = http.createServer(async (req, res) => {
           (!domCache.dirty || engineBusy > 0)) {
         return send(domCache.parts);
       }
-      const payload = await withEngine(() => domPayload());
+      const trace = process.env.TDOM_TRACE_HTTP ? [performance.now()] : null;
+      const payload = await withEngine(() => { trace?.push(performance.now()); const built = domPayload(); trace?.push(performance.now()); return built; });
       // a revision asked for by number is kept: the next one is sent as a change from it
       if (Number.isSafeInteger(wantRev) && payload.srcRev === wantRev && payload.srcRev === engine.srcRev &&
           payload.documentEpoch === documentEpoch) {
-        return send(rememberDom(payload));
+        const parts = rememberDom(payload);
+        trace?.push(performance.now());
+        send(parts);
+        if (trace) {
+          trace.push(performance.now());
+          console.log(`[http-trace] /dom queue ${(trace[1] - trace[0]).toFixed(1)} payload ${(trace[2] - trace[1]).toFixed(1)} ` +
+            `serialize ${(trace[3] - trace[2]).toFixed(1)} delta+send ${(trace[4] - trace[3]).toFixed(1)} ms`);
+        }
+        return;
       }
       return json(res, payload);
     }
@@ -2565,9 +2623,19 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(404);
         return res.end('unknown chunk');
       }
+      // A chunk's pixels change under a stable block id, but never under one
+      // version of it: named with this process and this document as well,
+      // the picture is the same forever. A page re-staged for a keystroke
+      // then takes its unchanged pictures (every code box on it) from the
+      // browser instead of asking for each again.
+      const requestedDocument = url.searchParams.get('e');
+      if (requestedDocument != null && Number(requestedDocument) !== documentEpoch) {
+        return json(res, { error: 'superseded chunk' }, 404);
+      }
+      const immutable = requestedVersion != null && requestedDocument != null && url.searchParams.get('b') === BOOT_ID;
       res.writeHead(200, {
         'Content-Type': 'image/svg+xml',
-        'Cache-Control': 'no-cache', // chunk content changes under a stable block id
+        'Cache-Control': immutable ? 'private, max-age=31536000, immutable' : 'no-cache',
       });
       return res.end(svg);
     }
@@ -2655,12 +2723,13 @@ const server = http.createServer(async (req, res) => {
       const anchorDiagnostics = {};
       const anchorAcceptedAt = performance.now();
       const nowEpoch = Date.now();
+      let domPush = '';
       const anchorClientEditAt = canonicalAnchorClientEditTimestamp(
         body.clientEditAtEpochMs,
         nowEpoch
       );
       try {
-        lastReport = await withEngine(async () => {
+        const editInQueue = async () => {
           // optional optimistic-concurrency guard: a client that states the
           // source revision its offsets were computed against gets a 409
           // instead of a silent mis-application when it fell behind
@@ -2871,6 +2940,14 @@ const server = http.createServer(async (req, res) => {
           await materializeProjectBibliography(next, activeProject);
           engine.invalidateProjectInputs?.([path.join(engine.workDir, 'driver.bbl')]);
           return engine.refresh({ changed: [path.join(engine.workDir, 'driver.bbl')] });
+        };
+        lastReport = await withEngine(async () => {
+          const report = await editInQueue();
+          // Still this edit's turn of the queue, its state intact: the source
+          // map the viewer needs before it shows this revision goes out with
+          // the update instead of being asked for afterwards.
+          domPush = updateDomPush(report);
+          return report;
         });
       } catch (err) {
         if (err?.status === 409) {
@@ -3007,9 +3084,14 @@ const server = http.createServer(async (req, res) => {
       }
       // one serialization for both consumers: the SSE fanout and the HTTP
       // response used to stringify the full report (all patches) twice
+      // (what the server itself adds between the engine and the viewers; the
+      // report on the wire was serialized before these three are set)
+      lastReport.timing.plannedAtEpochMs = Date.now();
       const reportJson = JSON.stringify(lastReport);
+      lastReport.timing.reportBytes = reportJson.length;
       completeDocumentReset(resetEpoch);
-      broadcastRaw(`{"kind":"update","documentEpoch":${documentEpoch},"report":${reportJson}}`);
+      broadcastRaw(`{"kind":"update","documentEpoch":${documentEpoch}${domPush ? `,"dom":${domPush}` : ''},"report":${reportJson}}`);
+      lastReport.timing.sentAtEpochMs = Date.now();
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(reportJson);
       if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, anchorEpoch, anchorProofPrefetch);

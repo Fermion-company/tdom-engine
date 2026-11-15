@@ -111,8 +111,8 @@ export function buildDomSnapshot({
     blocks: blocks.map((b, i) => {
       const chunkKeys = chunkTargets(b).map((t) => t.key);
       const own = ownRegions(b);
-      const titleRegions = preambleEditRegions
-        .filter(() => /\\maketitle\b/.test(b.text))
+      // (asked once per block, not once per preamble region of every block)
+      const titleRegions = (preambleEditRegions.length && /\\maketitle\b/.test(b.text) ? preambleEditRegions : [])
         .map((region) => ({
           id: `${b.id}:${region.id}`,
           kind: region.kind,
