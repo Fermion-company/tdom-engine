@@ -213,7 +213,13 @@ function offsetPosition(text, starts, offset) {
 // block identity, by content (a touch changes nothing). A replacement
 // PNG/PDF/listing marks only its owning block dirty; the watcher then calls
 // engine.refresh(), preserving stale pixels until the fresh exact chunk lands.
+// Every command the scan below looks for; a block naming none of them (nearly
+// all of a book's 3,400) is returned as it is, without the comment strip and
+// the seven sweeps that ran for each one on every keystroke.
+const READS_A_RESOURCE = /\\(?:includegraphics|includepdf|lstinputlisting|verbatiminput|inputminted|addplot|input|include|printindex)/;
+
 function decorateExternalResources(seg, context) {
+  if (!READS_A_RESOURCE.test(seg.text)) return seg;
   const specs = [];
   const seenTex = new Set();
   let externalGraphics = false;

@@ -9,6 +9,16 @@ import { sourceClosure } from './closure.js';
 import { planPreamblePatch } from './preamble-patch.js';
 import { projectPackageText } from './rescue-classifier.js';
 
+// Asked of every block on every update; the answer belongs to the text.
+const columnSwitchMemo = new WeakMap(); // block -> { text, uses }
+function usesColumnSwitch(block) {
+  const kept = columnSwitchMemo.get(block);
+  if (kept && kept.text === block.text) return kept.uses;
+  const uses = bodyUsesColumnSwitch(block.text);
+  columnSwitchMemo.set(block, { text: block.text, uses });
+  return uses;
+}
+
 export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, callbacks }) {
   const { opaqueUpdate, deferClosureUpdate, bootRoot, scheduleStructuredReprobe, expandIncludes, unindexBlock } = callbacks;
   const text = engine.store.get(engine.file);
@@ -78,10 +88,20 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
     ...expandedStructuralGate.shippingExactUses,
   ];
   if (engine.blocks.length) {
+    // One verdict per block text, kept while the document's literal
+    // environments and conditionals are the same objects (documentBounds
+    // hands the same ones out for an unchanged root) and the block is entered
+    // with the same carried depth: a keystroke re-read all 3,400 blocks of a
+    // book for the one that changed.
+    const kept = engine.closureMemo?.literalEnvs === bounds.literalEnvs &&
+      engine.closureMemo.conditionals === bounds.conditionals ? engine.closureMemo.byText : null;
+    const byText = new Map();
     let carried = 0;
     for (const seg of segs) {
-      const closure = sourceClosure(seg.text, {
+      const known = kept?.get(seg.text);
+      const closure = known && known.carried === carried ? known.closure : sourceClosure(seg.text, {
         literalEnvs: bounds.literalEnvs, documentConditionals: bounds.conditionals, carried });
+      if (closure.closed) byText.set(seg.text, { carried, closure });
       carried = closure.closed ? closure.carry ?? 0 : carried;
       if (!closure.closed) {
         timer.lap('closure');
@@ -94,6 +114,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
         };
       }
     }
+    engine.closureMemo = { literalEnvs: bounds.literalEnvs, conditionals: bounds.conditionals, byText };
   }
   const diff = diffBlocks(engine.blocks, segs, () => engine.idSeq++);
   engine.blocks = diff.blocks;
@@ -111,7 +132,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
     engine.previewReasons = [...new Set(shippingExactUses.flatMap((use) =>
       use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)
     ))];
-  } else if (engine.blocks.some((block) => bodyUsesColumnSwitch(block.text))) {
+  } else if (engine.blocks.some(usesColumnSwitch)) {
     engine.previewPolicy = 'canonical-anchor';
     engine.previewReasons = [...new Set([...engine.previewReasons, 'body column switch'])];
   }
