@@ -7,6 +7,16 @@ import { cacheIncludeRead } from './include-cache.js';
 import { documentBodyRange, subfileGroupOpen, subfileGroupClose } from './subfile.js';
 
 const joinedSegmentMemos = new WeakMap(); // include cache -> file -> segmentBody memo of its joined text
+// This runs for every file of the project on every keystroke, and most of
+// what it computes is the same as the keystroke before: the line starts of
+// files that did not change, whether a file reads others, a segment's
+// identity from its own hash and its files (2.7 ms of each keystroke on a
+// 72-page book of ten chapter files, a third of it those three). Kept by
+// value, bounded.
+const lineStartsMemo = new Map(); // file text -> its line starts
+const readsOthersMemo = new Map(); // file text -> first \input and \subfile in it
+const segmentHashMemo = new Map(); // `${seg.hash}|${files}` -> hash
+const bounded = (memo, limit) => { if (memo.size > limit) memo.clear(); return memo; };
 
 // An input is token substitution, not a paragraph boundary. Segment the
 // substituted body and keep a source map for regions crossing file edges.
@@ -37,7 +47,12 @@ export function expandInputParagraphs(segs, context) {
     // chapter of the 316-page book) is taken literally. This runs for every
     // file on every keystroke (tex64-internal #85).
     const firstOf = (needle) => { const at = source.indexOf(needle, start); return at < 0 || at >= end ? -1 : at; };
-    const nested = Math.max(firstOf('\\input'), firstOf('\\subfile'));
+    let nested;
+    if (start === 0 && end === source.length) {
+      let held = readsOthersMemo.get(source);
+      if (held === undefined) bounded(readsOthersMemo, 128).set(source, held = Math.max(firstOf('\\input'), firstOf('\\subfile')));
+      nested = held;
+    } else nested = Math.max(firstOf('\\input'), firstOf('\\subfile'));
     if (depth >= 4 || nested < 0) {
       literal(end);
       return;
@@ -168,15 +183,25 @@ export function expandInputParagraphs(segs, context) {
       sourceEnd: rootOnly ? undefined : first.sourceEnd,
       sourceParts: single ? undefined : parts,
       resourceBaseDir: path.dirname(first.file),
-      hash: fnv1a(`${seg.hash}|${parts.map(part => part.file).join('|')}`) };
+      hash: segmentHash(`${seg.hash}|${parts.map(part => part.file).join('|')}`) };
   }
+}
+
+function segmentHash(key) {
+  let hash = segmentHashMemo.get(key);
+  if (hash === undefined) bounded(segmentHashMemo, 16384).set(key, hash = fnv1a(key));
+  return hash;
 }
 
 function offsetPosition(text, offset, indexes) {
   let starts = indexes.get(text);
   if (!starts) {
-    starts = [0];
-    for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
+    starts = lineStartsMemo.get(text);
+    if (!starts) {
+      starts = [0];
+      for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
+      bounded(lineStartsMemo, 128).set(text, starts);
+    }
     indexes.set(text, starts);
   }
   let lo = 0, hi = starts.length;
