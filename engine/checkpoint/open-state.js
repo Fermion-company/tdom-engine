@@ -1,5 +1,6 @@
 import { clearShipPacing } from './ship-pacing.js';
 import { makeChunkMap } from './constructor-state.js';
+import { LabelTable } from './label-table.js';
 
 export function resetOpenState(engine, text, file) {
   engine.shipDocumentEpoch = (engine.shipDocumentEpoch ?? 0) + 1;
@@ -31,7 +32,7 @@ export function resetOpenState(engine, text, file) {
   engine.canonicalPageCount = null;
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
-  engine.labelTable = new Map();
+  engine.labelTable = new LabelTable();
   engine.hrefTable = new Map();
   engine.blockLabelIdx = new Map();
   engine.blockRefIdx = new Map();

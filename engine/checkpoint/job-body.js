@@ -63,8 +63,12 @@ export function buildJobBlockBody({
       const val = labelTable.get(key);
       const cs = key.startsWith('cite:') ? `b@${key.slice(5)}` : `r@${key}`;
       if (val === undefined) {
-        // vanished label: neutralize stale definitions in this lineage
-        defs.push(`\\global\\expandafter\\let\\csname ${cs}\\endcsname\\relax`);
+        // vanished label: neutralize stale definitions in this lineage.
+        // Only one the engine has held: a key it never held is defined, if
+        // at all, by the document's own means (label-table.js), and stays.
+        if (labelTable.ever?.has(key) ?? true) {
+          defs.push(`\\global\\expandafter\\let\\csname ${cs}\\endcsname\\relax`);
+        }
       } else if (key.startsWith('cite:')) {
         defs.push(`\\global\\@namedef{${cs}}{${val}}`);
       } else {

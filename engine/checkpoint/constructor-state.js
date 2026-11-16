@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { SourceStore } from '../source-store.js';
 import { CanonicalRenderer } from './canonical.js';
+import { LabelTable } from './label-table.js';
 
 /** Chunk store with a write generation: every set/delete bumps `.rev`, so
  * rebuildUnits can skip its per-block signature sweep when nothing about
@@ -50,7 +51,7 @@ export function initializeEngineState(
   engine.counters = [...baseCounters];
   engine.preHash = null;
   engine.preambleEditRegions = [];
-  engine.labelTable = new Map(); // key -> value (for reboot injection)
+  engine.labelTable = new LabelTable(); // key -> value (for reboot injection)
   engine.hrefTable = new Map(); // key -> hyperref anchor (\@currentHref at \label)
   // incremental label/ref bookkeeping — the hot path must never scan
   // every block × every label (O(L×B) melts on long documents)
