@@ -17,6 +17,8 @@ export async function runUpdateTypesetPhase(engine, {
   plainPreviewAdmission = null,
   coldBudgetMs = 0,
   coldResume = false,
+  // an edit (not a boot): a table of contents its pages do not show may wait
+  deferToc = false,
   callbacks,
 }) {
   const {
@@ -487,6 +489,19 @@ export async function runUpdateTypesetPhase(engine, {
     const prov = paginateNow();
     const toc = computeToc(prov);
     if (toc.hash === engine.tocHash) break;
+    // An edit whose own pages show no table of contents (a line added in
+    // chapter five moves the headings after it to other pages) leaves it to
+    // the settle pass, which runs this same fixed point once the typing is
+    // quiet (chain-pass.js chainAfterPass) and publishes it then. On a
+    // 72-page book with a table of contents it took 0.5 to 3.7 s of the
+    // keystroke that added a line, and every keystroke behind it waited.
+    if (pass === 0 && deferToc) {
+      const consumer = engine.blocks.findIndex((block) => block.consumesToc);
+      if (consumer >= 0 && !tocShownWithEdit(prov, engine.blocks, dirtySource)) {
+        queueChainWork('settle', consumer, []);
+        break;
+      }
+    }
     engine.tocHash = toc.hash;
     for (const [ext, content] of Object.entries(toc.contents)) {
       writeFileSync(path.join(engine.workDir, `driver.${ext}`), content);
@@ -522,4 +537,20 @@ export async function runUpdateTypesetPhase(engine, {
   timer.lap('pagectx');
   Object.assign(engine.lastWalkTrace, { typeset: typesetCount, stop: fgStop, verdict, ms: walkMs });
   engine._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict, cold };
+}
+
+/** Whether a page that shows a block of `dirtySource` also shows a block that prints the table of contents. */
+function tocShownWithEdit(pages, blocks, dirtySource) {
+  const consumers = new Set(blocks.filter((block) => block.consumesToc).map((block) => block.id));
+  for (const page of pages) {
+    const ids = new Set((page.draw ?? []).map((draw) => draw.u?.blockId).filter(Boolean));
+    let edited = false;
+    let toc = false;
+    for (const id of ids) {
+      edited ||= dirtySource.has(id);
+      toc ||= consumers.has(id);
+    }
+    if (edited && toc) return true;
+  }
+  return false;
 }

@@ -268,6 +268,24 @@ end
 
 local function by_string(a, b) return tostring(a) < tostring(b) end
 
+-- The sorted key list of a table of string keys, by the keys as pairs()
+-- gave them. A galley is hundreds of runs of the same few shapes: sorting
+-- each one's keys was most of the 9 to 12 ms a keystroke's report took to
+-- encode (a five-line Japanese paragraph, 48 KB). The order is the sorted
+-- one as before, so the bytes are the same.
+local sorted_keys, sorted_count = {}, 0
+local function sorted_string_keys(keys, count)
+  local signature = table.concat(keys, '\1', 1, count)
+  local held = sorted_keys[signature]
+  if held then return held end
+  table.sort(keys)
+  if sorted_count < 4096 then
+    sorted_keys[signature] = keys
+    sorted_count = sorted_count + 1
+  end
+  return keys
+end
+
 local function jput(out, n, v)
   local t = type(v)
   if t == 'number' then
@@ -311,7 +329,7 @@ local function jput(out, n, v)
         if type(k) ~= 'string' then strings = false end
       end
       if count > 1 then
-        if strings then table.sort(keys) else table.sort(keys, by_string) end
+        if strings then keys = sorted_string_keys(keys, count) else table.sort(keys, by_string) end
       end
       n = n + 1
       out[n] = '{'
@@ -1746,9 +1764,19 @@ function tdom_report()
     paintLate = paint_late,
     backend = resident_backend_profile(),
   })
+  local TJ = os.gettimeofday and os.gettimeofday() or os.clock()
   if head and not capture then node.flush_list(head) end
+  local TE = os.gettimeofday and os.gettimeofday() or os.clock()
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
   conn:send(payload)
+  if TRACE_USAGE and WORKDIR and JOB.keystroke then
+    local f = io.open(WORKDIR .. '/spare-trace.log', 'a')
+    if f then
+      f:write(string.format('payload %d bytes encode %.2f ms flush %.2f ms send %.2f ms\n', #payload, (TJ - TR1) * 1000,
+        (TE - TJ) * 1000, ((os.gettimeofday and os.gettimeofday() or os.clock()) - TE) * 1000))
+      f:close()
+    end
+  end
   payload, items = nil, nil -- not live across the collect
   local gc_started = os.gettimeofday and os.gettimeofday() or os.clock()
   checkpoint_gc(JOB.calibrate, JOB.interactive, (T_JOB or 0) > 0 and gc_started - T_JOB or 0)

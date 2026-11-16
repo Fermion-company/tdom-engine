@@ -2404,6 +2404,7 @@ export class CheckpointEngine {
         // walk has no prefix to defer.
         coldBudgetMs: rebooted || retry || editLabel === 'open' ? 0 : this.coldPrefixBudgetMs,
         coldResume,
+        deferToc: !rebooted && !retry && editLabel !== 'open',
         callbacks: {
           nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
           typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),
