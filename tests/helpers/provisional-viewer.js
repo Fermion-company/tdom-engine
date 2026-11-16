@@ -91,6 +91,8 @@ export function jumpViewer({ fetch, pages = 2 } = {}) {
   let timerId = 0;
   Object.assign(state, {
     fetch, CSS: { escape: String }, embedViewportToken: null, dismissSyncMarker() {},
+    // (no outer paper: the whole document is live, as in a document under the page limit)
+    outerPaper: null,
     sameSourceFile: (a, b) => a === b, scheduleEmbedSnapshot() {},
     requestAnimationFrame(fn) { fn(); },
     canonicalIdFromSrc: src => Number(/\?c=(\d+)/.exec(src)?.[1]),
