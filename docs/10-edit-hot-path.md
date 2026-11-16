@@ -224,7 +224,7 @@ label が動いた伝播中に CAPTURE 可能な block の exact chunk が古い
 
 label が動いたとき、後方で定義された label を前方 block が参照していることがある。foreground 中に `pendingChain` が無ければ、ref index から候補 block を取り、必要なものだけ再組版する。
 
-`toc` は provisional pagination から `.toc` 内容を合成し、hash が動けば toc consumer block を再組版する。最大 3 pass である。chain work が pending のときは、`#chainAfterPass()` 側で同じ処理を行う。編集（boot・reboot・retry 以外）で目次が動いたときは、編集した block の載るページに目次が無ければ、この場で組み直さず目次の block から settle を積み、打鍵が止まってから `#chainAfterPass()` が同じ固定点を回して公開する（`deferToc`）。72 ページの本で行が 1 行増える打鍵は、見出しが次のページへ移って目次の組み直しに 0.5〜3.7 s かかり、後ろの打鍵もそれを待っていた。
+`toc` は provisional pagination から `.toc` 内容を合成し、hash が動けば toc consumer block を再組版する。最大 3 pass である。chain work が pending のときは、`#chainAfterPass()` 側で同じ処理を行う。編集（boot・reboot・retry 以外）で目次が動いたときは、編集した block の載るページに目次が無ければ、この場で組み直さず `engine.tocOwed` を立てる（`deferToc`）。scheduler は打鍵が止まって quiet gate を過ぎてから目次の block から settle を積み、`#chainAfterPass()` が同じ固定点を回して公開する。すぐ積まないのは、編集 block より前から始まる chain work が pending だと、以後の打鍵が prose keystroke として扱われず、後ろの block の検証を待ってから見せることになるため。非同期の再ページ割りが見つけた目次のずれも同じく owed にする。`#chainAfterPass()` は目次の block を組み直し終えてから `tocHash` を更新する（途中で打鍵に止められたら、次の pass がもう一度組む）。72 ページの本で行が 1 行増える打鍵は、見出しが次のページへ移って目次の組み直しに 0.5〜3.7 s かかり、後ろの打鍵もそれを待っていた。
 
 ## 10.8 page-context rescue
 

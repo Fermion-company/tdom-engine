@@ -4,7 +4,7 @@ import { shippingPriorityQuietMs } from './interactive-priority.js';
 const CHAIN_MAX_STALE_MS = Number(process.env.TDOM_CHAIN_MAX_STALE ?? 2000);
 
 export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive = false, pageRenderIds = [], idleRound = 0 } = {}) {
-  const { locked, runChainPass, chunkTargets, queueRender, enforceCheckpointCap, coldResume, queueGrid, gridWanted } = callbacks;
+  const { locked, runChainPass, chunkTargets, queueRender, enforceCheckpointCap, coldResume, queueGrid, gridWanted, queueOwedToc } = callbacks;
   // Deferred chain work is the ONLY background chain activity (docs/10
   // §I3): the pass starts after a short idle gate or its oldest work's
   // deadline, and aborts on the next edit (#update sets
@@ -16,7 +16,7 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
     // Nothing queued and no grid boundary to fill: settle at once, so the
     // header pass and everything else that waits for this task is not
     // held behind the idle gate (the engine is completely idle then).
-    if (!engine.pendingChain && !gridWanted?.()) return null;
+    if (!engine.pendingChain && !engine.tocOwed && !gridWanted?.()) return null;
     // Two rounds at most: the queued work, then — once the queue drained
     // and behind the same idle gate — the grid pass (docs/03) that fills
     // keep-set boundaries lacking a continuation. A cold hand-off leaves
@@ -49,6 +49,8 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
         });
       }
       if (engine.bgAbort || engine.editPending) return null;
+      // a table of contents an edit left owed (update-typeset-phase.js), now that it is quiet
+      if (!engine.pendingChain && engine.tocOwed) queueOwedToc?.();
       if (!engine.pendingChain && !queueGrid?.()) return null;
       if (process.env.TDOM_TRACE_GRID) console.error('[grid] sched', JSON.stringify({ round, kind: engine.pendingChain?.kind, t: Math.round(performance.now()) }));
       if (engine.pendingChain.kind === 'cold' && engine.coldTrace) engine.coldTrace.gateAt = performance.now();

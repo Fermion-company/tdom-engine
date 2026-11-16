@@ -485,22 +485,26 @@ export async function runUpdateTypesetPhase(engine, {
   // shift the toc — iterate like latex reruns would, but per block.
   // Deferred to #chainAfterPass while chain work is pending (page numbers
   // are still moving until the suffix settles).
+  let tocDeferred = false;
+  const tocRuns = !engine.pendingChain;
   for (let pass = 0; pass < 3 && !engine.pendingChain; pass++) {
     const prov = paginateNow();
     const toc = computeToc(prov);
     if (toc.hash === engine.tocHash) break;
     // An edit whose own pages show no table of contents (a line added in
-    // chapter five moves the headings after it to other pages) leaves it to
-    // the settle pass, which runs this same fixed point once the typing is
-    // quiet (chain-pass.js chainAfterPass) and publishes it then. On a
-    // 72-page book with a table of contents it took 0.5 to 3.7 s of the
-    // keystroke that added a line, and every keystroke behind it waited.
-    if (pass === 0 && deferToc) {
-      const consumer = engine.blocks.findIndex((block) => block.consumesToc);
-      if (consumer >= 0 && !tocShownWithEdit(prov, engine.blocks, dirtySource)) {
-        queueChainWork('settle', consumer, []);
-        break;
-      }
+    // chapter five moves the headings after it to other pages) leaves it
+    // owed: once the typing is quiet the scheduler queues the settle pass
+    // that runs this same fixed point (background-scheduler.js,
+    // chain-pass.js chainAfterPass). On a 72-page book with a table of
+    // contents it took 0.5 to 3.7 s of the keystroke that added a line, and
+    // every keystroke behind it waited. (Not queued now: chain work pending
+    // in front of the paragraph typed in sends every later keystroke back to
+    // verifying the paragraph after it before it is shown.)
+    if (pass === 0 && deferToc && engine.blocks.some((block) => block.consumesToc) &&
+        !tocShownWithEdit(prov, engine.blocks, dirtySource)) {
+      engine.tocOwed = true;
+      tocDeferred = true;
+      break;
     }
     engine.tocHash = toc.hash;
     for (const [ext, content] of Object.entries(toc.contents)) {
@@ -522,6 +526,7 @@ export async function runUpdateTypesetPhase(engine, {
     }
     if (!anyConsumer) break;
   }
+  if (tocRuns && !tocDeferred) engine.tocOwed = false; // (done here after all)
   timer.lap('toc');
 
   // ---- page-context-sensitive rescues ---------------------------------

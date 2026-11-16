@@ -295,7 +295,6 @@ export async function chainAfterPass(engine, work, callbacks) {
     const prov = paginateNow();
     const toc = computeToc(prov);
     if (toc.hash === engine.tocHash) break;
-    engine.tocHash = toc.hash;
     for (const [ext, content] of Object.entries(toc.contents)) {
       writeFileSync(path.join(engine.workDir, `driver.${ext}`), content);
     }
@@ -308,8 +307,12 @@ export async function chainAfterPass(engine, work, callbacks) {
       const n = await retypesetChain(nearestCheckpoint(c), c, () => {}, () => engine.bgAbort);
       if (n < 0) return;
     }
+    // (only now: a pass stopped by a keystroke before its table of contents
+    // was typeset again must find the hash still different and do it again)
+    engine.tocHash = toc.hash;
     if (!anyConsumer) break;
   }
+  engine.tocOwed = false;
   queueMovedOffsets();
   asyncRepaginate();
 }

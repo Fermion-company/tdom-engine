@@ -28,10 +28,13 @@ export function asyncRepaginate(
   // (the one identity gap the farm's incremental-vs-scratch check kept
   // finding). Queue the settle pass; #chainAfterPass runs the toc
   // fixpoint once the stream is quiet.
-  if (engine.mode === 'structured' && !engine.pendingChain) {
+  // (owed, not queued: the scheduler queues it once the typing is quiet,
+  // background-scheduler.js; queued now, every keystroke until then would
+  // verify the paragraph after it before showing it)
+  if (engine.mode === 'structured' && !engine.pendingChain && !engine.tocOwed) {
     const consumer = engine.blocks.findIndex((b) => b.consumesToc);
     if (consumer >= 0 && computeToc(pages).hash !== engine.tocHash) {
-      queueChainWork('settle', consumer, []);
+      engine.tocOwed = true;
       scheduleBackground(consumer, []);
     }
   }

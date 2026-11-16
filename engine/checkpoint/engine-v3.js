@@ -3148,6 +3148,11 @@ export class CheckpointEngine {
       gridWanted: () =>
         process.env.TDOM_GRID_FILL !== '0' && !this.closed && !this.gridFill.stalled &&
         this.gridMissing().length > 0,
+      queueOwedToc: () => {
+        const consumer = this.blocks.findIndex((block) => block.consumesToc);
+        if (consumer < 0) this.tocOwed = false;
+        else this.#queueChainWork('settle', consumer, []);
+      },
       queueGrid: () => {
         if (process.env.TDOM_GRID_FILL === '0') return false;
         if (this.shipBooting || this.warming || this.updating || this.pendingChain) return false;

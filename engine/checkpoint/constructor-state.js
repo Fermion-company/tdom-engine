@@ -89,6 +89,7 @@ export function initializeEngineState(
   engine.backendName = 'checkpoint';
   engine.diagnostics = [];
   engine.tocHash = null;
+  engine.tocOwed = false; // an edit left the table of contents for the settle pass (update-typeset-phase.js)
   engine.includes = new Map(); // path -> {mtime, readPath, text, announcedText} (include-cache.js)
   engine.resourceReads = new Map(); // read path -> {mtime, size, hash, announcedHash} (include-cache.js)
   engine.watchers = new Map(); // path -> {close()} re-arming watch handle (include-expander.js)

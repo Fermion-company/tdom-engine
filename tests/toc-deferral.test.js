@@ -36,8 +36,22 @@ test('an edit that moves headings to other pages leaves the table of contents to
       const report = await engine.edit(at, at, Array.from({ length: 12 }, (_, i) => paragraph(`new ${i}`)).join('\n\n') + '\n\n');
       assert.equal(engine.blocks.find((block) => block.id === toc.id).galley.items.length > 0, true);
       assert.ok(!report.dirtySemanticNodes.includes('blk-' + toc.id), 'the table of contents was not typeset with the edit');
-      assert.equal(engine.pendingChain?.kind, 'settle', 'it is owed to the settle pass');
+      assert.equal(engine.tocOwed, true, 'it is owed to the settle pass');
+      assert.notEqual(engine.pendingChain?.from, toc && engine.blocks.indexOf(engine.blocks.find((block) => block.id === toc.id)),
+        'and not queued in front of the paragraph typed in while the typing goes on');
+      // the typing goes on in a later paragraph: still shown before the paragraph after it is verified
+      // (the caret warmed there first, as the host does: twelve new paragraphs left no checkpoint near it)
+      assert.equal((await engine.warmEditOffset(engine.getSource().indexOf('Paragraph 4.2'))).status, 'ready');
+      assert.equal(engine.tocOwed, true, 'the warm did not settle it');
+      for (let k = 0; k < 3; k++) {
+        const word = engine.getSource().indexOf('Paragraph 4.2') + 'Paragraph 4.2'.length;
+        const keystroke = await engine.edit(word, word, 'x');
+        assert.equal(keystroke.stats.chainVerdict, 'verify', JSON.stringify(keystroke.stats));
+        assert.equal(keystroke.stats.blocksTypeset, 1, 'the paragraph after it is not on the response path');
+        assert.equal(engine.tocOwed, true, 'the table of contents is still owed while the typing goes on');
+      }
       await drain(engine);
+      assert.equal(engine.tocOwed, false);
       const tocAfter = JSON.stringify(engine.blocks.find((block) => block.id === toc.id).galley.items);
       assert.notEqual(tocAfter, tocBefore, 'once quiet, the table of contents shows the new page numbers');
       const incremental = signature(engine);
