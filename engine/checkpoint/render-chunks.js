@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { cropSvg } from './util/svg.js';
+import { cropSvg, pdfPageSvgArgs } from './util/svg.js';
 
 const execFileP = promisify(execFile);
 
@@ -13,11 +13,7 @@ export async function cropRenderTargets({ jobdir, pdf, targets, chunks, forGalle
   let editPdf;
   for (const tgt of targets) {
     const svgPath = path.join(jobdir, `${prefix}-${tgt.page}.svg`);
-    await execFileP(
-      'pdftocairo',
-      ['-svg', '-f', String(tgt.page), '-l', String(tgt.page), pdf, svgPath],
-      { timeout: 30_000 }
-    );
+    await execFileP('pdftocairo', pdfPageSvgArgs(tgt.page, pdf, svgPath), { timeout: 30_000 });
     const width = tgt.w + 2 * padding;
     const svg = cropSvg(readFileSync(svgPath, 'utf8'), width, tgt.h);
     const prev = chunks.get(tgt.key);

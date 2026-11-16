@@ -62,6 +62,7 @@ import {
 import { isPathInside } from './engine/project-inputs.js';
 import { serializeDomBlock } from './engine/checkpoint/inspector.js';
 import { fnv1a } from './engine/hash.js';
+import { pdfPageSvgArgs } from './engine/checkpoint/util/svg.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 4633);
@@ -646,7 +647,7 @@ async function outerPageSvg(sheet) {
       outerRendering++;
       try {
         const tmp = `${file}.${process.pid}.tmp`;
-        await execFileP('pdftocairo', ['-svg', '-f', String(sheet), '-l', String(sheet), paper.pdf, tmp], { timeout: 30_000 });
+        await execFileP('pdftocairo', pdfPageSvgArgs(sheet, paper.pdf, tmp), { timeout: 30_000 });
         renameSync(tmp, file);
         return file;
       } finally {

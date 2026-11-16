@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { readIsoPageKeys } from './iso-page-cache.js';
+import { pdfPageSvgArgs } from './util/svg.js';
 
 const execFileP = promisify(execFile);
 
@@ -23,7 +24,7 @@ export async function renderIsoPages(jobdir, pdf, pages, convert = execFileP, ca
           writeFileSync(paths[index], previous);
           continue;
         }
-        await convert('pdftocairo', ['-svg', '-f', String(index + 1), '-l', String(index + 1), pdf, paths[index]],
+        await convert('pdftocairo', pdfPageSvgArgs(index + 1, pdf, paths[index]),
           { timeout: 30_000 });
         if (keys) {
           const svg = readFileSync(paths[index]);

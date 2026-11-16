@@ -48,6 +48,7 @@ import { pdfEditGlyphs } from './pdf-edit-geometry.js';
 import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
 import { prepareSyncTeXBatchHelper, querySyncTeXRange } from './synctex-batch.js';
 import { parseJumpText, parseJumpTsv, parseJumpRecords, jumpRecords, jumpAnchor, locateJump, indexStartRecords } from './jump-sync.js';
+import { pdfPageSvgArgs } from './util/svg.js';
 
 const execFileP = promisify(execFile);
 const gunzipP = promisify(gunzip);
@@ -2363,7 +2364,7 @@ export class CanonicalRenderer {
     let job;
     job = (async () => {
       try {
-        await this.#exec('pdftocairo', ['-svg', '-f', String(n), '-l', String(n), generation.pdf, out], {
+        await this.#exec('pdftocairo', pdfPageSvgArgs(n, generation.pdf, out), {
           timeout: 60_000,
         });
         const svg = readFileSync(out, 'utf8');
