@@ -132,13 +132,16 @@ function pumpRenders(engine, callbacks) {
         // typeset within the first 50, and in a burst it never did: the page
         // showed the previous keystroke's picture until the typing stopped.
         const cropOnly = interactive && !!sentRender(engine.blocks.find((b) => b.id === id));
-        const quietMs = propagation || cropOnly ? 0
+        // (TDOM_RENDER_HOLD_MS, for a diagnostic session: keep those pixels
+        // back that long, to look at what the page shows before they land)
+        const quietMs = propagation ? 0 : cropOnly ? Math.max(0, Number(process.env.TDOM_RENDER_HOLD_MS) || 0)
           : interactive ? renderQuiet : shippingPriorityQuietMs(engine, renderQuiet);
         const remaining = quietMs - (Date.now() - (engine.lastEditAt ?? 0));
         if (remaining > 0) {
           await new Promise((r) => setTimeout(r, Math.min(25, remaining)));
           continue;
         }
+        if (cropOnly && engine.renderStats) engine.renderStats.sentTaken = (engine.renderStats.sentTaken ?? 0) + 1;
         await withReplaceablePreviewJob(engine, 'resident-render', async () => {
           // The queue entry remains present while the Build gate is closed.
           // Re-read it after waking because a newer edit may replace its tag.
