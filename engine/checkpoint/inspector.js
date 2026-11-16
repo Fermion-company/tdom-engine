@@ -6,6 +6,13 @@ import { instrumentEditRegions } from '../edit-regions.js';
 // of its text, its region list and where its source sits; they are kept on
 // the block while those stay the same.
 const blockRegionMemo = new WeakMap(); // block -> { text, editRegions, anchor, regions }
+// block -> { key, galley, sourceParts, regions, entry }: the block's entry as
+// last built, handed out again while everything it is made of is the same.
+// The snapshot is rebuilt after every keystroke (the update carries it to
+// the viewer) and a book has hundreds of blocks of which one changed: built
+// and serialized anew each time, they were 2 to 5 ms of every keystroke on
+// a 72-page book. serializeDomBlock keeps the text of an entry it has seen.
+const blockEntryMemo = new WeakMap();
 
 export function buildDomSnapshot({
   rev,
@@ -130,7 +137,16 @@ export function buildDomSnapshot({
           },
         }));
       const blockRegions = titleRegions.length ? [...own, ...titleRegions] : own;
-      return {
+      const pages = blockPages.get(b.id) ?? [];
+      const at = b.file && b.sourceStart && b.sourceEnd ? null : [position(file, b.start), position(file, b.end)];
+      const key = `${i}|${b.kind ?? ''}|${chunkKeys.join(',')}|${b.fidelity?.level ?? ''}|${b.fidelity?.exactLines ?? 0}|` +
+        `${pages.join(',')}|${b.file ?? ''}|${b.start}|${b.end}|` +
+        (at ? `${at[0].line}:${at[0].column}-${at[1].line}:${at[1].column}`
+          : `${b.sourceStart.line}:${b.sourceStart.column}-${b.sourceEnd.line}:${b.sourceEnd.column}`);
+      const kept = blockEntryMemo.get(b);
+      if (kept && kept.key === key && kept.galley === b.galley && kept.sourceParts === b.sourceParts &&
+          kept.regions === blockRegions) return kept.entry;
+      const entry = {
         id: b.id,
         index: i,
         type: b.kind ?? 'block',
@@ -138,23 +154,20 @@ export function buildDomSnapshot({
         gfxChunks: chunkKeys,
         fidelity: b.fidelity?.level ?? null,
         exactLines: b.fidelity?.exactLines ?? 0,
-        source: b.file && b.sourceStart && b.sourceEnd
-          ? { file: b.file, start: b.sourceStart, end: b.sourceEnd }
-          : {
-              file,
-              start: position(file, b.start),
-              end: position(file, b.end),
-            },
+        source: at ? { file, start: at[0], end: at[1] } : { file: b.file, start: b.sourceStart, end: b.sourceEnd },
         sourceRanges: b.sourceParts?.map(part => ({ file: part.file, start: part.sourceStart, end: part.sourceEnd })),
         labels: (b.galley?.labels ?? []).map((l) => l.k),
         refs: b.galley?.refs ?? [],
-        pages: blockPages.get(b.id) ?? [],
+        pages,
         // raw offsets into the main buffer for in-preview box editing;
         // blocks expanded from \input files are not editable in-place
         file: b.file ?? null,
         span: b.file ? null : { start: b.start, end: b.end },
         editRegions: blockRegions,
       };
+      // (a block with title regions gets a new list each time: not kept)
+      if (blockRegions === own) blockEntryMemo.set(b, { key, galley: b.galley, sourceParts: b.sourceParts, regions: blockRegions, entry });
+      return entry;
     }),
     labels: Object.fromEntries(labelTable),
   };
@@ -189,7 +202,15 @@ export function buildFidelitySummary({ blocks, fidelityDemoted, demotedFamilies,
 // text is serialized once. `editRegions` is the block's last key, so the
 // result is JSON.stringify(block) to the byte.
 const regionJson = new WeakMap();
+const entryJson = new WeakMap(); // an entry buildDomSnapshot handed out again -> its text
 export function serializeDomBlock(block) {
+  const held = entryJson.get(block);
+  if (held !== undefined) return held;
+  const text = serializeDomEntry(block);
+  entryJson.set(block, text);
+  return text;
+}
+function serializeDomEntry(block) {
   const regions = block.editRegions;
   const keys = Object.keys(block);
   if (!Array.isArray(regions) || !regions.length || keys.length < 2 || keys.at(-1) !== 'editRegions') return JSON.stringify(block);

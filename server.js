@@ -2832,6 +2832,7 @@ const server = http.createServer(async (req, res) => {
               )
             : null;
           anchorEdit = rootChanged ? { start, end, text } : childAnchorEdit;
+          editTrace?.push(['childAnchor', performance.now()]);
           if (ENABLE_CANONICAL_ANCHOR && anchorEdit) {
             const certificate = engine.canonical.generationCertificate();
             if (certificate && certificate.rev === engine.srcRev &&
@@ -2880,7 +2881,9 @@ const server = http.createServer(async (req, res) => {
               anchorDiagnostics.reason = 'canonical-behind';
             }
           }
+          editTrace?.push(['anchorBase', performance.now()]);
           const overlayDelta = applyProjectOverlays(activeProject, body);
+          editTrace?.push(['overlay', performance.now()]);
           // The autosave of this keystroke can reach the engine first, through
           // the watcher, while this request waits behind an earlier edit: an
           // overlay of the bytes the engine already read is no input change

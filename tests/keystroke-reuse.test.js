@@ -66,6 +66,7 @@ test('edit regions kept on a block follow its source as it moves', () => {
   const first = update(text);
   const again = update(text);
   assert.equal(again.blocks[1].editRegions, first.blocks[1].editRegions, 'an untouched block hands out the same regions');
+  assert.equal(again.blocks[1], first.blocks[1], 'and the same entry, whose text is kept');
   // a line added above: every later region moves down, no text changed
   const moved = update(`Zeroth.\n\n${text}`);
   assert.notEqual(moved.blocks[2].editRegions, first.blocks[1].editRegions);
@@ -78,6 +79,7 @@ test('edit regions kept on a block follow its source as it moves', () => {
   const typed = update(text.replace('First paragraph', 'First paragraphs'));
   assert.equal(second(typed).editRegions, second(settled).editRegions, 'a later block hands out the same regions');
   assert.equal(second(typed).span.start, second(settled).span.start + 1);
+  assert.notEqual(second(typed), second(settled), 'a block whose offsets moved gets a new entry');
   // the block itself edited
   update(text.replace('Second', 'Seconds'));
   // a region list replaced for the same text (a rescue's metadata arriving)
