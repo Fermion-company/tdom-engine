@@ -517,6 +517,13 @@ function cacheDomBeforeNext() {
   if (Date.now() > domInterestUntil || !result?.stats || !Number.isSafeInteger(result.srcRev)) return;
   if (result.srcRev !== engine?.srcRev) return;
   if (domCache?.srcRev === engine.srcRev && domCache.epoch === documentEpoch && !domCache.dirty) return;
+  // A viewer that was handed this revision's snapshot (with the update, or
+  // on request) keeps it and does not ask for the revision again. Built anew
+  // here after every exact render that landed between two keystrokes, the
+  // snapshot cost the next keystroke 2.8 ms for a request that never came
+  // (a 72-page book, a paragraph with formulas). Whoever does ask is served
+  // on request, as before.
+  if (domCache?.srcRev === engine.srcRev && domCache.epoch === documentEpoch && domServed?.srcRev === engine.srcRev) return;
   try {
     rememberDom(domPayload(result));
   } catch {
