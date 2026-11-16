@@ -172,7 +172,12 @@ export function classifyPlainPreviewEdit(engine, options) {
   const next = engine.blocks[idx + 1];
   if (idx < 0) return tracePlain('not-one-block', `${options.dirtySource.size} dirty`);
   if (!next) return tracePlain('last-block');
-  if (pending && (pending.kind !== 'settle' || pending.phase !== 'blocks' ||
+  // (a settle in its after phase, with no labels to carry back, has only the
+  // table of contents left: nothing the paragraph typed in reads. Its blocks
+  // phase found the paragraph after this one unchanged, or plainBlockId
+  // would be gone. Refused, every keystroke after a line was added waited
+  // for the paragraph after it until the typing stopped.)
+  if (pending && (pending.kind !== 'settle' || (pending.phase !== 'blocks' && pending.phase !== 'after') ||
       pending.plainBlockId !== id || pending.from <= idx || pending.labels.size)) {
     return tracePlain('pending', `${pending.kind}/${pending.phase} from ${pending.from} plain ${pending.plainBlockId} labels ${pending.labels?.size}`);
   }

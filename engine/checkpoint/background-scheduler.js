@@ -88,7 +88,11 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
   void task.then((work) => {
     if (work || engine.closed || engine.bgTask !== task || engine.bgAbort || engine.editPending) return;
     const left = engine.pendingChain;
-    if (!left) return;
+    // (a table of contents the pass left owed is queued once it is quiet)
+    if (!left) {
+      if (engine.tocOwed && idleRound < 8) scheduleBackground(engine, [], callbacks, { idleRound: idleRound + 1 });
+      return;
+    }
     if (idleRound >= 8) {
       if (left.kind === 'grid') engine.pendingChain = null;
       return;

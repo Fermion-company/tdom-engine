@@ -12,11 +12,12 @@ export async function drain(eng, timeoutMs = 180_000) {
     // (docs/10 §10.4a), which runs after the chain pass hands it back
     const busy =
       eng.pendingChain || eng.bgActive || eng.rescuePumping || (eng.rescueQueue?.size ?? 0) > 0 ||
-      (eng.coldDirty?.size ?? 0) > 0;
+      (eng.coldDirty?.size ?? 0) > 0 || eng.tocOwed;
     if (!busy) {
       await new Promise((r) => setTimeout(r, 400));
       if (
         !eng.pendingChain &&
+        !eng.tocOwed &&
         !eng.bgActive &&
         !eng.rescuePumping &&
         (eng.rescueQueue?.size ?? 0) === 0 &&

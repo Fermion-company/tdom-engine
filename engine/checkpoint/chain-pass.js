@@ -263,6 +263,9 @@ export async function runChainPass(engine, callbacks) {
   }
 }
 
+// (the time since the last keystroke after which the typing counts as stopped)
+const TOC_QUIET_MS = 300;
+
 /**
  * Post-settle dependency passes — the async twins of the foreground's
  * inline backward-reference and toc sections, run once the suffix state
@@ -290,7 +293,13 @@ export async function chainAfterPass(engine, work, callbacks) {
       if (n < 0) return;
     }
   }
-  for (let pass = 0; pass < 3; pass++) {
+  // A pass that runs while the typing goes on (chain work past its deadline)
+  // leaves the table of contents owed: typesetting it took half a second
+  // and the next keystroke killed it, gap after gap. The scheduler queues it
+  // once the typing is quiet (background-scheduler.js).
+  const typing = Date.now() - (engine.lastEditAt ?? 0) < TOC_QUIET_MS;
+  if (typing && engine.blocks.some((block) => block.consumesToc)) engine.tocOwed = true;
+  for (let pass = 0; pass < 3 && !typing; pass++) {
     if (engine.bgAbort) return;
     const prov = paginateNow();
     const toc = computeToc(prov);
@@ -312,7 +321,7 @@ export async function chainAfterPass(engine, work, callbacks) {
     engine.tocHash = toc.hash;
     if (!anyConsumer) break;
   }
-  engine.tocOwed = false;
+  if (!typing) engine.tocOwed = false;
   queueMovedOffsets();
   asyncRepaginate();
 }
