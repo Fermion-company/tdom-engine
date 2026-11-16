@@ -1946,6 +1946,7 @@ export class CheckpointEngine {
       await cropRenderTargets({
         jobdir: early.jobdir, pdf: early.pdf, prefix: 'chunk', forGalley: hash, chunks: staged,
         targets: [{ key: blockId, page: 1, w: galley.w, h: galley.h + galley.d }],
+        anchor: { key: blockId, galley },
       });
       if (!wanted()) return;
       const landed = staged.get(blockId);

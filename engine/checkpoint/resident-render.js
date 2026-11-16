@@ -217,8 +217,12 @@ export async function renderResidentBlock(
     // replaced (a held one, #103) may land after the newer galley's own
     // pixels, and must never overwrite them.
     const staged = new Map(targets.map((target) => [target.key, engine.chunks.get(target.key)]));
+    // (the galley these pixels are of: the block may hold a newer one by now)
+    const drawn = engine.blocks.find((b) => b.id === block.id) ?? block;
+    const drawnGalley = drawn.galleyHash === forGalley ? drawn.galley : drawn.exactHistory?.get(forGalley)?.galley;
     await cropRenderTargets({
       jobdir: shippedEarly ? early.jobdir : jobdir, pdf, targets, chunks: staged, forGalley, prefix: 'chunk',
+      anchor: drawnGalley ? { key: block.id, galley: drawnGalley } : null,
     });
     timing.cropMs = Date.now() - t0;
     const live = engine.blocks.find((b) => b.id === block.id);

@@ -1183,7 +1183,9 @@ function tryCommitProvisionalStages() {
     // (for a diagnostic session: the blocks this page shows from an earlier
     // galley's pixels, i.e. not yet what the source says now)
     traceStage('commit', dl.page, Array.isArray(globalThis.__tdomStageTrace)
-      ? { sourceRev, held: [...new Set(dl.commands.filter(cmd => cmd.op === 'chunk' && cmd.held).map(cmd => cmd.src))] }
+      ? { sourceRev,
+        held: [...new Set(dl.commands.filter(cmd => cmd.op === 'chunk' && cmd.held && !cmd.part).map(cmd => cmd.src))],
+        parts: dl.commands.filter(cmd => cmd.op === 'chunk' && cmd.part).length }
       : { sourceRev });
     committedPageSrcs.set(dl.page, stage.srcs ?? displayListSrcs(dl));
     pageEditGroup.delete(dl.page);
@@ -1408,10 +1410,16 @@ function renderPage(dl, flash) {
     const W = geometry.paperwidth;
     const H = geometry.paperheight;
     const shiftPct = (cmd.sy / cmd.w) * 100;
+    // A part (display-list.js partCommands) is a window narrower than its
+    // picture: one run of a formula, cut out of the picture made for an
+    // earlier galley and set where the run stands now. The picture keeps
+    // its own width and is moved left as well as up behind the window.
+    const part = cmd.part && cmd.cw > 0
+      ? `width:${(cmd.cw / cmd.w) * 100}%;max-width:none;margin-left:-${(cmd.sx / cmd.w) * 100}%;` : '';
     staging.insertAdjacentHTML(
       'beforeend',
-      `<div class="chunkwin${cmd.st ? ' stale' : ''}${cmd.held ? ' held' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
-        `<img class="chunk" src="${chunkImageSrc(cmd)}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
+      `<div class="chunkwin${cmd.st ? ' stale' : ''}${cmd.held ? ' held' : ''}${cmd.part ? ' part' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
+        `<img class="chunk" src="${chunkImageSrc(cmd)}" style="${part}margin-top:-${shiftPct}%" draggable="false"></div>`
     );
   }
   const ready = () => {

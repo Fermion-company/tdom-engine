@@ -7,6 +7,10 @@ import { r2 } from './util/svg.js';
 // so fractional CSS clipping could still shave antialiased math ink. Two bp
 // remains well inside ordinary TeX line spacing while surviving that rounding.
 const EXACT_CHUNK_BLEED_BP = 2;
+// A run cut out of an earlier picture (exact-parts.js) takes less to its
+// sides than above and below: what stands beside it in that picture is
+// other ink of that line, which may not be beside it any more.
+const EXACT_PART_SIDE_BLEED_BP = 0.75;
 
 export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twinMetrics }) {
   const geo = geometry;
@@ -132,6 +136,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       line: u.li,
       backend: u.ln.backend,
     });
+    if (u.ln.parts) partCommands(commands, u, L, baseline, chunks.get(u.blockId));
   }
   flushGfx();
   // Header / footer: TeX-typeset boxes from the page-style job (the exact
@@ -162,6 +167,49 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
   dl.hash = fnv1a(JSON.stringify(commands));
   dl.hfSig = hfSig; // display lists built pre-header-job get rebuilt
   return dl;
+}
+
+/** The exact runs of a composed line (stream.js `parts`): each a window on
+ * the block's picture in hand, which was made for an earlier galley. `sx`
+ * and `sy` say where in that picture the window looks, `cw` how wide the
+ * whole picture is; `held` keeps every reader of exact pixels (editing
+ * geometry, the publication referee) from taking them for the current
+ * source's. Text between the windows is ordinary glyph commands. */
+function partCommands(commands, unit, X, baseline, meta) {
+  if (!meta) return;
+  const pad = -(meta.xBp ?? 0);
+  const width = meta.wBp ?? 0;
+  const height = meta.hBp ?? 0;
+  for (const part of unit.ln.parts) {
+    let sx = part.sx + pad - EXACT_PART_SIDE_BLEED_BP;
+    let x = X + part.x - EXACT_PART_SIDE_BLEED_BP;
+    let w = part.w + 2 * EXACT_PART_SIDE_BLEED_BP;
+    if (sx < 0) { x -= sx; w += sx; sx = 0; }
+    w = Math.min(w, width - sx);
+    let sy = part.sy - EXACT_CHUNK_BLEED_BP;
+    let y = baseline + part.top - EXACT_CHUNK_BLEED_BP;
+    let h = part.h + 2 * EXACT_CHUNK_BLEED_BP;
+    if (sy < 0) { y -= sy; h += sy; sy = 0; }
+    h = Math.min(h, height - sy);
+    if (!(w > 0) || !(h > 0)) continue;
+    commands.push({
+      op: 'chunk',
+      chunk: unit.blockId,
+      x: r2(x),
+      y: r2(y),
+      w: r2(w),
+      h: r2(h),
+      sx: r2(sx),
+      sy: r2(sy),
+      cw: r2(width),
+      ch: r2(height),
+      cv: meta.v ?? 0,
+      held: 1,
+      part: 1,
+      line: unit.li,
+      src: unit.blockId,
+    });
+  }
 }
 
 /** Paint one run list (glyphs + rules) at a baseline — shared by body
