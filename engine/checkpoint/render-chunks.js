@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { cropSvg, pdfPageSvgArgs } from './util/svg.js';
+import { learnOutlines } from './exact-synth.js';
 
 const execFileP = promisify(execFile);
 
@@ -87,7 +88,9 @@ export function anchorGlyphs(svg, galley, padBp) {
 
 // `anchor`: { key, galley } names the target that shows the block's own
 // lines (its main page) and the galley it was rendered for (anchorGlyphs).
-export async function cropRenderTargets({ jobdir, pdf, targets, chunks, forGalley, prefix, anchor = null }) {
+// `outlines`: the store a checked picture's formula glyphs are learned into
+// (exact-synth.js).
+export async function cropRenderTargets({ jobdir, pdf, targets, chunks, forGalley, prefix, anchor = null, outlines = null }) {
   const paddingPath = path.join(jobdir, 'render-padding.txt');
   const padding = existsSync(paddingPath) ? Number(readFileSync(paddingPath, 'utf8')) : 0;
   if (!Number.isFinite(padding) || padding < 0) throw new Error('invalid render padding');
@@ -99,6 +102,7 @@ export async function cropRenderTargets({ jobdir, pdf, targets, chunks, forGalle
     const cropped = cropSvg(readFileSync(svgPath, 'utf8'), width, tgt.h);
     const { svg, anchored } = anchor && anchor.key === tgt.key
       ? anchorGlyphs(cropped, anchor.galley, padding) : { svg: cropped, anchored: false };
+    if (anchored && outlines) learnOutlines(svg, anchor.galley, outlines);
     const prev = chunks.get(tgt.key);
     chunks.set(tgt.key, {
       svg,

@@ -136,7 +136,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       line: u.li,
       backend: u.ln.backend,
     });
-    if (u.ln.parts) partCommands(commands, u, L, baseline, chunks.get(u.blockId));
+    if (u.ln.parts) partCommands(commands, u, L, baseline, chunks.get(u.ln.partsChunk ?? u.blockId));
   }
   flushGfx();
   // Header / footer: TeX-typeset boxes from the page-style job (the exact
@@ -194,7 +194,7 @@ function partCommands(commands, unit, X, baseline, meta) {
     if (!(w > 0) || !(h > 0)) continue;
     commands.push({
       op: 'chunk',
-      chunk: unit.blockId,
+      chunk: unit.ln.partsChunk ?? unit.blockId,
       x: r2(x),
       y: r2(y),
       w: r2(w),

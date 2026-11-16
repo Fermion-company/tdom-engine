@@ -223,6 +223,7 @@ export async function renderResidentBlock(
     await cropRenderTargets({
       jobdir: shippedEarly ? early.jobdir : jobdir, pdf, targets, chunks: staged, forGalley, prefix: 'chunk',
       anchor: drawnGalley ? { key: block.id, galley: drawnGalley } : null,
+      outlines: engine.chunks.outlines,
     });
     timing.cropMs = Date.now() - t0;
     const live = engine.blocks.find((b) => b.id === block.id);

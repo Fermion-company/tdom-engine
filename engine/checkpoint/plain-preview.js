@@ -14,6 +14,12 @@ const PROSE_BARRIER = /[\\$%{}&#^_~\r\n]/;
 // verified first and in 23.2 ms without (median of 27 keystrokes).
 const HEAVY_NEIGHBOUR_MS = 6;
 
+// What a keystroke inside an inline formula may type or delete: letters,
+// digits, spaces and the operators of a formula whose mathcodes are
+// ordinary (a character the paragraph makes math-active is refused on top:
+// tdomMathActive). Not the prime, which is math-active in every LaTeX.
+const MATH_ORDINARY = /^[A-Za-z0-9 +\-=<>()[\]|/.,;:!?*]*$/;
+
 /**
  * Whether `block` differs from `oldBlock` by one stretch of ordinary
  * characters typed into (or deleted from) printed prose: the stretch lies
@@ -22,6 +28,8 @@ const HEAVY_NEIGHBOUR_MS = 6;
  * every region of the paragraph is otherwise where and what it was. Unlike
  * classifyResidentEdit this needs no edit context, so it also holds for a
  * paragraph of an included file and for one that carries commands elsewhere.
+ * Inside an inline formula (a math region) the same holds for ordinary
+ * characters of a formula (MATH_ORDINARY): `math` is then set.
  * Returns the characters that came and went, or null.
  */
 export function proseKeystroke(oldBlock, block) {
@@ -43,6 +51,7 @@ export function proseKeystroke(oldBlock, block) {
   const regions = discoverEditRegions(after);
   if (oldRegions.length !== regions.length) return null;
   let held = false;
+  let math = false;
   for (let i = 0; i < regions.length; i++) {
     const was = oldRegions[i];
     const now = regions[i];
@@ -58,12 +67,15 @@ export function proseKeystroke(oldBlock, block) {
       // the one region the change is in
       // (not at its very first character: a command in front of the region
       // may be reading that character as its argument)
-      if (held || was.kind !== 'text' || was.contentStart >= prefix || was.contentEnd < removedEnd ||
+      const inFormula = was.kind === 'math' && !was.display && !now.display &&
+        MATH_ORDINARY.test(inserted) && MATH_ORDINARY.test(removed);
+      if (held || (was.kind !== 'text' && !inFormula) || was.contentStart >= prefix || was.contentEnd < removedEnd ||
           was.contentStart !== now.contentStart || was.contentEnd + delta !== now.contentEnd) return null;
       held = true;
+      math = inFormula;
     }
   }
-  return held ? { inserted, removed } : null;
+  return held ? (math ? { inserted, removed, math: true } : { inserted, removed }) : null;
 }
 
 // An ordinary-looking character that is active where the block starts (a
@@ -177,6 +189,12 @@ export function classifyPlainPreviewEdit(engine, options) {
   if (prose && (touchesActive(old?.galley?.tdomActive, prose.removed) || touchesActive(old?.galley?.tdomActive, prose.inserted))) {
     return tracePlain('active-character');
   }
+  // (in a formula, a character the paragraph's mathematics makes active too;
+  // '?' when TeX could not tell: refused)
+  if (prose?.math && (touchesActive(old?.galley?.tdomMathActive, prose.removed) ||
+      touchesActive(old?.galley?.tdomMathActive, prose.inserted))) {
+    return tracePlain('math-active-character');
+  }
   const witness = prose ? proseBoundaryWitness(old) : plainPreviewWitness(old);
   if (!witness) return tracePlain('no-witness', prose ? 'prose' : 'plain');
   tracePlain('admitted', prose ? 'prose' : 'probe');
@@ -191,6 +209,10 @@ export function canDeferPlainVerification(admission, before, block) {
   // the block as just typeset says which of its characters are active
   if (admission.prose && touchesActive(block.galley?.tdomActive, admission.prose.inserted)) {
     tracePlain('active-after');
+    return false;
+  }
+  if (admission.prose?.math && touchesActive(block.galley?.tdomMathActive, admission.prose.inserted)) {
+    tracePlain('math-active-after');
     return false;
   }
   const same = (admission.prose ? proseBoundaryWitness(block) : plainPreviewWitness(block)) === admission.witness;

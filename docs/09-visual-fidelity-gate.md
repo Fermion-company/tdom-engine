@@ -105,6 +105,15 @@ chunk の鮮度は `unitsSig` の版数と fresh/stale ビットで追跡し、U
 変わった応答は採用しない。到着した素材は画面外で組み立て、フォント・文字座標・
 ソース範囲まで揃えてから、影響する全ページを同じ処理内で切り替える。
 
+### 9.5a 新しい画素が届く前の数式行（組み合わせ表示）
+
+数式のある段落を打鍵すると、その段落の exact 画素は新しい galley 用に作り直しになる（100〜160 ms）。その間、段落を前の galley のまま見せる（#103 の held）代わりに、現在の galley の行を次のように組む（`stream.js`）。
+
+- **手元の絵から切り出す**（`exact-parts.js`）: 打鍵が数式の外なら、数式の各 run は手元の絵（前の galley 用、glyph の位置を galley と照合済み `chunk.anchored`）に同じ run（同じ文字・font・大きさ・上下位置）としてある。本文は glyph で描き、各数式 run はその絵から窓として切り出して、今の位置に置く。
+- **字形から組み立てる**（`exact-synth.js`）: 打鍵が数式の中で、手元の絵に無い run ができたとき。照合済みの絵からは、数式 glyph の輪郭を font（`stableFontKey`: file・name・size）と slot ごとに覚えておく（`learnOutlines`、`engine.chunks.outlines`）。daemon は exact 画素の要る run について、各 glyph の run 内の位置（`gp`）と、`t` で表せない slot（`gc`）を送る。新しい galley の数式 run を、その輪郭で galley の位置に置いた SVG を組み立て（`synthesizeExactPicture`、block の chunk `<id>~s`）、そこから切り出す。罫（分数の線・根号の上線）は galley の幅・高さの塗りの矩形にする。
+- 組み立てた絵は、その galley の実際の絵とピクセル単位で同じであることを確かめた（照合済みの絵から作った 16 窓、数式内への打鍵 2 種のそれぞれ 16〜18 窓で、差は最大 4/255 のアンチエイリアス）。それでも検証済みの画素ではないので、切り出しの窓は `held` 付きで、本物の絵が届けば置き換わり、組み立てた絵は捨てる。
+- 組み立てない場合: 一度も描いていない glyph（その font のその大きさで未見の文字）、数式でない exact run（legacy font の本文など）、位置の無い run、`#rrggbb` でない色、図・float・脚注・rescue のある block。どれか一つでもあれば従来どおり前の galley のまま見せる。`TDOM_NO_EXACT_SYNTH=1` で組み立てを止められる。
+
 ## 9.6 レンダーポンプと3つの chunk ソース
 
 `#queueRender` / `#pumpRenders` はブロックごとの latest-wins を保ち、現世代の
@@ -169,6 +178,7 @@ canonical 着地時の一致検証（第8章 §8.4）が fidelity にも接続�
 |---|---|
 | display math がTeX品質 | math 行は exact chunk |
 | inline math 段落の編集中に本文が古い chunk に隠れない | 全数式の exact chunk とフォントが揃うまで完成済みページを保持（§9.4） |
+| 数式のある行・数式の中への打鍵がすぐ見える | 手元の絵からの切り出し、または照合済みの字形から組み立てた絵（§9.5a） |
 | 隣接する `\texttt` / `\textit` が遅れて差し替わらない | safe 行を構造化 glyph のまま維持＋font manifest を同時配送 |
 | CM / LM / unicode-math / CJK が fallback しない | フォントティア＋`xb` 検出＋font-fail 降格 |
 | TikZ / PDF literal は常にTeX由来 | 従来の `blk_gfx`（変更なし） |

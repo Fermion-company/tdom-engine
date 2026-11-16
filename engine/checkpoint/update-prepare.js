@@ -8,6 +8,7 @@ import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { sourceClosure } from './closure.js';
 import { planPreamblePatch } from './preamble-patch.js';
 import { projectPackageText } from './rescue-classifier.js';
+import { synthChunkKey } from './exact-synth.js';
 
 // Asked of every block on every update; the answer belongs to the text.
 const columnSwitchMemo = new WeakMap(); // block -> { text, uses }
@@ -149,7 +150,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
     engine.renderWant.delete(id);
     engine.rescueQueue.delete(id);
     for (const key of engine.chunks.keys()) {
-      if (key === id || key.startsWith(id + '#') || key.startsWith(id + '@')) {
+      if (key === id || key.startsWith(id + '#') || key.startsWith(id + '@') || key === synthChunkKey(id)) {
         engine.chunks.delete(key);
       }
     }

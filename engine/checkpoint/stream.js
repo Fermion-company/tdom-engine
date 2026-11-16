@@ -1,6 +1,10 @@
 import { parsePlacement } from './pagebuilder.js';
 import { exactFallbackCompatible, exactFallbackEligible } from './galley-adoption.js';
 import { composeExactLines } from './exact-parts.js';
+import { synthChunkFor, synthChunkKey } from './exact-synth.js';
+
+// TDOM_NO_EXACT_SYNTH=1: never put a formula's picture together (exact-synth.js)
+const NO_SYNTH = !!process.env.TDOM_NO_EXACT_SYNTH;
 
 /**
  * galley items -> the page builder's input stream. The items ARE the real
@@ -32,12 +36,27 @@ export function buildStream(block, chunks) {
   // (only out of a picture whose glyphs stand where its galley's runs do,
   // render-chunks.js anchorGlyphs: the cut-outs are taken by those places)
   const why = process.env.TDOM_TRACE_PARTS ? [] : null;
-  const composed = candidate && bc.anchored && !block.gfx && !block.fidelity?.blockExact &&
-    !block.fidelity?.canonicalOnly && exactFallbackEligible(block.galley)
+  const composable = !block.gfx && !block.fidelity?.blockExact && !block.fidelity?.canonicalOnly &&
+    exactFallbackEligible(block.galley);
+  let composed = candidate && bc.anchored && composable
     ? composeExactLines(block.galley, block.fidelity, candidate.galley, candidate.fidelity, why) : null;
+  // A keystroke inside the formula: no run of the picture in hand is the new
+  // one. Its picture is then put together from the outlines of glyphs the
+  // engine has drawn before (exact-synth.js), and the lines are composed out
+  // of that picture instead, each run at its own place.
+  let partsChunk = null;
+  if (!composed && candidate && composable && !NO_SYNTH) {
+    const synth = synthChunkFor(block, chunks);
+    if (synth) {
+      composed = composeExactLines(block.galley, block.fidelity, block.galley, block.fidelity, why);
+      if (composed) partsChunk = synthChunkKey(block.id);
+    } else why?.push('no picture could be put together');
+  } else if (bc?.forGalley === block.galleyHash && chunks.has(synthChunkKey(block.id))) {
+    chunks.delete(synthChunkKey(block.id)); // its own pixels are in
+  }
   // TDOM_TRACE_PARTS=1: why a block whose pixels are behind was or was not composed
   if (why && block.needsRender && bc && bc.forGalley !== block.galleyHash) {
-    console.error('[parts]', block.id, composed ? `composed ${composed.size} line(s)` : 'not composed:',
+    console.error('[parts]', block.id, composed ? `composed ${composed.size} line(s)${partsChunk ? ' from a picture put together' : ''}` : 'not composed:',
       composed ? '' : !candidate ? 'no painted galley held' : !bc.anchored ? 'picture not anchored'
         : block.gfx || block.fidelity?.blockExact ? 'whole-block graphics' : block.fidelity?.canonicalOnly ? 'canonical only'
           : !exactFallbackEligible(block.galley) ? 'floats, footnotes or rescued lines' : why.join('; '));
@@ -187,8 +206,10 @@ export function buildStream(block, chunks) {
           boxH: it.h ?? 0,
           runs: parted ? parted.runs : suppress ? [] : (it.runs ?? []),
           // exact runs of this line as cut-outs of the block's picture in
-          // hand, made for an earlier galley (display-list.js partCommands)
+          // hand, made for an earlier galley (display-list.js partCommands),
+          // or of the picture put together for this one (`partsChunk`)
           parts: parted ? parted.parts : undefined,
+          partsChunk: parted && partsChunk ? partsChunk : undefined,
           // Even when fidelity forbids painting a glyph bridge, the real run
           // extents remain useful as transparent source-line hit geometry.
           editRuns: it.runs ?? [],

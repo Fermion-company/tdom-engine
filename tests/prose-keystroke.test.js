@@ -32,13 +32,22 @@ test('anything TeX reads as syntax, or outside printed prose, is not', () => {
   assert.equal(typed('節で', '節{で'), false, 'a brace');
   assert.equal(typed('words', 'wor\nds'), false, 'a line break');
   assert.equal(typed('words', 'wor%ds'), false, 'a comment sign');
-  assert.equal(typed('x+y', 'x+y+z'), false, 'mathematics');
+  assert.equal(typed('x+y', 'x+y^2'), false, 'a superscript inside a formula');
+  assert.equal(typed('x+y', "x'+y"), false, 'the prime, math-active in every LaTeX');
   assert.equal(prose(TEXT, TEXT.replace('ソート', 'ソートa').replace('います', 'いまxす')), false, 'two places at once');
   assert.equal(prose(TEXT, TEXT), false, 'no change');
   assert.equal(prose('\\let\\a bcd', '\\let\\a xbcd'), false, 'the character a command in front may take');
   assert.equal(prose('One.', 'One. \\begin{quote}x\\end{quote}'), false);
   assert.equal(prose(null, 'x'), false);
   assert.deepEqual(proseKeystroke({ text: 'Plain words.' }, { text: 'Plain new words.' }), { inserted: 'new ', removed: '' });
+});
+
+test('ordinary characters typed into an inline formula are a prose keystroke of mathematics', () => {
+  assert.deepEqual(proseKeystroke({ text: TEXT }, { text: TEXT.replace('x+y', 'x+y+z') }), { inserted: '+z', removed: '', math: true });
+  assert.deepEqual(proseKeystroke({ text: 'add $1$ to it' }, { text: 'add $12$ to it' }), { inserted: '2', removed: '', math: true });
+  assert.equal(prose('Here \\[x+y\\] ok', 'Here \\[x+ay\\] ok'), false, 'display mathematics');
+  assert.equal(prose('Here $x+y$ ok', 'Here $ax+y$ ok'), false, 'the first character of a formula');
+  assert.equal(prose('Here $x+y$ ok', 'Here $x\\alpha+y$ ok'), false, 'a command');
 });
 
 const texReady = spawnSync('lualatex', ['--version']).status === 0;
@@ -155,6 +164,48 @@ test('a prose keystroke in a plain single-file article leaves the paragraph afte
       } finally {
         await fresh.close();
       }
+    } finally {
+      await engine.close().catch(() => {});
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+test('a keystroke inside an inline formula is shown before the heavy block after it is verified; a math-active comma is not',
+  { skip: !texReady && 'lualatex not installed' }, async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'tdom-prose-formula-'));
+    const source = String.raw`\documentclass{article}
+\usepackage{tcolorbox}
+\usepackage{icomma}
+\begin{document}
+Lead paragraph.
+
+FormulaMarker adds $1$ to the count and keeps $x+y$ in the text of the paragraph.
+
+\begin{tcolorbox}
+Next graphics witness.
+\end{tcolorbox}
+
+Tail paragraph.
+\end{document}
+`;
+    const engine = new CheckpointEngine({ workDir: path.join(root, 'work') });
+    try {
+      await engine.open(source, 'main.tex');
+      await drain(engine);
+      const original = engine.blocks.find((block) => block.text.includes('FormulaMarker'));
+      const at = () => engine.getSource().indexOf('$1') + 2;
+      for (const k of [0, 1, 2]) {
+        const report = k === 2 ? await engine.edit(at(), at() + 1, '') : await engine.edit(at(), at(), String(k + 2));
+        assert.equal(report.stats.chainVerdict, 'verify', JSON.stringify(report.stats));
+        assert.equal(report.stats.blocksTypeset, 1, 'the box after the paragraph is not on the response path');
+        assert.equal(engine.pendingChain?.plainBlockId, original.id, 'its verification is still owed');
+      }
+      await drain(engine);
+      assert.equal(engine.pendingChain, null, 'and is done once the typing stops');
+      // under icomma the comma runs a macro in mathematics: the ordinary, verified path
+      const comma = await engine.edit(at(), at(), ',5');
+      assert.notEqual(comma.stats.chainVerdict, 'verify', JSON.stringify(comma.stats));
+      await drain(engine);
     } finally {
       await engine.close().catch(() => {});
       rmSync(root, { recursive: true, force: true });

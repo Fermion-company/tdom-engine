@@ -925,6 +925,9 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       if legacy or (fi and fi.mth) then
         line_x = true
       end
+      -- (a run that is shown as exact pixels says where each of its glyphs
+      -- stands and which slot of the font it is: encode_runs)
+      if in_math or legacy or (fi and fi.mth) then run.ex = true end
       -- Glyphs outside cmap reach: luaotfload parks unencoded glyphs
       -- (math size variants, extensible pieces) in the PUA planes, and
       -- anything ≥ 0x110000 is not even valid UTF-8 for the payload.
@@ -938,7 +941,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
         line_xb = true
       end
       if c < 32 then c = 0xE000 + c end
-      run.g[#run.g + 1] = { c, gx }
+      run.g[#run.g + 1] = { c, gx, n.char or 63 }
       -- actual glyph extents from TeX's font tables (needed for the OMX
       -- vertical correction when substituting unicode twins client-side)
       local fdata = font.getfont(n.font)
@@ -1519,6 +1522,25 @@ local function encode_runs(items)
             chars[i] = unicode.utf8.char(pair[1] > 0 and pair[1] or 63)
           end
           r.t = table.concat(chars)
+          -- A run that needs exact pixels (mathematics, a math or legacy
+          -- font) also says where each glyph after the first stands (`gp`,
+          -- from the run's x) and, where `t` could not carry it, which slot
+          -- of the font each glyph is (`gc`): its picture can then be put
+          -- together from glyphs of pictures already made (exact-synth.js).
+          if r.ex then
+            r.ex = nil
+            if #r.g > 1 then
+              local gp = {}
+              for i, pair in ipairs(r.g) do gp[i] = math.floor((pair[2] - r.x) * 1000 + 0.5) / 1000 end
+              r.gp = gp
+            end
+            local gc, differs = {}, false
+            for i, pair in ipairs(r.g) do
+              gc[i] = pair[3]
+              if pair[3] ~= pair[1] then differs = true end
+            end
+            if differs then r.gc = gc end
+          end
           r.g = nil
         end
       end
@@ -1717,6 +1739,7 @@ function tdom_report()
     closure_error = JOB.error,
     tdomSourceCatcodesSafe = JOB.sourceCatcodesSafe == true,
     tdomActive = JOB.activeChars ~= '' and JOB.activeChars or nil,
+    tdomMathActive = JOB.mathActiveChars ~= '' and JOB.mathActiveChars or nil,
     trail = md5.sumhexa(table.concat(blk_trail or {}, '\n')),
     trailMarks = trail_marks,
     epochs = epochs,
@@ -2547,12 +2570,32 @@ local function source_active_chars(body)
   return ok and found or '?'
 end
 
+-- The characters of `body` that run a macro when typed in mathematics
+-- (mathcode "8000: the prime, a comma under icomma, a document's own). A
+-- keystroke inside a formula is only taken for a keystroke of ordinary
+-- characters when it touches none of them (plain-preview.js).
+local function source_math_active_chars(body)
+  local ok, found = pcall(function()
+    local seen, out = {}, {}
+    for _, cp in utf8.codes(body) do
+      if cp >= 32 and cp < 0x110000 and not seen[cp] then
+        seen[cp] = true
+        local code = tex.getmathcode(cp)
+        if type(code) == 'table' and code[1] == 8 then out[#out + 1] = utf8.char(cp) end
+      end
+    end
+    return table.concat(out)
+  end)
+  return ok and found or '?'
+end
+
 function inject_job(body, ship)
   -- Typeset ON the main vertical list — full state continuity with the
   -- previous blocks (prevdepth, \everypar, spacefactor, open counters...).
   -- The dormant page collects the nodes; tdom_report harvests them.
   JOB.sourceCatcodesSafe = native_source_catcodes_safe(body)
   JOB.activeChars = source_active_chars(body)
+  JOB.mathActiveChars = source_math_active_chars(body)
   local lines = input_lines(body)
   lines[#lines + 1] = '\\par'
   if ship then

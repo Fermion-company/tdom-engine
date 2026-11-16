@@ -11,6 +11,9 @@ import { LabelTable } from './label-table.js';
 export function makeChunkMap() {
   const m = new Map();
   m.rev = 0;
+  // the outline of every formula glyph seen in a checked picture, by font
+  // and slot (exact-synth.js): not a chunk, and not counted in `rev`
+  m.outlines = new Map();
   const set = m.set.bind(m);
   const del = m.delete.bind(m);
   m.set = (k, v) => {
