@@ -286,6 +286,50 @@ local function sorted_string_keys(keys, count)
   return keys
 end
 
+-- A number as jput writes it.
+local function jnum(v)
+  if math.type(v) == 'integer' and v > -10000000000 and v < 10000000000 then return tostring(v) end
+  if v ~= v or v == math.huge or v == -math.huge then return '0' end
+  return string.format('%.10g', v)
+end
+
+-- The two run shapes a galley is made of, written in one piece: the same
+-- bytes jput writes (keys sorted), with a third of the garbage. A
+-- five-line Japanese paragraph is some 400 of them, half glyph runs and half
+-- the empty rules of its JFM glue; written key by key they were most of the
+-- 5 ms a keystroke's report took to encode in the job (offline 4.3 -> 2.6 ms
+-- and 902 -> 401 KB allocated for 110 KB). Nil for any other shape.
+local function jglyph(r)
+  local c, t, m = r.c, r.t, r.m
+  if type(c) ~= 'string' or type(t) ~= 'string' then return nil end
+  local count = 0
+  for _ in pairs(r) do count = count + 1 end
+  if count ~= (m == nil and 9 or 10) then return nil end
+  local dy, f, gd, gh, s, w, x = r.dy, r.f, r.gd, r.gh, r.s, r.w, r.x
+  if type(dy) ~= 'number' or type(f) ~= 'number' or type(gd) ~= 'number' or type(gh) ~= 'number' or
+      type(s) ~= 'number' or type(w) ~= 'number' or type(x) ~= 'number' or (m ~= nil and type(m) ~= 'number') then
+    return nil
+  end
+  return '{"c":' .. jstr(c) .. ',"dy":' .. jnum(dy) .. ',"f":' .. jnum(f) .. ',"gd":' .. jnum(gd) .. ',"gh":' .. jnum(gh) ..
+    (m == nil and '' or (',"m":' .. jnum(m))) .. ',"s":' .. jnum(s) .. ',"t":' .. jstr(t) .. ',"w":' .. jnum(w) ..
+    ',"x":' .. jnum(x) .. '}'
+end
+local RULE_NUMBERS = { 'dy', 'h', 'rd', 'rh', 'ri', 'rl', 'rr', 'rs', 'rv', 'rw', 'w', 'x' }
+local function jrule(r)
+  local count = 0
+  for _ in pairs(r) do count = count + 1 end
+  if count ~= 16 then return nil end
+  local c, ra, rdir = r.c, r.ra, r.rdir
+  if type(c) ~= 'string' or type(ra) ~= 'string' or type(rdir) ~= 'string' then return nil end
+  for i = 1, #RULE_NUMBERS do
+    if type(r[RULE_NUMBERS[i]]) ~= 'number' then return nil end
+  end
+  return '{"c":' .. jstr(c) .. ',"dy":' .. jnum(r.dy) .. ',"h":' .. jnum(r.h) .. ',"ra":' .. jstr(ra) .. ',"rd":' .. jnum(r.rd) ..
+    ',"rdir":' .. jstr(rdir) .. ',"rh":' .. jnum(r.rh) .. ',"ri":' .. jnum(r.ri) .. ',"rl":' .. jnum(r.rl) ..
+    ',"rr":' .. jnum(r.rr) .. ',"rs":' .. jnum(r.rs) .. ',"rule":true,"rv":' .. jnum(r.rv) .. ',"rw":' .. jnum(r.rw) ..
+    ',"w":' .. jnum(r.w) .. ',"x":' .. jnum(r.x) .. '}'
+end
+
 local function jput(out, n, v)
   local t = type(v)
   if t == 'number' then
@@ -304,6 +348,12 @@ local function jput(out, n, v)
     n = n + 1
     out[n] = v and 'true' or 'false'
   elseif t == 'table' then
+    local whole = (v.t ~= nil and jglyph(v)) or (v.rule == true and jrule(v)) or nil
+    if whole then
+      n = n + 1
+      out[n] = whole
+      return n
+    end
     if v[1] ~= nil or next(v) == nil then
       n = n + 1
       out[n] = '['
