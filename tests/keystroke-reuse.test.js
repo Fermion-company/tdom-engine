@@ -71,6 +71,13 @@ test('edit regions kept on a block follow its source as it moves', () => {
   assert.notEqual(moved.blocks[2].editRegions, first.blocks[1].editRegions);
   // same offsets, another line structure before the block
   update(text.replace('Zeroth.\n\n', 'Zero\nth.\n'));
+  // a character typed above: the offsets of the later blocks move, their
+  // lines and columns do not, and neither do their regions
+  const second = (dom) => dom.blocks.find((block) => block.editRegions.some((region) => String(region.value).includes('Second')));
+  const settled = update(text);
+  const typed = update(text.replace('First paragraph', 'First paragraphs'));
+  assert.equal(second(typed).editRegions, second(settled).editRegions, 'a later block hands out the same regions');
+  assert.equal(second(typed).span.start, second(settled).span.start + 1);
   // the block itself edited
   update(text.replace('Second', 'Seconds'));
   // a region list replaced for the same text (a rescue's metadata arriving)

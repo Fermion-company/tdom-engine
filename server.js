@@ -544,6 +544,8 @@ function serializeDom(payload) {
   return {
     srcRev: payload.srcRev, stamp, order, files, tail, unique,
     blocks: new Map(order.map((id, i) => [id, blockText[i]])),
+    // (the blocks themselves, to tell one that only moved: domDeltaBody)
+    raw: new Map(order.map((id, i) => [id, blocks[i]])),
     sources: new Map(files.map((file, i) => [file, sourceText[i]])),
     // the whole document as one string, only for a viewer that holds no earlier one
     get body() {
@@ -593,10 +595,37 @@ function domDeltaBody(parts, base) {
   if (!Number.isSafeInteger(base) || base === parts.stamp || !parts.unique) return null;
   const earlier = domServed?.stamp === base ? domServed : domEarlier.findLast((item) => item.stamp === base);
   if (!earlier?.unique) return null;
-  const blocks = parts.order.filter((id) => earlier.blocks.get(id) !== parts.blocks.get(id)).map((id) => parts.blocks.get(id));
+  // A block that only stands elsewhere now (another place in the list of
+  // blocks, other pages, other offsets in the root file) is sent as that
+  // place, not whole. A character typed into a single-file document moves
+  // the offsets of every block after it: 394 of 400 blocks, 258 KB with
+  // every keystroke, where their places take 16 KB. A keystroke that makes
+  // a chapter one page longer moves every block after it to another page:
+  // 1.2 MB on a 72-page book.
+  const blocks = [];
+  const moved = [];
+  for (const id of parts.order) {
+    const text = parts.blocks.get(id);
+    if (earlier.blocks.get(id) === text) continue;
+    const now = parts.raw?.get(id);
+    if (onlyMoved(earlier.raw?.get(id), now)) {
+      moved.push(`[${JSON.stringify(id)},${JSON.stringify(now.index)},${JSON.stringify(now.pages)},${JSON.stringify(now.span ?? null)}]`);
+    }
+    else blocks.push(text);
+  }
   const sources = parts.files.filter((file) => earlier.sources.get(file) !== parts.sources.get(file)).map((file) => parts.sources.get(file));
   return `{"domStamp":${parts.stamp},"delta":{"base":${base}},"order":${JSON.stringify(parts.order)},"files":${JSON.stringify(parts.files)},` +
-    `"blocks":[${blocks.join(',')}],"sources":[${sources.join(',')}]${parts.tail.length > 1 ? ',' : ''}${parts.tail}`;
+    `"blocks":[${blocks.join(',')}],"moved":[${moved.join(',')}],"sources":[${sources.join(',')}]${parts.tail.length > 1 ? ',' : ''}${parts.tail}`;
+}
+/** What an edit became, for a client that asked for no more (`slim`). */
+function editAnswer(report) {
+  return { srcRev: report?.srcRev ?? null, rev: report?.rev ?? null, slim: true };
+}
+/** Whether two serializations of one block differ in nothing but its index, its pages and its offsets in the root file. */
+function onlyMoved(was, now) {
+  if (!was || !now || was.editRegions !== now.editRegions) return false;
+  const rest = ({ index: _index, pages: _pages, span: _span, editRegions: _regions, ...other }) => JSON.stringify(other);
+  return rest(was) === rest(now);
 }
 
 // ---- outer paper -------------------------------------------------------
@@ -3001,7 +3030,7 @@ const server = http.createServer(async (req, res) => {
         }
         throw err;
       }
-      if (inputUnchanged) return json(res, lastReport);
+      if (inputUnchanged) return json(res, body.slim === true ? editAnswer(lastReport) : lastReport);
       // when this keystroke reached the server and left the engine (epoch ms)
       lastReport.timing = {
         clientEditAtEpochMs: Number.isFinite(Number(body.clientEditAtEpochMs)) ? Number(body.clientEditAtEpochMs) : null,
@@ -3144,7 +3173,11 @@ const server = http.createServer(async (req, res) => {
           ` | engine phases ${JSON.stringify(Object.fromEntries(Object.entries(lastReport.stats ?? {}).filter(([k]) => /Us$/.test(k)).map(([k, v]) => [k.slice(0, -2), Math.round(v / 100) / 10])))}`);
       }
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(reportJson);
+      // A client that only wants to know which revision its edit became (a
+      // host whose viewers follow the event stream) asks for that alone:
+      // the report is every page the edit moved, 60 KB for a keystroke and
+      // megabytes for one that reflows a chapter, parsed for one number.
+      res.end(body.slim === true ? JSON.stringify(editAnswer(lastReport)) : reportJson);
       if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, anchorEpoch, anchorProofPrefetch);
       return;
     }

@@ -3908,11 +3908,19 @@ function applySnapshotDelta(base, delta) {
     snapshotBlockIndex.set(base, byId);
   }
   const changed = new Map((delta.blocks ?? []).map(block => [String(block.id), block]));
+  // (a block that only stands elsewhere now: its place in the list, its pages, its offsets in the root file)
+  const moved = new Map((delta.moved ?? []).map(([id, index, pages, span]) => [String(id), { index, pages, span }]));
   const blocks = [];
   for (const id of delta.order ?? []) {
     const block = changed.get(id) ?? byId.get(id);
     if (!block) return null;
-    blocks.push(block);
+    const place = moved.get(id);
+    if (!place) { blocks.push(block); continue; }
+    const next = { ...block, index: place.index, pages: place.pages };
+    // (a block of an included file carries no offsets in the root file)
+    if (place.span == null) delete next.span;
+    else next.span = place.span;
+    blocks.push(next);
   }
   const sourceByFile = new Map((base.sources ?? []).map(source => [source.file, source]));
   for (const source of delta.sources ?? []) sourceByFile.set(source.file, source);
@@ -3922,7 +3930,7 @@ function applySnapshotDelta(base, delta) {
     if (!source) return null;
     sources.push(source);
   }
-  const { delta: _delta, order: _order, files: _files, ...rest } = delta;
+  const { delta: _delta, order: _order, files: _files, moved: _moved, ...rest } = delta;
   return { ...rest, blocks, sources };
 }
 

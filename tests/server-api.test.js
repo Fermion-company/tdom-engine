@@ -163,6 +163,42 @@ test('a viewer gets the source snapshot of the revision it staged while the next
   assert.equal(current.srcRev, next.srcRev);
 });
 
+test('a block that only moved to another page travels as its new place; a host can ask for the revision alone', { skip: !texReady && 'lualatex not installed' }, async (t) => {
+  const base = await startServer(t);
+  const post = (body) => fetch(`${base}/edit`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((res) => res.json());
+  const doc = await fetch(`${base}/doc`).then((res) => res.json());
+  // (a snapshot asked for by its revision is kept, and carries the stamp a later change is taken from)
+  const status = await fetch(`${base}/status`).then((res) => res.json());
+  const held = await fetch(`${base}/dom?srcRev=${status.srcRev}`).then((res) => res.json());
+  assert.ok(Number.isSafeInteger(held.domStamp), JSON.stringify(Object.keys(held)));
+  // a page break in front of a paragraph in the middle: every block after it stands on another page
+  const at = doc.source.indexOf('watch the inspector');
+  const line = doc.source.lastIndexOf('\n', at) + 1;
+  const answer = await post({ start: line, end: line, text: '\\clearpage ', slim: true });
+  assert.deepEqual(Object.keys(answer).sort(), ['rev', 'slim', 'srcRev'], 'the revision alone, not the report');
+  assert.ok(Number.isSafeInteger(answer.srcRev));
+  const delta = await fetch(`${base}/dom?srcRev=${answer.srcRev}&base=${held.domStamp}`).then((res) => res.json());
+  assert.equal(Number(delta.delta?.base), held.domStamp);
+  assert.ok(delta.moved.length > 0, 'blocks after the break are sent as their new place');
+  assert.ok(delta.blocks.length < delta.moved.length, JSON.stringify({ blocks: delta.blocks.length, moved: delta.moved.length }));
+  // applied the way the viewer does, the change gives the snapshot the server would send whole
+  const APP = (await import('node:fs')).readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const applySnapshotDelta = Function('snapshotBlockIndex', `${APP.slice(
+    APP.indexOf('function applySnapshotDelta'), APP.indexOf('// The update that brings a revision also brings its source map')
+  )}; return applySnapshotDelta;`)(new WeakMap());
+  const applied = applySnapshotDelta(held, delta);
+  const whole = await fetch(`${base}/dom?srcRev=${answer.srcRev}`).then((res) => res.json());
+  assert.equal(whole.srcRev, answer.srcRev);
+  assert.deepEqual(applied.blocks, whole.blocks);
+  assert.deepEqual(applied.sources, whole.sources);
+  assert.ok(whole.blocks.some((block, i) => JSON.stringify(block.pages) !== JSON.stringify(held.blocks[i]?.pages)), 'pages did change');
+  // without `slim` the answer is the report, as before
+  const report = await post({ start: line, end: line + 1, text: '\\' });
+  assert.ok(Array.isArray(report.patches));
+});
+
 test('a host names an outer paper: its sheets around the chapter are served, the chapter\'s own are not', { skip: !texReady && 'lualatex not installed' }, async (t) => {
   const base = await startServer(t);
   const post = (body) => fetch(`${base}/outer`, { method: 'POST', body: JSON.stringify(body) }).then(async (r) => [r.status, await r.json()]);

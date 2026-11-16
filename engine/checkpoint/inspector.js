@@ -63,8 +63,12 @@ export function buildDomSnapshot({
     if (b.file && b.sourceStart) return `${b.file}|${b.sourceStart.line}|${b.sourceStart.column}`;
     // a root block's text is the root's own slice; anything else is not kept
     if (b.end - b.start !== b.text.length) return null;
+    // (by line and column, not by offset: a character typed above moves the
+    // offset of every block after it and the position of none. Keyed by the
+    // offset, one keystroke in a single-file document of 400 paragraphs
+    // rebuilt the regions of the 394 blocks after it.)
     const start = position(file, b.start);
-    return `${file}|${b.start}|${start.line}|${start.column}`;
+    return `${file}|${start.line}|${start.column}`;
   };
   const ownRegions = (b) => {
     const anchor = regionAnchor(b);
