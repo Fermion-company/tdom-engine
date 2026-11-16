@@ -37,6 +37,29 @@ local JOB = nil -- set in a freshly forked job child
 local FAULT_FORKFAIL = 0
 local FAULT_WEDGE = 0
 local FAULT_SILENT = 0 -- swallow the job without forking or replying at all
+-- Spare continuations (fork shim, "a spare continuation"): after the job of
+-- a keystroke's own block this checkpoint forks the child the NEXT
+-- keystroke's job would be forked into. While it waits, that child loads
+-- the fonts the last job had to load and reads the pages it read. `on` only
+-- where a job can say which pages those were.
+--   pid       the spare this checkpoint has waiting
+--   due       this checkpoint owes itself a spare (made once it is idle)
+--   owed      this checkpoint owes the list of pages its own job read
+--   base      (in a spare, and the job it becomes) font.max() of the
+--             checkpoint it was forked from
+--   fontSeq   (in a spare) the font list it has loaded
+--   resume    (in a spare) its pipe, while TeX loads fonts for it
+--   ahead     (in a spare) fonts loaded ahead; touched, ms: pages read ahead
+local SPARE = { on = false, fonts = false, pid = nil, due = false, owed = false }
+local FONT_SPEC = {} -- font id -> "<size in sp> <name>" (as TeX was asked for it)
+local WARM_NAMES = {} -- names of the fonts a spare is loading (tdomwarmname)
+local TRACE_USAGE = false -- TDOM_TRACE_JOB with a shim that can tell (tdom_boot)
+local function drop_spare()
+  if SPARE.pid then
+    fk.spare_drop()
+    SPARE.pid = nil
+  end
+end
 local seen_fonts = {}
 local blk_labels = {}
 local blk_refs = {}
@@ -327,6 +350,9 @@ function tdom_boot(port, workdir, counters)
   end
   fk = shim()
   fk.ignore_sigchld()
+  SPARE.on = not os.getenv('TDOM_NO_SPARES') and fk.hints_init ~= nil and fk.hints_init() == true
+  SPARE.fonts = SPARE.on and not os.getenv('TDOM_NO_FONT_AHEAD') and fk.fonts_put ~= nil
+  TRACE_USAGE = os.getenv('TDOM_TRACE_JOB') ~= nil and fk.usage ~= nil
   -- Establish one descriptor even when the preamble has not opened PDF yet.
   -- Every descendant clones it together with its backend object state.
   pdf.immediateobj('<<>>')
@@ -351,6 +377,8 @@ function tdom_boot(port, workdir, counters)
       if JOB then
         JOB.had_error = true
         JOB.error = tostring(status.lasterrorstring or 'unknown')
+      elseif SPARE.loading then
+        SPARE.failed = true -- (a font could not be loaded ahead: this spare asks for no more)
       end
       if os.getenv('TDOM_TRACE_ERRORS') then
         texio.write_nl('term and log', 'tdom: native error: ' .. tostring(status.lasterrorstring or 'unknown'))
@@ -1611,10 +1639,30 @@ function tdom_report()
   local TR1 = os.gettimeofday and os.gettimeofday() or os.clock()
   local tm = nil
   if os.getenv('TDOM_TRACE_JOB') then
+    -- where the job's time went: its own CPU, the kernel's (page faults), and how many of those
+    local was, now = JOB.usage, JOB.usage and { fk.usage() }
     tm = {
+      userMs = was and math.floor((now[1] - was[1]) * 100 + 0.5) / 100 or nil,
+      sysMs = was and math.floor((now[2] - was[2]) * 100 + 0.5) / 100 or nil,
+      faults = was and now[3] - was[3] or nil,
+      cowFaults = was and now[4] - was[4] or nil,
+      -- fonts this job had to load: ones the checkpoint it was forked from did not have
+      fontsLoaded = JOB.fontMax and (function()
+        local names = {}
+        for id = JOB.fontMax + 1, font.max() do
+          local ok, f = pcall(font.getfont, id)
+          names[#names + 1] = ok and f and (tostring(f.name or f.fullname or '?'):sub(1, 60) .. '@' .. tostring(f.size and math.floor(f.size / 65536 * 100 + 0.5) / 100 or '?')) or ('#' .. id)
+        end
+        return #names > 0 and names or nil
+      end)() or nil,
       typeset = math.floor((TR0 - (T_JOB or TR0)) * 100000 + 0.5) / 100,
       harvest = math.floor((TR1 - TR0) * 100000 + 0.5) / 100,
       heapKb = collectgarbage('count'),
+      -- this job ran in a spare continuation: pages it read ahead, ms that
+      -- took, fonts it loaded ahead
+      spareTouched = SPARE.touched,
+      spareMs = SPARE.ms and math.floor(SPARE.ms * 100 + 0.5) / 100 or nil,
+      fontsAhead = SPARE.ahead,
       -- epoch ms, to place the job between the orchestrator's own stamps
       -- (seconds and the fraction apart: the encoder keeps few digits)
       forkMs = T_RECV and T_FORKED and (T_FORKED - T_RECV) * 1000 or nil,
@@ -1639,8 +1687,18 @@ function tdom_report()
     CAPTURE_TOKEN = JOB.capture
     capture = JOB.capture
   end
+  -- the fonts this job holds that the checkpoint it was forked from has not
+  -- ("<size in sp> <name>" lines)
+  local font_list = SPARE.fonts and JOB.fontBase and font_specs_since(JOB.fontBase) or nil
+  JOB.fontList = font_list
   local payload = jenc({
     tm = tm,
+    -- this job ran in a spare continuation: pages it read ahead, fonts it loaded ahead
+    spare = SPARE.touched and { pages = SPARE.touched, fonts = SPARE.ahead or 0 } or nil,
+    -- fonts this job itself had to load
+    fontLoads = JOB.fontBase and font.max() - JOB.fontBase - (SPARE.ahead or 0) or nil,
+    -- (the engine hands the list back when the caret comes to this block: SPARE)
+    fontList = font_list and font_list ~= '' and font_list or nil,
     block = JOB.id,
     capture = capture,
     gfx = blk_gfx,
@@ -1675,7 +1733,28 @@ function tdom_report()
   -- this child now becomes the next checkpoint in the chain
   CKPT = JOB.ckpt
   conn:send('CKPT ' .. CKPT .. ' ' .. fk.getpid() .. ' ' .. (TDOM_GC_FLOOR or 0) .. ' ' .. gc_ms .. '\n')
+  local keystroke, list = JOB.keystroke, JOB.fontList
   JOB = nil
+  SPARE.touched, SPARE.ms, SPARE.ahead, SPARE.base = nil, nil, nil, nil
+  if SPARE.on and keystroke then
+    -- this job's pages are told to the next keystroke's spare (tdom_wait)
+    SPARE.owed = true
+    -- and the fonts it had that the checkpoint before it has not
+    -- (left as it is when it says the same: a spare that has loaded the
+    -- list is not asked again)
+    if list and list ~= (fk.fonts_get(CKPT, 1) or '') then
+      -- A font listed twice was loaded ahead and then loaded again by the
+      -- job: it is not one TeX finds again by its name and size (a package
+      -- defined it itself). Loading ahead only costs here: leave this point
+      -- of the document to ordinary jobs.
+      local seen, twice = {}, false
+      for line in list:gmatch('[^\n]+') do
+        twice = twice or seen[line] == true
+        seen[line] = true
+      end
+      fk.fonts_put(CKPT, not twice and list)
+    end
+  end
 end
 
 -- ------------------------------------------------------------ shipping
@@ -1867,19 +1946,191 @@ local function recv_exact(n)
   return table.concat(parts)
 end
 
-function tdom_wait()
+-- TDOM_TRACE_JOB: what a render child spent from its fork to its finished
+-- PDF (wall, its own CPU, the kernel's, page faults, copy-on-write faults).
+local function render_usage_start(kind)
+  if TRACE_USAGE then
+    RENDER_USAGE = { kind = kind, at = os.gettimeofday(), fk.usage() }
+  end
+end
+local function render_usage_end()
+  local was = RENDER_USAGE
+  if not was or not WORKDIR then return end
+  local now = { fk.usage() }
+  local f = io.open(WORKDIR .. '/spare-trace.log', 'a')
+  if f then
+    f:write(string.format('%s pid %d wall %.1f user %.1f sys %.1f faults %d cow %d\n', was.kind, fk.getpid(),
+      (os.gettimeofday() - was.at) * 1000, now[1] - was[1], now[2] - was[2], now[3] - was[3], now[4] - was[4]))
+    f:close()
+  end
+end
+
+-- ---- fonts ahead of the job
+--
+-- A block that is the first in the document to use a font (the first math,
+-- the first bold, a logo's small capital) loads it in every job: the
+-- checkpoint the job is forked from never has it. One paragraph of a book
+-- spent 17 of its 18 ms loading a 6 pt face for \LaTeX, at each keystroke.
+-- So a keystroke's job says which fonts it holds that its checkpoint does
+-- not, and the spare of the next keystroke loads them, by the name and size
+-- TeX was asked for and in the same order, before the job arrives. A font is
+-- a resource: the paragraph is set the same whether its fonts were loaded a
+-- moment earlier or in its middle (and TeX gives them the same numbers).
+
+-- "<size in sp> <name>" of every font above `base`, a line each; nil when
+-- one of them cannot be asked for again by name.
+function font_specs_since(base)
+  local lines = {}
+  for id = base + 1, font.max() do
+    local spec = FONT_SPEC[id]
+    if spec == nil then
+      local ok, f = pcall(font.getfont, id)
+      local name, size = ok and f and f.name, ok and f and tonumber(f.size)
+      spec = type(name) == 'string' and name ~= '' and not name:find('["\n\r]') and size and size > 0 and
+        string.format('%d %s', size, name) or false
+      FONT_SPEC[id] = spec
+    end
+    if not spec then return nil end
+    lines[#lines + 1] = spec
+  end
+  return table.concat(lines, '\n')
+end
+
+-- (the name goes to TeX as plain characters, whatever the document has made
+-- of the characters in it)
+function tdomwarmname(i)
+  tex.sprint(-2, '"' .. tostring(WARM_NAMES[i] or '') .. '"')
+end
+
+-- TeX lines that load the listed fonts and leave nothing else behind.
+local function font_load_lines(list)
+  local ok, primitive = pcall(function() return token.create('font').cmdname == 'def_font' end)
+  if not ok or not primitive then return nil end
+  local lines = { '\\begingroup' }
+  WARM_NAMES = {}
+  for size, name in list:gmatch('(%d+) ([^\n]+)') do
+    WARM_NAMES[#WARM_NAMES + 1] = name
+    lines[#lines + 1] = '\\font\\tdomwarmfont=\\directlua{tdomwarmname(' .. #WARM_NAMES .. ')} at ' .. size .. 'sp\\relax'
+  end
+  if #WARM_NAMES == 0 then return nil end
+  lines[#lines + 1] = '\\endgroup'
+  return lines
+end
+
+-- In a spare continuation: wait for the job. Returns its JOB line and body;
+-- or nothing, having handed TeX the fonts to load first (tdom_wait comes
+-- back here through SPARE.resume).
+local function spare_serve(rfd)
+  if SPARE.loading then
+    -- back from loading fonts
+    SPARE.loading = nil
+    SPARE.ahead = font.max() - SPARE.base
+    font_specs_since(SPARE.base) -- (described now, not while the job's report waits)
+  end
   while true do
-    local line, err = conn:receive('*l')
+    local message, touched, ms = fk.spare_wait(rfd, SPARE.fonts and CKPT + 1 or -1, SPARE.fontSeq)
+    if message ~= false then
+      local line, body = message:match('^([^\n]*)\n(.*)$')
+      if not line then fk._exit(0) end
+      SPARE.touched, SPARE.ms = touched, ms
+      return line, body
+    end
+    local list, seq = fk.fonts_get(CKPT + 1, SPARE.fontSeq)
+    if list then
+      SPARE.fontSeq = seq
+      local lines = not SPARE.failed and font_load_lines(list)
+      if lines then
+        SPARE.resume, SPARE.loading = rfd, true
+        tex.print(lines)
+        return nil
+      end
+    end
+  end
+end
+
+-- This checkpoint's spare. In the parent: nothing. In the spare itself: as
+-- spare_serve.
+local function make_spare()
+  local spid, rfd = fk.spare_fork(PDF_FD)
+  if spid ~= 0 then
+    if spid and spid > 0 then SPARE.pid = spid end
+    return nil, nil, false
+  end
+  -- a forked child must not hold the inherited descriptor
+  conn:close()
+  conn = nil
+  SPARE.pid, SPARE.due, SPARE.owed = nil, false, false
+  SPARE.base, SPARE.fontSeq, SPARE.ahead, SPARE.failed = font.max(), 0, nil, nil
+  local line, body = spare_serve(rfd)
+  return line, body, true
+end
+
+function tdom_wait()
+  -- set in a spare continuation once its parent has handed it a job: the
+  -- JOB line and body the parent received
+  local spare_line, spare_body = nil, nil
+  if SPARE.resume then
+    -- a spare, back from loading fonts
+    local rfd = SPARE.resume
+    SPARE.resume = nil
+    spare_line, spare_body = spare_serve(rfd)
+    if not spare_line then return end -- (more fonts)
+  end
+  while true do
+    local line, err = spare_line, nil
+    -- (the job handed to this spare is this turn's command, once)
+    local handed_body = spare_body
+    spare_line, spare_body = nil, nil
+    if not line then
+      if not conn then fk._exit(0) end
+      -- What this checkpoint does once nothing has asked anything of it for
+      -- a moment (a render forked beside a job, or captured from it, comes
+      -- first):
+      while (SPARE.due or SPARE.owed) and not conn:dirty() and
+          not fk.wait_readable(conn:getfd(), SPARE.due and 8 or 15) do
+        if SPARE.due then
+          -- the continuation of the next keystroke's job
+          SPARE.due = false
+          if not SPARE.pid then
+            local in_spare
+            line, handed_body, in_spare = make_spare()
+            if in_spare and not line then return end -- the spare: TeX loads its fonts
+            if line then break end -- the spare, and here is its job
+          end
+        else
+          -- Say which pages the job that made this checkpoint read, for the
+          -- spare of the next keystroke. Listing them walks this process's
+          -- whole page table (0.1 to 0.5 s in a book): once per point of the
+          -- document and then every ten seconds, since one paragraph's
+          -- keystrokes read the same pages. (Dropped the moment something
+          -- does ask: false, and asked again.)
+          local pages, runs, ms = fk.hints_record(CKPT, 10000, conn:getfd())
+          SPARE.owed = pages == false
+          if pages and os.getenv('TDOM_TRACE_JOB') and WORKDIR then
+            local f = io.open(WORKDIR .. '/spare-trace.log', 'a')
+            if f then
+              f:write(string.format('record pid %d ckpt %d pages %d runs %d %.2f ms\n', fk.getpid(), CKPT, pages, runs, ms))
+              f:close()
+            end
+          end
+        end
+      end
+      if not line then line, err = conn:receive('*l') end
+    end
     if not line then
       fk._exit(0) -- orchestrator went away
     end
-    local cmd, a, b, c, d, mode, live_floor = line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)')
+    local cmd, a, b, c, d, mode, live_floor, key =
+      line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)')
     if cmd == 'DIE' then
       fk._exit(0)
     elseif cmd == 'PING' then
       conn:send('PONG ' .. CKPT .. '\n')
     elseif cmd == 'FAULT' then
       -- test-only fault injection: FAULT FORKFAIL <n> | FAULT WEDGE <n>
+      -- (a spare forked before the fault was set would not carry it)
+      drop_spare()
+      SPARE.on, SPARE.due = false, false
       if a == 'FORKFAIL' then
         FAULT_FORKFAIL = tonumber(b) or 0
       elseif a == 'WEDGE' then
@@ -1887,21 +2138,50 @@ function tdom_wait()
       elseif a == 'SILENT' then
         FAULT_SILENT = tonumber(b) or 0
       end
+    elseif cmd == 'SPARE' then
+      -- SPARE <newCkptIdx> <bodyLen>: the caret has come to the block this
+      -- checkpoint stands in front of. Make the spare continuation of its
+      -- first keystroke now. Body: the fonts that block's last job held
+      -- that this checkpoint has not (a job's fontList).
+      local tag = tonumber(a)
+      local len = tonumber(b) or 0
+      local list = len > 0 and recv_exact(len) or ''
+      if SPARE.on and tag == CKPT + 1 then
+        if SPARE.fonts and list ~= '' and list ~= (fk.fonts_get(tag, 1) or '') then fk.fonts_put(tag, list) end
+        if not SPARE.pid then SPARE.due = true end
+      end
     elseif cmd == 'JOB' or cmd == 'STEP' then
-      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B|C> <liveFloorKb>
+      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B|C> <liveFloorKb> [K]
+      -- (K: the job of the block a keystroke changed)
       local id = a
       T_RECV = os.gettimeofday and os.gettimeofday() or nil
       local newckpt = tonumber(b) or (CKPT + 1)
       local len = tonumber(c) or 0
       local capture = d ~= '' and d ~= '-' and d or nil
-      local body = len > 0 and recv_exact(len) or ''
+      local body = handed_body or (len > 0 and recv_exact(len) or '')
       if FAULT_SILENT > 0 then
         -- body already consumed (protocol stays in sync); reply with nothing
         FAULT_SILENT = FAULT_SILENT - 1
         texio.write_nl('term and log', 'TDOMFAULT silent job=' .. tostring(id))
       else
       local wedge = take_wedge_fault()
-      local pid = cmd == 'STEP' and 0 or fork_for(id)
+      -- a keystroke's job goes to the spare continuation when there is one
+      local sparable = SPARE.on and cmd == 'JOB' and key == 'K' and not wedge
+      local pid
+      if handed_body then
+        pid = 0 -- this process is that continuation
+      elseif cmd == 'STEP' then
+        -- this checkpoint itself moves on: a spare of the state it leaves is of no use
+        drop_spare()
+        SPARE.due = false
+        pid = 0
+      elseif sparable and SPARE.pid and fk.spare_send(line .. '\n' .. body) then
+        pid = SPARE.pid
+        SPARE.pid = nil
+      else
+        if sparable then SPARE.pid = nil end -- (spare_send let a spare that could not take the job go)
+        pid = fork_for(id)
+      end
       if pid == 0 then
         if wedge then
           os.execute('/bin/sleep 30')
@@ -1912,7 +2192,9 @@ function tdom_wait()
         -- CAPTURE or checkpoint retirement.
         T_FORKED = os.gettimeofday and os.gettimeofday() or nil
         drop_capture()
-        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F', calibrate = mode == 'C' }
+        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F', calibrate = mode == 'C',
+          keystroke = key == 'K', fontBase = handed_body and SPARE.base or font.max() }
+        SPARE.pid, SPARE.due, SPARE.owed = nil, false, false
         fk.set_interactive(JOB.interactive and 1 or 0)
         gc_base_kb = tonumber(live_floor) or 0
         gc_guard_kb, gc_guard_ms = nil, 0
@@ -1922,6 +2204,10 @@ function tdom_wait()
         -- spread over every job of the lineage.
         collectgarbage('stop')
         T_JOB = os.gettimeofday and os.gettimeofday() or os.clock()
+        if TRACE_USAGE then
+          JOB.usage = { fk.usage() }
+          JOB.fontMax = font.max()
+        end
         blk_labels = {}
         blk_refs = {}
         blk_counters = {}
@@ -1958,6 +2244,9 @@ function tdom_wait()
         return -- resume TeX: typeset, report, then \TDOMloop brings us back
       elseif pid then
         conn:send('FORKED ' .. id .. ' ' .. pid .. '\n')
+        -- the continuation of the next keystroke's job is made once this
+        -- checkpoint is idle (above)
+        if sparable and not SPARE.pid then SPARE.due = true end
       end
       end
     elseif cmd == 'RENDER' then
@@ -1975,6 +2264,7 @@ function tdom_wait()
         RENDER_MODE = true
         FLOAT_COPIES = {}
         FOOT_COPIES = {}
+        render_usage_start('render')
         reconnect('render', 0)
         assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish resident PDF')
         lfs.chdir(jobdir)
@@ -1983,6 +2273,7 @@ function tdom_wait()
           pcall(function()
             conn:send('DONE ' .. request .. '\n')
           end)
+          pcall(render_usage_end)
         end
         if luatexbase and luatexbase.add_to_callback then
           pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdom')
@@ -2012,6 +2303,7 @@ function tdom_wait()
           RENDER_MODE = true
           FLOAT_COPIES = {}
           FOOT_COPIES = {}
+          render_usage_start('capture')
           reconnect('render', 0)
           assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish captured PDF')
           lfs.chdir(jobdir)
@@ -2019,6 +2311,7 @@ function tdom_wait()
             pcall(function()
               conn:send('DONE ' .. request .. '\n')
             end)
+            pcall(render_usage_end)
           end
           if luatexbase and luatexbase.add_to_callback then
             pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdom')

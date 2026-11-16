@@ -175,6 +175,28 @@ exact 画素の要る block（`needsRender`）を編集すると、render pump �
 - JOB が返した galley に `tdomEarlyRender` として付け、pump はその galley が block に付いていて本文が同じときだけ、その PDF を切り出す（`render-pump.js`）。後の update が block を別の state で組み直して galley が替われば使わない。次の打鍵の preempt では子が kill され、PDF の置き場は galley が替わったとき（`#adoptGalley`）か 30 s 後に消える。JOB が失敗したときもその場で捨てる。last-good 保持と stale-first rescue の複製では印を外す。置き場を作れなかったときは送らず、pump がふだんどおり描く。
 - pump が自分で送る RENDER も、galley を組んだ JOB の prelude（`tdomRenderPrelude`。vstale でない checkpoint の JOB だけが残す）を本文の前に付けるので、先行 RENDER が kill された打鍵でも参照番号は galley と揃う。isolated rescue などその prelude の無い galley は、従来どおり primer だけを付ける。
 
+## 10.4d 打鍵の JOB を受ける予備の子（spare continuation）
+
+編集 block の JOB は、その block の入口の checkpoint から fork した子が組む。fork したばかりの子には二つの費用が毎打鍵かかっていた。
+
+- **フォントの読み直し**: block が文書の中でその font を最初に使う場所（最初の数式、最初の太字、`\LaTeX` ロゴの小さい A など）だと、入口の checkpoint はその font を持たないので、JOB のたびに読み込む。389 ページの本の章ウィンドウでは、3 行の地の文が 18 ms のうち 17 ms を 6 pt の 1 書体の読み込みに使っていた（同じ子でもう一度組むと 1.5 ms）。章ウィンドウは各章が前文の font だけで始まるので、特に当たりやすい。
+- **ページの読み込み直し**: 子の page table は空で、親と共有するメモリを読むたびに fault が起きる（同じ段落で 4,400 回、kernel 時間 5 ms）。fault の費用は fork の世代が深いほど上がる（1 世代 1.7 µs、400 世代 15 µs / page）。
+
+そこで、編集 block の JOB を渡したあと、checkpoint は次の打鍵の JOB を受ける子を先に fork しておく（`daemon.lua` の `SPARE`、`tdomfork.c` の「a spare continuation」）。
+
+- engine は、編集で本文が変わった block の JOB に `K` を付ける（`keystrokeSource`。open と reboot では付けない）。checkpoint は `K` の JOB を渡したあと 8 ms 何も来なければ予備の子を fork する（`fk.spare_fork`）。先行 RENDER など続けて来る命令を先に通すためである。
+- 予備の子は、(1) 直前の JOB が checkpoint に無くて持っていた font を、TeX に頼まれたとおりの名前と大きさで、同じ順に読み込む（group の中の `\font\tdomwarmfont=… at …sp`。名前は文書の catcode に左右されないよう plain な文字で渡す）。(2) 直前の JOB の page table にあったページを 1 byte ずつ読む。(3) pipe で JOB を待つ。次の `K` の JOB は fork せずにこの子へ渡す（`fk.spare_send`）。
+- font は資源であり、少し前に読み込んであっても段落の組み結果は変わらない。同じ順に読み込めば font 番号も同じになる（単体の LuaLaTeX で、19 書体を先に読み込んだ版と読み込まない版の出力 SVG が一致することを確かめた）。順が変わった場合は番号だけが変わる。galley は自分の font 表を持つので表示は変わらない。
+- JOB は `fontList`（checkpoint の `font.max()` より上の font の「大きさ 名前」）、`fontLoads`（JOB 自身が読み込んだ数）、`spare`（予備の子が先に読んだ pages と fonts）を galley に付けて返す。caret が block に来たとき（`warmEditOffset` が ready）、engine はその block の `fontList` を付けて `SPARE` を送るので、最初の 1 打にも予備の子がある。
+- ページの一覧は、JOB を終えて checkpoint になった子が、15 ms 何も来なくなってから取る（`fk.hints_record`。自分の page table を答える sysctl `vm.self_region_footprint` と `mach_vm_page_range_query`）。page table 全体を歩くので本では 0.1〜0.5 秒かかる。同じ場所（同じ checkpoint 番号）では 10 秒に 1 回までとし、命令が来たら中断する。JOB が**書いた**ページ（予備の子で先に複製を作れば copy-on-write の fault も減る）は調べない。ページごとの記録（`mach_vm_page_info`）を読むと、系統全体が共有する memory object を世代の数だけ lock する。89 世代目の checkpoint では一覧 1 回に 1 秒かかり、その間、同じ文書の JOB・予備の子・RENDER が lock を待って止まった（72 ページの本の数式段落で、紙面が 5 打鍵ぶん動かなかった）。
+- 予備の子は checkpoint の状態の写しである。checkpoint が STEP で先へ進むとき、fault 注入を受けたときは捨てる。checkpoint が終われば pipe が閉じて予備の子も終わる。予備の子を持つ pipe の書き口は checkpoint だけが持つ（他の子は fork 直後に閉じる）。
+- 読み込んでも JOB がまた読み込む font（package が自分で定義した font。一覧に同じ行が 2 度出る）がある場所では、先読みをやめる（`fk.fonts_put(tag, false)`）。先読み中に TeX の error が出た予備の子は、それ以上読み込まない。
+- `vm.self_region_footprint` の無い環境（古い macOS、Linux）では `fk.hints_init()` が false を返し、従来どおり毎回 fork する。`TDOM_NO_SPARES=1` は全体を、`TDOM_NO_FONT_AHEAD=1` は font の先読みだけを止める。`TDOM_TRACE_JOB=1` では JOB ごとの user / kernel 時間、fault 数、読み込んだ font 名が `[job-gc]` に出る。
+
+実機（packaged beta、389 ページの本の章ウィンドウ、150 ms 間隔の打鍵）: TeX 側の組版 23 → 6 ms、打鍵から紙面まで中央値 48 → 30 ms。
+
+一覧は系統全体で 1 つ（最後に打った段落のもの）である。font の使用を消しても、その段落で打ち続ける間は一覧に残る。予備の子は先読みした font を自分のメモリに持つ（和文 1 書体で 10〜20 MB）。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。

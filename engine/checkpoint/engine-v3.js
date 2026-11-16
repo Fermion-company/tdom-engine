@@ -377,6 +377,24 @@ export class CheckpointEngine {
     const first = Math.min(target, ...caretOwed, ...missing.map(item => item.index));
     const last = Math.max(target, ...caretOwed, ...missing.map(item => item.index));
     this.warmInfo = { status: 'scheduled', sourceRev, target, offset: numericOffset, file: sourceFile };
+    // While the typing goes on, a warm that would have to walk waits for it
+    // to pause. The host sends a warm after every keystroke; a walk begun
+    // between two of them holds the chain lock for the block it is in, and
+    // the next keystroke waits for that block (in a book, the heading after
+    // the paragraph: 40 to 60 ms of every other keystroke once the settle
+    // pass had started moving the blocks behind the caret). The walk is for
+    // the pixels around the caret, and the text there is still moving. A
+    // lone keystroke (the one before it more than 400 ms back) is not held.
+    const walks = caretOwed.length > 0 || !this.checkpoints.has(target) || !this.checkpoints.has(target + 1) ||
+      missing.some(item => !this.checkpoints.has(item.index));
+    const sinceEdit = Date.now() - (this.lastEditAt ?? 0);
+    if (walks && (this.editGapMs ?? Infinity) < 400 && sinceEdit < 400) {
+      await new Promise((resolve) => setTimeout(resolve, 400 - sinceEdit));
+      if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev || this.editPending > 0) {
+        return { status: 'superseded', sourceRev, target };
+      }
+      return this.warmEditOffset(offset, file, { caret });
+    }
     // Cursor movement outranks background rescue/settle work, but never an
     // edit. Reuse the established abort path so a deep LuaTeX-ja job cannot
     // hold the foreground lock until its timeout.
@@ -415,8 +433,22 @@ export class CheckpointEngine {
       this.editHold = [...new Set([target, target + 1, ...caretPins, ...missing.map(item => item.index), ...this.editHold])]
         .filter((idx) => idx >= 0 && idx <= this.blocks.length)
         .slice(0, 8 + caretPins.length + Math.min(16, missing.length));
-      if (!missing.length && !caretOwed.length && this.checkpoints.has(target) && this.checkpoints.has(target + 1)) {
+      // A block without its pixels needs the walk only for the checkpoint in
+      // front of it: its render starts there. With that checkpoint standing
+      // (pinned just above) the render is asked for and nothing is typeset.
+      // Typing in a paragraph with a formula, the paragraph is without the
+      // pixels of its newest text after every keystroke: the caret's warm
+      // walked each time, typeset the paragraph again and the heading after
+      // it (50 to 85 ms in a book), and the next keystroke waited for that
+      // block to end (22 to 68 ms of every keystroke once the typing had
+      // gone on for two seconds).
+      const unreached = missing.filter(item => !this.checkpoints.has(item.index));
+      if (!unreached.length && !caretOwed.length && this.checkpoints.has(target) && this.checkpoints.has(target + 1)) {
+        for (const item of missing) this.#queueRender(item.block.id, { interactiveRev: sourceRev });
         this.#enforceCheckpointCap();
+        // (this warm stopped the scheduler on its way in: chain work a
+        // keystroke left for later goes back to it, as after a walk)
+        this.#kickPendingChain();
         const ready = {
           status: 'ready',
           sourceRev,
@@ -426,6 +458,7 @@ export class CheckpointEngine {
           ms: performance.now() - startedAt,
         };
         this.warmInfo = ready;
+        this.#offerSpare(target);
         return ready;
       }
       const from = this.#nearestCheckpoint(first);
@@ -537,6 +570,7 @@ export class CheckpointEngine {
         ms: performance.now() - startedAt,
       };
       this.warmInfo = result;
+      if (result.status === 'ready') this.#offerSpare(target);
       return result;
     });
     this.bgTask = run.then(() => {}, () => {});
@@ -719,6 +753,20 @@ export class CheckpointEngine {
 
   // ------------------------------------------------------------- typeset
 
+  /**
+   * The caret stands in block `target`: the checkpoint in front of it makes
+   * the spare continuation of the first keystroke now, with the fonts the
+   * block's last job had to load (daemon.lua SPARE).
+   */
+  #offerSpare(target) {
+    const ck = this.checkpoints.get(target);
+    const block = this.blocks[target];
+    if (!ck || !block || ck.vstale) return;
+    const fonts = Buffer.from(block.galley?.fontList ?? '', 'utf8');
+    ck.send(`SPARE ${target + 1} ${fonts.length}\n`);
+    if (fonts.length) ck.sendRaw(fonts);
+  }
+
   async #jobBlock(idx, override = null, replayToken = null) {
     const block = this.blocks[idx];
     const jobStarted = performance.now();
@@ -800,7 +848,11 @@ export class CheckpointEngine {
       // galley kept from an older root does not carry its floor over)
       const liveFloor = this.confirmedLiveHeapKb || 0;
       const sentAt = process.env.TDOM_TRACE_JOB ? performance.timeOrigin + performance.now() : 0;
-      ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}\n`);
+      // K: the job of the block a keystroke changed. Its checkpoint keeps a
+      // spare continuation ready for the next keystroke (daemon.lua SPARE).
+      const keystroke = !advance && !override && this.updating && !this.bgActive && !this.warming &&
+        !!this.keystrokeSource?.has(block.id);
+      ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}${keystroke ? ' K' : ''}\n`);
       ck.sendRaw(body);
       // The block this edit changed ships its exact RENDER beside its JOB,
       // forked from the same entry state with the JOB's own prelude (label
@@ -2337,6 +2389,8 @@ export class CheckpointEngine {
     // A boot (or reboot) walk may compile first-ever rescues inline
     // (#bootIsoCompile) for this much compile time in total.
     this.bootRescueBudgetMs = rebooted || editLabel === 'open' ? this.bootRescueMs : 0;
+    // the blocks an edit of the document changed (their jobs are marked K: #jobBlock)
+    this.keystrokeSource = rebooted || editLabel === 'open' ? null : dirtySource;
     try {
       await runUpdateTypesetPhase(this, {
         oldBlocks,
