@@ -445,8 +445,8 @@ function tdom_boot(port, workdir, counters)
       if JOB then
         JOB.had_error = true
         JOB.error = tostring(status.lasterrorstring or 'unknown')
-      elseif SPARE.loading then
-        SPARE.failed = true -- (a font could not be loaded ahead: this spare asks for no more)
+      elseif SPARE.loading or SPARE.warming then
+        SPARE.failed = true -- (a font could not be loaded, or the warm-up stumbled: this spare does no more of either)
       end
       if os.getenv('TDOM_TRACE_ERRORS') then
         texio.write_nl('term and log', 'tdom: native error: ' .. tostring(status.lasterrorstring or 'unknown'))
@@ -1753,6 +1753,7 @@ function tdom_report()
       spareTouched = SPARE.touched,
       spareMs = SPARE.ms and math.floor(SPARE.ms * 100 + 0.5) / 100 or nil,
       fontsAhead = SPARE.ahead,
+      warmMs = SPARE.warmMs and math.floor(SPARE.warmMs * 100 + 0.5) / 100 or nil,
       -- epoch ms, to place the job between the orchestrator's own stamps
       -- (seconds and the fraction apart: the encoder keeps few digits)
       forkMs = T_RECV and T_FORKED and (T_FORKED - T_RECV) * 1000 or nil,
@@ -1836,7 +1837,7 @@ function tdom_report()
   conn:send('CKPT ' .. CKPT .. ' ' .. fk.getpid() .. ' ' .. (TDOM_GC_FLOOR or 0) .. ' ' .. gc_ms .. '\n')
   local keystroke, list = JOB.keystroke, JOB.fontList
   JOB = nil
-  SPARE.touched, SPARE.ms, SPARE.ahead, SPARE.base = nil, nil, nil, nil
+  SPARE.touched, SPARE.ms, SPARE.ahead, SPARE.base, SPARE.warmMs = nil, nil, nil, nil, nil
   if SPARE.on and keystroke then
     -- this job's pages are told to the next keystroke's spare (tdom_wait)
     SPARE.owed = true
@@ -2118,6 +2119,48 @@ local function font_load_lines(list)
   return lines
 end
 
+-- ---- the paragraph typeset once ahead of its keystroke
+--
+-- A job forked from a checkpoint typesets its paragraph with every cache
+-- cold: LuaTeX-ja's tables, the node allocator, Lua's strings. The same
+-- paragraph typeset a second time in the same process took a fraction of
+-- the time. So a spare, while it waits, typesets the characters of the
+-- paragraph its checkpoint's last keystroke sent (no command, brace, math
+-- shift, comment sign or active character: only characters TeX reads as
+-- letters, others and spaces) in a box it throws away, inside a group with
+-- \globaldefs=-1: every assignment, global or not, is undone at the end of
+-- the group, and no command of the paragraph runs. TDOM_NO_WARM=1 turns it off.
+local WARM = not os.getenv('TDOM_NO_WARM')
+local WARM_LIMIT = 6000 -- characters
+
+local function warm_text(body)
+  local ok, text = pcall(function()
+    local out, n, skip_name = {}, 0, false
+    for _, cp in utf8.codes(body) do
+      if n >= WARM_LIMIT then break end
+      local cat = tex.getcatcode(cp)
+      if skip_name and cat == 11 then
+        -- the rest of a command's name
+      else
+        skip_name = false
+        if cat == 0 then
+          skip_name = true
+        elseif cat == 11 or cat == 12 then
+          n = n + 1
+          out[n] = utf8.char(cp)
+        elseif cat == 10 or cat == 5 then
+          if n > 0 and out[n] ~= ' ' then
+            n = n + 1
+            out[n] = ' '
+          end
+        end
+      end
+    end
+    return table.concat(out, '', 1, n)
+  end)
+  return ok and text:find('%S') and text or nil
+end
+
 -- In a spare continuation: wait for the job. Returns its JOB line and body;
 -- or nothing, having handed TeX the fonts to load first (tdom_wait comes
 -- back here through SPARE.resume).
@@ -2127,6 +2170,24 @@ local function spare_serve(rfd)
     SPARE.loading = nil
     SPARE.ahead = font.max() - SPARE.base
     font_specs_since(SPARE.base) -- (described now, not while the job's report waits)
+  end
+  if SPARE.warming then
+    SPARE.warming = nil
+    SPARE.warmMs = (os.gettimeofday() - SPARE.warmAt) * 1000
+  elseif WARM and SPARE.warmBody and not SPARE.failed and not SPARE.loading then
+    -- the paragraph once, ahead of its keystroke (fonts first: the job's own
+    -- loading of them would differ from a warm-up's)
+    local fonts_waiting = SPARE.fonts and fk.fonts_get(CKPT + 1, SPARE.fontSeq) ~= nil
+    if not fonts_waiting then
+      local text = warm_text(SPARE.warmBody)
+      SPARE.warmBody = nil
+      if text then
+        SPARE.resume, SPARE.warming, SPARE.warmAt = rfd, true, os.gettimeofday()
+        WARM_TEXT = text
+        tex.print({ '\\begingroup\\globaldefs=-1\\relax\\setbox0=\\vbox{\\directlua{tex.sprint(-2, WARM_TEXT)}\\par}\\endgroup' })
+        return nil
+      end
+    end
   end
   while true do
     local message, touched, ms = fk.spare_wait(rfd, SPARE.fonts and CKPT + 1 or -1, SPARE.fontSeq)
@@ -2268,6 +2329,8 @@ function tdom_wait()
       local wedge = take_wedge_fault()
       -- a keystroke's job goes to the spare continuation when there is one
       local sparable = SPARE.on and cmd == 'JOB' and key == 'K' and not wedge
+      -- (and the next spare typesets its characters once ahead: warm_text)
+      if sparable and not handed_body then SPARE.warmBody = body end
       local pid
       if handed_body then
         pid = 0 -- this process is that continuation

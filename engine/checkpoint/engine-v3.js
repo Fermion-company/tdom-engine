@@ -2212,6 +2212,14 @@ export class CheckpointEngine {
         this.updating = true;
         this.bgAbort = false;
         this.updateSeq++;
+        // A table of contents queued while the typing paused goes back to
+        // being owed: pending in front of the paragraph typed in, it sent
+        // every keystroke until it finished back to verifying the paragraph
+        // after it first (update-typeset-phase.js deferToc).
+        if (keystroke && this.pendingChain?.tocOnly) {
+          this.pendingChain = null;
+          this.tocOwed = true;
+        }
         try {
           preemptResidentRenders(this);
           return await this.#updateInner({ ...args, announceDocumentReset });
@@ -3087,6 +3095,7 @@ export class CheckpointEngine {
     }
     cur.kind = cur.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle';
     delete cur.plainBlockId;
+    delete cur.tocOnly; // (it carries other work now)
     // A clean island before another pending frontier cannot prove that
     // later propagation finished. Keep both ends when merging requests.
     cur.through = Math.max(cur.from, cur.through ?? cur.from, through);
@@ -3151,7 +3160,11 @@ export class CheckpointEngine {
       queueOwedToc: () => {
         const consumer = this.blocks.findIndex((block) => block.consumesToc);
         if (consumer < 0) this.tocOwed = false;
-        else this.#queueChainWork('settle', consumer, []);
+        else {
+          this.#queueChainWork('settle', consumer, []);
+          // (only the table of contents: a keystroke hands it back, #update)
+          if (this.pendingChain && !this.pendingChain.carry) this.pendingChain.tocOnly = true;
+        }
       },
       queueGrid: () => {
         if (process.env.TDOM_GRID_FILL === '0') return false;

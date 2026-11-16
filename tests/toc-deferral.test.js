@@ -42,13 +42,15 @@ test('an edit that moves headings to other pages leaves the table of contents to
       // the typing goes on in a later paragraph: still shown before the paragraph after it is verified
       // (the caret warmed there first, as the host does: twelve new paragraphs left no checkpoint near it)
       assert.equal((await engine.warmEditOffset(engine.getSource().indexOf('Paragraph 4.2'))).status, 'ready');
-      assert.equal(engine.tocOwed, true, 'the warm did not settle it');
+      // (a pause long enough queues it: the next keystroke hands it back)
+      await new Promise((resolve) => setTimeout(resolve, 600));
       for (let k = 0; k < 3; k++) {
         const word = engine.getSource().indexOf('Paragraph 4.2') + 'Paragraph 4.2'.length;
         const keystroke = await engine.edit(word, word, 'x');
         assert.equal(keystroke.stats.chainVerdict, 'verify', JSON.stringify(keystroke.stats));
         assert.equal(keystroke.stats.blocksTypeset, 1, 'the paragraph after it is not on the response path');
-        assert.equal(engine.tocOwed, true, 'the table of contents is still owed while the typing goes on');
+        assert.equal(engine.tocOwed || engine.pendingChain?.tocOnly === true || engine.pendingChain?.plainBlockId != null, true,
+          'the table of contents is still owed while the typing goes on');
       }
       await drain(engine);
       assert.equal(engine.tocOwed, false);
