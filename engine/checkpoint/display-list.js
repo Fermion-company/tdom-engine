@@ -165,7 +165,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
   }
   const dl = { page: page.number, commands };
   dl.hash = fnv1a(JSON.stringify(commands));
-  dl.hfSig = hfSig; // display lists built pre-header-job get rebuilt
+  dl.hfSig = hfSig; // this page's own head and foot: rebuilt when they change (header-footer.js pageHfSig)
   return dl;
 }
 

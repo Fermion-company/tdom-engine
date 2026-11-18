@@ -1,5 +1,6 @@
 import { reconcile } from './pagebuilder.js';
 import { buildPagePatches } from './page-patches.js';
+import { pageHfSig } from './header-footer.js';
 
 export function asyncRepaginate(
   engine,
@@ -13,7 +14,7 @@ export function asyncRepaginate(
   // patches through the async channel (SSE)
   const rawPages = paginateNow();
   const { pages } = reconcile(rawPages, engine.pages);
-  const { patches } = buildPagePatches(pages, engine.pages, engine.hfSig, displayList);
+  const { patches } = buildPagePatches(pages, engine.pages, (page) => pageHfSig(engine.hf, page.number), displayList);
   engine.pages = pages;
   if (patches.length && engine.onAsyncPatches) {
     engine.rev++;

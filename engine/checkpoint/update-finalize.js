@@ -2,6 +2,7 @@ import { performance } from 'node:perf_hooks';
 import { reconcile } from './pagebuilder.js';
 import { nextEditHold, editPageRenderIds, focusRescueIds } from './update-helpers.js';
 import { buildPagePatches } from './page-patches.js';
+import { pageHfSig } from './header-footer.js';
 import { buildUpdateResponse } from './update-response.js';
 import { residentPaintable } from './ship-pacing.js';
 
@@ -31,7 +32,7 @@ export function finalizeUpdate(engine, {
   const pagesRaw = paginateNow();
   const prevPageCount = engine.pages.length;
   const { pages, reused, rebuilt } = reconcile(pagesRaw, engine.pages);
-  const { patches, dirtyPages } = buildPagePatches(pages, engine.pages, engine.hfSig, displayList);
+  const { patches, dirtyPages } = buildPagePatches(pages, engine.pages, (page) => pageHfSig(engine.hf, page.number), displayList);
   if (!advanceSrcRev) {
     // A cold resume owes the keystroke its page: when another walk already
     // typeset the block and published the page through the async channel,

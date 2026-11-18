@@ -1,9 +1,13 @@
+// `hfSig`: the header/footer signature a page's display list must have been
+// built with to be kept, as a function of the page (header-footer.js
+// pageHfSig) or one value for every page.
 export function buildPagePatches(pages, prevPages, hfSig, displayList) {
   const prevHashes = new Map(prevPages.map((p) => [p.number, p.dl?.hash]));
   const patches = [];
   const dirtyPages = [];
+  const sigOf = typeof hfSig === 'function' ? hfSig : () => hfSig;
   for (const page of pages) {
-    if (!page.dl || page.dl.hfSig !== hfSig) page.dl = displayList(page);
+    if (!page.dl || page.dl.hfSig !== sigOf(page)) page.dl = displayList(page);
     if (page.dl.hash !== prevHashes.get(page.number)) {
       dirtyPages.push(page.number);
       patches.push({ type: 'replace-page', page: page.number, displayList: page.dl });

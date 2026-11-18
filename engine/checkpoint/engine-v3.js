@@ -106,6 +106,7 @@ import {
   verifyAgainstCanonical as verifyAgainstCanonicalHelper,
 } from './canonical-arrival.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
+import { pageHfSig } from './header-footer.js';
 import { adoptGalleyBlock, exactFallbackEligible, exitStateVec } from './galley-adoption.js';
 import { cropRenderTargets } from './render-chunks.js';
 import { checkpointBudgetFor, checkpointKeepSet, memoryCheckpointCeiling, nearestCheckpoint,
@@ -3401,7 +3402,7 @@ export class CheckpointEngine {
       geometry: this.geometry,
       chunks: this.chunks,
       hf: this.hf,
-      hfSig: this.hfSig,
+      hfSig: pageHfSig(this.hf, page.number),
       fonts: this.fonts,
       twinMetrics: this.twinMetrics,
     });

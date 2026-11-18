@@ -227,6 +227,12 @@ label が動いたとき、後方で定義された label を前方 block が参
 
 `toc` は provisional pagination から `.toc` 内容を合成し、hash が動けば toc consumer block を再組版する。最大 3 pass である。chain work が pending のときは、`#chainAfterPass()` 側で同じ処理を行う。編集（boot・reboot・retry 以外）で目次が動いたときは、編集した block の載るページに目次が無ければ、この場で組み直さず `engine.tocOwed` を立てる（`deferToc`）。scheduler は打鍵が止まって quiet gate を過ぎてから目次の block から settle を積み、`#chainAfterPass()` が同じ固定点を回して公開する。すぐ積まないのは、編集 block より前から始まる chain work が pending だと、以後の打鍵が prose keystroke として扱われず、後ろの block の検証を待ってから見せることになるため。非同期の再ページ割りが見つけた目次のずれも同じく owed にする。`#chainAfterPass()` は目次の block を組み直し終えてから `tocHash` を更新する（途中で打鍵に止められたら、次の pass がもう一度組む）。打鍵が止まって積まれた目次だけの settle（`tocOnly`）は、終わる前に打鍵が来れば owed に戻す（積まれたままだと、以後の打鍵はまた後ろの段落の検証を待つ）。打鍵が続いている間（最後の打鍵から 300 ms 以内）に期限切れで始まった pass も、目次は組まずに owed にして残す（目次の組み直しは本で 0.5 s かかり、打鍵の合間ごとに始まっては次の打鍵に止められていた）。prose keystroke の判定は、labels の無い after 段の settle（残りは目次だけで、`plainBlockId` が残っていれば後ろの段落は変わらなかった）を妨げにしない。72 ページの本で行が 1 行増える打鍵は、見出しが次のページへ移って目次の組み直しに 0.5〜3.7 s かかり、後ろの打鍵もそれを待っていた。
 
+## 10.7a 柱とノンブルの job が届いたとき
+
+見出しが別のページへ移る、ページ数が変わる、といった編集のあとは、柱とノンブルを組む job（`header-scheduler.js`）が走り、届くと `asyncRepaginate` が display list を作り直す。作り直すのは、**そのページ自身の柱・ノンブルが変わったページだけ**である（`header-footer.js` の `pageHfSig`。ページの display list は `dl.hfSig` に自分のページの entry の署名を持ち、`buildPagePatches` はそれが変わったページだけを組み直す）。
+
+以前は map 全体の署名で比べていたため、job が届くたびに全ページの display list を、打鍵を受けるスレッドの上で一度に作り直していた（72 ページの本で 20〜45 ms。柱が変わったのは数ページ）。段落に 1 行足す打鍵のたびに起きる。最初の job（open 直後。全ページが仮のノンブルから本物の柱へ変わる）は今も全ページを作り直す。
+
 ## 10.8 page-context rescue
 
 非同期 rescue の採択で後続の galley が変わった場合、その block の exact render も再予約する。旧 galley の描画が先に完了していても、修正された段落・数式・脚注の chunk を現在の galley 世代で作り直す。
