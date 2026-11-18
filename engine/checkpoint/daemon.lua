@@ -315,22 +315,98 @@ local function jglyph(r)
     ',"x":' .. jnum(x) .. '}'
 end
 local RULE_NUMBERS = { 'dy', 'h', 'rd', 'rh', 'ri', 'rl', 'rr', 'rs', 'rv', 'rw', 'w', 'x' }
-local function jrule(r)
+local function rule_shape(r)
   local count = 0
   for _ in pairs(r) do count = count + 1 end
-  if count ~= 16 then return nil end
-  local c, ra, rdir = r.c, r.ra, r.rdir
-  if type(c) ~= 'string' or type(ra) ~= 'string' or type(rdir) ~= 'string' then return nil end
+  if count ~= 16 then return false end
+  if type(r.c) ~= 'string' or type(r.ra) ~= 'string' or type(r.rdir) ~= 'string' then return false end
   for i = 1, #RULE_NUMBERS do
-    if type(r[RULE_NUMBERS[i]]) ~= 'number' then return nil end
+    if type(r[RULE_NUMBERS[i]]) ~= 'number' then return false end
   end
+  return true
+end
+local function jrule(r)
+  if not rule_shape(r) then return nil end
+  local c, ra, rdir = r.c, r.ra, r.rdir
   return '{"c":' .. jstr(c) .. ',"dy":' .. jnum(r.dy) .. ',"h":' .. jnum(r.h) .. ',"ra":' .. jstr(ra) .. ',"rd":' .. jnum(r.rd) ..
     ',"rdir":' .. jstr(rdir) .. ',"rh":' .. jnum(r.rh) .. ',"ri":' .. jnum(r.ri) .. ',"rl":' .. jnum(r.rl) ..
     ',"rr":' .. jnum(r.rr) .. ',"rs":' .. jnum(r.rs) .. ',"rule":true,"rv":' .. jnum(r.rv) .. ',"rw":' .. jnum(r.rw) ..
     ',"w":' .. jnum(r.w) .. ',"x":' .. jnum(r.x) .. '}'
 end
 
-local function jput(out, n, v)
+-- ---- rules on the wire
+--
+-- LuaTeX-ja puts an empty rule between every two characters, and each one
+-- travels with the raw evidence the engine certifies it by (RuleRunV2: 16
+-- fields, among them the node's whole attribute list): 60 % of the bytes of
+-- a Japanese paragraph's galley, 115 rules of 235 bytes in a four-line one,
+-- alike but for where they stand and, in two to five kinds a line, for one
+-- attribute (the character class). In a galley sent to the engine
+-- (jenc_wire) a rule that differs from a whole rule written earlier in its
+-- run list in nothing but x is written as {"rq":[j,x]}, j counting the whole
+-- rules of that list from 0; the engine puts the whole rule back as it reads
+-- the message (rule-pack.js), so every run it sees, hashes and proves with
+-- is what it was. jenc itself writes the reference bytes as before.
+-- TDOM_NO_RULE_PACK=1 sends every rule whole.
+local PACK_RULES = not os.getenv('TDOM_NO_RULE_PACK')
+local PACKING = false -- inside jenc_wire
+local RULE_SAME = { 'ra', 'dy', 'h', 'c', 'rd', 'rdir', 'rh', 'ri', 'rl', 'rr', 'rs', 'rv', 'rw', 'w' }
+local RULE_LOOK_BACK = 8 -- whole rules of the list a short form is looked for among
+local function same_rule(a, b)
+  for i = 1, #RULE_SAME do
+    local k = RULE_SAME[i]
+    local x, y = a[k], b[k]
+    -- (the same bytes on the wire: 5 and 5.0 are, 0.0 and -0.0 are not)
+    if x ~= y or (x == 0 and 1 / x ~= 1 / y) then return false end
+  end
+  return true
+end
+
+local jput
+local function jruns(out, n, runs)
+  n = n + 1
+  out[n] = '['
+  -- the rules written whole so far, in order (false: one no short form may stand for)
+  local whole, count = {}, 0
+  for i = 1, #runs do
+    if i > 1 then
+      n = n + 1
+      out[n] = ','
+    end
+    local r = runs[i]
+    if type(r) == 'table' and r.rule == true then
+      if not rule_shape(r) then
+        count = count + 1
+        whole[count] = false
+        n = jput(out, n, r)
+      else
+        local found = nil
+        for j = count, count > RULE_LOOK_BACK and count - RULE_LOOK_BACK + 1 or 1, -1 do
+          local p = whole[j]
+          if p and same_rule(r, p) then
+            found = j
+            break
+          end
+        end
+        n = n + 1
+        if found then
+          out[n] = '{"rq":[' .. (found - 1) .. ',' .. jnum(r.x) .. ']}'
+        else
+          count = count + 1
+          whole[count] = r
+          out[n] = jrule(r)
+        end
+      end
+    else
+      n = jput(out, n, r)
+    end
+  end
+  n = n + 1
+  out[n] = ']'
+  return n
+end
+
+function jput(out, n, v)
   local t = type(v)
   if t == 'number' then
     n = n + 1
@@ -387,7 +463,12 @@ local function jput(out, n, v)
         local k = keys[i]
         n = n + 1
         out[n] = i > 1 and (',' .. jkey(k)) or jkey(k)
-        n = jput(out, n, v[k])
+        local value = v[k]
+        if PACKING and k == 'runs' and type(value) == 'table' and (value[1] ~= nil or next(value) == nil) then
+          n = jruns(out, n, value)
+        else
+          n = jput(out, n, value)
+        end
       end
       n = n + 1
       out[n] = '}'
@@ -400,8 +481,20 @@ local function jput(out, n, v)
 end
 
 local function jenc(v)
+  PACKING = false
   local out = {}
   jput(out, 0, v)
+  return table.concat(out)
+end
+
+-- A galley for the engine: jenc's bytes, with the rules of each run list
+-- written short where they repeat (see "rules on the wire").
+local function jenc_wire(v)
+  PACKING = PACK_RULES
+  local out = {}
+  local ok, err = pcall(jput, out, 0, v)
+  PACKING = false
+  if not ok then error(err, 0) end
   return table.concat(out)
 end
 
@@ -873,7 +966,17 @@ end
 -- RuleRunV2 retains the raw LuaTeX evidence that `rule=true` used to erase.
 -- In particular subtype=3 is empty_rule in certified LuaTeX PDF profiles:
 -- it participates in layout but the production backend emits no paint.
+-- (Nodes with the same attributes share one attribute list, and the empty
+-- rules of a paragraph all do: the signature is kept by list for the length
+-- of one walk, during which no list is made or freed.)
+local ATTR_SIG = {}
+local attr_list_of = node.direct and node.direct.getattributelist and node.direct.todirect and function(n)
+  return node.direct.getattributelist(node.direct.todirect(n))
+end or nil
 local function rule_attr_signature(n)
+  local list = n and attr_list_of and attr_list_of(n) or nil
+  local kept = list and ATTR_SIG[list]
+  if kept then return kept end
   local parts = {}
   local a = n and n.attr
   if a and a.id ~= ATTRIBUTE then a = a.next end -- skip attribute_list head
@@ -881,7 +984,9 @@ local function rule_attr_signature(n)
     parts[#parts + 1] = tostring(a.number or 0) .. ':' .. tostring(a.value or 0)
     a = a.next
   end
-  return table.concat(parts, ',')
+  local sig = table.concat(parts, ',')
+  if list then ATTR_SIG[list] = sig end
+  return sig
 end
 
 local function rule_run(n, x, dy, effective_w, effective_h, effective_d, color)
@@ -1552,6 +1657,7 @@ function tdom_float(n, placement, ftype)
   local box = tex.box[TDOM_FLOATBOX]
   if not box then return end
   colstack = {}
+  ATTR_SIG = {}
   local saved_gfx = blk_gfx
   blk_gfx = false
   local saved_marks = pending_fmarks
@@ -1625,6 +1731,7 @@ function tdom_hf_box(boxnum, page, which)
   local box = tex.box[boxnum]
   if not box then return end
   colstack = {}
+  ATTR_SIG = {}
   local saved_marks = pending_fmarks
   pending_fmarks = {}
   local items = extract_items(box.list, box)
@@ -1699,6 +1806,7 @@ function tdom_report()
   local TR0 = os.gettimeofday and os.gettimeofday() or os.clock()
   local head = harvest_nodes()
   colstack = {}
+  ATTR_SIG = {}
   pending_fmarks = {}
   top_epochs = {}
   local items = extract_items(head, nil)
@@ -1782,7 +1890,7 @@ function tdom_report()
   -- ("<size in sp> <name>" lines)
   local font_list = SPARE.fonts and JOB.fontBase and font_specs_since(JOB.fontBase) or nil
   JOB.fontList = font_list
-  local payload = jenc({
+  local payload = jenc_wire({
     tm = tm,
     -- this job ran in a spare continuation: pages it read ahead, fonts it loaded ahead
     spare = SPARE.touched and { pages = SPARE.touched, fonts = SPARE.ahead or 0 } or nil,

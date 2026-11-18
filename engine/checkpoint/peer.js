@@ -1,3 +1,5 @@
+import { holdsPackedRules, unpackRuleRuns } from './rule-pack.js';
+
 const TRACE_JOB = !!process.env.TDOM_TRACE_JOB;
 
 export class Peer {
@@ -36,6 +38,7 @@ export class Peer {
         let json = null;
         try {
           json = JSON.parse(payload);
+          if (holdsPackedRules(payload)) unpackRuleRuns(json);
           if (TRACE_JOB && kind === 'GALLEY' && json.tm) {
             json.tm.headerAt = headerAt;
             json.tm.parsedAt = performance.timeOrigin + performance.now();

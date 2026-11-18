@@ -198,6 +198,15 @@ exact 画素の要る block（`needsRender`）を編集すると、render pump �
 
 一覧は系統全体で 1 つ（最後に打った段落のもの）である。font の使用を消しても、その段落で打ち続ける間は一覧に残る。予備の子は先読みした font を自分のメモリに持つ（和文 1 書体で 10〜20 MB）。
 
+## 10.4e galley の中の空の罫の送り方
+
+LuaTeX-ja は和文の文字と文字の間に空の罫（`empty_rule`、幅 0）を 1 つずつ置く。daemon はそれを 1 つずつ、engine が「描かれない」と証明するための生の証拠（RuleRunV2: 16 項目。node の属性の一覧 `ra` を含む）付きで送る。和文の段落の galley の bytes の 6 割がこれである（4 行の段落で 45 KB 中 27 KB。文字の run は 15 KB）。1 行の中の罫は場所 `x` と属性の 1 項目（文字クラス）だけが違い、2〜5 種類が交互に並ぶ。
+
+- engine へ送る galley（`jenc_wire`）では、同じ run の一覧の中で先に丸ごと書いた罫と `x` 以外が同じ罫を `{"rq":[j,x]}` と書く（`j` はその一覧の中で丸ごと書いた罫を 0 から数えた番号。直近 8 個から探す）。engine は message を読んだその場で（`peer.js` → `rule-pack.js`）罫を丸ごとに戻す。項目も並びも同じなので、galley の hash、layout witness、証明は丸ごと送ったときと同じになる。`jenc` 自体の bytes（reference encoder と一致）は変えていない。`TDOM_NO_RULE_PACK=1` で全部を丸ごと送る。
+- 属性の一覧の署名（`rule_attr_signature`）は、1 回の walk の間、属性 list ごとに覚える（同じ属性の node は list を共有する）。
+
+72 ページの本の 4 行の段落で、送る bytes は 44.6 → 22.9 KB、2 行の地の文で 34.3 → 16.1 KB。子の中の時間は encode で約 0.2 ms、harvest で 0.5〜0.8 ms 減る。罫そのものを daemon で捨てれば約 3 ms 減るが、`stableRunLayoutRecord` が layout witness に空の罫を含めている（`run-semantics.js`）ので捨てない。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。
