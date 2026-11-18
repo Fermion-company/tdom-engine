@@ -33,6 +33,10 @@ export function provisionalViewer(pages, canonicalCount = pages.length) {
     deferredDirectPresentationEvents: [], canonicalAnchorPreview: null, canonicalAnchorPendingPatch: null,
     directPresentationBlocked: () => false, ensureOpaqueBatchEditorTargetPage: () => true,
     captureDirectEditorPageScroll() {}, applyStagedDirectEditor() {}, scheduleViewportWarm() {},
+    scheduleChunkPrefetch() {}, // (pictures are not fetched here)
+    // every page is in sight: a page out of sight does not hold a commit
+    // (app.js pagesInSight), and these transactions are about the ones that do
+    pagesEl: { getBoundingClientRect: () => ({ top: 0, bottom: 1e9, left: 0, width: 600, height: 1e9 }) },
     updateCanonState() {}, fulfillCanonicalDisplay() {}, updateBadge() {}, traceStage() {},
     demands: [], requestCanonicalDisplay(options) { state.demands.push(options); },
     queueMicrotask: fn => fn(),
@@ -46,6 +50,7 @@ export function provisionalViewer(pages, canonicalCount = pages.length) {
           return null;
         },
         querySelectorAll: () => [],
+        getBoundingClientRect: () => ({ top: (n - 1) * 820, bottom: (n - 1) * 820 + 800, left: 0, width: 600, height: 800 }),
         append(...nodes) { this.paper = nodes; }, remove() { this.isConnected = false; },
       });
       return state.pageDivs.get(n);
