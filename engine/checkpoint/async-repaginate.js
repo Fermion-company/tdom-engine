@@ -12,9 +12,17 @@ export function asyncRepaginate(
   if (engine.mode !== 'structured') return;
   // rebuild display lists after async galley/chunk arrivals and push
   // patches through the async channel (SSE)
+  // (what each part took, for a caller that traces it: header-scheduler.js TDOM_TRACE_HF)
+  const startedAt = performance.now();
   const rawPages = paginateNow();
   const { pages } = reconcile(rawPages, engine.pages);
-  const { patches } = buildPagePatches(pages, engine.pages, (page) => pageHfSig(engine.hf, page.number), displayList);
+  const paginatedAt = performance.now();
+  let built = 0;
+  const { patches } = buildPagePatches(pages, engine.pages, (page) => pageHfSig(engine.hf, page.number), (page) => {
+    built++;
+    return displayList(page);
+  });
+  const builtAt = performance.now();
   engine.pages = pages;
   if (patches.length && engine.onAsyncPatches) {
     engine.rev++;
@@ -23,6 +31,7 @@ export function asyncRepaginate(
     // client never paints the patch through a browser fallback font.
     engine.onAsyncPatches({ rev: engine.rev, fonts: engine.getFontManifest(), patches });
   }
+  const sentAt = performance.now();
   // toc drift: an async landing (header job, rescue offsets, chunk
   // adoption) moved provisional page numbers AFTER the last toc pass —
   // the \tableofcontents blocks would keep printing the older numbers
@@ -39,4 +48,9 @@ export function asyncRepaginate(
       scheduleBackground(consumer, []);
     }
   }
+  return {
+    pages: pages.length, built, patches: patches.length,
+    paginateMs: paginatedAt - startedAt, buildMs: builtAt - paginatedAt, sendMs: sentAt - builtAt,
+    tocMs: performance.now() - sentAt,
+  };
 }

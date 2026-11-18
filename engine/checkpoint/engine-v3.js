@@ -3256,7 +3256,7 @@ export class CheckpointEngine {
   }
 
   #asyncRepaginate() {
-    asyncRepaginateHelper(this, {
+    return asyncRepaginateHelper(this, {
       paginateNow: () => this.#paginateNow(),
       displayList: (page) => this.#displayList(page),
       computeToc: (pages) => this.#computeToc(pages),
