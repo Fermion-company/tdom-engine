@@ -61,6 +61,7 @@ import {
 } from './engine/project-bibliography.js';
 import { isPathInside } from './engine/project-inputs.js';
 import { serializeDomBlock } from './engine/checkpoint/inspector.js';
+import { textSplice } from './engine/text-splice.js';
 import { fnv1a } from './engine/hash.js';
 import { pdfPageSvgArgs } from './engine/checkpoint/util/svg.js';
 
@@ -539,12 +540,32 @@ function cacheDomBeforeNext() {
 const domEarlier = []; // serializations before domCache's, newest last
 let domStamp = 0;
 let domServed = null; // the serialization last handed to a viewer (kept whatever was made since)
+// The text of every source file travels in the snapshot. It was serialized
+// again for every file with every keystroke, and the file typed in was sent
+// whole (a single-file document of 190 pages: 290,000 characters to the
+// viewer with each key). A file whose text is the one serialized before
+// keeps that serialization, and a change goes out as the stretch that came
+// and went (domDeltaBody; the viewer holds the text before it).
+// TDOM_NO_SOURCE_SPLICE=1: every changed file whole, as before.
+const NO_SOURCE_SPLICE = !!process.env.TDOM_NO_SOURCE_SPLICE;
+const sourceJsonKept = new Map(); // file -> { text, json }
+function sourceJson(source) {
+  const plain = typeof source?.file === 'string' && typeof source.text === 'string' && Object.keys(source).length === 2;
+  const kept = plain ? sourceJsonKept.get(source.file) : null;
+  if (kept && kept.text === source.text) return kept.json;
+  const json = JSON.stringify(source);
+  if (plain) {
+    if (sourceJsonKept.size > 2048) sourceJsonKept.clear();
+    sourceJsonKept.set(source.file, { text: source.text, json });
+  }
+  return json;
+}
 function serializeDom(payload) {
   const { blocks = [], sources = [], ...rest } = payload;
   const order = blocks.map((block) => String(block.id));
   const blockText = blocks.map(serializeDomBlock);
   const files = sources.map((source) => source.file);
-  const sourceText = sources.map((source) => JSON.stringify(source));
+  const sourceText = sources.map(sourceJson);
   const tail = JSON.stringify(rest).slice(1); // `"rev":…}`
   const unique = new Set(order).size === order.length;
   const stamp = ++domStamp;
@@ -554,6 +575,8 @@ function serializeDom(payload) {
     // (the blocks themselves, to tell one that only moved: domDeltaBody)
     raw: new Map(order.map((id, i) => [id, blocks[i]])),
     sources: new Map(files.map((file, i) => [file, sourceText[i]])),
+    // (the texts themselves, to send a change of one as a splice: domDeltaBody)
+    texts: new Map(sources.map((source) => [source.file, Object.keys(source).length === 2 ? source.text : null])),
     // the whole document as one string, only for a viewer that holds no earlier one
     get body() {
       const body = `{"domStamp":${stamp},"blocks":[${blockText.join(',')}],"sources":[${sourceText.join(',')}]${tail.length > 1 ? ',' : ''}${tail}`;
@@ -620,7 +643,15 @@ function domDeltaBody(parts, base) {
     }
     else blocks.push(text);
   }
-  const sources = parts.files.filter((file) => earlier.sources.get(file) !== parts.sources.get(file)).map((file) => parts.sources.get(file));
+  const sources = parts.files.filter((file) => earlier.sources.get(file) !== parts.sources.get(file)).map((file) => {
+    const before = NO_SOURCE_SPLICE ? null : earlier.texts?.get(file);
+    const after = parts.texts?.get(file);
+    if (typeof before !== 'string' || typeof after !== 'string') return parts.sources.get(file);
+    const [at, gone, came] = textSplice(before, after);
+    // (worth it only when the change is a small part of the file)
+    if (came.length * 2 + 64 >= after.length) return parts.sources.get(file);
+    return `{"file":${JSON.stringify(file)},"splice":[${at},${gone},${JSON.stringify(came)}]}`;
+  });
   return `{"domStamp":${parts.stamp},"delta":{"base":${base}},"order":${JSON.stringify(parts.order)},"files":${JSON.stringify(parts.files)},` +
     `"blocks":[${blocks.join(',')}],"moved":[${moved.join(',')}],"sources":[${sources.join(',')}]${parts.tail.length > 1 ? ',' : ''}${parts.tail}`;
 }

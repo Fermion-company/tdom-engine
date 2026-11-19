@@ -4046,7 +4046,15 @@ function applySnapshotDelta(base, delta) {
     blocks.push(next);
   }
   const sourceByFile = new Map((base.sources ?? []).map(source => [source.file, source]));
-  for (const source of delta.sources ?? []) sourceByFile.set(source.file, source);
+  for (const source of delta.sources ?? []) {
+    if (!Array.isArray(source.splice)) { sourceByFile.set(source.file, source); continue; }
+    // (the file's text as a change of the text held: where, how many characters go, what comes)
+    const held = sourceByFile.get(source.file);
+    const [at, gone, came] = source.splice;
+    if (typeof held?.text !== 'string' || typeof came !== 'string' || !Number.isSafeInteger(at) || !Number.isSafeInteger(gone) ||
+        at < 0 || gone < 0 || at + gone > held.text.length) return null;
+    sourceByFile.set(source.file, { ...held, text: held.text.slice(0, at) + came + held.text.slice(at + gone) });
+  }
   const sources = [];
   for (const file of delta.files ?? []) {
     const source = sourceByFile.get(file);

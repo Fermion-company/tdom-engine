@@ -246,3 +246,42 @@ test('the viewer keeps the elements of the lines a keystroke did not change', as
   assert.equal(viewer.patch(svgOf(['a']), parts(['a']), svgOf(['b']), parts(['b'])), false, 'switched off');
   assert.equal(viewer.cut(parts(['a']), parts(['b'])), null);
 });
+
+test('a changed source file goes to the viewer as the stretch that came and went', async () => {
+  const { textSplice } = await import('../engine/text-splice.js');
+  const apply = (before, [at, gone, came]) => before.slice(0, at) + came + before.slice(at + gone);
+  const long = 'あいうえお\n'.repeat(40_000); // longer than one comparison step
+  const cases = [
+    ['', ''], ['abc', 'abc'], ['', 'abc'], ['abc', ''], ['abc', 'abXc'], ['abXc', 'abc'], ['aaa', 'aa'], ['aa', 'aaa'],
+    ['abcabc', 'abc'], ['xyz', 'abc'], ['head mid tail', 'head MID tail'],
+    [long, long.slice(0, 123_457) + 'か' + long.slice(123_457)],
+    [long, long.slice(0, 70_000) + long.slice(70_003)],
+    [long + 'x', 'y' + long], [long, long + long],
+  ];
+  for (const [before, after] of cases) {
+    const splice = textSplice(before, after);
+    assert.equal(apply(before, splice), after);
+    assert.ok(splice[0] >= 0 && splice[1] >= 0 && splice[0] + splice[1] <= before.length);
+  }
+  // one typed character: one character, wherever it is
+  assert.deepEqual(textSplice(long, long.slice(0, 123_457) + 'か' + long.slice(123_457)), [123_457, 0, 'か']);
+  assert.deepEqual(textSplice('abc', 'abc'), [3, 0, '']);
+
+  // and the viewer puts it into the text it holds; a splice it cannot place asks for the whole snapshot
+  const { readFileSync } = await import('node:fs');
+  const vm = (await import('node:vm')).default;
+  const app = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const start = app.indexOf('function applySnapshotDelta(');
+  const viewer = { snapshotBlockIndex: new WeakMap() };
+  vm.createContext(viewer);
+  vm.runInContext(app.slice(start, app.indexOf('\n}\n', start) + 3) + '\nthis.apply = applySnapshotDelta;', viewer);
+  const base = { domStamp: 1, blocks: [{ id: 'b1', index: 0 }], sources: [{ file: '/d/a.tex', text: 'head mid tail' }, { file: '/d/b.tex', text: 'other' }] };
+  const delta = (sources) => ({ domStamp: 2, delta: { base: 1 }, order: ['b1'], files: ['/d/a.tex', '/d/b.tex'], blocks: [], moved: [], sources });
+  const next = viewer.apply(base, delta([{ file: '/d/a.tex', splice: textSplice('head mid tail', 'head MID tail!') }]));
+  assert.deepEqual(JSON.parse(JSON.stringify(next.sources)), [{ file: '/d/a.tex', text: 'head MID tail!' }, { file: '/d/b.tex', text: 'other' }]);
+  assert.equal(next.sources[1], base.sources[1], 'a file that did not change is the object held');
+  assert.equal(viewer.apply(base, delta([{ file: '/d/a.tex', splice: [5, 100, 'x'] }])), null, 'past the end of the text held');
+  assert.equal(viewer.apply(base, delta([{ file: '/d/c.tex', splice: [0, 0, 'x'] }])), null, 'a file the viewer does not hold');
+  const whole = viewer.apply(base, delta([{ file: '/d/a.tex', text: 'all new' }]));
+  assert.equal(whole.sources[0].text, 'all new', 'a file sent whole is taken whole, as before');
+});

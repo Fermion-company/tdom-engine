@@ -49,13 +49,24 @@ export function editPageRenderIds(blocks, pages, dirtySource) {
   // something every page carries (the running head's source): counted as a
   // block it tied the whole chapter to the edited page, and each keystroke
   // replayed from the chapter's first picture.
-  const real = new Set(blocks.map(block => block.id));
-  const idsOf = page => (page.draw ?? []).map(draw => draw.u?.blockId).filter(id => real.has(id));
+  // (every page of the document is looked at with every keystroke: no list
+  // is built for a page that holds none of the blocks asked about, and the
+  // set of the document's blocks only once one does. 191 pages of 41 lines:
+  // 1.8 ms a keystroke as two lists a page.)
+  let real = null;
+  const isReal = id => (real ??= new Set(blocks.map(block => block.id))).has(id);
+  const holdsOneOf = (page, ids) => {
+    for (const draw of page.draw ?? []) {
+      const id = draw.u?.blockId;
+      if (id != null && ids.has(id) && isReal(id)) return true;
+    }
+    return false;
+  };
+  const idsOf = page => (page.draw ?? []).map(draw => draw.u?.blockId).filter(id => isReal(id));
   const nearby = new Set();
   for (const page of pages) {
-    const ids = idsOf(page);
-    if (!ids.some(id => dirtySource.has(id))) continue;
-    for (const id of ids) nearby.add(id);
+    if (!holdsOneOf(page, dirtySource)) continue;
+    for (const id of idsOf(page)) nearby.add(id);
   }
   // A block that runs over the page boundary ties the next page to this one:
   // the viewer shows both or neither. In a long document the boot leaves far
@@ -63,9 +74,8 @@ export function editPageRenderIds(blocks, pages, dirtySource) {
   // that neighbour held the page being typed on until the next canonical.
   const tied = new Set(nearby);
   for (const page of pages) {
-    const ids = idsOf(page);
-    if (!ids.some(id => nearby.has(id))) continue;
-    for (const id of ids) tied.add(id);
+    if (!holdsOneOf(page, nearby)) continue;
+    for (const id of idsOf(page)) tied.add(id);
   }
   return blocks.filter(block => tied.has(block.id) && block.needsRender).map(block => block.id);
 }

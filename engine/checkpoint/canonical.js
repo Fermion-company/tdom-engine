@@ -245,8 +245,20 @@ export class CanonicalRenderer {
     void this.prepareSyncTeXHelper();
   }
 
+  // The hash walks the whole root source. A keystroke asked for it twice
+  // (is the last generation the compile of this text? is the job that runs
+  // one of this text?): 4 ms of a keystroke in an 800 KB single file, and
+  // more with every page. Both questions are answered without it when the
+  // answer cannot be yes: a text of another length is not the text that was
+  // hashed (the lengths are kept with the hashes), and a job of another
+  // revision is not asked about at all (schedule).
   #sourceHash(source, inputEpoch = this.inputEpoch) {
-    return fnv1a(`${inputEpoch}\0${source}`);
+    const hash = fnv1a(`${inputEpoch}\0${source}`);
+    this.hashedLengths ??= new Map();
+    this.hashedLengths.delete(hash);
+    this.hashedLengths.set(hash, source.length);
+    if (this.hashedLengths.size > 64) this.hashedLengths.delete(this.hashedLengths.keys().next().value);
+    return hash;
   }
 
   compilationIdentity(source) {
@@ -365,6 +377,8 @@ export class CanonicalRenderer {
   /** True when `generation` is the exact compile of `source` under the current inputs. */
   #generationCurrent(generation, source) {
     if (!generation || typeof source !== 'string') return false;
+    const hashedLength = this.hashedLengths?.get(generation.srcHash);
+    if (hashedLength !== undefined && hashedLength !== source.length) return false;
     if (generation.srcHash !== this.#sourceHash(source, generation.inputEpoch)) return false;
     if (generation.inputEpoch === this.inputEpoch) return true;
     return this.#inputsUnchangedSince(generation);
@@ -1177,11 +1191,13 @@ export class CanonicalRenderer {
     // A Build lease is exempt: the Build import owns the pending job it
     // creates here (commitBuildGeneration), whatever is already running.
     // A baseline that already failed for these bytes is not compiled again.
-    const srcHash = this.#sourceHash(source);
-    if (!this.buildLease && !this.pendingJob && (
-      this.runningJob?.rev === rev && this.runningJob.srcHash === srcHash ||
-      !this.running && this.lastError?.rev === rev && this.lastError.srcHash === srcHash
-    )) return;
+    // (the hash only when a job of this very revision runs or failed)
+    const sameRunning = this.runningJob?.rev === rev;
+    const sameFailed = !this.running && this.lastError?.rev === rev;
+    if (!this.buildLease && !this.pendingJob && (sameRunning || sameFailed)) {
+      const srcHash = this.#sourceHash(source);
+      if (sameRunning && this.runningJob.srcHash === srcHash || sameFailed && this.lastError.srcHash === srcHash) return;
+    }
     const waiting = this.pendingJob;
     if (!this.buildLease && waiting && this.timer && waiting.rev === rev && waiting.inputEpoch === this.inputEpoch &&
         waiting.source === source) {

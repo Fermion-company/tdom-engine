@@ -224,7 +224,15 @@ function maskIgnored(source) {
   const at = (i) => (blank[i] && source[i] !== '\n' && source[i] !== '\r' ? ' ' : source[i]);
   for (const match of source.matchAll(LITERAL_RE)) mark(match.index, match.index + match[0].length);
 
+  // (only a percent sign or a backslash that is not blanked does anything
+  // here: the scan goes from one to the next instead of character by
+  // character. 800 KB of a single-file document cost 1.5 ms a keystroke.)
+  const next = /[%\\]/g;
   for (let i = 0; i < source.length; ) {
+    next.lastIndex = i;
+    const hit = next.exec(source);
+    if (!hit) break;
+    i = hit.index;
     const c = at(i);
     if (c === ' ') {
       i++;
@@ -384,10 +392,9 @@ export function collectDefinitions(source) {
   const defs = new Map();
   const spans = [];
   for (let i = 0; i < masked.length; ) {
-    if (masked[i] !== '\\') {
-      i++;
-      continue;
-    }
+    // (from backslash to backslash: nothing else starts a definition)
+    i = masked.indexOf('\\', i);
+    if (i < 0) break;
     const command = readControl(masked, i);
     if (!command) {
       i++;
@@ -963,16 +970,24 @@ function maskSpans(source, spans) {
 }
 
 function usedStructuralAliases(bodyInfo, defs) {
-  const source = maskSpans(bodyInfo.masked, bodyInfo.spans);
   const found = [];
+  // (a use is only ever recorded for a definition that may reach a sink:
+  // with none in the document there is nothing to look for)
+  let reaching = false;
+  for (const record of defs.values()) {
+    if (record?.may?.size) {
+      reaching = true;
+      break;
+    }
+  }
+  if (!reaching) return found;
+  const source = maskSpans(bodyInfo.masked, bodyInfo.spans);
   const exactMemo = new Map();
   const unresolvedMemo = new Map();
   const selfContainedMemo = new Map();
   for (let i = 0; i < source.length; ) {
-    if (source[i] !== '\\') {
-      i++;
-      continue;
-    }
+    i = source.indexOf('\\', i);
+    if (i < 0) break;
     const control = readControl(source, i);
     if (!control) {
       i++;

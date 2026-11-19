@@ -262,6 +262,17 @@ viewer（`web/app.js`）は、打鍵のあったページの SVG を毎回まる
 - 打った文字の commit まで（中央値）: 26 ms → 18 ms。その変更を含む描画 frame が終わるまで（変更の 2 frame 後の `requestAnimationFrame`）: 46 ms → 28 ms。
 - 30 打鍵のあと、ページの SVG は同じ列から作り直した SVG と一致する（`outerHTML` の比較）。
 
+## 10.4i 1 ファイルの長い文書で打鍵のたびに全文へ触れていた処理
+
+1 ファイル 2,600 段落（191 ページ、826 KB）の文書を packaged app の engine の CPU profile で見ると、1 文字の打鍵で source 全体を読む処理が並んでいた（章ごとの file に分かれた本では root が小さいので目立たない）。
+
+- **local な alias の走査**（`structural-aliases.js` の `maskIgnored`・`collectDefinitions`・`usedStructuralAliases`）: 3 つとも source を 1 文字ずつ進んでいたが、何かをするのは `\`（mask では `%` も）の位置だけである。次の `\` まで `indexOf` で飛ぶ。sink に届く定義が文書に 1 つも無ければ、use の走査はしない（use を記録するのはそういう定義だけ）。結果は変わらない: 手元の TeX source 692 個と TeX Live の package・文書 676 個（15.5 MB）で、前の実装と 4,104 通りの結果がすべて一致。6.7 ms → 約 1 ms。
+- **canonical の source hash**（`canonical.js` の `schedule`）: 「直前の generation はこの text の compile か」「走っている job はこの text のものか」を確かめるために、root の全文の hash を打鍵ごとに 2 回取っていた（4.3 ms）。hash と一緒に text の長さを覚え、長さが違えば hash を取らずに「違う」と答える。走っている job・失敗した job の revision が今の revision でなければ、そもそも尋ねない。
+- **打鍵のあったページの近くの block 探し**（`update-helpers.js` の `editPageRenderIds`）: 全ページの全行から配列を 2 つずつ作っていた（1.8 ms）。該当する block のあるページだけ配列を作る。
+- **source の text の送り方**（`server.js` の `serializeDom`・`domDeltaBody`、`web/app.js` の `applySnapshotDelta`）: snapshot は source file の全文を持つ。打鍵のたびに全 file の text を JSON にし、打った file は全文を viewer へ送っていた（この文書で 29 万字、event は 578 KB）。text が前と同じ file は前の JSON を使い、変わった file は「どこから何文字消して何を入れるか」（`engine/text-splice.js` の `textSplice`）だけを送る。viewer は持っている text に当てはめ、当てはめられなければ snapshot 全体を取り直す。`TDOM_NO_SOURCE_SPLICE=1` で全文を送る。
+
+実機（この文書の中ほどで 150 ms 間隔 30 打鍵）: engine 21.5 ms → 14〜15 ms、打った文字の commit まで 44 ms → 35 ms（§3.5a の修正の前は、ページ数の食い違いで resident のページが出ず 0/30）。まだ block の数に比例するのは snapshot の作成（`dom` 段 6〜7 ms: 打った位置より後の block は root の中の offset が動くので、1,300 個の entry を作り直して比べている）。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。
