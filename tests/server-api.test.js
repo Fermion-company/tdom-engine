@@ -242,6 +242,98 @@ test('a block that only moved to another page travels as its new place; a host c
   assert.ok(Array.isArray(report.patches));
 });
 
+test('a stream that takes cuts gets each page\'s list as its change from the one before; put together it is the plain list', { skip: !texReady && 'lualatex not installed' }, async (t) => {
+  const base = await startServer(t);
+  const http = await import('node:http');
+  // an event stream read as the events it carries
+  const listen = (query) => {
+    const events = [];
+    const waiting = [];
+    let buffer = '';
+    const request = http.get(`${base}/events${query}`, (res) => {
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        buffer += chunk;
+        for (let end = buffer.indexOf('\n\n'); end >= 0; end = buffer.indexOf('\n\n', 0)) {
+          const frame = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          if (!frame.startsWith('data: ')) continue;
+          const text = frame.slice(6);
+          events.push({ text, msg: JSON.parse(text) });
+          while (waiting.length) waiting.shift()();
+        }
+      });
+    });
+    t.after(() => request.destroy());
+    const next = async (from, want) => {
+      const until = Date.now() + 30_000;
+      for (;;) {
+        const index = events.findIndex((event, i) => i >= from && want(event.msg));
+        if (index >= 0) return index;
+        if (Date.now() > until) throw new Error('no such event');
+        await Promise.race([new Promise((resolve) => waiting.push(resolve)), new Promise((resolve) => setTimeout(resolve, 200))]);
+      }
+    };
+    return { events, next };
+  };
+  const plain = listen('');
+  const cuts = listen('?lists=cut');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  // the viewer's own way of putting the lists in place
+  const APP = (await import('node:fs')).readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const from = APP.indexOf('const streamLists = new Map();');
+  const resolveStreamLists = Function(`${APP.slice(from, APP.indexOf('\n}\n', APP.indexOf('function resolveStreamLists(')) + 3)}; return resolveStreamLists;`)();
+  const post = (body) => fetch(`${base}/edit`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).then((res) => res.json());
+  const doc = await fetch(`${base}/doc`).then((res) => res.json());
+  const at = doc.source.indexOf('watch the inspector');
+  assert.ok(at > 0);
+  const updateOf = (srcRev) => (msg) => msg.kind === 'update' && msg.report?.srcRev === srcRev;
+  const lists = (msg) => (msg.report?.patches ?? msg.patches ?? []).filter((patch) => patch.type === 'replace-page').map((patch) => patch.displayList);
+  let seenPlain = 0;
+  let seenCuts = 0;
+  const forms = [];
+  const bytes = [];
+  let previous = null;
+  for (let key = 0; key < 4; key++) {
+    const answer = await post({ start: at + key, end: at + key, text: 'x' });
+    assert.ok(Array.isArray(answer.patches), 'the answer of an edit is the report with plain lists');
+    for (const patch of answer.patches) if (patch.type === 'replace-page') assert.ok(Array.isArray(patch.displayList.commands));
+    const p = await plain.next(seenPlain, updateOf(answer.srcRev));
+    const c = await cuts.next(seenCuts, updateOf(answer.srcRev));
+    // every event up to this one, in the stream's order (async repaints between two keys carry lists too)
+    for (let i = seenCuts; i <= c; i++) {
+      const sent = lists(cuts.events[i].msg).map((list) => list.commands);
+      for (const value of sent) forms.push(Array.isArray(value) ? 'plain' : Array.isArray(value.all) ? 'all' : 'cut');
+      assert.equal(resolveStreamLists(cuts.events[i].msg), true, `event ${i} of the stream could be put together`);
+    }
+    for (let i = seenPlain; i <= p; i++) for (const list of lists(plain.events[i].msg)) assert.ok(Array.isArray(list.commands), 'a stream that did not ask gets plain lists');
+    assert.deepEqual(cuts.events[c].msg, plain.events[p].msg, 'put together, the event is the plain one');
+    assert.deepEqual(lists(plain.events[p].msg), answer.patches.filter((patch) => patch.type === 'replace-page').map((patch) => patch.displayList));
+    bytes.push([plain.events[p].text.length, cuts.events[c].text.length]);
+    // the commands a keystroke did not change are the objects held from the event before
+    const now = lists(cuts.events[c].msg)[0];
+    if (previous && now && previous.page === now.page) {
+      const kept = now.commands.filter((command) => previous.commands.includes(command)).length;
+      assert.ok(kept > now.commands.length / 2, `${kept} of ${now.commands.length} commands are the ones held`);
+    }
+    previous = now ?? previous;
+    seenPlain = p + 1;
+    seenCuts = c + 1;
+  }
+  assert.ok(forms.includes('all'), 'the first list of a page travels whole');
+  assert.ok(forms.includes('cut'), `later ones as cuts: ${forms.join(' ')}`);
+  assert.ok(!forms.includes('plain'), 'a stream that asked gets no plain list');
+  const last = bytes.at(-1);
+  assert.ok(last[1] < last[0] / 2, `a later keystroke's event is much smaller as a cut: ${JSON.stringify(bytes)}`);
+  // a list that does not continue what is held is refused (the viewer then takes a new stream)
+  const forged = { kind: 'patches', patches: [{ type: 'replace-page', displayList: { page: previous.page, commands: { n: 999999, base: 123456, of: 1, head: 0, tail: 0, mid: [] } } }] };
+  assert.equal(resolveStreamLists(forged), false);
+  // a plain list on the stream drops the base for that page
+  assert.equal(resolveStreamLists({ kind: 'patches', patches: [{ type: 'replace-page', displayList: { page: previous.page, commands: [] } }] }), true);
+});
+
 test('a host names an outer paper: its sheets around the chapter are served, the chapter\'s own are not', { skip: !texReady && 'lualatex not installed' }, async (t) => {
   const base = await startServer(t);
   const post = (body) => fetch(`${base}/outer`, { method: 'POST', body: JSON.stringify(body) }).then(async (r) => [r.status, await r.json()]);

@@ -1544,6 +1544,58 @@ function svgFor(dl, className = '') {
   return svgParts(dl, className).join('');
 }
 
+// The element a command draws into the page's SVG ('' when it draws none
+// there), kept with the command: the commands of the lines a keystroke did
+// not change are the objects this stream already carried (resolveStreamLists),
+// and their elements were written out again for every keystroke (1 ms of a
+// dense page's 2,000 commands). The one thing outside the command a piece
+// depends on is whether its font has arrived.
+const commandPiece = new WeakMap(); // a command -> { piece, ready }
+function pieceOfCommand(cmd) {
+  const ready = cmd.op !== 'glyphs' || !cmd.fam || readyFonts.has(cmd.fam);
+  const kept = commandPiece.get(cmd);
+  if (kept && kept.ready === ready) return kept.piece;
+  const piece = commandMarkup(cmd);
+  commandPiece.set(cmd, { piece, ready });
+  return piece;
+}
+function commandMarkup(cmd) {
+  const lineAttr = cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`;
+  if (cmd.op === 'glyphs') {
+    let fontAttrs;
+    if (cmd.fam) {
+      // checkpoint backend: real TeX font, TeX positions; disable browser
+      // shaping so run-start x + font advances reproduce TeX exactly
+      const pending = readyFonts.has(cmd.fam) ? '' : ' data-font-pending="1"';
+      fontAttrs = ` font-family="${escapeXml(cmd.fam)}" data-font-family="${escapeXml(cmd.fam)}"${pending} style="font-kerning:none;font-variant-ligatures:none;letter-spacing:0"`;
+    } else {
+      const it = cmd.font === 'italic' || cmd.font === 'bolditalic' ? ` font-style="italic"` : '';
+      const b = cmd.font === 'bold' || cmd.font === 'bolditalic' ? ` font-weight="bold"` : '';
+      fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
+    }
+    if (cmd.ov && Array.isArray(cmd.runs)) {
+      // (one element for the runs of a line that look alike, each at its own place)
+      return `<text y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}"${OVER_TEXT_ATTRS} xml:space="preserve">` +
+        cmd.runs.map(([x, text]) => `<tspan x="${x}">${escapeXml(text)}</tspan>`).join('') + '</text>';
+    }
+    return `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-width="${cmd.w ?? 0}" data-gh="${cmd.gh ?? 0}" data-gd="${cmd.gd ?? 0}"${cmd.ov ? OVER_TEXT_ATTRS : ` data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}`} xml:space="preserve">${escapeXml(cmd.text)}</text>`;
+  }
+  if (cmd.op === 'rule' && cmd.w > 0 && cmd.h > 0) {
+    return `<rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}" fill="${cmd.color || '#1a1a1a'}"${cmd.ov ? OVER_TEXT_ATTRS : ` data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}`}/>`;
+  }
+  if (cmd.op === 'editbox') {
+    return `<rect class="tdom-edit-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}" data-edit="${escapeXml(cmd.edit)}"/>`;
+  }
+  if (cmd.op === 'sourcebox') {
+    return `<rect class="tdom-source-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}"${lineAttr}${cmd.ink ? ' data-ink="1"' : ''}${cmd.math ? ' data-math="1"' : ''}${cmd.stale ? ' data-stale="1"' : ''}${cmd.complex ? ' data-complex="1"' : ''}/>`;
+  }
+  // (exact-render chunks are drawn as HTML <img> overlays, see renderPage)
+  if (cmd.op === 'folio') {
+    return `<text x="${cmd.x}" y="${cmd.y}" font-size="10" font-family="${FONT_FAMILY.regular}" fill="#1a1a1a" text-anchor="middle">${escapeXml(cmd.text)}</text>`;
+  }
+  return '';
+}
+
 // The page's SVG as its pieces: the opening tag, one element a command that
 // draws into it (in the commands' order), the closing tag. A commit keeps the
 // elements whose piece did not change (patchProvisionalSvg).
@@ -1552,49 +1604,8 @@ function svgParts(dl, className = '') {
     `<svg${className ? ` class="${escapeXml(className)}"` : ''} viewBox="0 0 ${geometry.paperwidth} ${geometry.paperheight}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">`,
   ];
   for (const cmd of dl.commands) {
-    const lineAttr = cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`;
-    if (cmd.op === 'glyphs') {
-      let fontAttrs;
-      if (cmd.fam) {
-        // checkpoint backend: real TeX font, TeX positions; disable browser
-        // shaping so run-start x + font advances reproduce TeX exactly
-        const pending = readyFonts.has(cmd.fam) ? '' : ' data-font-pending="1"';
-        fontAttrs = ` font-family="${escapeXml(cmd.fam)}" data-font-family="${escapeXml(cmd.fam)}"${pending} style="font-kerning:none;font-variant-ligatures:none;letter-spacing:0"`;
-      } else {
-        const it = cmd.font === 'italic' || cmd.font === 'bolditalic' ? ` font-style="italic"` : '';
-        const b = cmd.font === 'bold' || cmd.font === 'bolditalic' ? ` font-weight="bold"` : '';
-        fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
-      }
-      if (cmd.ov && Array.isArray(cmd.runs)) {
-        // (one element for the runs of a line that look alike, each at its own place)
-        parts.push(
-          `<text y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}"${OVER_TEXT_ATTRS} xml:space="preserve">` +
-          cmd.runs.map(([x, text]) => `<tspan x="${x}">${escapeXml(text)}</tspan>`).join('') + '</text>'
-        );
-        continue;
-      }
-      parts.push(
-        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-width="${cmd.w ?? 0}" data-gh="${cmd.gh ?? 0}" data-gd="${cmd.gd ?? 0}"${cmd.ov ? OVER_TEXT_ATTRS : ` data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}`} xml:space="preserve">${escapeXml(cmd.text)}</text>`
-      );
-    } else if (cmd.op === 'rule' && cmd.w > 0 && cmd.h > 0) {
-      parts.push(
-        `<rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}" fill="${cmd.color || '#1a1a1a'}"${cmd.ov ? OVER_TEXT_ATTRS : ` data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}`}/>`
-      );
-    } else if (cmd.op === 'editbox') {
-      parts.push(
-        `<rect class="tdom-edit-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}" data-edit="${escapeXml(cmd.edit)}"/>`
-      );
-    } else if (cmd.op === 'sourcebox') {
-      parts.push(
-        `<rect class="tdom-source-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}"${lineAttr}${cmd.ink ? ' data-ink="1"' : ''}${cmd.math ? ' data-math="1"' : ''}${cmd.stale ? ' data-stale="1"' : ''}${cmd.complex ? ' data-complex="1"' : ''}/>`
-      );
-    } else if (cmd.op === 'chunk') {
-      // exact-render chunks are drawn as HTML <img> overlays (see renderPage)
-    } else if (cmd.op === 'folio') {
-      parts.push(
-        `<text x="${cmd.x}" y="${cmd.y}" font-size="10" font-family="${FONT_FAMILY.regular}" fill="#1a1a1a" text-anchor="middle">${escapeXml(cmd.text)}</text>`
-      );
-    }
+    const piece = pieceOfCommand(cmd);
+    if (piece) parts.push(piece);
   }
   parts.push('</svg>');
   return parts;
@@ -7876,17 +7887,70 @@ function escapeHtml(s) {
 
 // ---------------------------------------------------------------- SSE
 
-const sse = new EventSource('/events');
-sse.onmessage = (ev) => {
-  try {
-    stateEventEpoch++;
-    const tracing = Array.isArray(globalThis.__tdomStageTrace);
-    if (tracing) traceStage('event', null, { bytes: ev.data.length });
-    const msg = JSON.parse(ev.data);
-    if (tracing) traceStage('parsed', null, { kind: msg.kind });
-    receivePreviewEvent(msg);
-  } catch { /* ignore malformed events */ }
-};
+// A page's display list comes whole the first time this stream carries it
+// and after that as its change from the one before: the commands between
+// those that are the same at the start and at the end (server.js
+// broadcastAtLists). The lists are kept here as they arrive, whatever the
+// viewer then does with the event, so the next change always has its base.
+// The commands of the shared start and end are the objects held: nothing
+// here ever changes a command it was sent.
+const streamLists = new Map(); // page -> { n, commands }: the list this stream last carried for the page
+/** Puts every display list of an event in place; false when one cannot be made from what is held. */
+function resolveStreamLists(msg) {
+  const patches = Array.isArray(msg?.patches) ? msg.patches : Array.isArray(msg?.report?.patches) ? msg.report.patches : null;
+  if (!patches) return true;
+  for (const patch of patches) {
+    const dl = patch?.type === 'replace-page' ? patch.displayList : null;
+    if (!dl) continue;
+    const sent = dl.commands;
+    // (a plain list: the server keeps no base for this page either)
+    if (Array.isArray(sent)) { streamLists.delete(dl.page); continue; }
+    if (!sent || typeof sent !== 'object' || !Number.isSafeInteger(sent.n)) return false;
+    let commands = sent.all;
+    if (!Array.isArray(commands)) {
+      const held = streamLists.get(dl.page);
+      const { head, tail, mid } = sent;
+      if (!held || held.n !== sent.base || held.commands.length !== sent.of || !Array.isArray(mid) ||
+          !Number.isSafeInteger(head) || !Number.isSafeInteger(tail) || head < 0 || tail < 0 || head + tail > held.commands.length) return false;
+      commands = head === held.commands.length && !mid.length
+        ? held.commands
+        : [...held.commands.slice(0, head), ...mid, ...held.commands.slice(held.commands.length - tail)];
+    }
+    dl.commands = commands;
+    streamLists.set(dl.page, { n: sent.n, commands });
+  }
+  return true;
+}
+let sse = null;
+function openEventStream() {
+  const stream = new EventSource('/events?lists=cut');
+  sse = stream;
+  // (a stream that connects again is another stream to the server: it starts from whole lists)
+  stream.onopen = () => { if (sse === stream) streamLists.clear(); };
+  stream.onmessage = (ev) => {
+    if (sse !== stream) return;
+    try {
+      stateEventEpoch++;
+      const tracing = Array.isArray(globalThis.__tdomStageTrace);
+      if (tracing) traceStage('event', null, { bytes: ev.data.length });
+      const msg = JSON.parse(ev.data);
+      if (!resolveStreamLists(msg)) {
+        // Not reachable while both ends keep to the stream's order. If it
+        // ever is, nothing built on this event can be trusted: take a new
+        // stream and the document as the server has it.
+        console.warn('[tdom] a display list could not be made from the one held; reloading the document');
+        stream.close();
+        streamLists.clear();
+        openEventStream();
+        void boot();
+        return;
+      }
+      if (tracing) traceStage('parsed', null, { kind: msg.kind });
+      receivePreviewEvent(msg);
+    } catch { /* ignore malformed events */ }
+  };
+}
+openEventStream();
 function receivePreviewEvent(msg) {
   try {
     if (msg.kind === 'reset-pending') {

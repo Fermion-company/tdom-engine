@@ -1164,22 +1164,134 @@ const sseClients = new Set();
 // patch payload in this process forever: past the high-water mark we drop
 // the connection — EventSource reconnects and resyncs by itself.
 const SSE_MAX_BUFFER = 8 * 1024 * 1024;
-function broadcastRaw(jsonStr) {
-  const data = `data: ${jsonStr}\n\n`;
-  for (const res of sseClients) {
-    try {
-      res.write(data);
-      if (res.writableLength > SSE_MAX_BUFFER) {
-        sseClients.delete(res);
-        res.destroy();
-      }
-    } catch {
+function writeEvent(res, jsonStr) {
+  try {
+    res.write(`data: ${jsonStr}\n\n`);
+    if (res.writableLength > SSE_MAX_BUFFER) {
       sseClients.delete(res);
+      res.destroy();
     }
+  } catch {
+    sseClients.delete(res);
   }
 }
+function broadcastRaw(jsonStr) {
+  for (const res of sseClients) writeEvent(res, jsonStr);
+}
+
+// ---- display lists on the event stream -----------------------------------
+// An update carries the display list of every page it touched: all the
+// commands of the page, of which a keystroke changes a line or two. On a
+// dense page that is 200 KB serialized, written, read and parsed with every
+// key, and a node built in the viewer for each of its 2,000 commands.
+//
+// A command is never changed once its list is built (display-list.js keeps
+// the commands of an unchanged line from one build to the next), so its JSON
+// is kept with it. And a stream that asked for it (`/events?lists=cut`) is
+// sent, for a page it was sent before, only the commands between the ones
+// that are the same at the start and at the end: `{n, base, of, head, tail,
+// mid}` in place of the list, where `base` numbers the list that stream was
+// last sent for the page and `n` this one. The first list of a page on a
+// stream travels whole (`{n, all}`). Everything is relative to what went
+// out on that same stream, in order: there is nothing a viewer could hold
+// that the server does not know of. Any other client gets plain lists.
+// TDOM_LISTS_WHOLE=1: plain lists for every client, as before.
+const LISTS_WHOLE = !!process.env.TDOM_LISTS_WHOLE;
+const commandJson = new WeakMap(); // a command -> its JSON
+function jsonOfCommand(command) {
+  if (command === null || typeof command !== 'object') return JSON.stringify(command) ?? 'null';
+  let text = commandJson.get(command);
+  if (text === undefined) commandJson.set(command, text = JSON.stringify(command));
+  return text;
+}
+const listNumbers = new WeakMap(); // a list of commands -> the number it travels under
+let listCount = 0;
+function numberOfList(commands) {
+  let n = listNumbers.get(commands);
+  if (n === undefined) listNumbers.set(commands, n = ++listCount);
+  return n;
+}
+const listStreams = new WeakMap(); // an event stream that asked for cuts -> Map(page -> the commands last sent on it)
+const LIST_SLOT = `\u0001tdom-list-${Math.random().toString(36).slice(2)}-`;
+const wholeListJson = (commands) => `[${commands.map(jsonOfCommand).join(',')}]`;
+/** What stands in place of a page's list on a stream that takes cuts; remembers the list as sent. */
+function streamListJson(sent, displayList) {
+  const now = displayList.commands;
+  const n = numberOfList(now);
+  const old = sent.get(displayList.page);
+  sent.set(displayList.page, now);
+  if (old) {
+    const same = (a, b) => a === b || jsonOfCommand(a) === jsonOfCommand(b);
+    const most = Math.min(old.length, now.length);
+    let head = 0;
+    while (head < most && same(old[head], now[head])) head++;
+    let tail = 0;
+    while (tail < most - head && same(old[old.length - 1 - tail], now[now.length - 1 - tail])) tail++;
+    // (worth it when most of the page stays)
+    if ((now.length - head - tail) * 2 <= now.length) {
+      const mid = [];
+      for (let i = head; i < now.length - tail; i++) mid.push(jsonOfCommand(now[i]));
+      return `{"n":${n},"base":${numberOfList(old)},"of":${old.length},"head":${head},"tail":${tail},"mid":[${mid.join(',')}]}`;
+    }
+  }
+  return `{"n":${n},"all":${wholeListJson(now)}}`;
+}
+/**
+ * A payload's JSON cut at its display lists: the text around them and the
+ * lists, or null when it carries none (or nobody listening takes cuts).
+ */
+function cutAtLists(payload) {
+  if (LISTS_WHOLE) return null;
+  let taken = false;
+  for (const res of sseClients) if (listStreams.has(res)) { taken = true; break; }
+  if (!taken) return null;
+  const lists = [];
+  const stub = (patches) => patches.map((patch) => {
+    const displayList = patch?.type === 'replace-page' ? patch.displayList : null;
+    if (!displayList || !Array.isArray(displayList.commands) || !Number.isSafeInteger(displayList.page)) return patch;
+    lists.push(displayList);
+    return { ...patch, displayList: { ...displayList, commands: `${LIST_SLOT}${lists.length - 1}` } };
+  });
+  let light = null;
+  if (Array.isArray(payload?.patches)) light = { ...payload, patches: stub(payload.patches) };
+  else if (Array.isArray(payload?.report?.patches)) light = { ...payload, report: { ...payload.report, patches: stub(payload.report.patches) } };
+  if (!light || !lists.length) return null;
+  const json = JSON.stringify(light);
+  const pieces = [];
+  let from = 0;
+  for (let i = 0; i < lists.length; i++) {
+    const slot = JSON.stringify(`${LIST_SLOT}${i}`);
+    const at = json.indexOf(slot, from);
+    if (at < 0) return null;
+    pieces.push(json.slice(from, at));
+    from = at + slot.length;
+  }
+  pieces.push(json.slice(from));
+  return { pieces, lists };
+}
+const joinAtLists = (pieces, values) => {
+  let text = pieces[0];
+  for (let i = 0; i < values.length; i++) text += values[i] + pieces[i + 1];
+  return text;
+};
+/** Sends an event cut by cutAtLists: to each stream its own form of the lists. Returns the event with plain lists (made only if asked for). */
+function broadcastAtLists({ pieces, lists }, before = '', after = '') {
+  let whole = null;
+  const plain = () => (whole ??= joinAtLists(pieces, lists.map((displayList) => wholeListJson(displayList.commands))));
+  let bytes = 0;
+  for (const res of sseClients) {
+    const sent = listStreams.get(res);
+    const json = sent ? joinAtLists(pieces, lists.map((displayList) => streamListJson(sent, displayList))) : plain();
+    bytes ||= json.length;
+    writeEvent(res, before || after ? `${before}${json}${after}` : json);
+  }
+  return { plain, bytes };
+}
 function broadcast(payload) {
-  broadcastRaw(JSON.stringify({ documentEpoch, ...payload }));
+  const event = { documentEpoch, ...payload };
+  const cut = cutAtLists(event);
+  if (cut) broadcastAtLists(cut);
+  else broadcastRaw(JSON.stringify(event));
 }
 
 let pendingDocumentReset = null;
@@ -2865,6 +2977,8 @@ const server = http.createServer(async (req, res) => {
         Connection: 'keep-alive',
       });
       res.write(':ok\n\n');
+      // (a viewer that keeps the lists it is sent takes later ones as cuts: broadcastAtLists)
+      if (url.searchParams.get('lists') === 'cut') listStreams.set(res, new Map());
       sseClients.add(res);
       req.on('close', () => sseClients.delete(res));
       return;
@@ -3268,10 +3382,24 @@ const server = http.createServer(async (req, res) => {
       // (what the server itself adds between the engine and the viewers; the
       // report on the wire was serialized before these three are set)
       lastReport.timing.plannedAtEpochMs = Date.now();
-      const reportJson = JSON.stringify(lastReport);
-      lastReport.timing.reportBytes = reportJson.length;
+      // (to a stream that takes cuts, each page's list goes as its change from the one before: broadcastAtLists)
+      const reportCut = cutAtLists({ report: lastReport });
+      let reportJson = reportCut ? null : JSON.stringify(lastReport);
+      if (reportJson !== null) lastReport.timing.reportBytes = reportJson.length;
       completeDocumentReset(resetEpoch);
-      broadcastRaw(`{"kind":"update","documentEpoch":${documentEpoch}${domPush ? `,"dom":${domPush}` : ''},"report":${reportJson}}`);
+      const eventHead = `{"kind":"update","documentEpoch":${documentEpoch}${domPush ? `,"dom":${domPush}` : ''},"report":`;
+      let plainReport = null;
+      if (reportCut) {
+        // (the pieces are those of `{"report":…}`: its opening and closing go with the event's own)
+        const pieces = reportCut.pieces.slice();
+        pieces[0] = pieces[0].slice('{"report":'.length);
+        pieces[pieces.length - 1] = pieces[pieces.length - 1].slice(0, -1);
+        const sent = broadcastAtLists({ pieces, lists: reportCut.lists }, eventHead, '}');
+        lastReport.timing.reportBytes = sent.bytes;
+        plainReport = sent.plain;
+      } else {
+        broadcastRaw(`${eventHead}${reportJson}}`);
+      }
       lastReport.timing.sentAtEpochMs = Date.now();
       if (editTrace) {
         editTrace.push(['sent', performance.now()]);
@@ -3283,7 +3411,7 @@ const server = http.createServer(async (req, res) => {
       // host whose viewers follow the event stream) asks for that alone:
       // the report is every page the edit moved, 60 KB for a keystroke and
       // megabytes for one that reflows a chapter, parsed for one number.
-      res.end(body.slim === true ? JSON.stringify(editAnswer(lastReport)) : reportJson);
+      res.end(body.slim === true ? JSON.stringify(editAnswer(lastReport)) : reportJson ?? plainReport());
       if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, anchorEpoch, anchorProofPrefetch);
       return;
     }
