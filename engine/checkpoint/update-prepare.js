@@ -90,12 +90,16 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
     ...rawStructuralGate.shippingExactUses,
     ...expandedStructuralGate.shippingExactUses,
   ];
-  if (engine.blocks.length) {
+  {
     // One verdict per block text, kept while the document's literal
     // environments and conditionals are the same objects (documentBounds
     // hands the same ones out for an unchanged root) and the block is entered
     // with the same carried depth: a keystroke re-read all 3,400 blocks of a
     // book for the one that changed.
+    // (also on the first load, where nothing is held back whatever a block
+    // says: left to the first keystroke, the verdicts of every block were
+    // read then, 2.2 ms of it on a 191-page file)
+    const hold = engine.blocks.length > 0;
     const kept = engine.closureMemo?.literalEnvs === bounds.literalEnvs &&
       engine.closureMemo.conditionals === bounds.conditionals ? engine.closureMemo.byText : null;
     const byText = new Map();
@@ -106,7 +110,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
         literalEnvs: bounds.literalEnvs, documentConditionals: bounds.conditionals, carried });
       if (closure.closed) byText.set(seg.text, { carried, closure });
       carried = closure.closed ? closure.carry ?? 0 : carried;
-      if (!closure.closed) {
+      if (!closure.closed && hold) {
         timer.lap('closure');
         return {
           response: deferClosureUpdate(editLabel, timer, {

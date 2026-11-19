@@ -47,6 +47,7 @@ export function hasDefinitionEdit(oldBlocks, blocks, bounds, defRe) {
 // The blocks on a page, kept with its list of lines (which is never changed
 // once the page is built: a page built again has another list).
 const pageBlockIds = new WeakMap();
+const realBlockIds = new WeakMap(); // a list of blocks -> the ids in it
 const NO_IDS = new Set();
 function blockIdsOn(page) {
   const draw = page.draw;
@@ -73,8 +74,16 @@ export function editPageRenderIds(blocks, pages, dirtySource) {
   // them, and the set of the document's blocks is made only once a page
   // holds one of the blocks asked about. 191 pages of 41 lines: 1.8 ms a
   // keystroke as two lists a page, then 0.6 ms as a walk over every line.)
+  // (the ids of the document's blocks, kept with the list of blocks: the
+  // engine makes a new list with every update and never changes one)
   let real = null;
-  const isReal = id => (real ??= new Set(blocks.map(block => block.id))).has(id);
+  const isReal = id => {
+    if (!real) {
+      real = realBlockIds.get(blocks);
+      if (!real) realBlockIds.set(blocks, real = new Set(blocks.map(block => block.id)));
+    }
+    return real.has(id);
+  };
   const holdsOneOf = (page, ids) => {
     const here = blockIdsOn(page);
     const [few, many] = ids.size <= here.size ? [ids, here] : [here, ids];

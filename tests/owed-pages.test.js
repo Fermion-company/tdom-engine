@@ -160,12 +160,16 @@ test('a keystroke that moves every page after it answers with the nearest pages;
           else if (patch.type === 'remove-pages') for (const n of [...held.keys()]) if (n >= patch.from) held.delete(n);
         }
       };
+      const sinceKey = []; // how long after the last keystroke each event came
       engine.onAsyncPatches = (partial) => {
         assert.ok(partial.rev > lastRev, 'revisions only rise');
         lastRev = partial.rev;
         events.push(partial.patches.filter((patch) => patch.type === 'replace-page').map((patch) => patch.page));
+        sinceKey.push(Date.now() - engine.lastEditAt);
         take(partial.patches);
       };
+      // (the first load leaves every block's closure verdict behind, so the first keystroke reads one)
+      assert.ok(engine.closureMemo?.byText?.size >= PARAGRAPHS, `closure verdicts kept after opening: ${engine.closureMemo?.byText?.size}`);
       // a sentence added to a paragraph on the second page: several lines more, every page after it moves
       const at = engine.getSource().indexOf('marker12x') + 'marker12'.length;
       const report = await engine.edit(at, at, ` ${'and a sentence that makes this paragraph a good deal longer than it was '.repeat(3)}`);
@@ -187,6 +191,8 @@ test('a keystroke that moves every page after it answers with the nearest pages;
       await drain(engine, 120_000);
       assert.equal(engine.owedPaging, false);
       assert.ok(events.length >= 2, `${events.length} events brought the other pages`);
+      // …once the typing had paused, not between the keys
+      assert.ok(sinceKey.every((ms) => ms >= 250), `events came ${sinceKey.join(', ')} ms after the last keystroke`);
       assert.ok(events.every((pages) => pages.length <= EAGER_PAGES), JSON.stringify(events));
       const followed = new Set(events.flat());
       for (let n = answered.at(-1) + 1; n <= engine.pages.length; n++) assert.ok(followed.has(n), `page ${n} followed`);

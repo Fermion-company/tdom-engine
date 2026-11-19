@@ -160,9 +160,17 @@ const HEADING_RE = /^\s*\\(chapter|section|subsection|subsubsection|paragraph|su
 const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 12_000);
 const BOOT_TIMEOUT = 60_000;
 // The owed display lists (page-patches.js): how many pages one slice builds
-// and sends, and how long a slice waits while a keystroke is being answered.
+// and sends, how long a slice waits while a keystroke is being answered, and
+// how long after the last keystroke the slices start. While the typing goes
+// on they wait: sent between the keys, twenty-three events of 0.8 MB took
+// the viewer longer to read than the engine to make, and the next
+// keystroke's own page stood in line behind them (shown after 121 ms where
+// 23 is usual). The pages they bring are far from the edit.
+const WARM_SNAPSHOT_QUIET_MS = 150;
 const OWED_SLICE_PAGES = 4;
 const OWED_BUSY_WAIT_MS = 20;
+const OWED_QUIET_MS = Number(process.env.TDOM_OWED_QUIET_MS) >= 0 && process.env.TDOM_OWED_QUIET_MS !== ''
+  ? Number(process.env.TDOM_OWED_QUIET_MS) : 300;
 // Definition-bearing body edits: a macro/environment/length defined (or
 // undefined) in a BODY block can change the meaning of every later block in
 // ways the exit-state vector cannot see. Such edits forfeit checkpoint-suffix
@@ -2081,6 +2089,10 @@ export class CheckpointEngine {
       headingRe: HEADING_RE,
       applyFidelity: (b, g) => this.#applyFidelity(b, g),
     });
+    // (outside a keystroke: a walk that passes many blocks. What the snapshot
+    // keeps per block is read again once the walk has gone quiet, so the next
+    // keystroke does not pay for it: #warmSnapshotSoon)
+    if (this.bgActive || !this.updating) this.#warmSnapshotSoon();
     // A conservative source scan can request capture for a construct whose
     // harvested nodes ultimately need no exact pixels.  Release that retained
     // list immediately instead of keeping it until checkpoint retirement.
@@ -3290,6 +3302,25 @@ export class CheckpointEngine {
     );
   }
 
+  // The source snapshot keeps an entry per block for as long as the block's
+  // galley, fidelity and place are what they were (inspector.js). A walk that
+  // typesets blocks again without changing them (after opening, after a
+  // keystroke) hands each a new galley and fidelity object: the first
+  // snapshot after it reads every such block again (1.7 µs each: 4.5 ms on a
+  // 191-page file), and that snapshot was the first keystroke's, taken
+  // before the engine even started on it. Read here instead, once no galley
+  // has been adopted for a moment and no update runs.
+  #warmSnapshotSoon() {
+    clearTimeout(this.warmSnapshotTimer);
+    this.warmSnapshotTimer = setTimeout(() => {
+      this.warmSnapshotTimer = null;
+      if (this.closed || this.mode !== 'structured') return;
+      if (this.updating) return this.#warmSnapshotSoon();
+      try { this.getDOM(); } catch { /* the keystroke's own snapshot reports whatever is wrong */ }
+    }, WARM_SNAPSHOT_QUIET_MS);
+    this.warmSnapshotTimer.unref?.();
+  }
+
   // The display lists an update left owed (page-patches.js EAGER_PAGES):
   // built a few pages at a time, nearest the last edit first, and sent
   // through the async channel like any repaint. A keystroke goes first:
@@ -3297,13 +3328,15 @@ export class CheckpointEngine {
   #pumpOwedPages() {
     if (this.owedPagesTimer) return;
     this.owedPaging = true;
+    // (not before the typing has paused: OWED_QUIET_MS)
+    const quietIn = () => Math.max(0, OWED_QUIET_MS - (Date.now() - (this.lastEditAt ?? 0)));
     this.owedPagesTimer = setTimeout(() => {
       this.owedPagesTimer = null;
       if (this.closed || this.mode !== 'structured') {
         this.owedPaging = false;
         return;
       }
-      if (this.updating) return this.#pumpOwedPages();
+      if (this.updating || quietIn() > 0) return this.#pumpOwedPages();
       const { patches, later } = buildPagePatches(this.pages, this.pages, (page) => pageHfSig(this.hf, page.number),
         (page) => this.#displayList(page), { limit: OWED_SLICE_PAGES, focus: this.owedFocus ?? null, owedToo: true });
       if (patches.length && this.onAsyncPatches) {
@@ -3312,7 +3345,7 @@ export class CheckpointEngine {
       }
       this.owedPaging = later > 0;
       if (later > 0) this.#pumpOwedPages();
-    }, this.updating ? OWED_BUSY_WAIT_MS : 0);
+    }, Math.max(this.updating ? OWED_BUSY_WAIT_MS : 0, quietIn()));
     this.owedPagesTimer.unref?.();
   }
 

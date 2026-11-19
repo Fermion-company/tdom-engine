@@ -353,6 +353,17 @@ engine だけの計測（上の文書、行が増える打鍵）: 223 ms → 39�
 - **打ったページの近くの block**（`update-helpers.js` の `editPageRenderIds`。打鍵ごとに 3 回呼ばれる）: 全ページの全行を歩いていた。ページにある block の集合を、ページの行の list（作られた後は変わらない）と一緒に持つ。0.6 ms。
 - **units の stamp**（`units.js` の `rebuildUnits`。打鍵ごとに 3〜4 回、全 block）: 「chunk の世代・fidelity の世代・galley の hash」を block ごとに文字列につないで比べていた。3 つの値のまま比べる。
 
+## 10.4p 行が増えた次の打鍵と、開いた直後の打鍵
+
+§10.4n の後も、行が増えた打鍵の**次の**打鍵は 86〜121 ms かかっていた（普段は 23 ms）。engine は 0.3〜0.4 秒のあいだ 0.8 MB の event を 23 回送り、viewer は読むのに engine が作るより長くかかるので、次の打鍵の自分のページの event がその列の後ろで待っていた。owed のページは、**最後の打鍵から `OWED_QUIET_MS`（300 ms）経つまで送らない**（`engine-v3.js` の `#pumpOwedPages`）。打っている間は遠いページは古いままで、手が止まると届く。`TDOM_OWED_QUIET_MS=0` で間を置かない。
+
+開いた直後の最初の打鍵には、打鍵の外でできる仕事が乗っていた（191 ページの文書で、engine に入る前の `anchorBase` 6.3 ms、`segment` 7.5 ms（普段 2.5）、打鍵の後の `dom` 3.9 ms）。
+
+- **snapshot の entry を、組み直しをまたいで保つ**（`inspector.js`）。block を組み直す walk は、同じ箱の galley と、同じ中身の edit region の list を、別の object で渡してくる。entry の core は「galley が同じ object」「region の list が同じ object」のときだけ使い回していたので、walk が通った block は全部作り直しになり、前の snapshot と別の object になって、server は中身を JSON にして比べていた。label・reference が同じ galley（`sameGalleyParts`）、言っていることが同じ region の list（`sameRegionSpecs`）なら、同じ core・同じ entry のままにする。
+- **walk が静まったら snapshot を温める**（`engine-v3.js` の `#warmSnapshotSoon`）。打鍵の外で galley を adopt したら、150 ms 何も adopt されず update も走っていない時点で `getDOM()` を 1 回呼ぶ。walk が通った block の確かめ直し（1 block 1.7 µs）は、最初の打鍵の手前（`anchorBase` は打鍵の前の snapshot を取る）ではなく、ここで済む。
+- **closure の判定を最初の読み込みで残す**（`update-prepare.js`）。block ごとの closure の memo は block があるときだけ作っていたので、開いた直後は空で、最初の打鍵が全 block を判定していた（2.2 ms）。最初の読み込みでも作る（そこでは何も保留しない）。
+- `editPageRenderIds` が呼ばれるたびに作っていた「文書の block の id の集合」を、block の list と一緒に持つ（list は update のたびに新しく作られ、書き換えられない）。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。

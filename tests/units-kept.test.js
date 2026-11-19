@@ -153,6 +153,10 @@ test('a keystroke after the engine has walked the document again replaces the pa
         const id = engine.blocks.find((block) => block.text.includes(`marker${middle}`)).id;
         return engine.pages.filter((page) => (page.draw ?? []).some((d) => d.u?.blockId === id)).map((page) => page.number);
       };
+      // The snapshot's entry of a block is kept through such a walk too: a
+      // galley adopted again with the same labels and references is the same
+      // core, and nothing of the entry is rebuilt (inspector.js sameGalleyParts).
+      const entries = engine.getDOM().blocks;
       // the first key after opening (the walk that built the chain has passed every block)
       const first = await replacedBy(() => type('a'));
       assert.deepEqual(first, own(), `the first keystroke replaced pages ${first.join(',')}; the paragraph is on ${own().join(',')}`);
@@ -162,6 +166,17 @@ test('a keystroke after the engine has walked the document again replaces the pa
       }
       // the typing pauses: the engine walks on from the paragraph to rebuild what follows it
       await settle();
+      {
+        const now = engine.getDOM().blocks;
+        const edited = engine.blocks.findIndex((block) => block.text.includes(`marker${middle}`));
+        let same = 0;
+        for (let i = 0; i < edited; i++) if (now[i] === entries[i]) same++;
+        assert.equal(same, edited, 'the blocks before the paragraph keep their entries, object for object');
+        const { domEntriesDifferInPlaceOnly } = await import('../engine/checkpoint/inspector.js');
+        for (let i = edited + 1; i < now.length; i++) {
+          assert.ok(now[i] === entries[i] || domEntriesDifferInPlaceOnly(entries[i], now[i]), `the entry of block ${i} differs in more than its place`);
+        }
+      }
       const afterRest = await replacedBy(() => type('e'));
       assert.deepEqual(afterRest, own(), `the first keystroke after a rest replaced pages ${afterRest.join(',')}`);
       // and the pages are what a fresh engine makes of the same text

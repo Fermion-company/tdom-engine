@@ -578,3 +578,50 @@ test('the blocks near an edited page are the ones a walk over every line finds',
     }
   }
 });
+
+test('a block whose galley is adopted again with the same labels and references keeps its entry', () => {
+  const text = 'Alpha paragraph.\n\nBeta paragraph.\n';
+  const blocks = diffBlocks([], segmentBody(text, 0), (() => { let id = 0; return () => `b${id++}`; })()).blocks;
+  for (const block of blocks) block.editRegions = instrumentEditRegions(block.text).regions;
+  const galley = (labels, refs) => ({ labels: labels.map((k) => ({ k })), refs });
+  blocks[0].galley = galley(['sec:a'], ['fig:1']);
+  blocks[1].galley = galley([], []);
+  const snap = keeping();
+  const first = snap(blocks, text);
+  assert.deepEqual(first.blocks[0].labels, ['sec:a']);
+  // the same boxes typeset again: another galley object, another fidelity object
+  blocks[0].galley = galley(['sec:a'], ['fig:1']);
+  blocks[0].fidelity = { level: undefined };
+  blocks[1].galley = galley([], []);
+  const again = snap(blocks, text);
+  assert.equal(again.blocks[0], first.blocks[0], 'the same entry, not an equal one');
+  assert.equal(again.blocks[1], first.blocks[1]);
+  assert.deepEqual(again, fresh(unseen(blocks), text));
+  // …and once more, by the quick check this time
+  assert.equal(snap(blocks, text).blocks[0], first.blocks[0]);
+  // its edit regions recorded anew, saying the same: the same entry still
+  blocks[0].editRegions = blocks[0].editRegions.map((region) => ({ ...region }));
+  blocks[0].galley = galley(['sec:a'], ['fig:1']);
+  const recorded = snap(blocks, text);
+  assert.equal(recorded.blocks[0], first.blocks[0]);
+  assert.equal(recorded.blocks[0].editRegions, first.blocks[0].editRegions);
+  assert.deepEqual(recorded, fresh(unseen(blocks), text));
+  // …saying something else: another entry
+  blocks[0].editRegions = blocks[0].editRegions.map((region, i) => (i === 0 ? { ...region, value: `${region.value}!` } : region));
+  const changed = snap(blocks, text);
+  assert.notEqual(changed.blocks[0], first.blocks[0]);
+  assert.deepEqual(changed, fresh(unseen(blocks), text));
+  blocks[0].editRegions = instrumentEditRegions(blocks[0].text).regions;
+  const first2 = snap(blocks, text);
+  assert.deepEqual(first2, fresh(unseen(blocks), text));
+  Object.assign(first, first2); // (the entries compared from here on)
+  // another label, another reference, one more or one fewer: another entry
+  for (const [labels, refs] of [[['sec:b'], ['fig:1']], [['sec:a'], ['fig:2']], [['sec:a', 'x'], ['fig:1']], [[], ['fig:1']], [['sec:a'], []]]) {
+    blocks[0].galley = galley(labels, refs);
+    const other = snap(blocks, text);
+    assert.notEqual(other.blocks[0], first.blocks[0], JSON.stringify([labels, refs]));
+    assert.deepEqual(other.blocks[0].labels, labels);
+    assert.deepEqual(other, fresh(unseen(blocks), text));
+    assert.equal(other.blocks[1], first.blocks[1], 'the other block is untouched');
+  }
+});

@@ -55,6 +55,33 @@ export function filesOfRegions(regions) {
   return files;
 }
 
+// Whether two lists of a block's edit regions (as the typesetting job
+// records them) say the same: the same regions with the same plain values.
+const sameRegionSpecs = (a, b) => {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const one = a[i];
+    const other = b[i];
+    if (one === other) continue;
+    if (!one || !other) return false;
+    const keys = Object.keys(one);
+    if (keys.length !== Object.keys(other).length) return false;
+    // (anything that is not a plain value counts only as the very same thing)
+    for (const key of keys) if (one[key] !== other[key]) return false;
+  }
+  return true;
+};
+// Whether a core's labels and references are those of this galley.
+const sameGalleyParts = (core, galley) => {
+  const labels = galley?.labels ?? [];
+  if (labels.length !== core.labels.length) return false;
+  for (let i = 0; i < labels.length; i++) if (labels[i].k !== core.labels[i]) return false;
+  const refs = galley?.refs ?? [];
+  if (refs === core.refs) return true;
+  if (refs.length !== core.refs.length) return false;
+  for (let i = 0; i < refs.length; i++) if (refs[i] !== core.refs[i]) return false;
+  return true;
+};
 const sameButSourceAndRegions = (was, now) =>
   was.gfxChunks === now.gfxChunks && was.labels === now.labels && was.refs === now.refs &&
   was.sourceRanges === now.sourceRanges && was.id === now.id && was.type === now.type && was.gfx === now.gfx &&
@@ -240,7 +267,12 @@ export function buildDomSnapshot({
   const ownRegions = (b) => {
     const anchor = regionAnchor(b);
     const kept = blockRegionMemo.get(b);
-    if (kept && anchor !== null && kept.anchor === anchor && kept.editRegions === b.editRegions && kept.text === b.text) {
+    // (a block typeset again gets its region list anew, the same regions in
+    // another array: told by what they say, so the regions handed out, and
+    // with them the block's entry, stay the ones they were)
+    if (kept && anchor !== null && kept.anchor === anchor && kept.text === b.text &&
+        (kept.editRegions === b.editRegions || sameRegionSpecs(kept.editRegions, b.editRegions))) {
+      kept.editRegions = b.editRegions;
       return kept.regions;
     }
     // Canonical snapshots can arrive before an isolated rescue's
@@ -368,8 +400,13 @@ export function buildDomSnapshot({
         mode: b.sourceParts ? null : inFile ? 'file' : !b.file && b.end - b.start === b.text.length ? 'root' : null,
         startLine: from.line, startColumn: from.column, endLine: to.line, endColumn: to.column,
       };
-      if (kept && kept.key === key && kept.galley === b.galley && kept.sourceParts === b.sourceParts && kept.regions === blockRegions) {
+      // (a galley adopted again with what the core took from it unchanged, its
+      // labels and its references, is the same core: a walk that typesets a
+      // block again hands it another galley object with the same boxes)
+      if (kept && kept.key === key && kept.sourceParts === b.sourceParts && kept.regions === blockRegions &&
+          (kept.galley === b.galley || sameGalleyParts(kept.core, b.galley))) {
         Object.assign(kept, reads);
+        kept.galley = b.galley;
       } else {
         kept = {
           key, keyHead, galley: b.galley, sourceParts: b.sourceParts, regions: blockRegions, ...reads,
