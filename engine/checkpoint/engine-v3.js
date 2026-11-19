@@ -107,6 +107,7 @@ import {
 } from './canonical-arrival.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
 import { pageHfSig } from './header-footer.js';
+import { buildPagePatches } from './page-patches.js';
 import { adoptGalleyBlock, exactFallbackEligible, exitStateVec } from './galley-adoption.js';
 import { cropRenderTargets } from './render-chunks.js';
 import { checkpointBudgetFor, checkpointKeepSet, memoryCheckpointCeiling, nearestCheckpoint,
@@ -158,6 +159,10 @@ const BASE_COUNTERS = [
 const HEADING_RE = /^\s*\\(chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
 const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 12_000);
 const BOOT_TIMEOUT = 60_000;
+// The owed display lists (page-patches.js): how many pages one slice builds
+// and sends, and how long a slice waits while a keystroke is being answered.
+const OWED_SLICE_PAGES = 4;
+const OWED_BUSY_WAIT_MS = 20;
 // Definition-bearing body edits: a macro/environment/length defined (or
 // undefined) in a BODY block can change the meaning of every later block in
 // ways the exit-state vector cannot see. Such edits forfeit checkpoint-suffix
@@ -637,6 +642,10 @@ export class CheckpointEngine {
   }
 
   getDisplayLists() {
+    // (a page whose list is still owed to the viewers gets it here; it stays owed)
+    for (const page of this.pages) {
+      if (!page.dl || page.dl.hfSig !== pageHfSig(this.hf, page.number)) page.dl = this.#displayList(page);
+    }
     return displayLists(this.pages);
   }
 
@@ -2501,6 +2510,7 @@ export class CheckpointEngine {
         shipUpdate: (sourceText, changes) => this.#shipNow(sourceText, changes),
         deferShipUpdate: (sourceText, changes) => this.#shipLater(sourceText, changes, editedInPlace),
         fidelitySummary: () => this.#fidelitySummary(),
+        pumpOwedPages: () => this.#pumpOwedPages(),
       },
     });
   }
@@ -3280,8 +3290,35 @@ export class CheckpointEngine {
     );
   }
 
+  // The display lists an update left owed (page-patches.js EAGER_PAGES):
+  // built a few pages at a time, nearest the last edit first, and sent
+  // through the async channel like any repaint. A keystroke goes first:
+  // while an update runs, the next slice waits.
+  #pumpOwedPages() {
+    if (this.owedPagesTimer) return;
+    this.owedPaging = true;
+    this.owedPagesTimer = setTimeout(() => {
+      this.owedPagesTimer = null;
+      if (this.closed || this.mode !== 'structured') {
+        this.owedPaging = false;
+        return;
+      }
+      if (this.updating) return this.#pumpOwedPages();
+      const { patches, later } = buildPagePatches(this.pages, this.pages, (page) => pageHfSig(this.hf, page.number),
+        (page) => this.#displayList(page), { limit: OWED_SLICE_PAGES, focus: this.owedFocus ?? null, owedToo: true });
+      if (patches.length && this.onAsyncPatches) {
+        this.rev++;
+        this.onAsyncPatches({ rev: this.rev, fonts: this.getFontManifest(), patches });
+      }
+      this.owedPaging = later > 0;
+      if (later > 0) this.#pumpOwedPages();
+    }, this.updating ? OWED_BUSY_WAIT_MS : 0);
+    this.owedPagesTimer.unref?.();
+  }
+
   #asyncRepaginate() {
     return asyncRepaginateHelper(this, {
+      pumpOwedPages: () => this.#pumpOwedPages(),
       paginateNow: () => this.#paginateNow(),
       displayList: (page) => this.#displayList(page),
       computeToc: (pages) => this.#computeToc(pages),

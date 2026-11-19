@@ -1,10 +1,10 @@
 import { reconcile } from './pagebuilder.js';
-import { buildPagePatches } from './page-patches.js';
+import { buildPagePatches, EAGER_PAGES } from './page-patches.js';
 import { pageHfSig } from './header-footer.js';
 
 export function asyncRepaginate(
   engine,
-  { paginateNow, displayList, computeToc, queueChainWork, scheduleBackground }
+  { paginateNow, displayList, computeToc, queueChainWork, scheduleBackground, pumpOwedPages = () => {} }
 ) {
   // Demotion to opaque tears down the resident tree. Async render callbacks
   // that were already resolving must not resurrect provisional pages or hit
@@ -18,12 +18,16 @@ export function asyncRepaginate(
   const { pages } = reconcile(rawPages, engine.pages);
   const paginatedAt = performance.now();
   let built = 0;
-  const { patches } = buildPagePatches(pages, engine.pages, (page) => pageHfSig(engine.hf, page.number), (page) => {
+  // (an arrival that moves every page after it, or headers that change on
+  // all of them, is delivered like a keystroke's: the pages nearest the last
+  // edit now, the others a few at a time: page-patches.js EAGER_PAGES)
+  const { patches, later } = buildPagePatches(pages, engine.pages, (page) => pageHfSig(engine.hf, page.number), (page) => {
     built++;
     return displayList(page);
-  });
+  }, { limit: EAGER_PAGES, focus: engine.owedFocus ?? null });
   const builtAt = performance.now();
   engine.pages = pages;
+  if (later) pumpOwedPages();
   if (patches.length && engine.onAsyncPatches) {
     engine.rev++;
     // A late exact render or chain pass can be the first update that uses a

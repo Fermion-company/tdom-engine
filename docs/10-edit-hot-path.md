@@ -326,6 +326,21 @@ block の units（`units.js`。page builder が並べるもので、units が同
 
 上の 191 ページの文書で、最初の打鍵・休んだ後の打鍵とも、作り直すのは打った段落のある 1 ページだけになった（`paginate` 2.3 ms・1.7 ms）。`tests/units-kept.test.js` は、開いた直後と休んだ後の打鍵が段落のあるページだけを差し替えること、できあがったページが開き直した engine のページと一致することを確かめる（`TDOM_REBUILD_UNITS_ALWAYS=1` では落ちる）。
 
+## 10.4n 後ろのページを全部動かす打鍵：近いページだけ先に、残りは小分けで
+
+段落が 1 行増える（減る）打鍵は、その後ろの改ページすべてをまたいで 1 行ずつ送る。改ページを強制するもの（章の切れ目など）に当たるまで、後ろのページは全部変わる。191 ページ・2,600 段落の 1 つの流れの中ほどでは 96 ページである。ここに 3 つの問題が重なっていた。
+
+- **engine**: その打鍵の中で 96 ページの display list を作っていた（`paginate` 段 150〜190 ms。打鍵に答える thread の上）。
+- **server**: 96 ページの list を 1 つの event（18 MB）で送っていた。event stream は 1 client あたり 8 MB より多く溜めると接続を切る（`SSE_MAX_BUFFER`。止まった client のために溜め続けないための上限）。この event はそれを超えるので、**viewer の stream が切られ、EventSource が繋ぎ直すまでの約 3 秒、どの打鍵も紙面に出なかった**（packaged app、70 打鍵のうち行が増えた打鍵から 20 打鍵）。切られた event の中身（後ろのページ）は viewer に届かないままだった。
+- **viewer**: 届いたページは見えていなくても全部組み立てていた（markup、parse、差し替え、browser の layout）。stage は revision ごとのものなので、commit されるまでは打鍵のたびに作り直してもいた。
+
+直したのは 2 か所である。
+
+- **1 回の update が作る display list は、編集位置に近い 4 ページまで**（`page-patches.js` の `buildPagePatches` の `limit`、`EAGER_PAGES`）。残りのページは「owed」として、viewer が今その番号のページに何を表示しているか（最後に送った list の hash）だけを覚える。engine は打鍵の合間に 4 ページずつ作って async の経路（`kind: 'patches'`）で送る（`engine-v3.js` の `#pumpOwedPages`。直前の編集位置に近いページから。update が走っている間は待つ）。owed のページは、後から作った list が viewer の表示と同じなら送らない。次の打鍵は自分のページだけを作り、まだ owed のページは pump に任せる。headers が全ページで変わったとき・async の到着が後ろを全部動かしたとき（`async-repaginate.js`）も同じ扱いになる。boot は従来どおり全ページを一度に作る。`getDisplayLists()`（`/doc`）は owed のページの list もその場で作って返す。`TDOM_EAGER_PAGES=0` で従来どおり全部一度に、`=<n>` で枚数を変える。
+- **viewer は、4 ページ以上を組み立てる update では、pane に近くないページを組み立てない**（`web/app.js` の `renderPage` の `mayDefer`、`nearSight`）。見えているページから 2 ページより遠く、すでに何かを表示しているページは、中身を持たない stage になる。commit にとっては「見えていない、まだ ready でないページ」で、何とも結ばれず、今の表示を保つ（§4.5 の `away`。exact pixel を待つ見えないページと同じ）。scroll・resize で pane に近づいたら、後回しにした list で組み立てる（`stageDeferredNearSight`）。canonical のページが先に届けば組み立てない。何も表示していないページ（文書の最初の表示）は従来どおり全部組み立てる。`globalThis.__tdomStageAllPages = true` で常に全部。
+
+engine だけの計測（上の文書、行が増える打鍵）: 223 ms → 39〜44 ms（`paginate` 193 → 10〜11 ms）、その打鍵の report は 17.9 MB → 0.75 MB。残りの 92 ページは 23 回の event（最大 0.77 MB）に分かれ、打鍵の 0.3〜0.4 秒後までに届く。届いた list を順に当てはめた結果は、engine の全ページの list と一致する。`tests/owed-pages.test.js` は `buildPagePatches` の規則を場合ごとに確かめ、TeX を通して「打鍵の応答は近い 4 ページ、残りは後から、全ページが届く、開き直した engine のページと行が一致する」を確かめる。`tests/deferred-pages.test.js` は viewer 自身の stage・commit の code で、近いページだけが組み立てられ、後回しのページが表示を保ち、近づくと組み立てられることを確かめる。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。
