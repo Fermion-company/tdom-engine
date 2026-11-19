@@ -1166,11 +1166,19 @@ const sseClients = new Set();
 const SSE_MAX_BUFFER = 8 * 1024 * 1024;
 function writeEvent(res, jsonStr) {
   try {
-    res.write(`data: ${jsonStr}\n\n`);
+    // The mark is for a client that is not reading: it is looked at before
+    // the event is written, so it counts what the client has left untaken,
+    // not the event in hand. Looked at after the write, one event larger
+    // than the mark (a reboot's pages of a long document; before
+    // page-patches.js EAGER_PAGES, a keystroke that moved 96 pages) cut off
+    // a viewer that was keeping up: nothing reached it for the three seconds
+    // EventSource takes to connect again, and what was sent meanwhile was lost.
     if (res.writableLength > SSE_MAX_BUFFER) {
       sseClients.delete(res);
       res.destroy();
+      return;
     }
+    res.write(`data: ${jsonStr}\n\n`);
   } catch {
     sseClients.delete(res);
   }

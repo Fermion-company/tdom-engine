@@ -146,7 +146,7 @@ test('a page put off that owes exact ink waits as it did; one near a page in sig
   assert.equal(viewer.nearSight(4), true);
   assert.equal(viewer.nearSight(5), false);
   assert.equal(viewer.nearSight(99), true, 'a page that has no shell yet has no place: it is built');
-  // a shell that shows nothing yet is built wherever it is (the first presentation of a document builds every page)
+  // a shell that shows nothing yet (a page never scrolled to) is put off like any other
   viewer.built.length = 0;
   viewer.appliedSrcRev = 4;
   for (const page of [11, 12]) {
@@ -155,8 +155,14 @@ test('a page put off that owes exact ink waits as it did; one near a page in sig
   }
   viewer.stageProvisionalPatches(range(6, 12).map((n) => replace(version(n, 'v3'))), false, 12);
   await settle();
-  assert.deepEqual(viewer.built, [11, 12]);
-  assert.deepEqual(viewer.deferred(), [5, 6, 7, 8, 9, 10]);
+  assert.deepEqual(viewer.built, []);
+  assert.deepEqual(viewer.deferred(), [5, 6, 7, 8, 9, 10, 11, 12]);
+  // …and built when the reader comes to it
+  viewer.look(12, 12);
+  viewer.stageDeferredNearSight();
+  await settle();
+  assert.deepEqual(viewer.built, [10, 11, 12]);
+  assert.equal(viewer.shown()[11], 'page 12 v3');
 });
 
 test('a page that shows a canonical paper is put off like one that shows resident ink', async () => {

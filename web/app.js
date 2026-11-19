@@ -1413,9 +1413,15 @@ function chunkImageSrc(cmd) {
 // shows (provisionalCommitGroups `away`), exactly like a page out of sight
 // that waits for exact pixels. It is built when it comes near the pane
 // (stageDeferredNearSight), or never, if canonical pages arrive first.
+// A page that shows nothing yet is put off too: in a long document most
+// pages never scrolled to are empty shells (their canonical picture is
+// loaded when they come near, canonicalStageObserver), and built as their
+// lists arrived, a tenth of a second each, they kept the page being typed
+// on from being shown for the next six keystrokes.
 // Only an update of many pages is treated so; a keystroke's own page or two
-// are built as they come. globalThis.__tdomStageAllPages = true: build every
-// page of every update, as before.
+// are built as they come, and a page that has no shell yet (the first
+// presentation of a document) always is. globalThis.__tdomStageAllPages =
+// true: build every page of every update, as before.
 const NEAR_SIGHT_PAGES = 2; // (a page this close to one in sight is built)
 function nearSight(page) {
   if (!pageDivs.has(page)) return true; // (no place yet)
@@ -1472,8 +1478,7 @@ function renderPage(dl, flash, mayDefer = false) {
     if (impossible || pagesInSight().has(dl.page)) requestCanonicalDisplay({ residentImpossible: impossible });
     return;
   }
-  // (a page that shows nothing yet is built: the first presentation of a document builds every page, as before)
-  if (mayDefer && !globalThis.__tdomStageAllPages && pagePainted(dl.page) && !nearSight(dl.page)) {
+  if (mayDefer && !globalThis.__tdomStageAllPages && !nearSight(dl.page)) {
     stage.deferred = true;
     return;
   }
