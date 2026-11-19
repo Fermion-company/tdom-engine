@@ -275,7 +275,7 @@ function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, lin
           dy = r.dy - gh + 0.78 * (gh + gd);
         }
       }
-      commands.push({
+      const command = {
         op: 'glyphs',
         fam: fmeta?.family ?? 'f-unknown',
         size: r.s,
@@ -290,7 +290,27 @@ function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, lin
         line,
         math: r.m || fmeta?.mth ? 1 : undefined,
         ov: over ? 1 : undefined,
-      });
+      };
+      if (over) {
+        // Ink only (the viewer gives it no part in editing): the runs of a
+        // line that share font, size, baseline and colour go as one command,
+        // each run's place and text in `runs`. A Japanese line is a run a
+        // character; one command a run made the page's patch half as large
+        // again, and the viewer build a node for every character of every
+        // such line on the page with every keystroke.
+        const last = commands[commands.length - 1];
+        if (last && last.ov && last.op === 'glyphs' && last.runs && last.fam === command.fam && last.size === command.size &&
+            last.y === command.y && last.color === command.color && last.math === command.math && last.src === src && last.line === line) {
+          last.runs.push([command.x, text]);
+          last.text += text;
+          last.w = r2(command.x + command.w - last.x);
+          last.gh = Math.max(last.gh, command.gh);
+          last.gd = Math.max(last.gd, command.gd);
+          continue;
+        }
+        command.runs = [[command.x, text]];
+      }
+      commands.push(command);
     }
   }
 }

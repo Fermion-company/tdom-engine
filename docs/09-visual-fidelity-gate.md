@@ -120,7 +120,7 @@ block 自身の galley の絵が届いたあとも、組み合わせ表示ので
 
 - 以前は絵が届くと行全体を絵に替えていた。絵は PDF の輪郭、glyph layer は browser の文字なので、打鍵のたびに約 0.1 秒後、行の文字の濃さが変わっていた（72 ページの本の 4 行の段落で 74,800 画素中 2,944 画素が 40/255 以上変わる。この表示では 80 画素）。owner の選択（2026-11-19）。
 - `stream.js`: 自分の絵が現行のとき、`composeExactLines(galley, galley)` で各 exact 行の「glyph で描く run」と「絵から見せる run の箱」を出し、行の unit に `reveal` として付ける。行は従来どおり block の絵の chunk 行のままである（`gfxChunk`）。
-- `display-list.js`: chunk command に `show`（ページ上の箱 `[x, y, w, h]` の一覧。切り出しの窓と同じ余白）を付け、行の文字は `ov: 1` の glyph command として source hit box の後ろ（上）に出す。
+- `display-list.js`: chunk command に `show`（ページ上の箱 `[x, y, w, h]` の一覧。切り出しの窓と同じ余白）を付け、行の文字は `ov: 1` の glyph command として source hit box の後ろ（上）に出す。 `ov` の文字は編集に使わない ink なので、同じ行で font・大きさ・baseline・色が同じ run を 1 つの command にまとめ、各 run の位置と文字を `runs: [[x, text], …]` で送る（viewer は 1 つの `<text>` の中の `<tspan x>` として描く。描画は run ごとの要素と 1 画素も違わない）。和文の行は 1 文字 1 run なので、まとめないと数式の多いページの patch が 37 → 52 KB になり、1 打鍵が 12〜16 ms 遅くなった（章ウィンドウ・数式の中: 36〜38 → 49〜54 ms。まとめた後は 31〜33 ms）。
 - viewer（`web/app.js`）: `show` のある絵の窓は、その箱だけを `clip-path` の polygon で見せる。`ov` の文字は `data-src` を持たず `pointer-events: none` で描く。この行の編集・hit test・glyph の幾何は、行全体を絵で見せていたときと同じく、絵と source hit box で行う（文字の node は ink だけ）。
 - 合成できない block（図、照合できなかった絵、rescue）は従来どおり行全体を絵で見せる。`TDOM_EXACT_WHOLE_LINES=1` で以前の表示に戻す。
 

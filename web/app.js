@@ -1528,6 +1528,14 @@ function svgFor(dl, className = '') {
         const b = cmd.font === 'bold' || cmd.font === 'bolditalic' ? ` font-weight="bold"` : '';
         fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
       }
+      if (cmd.ov && Array.isArray(cmd.runs)) {
+        // (one element for the runs of a line that look alike, each at its own place)
+        parts.push(
+          `<text y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}"${OVER_TEXT_ATTRS} xml:space="preserve">` +
+          cmd.runs.map(([x, text]) => `<tspan x="${x}">${escapeXml(text)}</tspan>`).join('') + '</text>'
+        );
+        continue;
+      }
       parts.push(
         `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-width="${cmd.w ?? 0}" data-gh="${cmd.gh ?? 0}" data-gd="${cmd.gd ?? 0}"${cmd.ov ? OVER_TEXT_ATTRS : ` data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}`} xml:space="preserve">${escapeXml(cmd.text)}</text>`
       );

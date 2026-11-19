@@ -153,7 +153,10 @@ test('a line whose own picture is in shows the picture at its exact runs only, t
   // x: margin 72 + the run's place - 0.75; y: from the line's baseline (72 + 22), the box of its glyphs with 2 above and below
   assert.deepEqual(window.show, [[72 + 12 - 0.75, 94 - 5 - 2, 5 + 1.5, 6 + 4], [72 + 17 - 0.75, 94 - 4 - 5 - 2, 3 + 1.5, 6 + 4]]);
   const over = commands.filter((command) => command.ov);
-  assert.deepEqual(over.map((command) => [command.op, command.text, command.x]), [['glyphs', 'ab', 72], ['glyphs', 'cd', 94]]);
+  // (the runs of the line that look alike go as one command, each at its own place)
+  assert.deepEqual(over.map((command) => [command.op, command.text, command.x, command.runs]),
+    [['glyphs', 'abcd', 72, [[72, 'ab'], [94, 'cd']]]]);
+  assert.equal(over[0].w, 32, 'from the first run\'s left edge to the last one\'s right');
   assert.ok(!over.some((command) => command.math));
   const plain = commands.filter((command) => command.op === 'glyphs' && !command.ov);
   assert.deepEqual(plain.map((command) => command.text), ['plain'], 'the other line is ordinary glyphs');
@@ -177,7 +180,7 @@ test('the viewer shows such a picture through its openings and gives the text dr
   const app = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
   const cut = (from, to) => app.slice(app.indexOf(from), app.indexOf(to, app.indexOf(from) + from.length));
   const svgStart = app.indexOf('function svgFor(');
-  const viewer = { geometry: { paperwidth: 600, paperheight: 800 }, escapeXml: (value) => String(value),
+  const viewer = { geometry: { paperwidth: 600, paperheight: 800 }, escapeXml: (value) => String(value).replace(/</g, '&lt;'),
     readyFonts: new Set(['f-text']), FONT_FAMILY: { regular: 'serif' } };
   vm.createContext(viewer);
   vm.runInContext(cut('const OVER_TEXT_ATTRS', '/** Unified SVG page') + app.slice(svgStart, app.indexOf('\n}\n', svgStart) + 3) +
@@ -193,13 +196,16 @@ test('the viewer shows such a picture through its openings and gives the text dr
 
   const page = viewer.svg({ page: 1, commands: [
     { op: 'sourcebox', x: 72, y: 100, w: 200, h: 12, line: 1, ink: 1, math: 1, src: 'b1' },
-    { op: 'glyphs', fam: 'f-text', size: 10, x: 72, y: 110, text: 'ab', w: 10, gh: 7, gd: 2, src: 'b1', line: 1, ov: 1 },
+    { op: 'glyphs', fam: 'f-text', size: 10, x: 72, y: 110, text: 'ab<d', w: 32, gh: 7, gd: 2, src: 'b1', line: 1, ov: 1,
+      runs: [[72, 'ab'], [94, '<d']] },
     { op: 'glyphs', fam: 'f-text', size: 10, x: 72, y: 130, text: 'plain', w: 30, gh: 7, gd: 2, src: 'b1', line: 2 },
   ] });
-  const texts = [...page.matchAll(/<text [^>]*>[^<]*<\/text>/g)].map((match) => match[0]);
+  const texts = [...page.matchAll(/<text [^>]*>.*?<\/text>/g)].map((match) => match[0]);
   assert.equal(texts.length, 2);
   assert.match(texts[0], /data-ov="1" pointer-events="none"/);
   assert.doesNotMatch(texts[0], /data-src|data-line/, 'not a node the editing code finds by its source');
+  assert.match(texts[0], /<text y="110" font-size="10"[^>]*><tspan x="72">ab<\/tspan><tspan x="94">&lt;d<\/tspan><\/text>$/,
+    'one element, each run at its own place');
   assert.match(texts[1], /data-src="b1" data-line="2"/);
   assert.doesNotMatch(texts[1], /pointer-events/);
   assert.match(page, /class="tdom-source-hit"[^>]*data-src="b1"/, 'the line is still found by its hit box');
