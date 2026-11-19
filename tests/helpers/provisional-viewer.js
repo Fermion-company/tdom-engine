@@ -35,6 +35,7 @@ export function provisionalViewer(pages, canonicalCount = pages.length) {
     captureDirectEditorPageScroll() {}, applyStagedDirectEditor() {}, scheduleViewportWarm() {},
     scheduleChunkPrefetch() {}, // (pictures are not fetched here)
     patchProvisionalSvg: () => false, spliceSvgChildren() {}, // (these shells hold no SVG: a page is put in whole)
+    buildDeferredStages: () => 0, // (the stand-in renderPage below builds every page at once: nothing is put off)
     // every page is in sight: a page out of sight does not hold a commit
     // (app.js pagesInSight), and these transactions are about the ones that do
     pagesEl: { getBoundingClientRect: () => ({ top: 0, bottom: 1e9, left: 0, width: 600, height: 1e9 }) },

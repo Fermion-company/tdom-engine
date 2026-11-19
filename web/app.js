@@ -1148,6 +1148,9 @@ function tryCommitProvisionalStages() {
     const tailInSight = [...provisionalRemovedPages].some(page => sight.has(page));
     if (((pageCountMismatch || provisionalRemovedPages.size) && (owedInSight.length || tailInSight)) ||
         (canonicalPageCount === null && !residentCountSettled) || directEditor) {
+      // (where no page is taken without the others, the pages put off while
+      // out of sight are built after all: renderPage `mayDefer`)
+      if ((canonicalPageCount === null && !residentCountSettled) || directEditor) buildDeferredStages();
       if (owedInSight.length) scheduleViewportWarm({ owedOnly: true });
       return traceStage('hold', null, { why: 'not-all-ready', residentPageCount, canonicalPageCount,
         pendingLayout: provisionalPendingLayout.size, removed: provisionalRemovedPages.size, editor: !!directEditor,
@@ -1444,6 +1447,16 @@ function stageDeferredNearSight() {
     }
   });
 }
+/** Builds every page that was put off (a commit that takes no page without the others needs them all). */
+function buildDeferredStages() {
+  let built = 0;
+  for (const [page, stage] of [...provisionalStages]) {
+    if (!stage.deferred) continue;
+    renderPage(provisionalDisplayLists.get(page) ?? stage.dl, false);
+    built++;
+  }
+  return built;
+}
 const listOwesExactInk = new WeakMap(); // a display list -> whether a command of it owes exact ink
 function owesExactInkAnywhere(dl) {
   let owes = listOwesExactInk.get(dl);
@@ -1478,7 +1491,9 @@ function renderPage(dl, flash, mayDefer = false) {
     if (impossible || pagesInSight().has(dl.page)) requestCanonicalDisplay({ residentImpossible: impossible });
     return;
   }
-  if (mayDefer && !globalThis.__tdomStageAllPages && !nearSight(dl.page)) {
+  // (with an editor open on the paper every page commits together,
+  // tryCommitProvisionalStages: nothing is put off then)
+  if (mayDefer && !directEditor && !globalThis.__tdomStageAllPages && !nearSight(dl.page)) {
     stage.deferred = true;
     return;
   }

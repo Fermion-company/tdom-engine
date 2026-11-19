@@ -38,7 +38,8 @@ function viewerOf(pageCount, canonicalPages = 0) {
       }),
     },
   });
-  vm.runInContext(`${STAGING}\nthis.renderPage = renderPage; this.stageDeferredNearSight = stageDeferredNearSight; this.nearSight = nearSight;`, viewer);
+  vm.runInContext(`${STAGING}\nthis.renderPage = renderPage; this.stageDeferredNearSight = stageDeferredNearSight; this.nearSight = nearSight;\n` +
+    'this.buildDeferredStages = buildDeferredStages;', viewer);
   // the pane shows the pages from `first` to `last`
   viewer.look = (first, last) => {
     viewer.pagesEl = { getBoundingClientRect: () => ({ top: (first - 1) * PAGE_PITCH + 1, bottom: (last - 1) * PAGE_PITCH + 799,
@@ -180,4 +181,35 @@ test('a page that shows a canonical paper is put off like one that shows residen
   await settle();
   assert.deepEqual(viewer.built, [9, 10, 11, 12]);
   assert.deepEqual(viewer.deferred(), [1, 2]);
+});
+
+test('with an editor open on the paper nothing is put off, and pages put off before it opened are built when it does', async () => {
+  const viewer = viewerOf(12, 12);
+  viewer.look(1, 12);
+  viewer.stageProvisionalPatches(range(1, 12).map((n) => replace(version(n, 'v1'))), false, 12);
+  await settle();
+  viewer.look(2, 2);
+  // pages put off, no editor
+  viewer.built.length = 0;
+  viewer.appliedSrcRev = 3;
+  viewer.stageProvisionalPatches(range(2, 12).map((n) => replace(version(n, 'v2'))), false, 12);
+  await settle();
+  assert.deepEqual(viewer.deferred(), [5, 6, 7, 8, 9, 10, 11, 12]);
+  // an editor opens on page 2: the next attempt to commit builds them, because with an editor every page commits together
+  viewer.built.length = 0;
+  vm.runInContext('directEditor = { pageNumber: 2, kind: "text" }; directEditorRegionInSnapshot = () => null; provisionalStageKeepsEditor = () => true;' +
+    'repositionDirectEditor = () => {}; refreshDirectEditGeometry = async () => {}; loadChunkInputGeometry = async () => null; provisionalChunkGlyphs = () => [];', viewer);
+  viewer.tryCommitProvisionalStages();
+  await settle();
+  assert.deepEqual(viewer.built, [5, 6, 7, 8, 9, 10, 11, 12]);
+  assert.deepEqual(viewer.deferred(), []);
+  assert.deepEqual(viewer.shown().slice(4), range(5, 12).map((n) => `page ${n} v2`));
+  // and a later update of many pages is built whole
+  viewer.built.length = 0;
+  viewer.appliedSrcRev = 4;
+  viewer.stageProvisionalPatches(range(2, 12).map((n) => replace(version(n, 'v3'))), false, 12);
+  await settle();
+  assert.deepEqual(viewer.built, range(2, 12));
+  assert.deepEqual(viewer.deferred(), []);
+  assert.deepEqual(viewer.shown().slice(1), range(2, 12).map((n) => `page ${n} v3`));
 });
