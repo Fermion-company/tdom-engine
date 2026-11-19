@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -166,8 +166,12 @@ test('propagation renders bypass the quiet gate and an active edit cohort withou
   assert.equal(engine.renderWant.size, 0);
 });
 
+// (the one test of this file that typesets: skipped where TeX is absent, as on CI)
+const texReady = spawnSync('lualatex', ['--version']).status === 0;
+
 for (const ceiling of [8, 12]) {
-  test(`native merged equation propagation drains exactly at ceiling ${ceiling}`, { timeout: 180_000 }, async () => {
+  test(`native merged equation propagation drains exactly at ceiling ${ceiling}`,
+    { timeout: 180_000, skip: !texReady && 'lualatex not installed' }, async () => {
     const { stdout: source } = await promisify(execFile)(process.execPath,
       [fileURLToPath(new URL('../tools/gen-long-doc.mjs', import.meta.url)), '12']);
     const root = mkdtempSync(path.join(tmpdir(), 'tdom-low-ceiling-'));
