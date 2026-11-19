@@ -133,6 +133,15 @@ large math glyph、OpenType math、PUA/unencoded glyph、PDF literal などは d
 
 resident RENDER / CAPTURE と isolated RENDER の PDF は、TeX の論理幅の左右に元の用紙幅だけ余白を持つ。`render-padding.txt` の実測余白を chunk の `xBp` と画像幅へ反映し、文字原点と sourcebox の論理幅を保つ。負の x 座標に描く枠線も PDF 化の時点で失われず、最終的な表示範囲は物理ページが切り取る。
 
+### 3.5a dormant page の積算を block ごとに戻す
+
+resident の TeX は、どの block も高さ `\maxdimen` の 1 枚の page（dormant page）の上で組む。組んだ node は block ごとに取り出す（`harvest_nodes`）が、page builder が持つ積算（`\pagetotal` など page_so_far の一族）は TeX が自分では戻さない（page が「空」に戻らないので `freeze_page_specs` が走らない）。
+
+- `daemon.lua` は取り出しのたびにこの一族を 0 に戻す（`reseed_page`）。**Lua からの代入は効かない**。`tex.pagetotal = 0` は error にならず、何も変えない（LuaTeX 1.24: box 2 つ、代入、box 1 つのあと `\pagetotal` は 3 つ分を返す）。以前はこの代入だけだったので、積算は系統の全 block で増え続けていた。
+- 積算が `\maxdimen`（16383 pt。11 pt の本文で 933 行、約 23 ページ）に達すると、page builder が段落の途中で発火し、absorb が文書に無い eject の印を galley に入れる。自前の改ページの無い流れがそれより長い文書は、23 ページごとに 10 行短いページができていた（2,600 段落の 1 ファイル: LuaLaTeX の 191 ページに対して 193 ページ。page 数が違うので viewer は resident のページを出さない。400 段落: 同じ 30 ページだが 23 ページ目から割り付けが違う）。`\clearpage` のある文書（章ごとに改ページする本）は、そこで積算が切れるので当たらなかった。
+- 今は TeX 自身の代入で戻す（`reset_page_so_far`: `\pagetotal=0pt` ほかを 1 度だけ定義した macro に入れ、`tex.runtoks` で実行する。その時点の catcode に左右されない）。`TDOM_NO_PAGE_RESET=1` で以前の動作。
+- 確認: 2,600 段落の文書で resident の 191 ページすべての先頭行が LuaLaTeX の PDF と一致。`tests/long-flow.test.js`（400 pt の block 60 個: resident のページ数が LuaLaTeX と同じで eject の印が無い。戻さないと 30 個目より後の block に印が付く）。
+
 ## 3.6 `#updateInner()` の現行順序
 
 `open()`、`edit()`、`refresh()` は最終的に `#updateInner()` に入る。現在の大きな流れは次である。

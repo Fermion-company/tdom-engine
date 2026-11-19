@@ -1421,6 +1421,37 @@ end
 -- content), the output routine started firing on every contribution — every
 -- block past that point died in-chain and fell back to the isolated rescue,
 -- which is exactly the "long documents crawl" wall.
+-- The page_so_far family (\pagetotal and the rest) cannot be set from Lua:
+-- `tex.pagetotal = 0` runs without an error and changes nothing (LuaTeX
+-- 1.24: two boxes, the assignment, one more box, and \pagetotal reads all
+-- three). The zeroing below was written that way, so the dormant page's
+-- total still grew with every block of the lineage, and at \maxdimen
+-- (16383 pt: 933 lines of an 11 pt text, 23 pages) the builder fired in the
+-- middle of a paragraph. The absorb planted an eject marker the document
+-- does not have: a document that runs longer than that without a page break
+-- of its own was paginated with a short page every 23 pages (2,600
+-- paragraphs: 193 pages against LuaLaTeX's 191; 400 paragraphs: the same 30
+-- pages, laid out differently from page 23 on). TeX's own assignment does
+-- reset the family; it is run from a macro defined once, so the catcodes of
+-- the moment do not matter.
+local RESET_PAGE_MACRO = 'tdom@resetpagesofar'
+local reset_page_ready = nil
+local function reset_page_so_far()
+  if reset_page_ready == nil then
+    reset_page_ready = pcall(function()
+      local body = '\\pagetotal=0pt \\pagestretch=0pt \\pagefilstretch=0pt \\pagefillstretch=0pt ' ..
+        '\\pagefilllstretch=0pt \\pageshrink=0pt \\pagedepth=0pt '
+      local latex = luatexbase and luatexbase.registernumber and luatexbase.registernumber('catcodetable@latex')
+      if latex then token.set_macro(latex, RESET_PAGE_MACRO, body, 'global')
+      else token.set_macro(RESET_PAGE_MACRO, body, 'global') end
+    end)
+  end
+  if not reset_page_ready then return false end
+  return pcall(function()
+    tex.runtoks(function() tex.sprint(token.create(RESET_PAGE_MACRO)) end)
+  end)
+end
+
 local function reseed_page()
   -- The dormant page is \vsize=\maxdimen, set once by the boot template,
   -- and a class may put the real height back in the middle of a document:
@@ -1454,6 +1485,9 @@ local function reseed_page()
   -- every block in the lineage; past ~25 pages of cumulative content the
   -- typesetting child starts spinning forever (every in-chain job times
   -- out and the whole document degrades to the rescue path).
+  -- (through TeX: the assignments from Lua below are kept for an engine
+  -- where they work, but in LuaTeX 1.24 they do nothing)
+  if not os.getenv('TDOM_NO_PAGE_RESET') then reset_page_so_far() end
   pcall(function()
     tex.pagetotal = 0
     tex.pagestretch = 0
