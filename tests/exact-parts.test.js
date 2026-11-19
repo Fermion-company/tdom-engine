@@ -183,7 +183,9 @@ test('the viewer shows such a picture through its openings and gives the text dr
   const viewer = { geometry: { paperwidth: 600, paperheight: 800 }, escapeXml: (value) => String(value).replace(/</g, '&lt;'),
     readyFonts: new Set(['f-text']), FONT_FAMILY: { regular: 'serif' } };
   vm.createContext(viewer);
-  vm.runInContext(cut('const OVER_TEXT_ATTRS', '/** Unified SVG page') + app.slice(svgStart, app.indexOf('\n}\n', svgStart) + 3) +
+  // (svgFor joins the pieces svgParts makes)
+  vm.runInContext(cut('const OVER_TEXT_ATTRS', '/** Unified SVG page') +
+    app.slice(svgStart, app.indexOf('\n}\n', app.indexOf('function svgParts(')) + 3) +
     '\nthis.clip = chunkShowClip; this.svg = svgFor;', viewer);
 
   const window = { op: 'chunk', x: 60, y: 100, w: 240, h: 20 };

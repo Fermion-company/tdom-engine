@@ -161,3 +161,88 @@ test('a page built again keeps the commands of the lines that did not move, and 
   assert.equal(otherFonts.commands[0].fam, 'f-other');
   assert.equal(before.commands[0].fam, 'f-text', 'the kept commands were not touched');
 });
+
+test('the viewer keeps the elements of the lines a keystroke did not change', async () => {
+  const { readFileSync } = await import('node:fs');
+  const vm = (await import('node:vm')).default;
+  const app = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const from = app.indexOf('const fontSettled');
+  const viewer = {};
+  vm.createContext(viewer);
+  vm.runInContext(app.slice(from, app.indexOf('\n}\n', app.indexOf('function patchProvisionalSvg(')) + 3) +
+    '\nthis.patch = patchProvisionalSvg; this.cut = svgPartsCut; this.splice = spliceSvgChildren;', viewer);
+
+  // a stand-in for an SVG element and its children
+  const svgOf = (names) => {
+    const svg = { childNodes: [] };
+    svg.insertBefore = (node, before) => {
+      node.parent?.childNodes.splice(node.parent.childNodes.indexOf(node), 1);
+      const at = before == null ? svg.childNodes.length : svg.childNodes.indexOf(before);
+      svg.childNodes.splice(at, 0, node);
+      node.parent = svg;
+    };
+    for (const name of names) {
+      const node = { name, parent: svg, remove() { this.parent.childNodes.splice(this.parent.childNodes.indexOf(this), 1); this.parent = null; } };
+      svg.childNodes.push(node);
+    }
+    return svg;
+  };
+  const parts = (names) => ['<svg viewBox="0 0 600 800">', ...names.map((name) => `<text>${name}</text>`), '</svg>'];
+  const names = (svg) => svg.childNodes.map((node) => node.name);
+
+  // a line in the middle changed and grew by one element
+  const before = ['a', 'b', 'c', 'd', 'e'];
+  const after = ['a', 'b', 'C1', 'C2', 'd', 'e'];
+  const committed = svgOf(before);
+  const kept = [...committed.childNodes];
+  const staged = svgOf(after);
+  assert.equal(viewer.patch(committed, parts(before), staged, parts(after)), true);
+  assert.deepEqual(names(committed), after);
+  for (const i of [0, 1]) assert.equal(committed.childNodes[i], kept[i], 'elements before the change stay');
+  for (const i of [1, 2]) assert.equal(committed.childNodes.at(-i), kept.at(-i), 'elements after it stay');
+  assert.deepEqual(names(staged), ['a', 'b', 'd', 'e'], 'only the changed elements were taken from the staged page');
+
+  // the last line removed; the first one changed; nothing changed; everything changed
+  for (const [from, to] of [[['a', 'b', 'c'], ['a', 'b']], [['a', 'b'], ['A', 'b']], [['a', 'b'], ['a', 'b']], [['a', 'b'], ['x', 'y', 'z']],
+    [[], ['a']], [['a'], []], [['a', 'a', 'a'], ['a', 'a']]]) {
+    const live = svgOf(from);
+    assert.equal(viewer.patch(live, parts(from), svgOf(to), parts(to)), true, `${from} -> ${to}`);
+    assert.deepEqual(names(live), to, `${from} -> ${to}`);
+  }
+
+  // a font that became ready since the committed page was built: the same element
+  const pending = ['<svg viewBox="0 0 600 800">', '<text data-font-pending="1">a</text>', '<text>b</text>', '</svg>'];
+  const settled = ['<svg viewBox="0 0 600 800">', '<text>a</text>', '<text>B</text>', '</svg>'];
+  const live = svgOf(['a', 'b']);
+  const first = live.childNodes[0];
+  assert.equal(viewer.patch(live, pending, svgOf(['a', 'B']), settled), true);
+  assert.equal(live.childNodes[0], first);
+  assert.deepEqual(names(live), ['a', 'B']);
+
+  // not this function's case: the page is replaced whole, and nothing was touched
+  const untouched = svgOf(['a', 'b']);
+  assert.equal(viewer.patch(untouched, parts(['a', 'b']), svgOf(['a']), ['<svg viewBox="0 0 500 700">', '<text>a</text>', '</svg>']), false, 'another paper');
+  assert.equal(viewer.patch(untouched, parts(['a']), svgOf(['a']), parts(['a'])), false, 'the committed page is not what its pieces say');
+  assert.equal(viewer.patch(untouched, parts(['a', 'b']), svgOf(['a', 'b']), parts(['a'])), false, 'the staged page is not what its pieces say');
+  assert.equal(viewer.patch(null, parts(['a']), svgOf(['a']), parts(['a'])), false, 'no committed page');
+  assert.equal(viewer.patch(untouched, undefined, svgOf(['a']), parts(['a'])), false, 'a page committed without its pieces');
+  assert.deepEqual(names(untouched), ['a', 'b']);
+
+  // the staged page is cut the same way before it is parsed: only the pieces
+  // between the shared start and end become elements, and those go in
+  for (const [from, to] of [[before, after], [['a', 'b', 'c'], ['a', 'b']], [['a', 'b'], ['a', 'b']], [['a'], ['x', 'y']], [[], ['a', 'b']]]) {
+    const cut = viewer.cut(parts(from), parts(to));
+    assert.ok(cut.head + cut.tail <= Math.min(from.length, to.length));
+    const page = svgOf(from);
+    const middle = svgOf(to.slice(cut.head, to.length - cut.tail)); // what the stage parsed
+    viewer.splice(page, cut.head, from.length - cut.tail, [...middle.childNodes]);
+    assert.deepEqual(names(page), to, `${from} -> ${to}`);
+  }
+  assert.deepEqual({ ...viewer.cut(parts(before), parts(after)) }, { head: 2, tail: 2 });
+  assert.equal(viewer.cut(undefined, parts(['a'])), null, 'no committed pieces: the page is built whole');
+  assert.equal(viewer.cut(['<svg viewBox="0 0 500 700">', '</svg>'], parts(['a'])), null, 'another paper');
+
+  viewer.__tdomWholePageCommit = true;
+  assert.equal(viewer.patch(svgOf(['a']), parts(['a']), svgOf(['b']), parts(['b'])), false, 'switched off');
+  assert.equal(viewer.cut(parts(['a']), parts(['b'])), null);
+});

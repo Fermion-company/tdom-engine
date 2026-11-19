@@ -1191,7 +1191,29 @@ function tryCommitProvisionalStages() {
     pageEditGroup.delete(dl.page);
     let div = pageDivs.get(dl.page);
     if (!div) div = ensureShell(dl.page);
-    div.querySelector(':scope > svg:not(.tdom-canonical-delta)')?.remove();
+    const committedSvg = div.querySelector(':scope > svg:not(.tdom-canonical-delta)');
+    let stagedSvg = staging.firstElementChild?.localName === 'svg' ? staging.firstElementChild : null;
+    // (the lines that did not change keep their elements: patchProvisionalSvg)
+    let kept = false;
+    const cut = stagedSvg ? stage.svgCut : null;
+    if (cut) {
+      if (committedSvg && !globalThis.__tdomWholePageCommit && div.provisionalSvgParts === cut.base &&
+          committedSvg.childNodes.length === cut.base.length - 2) {
+        spliceSvgChildren(committedSvg, cut.head, cut.base.length - 2 - cut.tail, [...stagedSvg.childNodes]);
+        kept = true;
+      } else {
+        // the page is not the one this stage was cut against any more: its whole SVG after all
+        const whole = document.createElement('div');
+        whole.innerHTML = stage.svgParts.join('');
+        whole.querySelectorAll('text[data-font-pending]').forEach(node => node.removeAttribute('data-font-pending'));
+        stagedSvg.replaceWith(whole.firstElementChild);
+        stagedSvg = staging.firstElementChild;
+      }
+    }
+    if (!kept) kept = patchProvisionalSvg(committedSvg, div.provisionalSvgParts, stagedSvg, stage.svgParts);
+    if (kept) stagedSvg.remove();
+    else committedSvg?.remove();
+    div.provisionalSvgParts = stage.svgParts ?? null;
     div.querySelectorAll('.chunkwin').forEach(e => e.remove());
     div.append(...staging.childNodes);
     div.provisionalEpoch = (div.provisionalEpoch ?? 0) + 1;
@@ -1404,7 +1426,15 @@ function renderPage(dl, flash) {
   const families = [...new Set(dl.commands.filter(cmd => cmd.op === 'glyphs' && cmd.fam).map(cmd => cmd.fam))];
   injectFonts(families);
   const staging = document.createElement('div');
-  staging.innerHTML = svgFor(dl);
+  stage.svgParts = svgParts(dl);
+  // (only what differs from the page as it stands is parsed: patchProvisionalSvg)
+  const base = div?.provisionalSvgParts ?? null;
+  const cut = svgPartsCut(base, stage.svgParts);
+  if (cut) {
+    stage.svgCut = { base, head: cut.head, tail: cut.tail };
+    staging.innerHTML = stage.svgParts[0] +
+      stage.svgParts.slice(cut.head + 1, stage.svgParts.length - 1 - cut.tail).join('') + '</svg>';
+  } else staging.innerHTML = stage.svgParts.join('');
   for (const cmd of dl.commands) {
     if (cmd.op !== 'chunk') continue;
     const W = geometry.paperwidth;
@@ -1511,6 +1541,13 @@ function chunkShowClip(cmd) {
 
 /** Unified SVG page: TeX-positioned glyph runs, rules, chunk images, folio. */
 function svgFor(dl, className = '') {
+  return svgParts(dl, className).join('');
+}
+
+// The page's SVG as its pieces: the opening tag, one element a command that
+// draws into it (in the commands' order), the closing tag. A commit keeps the
+// elements whose piece did not change (patchProvisionalSvg).
+function svgParts(dl, className = '') {
   const parts = [
     `<svg${className ? ` class="${escapeXml(className)}"` : ''} viewBox="0 0 ${geometry.paperwidth} ${geometry.paperheight}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">`,
   ];
@@ -1560,7 +1597,58 @@ function svgFor(dl, className = '') {
     }
   }
   parts.push('</svg>');
-  return parts.join('');
+  return parts;
+}
+
+// A keystroke changes a line or two of its page, and the page was replaced
+// whole: the old SVG removed, the new one put in. The browser then lays out
+// and paints every element of the page again; on a dense page of Japanese
+// text (an element a character, 1,500 of them) that was 18 ms of layout
+// after every keystroke, more than the engine takes to typeset it.
+//
+// The elements of an SVG built by svgParts stand in the order of its pieces
+// and nothing else adds or removes one. So the committed SVG stays, and of
+// the staged one only the elements between the pieces that are the same at
+// the start and the same at the end are moved in, in place of the old ones.
+// Same piece, same element: the one change made to an element after it is
+// built, clearing its font-pending mark, is left out of the comparison (the
+// mark is cleared on the page as soon as the font is ready, injectFonts).
+// Anything unexpected (another paper, a count that does not match the
+// pieces) leaves the page to be replaced whole, as before.
+//
+// The staged page is cut the same way before it is parsed (renderPage): of
+// a page whose committed pieces are known, only the pieces between the
+// shared start and end become elements, and the commit puts exactly those
+// in. If the page is no longer the one the stage was cut against, the whole
+// SVG is built at the commit instead.
+// globalThis.__tdomWholePageCommit = true: build and replace whole, always.
+const fontSettled = piece => (piece.includes(' data-font-pending="1"') ? piece.replace(' data-font-pending="1"', '') : piece);
+// How many pieces two pages share at their start and at their end.
+function svgPartsCut(oldParts, newParts) {
+  if (globalThis.__tdomWholePageCommit || !Array.isArray(oldParts) || !Array.isArray(newParts)) return null;
+  const oldCount = oldParts.length - 2;
+  const newCount = newParts.length - 2;
+  if (oldCount < 0 || newCount < 0 || oldParts[0] !== newParts[0]) return null;
+  const same = (a, b) => a === b || fontSettled(a) === fontSettled(b);
+  let head = 0;
+  while (head < oldCount && head < newCount && same(oldParts[head + 1], newParts[head + 1])) head++;
+  let tail = 0;
+  while (tail < oldCount - head && tail < newCount - head && same(oldParts[oldCount - tail], newParts[newCount - tail])) tail++;
+  return { head, tail };
+}
+// The children [head, end) of `svg` make room for `fresh`.
+function spliceSvgChildren(svg, head, end, fresh) {
+  const stale = Array.prototype.slice.call(svg.childNodes, head, end);
+  const before = svg.childNodes[end] ?? null;
+  for (const node of stale) node.remove();
+  for (const node of fresh) svg.insertBefore(node, before);
+}
+function patchProvisionalSvg(oldSvg, oldParts, newSvg, newParts) {
+  const cut = oldSvg && newSvg ? svgPartsCut(oldParts, newParts) : null;
+  if (!cut || oldSvg.childNodes.length !== oldParts.length - 2 || newSvg.childNodes.length !== newParts.length - 2) return false;
+  spliceSvgChildren(oldSvg, cut.head, oldParts.length - 2 - cut.tail,
+    Array.prototype.slice.call(newSvg.childNodes, cut.head, newParts.length - 2 - cut.tail));
+  return true;
 }
 
 function removePagesFrom(from) {

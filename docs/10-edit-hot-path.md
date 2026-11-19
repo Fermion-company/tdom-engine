@@ -247,6 +247,21 @@ LuaTeX-ja は和文の文字と文字の間に空の罫（`empty_rule`、幅 0�
 
 engine だけで測ると、この文書の打鍵の paginate は 3.5 ms → 1.1 ms（同じ負荷で交互に 2 往復）。実機（packaged beta、150 ms 間隔で 30 打鍵、同じ build で交互に 2 往復）では、打った文字が紙面に出るまで 29 ms と 34 ms → 26 ms と 25 ms、engine の時間は 15〜18 ms → 12 ms。
 
+## 10.4h 紙面の差し替え：変わっていない行の要素を残す
+
+viewer（`web/app.js`）は、打鍵のあったページの SVG を毎回まるごと作り、古い SVG と入れ替えていた。変わるのは 1〜2 行でも、browser はページの全要素を作り直し、配置し直し、描き直す。和文の密なページ（1 文字 1 要素で約 1,500 要素）では、入れ替えのあとの layout が 1 打鍵に 13〜18 ms かかっていた（viewer の profile。入れ替えの時刻より後なので、「紙面に出るまで」の計測には入っていなかった）。TeX が段落を組む時間より長い。
+
+- ページの SVG は「開始 tag、SVG に描く command 1 つにつき 1 要素、終了 tag」の列として作る（`svgParts`）。commit したページはこの列を覚える（`div.provisionalSvgParts`）。SVG の子はこの列の順に並び、ほかに子を足したり消したりする code は無い。
+- 次のページを stage するとき、列の先頭と末尾で前のページと同じ部分を数え（`svgPartsCut`）、**違う部分だけ**を HTML として解析する。commit では、古い SVG をそのまま残し、違う部分の要素だけを入れ替える（`spliceSvgChildren`）。同じ列なら同じ要素である。要素を作ったあとに変わるのは font の読み込み待ちの印だけで、比較からは外す。
+- stage のあとでページが別のものに替わっていたら（stage が比べた列と commit 済みの列が違う）、commit の時に SVG 全体を作って比べ直す（`patchProvisionalSvg`）。用紙が違う、子の数が列と合わない、などのときは従来どおりまるごと入れ替える。chunk の窓（`<div class="chunkwin">`）は従来どおり毎回作り直す。
+- `globalThis.__tdomWholePageCommit = true` で、従来どおり全体を作って入れ替える。
+
+実機（packaged beta、1 ファイル 30 ページの文書の密なページ、150 ms 間隔で 30 打鍵）:
+
+- viewer の 1 打鍵あたりの時間: 入れ替え後の layout 13.2 ms → 0.03 ms、stage（HTML の解析）4.3 ms → 1.0 ms、受信から commit まで 5.3 ms → 1.9 ms。
+- 打った文字の commit まで（中央値）: 26 ms → 18 ms。その変更を含む描画 frame が終わるまで（変更の 2 frame 後の `requestAnimationFrame`）: 46 ms → 28 ms。
+- 30 打鍵のあと、ページの SVG は同じ列から作り直した SVG と一致する（`outerHTML` の比較）。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。
