@@ -4021,47 +4021,95 @@ function loadMathWysiwyg() {
 
 // The newest snapshot received, the base the next one is a change from.
 let provisionalSnapshotHeld = null; // { epoch, snapshot }
-const snapshotBlockIndex = new WeakMap(); // snapshot -> Map(block id -> block)
 
 /** A full snapshot from an earlier one and the server's change list; null when they do not fit. */
 function applySnapshotDelta(base, delta) {
-  let byId = snapshotBlockIndex.get(base);
-  if (!byId) {
-    byId = new Map((base.blocks ?? []).map(block => [String(block.id), block]));
-    snapshotBlockIndex.set(base, byId);
+  const held = base.blocks ?? [];
+  // The list of blocks is the held one with a stretch replaced: its first
+  // `head` blocks, the blocks named, its last `tail`.
+  if (!Array.isArray(delta.cut)) return null;
+  const [head, tail, named] = delta.cut;
+  if (!Number.isSafeInteger(head) || !Number.isSafeInteger(tail) || !Array.isArray(named) ||
+      head < 0 || tail < 0 || head + tail > held.length) return null;
+  const blocks = named.length === 0 && head + tail === held.length
+    ? held.slice()
+    : [...held.slice(0, head), ...named.map(() => null), ...held.slice(held.length - tail)];
+  // the blocks sent whole, each with where it stands
+  const at = delta.at ?? [];
+  const changed = delta.blocks ?? [];
+  if (at.length !== changed.length) return null;
+  for (let k = 0; k < changed.length; k++) {
+    const i = at[k];
+    if (!Number.isSafeInteger(i) || i < 0 || i >= blocks.length) return null;
+    const name = i >= head && i < head + named.length ? named[i - head] : blocks[i]?.id;
+    if (String(name) !== String(changed[k].id)) return null;
+    blocks[i] = changed[k];
   }
-  const changed = new Map((delta.blocks ?? []).map(block => [String(block.id), block]));
+  // a named block that was not sent is one of the stretch replaced
+  let replaced = null;
+  for (let k = 0; k < named.length; k++) {
+    if (blocks[head + k]) continue;
+    if (!replaced) {
+      replaced = new Map();
+      for (let j = head; j < held.length - tail; j++) replaced.set(String(held[j].id), held[j]);
+    }
+    const found = replaced.get(String(named[k]));
+    if (!found) return null;
+    blocks[head + k] = found;
+  }
   // (a block that only stands elsewhere now: its place in the list, its pages, its offsets in the root file)
-  const moved = new Map((delta.moved ?? []).map(([id, index, pages, span]) => [String(id), { index, pages, span }]));
-  const blocks = [];
-  for (const id of delta.order ?? []) {
-    const block = changed.get(id) ?? byId.get(id);
-    if (!block) return null;
-    const place = moved.get(id);
-    if (!place) { blocks.push(block); continue; }
-    const next = { ...block, index: place.index, pages: place.pages };
+  for (const [i, index, pages, span] of delta.moved ?? []) {
+    if (!Number.isSafeInteger(i) || i < 0 || i >= blocks.length) return null;
+    const next = { ...blocks[i], index, pages };
     // (a block of an included file carries no offsets in the root file)
-    if (place.span == null) delete next.span;
-    else next.span = place.span;
-    blocks.push(next);
+    if (span == null) delete next.span;
+    else next.span = span;
+    blocks[i] = next;
+  }
+  // (blocks in a row that moved by the same amount: `by` characters in the root file, `places` in the list)
+  for (const run of delta.shift ?? []) {
+    const [from, to, by, places] = run;
+    if (![from, to, by, places].every(Number.isSafeInteger) || from < 0 || to < from || to > blocks.length) return null;
+    for (let i = from; i < to; i++) {
+      const block = blocks[i];
+      if (by && !block.span) return null;
+      blocks[i] = block.span
+        ? { ...block, index: block.index + places, span: { start: block.span.start + by, end: block.span.end + by } }
+        : { ...block, index: block.index + places };
+    }
+  }
+  // (blocks in a row that stand `down` lines further in their file, the same otherwise: a line was added above them)
+  for (const run of delta.lines ?? []) {
+    const [from, to, down] = run;
+    if (![from, to, down].every(Number.isSafeInteger) || from < 0 || to < from || to > blocks.length) return null;
+    const lower = (source) => ({ ...source,
+      start: { ...source.start, line: source.start.line + down }, end: { ...source.end, line: source.end.line + down } });
+    for (let i = from; i < to; i++) {
+      const block = blocks[i];
+      if (!block.source?.start || !block.source.end || !Array.isArray(block.editRegions) ||
+          block.editRegions.some(region => !region.source?.start || !region.source.end)) return null;
+      blocks[i] = { ...block, source: lower(block.source),
+        editRegions: block.editRegions.map(region => ({ ...region, source: lower(region.source) })) };
+    }
   }
   const sourceByFile = new Map((base.sources ?? []).map(source => [source.file, source]));
   for (const source of delta.sources ?? []) {
     if (!Array.isArray(source.splice)) { sourceByFile.set(source.file, source); continue; }
     // (the file's text as a change of the text held: where, how many characters go, what comes)
-    const held = sourceByFile.get(source.file);
+    const before = sourceByFile.get(source.file);
     const [at, gone, came] = source.splice;
-    if (typeof held?.text !== 'string' || typeof came !== 'string' || !Number.isSafeInteger(at) || !Number.isSafeInteger(gone) ||
-        at < 0 || gone < 0 || at + gone > held.text.length) return null;
-    sourceByFile.set(source.file, { ...held, text: held.text.slice(0, at) + came + held.text.slice(at + gone) });
+    if (typeof before?.text !== 'string' || typeof came !== 'string' || !Number.isSafeInteger(at) || !Number.isSafeInteger(gone) ||
+        at < 0 || gone < 0 || at + gone > before.text.length) return null;
+    sourceByFile.set(source.file, { ...before, text: before.text.slice(0, at) + came + before.text.slice(at + gone) });
   }
+  // (the files in the order held, when no list of them came)
   const sources = [];
-  for (const file of delta.files ?? []) {
+  for (const file of delta.files ?? (base.sources ?? []).map(source => source.file)) {
     const source = sourceByFile.get(file);
     if (!source) return null;
     sources.push(source);
   }
-  const { delta: _delta, order: _order, files: _files, moved: _moved, ...rest } = delta;
+  const { delta: _delta, cut: _cut, files: _files, moved: _moved, shift: _shift, lines: _lines, at: _at, ...rest } = delta;
   return { ...rest, blocks, sources };
 }
 

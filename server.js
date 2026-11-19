@@ -60,7 +60,7 @@ import {
   prepareExternalBibliography,
 } from './engine/project-bibliography.js';
 import { isPathInside } from './engine/project-inputs.js';
-import { serializeDomBlock } from './engine/checkpoint/inspector.js';
+import { domEntriesDifferInPlaceOnly, domEntryLinesMovedBy, filesOfRegions, serializeDomBlock } from './engine/checkpoint/inspector.js';
 import { textSplice } from './engine/text-splice.js';
 import { fnv1a } from './engine/hash.js';
 import { pdfPageSvgArgs } from './engine/checkpoint/util/svg.js';
@@ -560,30 +560,36 @@ function sourceJson(source) {
   }
   return json;
 }
+// Nothing of a block is serialized until it is sent: a keystroke's change
+// names the blocks that differ by looking at the entries themselves (the same
+// object, or the same parts in another place: inspector.js), and the whole
+// document as one string is made only for a viewer that holds no earlier one.
 function serializeDom(payload) {
   const { blocks = [], sources = [], ...rest } = payload;
   const order = blocks.map((block) => String(block.id));
-  const blockText = blocks.map(serializeDomBlock);
   const files = sources.map((source) => source.file);
-  const sourceText = sources.map(sourceJson);
   const tail = JSON.stringify(rest).slice(1); // `"rev":…}`
-  const unique = new Set(order).size === order.length;
   const stamp = ++domStamp;
-  return {
-    srcRev: payload.srcRev, stamp, order, files, tail, unique,
-    blocks: new Map(order.map((id, i) => [id, blockText[i]])),
-    // (the blocks themselves, to tell one that only moved: domDeltaBody)
-    raw: new Map(order.map((id, i) => [id, blocks[i]])),
-    sources: new Map(files.map((file, i) => [file, sourceText[i]])),
+  const lazy = (object, name, make) => Object.defineProperty(object, name, {
+    configurable: true,
+    get() {
+      const value = make();
+      Object.defineProperty(object, name, { value, writable: true, configurable: true });
+      return value;
+    },
+  });
+  const parts = {
+    srcRev: payload.srcRev, stamp, order, files, tail,
+    // the blocks themselves, in order
+    entries: blocks,
     // (the texts themselves, to send a change of one as a splice: domDeltaBody)
     texts: new Map(sources.map((source) => [source.file, Object.keys(source).length === 2 ? source.text : null])),
-    // the whole document as one string, only for a viewer that holds no earlier one
-    get body() {
-      const body = `{"domStamp":${stamp},"blocks":[${blockText.join(',')}],"sources":[${sourceText.join(',')}]${tail.length > 1 ? ',' : ''}${tail}`;
-      Object.defineProperty(this, 'body', { value: body });
-      return body;
-    },
+    sourceOf: new Map(sources.map((source) => [source.file, source])),
   };
+  // the whole document as one string, only for a viewer that holds no earlier one
+  lazy(parts, 'body', () => `{"domStamp":${stamp},"blocks":[${blocks.map(serializeDomBlock).join(',')}],` +
+    `"sources":[${sources.map(sourceJson).join(',')}]${tail.length > 1 ? ',' : ''}${tail}`);
+  return parts;
 }
 function rememberDom(payload) {
   const parts = serializeDom(payload);
@@ -620,11 +626,36 @@ function updateDomPush(report, raw) {
     return '';
   }
 }
+const sameList = (a, b) => {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
 /** The snapshot as a change from the serialization stamped `base`, or null when that one is not held. */
 function domDeltaBody(parts, base) {
-  if (!Number.isSafeInteger(base) || base === parts.stamp || !parts.unique) return null;
+  if (!Number.isSafeInteger(base) || base === parts.stamp) return null;
   const earlier = domServed?.stamp === base ? domServed : domEarlier.findLast((item) => item.stamp === base);
-  if (!earlier?.unique) return null;
+  if (!earlier) return null;
+  // The list of blocks is the earlier one with a stretch replaced: its first
+  // `head` blocks, the blocks named, its last `tail` (a keystroke that adds
+  // or removes no block: all of it and nothing named). Blocks are told
+  // apart place by place, and their names are not sent again (2,600 names
+  // with every keystroke of a 191-page file).
+  const n = parts.order.length;
+  const m = earlier.order.length;
+  let head = 0;
+  while (head < n && head < m && parts.order[head] === earlier.order[head]) head++;
+  let tail = 0;
+  while (tail < n - head && tail < m - head && parts.order[n - 1 - tail] === earlier.order[m - 1 - tail]) tail++;
+  const named = parts.order.slice(head, n - tail);
+  if (new Set(named).size !== named.length) return null;
+  let replaced = null; // the earlier blocks of the stretch, by name
+  for (let j = head; j < m - tail; j++) {
+    replaced ??= new Map();
+    if (replaced.has(earlier.order[j])) return null;
+    replaced.set(earlier.order[j], earlier.entries[j]);
+  }
   // A block that only stands elsewhere now (another place in the list of
   // blocks, other pages, other offsets in the root file) is sent as that
   // place, not whole. A character typed into a single-file document moves
@@ -632,28 +663,71 @@ function domDeltaBody(parts, base) {
   // every keystroke, where their places take 16 KB. A keystroke that makes
   // a chapter one page longer moves every block after it to another page:
   // 1.2 MB on a 72-page book.
+  // Blocks in a row that moved by the same amount, on the pages they were
+  // on, are sent as one run `[from, to, by, places]`: `by` characters further
+  // in the root file, `places` further in the list. A character typed in the
+  // middle of a 191-page file moved 1,300 blocks: 52 KB of places with every
+  // keystroke, now one run.
   const blocks = [];
+  const at = [];
   const moved = [];
-  for (const id of parts.order) {
-    const text = parts.blocks.get(id);
-    if (earlier.blocks.get(id) === text) continue;
-    const now = parts.raw?.get(id);
-    if (onlyMoved(earlier.raw?.get(id), now)) {
-      moved.push(`[${JSON.stringify(id)},${JSON.stringify(now.index)},${JSON.stringify(now.pages)},${JSON.stringify(now.span ?? null)}]`);
+  const shift = [];
+  let run = null;
+  // …and blocks in a row that stand `down` lines further in their file, the
+  // same otherwise (a line added above them): `[from, to, down]`.
+  const lines = [];
+  let lineRun = null;
+  const entries = parts.entries;
+  for (let i = 0; i < n; i++) {
+    const now = entries[i];
+    const was = i < head ? earlier.entries[i] : i >= n - tail ? earlier.entries[i - n + m] : replaced?.get(parts.order[i]);
+    if (was === now) continue;
+    if (!domEntriesDifferInPlaceOnly(was, now)) {
+      const down = domEntryLinesMovedBy(was, now);
+      if (down === null) {
+        // (entries not made from one core: by what they say)
+        const text = serializeDomBlock(now);
+        if (was && serializeDomBlock(was) === text) continue;
+        if (!onlyMoved(was, now)) {
+          blocks.push(text);
+          at.push(i);
+          continue;
+        }
+      } else if (down) {
+        if (lineRun && lineRun[1] === i && lineRun[2] === down) lineRun[1] = i + 1;
+        else lines.push(lineRun = [i, i + 1, down]);
+      }
     }
-    else blocks.push(text);
+    const by = was.span && now.span ? now.span.start - was.span.start : 0;
+    const places = now.index - was.index;
+    const inRun = (was.span == null) === (now.span == null) && Number.isSafeInteger(places) && Number.isSafeInteger(by) &&
+      (!now.span || now.span.end - was.span.end === by) && sameList(was.pages ?? [], now.pages ?? []);
+    if (!inRun) {
+      moved.push(`[${i},${JSON.stringify(now.index)},${JSON.stringify(now.pages)},${JSON.stringify(now.span ?? null)}]`);
+      continue;
+    }
+    if (!by && !places) continue; // (stands where it stood)
+    if (run && run[1] === i && run[2] === by && run[3] === places) run[1] = i + 1;
+    else shift.push(run = [i, i + 1, by, places]);
   }
-  const sources = parts.files.filter((file) => earlier.sources.get(file) !== parts.sources.get(file)).map((file) => {
-    const before = NO_SOURCE_SPLICE ? null : earlier.texts?.get(file);
-    const after = parts.texts?.get(file);
-    if (typeof before !== 'string' || typeof after !== 'string') return parts.sources.get(file);
-    const [at, gone, came] = textSplice(before, after);
+  const sources = parts.files.flatMap((file) => {
+    const before = earlier.texts.get(file);
+    const after = parts.texts.get(file);
+    if (typeof before !== 'string' || typeof after !== 'string') {
+      const text = sourceJson(parts.sourceOf.get(file));
+      return earlier.sourceOf.has(file) && sourceJson(earlier.sourceOf.get(file)) === text ? [] : [text];
+    }
+    if (before === after) return [];
+    if (NO_SOURCE_SPLICE) return [sourceJson(parts.sourceOf.get(file))];
+    const [from, gone, came] = textSplice(before, after);
     // (worth it only when the change is a small part of the file)
-    if (came.length * 2 + 64 >= after.length) return parts.sources.get(file);
-    return `{"file":${JSON.stringify(file)},"splice":[${at},${gone},${JSON.stringify(came)}]}`;
+    if (came.length * 2 + 64 >= after.length) return [sourceJson(parts.sourceOf.get(file))];
+    return [`{"file":${JSON.stringify(file)},"splice":[${from},${gone},${JSON.stringify(came)}]}`];
   });
-  return `{"domStamp":${parts.stamp},"delta":{"base":${base}},"order":${JSON.stringify(parts.order)},"files":${JSON.stringify(parts.files)},` +
-    `"blocks":[${blocks.join(',')}],"moved":[${moved.join(',')}],"sources":[${sources.join(',')}]${parts.tail.length > 1 ? ',' : ''}${parts.tail}`;
+  return `{"domStamp":${parts.stamp},"delta":{"base":${base}},"cut":[${head},${tail},${JSON.stringify(named)}],` +
+    `"files":${sameList(earlier.files, parts.files) ? 'null' : JSON.stringify(parts.files)},` +
+    `"blocks":[${blocks.join(',')}],"at":${JSON.stringify(at)},"moved":[${moved.join(',')}],"shift":${JSON.stringify(shift)},` +
+    `"lines":${JSON.stringify(lines)},"sources":[${sources.join(',')}]${parts.tail.length > 1 ? ',' : ''}${parts.tail}`;
 }
 /** What an edit became, for a client that asked for no more (`slim`). */
 function editAnswer(report) {
@@ -1517,17 +1591,6 @@ function bibliographySourceLocation(generatedText, generatedLine = null) {
   return null;
 }
 
-// The files a block's edit regions point into, kept with the regions (the
-// same array for as long as the block's regions are the same, inspector.js).
-const regionFiles = new WeakMap();
-function filesOfRegions(regions) {
-  let files = regionFiles.get(regions);
-  if (!files) {
-    files = [...new Set(regions.map((region) => region.source?.file).filter(Boolean))];
-    regionFiles.set(regions, files);
-  }
-  return files;
-}
 // `raw` is the engine's snapshot and may be shared with other readers of the
 // same state: it is left as it is.
 function domPayload(report = lastReport, raw = engine.getDOM()) {

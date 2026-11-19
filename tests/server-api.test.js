@@ -185,15 +185,58 @@ test('a block that only moved to another page travels as its new place; a host c
   assert.ok(delta.blocks.length < delta.moved.length, JSON.stringify({ blocks: delta.blocks.length, moved: delta.moved.length }));
   // applied the way the viewer does, the change gives the snapshot the server would send whole
   const APP = (await import('node:fs')).readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-  const applySnapshotDelta = Function('snapshotBlockIndex', `${APP.slice(
+  const applySnapshotDelta = Function(`${APP.slice(
     APP.indexOf('function applySnapshotDelta'), APP.indexOf('// The update that brings a revision also brings its source map')
-  )}; return applySnapshotDelta;`)(new WeakMap());
+  )}; return applySnapshotDelta;`)();
   const applied = applySnapshotDelta(held, delta);
   const whole = await fetch(`${base}/dom?srcRev=${answer.srcRev}`).then((res) => res.json());
   assert.equal(whole.srcRev, answer.srcRev);
   assert.deepEqual(applied.blocks, whole.blocks);
   assert.deepEqual(applied.sources, whole.sources);
   assert.ok(whole.blocks.some((block, i) => JSON.stringify(block.pages) !== JSON.stringify(held.blocks[i]?.pages)), 'pages did change');
+  // A character typed: the block typed in travels whole, the blocks after it as one run of
+  // offsets; a line break typed: the blocks after it as one run of lines as well. No block
+  // is named, and none but the one typed in is sent.
+  const step = async (from, edit, check) => {
+    const done = await post({ ...edit, slim: true });
+    const change = await fetch(`${base}/dom?srcRev=${done.srcRev}&base=${from.domStamp}`).then((res) => res.json());
+    assert.equal(Number(change.delta?.base), from.domStamp);
+    const now = await fetch(`${base}/dom?srcRev=${done.srcRev}`).then((res) => res.json());
+    const got = applySnapshotDelta(from, change);
+    assert.deepEqual(got.blocks, now.blocks);
+    assert.deepEqual(got.sources, now.sources);
+    check(change, now);
+    return now;
+  };
+  const source = (await fetch(`${base}/doc`).then((res) => res.json())).source;
+  const word = source.indexOf('watch the inspector');
+  const typed = await step(whole, { start: word, end: word, text: 'x' }, (change, now) => {
+    assert.deepEqual(change.cut, [now.blocks.length, 0, []], 'the same blocks in the same order: none named');
+    // (the block typed in, and the few the keystroke typeset again beside it)
+    assert.ok(change.blocks.length >= 1 && change.blocks.length <= 6, JSON.stringify(change.blocks.map((block) => block.id)));
+    assert.deepEqual(change.at, change.blocks.map((block) => now.blocks.findIndex((item) => item.id === block.id)));
+    assert.ok(change.shift.length >= 1 && change.shift.length <= change.blocks.length, JSON.stringify(change.shift));
+    assert.ok(change.shift.every((run) => run[2] === 1 && run[3] === 0), 'one character further, at the same place in the list');
+    assert.equal(change.shift.at(-1)[1], now.blocks.length, 'to the last block');
+    const inRuns = change.shift.reduce((sum, run) => sum + run[1] - run[0], 0);
+    assert.equal(inRuns + change.blocks.length, now.blocks.length - change.at[0], 'every block from the one typed in on, and none before');
+    assert.deepEqual(change.lines, []);
+    assert.deepEqual(change.moved, []);
+  });
+  const lineStart = source.lastIndexOf('\n', word) + 1;
+  // (in front of the blank line before the paragraph: one line more above everything after it)
+  const blank = source.lastIndexOf('\n\n', lineStart);
+  assert.ok(blank > 0);
+  await step(typed, { start: blank, end: blank, text: '\n' }, (change, now) => {
+    assert.deepEqual(change.cut, [now.blocks.length, 0, []]);
+    assert.ok(change.lines.length >= 1, JSON.stringify(change.lines));
+    assert.ok(change.lines.every((run) => run[2] === 1), JSON.stringify(change.lines));
+    assert.ok(change.blocks.length <= 6, `blocks sent whole: ${change.blocks.length} of ${now.blocks.length}, lines ${JSON.stringify(change.lines)}, at ${JSON.stringify(change.at)}`);
+    const lowered = change.lines.reduce((sum, run) => sum + run[1] - run[0], 0);
+    assert.ok(lowered >= now.blocks.length - change.lines[0][0] - change.blocks.length,
+      `the blocks after the line, as runs: ${JSON.stringify(change.lines)} of ${now.blocks.length}, whole at ${JSON.stringify(change.at)}`);
+    assert.equal(now.blocks.at(-1).source.start.line, typed.blocks.at(-1).source.start.line + 1);
+  });
   // without `slim` the answer is the report, as before
   const report = await post({ start: line, end: line + 1, text: '\\' });
   assert.ok(Array.isArray(report.patches));

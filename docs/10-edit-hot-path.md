@@ -271,7 +271,7 @@ viewer（`web/app.js`）は、打鍵のあったページの SVG を毎回まる
 - **打鍵のあったページの近くの block 探し**（`update-helpers.js` の `editPageRenderIds`）: 全ページの全行から配列を 2 つずつ作っていた（1.8 ms）。該当する block のあるページだけ配列を作る。
 - **source の text の送り方**（`server.js` の `serializeDom`・`domDeltaBody`、`web/app.js` の `applySnapshotDelta`）: snapshot は source file の全文を持つ。打鍵のたびに全 file の text を JSON にし、打った file は全文を viewer へ送っていた（この文書で 29 万字、event は 578 KB）。text が前と同じ file は前の JSON を使い、変わった file は「どこから何文字消して何を入れるか」（`engine/text-splice.js` の `textSplice`）だけを送る。viewer は持っている text に当てはめ、当てはめられなければ snapshot 全体を取り直す。`TDOM_NO_SOURCE_SPLICE=1` で全文を送る。
 
-実機（この文書の中ほどで 150 ms 間隔 30 打鍵）: engine 21.5 ms → 14〜15 ms、打った文字の commit まで 44 ms → 35 ms（§3.5a の修正の前は、ページ数の食い違いで resident のページが出ず 0/30）。まだ block の数に比例するのは snapshot の作成（`dom` 段 6〜7 ms: 打った位置より後の block は root の中の offset が動くので、1,300 個の entry を作り直して比べている）。
+実機（この文書の中ほどで 150 ms 間隔 30 打鍵）: engine 21.5 ms → 14〜15 ms、打った文字の commit まで 44 ms → 35 ms（§3.5a の修正の前は、ページ数の食い違いで resident のページが出ず 0/30）。このとき残っていた snapshot の作成（`dom` 段 6〜7 ms: 打った位置より後の block は root の中の offset が動くので、1,300 個の entry を作り直して比べていた）は §10.4k で外した。
 
 ## 10.4j overlay の file を打鍵のたびに読み直さない
 
@@ -282,6 +282,26 @@ viewer（`web/app.js`）は、打鍵のあったページの SVG を毎回まる
 - `TDOM_READ_OVERLAYS_ALWAYS=1` で毎回読む。
 
 章ウィンドウの打鍵で、engine の `readFileSync` は 1.0 → 0.36 ms、`prepareUpdate` は 3.1 → 2.75 ms（同じ build で交互に 1 往復）。
+
+## 10.4k snapshot：動いただけの block を作り直さない・送らない
+
+打鍵のたびに viewer へ届く snapshot（source map）は、block ごとの entry の列である。1 ファイルの文書では、打った位置より後の block はすべて root の中の offset が動く。191 ページ・2,600 block の文書の中ほどで 1 文字打つと、engine は 1,300 個の entry を作り直し、server はそれを JSON にして前の版と比べ、viewer へ 86 KB 送っていた。改行を 1 つ打つと、後ろの block は行番号も変わるので 1,300 個が丸ごと送られた（0.9 MB）。
+
+- **entry は core と place に分かれる**（`inspector.js` の `buildDomSnapshot`）。core は block が何であるか（種類、図、source の行と桁、label、edit region）、place は block がどこにあるか（列の中の番号、載っているページ、root の中の offset）。core が前のままかどうかは、作り直さずに確かめる: block が持つ object（galley、fidelity、edit region の list、text）が同じで、行と桁が root の行頭表（`SourceStore.lineStarts`）に照らして同じなら、前の core である。place だけが動いた block の entry は、前の entry と core の部品をすべて共有する新しい object になり、`domEntriesDifferInPlaceOnly` が中身を読まずにそう判定できる。複数の file にまたがる block、`\maketitle` を持つ block（前付の region が付く）は従来どおり毎回作る。
+- **行だけがずれた block**（上に行が増えた・減った）。core を前の core から作る: source と edit region の行だけを動かした複製で、残りの部品は共有する。何行ずれたかは core の `source` をさかのぼれば分かる（`domEntryLinesMovedBy`。viewer が数版前の snapshot を持っていても足し合わせる）。
+- **block の載っているページ**（`pagesOfBlocks`）。全ページの全行（この文書で 7,800 行）を毎回読んでいた。engine の memo に置き、行の list が別の object になったページ（打鍵 1 回で 1 ページ）だけを読み直して、そのページの block の list だけを作り替える。渡した list は書き換えない（前の snapshot の entry が持っている）。ページ番号が昇順でない紙面は毎回読む。
+- **送り方**（`server.js` の `domDeltaBody`、`web/app.js` の `applySnapshotDelta`）。送るまで何も JSON にしない（全文の JSON は、前の版を持たない viewer に全体を送るときだけ作る）。block の列は「前の列の先頭 `head` 個、名前を挙げた block、末尾 `tail` 個」（`cut`）で表し、block は名前ではなく位置で指す。丸ごと送る block は `blocks` と位置の `at`。同じだけ動いた block の並びは 1 つの run にまとめる: `shift` は `[from, to, by, places]`（root の中の offset が `by` 文字、列の番号が `places` だけ先）、`lines` は `[from, to, down]`（行が `down` 行だけ下）。ページが変わった block は 1 個ずつ（`moved`、位置で指す）。viewer は持っている snapshot に当てはめ、どれか 1 つでも当てはまらなければ全体を取り直す。core から作っていない entry（`.bbl` の block など）は、従来どおり JSON で比べる。
+- `SourceStore` の行頭表は、edit のたびに全文を 1 文字ずつ見て作っていた。行末から次の行末へ `indexOf` で進む。
+
+engine と server・viewer の該当 code だけを通した計測（上の文書の中ほど、12 打鍵の中央値）:
+
+| 打鍵 | server 側（snapshot を作って差分にする） | viewer 側（読んで当てはめる） | 送る量 |
+|---|---|---|---|
+| 1 文字 | 11.1 → 1.7 ms | 1.0 → 0.14 ms | 86 KB → 1.5 KB |
+| 改行 1 つ | 13.6 → 3.6 ms | 3.8 → 0.5 ms | 895 KB → 0.9 KB |
+| 新しい段落 | 3.0 ms | 0.3 ms | 6.2 KB |
+
+3 種類の打鍵とも、viewer が当てはめた snapshot・server の snapshot・何も覚えていない状態から作った snapshot が、block ごとに一致する（JSON の byte まで）。
 
 ## 10.5 definition edit
 

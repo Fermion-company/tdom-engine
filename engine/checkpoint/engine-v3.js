@@ -672,6 +672,8 @@ export class CheckpointEngine {
       chunkTargets: (b) => this.#chunkTargets(b),
       file: this.file,
       position: (file, offset) => this.store.position(file, offset),
+      lineStarts: (file) => this.store.lineStarts(file),
+      memo: (this.domMemo ??= {}),
       labelTable: this.labelTable,
       preambleEditRegions: this.closureDeferred ? [] : this.preambleEditRegions,
     });
