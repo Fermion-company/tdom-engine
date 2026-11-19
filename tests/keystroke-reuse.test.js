@@ -116,3 +116,48 @@ test('a block that names no resource command is left as it is, one that does is 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a page built again keeps the commands of the lines that did not move, and its hash is that of its content', async () => {
+  const { buildDisplayList } = await import('../engine/checkpoint/display-list.js');
+  const fonts = new Map([['text', { tier: 'native', family: 'f-text' }]]);
+  const geometry = { oddsidemargin: 0, topmargin: 0, headheight: 12, headsep: 25, textwidth: 345, textheight: 550, footskip: 30 };
+  const run = (t, x) => ({ t, f: 'text', s: 10, x, w: 10, dy: 0, gh: 7, gd: 2, c: '#000000' });
+  const line = (blockId, li, text) => ({
+    blockId, li, h: 8, d: 2,
+    ln: { boxH: 8, backend: null, runs: [...text].map((char, i) => run(char, i * 10)).concat([{ rule: true, x: 0, dy: 1, w: 30, h: 0.4 }]) },
+  });
+  const options = { geometry, chunks: new Map(), hf: null, hfSig: '', fonts, twinMetrics: null };
+  const first = line('b1', 0, 'あいう');
+  const second = line('b2', 0, 'えお');
+  const third = line('b3', 0, 'かき');
+  const page = (lines) => ({ number: 1, draw: lines.map(([u, y]) => ({ u, y })) });
+  // (a build that has seen none of these lines: the same lines as new objects)
+  const unseen = (u) => ({ ...u, ln: { ...u.ln, runs: u.ln.runs.map((r) => ({ ...r })) } });
+
+  const before = buildDisplayList(page([[first, 10], [second, 22], [third, 34]]), options);
+  assert.equal(before.commands.length, 3 + 1 + 2 + 1 + 2 + 1 + 1, 'glyphs and a rule a line, and the folio');
+  // the middle line changed and grew: the first stays, the third moves down
+  const edited = line('b2', 0, 'えおん');
+  const after = buildDisplayList(page([[first, 10], [edited, 22], [third, 46]]), options);
+  for (let i = 0; i < 4; i++) assert.equal(after.commands[i], before.commands[i], 'the unmoved line is the same commands');
+  assert.notEqual(after.commands.at(-2), before.commands.at(-2), 'a line at another place is built again');
+  assert.equal(after.commands.at(-2).y, before.commands.at(-2).y + 12);
+  assert.notEqual(after.hash, before.hash);
+
+  // what a build that kept nothing gives: the same commands, the same hash
+  const fresh = buildDisplayList(page([[unseen(first), 10], [unseen(edited), 22], [unseen(third), 46]]), options);
+  assert.deepEqual(after.commands, fresh.commands);
+  assert.equal(after.hash, fresh.hash, 'the hash is a function of the content alone');
+  // and back where it was, the page has the hash it had
+  const again = buildDisplayList(page([[first, 10], [second, 22], [third, 34]]), options);
+  assert.deepEqual(again.commands, before.commands);
+  assert.equal(again.hash, before.hash);
+  // one character of one command is another page
+  const other = buildDisplayList(page([[unseen(first), 10], [unseen(second), 22], [line('b3', 0, 'かく'), 34]]), options);
+  assert.notEqual(other.hash, before.hash);
+  // another font table is another build of every line
+  const otherFonts = buildDisplayList(page([[first, 10], [second, 22], [third, 34]]),
+    { ...options, fonts: new Map([['text', { tier: 'native', family: 'f-other' }]]) });
+  assert.equal(otherFonts.commands[0].fam, 'f-other');
+  assert.equal(before.commands[0].fam, 'f-text', 'the kept commands were not touched');
+});

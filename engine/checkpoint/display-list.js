@@ -12,6 +12,34 @@ const EXACT_CHUNK_BLEED_BP = 2;
 // other ink of that line, which may not be beside it any more.
 const EXACT_PART_SIDE_BLEED_BP = 0.75;
 
+// A page is built again with every keystroke on it, and all but a line or
+// two of it is what it was: the lines of the blocks that did not change, at
+// the places they had. On a dense page of Japanese text (a run a character,
+// 1,500 commands, 195 KB) making those commands again and hashing the whole
+// page's JSON was a quarter of the engine's time for the keystroke.
+//  - LINE_COMMANDS: the commands of a line that is glyphs and rules only,
+//    kept with the line (stream.js keeps a block's lines while its galley
+//    and pictures stay) and used again while it stands at the same place.
+//    Fonts never change under a line: a demoted family rebuilds every
+//    block's lines (fidelity-gate.js).
+//  - COMMAND_HASH: the page's hash is made of one hash per command, kept
+//    with the command, so only new commands are serialised for it. It is
+//    still a function of the commands' content alone.
+// TDOM_NO_LINE_REUSE=1: build every line and hash the page's JSON, as before.
+const NO_LINE_REUSE = !!process.env.TDOM_NO_LINE_REUSE;
+const LINE_COMMANDS = new WeakMap();
+const COMMAND_HASH = new WeakMap();
+function hashCommands(commands) {
+  if (NO_LINE_REUSE) return fnv1a(JSON.stringify(commands));
+  let joined = '';
+  for (const command of commands) {
+    let hash = COMMAND_HASH.get(command);
+    if (hash === undefined) COMMAND_HASH.set(command, hash = fnv1a(JSON.stringify(command)));
+    joined += hash + ',';
+  }
+  return fnv1a(joined);
+}
+
 export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twinMetrics }) {
   const geo = geometry;
   const L = 72 + (geo.oddsidemargin ?? 0);
@@ -152,6 +180,13 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       sourceHitCommand(commands, L, baseline, u, u.blockId, geo.textwidth, fonts);
       continue;
     }
+    const kept = !NO_LINE_REUSE && !u.ln.parts ? LINE_COMMANDS.get(u) : null;
+    if (kept && kept.L === L && kept.baseline === baseline && kept.fonts === fonts && kept.twinMetrics === twinMetrics &&
+        kept.runs === u.ln.runs && kept.src === u.blockId && kept.line === u.li && kept.backend === u.ln.backend) {
+      for (const command of kept.commands) commands.push(command);
+      continue;
+    }
+    const first = commands.length;
     runCommands(commands, u.ln.runs, L, baseline, u.blockId, {
       fonts,
       twinMetrics,
@@ -159,6 +194,12 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       backend: u.ln.backend,
     });
     if (u.ln.parts) partCommands(commands, u, L, baseline, chunks.get(u.ln.partsChunk ?? u.blockId));
+    else if (!NO_LINE_REUSE) {
+      LINE_COMMANDS.set(u, {
+        L, baseline, fonts, twinMetrics, runs: u.ln.runs, src: u.blockId, line: u.li, backend: u.ln.backend,
+        commands: commands.slice(first),
+      });
+    }
   }
   flushGfx();
   // Header / footer: TeX-typeset boxes from the page-style job (the exact
@@ -186,7 +227,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
     });
   }
   const dl = { page: page.number, commands };
-  dl.hash = fnv1a(JSON.stringify(commands));
+  dl.hash = hashCommands(commands);
   dl.hfSig = hfSig; // this page's own head and foot: rebuilt when they change (header-footer.js pageHfSig)
   return dl;
 }

@@ -238,6 +238,15 @@ LuaTeX-ja は和文の文字と文字の間に空の罫（`empty_rule`、幅 0�
 - 紙面の上の editor を開いたまま、その数式へ 150 ms 間隔で 12 打鍵（1 ページの文書。打鍵は source の側から入れた）: RENDER を送らなかった打鍵は 0 で、`TDOM_RENDER_EVERY_KEY=1` のときと同じく 1 打鍵に 1 本。editor を開かずに同じ打鍵をすると、字形の揃った 9 打鍵目から送らない。
 - 30 打鍵目の画面（組み合わせ表示）と、止まって block 自身の絵が届いた後の画面の差は、段落の範囲で 91 画素（40/255 以上。2560×1640 の画面）。
 
+## 10.4g 打鍵のたびに文書やページの全体へ触れていた処理
+
+1 文字の打鍵でも、文書の長さやページの文字数に比例する仕事が 2 つ残っていた。どちらも 1 ファイル 30 ページの文書（和文の地の文。1 ページ 1,470 command、195 KB）で見つけた。
+
+- **shipping chain への問い合わせ**（`ship-pacing.js` の `deferShipUpdate`）: 表示できる打鍵の replay は打鍵が止まるまで持っておく。持っている間に次の打鍵が来ると、chain に「今の source は chain の source と 1 unit しか違わないか」を尋ねていた（`replayableFrom`）。chain はそのために root の source 全体を unit に切り直す（30 ページで 2.5 ms。ページ数に比例する）。1 ファイルの文書では、これが打鍵ごとに走っていた。持っている打鍵と同じ block をその場で変えただけの打鍵（block の追加・削除・分割・結合が無く、間に別の revision も無い）では尋ねない。engine は update ごとに「その場で変えた 1 つの block」の id を渡す（`#updateInner` の `editedInPlace`）。尋ねなくても正しさは変わらない。持っていた text を replay するとき `resume()` が unit を切って比べ直し、2 つ以上違えば reboot を求める。`TDOM_SHIP_CHECK_EVERY_KEY=1` で毎回尋ねる。
+- **ページの display list**（`display-list.js`）: 打鍵のあったページは毎回 command を全部作り直し、ページ全体の JSON を hash していた。変わるのは 1〜2 行である。glyph と罫だけの行の command は行（`stream.js` が block ごとに持つ unit）に付けて覚え、同じ場所に立っている間はそのまま使う（`LINE_COMMANDS`）。ページの hash は command ごとの hash（command に付けて覚える）をつないだものにした。内容だけで決まる点は同じで、新しい command だけを直列化する。font の表は行の下で変わらない（family の降格は全 block の行を作り直す）。`TDOM_NO_LINE_REUSE=1` で従来どおり全部作る。
+
+engine だけで測ると、この文書の打鍵の paginate は 3.5 ms → 1.1 ms（同じ負荷で交互に 2 往復）。実機（packaged beta、150 ms 間隔で 30 打鍵、同じ build で交互に 2 往復）では、打った文字が紙面に出るまで 29 ms と 34 ms → 26 ms と 25 ms、engine の時間は 15〜18 ms → 12 ms。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。

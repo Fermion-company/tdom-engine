@@ -2474,6 +2474,10 @@ export class CheckpointEngine {
     // The settle/rebuild a cold walk carried through its resume is queued
     // again behind this update's own verdict (docs/10 §10.6 merging).
     if (chainCarry?.kind) this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels, chainCarry.queuedAt, chainCarry.through);
+    // the one block this update changed in place, if that is all it did
+    // (ship-pacing.js deferShipUpdate)
+    const editedInPlace = !rebooted && !coldResume && diff && !diff.added?.length && !diff.removed?.length &&
+      dirtySource.size === 1 ? [...dirtySource][0] : null;
     return finalizeUpdate(this, {
       text,
       editLabel,
@@ -2493,7 +2497,7 @@ export class CheckpointEngine {
         enforceCheckpointCap: () => this.#enforceCheckpointCap(),
         scheduleBackground: (fgStop, dirtyBlocks, options) => this.#scheduleBackground(fgStop, dirtyBlocks, options),
         shipUpdate: (sourceText, changes) => this.#shipNow(sourceText, changes),
-        deferShipUpdate: (sourceText, changes) => this.#shipLater(sourceText, changes),
+        deferShipUpdate: (sourceText, changes) => this.#shipLater(sourceText, changes, editedInPlace),
         fidelitySummary: () => this.#fidelitySummary(),
       },
     });
@@ -2572,8 +2576,8 @@ export class CheckpointEngine {
     immediateShipUpdate(this, text, projectInputChanges, (t, c) => this.#shipUpdate(t, c));
   }
 
-  #shipLater(text, projectInputChanges = null) {
-    deferShipUpdate(this, text, projectInputChanges, (t, c) => this.#shipUpdate(t, c));
+  #shipLater(text, projectInputChanges = null, editedBlock = null) {
+    deferShipUpdate(this, text, projectInputChanges, (t, c) => this.#shipUpdate(t, c), editedBlock);
   }
 
   /** The viewer asked for canonical pixels of the current revision. */
