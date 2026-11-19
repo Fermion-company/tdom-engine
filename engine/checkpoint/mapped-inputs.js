@@ -3,7 +3,7 @@ import path from 'node:path';
 import { segmentBody } from '../segmenter.js';
 import { fnv1a } from '../hash.js';
 import { resolveProjectInput } from '../project-inputs.js';
-import { cacheIncludeRead } from './include-cache.js';
+import { cacheIncludeRead, includeTextCurrent } from './include-cache.js';
 import { documentBodyRange, subfileGroupOpen, subfileGroupClose } from './subfile.js';
 
 const joinedSegmentMemos = new WeakMap(); // include cache -> file -> segmentBody memo of its joined text
@@ -76,10 +76,11 @@ export function expandInputParagraphs(segs, context) {
         // unchanged since the last expansion: the bytes read then (same rule
         // as include-expander's expandTextFile)
         const cached = context.includes.get(resolved.actualPath);
-        text = !resolved.overlay && cached && cached.mtime === stat.mtimeMs && cached.readPath === resolved.readPath
+        text = includeTextCurrent(cached, stat, resolved.readPath, resolved.overlay)
           ? cached.text
           : readFileSync(resolved.readPath, 'utf8');
-        cacheIncludeRead(context.includes, resolved.actualPath, { mtime: stat.mtimeMs, readPath: resolved.readPath, text });
+        cacheIncludeRead(context.includes, resolved.actualPath,
+          { mtime: stat.mtimeMs, size: stat.size, readPath: resolved.readPath, text });
         context.watchInclude(resolved.readPath);
       } catch { continue; }
       const rootUnit = depth === 0 ? segmentIndex + 1 : inheritedRootUnit;

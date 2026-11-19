@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { fnv1a } from '../hash.js';
 
 // engine.includes maps each project input the resident read to
 // {mtime, readPath, text, announcedText}. `announcedText` is what the
@@ -9,10 +10,50 @@ import path from 'node:path';
 // an external-change refresh invalidated it. A resident-only re-read (a cold
 // resume, a structured re-probe) that finds new bytes keeps the old value, so
 // the watcher event those bytes raise still invalidates canonical.
-export function cacheIncludeRead(includes, file, { mtime, readPath, text }) {
+export function cacheIncludeRead(includes, file, { mtime, readPath, text, size = null }) {
   const cached = includes.get(file);
   const announcedText = cached?.readPath === readPath ? cached.announcedText : text;
-  includes.set(file, { mtime, readPath, text, announcedText });
+  // `settled`: the file had been at rest for longer than any filesystem's
+  // timestamp step when these bytes were taken (includeTextCurrent)
+  includes.set(file, { mtime, readPath, text, announcedText, size, settled: Date.now() - mtime > OVERLAY_REST_MS,
+    // (the hash of these bytes, once asked for: overlayContentSig)
+    sig: cached && cached.text === text ? cached.sig : undefined });
+}
+
+/**
+ * The identity of an overlay's bytes for a block that reads it (an \input
+ * or \include line, a listing). It was the hash of a second read of the
+ * file at every expansion. The expansion that runs just before has read the
+ * file (or holds it, includeTextCurrent) and left its text here: when the
+ * file still has that time and size, the hash is taken from that text, once.
+ */
+export function overlayContentSig(includes, file, readPath, stat) {
+  const cached = includes?.get(file);
+  if (!READ_OVERLAYS_ALWAYS && cached && cached.readPath === readPath && cached.mtime === stat.mtimeMs &&
+      cached.size === stat.size && typeof cached.text === 'string') {
+    return cached.sig ??= fnv1a(cached.text);
+  }
+  return fnv1a(readFileSync(readPath, 'utf8'));
+}
+
+// An unsaved editor buffer reaches TeX as an overlay file, written again by
+// the server whenever the buffer changes. Its time of writing alone does not
+// say it is unchanged (two writes inside one step of a coarse filesystem
+// clock carry the same time), so an overlay was read again at every
+// expansion: every keystroke read every overlay of the project. A host that
+// keeps one chapter of a book live sends the other chapters as (empty)
+// overlays, forty files read with each keystroke for nothing (1.5 ms).
+// An overlay is taken from the cache when it has the time and the size it
+// was read with and had already been at rest for OVERLAY_REST_MS when it
+// was read: no later write can hide behind that time. A file of the project
+// itself keeps its rule (the time it was written).
+// TDOM_READ_OVERLAYS_ALWAYS=1: every overlay read at every expansion.
+export const OVERLAY_REST_MS = 3000;
+const READ_OVERLAYS_ALWAYS = !!process.env.TDOM_READ_OVERLAYS_ALWAYS;
+export function includeTextCurrent(cached, stat, readPath, overlay) {
+  if (!cached || cached.readPath !== readPath || cached.mtime !== stat.mtimeMs) return false;
+  if (!overlay) return true;
+  return !READ_OVERLAYS_ALWAYS && cached.settled === true && cached.size === stat.size;
 }
 
 // Runs right before a refresh invalidates `files` on the canonical layer:

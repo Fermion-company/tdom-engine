@@ -273,6 +273,16 @@ viewer（`web/app.js`）は、打鍵のあったページの SVG を毎回まる
 
 実機（この文書の中ほどで 150 ms 間隔 30 打鍵）: engine 21.5 ms → 14〜15 ms、打った文字の commit まで 44 ms → 35 ms（§3.5a の修正の前は、ページ数の食い違いで resident のページが出ず 0/30）。まだ block の数に比例するのは snapshot の作成（`dom` 段 6〜7 ms: 打った位置より後の block は root の中の offset が動くので、1,300 個の entry を作り直して比べている）。
 
+## 10.4j overlay の file を打鍵のたびに読み直さない
+
+保存していない editor の内容は overlay の file として TeX へ渡る。overlay は server が書き直すたびに変わり、書かれた時刻だけでは「変わっていない」と言えない（時刻の刻みが粗い filesystem では、同じ刻みの中の 2 回の書き込みが同じ時刻になる）ので、展開のたびに毎回読んでいた（`mapped-inputs.js`・`include-expander.js`）。本の 1 章だけを live にする host は残りの章を空の overlay で送るので、打鍵のたびに約 40 個の file を読んでいた（packaged app の engine の profile で 1.0〜1.5 ms）。file を読む block（`\input`・`\include` の行）は、中身の同一性のためにもう一度読んで hash していた。
+
+- overlay は、読んだときと同じ時刻・同じ大きさで、**読んだ時点ですでに `OVERLAY_REST_MS`（3 秒）以上書かれていなかった**ものだけ cache から取る（`include-cache.js` の `includeTextCurrent`、cache の `settled`）。読んだ後の書き込みは、その時刻より新しい時刻を必ず持つ。書かれたばかりの overlay（打っている章）は従来どおり毎回読む。project 自身の file の規則（書かれた時刻）は変えていない。
+- 中身の hash は、直前の展開が読んだ（または持っている）text から 1 度だけ取る（`overlayContentSig`）。file の時刻か大きさが違えば読む。
+- `TDOM_READ_OVERLAYS_ALWAYS=1` で毎回読む。
+
+章ウィンドウの打鍵で、engine の `readFileSync` は 1.0 → 0.36 ms、`prepareUpdate` は 3.1 → 2.75 ms（同じ build で交互に 1 往復）。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。

@@ -4,7 +4,7 @@ import { fnv1a } from '../hash.js';
 import { segmentBody } from '../segmenter.js';
 import { resolveProjectInput } from '../project-inputs.js';
 import { expandInputParagraphs } from './mapped-inputs.js';
-import { cacheIncludeRead, resourceContentSig } from './include-cache.js';
+import { cacheIncludeRead, includeTextCurrent, overlayContentSig, resourceContentSig } from './include-cache.js';
 import { documentBodyRange } from './subfile.js';
 
 export function expandIncludes(segs, depth, context) {
@@ -108,10 +108,10 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
   try {
     const st = statSync(readPath);
     const cached = context.includes.get(full);
-    const text = !overlay && cached && cached.mtime === st.mtimeMs && cached.readPath === readPath
+    const text = includeTextCurrent(cached, st, readPath, overlay)
       ? cached.text
       : readFileSync(readPath, 'utf8');
-    cacheIncludeRead(context.includes, full, { mtime: st.mtimeMs, readPath, text });
+    cacheIncludeRead(context.includes, full, { mtime: st.mtimeMs, size: st.size, readPath, text });
     context.watchInclude(readPath);
     // A \subfile contributes only its document body; offsets stay those of
     // the whole file so every block still maps to its real lines.
@@ -236,7 +236,7 @@ function decorateExternalResources(seg, context) {
       if (!st.isFile()) return null;
       context.watchInclude(resolved.readPath);
       const contentSig = resolved.overlay
-        ? fnv1a(readFileSync(resolved.readPath, 'utf8'))
+        ? overlayContentSig(context.includes, resolved.actualPath, resolved.readPath, st)
         : resourceContentSig(context.resources, resolved.readPath, st);
       specs.push(`${resolved.actualPath}:${resolved.readPath}:${contentSig}`);
       return resolved;

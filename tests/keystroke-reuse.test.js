@@ -285,3 +285,61 @@ test('a changed source file goes to the viewer as the stretch that came and went
   const whole = viewer.apply(base, delta([{ file: '/d/a.tex', text: 'all new' }]));
   assert.equal(whole.sources[0].text, 'all new', 'a file sent whole is taken whole, as before');
 });
+
+test('an overlay at rest is taken from the cache; one just written, or changed, is read', async () => {
+  const { cacheIncludeRead, includeTextCurrent, overlayContentSig, OVERLAY_REST_MS } = await import('../engine/checkpoint/include-cache.js');
+  const { statSync, utimesSync, readFileSync } = await import('node:fs');
+  const { fnv1a } = await import('../engine/hash.js');
+  const dir = mkdtempSync(path.join(tmpdir(), 'tdom-overlay-rest-'));
+  try {
+    const file = path.join(dir, 'chapter.tex');
+    const logical = '/project/chapter.tex';
+    const includes = new Map();
+    const read = () => {
+      const stat = statSync(file);
+      const cached = includes.get(logical);
+      const taken = includeTextCurrent(cached, stat, file, true);
+      const text = taken ? cached.text : readFileSync(file, 'utf8');
+      cacheIncludeRead(includes, logical, { mtime: stat.mtimeMs, size: stat.size, readPath: file, text });
+      return { taken, text };
+    };
+    const rested = (seconds) => { const at = new Date(Date.now() - seconds * 1000); utimesSync(file, at, at); };
+
+    // just written: read, and read again (a second write could carry the same time)
+    writeFileSync(file, 'first');
+    assert.deepEqual(read(), { taken: false, text: 'first' });
+    assert.equal(includes.get(logical).settled, false);
+    assert.deepEqual(read(), { taken: false, text: 'first' });
+
+    // at rest for longer than a filesystem's timestamp step: read once more, then kept
+    rested(OVERLAY_REST_MS / 1000 + 5);
+    assert.deepEqual(read(), { taken: false, text: 'first' }, 'the bytes read while it was fresh are not trusted');
+    assert.equal(includes.get(logical).settled, true);
+    assert.deepEqual(read(), { taken: true, text: 'first' });
+    assert.deepEqual(read(), { taken: true, text: 'first' });
+
+    // written again: another time, read
+    writeFileSync(file, 'second text');
+    assert.deepEqual(read(), { taken: false, text: 'second text' });
+    // another size under the same time is not the file that was read
+    rested(60);
+    read();
+    assert.equal(read().taken, true);
+    const kept = includes.get(logical);
+    assert.equal(includeTextCurrent({ ...kept, size: kept.size + 1 }, statSync(file), file, true), false);
+    assert.equal(includeTextCurrent(kept, statSync(file), path.join(dir, 'other.tex'), true), false, 'read through another path');
+    // a file of the project itself keeps its rule: the time it was written
+    assert.equal(includeTextCurrent({ ...kept, settled: false, size: null }, statSync(file), file, false), true);
+    assert.equal(includeTextCurrent(undefined, statSync(file), file, false), false);
+
+    // the identity of the bytes: from the text held, once; from the file when the file is another
+    assert.equal(overlayContentSig(includes, logical, file, statSync(file)), fnv1a('second text'));
+    assert.equal(includes.get(logical).sig, fnv1a('second text'));
+    read();
+    assert.equal(includes.get(logical).sig, fnv1a('second text'), 'carried while the text is the same');
+    writeFileSync(file, 'third');
+    assert.equal(overlayContentSig(includes, logical, file, statSync(file)), fnv1a('third'), 'a file written since is read');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
