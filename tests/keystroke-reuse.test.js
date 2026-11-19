@@ -501,3 +501,80 @@ test('an overlay at rest is taken from the cache; one just written, or changed, 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('the document bounds hand out the same sets for the same names, whatever else of the text changed', async () => {
+  const { documentBounds } = await import('../engine/segmenter.js');
+  const doc = (preamble, body) => `\\documentclass{article}\n${preamble}\\begin{document}\n${body}\n\\end{document}\n`;
+  const first = documentBounds(doc('', 'One paragraph.'));
+  const typed = documentBounds(doc('', 'One paragraph!'));
+  assert.equal(typed.literalEnvs, first.literalEnvs, 'a keystroke in the body: the same set of literal environments');
+  assert.equal(typed.conditionals, first.conditionals);
+  assert.deepEqual(typed.body, { start: first.body.start, end: first.body.end }, 'the bounds themselves are read anew');
+  const longer = documentBounds(doc('', 'One paragraph, longer.'));
+  assert.equal(longer.body.end, first.body.end + 8);
+  // a literal environment declared: another set, and it stays that set while the names stay
+  const listing = documentBounds(doc('\\lstnewenvironment{code}{}{}\n', 'x'));
+  assert.notEqual(listing.literalEnvs, first.literalEnvs);
+  assert.deepEqual([...listing.literalEnvs], ['code']);
+  assert.equal(listing.conditionals, first.conditionals, 'the conditionals did not change');
+  assert.equal(documentBounds(doc('\\lstnewenvironment{code}{}{}\n', 'xy')).literalEnvs, listing.literalEnvs);
+  const flagged = documentBounds(doc('\\lstnewenvironment{code}{}{}\n\\newif\\ifdraft\n', 'xy'));
+  assert.equal(flagged.literalEnvs, listing.literalEnvs);
+  assert.notEqual(flagged.conditionals, listing.conditionals);
+  assert.deepEqual([...flagged.conditionals], ['ifdraft']);
+  // back to none: an empty set again (not the one with a name in it)
+  const none = documentBounds(doc('', 'x'));
+  assert.equal(none.literalEnvs.size, 0);
+  assert.equal(none.conditionals.size, 0);
+});
+
+test('\\includeonly is found as before, and a source that does not say it is not searched', async () => {
+  const { includeOnlyFromSource } = await import('../engine/checkpoint/include-expander.js');
+  assert.equal(includeOnlyFromSource(''), null);
+  assert.equal(includeOnlyFromSource(null), null);
+  assert.equal(includeOnlyFromSource('\\documentclass{book}\n\\begin{document}\\include{a}\\end{document}\n'), null);
+  assert.deepEqual([...includeOnlyFromSource('\\documentclass{book}\n\\includeonly{ chap1 , ./parts/chap2.tex }\n')], ['chap1', 'parts/chap2']);
+  assert.deepEqual([...includeOnlyFromSource('  \\includeonly {a}')], ['a']);
+  assert.equal(includeOnlyFromSource('% \\includeonly{a}\n'), null, 'commented out');
+  assert.deepEqual([...includeOnlyFromSource('% \\includeonly{a}\n\\includeonly{b}\n')], ['b']);
+  assert.deepEqual([...includeOnlyFromSource('\\includeonly{}')], []);
+});
+
+test('the blocks near an edited page are the ones a walk over every line finds', async () => {
+  const { editPageRenderIds } = await import('../engine/checkpoint/update-helpers.js');
+  // the walk as it was: every line of every page
+  const reference = (blocks, pages, dirtySource) => {
+    const real = new Set(blocks.map((block) => block.id));
+    const idsOf = (page) => (page.draw ?? []).map((draw) => draw.u?.blockId).filter((id) => real.has(id));
+    const holds = (page, ids) => (page.draw ?? []).some((draw) => draw.u?.blockId != null && ids.has(draw.u.blockId) && real.has(draw.u.blockId));
+    const nearby = new Set();
+    for (const page of pages) if (holds(page, dirtySource)) for (const id of idsOf(page)) nearby.add(id);
+    const tied = new Set(nearby);
+    for (const page of pages) if (holds(page, nearby)) for (const id of idsOf(page)) tied.add(id);
+    return blocks.filter((block) => tied.has(block.id) && block.needsRender).map((block) => block.id);
+  };
+  let seed = 7;
+  const random = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+  for (let round = 0; round < 60; round++) {
+    const blocks = Array.from({ length: 30 }, (_, i) => ({ id: `b${i}`, needsRender: random() < 0.5 }));
+    // blocks in order over the pages, some running over a page boundary; every page also draws its running head
+    const pages = [];
+    let next = 0;
+    for (let number = 1; number <= 8; number++) {
+      const draw = [{ u: { blockId: '_head' } }, { u: {} }];
+      if (next > 0 && random() < 0.4) draw.push({ u: { blockId: `b${next - 1}` } });
+      const count = 1 + Math.floor(random() * 5);
+      for (let k = 0; k < count && next < blocks.length; k++, next++) {
+        const lines = 1 + Math.floor(random() * 3);
+        for (let line = 0; line < lines; line++) draw.push({ u: { blockId: `b${next}` } });
+      }
+      pages.push(random() < 0.1 ? { number } : { number, draw });
+    }
+    for (const dirty of [new Set([`b${Math.floor(random() * 30)}`]), new Set([`b${Math.floor(random() * 30)}`, `b${Math.floor(random() * 30)}`]),
+      new Set(['_head']), new Set(['gone']), new Set()]) {
+      assert.deepEqual(editPageRenderIds(blocks, pages, dirty), reference(blocks, pages, dirty), `round ${round}, ${[...dirty]}`);
+      // asked again of the same pages (their blocks are kept with them)
+      assert.deepEqual(editPageRenderIds(blocks, pages, dirty), reference(blocks, pages, dirty));
+    }
+  }
+});

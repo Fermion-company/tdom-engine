@@ -90,7 +90,11 @@ export function expandIncludes(segs, depth, context) {
 }
 
 export function includeOnlyFromSource(source) {
-  const match = String(source || '').match(/^[^%\n]*\\includeonly\s*\{([^}]*)\}/m);
+  const text = String(source || '');
+  // (asked with every keystroke of the whole root: a source that does not
+  // say the word is not read line by line for it. 0.45 ms on an 826 KB file.)
+  if (!text.includes('\\includeonly')) return null;
+  const match = text.match(/^[^%\n]*\\includeonly\s*\{([^}]*)\}/m);
   if (!match) return null;
   return new Set(match[1].split(',').map(normalizeIncludeName).filter(Boolean));
 }

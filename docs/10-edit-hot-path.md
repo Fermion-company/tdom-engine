@@ -343,6 +343,16 @@ block の units（`units.js`。page builder が並べるもので、units が同
 
 engine だけの計測（上の文書、行が増える打鍵）: 223 ms → 39〜44 ms（`paginate` 193 → 10〜11 ms）、その打鍵の report は 17.9 MB → 0.75 MB。残りの 92 ページは 23 回の event（最大 0.77 MB）に分かれ、打鍵の 0.3〜0.4 秒後までに届く。届いた list を順に当てはめた結果は、engine の全ページの list と一致する。`tests/owed-pages.test.js` は `buildPagePatches` の規則を場合ごとに確かめ、TeX を通して「打鍵の応答は近い 4 ページ、残りは後から、全ページが届く、開き直した engine のページと行が一致する」を確かめる。`tests/deferred-pages.test.js` は viewer 自身の stage・commit の code で、近いページだけが組み立てられ、後回しのページが表示を保ち、近づくと組み立てられることを確かめる。
 
+## 10.4o 打鍵のたびに全 block・全ページをなめていた小さな処理
+
+2,600 block・191 ページの文書の engine の profile に、1 つ 0.5〜1.3 ms の「全部を見る」処理が並んでいた。どれも結果は変えずに、見なくてよいものを見ないようにした。
+
+- **`queueMovedOffsets`**（`rescue-offsets.js`。`pagectx` 段のすべて）: rescue されていない block について「package の breakable な箱を開くか」を見るために、全 block の galley の item をたどっていた。文書の package がそういう箱を 1 つも作らない（判定の正規表現が無い）なら、rescue されていない block には見るものが無い。1.3 ms。
+- **closure の memo**（`segmenter.js` の `documentBounds`）: block ごとの closure の結果は、literal な環境と conditional の集合が「同じ object」である間だけ使い回す。1 ファイルの文書では root の text が打鍵のたびに変わるので、集合も毎回新しく作られ、全 block の closure を毎回読み直していた。名前が同じなら前の集合をそのまま渡す。0.7 ms。
+- **`\includeonly` の検索**（`include-expander.js` の `includeOnlyFromSource`）: 行頭からの正規表現で root 全文を毎回走査していた。その語を含まない source は走査しない。0.45 ms（826 KB）。
+- **打ったページの近くの block**（`update-helpers.js` の `editPageRenderIds`。打鍵ごとに 3 回呼ばれる）: 全ページの全行を歩いていた。ページにある block の集合を、ページの行の list（作られた後は変わらない）と一緒に持つ。0.6 ms。
+- **units の stamp**（`units.js` の `rebuildUnits`。打鍵ごとに 3〜4 回、全 block）: 「chunk の世代・fidelity の世代・galley の hash」を block ごとに文字列につないで比べていた。3 つの値のまま比べる。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。

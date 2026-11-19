@@ -44,25 +44,44 @@ export function hasDefinitionEdit(oldBlocks, blocks, bounds, defRe) {
   return false;
 }
 
+// The blocks on a page, kept with its list of lines (which is never changed
+// once the page is built: a page built again has another list).
+const pageBlockIds = new WeakMap();
+const NO_IDS = new Set();
+function blockIdsOn(page) {
+  const draw = page.draw;
+  if (!draw) return NO_IDS;
+  let ids = pageBlockIds.get(draw);
+  if (!ids) {
+    ids = new Set();
+    for (const item of draw) {
+      const id = item.u?.blockId;
+      if (id != null) ids.add(id);
+    }
+    pageBlockIds.set(draw, ids);
+  }
+  return ids;
+}
+
 export function editPageRenderIds(blocks, pages, dirtySource) {
   // Only the document's own blocks tie pages together. A draw can also name
   // something every page carries (the running head's source): counted as a
   // block it tied the whole chapter to the edited page, and each keystroke
   // replayed from the chapter's first picture.
-  // (every page of the document is looked at with every keystroke: no list
-  // is built for a page that holds none of the blocks asked about, and the
-  // set of the document's blocks only once one does. 191 pages of 41 lines:
-  // 1.8 ms a keystroke as two lists a page.)
+  // (every page of the document is looked at with every keystroke, three
+  // times: the blocks of a page are read off its lines once and kept with
+  // them, and the set of the document's blocks is made only once a page
+  // holds one of the blocks asked about. 191 pages of 41 lines: 1.8 ms a
+  // keystroke as two lists a page, then 0.6 ms as a walk over every line.)
   let real = null;
   const isReal = id => (real ??= new Set(blocks.map(block => block.id))).has(id);
   const holdsOneOf = (page, ids) => {
-    for (const draw of page.draw ?? []) {
-      const id = draw.u?.blockId;
-      if (id != null && ids.has(id) && isReal(id)) return true;
-    }
+    const here = blockIdsOn(page);
+    const [few, many] = ids.size <= here.size ? [ids, here] : [here, ids];
+    for (const id of few) if (many.has(id) && isReal(id)) return true;
     return false;
   };
-  const idsOf = page => (page.draw ?? []).map(draw => draw.u?.blockId).filter(id => isReal(id));
+  const idsOf = page => [...blockIdsOn(page)].filter(id => isReal(id));
   const nearby = new Set();
   for (const page of pages) {
     if (!holdsOneOf(page, dirtySource)) continue;

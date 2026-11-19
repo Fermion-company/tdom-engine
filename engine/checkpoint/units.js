@@ -60,10 +60,12 @@ export function rebuildUnits(blocks, chunks, fidelityEpoch) {
   // since this block's last rebuild, its signature inputs are identical —
   // don't even build the sig string. This sweep runs 2-3× per edit over
   // every block; steady-state typing now touches only the edited block.
-  const worldRev = (chunks.rev ?? -1) + ':' + fidelityEpoch;
+  // (compared as three values, not joined into a string for every block:
+  // this sweep runs three or four times per keystroke over every block)
+  const chunksRev = chunks.rev ?? -1;
   for (const block of blocks) {
-    const stamp = worldRev + ':' + block.galleyHash;
-    if (block.units && block.unitsStamp === stamp) continue;
+    if (block.units && block.unitsChunksRev === chunksRev && block.unitsEpoch === fidelityEpoch &&
+        block.unitsGalley === block.galleyHash) continue;
     // the sig carries chunk VERSION and FRESHNESS (stale chunks are
     // displayed too — see buildStream — so a stale→fresh flip must
     // rebuild) plus the fidelity epoch (font-tier demotions)
@@ -83,6 +85,8 @@ export function rebuildUnits(blocks, chunks, fidelityEpoch) {
       block.units = buildStream(block, chunks);
       block.unitsSig = sig;
     }
-    block.unitsStamp = stamp;
+    block.unitsChunksRev = chunksRev;
+    block.unitsEpoch = fidelityEpoch;
+    block.unitsGalley = block.galleyHash;
   }
 }

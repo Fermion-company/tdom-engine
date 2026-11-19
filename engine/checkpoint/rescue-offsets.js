@@ -8,9 +8,14 @@ export function queueMovedOffsets(engine, { paginateNow, rescueCacheKey, pumpRes
   const entry = prov.blockEntry ?? new Map();
   const th = engine.geometry?.textheight ?? 0;
   let queued = false;
+  // (asked for every block with every keystroke: a document none of whose
+  // packages makes a breakable box has nothing to look at in a block that
+  // was not rescued. 1.3 ms on 2,600 blocks.)
+  const breakable = engine._packageBreakableRe;
   for (let c = 0; c < engine.blocks.length; c++) {
     const block = engine.blocks[c];
     if (!block.rescued) {
+      if (!breakable) continue;
       // tex64-internal #88: the fast path typesets a breakable box on the
       // \vsize=\maxdimen page, where it never splits. That is exact while
       // the box fits below the offset it was given (blockEntry is the

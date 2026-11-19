@@ -339,8 +339,27 @@ let boundsMemo = { text: null, value: null };
  * \end{document} in listings; taking the first string match cut the body
  * there, and the resident dropped every page after the listing.
  */
+// The literal environments and the conditionals are handed out as the sets
+// they were for the text before whenever they hold the same names: callers
+// keep what they worked out per block for as long as these are the same
+// objects (update-prepare.js closureMemo). In a single-file document the
+// text changes with every keystroke, so they were new sets each time, and
+// the closure of all 2,600 blocks of a 191-page file was read again with
+// every key (0.7 ms).
+const sameNames = (a, b) => {
+  if (a === b) return true;
+  if (!a || !b || a.size !== b.size) return false;
+  for (const name of a) if (!b.has(name)) return false;
+  return true;
+};
 export function documentBounds(text) {
-  if (boundsMemo.text !== text) boundsMemo = { text, value: scanDocumentBounds(text) };
+  if (boundsMemo.text !== text) {
+    const value = scanDocumentBounds(text);
+    const before = boundsMemo.value;
+    if (before && sameNames(before.literalEnvs, value.literalEnvs)) value.literalEnvs = before.literalEnvs;
+    if (before && sameNames(before.conditionals, value.conditionals)) value.conditionals = before.conditionals;
+    boundsMemo = { text, value };
+  }
   const { preamble, body, hasBegin, literalEnvs } = boundsMemo.value;
   return { preamble: { ...preamble }, body: { ...body }, hasBegin, literalEnvs, conditionals: boundsMemo.value.conditionals };
 }
