@@ -82,7 +82,7 @@ import { sourceClosure } from './closure.js';
 import { mayCaptureNativeBlock, mayNeedRender, releaseRenderHold } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
-import { preemptResidentRenders, queueRender as queueRenderHelper } from './render-pump.js';
+import { PAPER_EDITOR_MS, preemptResidentRenders, queueRender as queueRenderHelper, typedInBurst } from './render-pump.js';
 import { startResidentRender, supersededLanding } from './resident-render.js';
 import { withReplaceablePreviewJob } from './build-lease-preview.js';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
@@ -876,13 +876,22 @@ export class CheckpointEngine {
       // CAPTURE; the pump holds that one the same way, render-pump.js.)
       const pause = (this.editGapMs ?? 0) > 400 && !(this.keystrokePending > 0);
       const holdable = this.#holdableRender(block);
-      const hold = holdable && !this.heldRenders?.has(block.id);
+      // Keys closer together than the picture takes, in a block the page
+      // shows composed: no RENDER beside this JOB, the pump makes the
+      // picture when the typing pauses (render-pump.js typedInBurst).
+      const ownKeystroke = !override && !advance && block.sourceChanged && this.updating && !this.bgActive;
+      const burst = ownKeystroke && holdable && typedInBurst(this, block);
+      if (ownKeystroke) {
+        block.renderDeferred = burst;
+        if (burst && this.renderStats) this.renderStats.burstSkipped = (this.renderStats.burstSkipped ?? 0) + 1;
+      }
+      const hold = holdable && !burst && !this.heldRenders?.has(block.id);
       // TDOM_TRACE_RENDER=1: whether the edited block's exact RENDER left with its JOB, and why not
       if (process.env.TDOM_TRACE_RENDER && block.sourceChanged && block.needsRender && this.updating) {
         console.error('[early-render]', block.id, JSON.stringify({
           override: !!override, advance, capture: capture !== '-', mayCapture: mayCaptureNativeBlock(block),
           vstale: !!ck.vstale, bgActive: !!this.bgActive, already: this.earlyRenderUpdate === this.updateSeq,
-          holdable, heldInFlight: !!this.heldRenders?.has(block.id), pause, gap: this.editGapMs,
+          holdable, heldInFlight: !!this.heldRenders?.has(block.id), pause, gap: this.editGapMs, burst,
         }));
       }
       if (!override && !advance && !(capture !== '-' && mayCaptureNativeBlock(block)) &&
@@ -2570,6 +2579,16 @@ export class CheckpointEngine {
   /** The viewer asked for canonical pixels of the current revision. */
   noteDisplayDemand() {
     return noteDisplayDemandHelper(this, (t, c) => this.#shipUpdate(t, c));
+  }
+
+  /**
+   * A viewer read the glyph places of a block's picture (/chunk-glyphs): an
+   * editor is open on the paper, or a click is opening one. For a while the
+   * block typed into gets its picture beside every keystroke again
+   * (render-pump.js typedInBurst).
+   */
+  notePaperEditor() {
+    this.paperEditorUntil = Date.now() + PAPER_EDITOR_MS;
   }
 
   #noteShipActivity() {

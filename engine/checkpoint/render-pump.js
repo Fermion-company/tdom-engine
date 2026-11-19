@@ -2,6 +2,61 @@ import { renderResidentBlock } from './resident-render.js';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 import { withReplaceablePreviewJob } from './build-lease-preview.js';
 
+// Typing faster than an exact picture is made (docs/10 §10.4f).
+//
+// A block the page shows composed (stream.js: its text by the glyph layer,
+// every run that needs exact pixels cut out of a verified picture or put
+// together from verified outlines) looks the same before and after its own
+// picture lands. Rendering it beside every keystroke's JOB (#103) then buys
+// nothing the reader can see, and costs a lualatex child that embeds the
+// document's fonts and a pdftocairo, about 110 ms of another core per
+// keystroke: at 150 ms a key it starts to miss the next key after a couple
+// of seconds, the late picture is delivered as a second page patch, and the
+// child's work overlaps the next keystroke's own job.
+//
+// So while the keys come closer together than BURST_GAP (what the engine
+// already takes for typing that goes on, #jobBlock `pause`) and the block's
+// last galley was shown composed, the keystroke sends no RENDER; the pump
+// makes the picture once the typing has paused for BURST_PAUSE. A galley
+// that cannot be composed after all is rendered at once, as before.
+//
+// Not while an editor is open on the paper. It maps its formula through the
+// block's own picture (web/app.js provisionalStageKeepsEditor) and commits no
+// page that shows cut-outs of an earlier one, so there the picture of every
+// keystroke is what the reader sees. The viewer reads the glyph places of a
+// picture (/chunk-glyphs) only for such an editor or for the click that
+// opens one; for PAPER_EDITOR_MS after such a read every keystroke sends its
+// RENDER as before, and a picture left for the pause is made at once.
+// TDOM_RENDER_EVERY_KEY=1: the earlier behaviour.
+const EVERY_KEY = !!process.env.TDOM_RENDER_EVERY_KEY;
+const envMs = (name, fallback) => {
+  const n = Number(process.env[name]);
+  return process.env[name] != null && Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+export const BURST_GAP_MS = envMs('TDOM_BURST_GAP_MS', 400);
+export const BURST_PAUSE_MS = envMs('TDOM_BURST_PAUSE_MS', 450);
+export const PAPER_EDITOR_MS = envMs('TDOM_PAPER_EDITOR_MS', 30_000);
+
+/** A viewer read a picture's glyph places a moment ago (engine.notePaperEditor). */
+const editorOnPaper = (engine, now = Date.now()) => now < (engine?.paperEditorUntil ?? 0);
+
+/** Whether `block`, about to be typeset for a keystroke, is typed into
+ * faster than its picture is made while the page shows it composed. */
+export function typedInBurst(engine, block, now = Date.now()) {
+  return !EVERY_KEY && block?.galleyHash != null && block.composedFor === block.galleyHash &&
+    (engine.editGapMs ?? Infinity) <= BURST_GAP_MS && !editorOnPaper(engine, now);
+}
+
+/** How long after the last keystroke the pump makes the picture of a block
+ * whose keystroke sent no RENDER (`renderDeferred`): the pause, while the
+ * page shows the block's current galley composed; no time at all when that
+ * galley could not be composed (the page then shows an earlier one, and the
+ * typed character is not on it) or an editor is open on the paper. */
+export function deferredRenderQuietMs(block, engine = null, now = Date.now()) {
+  if (editorOnPaper(engine, now)) return 0;
+  return block?.composedFor != null && block.composedFor === block.galleyHash ? BURST_PAUSE_MS : 0;
+}
+
 /** Exact pixels are replaceable latency work. A new edit must not wait behind
  * boot/backlog renders that already occupy every pump lane. Cancel resident
  * render children while the update lock is held. Queued block ids stay in
@@ -82,8 +137,11 @@ function pumpRenders(engine, callbacks) {
         if (engine.updating) {
           // (the update that queued this edit's block ends within
           // milliseconds: look again soon when its RENDER is already out)
-          const waiting = [...engine.renderWant.keys()].some((queuedId) =>
-            sentRender(engine.blocks.find((b) => b.id === queuedId)));
+          const waiting = [...engine.renderWant.keys()].some((queuedId) => {
+            const queuedBlock = engine.blocks.find((b) => b.id === queuedId);
+            return sentRender(queuedBlock) ||
+              (queuedBlock?.renderDeferred && deferredRenderQuietMs(queuedBlock, engine) === 0);
+          });
           await new Promise((r) => setTimeout(r, waiting ? 2 : 25));
           continue;
         }
@@ -131,11 +189,17 @@ function pumpRenders(engine, callbacks) {
         // the keystroke (120 ms of it this wait) although its pixels were
         // typeset within the first 50, and in a burst it never did: the page
         // showed the previous keystroke's picture until the typing stopped.
-        const cropOnly = interactive && !!sentRender(engine.blocks.find((b) => b.id === id));
+        const wanted = engine.blocks.find((b) => b.id === id);
+        const cropOnly = interactive && !!sentRender(wanted);
+        // A keystroke of a burst sent no RENDER for this block (typedInBurst):
+        // its picture is made when the typing pauses, or at once when the
+        // page could not compose the galley after all.
+        const deferred = interactive && !cropOnly && !!wanted?.renderDeferred;
         // (TDOM_RENDER_HOLD_MS, for a diagnostic session: keep those pixels
         // back that long, to look at what the page shows before they land)
         const quietMs = propagation ? 0 : cropOnly ? Math.max(0, Number(process.env.TDOM_RENDER_HOLD_MS) || 0)
-          : interactive ? renderQuiet : shippingPriorityQuietMs(engine, renderQuiet);
+          : deferred ? deferredRenderQuietMs(wanted, engine)
+            : interactive ? renderQuiet : shippingPriorityQuietMs(engine, renderQuiet);
         const remaining = quietMs - (Date.now() - (engine.lastEditAt ?? 0));
         if (remaining > 0) {
           await new Promise((r) => setTimeout(r, Math.min(25, remaining)));
@@ -164,6 +228,10 @@ function pumpRenders(engine, callbacks) {
               return;
             }
             if (!block.needsRender) return;
+            if (block.renderDeferred) {
+              block.renderDeferred = false;
+              if (engine.renderStats) engine.renderStats.afterBurst = (engine.renderStats.afterBurst ?? 0) + 1;
+            }
             // the edit's own block: the next keystroke spares its render (#103)
             const hold = interactive && block.id === engine.heldFocus && !!callbacks.holdable?.(block);
             const ready = await renderBlock(engine, block, callbacks, hold).catch((err) => {

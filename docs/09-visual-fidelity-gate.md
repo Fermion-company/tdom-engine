@@ -113,6 +113,7 @@ chunk の鮮度は `unitsSig` の版数と fresh/stale ビットで追跡し、U
 - **字形から組み立てる**（`exact-synth.js`）: 打鍵が数式の中で、手元の絵に無い run ができたとき。照合済みの絵からは、数式 glyph の輪郭を font（`stableFontKey`: file・name・size）と slot ごとに覚えておく（`learnOutlines`、`engine.chunks.outlines`）。daemon は exact 画素の要る run について、各 glyph の run 内の位置（`gp`）と、`t` で表せない slot（`gc`）を送る。新しい galley の数式 run を、その輪郭で galley の位置に置いた SVG を組み立て（`synthesizeExactPicture`、block の chunk `<id>~s`）、そこから切り出す。罫（分数の線・根号の上線）は galley の幅・高さの塗りの矩形にする。
 - 組み立てた絵は、その galley の実際の絵とピクセル単位で同じであることを確かめた（照合済みの絵から作った 16 窓、数式内への打鍵 2 種のそれぞれ 16〜18 窓で、差は最大 4/255 のアンチエイリアス）。それでも検証済みの画素ではないので、切り出しの窓は `held` 付きで、本物の絵が届けば置き換わり、組み立てた絵は捨てる。
 - 組み立てない場合: 一度も描いていない glyph（その font のその大きさで未見の文字）、数式でない exact run（legacy font の本文など）、位置の無い run、`#rrggbb` でない色、図・float・脚注・rescue のある block。どれか一つでもあれば従来どおり前の galley のまま見せる。`TDOM_NO_EXACT_SYNTH=1` で組み立てを止められる。
+- 打鍵が続く間（間隔 400 ms 以下）は、この表示のまま block 自身の絵を作らない。打鍵が止まってから 1 枚作る。組み合わせられなかった打鍵の絵はすぐ作る（docs/10 §10.4f）。
 
 ### 9.5b block 自身の絵が届いたあとの数式行（文字は glyph のまま）
 

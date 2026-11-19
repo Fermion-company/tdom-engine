@@ -525,6 +525,9 @@ export function diffBlocks(oldBlocks, segs, nextId) {
           // (only for a block edited in place, never across a merge or split:
           // its held galley would show another block's text, tex64-internal #103)
           exactHistory: midOld === midNew ? ob.exactHistory ?? null : null,
+          // (the galley the page last showed composed, stream.js: a keystroke
+          // that follows quickly sends no RENDER, render-pump.js typedInBurst)
+          composedFor: midOld === midNew ? ob.composedFor ?? null : null,
           stateVec: ob.stateVec,
           units: ob.units,
           rescued: ob.rescued,

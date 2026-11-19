@@ -2671,6 +2671,8 @@ const server = http.createServer(async (req, res) => {
       const version = Number(url.searchParams.get('v'));
       const requestedEpoch = url.searchParams.get('e');
       if (requestedEpoch != null && Number(requestedEpoch) !== documentEpoch) return json(res, { glyphs: [] }, 404);
+      // (only an editor on the paper, or the click that opens one, asks for this)
+      engine.notePaperEditor?.();
       const chunk = engine.chunks.get(key);
       if (!chunk || chunk.v !== version) return json(res, { glyphs: [] }, 404);
       chunk.editGlyphs ??= (chunk.editCanonicalId != null

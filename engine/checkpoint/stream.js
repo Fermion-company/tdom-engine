@@ -57,6 +57,9 @@ export function buildStream(block, chunks) {
   } else if (bc?.forGalley === block.galleyHash && chunks.has(synthChunkKey(block.id))) {
     chunks.delete(synthChunkKey(block.id)); // its own pixels are in
   }
+  // (shown composed: a keystroke that follows quickly sends no RENDER of
+  // its own, render-pump.js typedInBurst)
+  if (composed) block.composedFor = block.galleyHash;
   // The block's own picture is in. Its exact lines keep the look they had
   // while it was on its way: the text drawn by the glyph layer, and of the
   // picture only the runs that need exact pixels (`reveal`: the line is the

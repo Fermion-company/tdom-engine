@@ -207,6 +207,35 @@ LuaTeX-ja は和文の文字と文字の間に空の罫（`empty_rule`、幅 0�
 
 72 ページの本の 4 行の段落で、送る bytes は 44.6 → 22.9 KB、2 行の地の文で 34.3 → 16.1 KB。子の中の時間は encode で約 0.2 ms、harvest で 0.5〜0.8 ms 減る。罫そのものを daemon で捨てれば約 3 ms 減るが、`stableRunLayoutRecord` が layout witness に空の罫を含めている（`run-semantics.js`）ので捨てない。
 
+## 10.4f 打鍵が続く間は編集 block の RENDER を出さない
+
+組み合わせ表示（docs/09 §9.5a）のできる block を続けて打つと、これまでは打鍵ごとに RENDER を 1 本、JOB と一緒に送っていた（#103 の held。前の 1 本が飛んでいる間は送らない）。絵 1 枚には約 110 ms かかる（子が段落を組んで PDF を出すまで約 70 ms。うち約 50 ms は本文の和文 font を含む 5 書体の埋め込み。pdftocairo と切り出しに 32〜38 ms）。150 ms 間隔の打鍵では次のことが起きていた。
+
+- 絵が次の打鍵に間に合わなくなると（72 ページの本の 4 行の段落で約 2 秒後から）、遅れて届いた絵のためにページが 1 打鍵に 2 回届き、子の仕事が次の打鍵の JOB と重なる（組版 16 → 21〜31 ms）。
+- 他の仕事で CPU が埋まっていると、この重なりで打鍵が 2〜3 倍遅くなる。
+
+一方、組み合わせ表示の行は、block 自身の絵が届く前と後で見た目が変わらない（docs/09 §9.5b。本文は glyph、数式は照合済みの絵か字形）。打鍵ごとの絵は、読む人には見えない差し替えのために作っていた。
+
+そこで、次の 2 つを満たす打鍵では、JOB と一緒の RENDER を送らない（`render-pump.js` の `typedInBurst`、`block.renderDeferred`）。
+
+1. 前の打鍵からの間隔が `BURST_GAP_MS`（400 ms。`#jobBlock` が「打鍵が続いている」とみなす境と同じ）以下である。
+2. block の直前の galley が組み合わせ表示で見せられていた（`block.composedFor === block.galleyHash`。`stream.js` が行を組み合わせたときに記す）。
+
+- 絵は pump が作る。block の今の galley が組み合わせ表示で見せられている間は、最後の打鍵から `BURST_PAUSE_MS`（450 ms）待つ。打鍵が止まると RENDER が 1 本だけ出て、block 自身の絵が届く。
+- 組み合わせられなかった galley（一度も描いていない glyph を数式に打った、など。ページは前の galley を見せていて、打った文字は出ていない）は、update が終わりしだい待たずに描く（`deferredRenderQuietMs` が 0）。次の打鍵は 2 を満たさないので、従来どおり JOB と一緒に RENDER を送る。
+- 止まった後の最初の 1 打、間隔が 400 ms を超える打鍵、組み合わせ表示のできない block（図・box・float・脚注・rescue）は、従来どおりである。
+- 紙面の上で editor が開いている間も従来どおりである。その editor（`web/app.js` の `provisionalStageKeepsEditor`）は、数式の位置を block 自身の絵で確かめるので、前の絵からの切り出しを見せるページを commit しない。表示側が絵の glyph の位置（`/chunk-glyphs`）を読むのは、この editor が開いているときと、それを開く click のときだけなので、server はその読み出しを engine に伝える（`notePaperEditor`）。そこから `PAPER_EDITOR_MS`（30 秒）の間は、どの打鍵も RENDER を送り、待たせてあった絵もすぐ描く。
+- `composedFor` は、block がその場で編集されたときだけ次の block object へ引き継ぐ（`segmenter.js` の `diffBlocks`。`exactHistory` と同じ条件）。
+- 手元の絵の galley は `exactHistory` に残り続ける（`holdExactGalley` は描かれた galley を捨てない）。打鍵が続く間、切り出しの元は打ち始めの絵のままである。
+- `TDOM_RENDER_EVERY_KEY=1` で従来の動作に戻る。`TDOM_BURST_GAP_MS` と `TDOM_BURST_PAUSE_MS` で境と待ち時間を変えられる。`renderStats.burstSkipped`（RENDER を送らなかった打鍵）と `renderStats.afterBurst`（pump が後から作った絵）で数えられる。
+
+実機（packaged beta、72 ページの本、150 ms 間隔で 30 打鍵、打った文字が紙面に出るまでの中央値。同じ build で `TDOM_RENDER_EVERY_KEY=1` と交互に 2 往復）:
+
+- 4 行の段落の行末: 従来 45 ms（28/30 打鍵）と 53 ms（30/30） → 27 ms と 28 ms（どちらも 30/30）。16 打鍵目からの遅れが無くなった。
+- 数式の中: 従来 45 ms（30/30）と 69 ms（28/30） → 31 ms と 31 ms（どちらも 30/30）。
+- 30 打鍵の間に送る RENDER は 30 本 → 1〜2 本、止まった後に 1 本。
+- 30 打鍵目の画面（組み合わせ表示）と、止まって block 自身の絵が届いた後の画面の差は、段落の範囲で 91 画素（40/255 以上。2560×1640 の画面）。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。
