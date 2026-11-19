@@ -511,3 +511,15 @@ canonical anchor（plain・mixed 共通）の契約の前提（信頼境界）: 
 文字入力、MathLive の選択変更、スクロール、ズーム、リサイズは同じフレーム予約を共有する。位置の調整が必要なフレームでは、その調整とカーソル描画を一度に行う。クリックで確定した位置と新しい PDF geometry の採択は同期で反映し、古い描画予約を取り消す。
 
 未反映の入力に対しては、直前の紙面で証明したカーソル位置を保つ。新しいモデル全体の caret を計算してから捨てる処理は行わない。通常の選択表示はページ寸法を一度読み、全マーカーを detached fragment に作って一度で置き換える。選択文字数に比例して layout read と DOM write を交互に行わない。IME 未確定文字だけは、候補位置に必要な実ブラウザ寸法を表示後に読む。
+
+## 10.12a canonical のページの数式を click したとき、SyncTeX が段落末の行を返す場合
+
+canonical のページの click は、reverse SyncTeX が返した source の行から edit region を決める（`web/app.js` の `resolveOpaqueEditRegion`）。数式は「その行を含む math region」の中から、forward SyncTeX の箱が click 点を含むものを選ぶ。
+
+段落によっては、inline 数式の node が自分の行を持たない（同じ段落に verbatim 風の macro がある 72 ページの本の段落で確認。標準の `synctex edit` でも同じ）。数式の上を click しても SyncTeX は段落を終えた行（直後の空行）を返し、その行を含む math region は無いので、何も開かなかった。forward SyncTeX もその数式の位置を返さない。
+
+- **ink で探す**（`inlineMathCopies`・`inlineMathUnderPoint`）。SyncTeX の答えには、その行を持つ箱（`anchors`）が付いてくる。段落を終えた行の箱は、その段落の印字行である。返った行を含む block、またはその行の直前（2 行以内）で終わる block の inline 数式について、数式自身の glyph（math field が並べたもの）を、その印字行の範囲に印字された glyph の中から探す（`TdomDirectEditGeometry.mathMaps`）。**その数式が、source にある回数とちょうど同じ回数だけ印字されているときだけ**採る。そのとき印字の順（行、次に左から）が source の順であり、pointer の下の copy がどの数式かが決まる。本文の数字や参照番号など、同じに見える ink が他にあれば回数が合わず、何も開かない（従来どおり）。この経路は、従来の探し方が何も見つけなかったときだけ通る。
+- **次の canonical へ付いていく**（`inlineMathBoundsByInk`、`stageDirectEditorForOpaqueBatch`）。開いている editor は、新しい canonical のページが届くたびに、新しい世代の同じ region の位置へ移される。その位置も forward SyncTeX で求めていたので、この種の数式では見つからず、editor が閉じられていた。ink で開いた editor（`openedByInk`）は、前の世代で数式があった点を新しい世代の reverse SyncTeX に尋ね、同じ方法で数式の copy を探す。
+
+`tests/inline-math-click.test.js` は、math field と glyph の照合を代役にして、採る・採らないの規則（回数が合う、同じ数式が 2 つ、数式の中の数式、範囲の外、display 数式）と、次の世代への追従を確かめる。packaged app では、72 ページの本の該当の `$2$` を実際に click して editor が開き、4 打鍵、9 秒の休止、さらに 2 打鍵がすべて source の 36 行の数式に入ることを確かめた。小さな文書の通常の数式 click（12 打鍵）は変わらない。
+

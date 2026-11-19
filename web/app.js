@@ -2644,9 +2644,15 @@ async function stageDirectEditorForOpaqueBatch(batch) {
         y: (session.printBounds.top + session.printBounds.bottom) / 2,
       }
     : { page: session.pageNumber };
-  const bounds = session.kind === 'text'
+  let bounds = session.kind === 'text'
     ? await canonicalTextRegionBounds(region, snapshot, batch.id)
     : await canonicalSourceBounds(region, null, batch.id, near);
+  // (an inline formula SyncTeX cannot place, opened by its ink, is followed
+  // into the new generation the same way: resolveOpaqueEditRegion, inlineMathUnderPoint)
+  if (!bounds && session.kind === 'math' && session.openedByInk) {
+    bounds = await inlineMathBoundsByInk(region, snapshot, batch.id, near);
+    if (directEditor?.sessionId !== session.sessionId) return { sessionId: session.sessionId, mapping: null };
+  }
   if (!bounds || !Number.isInteger(Number(bounds.page))) {
     return { sessionId: session.sessionId, mapping: null };
   }
@@ -4767,6 +4773,105 @@ function sourceDistanceToRegion(region, location) {
   return 0;
 }
 
+// The inline formulas of the paragraph SyncTeX named, each with its printed
+// copy, for a paragraph whose formulas SyncTeX itself cannot place.
+// `location` is SyncTeX's answer for a point of the paragraph: the line it
+// gave (which the paragraph's block holds, or which ended the paragraph just
+// after it) and the boxes that carry that line (`anchors`), which for the
+// line that ended a paragraph are the paragraph's printed lines. The
+// formulas are found by their ink. Each formula's own glyphs (as a math
+// field lays them out) are looked for among the glyphs printed there, and a
+// formula is taken only when it is printed there exactly as many times as
+// the source has it: then the copies, in reading order, are the source's
+// formulas in their order. Anything else printed alike (a digit in the
+// prose, a reference number) makes the count differ, and that formula is
+// left out.
+async function inlineMathCopies(snapshot, location, pageNumber, id, stillCurrent) {
+  const geometry = window.TdomDirectEditGeometry;
+  const Mathfield = customElements.get('math-field');
+  const line = Number(location?.line);
+  if (!geometry?.mathMaps || !Mathfield || !Number.isFinite(line)) return [];
+  const printedLines = (location.anchors ?? []).filter(item => Number(item.page) === pageNumber && item.box &&
+    [item.box.left, item.box.right, item.box.top, item.box.bottom].every(Number.isFinite));
+  if (!printedLines.length) return [];
+  const extent = { left: Math.min(...printedLines.map(item => item.box.left)), right: Math.max(...printedLines.map(item => item.box.right)),
+    top: Math.min(...printedLines.map(item => item.box.top)), bottom: Math.max(...printedLines.map(item => item.box.bottom)) };
+  const regions = (snapshot?.blocks ?? []).filter(block => sameSourceFile(block.source?.file, location.file) &&
+    Number.isInteger(block.source?.start?.line) && Number.isInteger(block.source?.end?.line) &&
+    block.source.start.line <= line && line <= block.source.end.line + 2)
+    .flatMap(block => (block.editRegions ?? [])
+      .filter(item => item.kind === 'math' && !item.display && sameSourceFile(item.source?.file, location.file))
+      .map(item => ({ ...item, blockSource: block.source ?? null })))
+    .sort((a, b) => a.source.start.line - b.source.start.line || a.source.start.column - b.source.start.column);
+  if (!regions.length || regions.length > 24) return [];
+  const glyphs = await canonicalGlyphs(pageNumber, id);
+  if (!stillCurrent() || !glyphs.length) return [];
+  const byValue = new Map();
+  for (const region of regions) {
+    if (!byValue.has(region.value)) byValue.set(region.value, []);
+    byValue.get(region.value).push(region);
+  }
+  const found = [];
+  const probe = new Mathfield();
+  try {
+    probe.mathVirtualKeyboardPolicy = 'manual';
+    probe.setAttribute('aria-hidden', 'true');
+    Object.assign(probe.style, { position: 'fixed', left: '-10000px', top: '0', opacity: '0', pointerEvents: 'none' });
+    document.body.appendChild(probe);
+    for (const [value, same] of byValue) {
+      probe.value = shouldWrapAligned(value) ? wrapAligned(value) : value;
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      if (!stillCurrent()) return [];
+      const copies = geometry.mathMaps(probe, glyphs, extent).map(({ map }) => ({ map,
+        left: Math.min(...map.map(g => g.left)), top: Math.min(...map.map(g => g.top)), bottom: Math.max(...map.map(g => g.bottom)) }));
+      // (printed as many times as the source has it, or it is not known which copy is which)
+      if (copies.length !== same.length) continue;
+      // reading order: by printed line, then from the left
+      copies.sort((a, b) => (Math.abs((a.top + a.bottom) - (b.top + b.bottom)) > 8 ? (a.top + a.bottom) - (b.top + b.bottom) : a.left - b.left));
+      copies.forEach(({ map }, order) => found.push({ region: same[order], map, extent }));
+    }
+  } finally { probe.remove(); }
+  return found;
+}
+const inkBounds = (map, pageNumber) => ({ page: pageNumber,
+  left: Math.min(...map.map(g => g.left)), right: Math.max(...map.map(g => g.right)),
+  top: Math.min(...map.map(g => g.top)), bottom: Math.max(...map.map(g => g.bottom)) });
+
+// The inline formula printed under `point` (a click SyncTeX answered with a
+// line no formula holds). Two formulas that cover the point alike leave it
+// undecided: null.
+async function inlineMathUnderPoint(snapshot, location, pageNumber, point, id, stillCurrent) {
+  if (!point) return null;
+  const geometry = window.TdomDirectEditGeometry;
+  const hits = (await inlineMathCopies(snapshot, location, pageNumber, id, stillCurrent)).filter(({ map, extent }) => {
+    if (point.x < extent.left - 3 || point.x > extent.right + 3 || point.y < extent.top - 3 || point.y > extent.bottom + 3) return false;
+    const glyph = geometry.nearest(map, point);
+    return glyph && point.x >= glyph.left - 2 && point.x <= glyph.right + 2 && point.y >= glyph.top - 1 && point.y <= glyph.bottom + 1;
+  });
+  if (!hits.length) return null;
+  // (a formula inside a larger one is not the formula clicked: `2` in `x^2`)
+  hits.sort((a, b) => b.map.length - a.map.length);
+  if (hits.length > 1 && hits[1].map.length === hits[0].map.length) return null;
+  return { region: hits[0].region, printBounds: inkBounds(hits[0].map, pageNumber) };
+}
+
+// Where an inline formula is printed in canonical generation `id`, for a
+// formula SyncTeX cannot place: asked of the paragraph printed at `near`
+// (where the formula stood in the generation before).
+async function inlineMathBoundsByInk(region, snapshot, id, near) {
+  if (!region || region.kind !== 'math' || region.display || !Number.isInteger(Number(near?.page)) ||
+      ![near.x, near.y].every(Number.isFinite)) return null;
+  const location = await fetch('/synctex', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ page: Number(near.page), x: near.x, y: near.y, id }),
+  }).then(response => (response.ok ? response.json() : null)).catch(() => null);
+  if (!location?.file) return null;
+  const key = JSON.stringify([region.source?.file, region.source?.start, region.source?.end]);
+  const copy = (await inlineMathCopies(snapshot, location, Number(near.page), id, () => true))
+    .find(item => JSON.stringify([item.region.source?.file, item.region.source?.start, item.region.source?.end]) === key);
+  return copy ? inkBounds(copy.map, Number(near.page)) : null;
+}
+
 async function resolveOpaqueEditRegion(page, event) {
   if (!page) page = pageAtClientPoint(event);
   if (!usesDirectEditSurface(page)) return null;
@@ -4965,6 +5070,19 @@ async function resolveOpaqueEditRegion(page, event) {
   // nor an exact math box. Reverse SyncTeX returns the nearest source line,
   // but proximity is navigation data, not proof that editable ink was hit.
   if (!clickedWord) return null;
+  // SyncTeX names a formula's own source line only where the formula's nodes
+  // carry it. In some paragraphs (seen where a verbatim macro stands in the
+  // same paragraph) a click on an inline formula gives the line that ended
+  // the paragraph instead: no block holds that line, no formula was looked
+  // at above, and the click opened nothing. There the formula is found by
+  // its ink (inlineMathUnderPoint): taken only when exactly one formula of
+  // the paragraph that ends at that line is printed under the pointer.
+  const inkMath = await inlineMathUnderPoint(domSnapshot, location, pageNumber, point, presented.id, stillPresented);
+  if (!stillPresented()) return null;
+  if (inkMath) {
+    return { ...inkMath, byInk: true,
+      caretOffset: caretOffsetForOpaqueRegion(inkMath.region, location, clickedWord, inkMath.printBounds, point) };
+  }
   for (const block of blocks) {
     const regions = (block.editRegions ?? [])
       .filter((region) => sameSourceFile(region.source?.file, location.file))
@@ -6976,6 +7094,8 @@ async function activateDirectEditorAtPoint(event) {
         resolved.printBounds,
         resolved.caretOffset
       );
+      // (found by its ink: followed by its ink too when the next canonical pages land)
+      if (resolved.byInk && directEditor?.region?.id === resolved.region.id) directEditor.openedByInk = true;
     }
     return;
   }
