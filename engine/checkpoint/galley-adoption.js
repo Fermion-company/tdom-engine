@@ -1,5 +1,39 @@
 import { fnv1a } from '../hash.js';
 import { instrumentEditRegions } from '../edit-regions.js';
+import { synthChunkKey } from './exact-synth.js';
+
+// A block's units (units.js: what the page builder lays out, the identity
+// of every page they stand on) were thrown away whenever a galley was
+// adopted, also when it was the galley they were made from: a walk that
+// typesets blocks again to rebuild checkpoints, or to verify a keystroke,
+// gets the same boxes back. The next pagination then saw other units in
+// every such block and built their pages again: after the background walk
+// that follows a keystroke, the first key of the next burst paginated 92
+// pages of a 191-page single file and built their display lists (167 ms in
+// the engine; the keys after it take 1 ms), 184 pages on the first key
+// after opening.
+// The units are kept when everything stream.js makes them from is what it
+// was: the same galley by its hash, the same fidelity, the same pictures to
+// draw from. TDOM_REBUILD_UNITS_ALWAYS=1: thrown away on every adoption.
+const KEEP_UNITS = !process.env.TDOM_REBUILD_UNITS_ALWAYS;
+const fidelityText = (fidelity) => JSON.stringify(fidelity, (_key, value) => (value instanceof Map ? [...value] : value));
+function unitsStillHold(was, block, galley, chunks) {
+  if (!KEEP_UNITS || was.hash == null || was.hash !== block.galleyHash) return false;
+  if (was.rescued !== block.rescued || was.gfx !== block.gfx || was.needsRender !== block.needsRender) return false;
+  const prev = was.galley;
+  // (the backend is a record of the job's own: by what it says)
+  if (!prev || galley.tdomPendingPaint || prev.tdomPendingPaint || galley.tdomColdPreview || prev.tdomColdPreview ||
+      (galley.backend !== prev.backend && JSON.stringify(galley.backend ?? null) !== JSON.stringify(prev.backend ?? null))) return false;
+  const picture = chunks?.get(block.id);
+  // (a block whose pixels are behind is laid out from an earlier galley, or
+  // put together from it: stream.js decides that anew each time)
+  if (block.needsRender && !block.rescued && picture && picture.forGalley !== block.galleyHash) return false;
+  if (chunks?.has(synthChunkKey(block.id))) return false;
+  if (was.fidelity !== block.fidelity && fidelityText(was.fidelity) !== fidelityText(block.fidelity)) return false;
+  // (what buildStream does first for a block whose own pixels are in)
+  if (picture?.forGalley === block.galleyHash && block.exactHistory) block.exactHistory = null;
+  return true;
+}
 
 /** The exit state a block records for a galley (the stateVec layout in util/galley.js). */
 export function exitStateVec(galley, counters) {
@@ -15,6 +49,11 @@ export function exitStateVec(galley, counters) {
 
 export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, applyFidelity }) {
   const reusedStaleGalley = !!galley.tdomStale;
+  // (a rescue's own chunks, or a galley carried over stale, are laid out anew)
+  const was = block.units && !reusedStaleGalley && !galley.tdomIsoChunks
+    ? { units: block.units, hash: block.galleyHash, galley: block.galley, fidelity: block.fidelity,
+      rescued: block.rescued, gfx: block.gfx, needsRender: block.needsRender }
+    : null;
   holdExactGalley(block, galley, chunks);
   block.galley = galley;
   const identity = [galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events];
@@ -88,7 +127,7 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
     : block.gfx
       ? 'graphics'
       : 'paragraph';
-  block.units = null;
+  block.units = was && unitsStillHold(was, block, galley, chunks) ? was.units : null;
   if (!reusedStaleGalley) block.sourceChanged = false;
 }
 

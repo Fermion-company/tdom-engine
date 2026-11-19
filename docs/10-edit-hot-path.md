@@ -303,6 +303,29 @@ engine と server・viewer の該当 code だけを通した計測（上の文�
 
 3 種類の打鍵とも、viewer が当てはめた snapshot・server の snapshot・何も覚えていない状態から作った snapshot が、block ごとに一致する（JSON の byte まで）。
 
+## 10.4l event stream：ページの描画命令を変更として送る
+
+update の event は、触れたページの display list を丸ごと運ぶ。打鍵で変わるのは 1〜2 行なのに、密なページ（72 ページの本の 1 ページで 2,000 命令、約 200 KB）では、打鍵のたびに全命令を JSON にして stream へ書き、viewer が読んで parse し、全命令の要素（SVG の断片）を書き出していた。engine が update を返してから viewer に event が届くまでが、普通のページより 3〜4 ms 長かった。
+
+- **命令の JSON は命令と一緒に持つ**（`server.js` の `jsonOfCommand`）。命令は list が作られた後は変わらない（変わらなかった行の命令は build をまたいで同じ object: §10.4g）ので、JSON にするのは新しい命令だけになる。
+- **stream ごとの差分**（`cutAtLists`・`broadcastAtLists`・`streamListJson`）。`/events?lists=cut` で開いた stream について、server はページごとに「その stream へ最後に送った list」を覚える。次にそのページの list を送るときは、先頭から一致する命令（`head` 個）と末尾から一致する命令（`tail` 個）を省き、間の命令だけを `{n, base, of, head, tail, mid}` として list の位置に入れる（`base` は基準の list の番号、`of` はその命令数、`n` はこの list の番号）。その stream で初めてのページは `{n, all}`。一致は object の同一性で見て、違う object は JSON で比べる。
+- **食い違いが起きない理由**。基準は「同じ stream に、順に流したもの」だけで、`/doc` など stream の外で渡した list は基準にしない。viewer は event を parse した直後、その event を表示に使うかどうかに関係なく list を組み立てて覚える（`web/app.js` の `resolveStreamLists`）。stream が接続し直されたら両側とも空から始める。それでも当てはまらない list が来たら（`base`・`of` が合わない）、viewer は stream を取り直して文書を読み直す。
+- **viewer の要素**。組み立てた list の先頭と末尾の命令は、viewer が持っている object そのものである。命令の要素も命令と一緒に持ち（`pieceOfCommand`。要素が命令の外に依存するのは font が届いたかどうかだけ）、変わらなかった行の要素は書き出さない。
+- stream を自分で読むほかの client（test、`lists=cut` を付けない接続）と、`/edit` の応答の report は、従来どおりの list を受け取る。`TDOM_LISTS_WHOLE=1` で全 client に従来の list を送る。
+
+`tests/server-api.test.js` は、cut の stream と通常の stream を同時に開いて打鍵し、cut の stream を viewer の code で組み立てた event が通常の stream の event と一致することを確かめる。要素の文字列は、実ページ 96 回分（128,682 命令、font が届く前・途中・後）で前の実装と一致した。
+
+## 10.4m 打ち始めの 1 打鍵：同じ galley を受け取り直しても units を捨てない
+
+block の units（`units.js`。page builder が並べるもので、units が同じ object であることが「そのページは変わっていない」の根拠になる）は、galley を adopt するたびに捨てて作り直していた（`galley-adoption.js`）。打鍵の後、engine は打った block から先を組み直して checkpoint を作り直す。開いた直後も同じである。その walk が通った block は、**前と同じ中身の galley** を受け取り直すだけなのに units が別の object になり、次の pagination は「そこから先のページが全部変わった」と見て、ページを組み直し、display list を作り直していた。払うのは次の打鍵、つまり打ち始めの 1 打鍵である。
+
+- 191 ページ・2,600 block の 1 ファイル文書: 開いた後の最初の打鍵の前に 2,491 block、3 秒休んだ後の打鍵の前に 1,150 block の units が入れ替わっていて、その打鍵は 184 ページ・92 ページを作り直した（engine だけの計測で `paginate` 段 361 ms・167 ms。続く打鍵は 1〜2 ms）。packaged app の同じ文書では最初の打鍵の `paginate` が 64 ms。
+- 10 ページの文書でも、最初の打鍵が 10 ページ中 6 ページを作り直していた。
+
+`adoptGalleyBlock` は、adopt した galley が units の元になった galley と同じ（hash が同じ）で、`stream.js` の `buildStream` が読むほかのもの（fidelity の中身、rescued・gfx・needsRender、galley の backend、自分の絵が届いているかどうか）も変わっていなければ、units をそのまま残す（`unitsStillHold`）。絵が前の galley のもののまま（`buildStream` が毎回「何で代えるか」を決め直す場合）、組み立てた絵（synth）が残っている場合、rescue の chunk を持ってきた galley、stale のまま持ち越した galley、paint 待ち・cold preview の galley は、従来どおり作り直す。`TDOM_REBUILD_UNITS_ALWAYS=1` で毎回捨てる。
+
+上の 191 ページの文書で、最初の打鍵・休んだ後の打鍵とも、作り直すのは打った段落のある 1 ページだけになった（`paginate` 2.3 ms・1.7 ms）。`tests/units-kept.test.js` は、開いた直後と休んだ後の打鍵が段落のあるページだけを差し替えること、できあがったページが開き直した engine のページと一致することを確かめる（`TDOM_REBUILD_UNITS_ALWAYS=1` では落ちる）。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。
