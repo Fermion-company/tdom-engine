@@ -904,11 +904,17 @@ function stageProvisionalPatches(patches, flash, pageCount = null, editIds = nul
       for (const n of displayLists.keys()) if (n >= patch.from) displayLists.delete(n);
     }
   }
+  const building = [];
   for (const [n, dl] of displayLists) {
     const previous = provisionalStages.get(n);
     if (replaced.has(n) || !previous || previous.sourceRev !== appliedSrcRev ||
-        previous.documentEpoch !== documentReset.adoptedEpoch) renderPage(dl, flash);
+        previous.documentEpoch !== documentReset.adoptedEpoch) building.push(dl);
   }
+  // (of an update of many pages, those the reader is not near are put off:
+  // renderPage. Fewer than four are simply built.)
+  const mayDefer = building.length >= 4;
+  if (mayDefer) traceStage('many', null, { pages: building.length });
+  for (const dl of building) renderPage(dl, flash, mayDefer);
   queueMicrotask(tryCommitProvisionalStages);
 }
 
@@ -1395,7 +1401,51 @@ function chunkImageSrc(cmd) {
   return `/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}${fixed}`;
 }
 
-function renderPage(dl, flash) {
+// A page the reader is not near is not built when its update arrives. A
+// keystroke that makes a paragraph a line longer moves one line across every
+// page break after it: in the middle of a 191-page single flow, 96 pages
+// arrive in one update. Building them all (their markup, parsing it, then
+// the browser's layout of 96 pages) held this thread for three seconds,
+// during which twenty keystrokes went unshown, and each key that followed
+// built them all again, because a stage belongs to one revision.
+// Such a page gets a stage with nothing built in it: to the commit it is a
+// page out of sight that is not ready, which joins nothing and keeps what it
+// shows (provisionalCommitGroups `away`), exactly like a page out of sight
+// that waits for exact pixels. It is built when it comes near the pane
+// (stageDeferredNearSight), or never, if canonical pages arrive first.
+// Only an update of many pages is treated so; a keystroke's own page or two
+// are built as they come. globalThis.__tdomStageAllPages = true: build every
+// page of every update, as before.
+const NEAR_SIGHT_PAGES = 2; // (a page this close to one in sight is built)
+function nearSight(page) {
+  if (!pageDivs.has(page)) return true; // (no place yet)
+  const sight = pagesInSight();
+  for (let step = -NEAR_SIGHT_PAGES; step <= NEAR_SIGHT_PAGES; step++) if (sight.has(page + step)) return true;
+  return false;
+}
+let deferredStageFrame = 0;
+function stageDeferredNearSight() {
+  if (deferredStageFrame) return;
+  deferredStageFrame = requestAnimationFrame(() => {
+    deferredStageFrame = 0;
+    if (usesCanonicalSurface() || documentReset.pending) return;
+    const pages = [];
+    for (const [page, stage] of provisionalStages) if (stage.deferred && nearSight(page)) pages.push(page);
+    for (const page of pages) {
+      const stage = provisionalStages.get(page);
+      // (the page's list did not change since it was put off, whatever revisions came after)
+      if (stage?.deferred) renderPage(provisionalDisplayLists.get(page) ?? stage.dl, false);
+    }
+  });
+}
+const listOwesExactInk = new WeakMap(); // a display list -> whether a command of it owes exact ink
+function owesExactInkAnywhere(dl) {
+  let owes = listOwesExactInk.get(dl);
+  if (owes === undefined) listOwesExactInk.set(dl, owes = dl.commands.some(owesExactInk));
+  return owes;
+}
+
+function renderPage(dl, flash, mayDefer = false) {
   if (usesCanonicalSurface()) return;
   const div = pageDivs.get(dl.page);
   // Stage the entire next surface off-DOM. A dirty mixed text/math line
@@ -1410,7 +1460,7 @@ function renderPage(dl, flash) {
   // while its neighboring page reveals this provisional transaction.
   pageDirtyRev.set(dl.page, sourceRev);
   if (div) div.dataset.provPending = '1';
-  if (dl.commands.some(owesExactInk)) {
+  if (owesExactInkAnywhere(dl)) {
     traceStage('blocked', dl.page);
     stage.srcs = displayListSrcs(dl);
     committedPageSrcs.set(dl.page, new Set([...(committedPageSrcs.get(dl.page) ?? []), ...stage.srcs]));
@@ -1420,6 +1470,11 @@ function renderPage(dl, flash) {
     // as long as the typing lasted. The page asks when it is scrolled to.
     const impossible = dl.commands.some(cmd => cmd.op === 'canon');
     if (impossible || pagesInSight().has(dl.page)) requestCanonicalDisplay({ residentImpossible: impossible });
+    return;
+  }
+  // (a page that shows nothing yet is built: the first presentation of a document builds every page, as before)
+  if (mayDefer && !globalThis.__tdomStageAllPages && pagePainted(dl.page) && !nearSight(dl.page)) {
+    stage.deferred = true;
     return;
   }
   traceStage('stage', dl.page);
@@ -7236,7 +7291,10 @@ window.addEventListener('resize', () => {
 pagesEl.addEventListener('scroll', () => {
   if (directEditor) scheduleDirectEditorVisuals(true);
   scheduleViewportWarm();
+  stageDeferredNearSight();
 }, { passive: true });
+// (a pane that was hidden or resized brings other pages near)
+if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferredNearSight()).observe(pagesEl);
 // Embed mode (?embed=1): a host app (e.g. TeX64) shows only the pages —
 // no topbar, no pane title, no inspector — and owns the editor, pushing
 // edits through POST /edit. The host passes its own look so the preview
