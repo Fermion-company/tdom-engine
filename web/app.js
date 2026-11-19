@@ -1418,7 +1418,7 @@ function renderPage(dl, flash) {
       ? `width:${(cmd.cw / cmd.w) * 100}%;max-width:none;margin-left:-${(cmd.sx / cmd.w) * 100}%;` : '';
     staging.insertAdjacentHTML(
       'beforeend',
-      `<div class="chunkwin${cmd.st ? ' stale' : ''}${cmd.held ? ' held' : ''}${cmd.part ? ' part' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
+      `<div class="chunkwin${cmd.st ? ' stale' : ''}${cmd.held ? ' held' : ''}${cmd.part ? ' part' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%;${chunkShowClip(cmd)}">` +
         `<img class="chunk" src="${chunkImageSrc(cmd)}" style="${part}margin-top:-${shiftPct}%" draggable="false"></div>`
     );
   }
@@ -1482,6 +1482,33 @@ function renderPage(dl, flash) {
   });
 }
 
+// The text of a line whose exact picture is shown only where it has to be
+// (a chunk command's `show`, display-list.js): drawn by the glyph layer so
+// that it looks as it did before the picture landed. It is ink only: the
+// line's editing, hit testing and geometry go by its picture and its source
+// hit box, as they do for a line shown whole from the picture.
+const OVER_TEXT_ATTRS = ' data-ov="1" pointer-events="none"';
+
+/** The openings of a picture window as a clip path: [x, y, w, h] on the page,
+ * as percentages of the window. One polygon, each opening walked the same
+ * way round and joined to the next by a line walked there and back. */
+function chunkShowClip(cmd) {
+  if (!Array.isArray(cmd.show) || !(cmd.w > 0) || !(cmd.h > 0)) return '';
+  const pct = (value) => `${Math.round(Math.max(0, Math.min(100, value)) * 1000) / 1000}%`;
+  const corners = [];
+  const starts = [];
+  for (const box of cmd.show) {
+    if (!Array.isArray(box) || box.length !== 4 || !box.every(Number.isFinite)) return '';
+    const left = pct(((box[0] - cmd.x) / cmd.w) * 100), right = pct(((box[0] + box[2] - cmd.x) / cmd.w) * 100);
+    const top = pct(((box[1] - cmd.y) / cmd.h) * 100), bottom = pct(((box[1] + box[3] - cmd.y) / cmd.h) * 100);
+    starts.push(`${left} ${top}`);
+    corners.push(`${left} ${top}`, `${right} ${top}`, `${right} ${bottom}`, `${left} ${bottom}`, `${left} ${top}`);
+  }
+  // nothing to show: the window stays in place for geometry, with no ink
+  if (!corners.length) return 'clip-path:polygon(0 0,0 0,0 0);';
+  return `clip-path:polygon(${[...corners, ...starts.reverse()].join(',')});`;
+}
+
 /** Unified SVG page: TeX-positioned glyph runs, rules, chunk images, folio. */
 function svgFor(dl, className = '') {
   const parts = [
@@ -1502,11 +1529,11 @@ function svgFor(dl, className = '') {
         fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
       }
       parts.push(
-        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-width="${cmd.w ?? 0}" data-gh="${cmd.gh ?? 0}" data-gd="${cmd.gd ?? 0}" data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''} xml:space="preserve">${escapeXml(cmd.text)}</text>`
+        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-width="${cmd.w ?? 0}" data-gh="${cmd.gh ?? 0}" data-gd="${cmd.gd ?? 0}"${cmd.ov ? OVER_TEXT_ATTRS : ` data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}`} xml:space="preserve">${escapeXml(cmd.text)}</text>`
       );
     } else if (cmd.op === 'rule' && cmd.w > 0 && cmd.h > 0) {
       parts.push(
-        `<rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}/>`
+        `<rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}" fill="${cmd.color || '#1a1a1a'}"${cmd.ov ? OVER_TEXT_ATTRS : ` data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}`}/>`
       );
     } else if (cmd.op === 'editbox') {
       parts.push(

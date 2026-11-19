@@ -114,6 +114,16 @@ chunk の鮮度は `unitsSig` の版数と fresh/stale ビットで追跡し、U
 - 組み立てた絵は、その galley の実際の絵とピクセル単位で同じであることを確かめた（照合済みの絵から作った 16 窓、数式内への打鍵 2 種のそれぞれ 16〜18 窓で、差は最大 4/255 のアンチエイリアス）。それでも検証済みの画素ではないので、切り出しの窓は `held` 付きで、本物の絵が届けば置き換わり、組み立てた絵は捨てる。
 - 組み立てない場合: 一度も描いていない glyph（その font のその大きさで未見の文字）、数式でない exact run（legacy font の本文など）、位置の無い run、`#rrggbb` でない色、図・float・脚注・rescue のある block。どれか一つでもあれば従来どおり前の galley のまま見せる。`TDOM_NO_EXACT_SYNTH=1` で組み立てを止められる。
 
+### 9.5b block 自身の絵が届いたあとの数式行（文字は glyph のまま）
+
+block 自身の galley の絵が届いたあとも、組み合わせ表示のできる block（§9.5a と同じ条件: 図・float・脚注・rescue が無く、絵の glyph の位置が galley と照合済み `chunk.anchored`）の exact 行は、**文字を glyph layer で描いたまま**にする。絵から見せるのは exact 画素の要る run（数式など）だけである。
+
+- 以前は絵が届くと行全体を絵に替えていた。絵は PDF の輪郭、glyph layer は browser の文字なので、打鍵のたびに約 0.1 秒後、行の文字の濃さが変わっていた（72 ページの本の 4 行の段落で 74,800 画素中 2,944 画素が 40/255 以上変わる。この表示では 80 画素）。owner の選択（2026-11-19）。
+- `stream.js`: 自分の絵が現行のとき、`composeExactLines(galley, galley)` で各 exact 行の「glyph で描く run」と「絵から見せる run の箱」を出し、行の unit に `reveal` として付ける。行は従来どおり block の絵の chunk 行のままである（`gfxChunk`）。
+- `display-list.js`: chunk command に `show`（ページ上の箱 `[x, y, w, h]` の一覧。切り出しの窓と同じ余白）を付け、行の文字は `ov: 1` の glyph command として source hit box の後ろ（上）に出す。
+- viewer（`web/app.js`）: `show` のある絵の窓は、その箱だけを `clip-path` の polygon で見せる。`ov` の文字は `data-src` を持たず `pointer-events: none` で描く。この行の編集・hit test・glyph の幾何は、行全体を絵で見せていたときと同じく、絵と source hit box で行う（文字の node は ink だけ）。
+- 合成できない block（図、照合できなかった絵、rescue）は従来どおり行全体を絵で見せる。`TDOM_EXACT_WHOLE_LINES=1` で以前の表示に戻す。
+
 ## 9.6 レンダーポンプと3つの chunk ソース
 
 `#queueRender` / `#pumpRenders` はブロックごとの latest-wins を保ち、現世代の

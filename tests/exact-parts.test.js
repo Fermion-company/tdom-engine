@@ -7,13 +7,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import vm from 'node:vm';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 import { exactRunIndices } from '../engine/checkpoint/fidelity.js';
 import { composeExactLines, exactRunKey } from '../engine/checkpoint/exact-parts.js';
 import { anchorGlyphs } from '../engine/checkpoint/render-chunks.js';
+import { buildStream } from '../engine/checkpoint/stream.js';
+import { buildDisplayList } from '../engine/checkpoint/display-list.js';
 import { drain, signature } from '../tools/harness.mjs';
 
 const PROFILE = {
@@ -114,6 +117,94 @@ test('the glyphs of a picture are put where the galley says, or the picture is l
   assert.equal(anchorGlyphs(svg, { ...galley, gfx: true }, 100).anchored, false);
 });
 
+// The block's own picture is in: the line is that picture for editing and
+// geometry, shown only where its exact runs are; the text is drawn by the
+// glyph layer, as it was while the picture was on its way (stream.js
+// `reveal`, display-list.js `show` and `ov`).
+test('a line whose own picture is in shows the picture at its exact runs only, the text drawn over as ink', () => {
+  const galley = { w: 200, backend: PROFILE, closure: 'native', items: [
+    line([text('plain', 0, 30)]),
+    { k: 'glue', a: 4 },
+    line([text('ab', 0, 10), math('x', 12, 5), math('2', 17, 3, -4), text('cd', 22, 10)]),
+  ] };
+  const block = (extra = {}) => ({ id: 'b1', galley, galleyHash: 'g1', needsRender: true,
+    fidelity: { ...fidelityOf(galley), level: 2, exactLines: 1 }, ...extra });
+  const chunksWith = (chunk) => { const chunks = new Map([['b1', chunk]]); chunks.outlines = new Map(); return chunks; };
+  const picture = { svg: '<svg/>', v: 3, wBp: 224, logicalWBp: 200, xBp: -12, hBp: 24, forGalley: 'g1', anchored: true };
+  const page = (stream) => ({ number: 1, draw: stream.filter((entry) => entry.t === 'box').reduce((draw, entry) => {
+    const y = (draw.at(-1)?.next ?? 0) + entry.u.h;
+    draw.push({ u: entry.u, y, next: y + entry.u.d + 4 });
+    return draw;
+  }, []) });
+  const geometry = { oddsidemargin: 0, topmargin: 0, headheight: 0, headsep: 0, textwidth: 200, textheight: 600 };
+  const list = (stream) => buildDisplayList(page(stream), { geometry, chunks: chunksWith(picture), hf: null, hfSig: '', fonts: FONTS, twinMetrics: {} });
+
+  const stream = buildStream(block(), chunksWith(picture));
+  const units = stream.filter((entry) => entry.t === 'box').map((entry) => entry.u);
+  assert.equal(units[0].ln.gfxChunk, null, 'a line with nothing exact is glyphs, as ever');
+  assert.equal(units[0].ln.reveal, undefined);
+  assert.ok(units[1].ln.gfxChunk && !units[1].ln.parts, 'the exact line is its picture, not cut-outs');
+  assert.deepEqual(units[1].ln.reveal.runs.map((run) => run.t), ['ab', 'cd']);
+  assert.equal(units[1].ln.reveal.parts.length, 2);
+
+  const commands = list(stream).commands;
+  const window = commands.find((command) => command.op === 'chunk');
+  assert.ok(window && !window.part && !window.held && !window.st);
+  // x: margin 72 + the run's place - 0.75; y: from the line's baseline (72 + 22), the box of its glyphs with 2 above and below
+  assert.deepEqual(window.show, [[72 + 12 - 0.75, 94 - 5 - 2, 5 + 1.5, 6 + 4], [72 + 17 - 0.75, 94 - 4 - 5 - 2, 3 + 1.5, 6 + 4]]);
+  const over = commands.filter((command) => command.ov);
+  assert.deepEqual(over.map((command) => [command.op, command.text, command.x]), [['glyphs', 'ab', 72], ['glyphs', 'cd', 94]]);
+  assert.ok(!over.some((command) => command.math));
+  const plain = commands.filter((command) => command.op === 'glyphs' && !command.ov);
+  assert.deepEqual(plain.map((command) => command.text), ['plain'], 'the other line is ordinary glyphs');
+  assert.ok(commands.some((command) => command.op === 'sourcebox' && command.src === 'b1'), 'the hit surface of the exact line stays');
+  assert.ok(commands.indexOf(commands.find((command) => command.op === 'sourcebox')) < commands.indexOf(over[0]), 'the text is drawn over it');
+
+  // a picture whose glyphs were not put where the galley says, a block of graphics, a rescued one: the line whole, as before
+  for (const [name, stale] of [
+    ['not anchored', buildStream(block(), chunksWith({ ...picture, anchored: false }))],
+    ['graphics', buildStream(block({ gfx: true }), chunksWith(picture))],
+    ['rescued', buildStream(block({ rescued: true }), chunksWith(picture))],
+  ]) {
+    const exact = stale.filter((entry) => entry.t === 'box').map((entry) => entry.u).filter((unit) => unit.ln.gfxChunk);
+    assert.ok(exact.length > 0 && exact.every((unit) => !unit.ln.reveal), name);
+    const whole = list(stale).commands;
+    assert.ok(!whole.some((command) => command.ov) && whole.filter((command) => command.op === 'chunk').every((command) => !command.show), name);
+  }
+});
+
+test('the viewer shows such a picture through its openings and gives the text drawn over it no part in editing', () => {
+  const app = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const cut = (from, to) => app.slice(app.indexOf(from), app.indexOf(to, app.indexOf(from) + from.length));
+  const svgStart = app.indexOf('function svgFor(');
+  const viewer = { geometry: { paperwidth: 600, paperheight: 800 }, escapeXml: (value) => String(value),
+    readyFonts: new Set(['f-text']), FONT_FAMILY: { regular: 'serif' } };
+  vm.createContext(viewer);
+  vm.runInContext(cut('const OVER_TEXT_ATTRS', '/** Unified SVG page') + app.slice(svgStart, app.indexOf('\n}\n', svgStart) + 3) +
+    '\nthis.clip = chunkShowClip; this.svg = svgFor;', viewer);
+
+  const window = { op: 'chunk', x: 60, y: 100, w: 240, h: 20 };
+  assert.equal(viewer.clip(window), '', 'no openings named: the whole window');
+  assert.equal(viewer.clip({ ...window, show: [[84, 105, 6, 10], [300, 90, 30, 10]] }),
+    // each opening walked round, then back along the corners they were entered by; kept inside the window
+    'clip-path:polygon(10% 25%,12.5% 25%,12.5% 75%,10% 75%,10% 25%,100% 0%,100% 0%,100% 0%,100% 0%,100% 0%,100% 0%,10% 25%);');
+  assert.equal(viewer.clip({ ...window, show: [] }), 'clip-path:polygon(0 0,0 0,0 0);', 'nothing to show');
+  assert.equal(viewer.clip({ ...window, show: [[84, 105, 6]] }), '', 'a box that is none: the whole window rather than a wrong one');
+
+  const page = viewer.svg({ page: 1, commands: [
+    { op: 'sourcebox', x: 72, y: 100, w: 200, h: 12, line: 1, ink: 1, math: 1, src: 'b1' },
+    { op: 'glyphs', fam: 'f-text', size: 10, x: 72, y: 110, text: 'ab', w: 10, gh: 7, gd: 2, src: 'b1', line: 1, ov: 1 },
+    { op: 'glyphs', fam: 'f-text', size: 10, x: 72, y: 130, text: 'plain', w: 30, gh: 7, gd: 2, src: 'b1', line: 2 },
+  ] });
+  const texts = [...page.matchAll(/<text [^>]*>[^<]*<\/text>/g)].map((match) => match[0]);
+  assert.equal(texts.length, 2);
+  assert.match(texts[0], /data-ov="1" pointer-events="none"/);
+  assert.doesNotMatch(texts[0], /data-src|data-line/, 'not a node the editing code finds by its source');
+  assert.match(texts[1], /data-src="b1" data-line="2"/);
+  assert.doesNotMatch(texts[1], /pointer-events/);
+  assert.match(page, /class="tdom-source-hit"[^>]*data-src="b1"/, 'the line is still found by its hit box');
+});
+
 const texReady = spawnSync('lualatex', ['--version']).status === 0;
 
 test('a keystroke beside a formula is on the page with its answer, the formula cut out of the picture in hand',
@@ -156,13 +247,26 @@ Tail paragraph.
         'every cut-out looks into the picture in hand');
       assert.ok(!commands.some((command) => command.op === 'pending-exact' || command.op === 'canon'));
 
-      // its own pixels land: the line is the picture again, whole
+      // its own pixels land: the line is its picture again (one window, the
+      // current source's), shown only where the formulas are; the text stays
+      // as the glyph layer drew it
       await engine.renderTask;
       await drain(engine);
       const landed = late.filter((command) => command.op === 'chunk');
       assert.ok(landed.length > 0 && landed.every((command) => !command.part && !command.held && !command.st),
         JSON.stringify(landed.slice(0, 2)));
       assert.equal(engine.chunks.get(block().id).forGalley, block().galleyHash);
+      const window = landed.at(-1);
+      assert.ok(Array.isArray(window.show) && window.show.length >= 2, 'openings for the formulas');
+      for (const [x, y, w, h] of window.show) {
+        assert.ok(w > 0 && h > 0 && x >= window.x - 0.01 && x + w <= window.x + window.w + 0.01, 'an opening lies in its window');
+        assert.ok(y + h > window.y && y < window.y + window.h);
+      }
+      const drawn = late.filter((command) => command.op === 'glyphs');
+      assert.ok(drawn.some((command) => command.ov === 1), 'the text of the line is drawn over, as ink');
+      assert.ok(drawn.filter((command) => command.ov).map((command) => command.text).join('').includes('MarkerWordQ'));
+      assert.ok(!drawn.some((command) => command.math), 'and no formula is left to the browser');
+      assert.ok(late.some((command) => command.op === 'sourcebox'), 'editing still goes by the line\'s hit box and picture');
 
       // a keystroke inside the formula has no twin for the changed run: the block waits as before
       const inside = engine.getSource().indexOf('x^2') + 2;

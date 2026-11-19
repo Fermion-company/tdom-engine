@@ -61,6 +61,10 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       cv: meta?.v ?? 0,
       st: gfxOpen.stale ? 1 : undefined, // stale-exact: previous pixels held
       held: gfxOpen.held ? 1 : undefined, // an earlier galley's own pixels: display only (#103)
+      // The picture is shown only through these openings, [x, y, w, h] on
+      // the page: the runs that need exact pixels. The rest of each line is
+      // drawn by the glyph layer (`ov` commands), under the picture's window.
+      show: gfxOpen.show && !gfxOpen.whole ? gfxOpen.show : undefined,
       line: gfxOpen.units === 1 ? gfxOpen.line : undefined,
       src: gfxOpen.blockId,
     });
@@ -82,6 +86,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       const unitRuns = u.ln.editRuns ?? u.ln.runs ?? [];
       const unitInk = unitRuns.some((run) => runPaintsInk(run, u.ln.backend));
       const unitExtent = Math.max(0, (u.h ?? 0) + (u.d ?? 0));
+      const reveal = u.ln.reveal ?? null;
       if (gfxOpen && gfxOpen.blockId === c.blockId && Math.abs(gfxOpen.top - chunkTop) < 0.05) {
         gfxOpen.clip1 = Math.max(gfxOpen.clip1, clip1);
         gfxOpen.stale ||= !!c.stale;
@@ -106,9 +111,26 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
           ink: unitInk,
         };
       }
+      if (reveal) {
+        // the same boxes a cut-out of this run would have (partCommands)
+        gfxOpen.show ??= [];
+        for (const part of reveal.parts) {
+          gfxOpen.show.push([
+            r2(L + part.x - EXACT_PART_SIDE_BLEED_BP), r2(baseline + part.top - EXACT_CHUNK_BLEED_BP),
+            r2(part.w + 2 * EXACT_PART_SIDE_BLEED_BP), r2(part.h + 2 * EXACT_CHUNK_BLEED_BP),
+          ]);
+        }
+      } else gfxOpen.whole = true; // a line of this window that is shown whole
       // Exact pixels cover this line; the unchanged TeX run extents provide
       // one transparent source-line hit surface underneath the chunk.
       sourceHitCommand(commands, L, baseline, u, u.blockId, 1, fonts);
+      if (reveal) {
+        // (drawn over the hit surface and marked `ov`: the viewer shows them
+        // and gives them no part in editing, which goes by the picture)
+        runCommands(commands, reveal.runs, L, baseline, u.blockId, {
+          fonts, twinMetrics, line: u.li, backend: u.ln.backend, over: true,
+        });
+      }
       continue;
     }
     flushGfx();
@@ -214,7 +236,7 @@ function partCommands(commands, unit, X, baseline, meta) {
 
 /** Paint one run list (glyphs + rules) at a baseline — shared by body
  * units and the TeX-typeset header/footer boxes. */
-function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, line, backend = null }) {
+function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, line, backend = null, over = false }) {
   for (const r of runs ?? []) {
     if (r.rule) {
       // Geometry is not a paint oracle: a normal zero-area PDF rule may be a
@@ -232,6 +254,7 @@ function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, lin
         color: r.c && r.c !== '#000000' ? r.c : undefined,
         src,
         line,
+        ov: over ? 1 : undefined,
       });
     } else if (r.t) {
       const fmeta = fonts.get(r.f);
@@ -266,6 +289,7 @@ function runCommands(commands, runs, X, baseline, src, { fonts, twinMetrics, lin
         src,
         line,
         math: r.m || fmeta?.mth ? 1 : undefined,
+        ov: over ? 1 : undefined,
       });
     }
   }

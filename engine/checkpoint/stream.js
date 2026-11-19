@@ -5,6 +5,9 @@ import { synthChunkFor, synthChunkKey } from './exact-synth.js';
 
 // TDOM_NO_EXACT_SYNTH=1: never put a formula's picture together (exact-synth.js)
 const NO_SYNTH = !!process.env.TDOM_NO_EXACT_SYNTH;
+// TDOM_EXACT_WHOLE_LINES=1: an exact line whose block has its own picture is
+// shown from that picture whole, text included, as it was before 2026-11-19.
+const WHOLE_LINES = !!process.env.TDOM_EXACT_WHOLE_LINES;
 
 /**
  * galley items -> the page builder's input stream. The items ARE the real
@@ -54,6 +57,17 @@ export function buildStream(block, chunks) {
   } else if (bc?.forGalley === block.galleyHash && chunks.has(synthChunkKey(block.id))) {
     chunks.delete(synthChunkKey(block.id)); // its own pixels are in
   }
+  // The block's own picture is in. Its exact lines keep the look they had
+  // while it was on its way: the text drawn by the glyph layer, and of the
+  // picture only the runs that need exact pixels (`reveal`: the line is the
+  // block's picture as before, shown through one opening per such run).
+  // Shown whole, the text of the line changed its weight the moment the
+  // picture landed (the picture is the PDF's outlines, the glyph layer the
+  // browser's text), a tenth of a second after every keystroke; the owner
+  // chose text that stays as it is (2026-11-19).
+  const revealed = !composed && !candidate && composable && !WHOLE_LINES && block.needsRender && !block.rescued &&
+      bc?.forGalley === block.galleyHash && bc.anchored
+    ? composeExactLines(block.galley, block.fidelity, block.galley, block.fidelity, null) : null;
   // TDOM_TRACE_PARTS=1: why a block whose pixels are behind was or was not composed
   if (why && block.needsRender && bc && bc.forGalley !== block.galleyHash) {
     console.error('[parts]', block.id, composed ? `composed ${composed.size} line(s)${partsChunk ? ' from a picture put together' : ''}` : 'not composed:',
@@ -185,6 +199,8 @@ export function buildStream(block, chunks) {
         // glyph geometry is not the current source's, #103)
         gfxChunk = { blockId: block.id, yOff, w: galley.w, stale: bcFresh ? undefined : 1, held: held ? 1 : undefined };
       }
+      // (the block's own picture, current: its text is drawn by the glyph layer)
+      const reveal = gfxChunk && bcFresh && !held && !it.chunk ? revealed?.get(ii) ?? null : null;
       // no exact pixels yet: mappable glyphs may bridge the render latency;
       // unmappable ones (and verification-demoted blocks) show nothing
       // rather than something wrong
@@ -210,6 +226,9 @@ export function buildStream(block, chunks) {
           // or of the picture put together for this one (`partsChunk`)
           parts: parted ? parted.parts : undefined,
           partsChunk: parted && partsChunk ? partsChunk : undefined,
+          // the line's own picture is shown only where these runs are, the
+          // other runs are drawn by the glyph layer (display-list.js)
+          reveal: reveal ? { runs: reveal.runs, parts: reveal.parts } : undefined,
           // Even when fidelity forbids painting a glyph bridge, the real run
           // extents remain useful as transparent source-line hit geometry.
           editRuns: it.runs ?? [],
