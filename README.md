@@ -144,3 +144,10 @@ npm run test:host
 ## 詳細 docs
 
 実装地図は [docs/README.md](docs/README.md) から読む。まず [docs/00-first-read.md](docs/00-first-read.md) で全体像を掴む。これは設計方針やロードマップではなく、現在のコードを読むための地図である。
+
+## Copyright and license
+
+Copyright (c) 2026 Kosei Kawaguchi and Takumi Kokawa.
+The original engine code is jointly owned by Kosei Kawaguchi and Takumi Kokawa
+and is licensed under the [MIT License](LICENSE). Third-party components
+retain their respective copyright notices and licenses.
