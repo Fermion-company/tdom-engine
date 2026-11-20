@@ -3,6 +3,8 @@ import { fnv1a } from '../hash.js';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 import { withReplaceablePreviewJob } from './build-lease-preview.js';
 
+const TRACE_HF = !!process.env.TDOM_TRACE_HF;
+
 export function scheduleHeaders(
   engine,
   helpers
@@ -72,7 +74,16 @@ function runHeaderJob(engine, helpers, specs, sig) {
           }
           engine.hf = map;
           engine.hfSig = sig;
-          asyncRepaginate();
+          // (the pages whose own head or foot changed are built again, on
+          // this thread: header-footer.js pageHfSig. TDOM_TRACE_HF=1 times it.)
+          const landedAt = TRACE_HF ? performance.now() : 0;
+          const did = asyncRepaginate();
+          if (TRACE_HF) {
+            const ms = (value) => (value ?? 0).toFixed(1);
+            console.error(`[hf] landed: ${engine.pages.length} pages in ${ms(performance.now() - landedAt)} ms` +
+              (did ? ` | paginate ${ms(did.paginateMs)}, ${did.built} display lists ${ms(did.buildMs)}, ` +
+                `${did.patches} patches sent ${ms(did.sendMs)}, toc ${ms(did.tocMs)}` : ''));
+          }
           resolve();
         };
         apply();

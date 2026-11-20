@@ -53,3 +53,18 @@ export function buildLeasePreviewSettlement(acquired, activeJobs) {
     expiresAt: acquired.expiresAt,
   };
 }
+
+export async function acquirePreviewBuildLease(engine, { requestId, ttlMs, documentReset = () => false }) {
+  if (!documentReset() && !engine.shipBooting && engine.warming) {
+    // Keep this request shorter than the host's bounded compatibility wait.
+    await engine.yieldWarmForBuild?.({ timeoutMs: 250 });
+  }
+  if (documentReset() || engine.shipBooting || engine.warming) {
+    // The bootstrap keeps its continuation and completes normally. A host
+    // with isolated Build outputs may proceed after its own short deadline.
+    const blockedBy = documentReset() ? 'document-reset' : engine.shipBooting ? 'shipping-boot' : 'warming';
+    return { ok: false, acquired: false, reason: 'resident-bootstrap-active', blockedBy, retryAfterMs: 250 };
+  }
+  const acquired = engine.canonical.acquireBuildLease(requestId, ttlMs);
+  return buildLeasePreviewSettlement(acquired, engine.buildLeasePreviewJobs) ?? acquired;
+}

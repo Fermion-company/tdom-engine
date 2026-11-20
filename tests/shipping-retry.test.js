@@ -172,7 +172,12 @@ test('a stale success cannot erase a newer chain failure', async () => {
   }
 });
 
-test('source ABA is rejected by monotonic source revision even when bytes match', async () => {
+// Since 4148b99 a baseline that certifies after the root source moved on is
+// kept when everything else is the same (session, document epoch, preamble,
+// dependencies, execution profile) and replayed forward to the current
+// source, like a keystroke: under continuous typing every baseline used to
+// be thrown away and the chain never became usable.
+test('source ABA is not taken for the baseline\'s revision even when the bytes match: the baseline is replayed forward', async () => {
   const engine = fakeEngine('source A');
   const chain = attachChain(engine);
   const attempt = begin(engine, chain);
@@ -181,27 +186,76 @@ test('source ABA is rejected by monotonic source revision even when bytes match'
     engine.shipBootTries = 2;
     engine.setSource('source B');
     engine.setSource('source A');
-    assert.equal(settleShippingBaseline(engine, chain, event(attempt)).outcome, 'certified-superseded');
-    assert.equal(engine.shipRetry.consecutiveFailures, 2, 'stale success is neutral');
-    assert.equal(engine.shipBootTries, 2);
+    let boots = 0;
+    let replays = 0;
+    const settled = settleShippingBaseline(engine, chain, event(attempt), () => boots++, () => replays++);
+    assert.equal(settled.outcome, 'certified-behind', 'the same bytes at a later revision are not the certified revision');
+    assert.equal(replays, 1, 'the baseline is carried forward to the current source');
+    assert.equal(boots, 0, 'and not thrown away');
+    assert.equal(engine.shipRetry.state, 'ready');
+    assert.equal(engine.shipRetry.lastOutcome, 'certified-behind');
+    assert.equal(engine.shipRetry.lastCertifiedSnapshot, attempt.snapshotId, 'what is certified is the snapshot it booted with');
+    assert.notEqual(attempt.snapshotId, shippingInputSnapshot(engine).snapshotId);
+    assert.equal(engine.shipRetry.consecutiveFailures, 0, 'a certified baseline of this lineage is a success');
+    assert.equal(engine.shipBootTries, 0);
   } finally {
     await cleanup(engine, chain);
   }
 });
 
-test('a newer production canonical seed makes an older baseline certificate stale', async () => {
+test('a baseline built on an older production canonical seed is kept and replayed forward', async () => {
   const engine = fakeEngine('source with stable bytes');
   engine.shipDesiredCanonicalId = 7;
   engine.shipDesiredCanonicalHash = 'canonical-7';
   const chain = attachChain(engine);
   const attempt = begin(engine, chain);
   try {
+    // (a canonical arrival during the build: it no longer restarts the baseline)
     engine.shipDesiredCanonicalId = 8;
     engine.shipDesiredCanonicalHash = 'canonical-8';
-    assert.equal(settleShippingBaseline(engine, chain, event(attempt)).outcome, 'certified-superseded');
-    assert.equal(engine.shipRetry.lastCertifiedSnapshot, null);
+    let boots = 0;
+    let replays = 0;
+    assert.equal(settleShippingBaseline(engine, chain, event(attempt), () => boots++, () => replays++).outcome, 'certified-behind');
+    assert.equal(replays, 1);
+    assert.equal(boots, 0);
+    assert.equal(engine.shipRetry.lastCertifiedSnapshot, attempt.snapshotId);
   } finally {
     await cleanup(engine, chain);
+  }
+});
+
+test('a certified baseline of another lineage is neutral and a new baseline is asked for', async () => {
+  const included = (engine, text) => {
+    const file = path.join(engine.docDir, 'child.tex');
+    engine.includes.set(file, { mtime: 1, readPath: file, text });
+    engine.shippingIncludeTrace = [{ actualPath: file, readPath: file, command: 'input', raw: 'child.tex', depth: 0,
+      parentFile: path.join(engine.docDir, engine.file), rootUnit: 1 }];
+  };
+  for (const [name, before, change] of [
+    ['the preamble', () => {}, (engine) => { engine.preHash = 'pre-2'; }],
+    ['the document epoch', () => {}, (engine) => { engine.shipDocumentEpoch = 2; }],
+    ['the session', () => {}, (engine) => { engine.shipSessionId = 'session-2'; }],
+    ['an included file', (engine) => included(engine, 'B\n'), (engine) => included(engine, 'C\n')],
+  ]) {
+    const engine = fakeEngine('source that stays');
+    before(engine);
+    const chain = attachChain(engine);
+    const attempt = begin(engine, chain);
+    try {
+      engine.shipRetry.consecutiveFailures = 2;
+      engine.shipBootTries = 2;
+      change(engine);
+      let boots = 0;
+      const settled = settleShippingBaseline(engine, chain, event(attempt), () => boots++,
+        () => assert.fail(`${name} changed: nothing is replayed across lineages`));
+      assert.equal(settled.outcome, 'certified-superseded', name);
+      assert.equal(boots, 1, name);
+      assert.equal(engine.shipRetry.consecutiveFailures, 2, 'stale success is neutral');
+      assert.equal(engine.shipBootTries, 2);
+      assert.equal(engine.shipRetry.lastCertifiedSnapshot, null);
+    } finally {
+      await cleanup(engine, chain);
+    }
   }
 });
 
@@ -373,11 +427,21 @@ test('shipping boot keeps one immutable input epoch across deferred close and op
 
     releaseOpen();
     await boot;
-    assert.equal(resumed.length, 1);
-    assert.equal(resumed[0].inputState.dependencies[0].bytes.toString('utf8'), 'C\n');
-    assert.equal(engine.shipGenRev.get(1), 2);
-    assert.equal(engine.shipDesiredInputSnapshot, resumed[0].inputState.identity.snapshotId);
+    // The child edit made during the boot is held while the baseline is
+    // built and validated (4148b99): nothing is replayed onto a baseline
+    // that has not certified, and no reboot is asked for behind its back.
+    assert.equal(resumed.length, 0);
+    assert.deepEqual(engine.shipPendingInputChanges?.projectInputChanges, { changed: [child], removed: [] });
+    assert.equal(engine.shipDesiredInputSnapshot, pendingC.identity.snapshotId, 'the newest input stays the one wanted');
+    assert.equal(engine.shipGenRev.get(0), 1);
     assert.equal(queued, 0);
+    // The baseline certifies for the B universe. Another included file is
+    // another lineage: it is not replayed forward, a new baseline is asked for.
+    const settled = settleShippingBaseline(engine, replacement, event(replacement.bootAttempt), () => queued++,
+      () => assert.fail('a dependency changed: the baseline is not replayed'));
+    assert.equal(settled.outcome, 'certified-superseded');
+    assert.equal(queued, 1);
+    assert.equal(resumed.length, 0, 'the B baseline is never presented as the C revision');
   } finally {
     releaseClose?.();
     releaseOpen?.();

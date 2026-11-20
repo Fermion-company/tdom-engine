@@ -1,5 +1,5 @@
 import { fnv1a } from '../hash.js';
-import { trailingGlueSpec } from './util/galley.js';
+import { trailingGlueSpec, compileOffset } from './util/galley.js';
 
 /**
  * The glue the isolated compile re-creates before the block (iso-context.js
@@ -16,6 +16,15 @@ function trailingGlueKey(blocks, idx) {
   return `${g.widthSp}/${g.stretchSp}/${g.shrinkSp}/${g.stretchOrder}/${g.shrinkOrder}`;
 }
 
+// An index block's text never changes while its index does: the block hash
+// carries the .ind's signature (include-expander.js), so a result compiled
+// with yesterday's index is not found for today's.
+const readsIndex = (block) => (/\\printindex\b/.test(block.text) ? [block.hash ?? ''] : []);
+// A contents list set through the real routine reads driver.toc, which the
+// engine rewrites as headings and page numbers move (tocHash).
+const readsToc = (block, tocHash) =>
+  (/\\(?:tableofcontents|listoffigures|listoftables)\b/.test(block.text) ? [`toc:${tocHash ?? ''}`] : []);
+
 /**
  * The rescue cache key carries every input the isolated compile depends
  * on: the block text, the previous block's exit state, the preamble, the
@@ -24,14 +33,14 @@ function trailingGlueKey(blocks, idx) {
  * with fresh seeds), and the block's on-page start offset (splitting
  * environments — mdframed, breakable tcolorbox — break by page position).
  */
-export function rescueCacheKey(block, idx, { blocks, labelTable, preHash }) {
+export function rescueCacheKey(block, idx, { blocks, labelTable, preHash, tocHash = null }) {
   const refVals = (block.galley?.refs ?? []).map(
     (k) => k + '=' + (labelTable.get(k) ?? '')
   );
   // same 0.25bp quantum as the iso strut — see #isoCompile
-  const pageOff = Math.round((block.pageOffset ?? 0) * 4) / 4;
+  const pageOff = compileOffset(block);
   return fnv1a(
-    JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, refVals, pageOff, trailingGlueKey(blocks, idx)])
+    JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, refVals, pageOff, trailingGlueKey(blocks, idx), ...readsIndex(block), ...readsToc(block, tocHash)])
   );
 }
 
@@ -41,8 +50,8 @@ export function rescueCacheKey(block, idx, { blocks, labelTable, preHash }) {
  * real page offset can only be found by this base; the moved-offset pass
  * then re-rescues the block if the offset it lands on differs.
  */
-export function rescueBaseKey(block, idx, { blocks, preHash }) {
-  return fnv1a(JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, trailingGlueKey(blocks, idx)]));
+export function rescueBaseKey(block, idx, { blocks, preHash, tocHash = null }) {
+  return fnv1a(JSON.stringify([block.text, blocks[idx - 1]?.stateVec ?? '', preHash, trailingGlueKey(blocks, idx), ...readsIndex(block), ...readsToc(block, tocHash)]));
 }
 
 export function isoCacheGet(isoCache, key) {

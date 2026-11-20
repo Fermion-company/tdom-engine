@@ -1,5 +1,6 @@
 import { fnv1a } from '../hash.js';
 import { opensPackageBreakable } from './rescue-classifier.js';
+import { opensOnFreshPage } from './util/galley.js';
 
 export function queueMovedOffsets(engine, { paginateNow, rescueCacheKey, pumpRescues }) {
   if (engine.mode !== 'structured') return;
@@ -7,9 +8,14 @@ export function queueMovedOffsets(engine, { paginateNow, rescueCacheKey, pumpRes
   const entry = prov.blockEntry ?? new Map();
   const th = engine.geometry?.textheight ?? 0;
   let queued = false;
+  // (asked for every block with every keystroke: a document none of whose
+  // packages makes a breakable box has nothing to look at in a block that
+  // was not rescued. 1.3 ms on 2,600 blocks.)
+  const breakable = engine._packageBreakableRe;
   for (let c = 0; c < engine.blocks.length; c++) {
     const block = engine.blocks[c];
     if (!block.rescued) {
+      if (!breakable) continue;
       // tex64-internal #88: the fast path typesets a breakable box on the
       // \vsize=\maxdimen page, where it never splits. That is exact while
       // the box fits below the offset it was given (blockEntry is the
@@ -33,7 +39,7 @@ export function queueMovedOffsets(engine, { paginateNow, rescueCacheKey, pumpRes
     // 0.25bp quantum shared with the rescue key and the iso strut: a
     // want/have pair inside one quantum compiles to the same galley by
     // construction, so only a real grid step queues work
-    const want = Math.round((entry.get(block.id) ?? 0) * 4) / 4;
+    const want = opensOnFreshPage(block) ? 0 : Math.round((entry.get(block.id) ?? 0) * 4) / 4;
     // "have" is the galley's compile PROVENANCE, not block.pageOffset —
     // the latter is set optimistically when a re-rescue is queued, so a
     // compile that never lands (failed, superseded) would otherwise lock

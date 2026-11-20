@@ -44,13 +44,68 @@ export function hasDefinitionEdit(oldBlocks, blocks, bounds, defRe) {
   return false;
 }
 
+// The blocks on a page, kept with its list of lines (which is never changed
+// once the page is built: a page built again has another list).
+const pageBlockIds = new WeakMap();
+const realBlockIds = new WeakMap(); // a list of blocks -> the ids in it
+const NO_IDS = new Set();
+function blockIdsOn(page) {
+  const draw = page.draw;
+  if (!draw) return NO_IDS;
+  let ids = pageBlockIds.get(draw);
+  if (!ids) {
+    ids = new Set();
+    for (const item of draw) {
+      const id = item.u?.blockId;
+      if (id != null) ids.add(id);
+    }
+    pageBlockIds.set(draw, ids);
+  }
+  return ids;
+}
+
 export function editPageRenderIds(blocks, pages, dirtySource) {
+  // Only the document's own blocks tie pages together. A draw can also name
+  // something every page carries (the running head's source): counted as a
+  // block it tied the whole chapter to the edited page, and each keystroke
+  // replayed from the chapter's first picture.
+  // (every page of the document is looked at with every keystroke, three
+  // times: the blocks of a page are read off its lines once and kept with
+  // them, and the set of the document's blocks is made only once a page
+  // holds one of the blocks asked about. 191 pages of 41 lines: 1.8 ms a
+  // keystroke as two lists a page, then 0.6 ms as a walk over every line.)
+  // (the ids of the document's blocks, kept with the list of blocks: the
+  // engine makes a new list with every update and never changes one)
+  let real = null;
+  const isReal = id => {
+    if (!real) {
+      real = realBlockIds.get(blocks);
+      if (!real) realBlockIds.set(blocks, real = new Set(blocks.map(block => block.id)));
+    }
+    return real.has(id);
+  };
+  const holdsOneOf = (page, ids) => {
+    const here = blockIdsOn(page);
+    const [few, many] = ids.size <= here.size ? [ids, here] : [here, ids];
+    for (const id of few) if (many.has(id) && isReal(id)) return true;
+    return false;
+  };
+  const idsOf = page => [...blockIdsOn(page)].filter(id => isReal(id));
   const nearby = new Set();
   for (const page of pages) {
-    if (!page.draw?.some(draw => dirtySource.has(draw.u?.blockId))) continue;
-    for (const draw of page.draw) nearby.add(draw.u?.blockId);
+    if (!holdsOneOf(page, dirtySource)) continue;
+    for (const id of idsOf(page)) nearby.add(id);
   }
-  return blocks.filter(block => nearby.has(block.id) && block.needsRender).map(block => block.id);
+  // A block that runs over the page boundary ties the next page to this one:
+  // the viewer shows both or neither. In a long document the boot leaves far
+  // blocks without exact pixels (background-scheduler.js), so a code box on
+  // that neighbour held the page being typed on until the next canonical.
+  const tied = new Set(nearby);
+  for (const page of pages) {
+    if (!holdsOneOf(page, nearby)) continue;
+    for (const id of idsOf(page)) tied.add(id);
+  }
+  return blocks.filter(block => tied.has(block.id) && block.needsRender).map(block => block.id);
 }
 
 /**

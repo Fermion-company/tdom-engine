@@ -37,6 +37,29 @@ local JOB = nil -- set in a freshly forked job child
 local FAULT_FORKFAIL = 0
 local FAULT_WEDGE = 0
 local FAULT_SILENT = 0 -- swallow the job without forking or replying at all
+-- Spare continuations (fork shim, "a spare continuation"): after the job of
+-- a keystroke's own block this checkpoint forks the child the NEXT
+-- keystroke's job would be forked into. While it waits, that child loads
+-- the fonts the last job had to load and reads the pages it read. `on` only
+-- where a job can say which pages those were.
+--   pid       the spare this checkpoint has waiting
+--   due       this checkpoint owes itself a spare (made once it is idle)
+--   owed      this checkpoint owes the list of pages its own job read
+--   base      (in a spare, and the job it becomes) font.max() of the
+--             checkpoint it was forked from
+--   fontSeq   (in a spare) the font list it has loaded
+--   resume    (in a spare) its pipe, while TeX loads fonts for it
+--   ahead     (in a spare) fonts loaded ahead; touched, ms: pages read ahead
+local SPARE = { on = false, fonts = false, pid = nil, due = false, owed = false }
+local FONT_SPEC = {} -- font id -> "<size in sp> <name>" (as TeX was asked for it)
+local WARM_NAMES = {} -- names of the fonts a spare is loading (tdomwarmname)
+local TRACE_USAGE = false -- TDOM_TRACE_JOB with a shim that can tell (tdom_boot)
+local function drop_spare()
+  if SPARE.pid then
+    fk.spare_drop()
+    SPARE.pid = nil
+  end
+end
 local seen_fonts = {}
 local blk_labels = {}
 local blk_refs = {}
@@ -215,42 +238,264 @@ end
 
 -- ---------------------------------------------------------------- json
 
+-- A galley is tens of kilobytes of small tables, encoded once per JOB while
+-- the keystroke waits (5 ms of a 14 ms job on a 72-page book). The output
+-- is written into one list instead of a string per table, a string with
+-- nothing to escape is taken as it is, and key names are escaped once.
+-- The bytes are the same as before for every value: galley hashes rest on
+-- them.
 local function jstr(s)
   s = tostring(s)
+  if not s:find('[%z\1-\31\\"]') then return '"' .. s .. '"' end
   s = s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', ''):gsub('\t', '\\t')
   s = s:gsub('[%z\1-\31]', '')
   return '"' .. s .. '"'
 end
 
-local function jenc(v)
+local jkey_cache, jkey_count = {}, 0
+local function jkey(k)
+  local s = jkey_cache[k]
+  if not s then
+    s = jstr(k) .. ':'
+    -- names are a small vocabulary; a document that makes them up (label
+    -- keys used as table keys) must not grow this for ever
+    if jkey_count >= 4096 then jkey_cache, jkey_count = {}, 0 end
+    jkey_cache[k] = s
+    jkey_count = jkey_count + 1
+  end
+  return s
+end
+
+local function by_string(a, b) return tostring(a) < tostring(b) end
+
+-- The sorted key list of a table of string keys, by the keys as pairs()
+-- gave them. A galley is hundreds of runs of the same few shapes: sorting
+-- each one's keys was most of the 9 to 12 ms a keystroke's report took to
+-- encode (a five-line Japanese paragraph, 48 KB). The order is the sorted
+-- one as before, so the bytes are the same.
+local sorted_keys, sorted_count = {}, 0
+local function sorted_string_keys(keys, count)
+  local signature = table.concat(keys, '\1', 1, count)
+  local held = sorted_keys[signature]
+  if held then return held end
+  table.sort(keys)
+  if sorted_count < 4096 then
+    sorted_keys[signature] = keys
+    sorted_count = sorted_count + 1
+  end
+  return keys
+end
+
+-- A number as jput writes it.
+local function jnum(v)
+  if math.type(v) == 'integer' and v > -10000000000 and v < 10000000000 then return tostring(v) end
+  if v ~= v or v == math.huge or v == -math.huge then return '0' end
+  return string.format('%.10g', v)
+end
+
+-- The two run shapes a galley is made of, written in one piece: the same
+-- bytes jput writes (keys sorted), with a third of the garbage. A
+-- five-line Japanese paragraph is some 400 of them, half glyph runs and half
+-- the empty rules of its JFM glue; written key by key they were most of the
+-- 5 ms a keystroke's report took to encode in the job (offline 4.3 -> 2.6 ms
+-- and 902 -> 401 KB allocated for 110 KB). Nil for any other shape.
+local function jglyph(r)
+  local c, t, m = r.c, r.t, r.m
+  if type(c) ~= 'string' or type(t) ~= 'string' then return nil end
+  local count = 0
+  for _ in pairs(r) do count = count + 1 end
+  if count ~= (m == nil and 9 or 10) then return nil end
+  local dy, f, gd, gh, s, w, x = r.dy, r.f, r.gd, r.gh, r.s, r.w, r.x
+  if type(dy) ~= 'number' or type(f) ~= 'number' or type(gd) ~= 'number' or type(gh) ~= 'number' or
+      type(s) ~= 'number' or type(w) ~= 'number' or type(x) ~= 'number' or (m ~= nil and type(m) ~= 'number') then
+    return nil
+  end
+  return '{"c":' .. jstr(c) .. ',"dy":' .. jnum(dy) .. ',"f":' .. jnum(f) .. ',"gd":' .. jnum(gd) .. ',"gh":' .. jnum(gh) ..
+    (m == nil and '' or (',"m":' .. jnum(m))) .. ',"s":' .. jnum(s) .. ',"t":' .. jstr(t) .. ',"w":' .. jnum(w) ..
+    ',"x":' .. jnum(x) .. '}'
+end
+local RULE_NUMBERS = { 'dy', 'h', 'rd', 'rh', 'ri', 'rl', 'rr', 'rs', 'rv', 'rw', 'w', 'x' }
+local function rule_shape(r)
+  local count = 0
+  for _ in pairs(r) do count = count + 1 end
+  if count ~= 16 then return false end
+  if type(r.c) ~= 'string' or type(r.ra) ~= 'string' or type(r.rdir) ~= 'string' then return false end
+  for i = 1, #RULE_NUMBERS do
+    if type(r[RULE_NUMBERS[i]]) ~= 'number' then return false end
+  end
+  return true
+end
+local function jrule(r)
+  if not rule_shape(r) then return nil end
+  local c, ra, rdir = r.c, r.ra, r.rdir
+  return '{"c":' .. jstr(c) .. ',"dy":' .. jnum(r.dy) .. ',"h":' .. jnum(r.h) .. ',"ra":' .. jstr(ra) .. ',"rd":' .. jnum(r.rd) ..
+    ',"rdir":' .. jstr(rdir) .. ',"rh":' .. jnum(r.rh) .. ',"ri":' .. jnum(r.ri) .. ',"rl":' .. jnum(r.rl) ..
+    ',"rr":' .. jnum(r.rr) .. ',"rs":' .. jnum(r.rs) .. ',"rule":true,"rv":' .. jnum(r.rv) .. ',"rw":' .. jnum(r.rw) ..
+    ',"w":' .. jnum(r.w) .. ',"x":' .. jnum(r.x) .. '}'
+end
+
+-- ---- rules on the wire
+--
+-- LuaTeX-ja puts an empty rule between every two characters, and each one
+-- travels with the raw evidence the engine certifies it by (RuleRunV2: 16
+-- fields, among them the node's whole attribute list): 60 % of the bytes of
+-- a Japanese paragraph's galley, 115 rules of 235 bytes in a four-line one,
+-- alike but for where they stand and, in two to five kinds a line, for one
+-- attribute (the character class). In a galley sent to the engine
+-- (jenc_wire) a rule that differs from a whole rule written earlier in its
+-- run list in nothing but x is written as {"rq":[j,x]}, j counting the whole
+-- rules of that list from 0; the engine puts the whole rule back as it reads
+-- the message (rule-pack.js), so every run it sees, hashes and proves with
+-- is what it was. jenc itself writes the reference bytes as before.
+-- TDOM_NO_RULE_PACK=1 sends every rule whole.
+local PACK_RULES = not os.getenv('TDOM_NO_RULE_PACK')
+local PACKING = false -- inside jenc_wire
+local RULE_SAME = { 'ra', 'dy', 'h', 'c', 'rd', 'rdir', 'rh', 'ri', 'rl', 'rr', 'rs', 'rv', 'rw', 'w' }
+local RULE_LOOK_BACK = 8 -- whole rules of the list a short form is looked for among
+local function same_rule(a, b)
+  for i = 1, #RULE_SAME do
+    local k = RULE_SAME[i]
+    local x, y = a[k], b[k]
+    -- (the same bytes on the wire: 5 and 5.0 are, 0.0 and -0.0 are not)
+    if x ~= y or (x == 0 and 1 / x ~= 1 / y) then return false end
+  end
+  return true
+end
+
+local jput
+local function jruns(out, n, runs)
+  n = n + 1
+  out[n] = '['
+  -- the rules written whole so far, in order (false: one no short form may stand for)
+  local whole, count = {}, 0
+  for i = 1, #runs do
+    if i > 1 then
+      n = n + 1
+      out[n] = ','
+    end
+    local r = runs[i]
+    if type(r) == 'table' and r.rule == true then
+      if not rule_shape(r) then
+        count = count + 1
+        whole[count] = false
+        n = jput(out, n, r)
+      else
+        local found = nil
+        for j = count, count > RULE_LOOK_BACK and count - RULE_LOOK_BACK + 1 or 1, -1 do
+          local p = whole[j]
+          if p and same_rule(r, p) then
+            found = j
+            break
+          end
+        end
+        n = n + 1
+        if found then
+          out[n] = '{"rq":[' .. (found - 1) .. ',' .. jnum(r.x) .. ']}'
+        else
+          count = count + 1
+          whole[count] = r
+          out[n] = jrule(r)
+        end
+      end
+    else
+      n = jput(out, n, r)
+    end
+  end
+  n = n + 1
+  out[n] = ']'
+  return n
+end
+
+function jput(out, n, v)
   local t = type(v)
   if t == 'number' then
-    if v ~= v or v == math.huge or v == -math.huge then return '0' end
-    return string.format('%.10g', v)
-  elseif t == 'boolean' then
-    return tostring(v)
+    n = n + 1
+    if math.type(v) == 'integer' and v > -10000000000 and v < 10000000000 then
+      out[n] = tostring(v)
+    elseif v ~= v or v == math.huge or v == -math.huge then
+      out[n] = '0'
+    else
+      out[n] = string.format('%.10g', v)
+    end
   elseif t == 'string' then
-    return jstr(v)
+    n = n + 1
+    out[n] = jstr(v)
+  elseif t == 'boolean' then
+    n = n + 1
+    out[n] = v and 'true' or 'false'
   elseif t == 'table' then
+    local whole = (v.t ~= nil and jglyph(v)) or (v.rule == true and jrule(v)) or nil
+    if whole then
+      n = n + 1
+      out[n] = whole
+      return n
+    end
     if v[1] ~= nil or next(v) == nil then
-      local parts = {}
-      for i = 1, #v do parts[#parts + 1] = jenc(v[i]) end
-      return '[' .. table.concat(parts, ',') .. ']'
+      n = n + 1
+      out[n] = '['
+      for i = 1, #v do
+        if i > 1 then
+          n = n + 1
+          out[n] = ','
+        end
+        n = jput(out, n, v[i])
+      end
+      n = n + 1
+      out[n] = ']'
     else
       -- SORTED keys: pairs() order depends on the Lua hash seed, which
       -- differs per process — two lineages typesetting identical content
       -- would otherwise emit differently-ordered JSON, making every galley
       -- hash (and thus page identity) a per-lineage artifact. Deterministic
       -- bytes here are what make "same output ⇒ same hash" true end to end.
-      local keys = {}
-      for k in pairs(v) do keys[#keys + 1] = k end
-      table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-      local parts = {}
-      for _, k in ipairs(keys) do parts[#parts + 1] = jstr(k) .. ':' .. jenc(v[k]) end
-      return '{' .. table.concat(parts, ',') .. '}'
+      local keys, count, strings = {}, 0, true
+      for k in pairs(v) do
+        count = count + 1
+        keys[count] = k
+        if type(k) ~= 'string' then strings = false end
+      end
+      if count > 1 then
+        if strings then keys = sorted_string_keys(keys, count) else table.sort(keys, by_string) end
+      end
+      n = n + 1
+      out[n] = '{'
+      for i = 1, count do
+        local k = keys[i]
+        n = n + 1
+        out[n] = i > 1 and (',' .. jkey(k)) or jkey(k)
+        local value = v[k]
+        if PACKING and k == 'runs' and type(value) == 'table' and (value[1] ~= nil or next(value) == nil) then
+          n = jruns(out, n, value)
+        else
+          n = jput(out, n, value)
+        end
+      end
+      n = n + 1
+      out[n] = '}'
     end
+  else
+    n = n + 1
+    out[n] = 'null'
   end
-  return 'null'
+  return n
+end
+
+local function jenc(v)
+  PACKING = false
+  local out = {}
+  jput(out, 0, v)
+  return table.concat(out)
+end
+
+-- A galley for the engine: jenc's bytes, with the rules of each run list
+-- written short where they repeat (see "rules on the wire").
+local function jenc_wire(v)
+  PACKING = PACK_RULES
+  local out = {}
+  local ok, err = pcall(jput, out, 0, v)
+  PACKING = false
+  if not ok then error(err, 0) end
+  return table.concat(out)
 end
 
 -- ---------------------------------------------------------------- boot
@@ -266,11 +511,22 @@ function tdom_boot(port, workdir, counters)
   end
   fk = shim()
   fk.ignore_sigchld()
+  SPARE.on = not os.getenv('TDOM_NO_SPARES') and fk.hints_init ~= nil and fk.hints_init() == true
+  SPARE.fonts = SPARE.on and not os.getenv('TDOM_NO_FONT_AHEAD') and fk.fonts_put ~= nil
+  TRACE_USAGE = os.getenv('TDOM_TRACE_JOB') ~= nil and fk.usage ~= nil
   -- Establish one descriptor even when the preamble has not opened PDF yet.
   -- Every descendant clones it together with its backend object state.
   pdf.immediateobj('<<>>')
   PDF_FD = fk.prepare_pdf(workdir .. '/driver.pdf')
   assert(PDF_FD >= 0, 'cannot privatize resident PDF output')
+  -- Read the default font map file (pdftex.map) here, once, if the preamble
+  -- has left it to be read at the first font the PDF backend meets. No
+  -- resident process ships a page, so every render child met its first font
+  -- anew and read the whole file again: 33 to 56 ms of each exact render,
+  -- more than typesetting and shipping the block. '+' with no name reads
+  -- the pending default and adds nothing (LuaTeX process_map_item); the PDF
+  -- a child writes is byte for byte the same.
+  pcall(pdf.mapfile, '+')
   sock = require('socket')
   conn = assert(sock.connect('127.0.0.1', PORT))
   conn:setoption('tcp-nodelay', true)
@@ -282,6 +538,8 @@ function tdom_boot(port, workdir, counters)
       if JOB then
         JOB.had_error = true
         JOB.error = tostring(status.lasterrorstring or 'unknown')
+      elseif SPARE.loading or SPARE.warming then
+        SPARE.failed = true -- (a font could not be loaded, or the warm-up stumbled: this spare does no more of either)
       end
       if os.getenv('TDOM_TRACE_ERRORS') then
         texio.write_nl('term and log', 'tdom: native error: ' .. tostring(status.lasterrorstring or 'unknown'))
@@ -708,7 +966,17 @@ end
 -- RuleRunV2 retains the raw LuaTeX evidence that `rule=true` used to erase.
 -- In particular subtype=3 is empty_rule in certified LuaTeX PDF profiles:
 -- it participates in layout but the production backend emits no paint.
+-- (Nodes with the same attributes share one attribute list, and the empty
+-- rules of a paragraph all do: the signature is kept by list for the length
+-- of one walk, during which no list is made or freed.)
+local ATTR_SIG = {}
+local attr_list_of = node.direct and node.direct.getattributelist and node.direct.todirect and function(n)
+  return node.direct.getattributelist(node.direct.todirect(n))
+end or nil
 local function rule_attr_signature(n)
+  local list = n and attr_list_of and attr_list_of(n) or nil
+  local kept = list and ATTR_SIG[list]
+  if kept then return kept end
   local parts = {}
   local a = n and n.attr
   if a and a.id ~= ATTRIBUTE then a = a.next end -- skip attribute_list head
@@ -716,7 +984,9 @@ local function rule_attr_signature(n)
     parts[#parts + 1] = tostring(a.number or 0) .. ':' .. tostring(a.value or 0)
     a = a.next
   end
-  return table.concat(parts, ',')
+  local sig = table.concat(parts, ',')
+  if list then ATTR_SIG[list] = sig end
+  return sig
 end
 
 local function rule_run(n, x, dy, effective_w, effective_h, effective_d, color)
@@ -828,6 +1098,9 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       if legacy or (fi and fi.mth) then
         line_x = true
       end
+      -- (a run that is shown as exact pixels says where each of its glyphs
+      -- stands and which slot of the font it is: encode_runs)
+      if in_math or legacy or (fi and fi.mth) then run.ex = true end
       -- Glyphs outside cmap reach: luaotfload parks unencoded glyphs
       -- (math size variants, extensible pieces) in the PUA planes, and
       -- anything ≥ 0x110000 is not even valid UTF-8 for the payload.
@@ -841,7 +1114,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
         line_xb = true
       end
       if c < 32 then c = 0xE000 + c end
-      run.g[#run.g + 1] = { c, gx }
+      run.g[#run.g + 1] = { c, gx, n.char or 63 }
       -- actual glyph extents from TeX's font tables (needed for the OMX
       -- vertical correction when substituting unicode twins client-side)
       local fdata = font.getfont(n.font)
@@ -1148,7 +1421,48 @@ end
 -- content), the output routine started firing on every contribution — every
 -- block past that point died in-chain and fell back to the isolated rescue,
 -- which is exactly the "long documents crawl" wall.
+-- The page_so_far family (\pagetotal and the rest) cannot be set from Lua:
+-- `tex.pagetotal = 0` runs without an error and changes nothing (LuaTeX
+-- 1.24: two boxes, the assignment, one more box, and \pagetotal reads all
+-- three). The zeroing below was written that way, so the dormant page's
+-- total still grew with every block of the lineage, and at \maxdimen
+-- (16383 pt: 933 lines of an 11 pt text, 23 pages) the builder fired in the
+-- middle of a paragraph. The absorb planted an eject marker the document
+-- does not have: a document that runs longer than that without a page break
+-- of its own was paginated with a short page every 23 pages (2,600
+-- paragraphs: 193 pages against LuaLaTeX's 191; 400 paragraphs: the same 30
+-- pages, laid out differently from page 23 on). TeX's own assignment does
+-- reset the family; it is run from a macro defined once, so the catcodes of
+-- the moment do not matter.
+local RESET_PAGE_MACRO = 'tdom@resetpagesofar'
+local reset_page_ready = nil
+local function reset_page_so_far()
+  if reset_page_ready == nil then
+    reset_page_ready = pcall(function()
+      local body = '\\pagetotal=0pt \\pagestretch=0pt \\pagefilstretch=0pt \\pagefillstretch=0pt ' ..
+        '\\pagefilllstretch=0pt \\pageshrink=0pt \\pagedepth=0pt '
+      local latex = luatexbase and luatexbase.registernumber and luatexbase.registernumber('catcodetable@latex')
+      if latex then token.set_macro(latex, RESET_PAGE_MACRO, body, 'global')
+      else token.set_macro(RESET_PAGE_MACRO, body, 'global') end
+    end)
+  end
+  if not reset_page_ready then return false end
+  return pcall(function()
+    tex.runtoks(function() tex.sprint(token.create(RESET_PAGE_MACRO)) end)
+  end)
+end
+
 local function reseed_page()
+  -- The dormant page is \vsize=\maxdimen, set once by the boot template,
+  -- and a class may put the real height back in the middle of a document:
+  -- jlreq's \tableofcontents leaves \vsize at \textheight. From there on
+  -- the builder filled a real page across blocks and fired the absorb about
+  -- once per page of content, each time planting an eject marker the
+  -- document does not have (a 72-page book paginated to 74), and a block
+  -- taller than the page fired it until the runaway guard killed its fork.
+  -- The goal of the page seeded below is read from \vsize, so restore it
+  -- first.
+  pcall(tex.set, 'global', 'vsize', 1073741823) -- \maxdimen
   local d = new_dummy()
   local oldc = tex.lists.contrib_head
   d.next = oldc
@@ -1171,15 +1485,32 @@ local function reseed_page()
   -- every block in the lineage; past ~25 pages of cumulative content the
   -- typesetting child starts spinning forever (every in-chain job times
   -- out and the whole document degrades to the rescue path).
+  -- (through TeX: the assignments from Lua below are kept for an engine
+  -- where they work, but in LuaTeX 1.24 they do nothing)
+  if not os.getenv('TDOM_NO_PAGE_RESET') then reset_page_so_far() end
   pcall(function()
     tex.pagetotal = 0
     tex.pagestretch = 0
+    tex.pagefistretch = 0
     tex.pagefilstretch = 0
     tex.pagefillstretch = 0
     tex.pagefilllstretch = 0
     tex.pageshrink = 0
     tex.pagedepth = 0
   end)
+  -- The builder also remembers where it would break and what the inserts
+  -- on this page cost, and none of that is reset either (the page never
+  -- becomes empty, so freeze_page_specs never runs). Once the accumulated
+  -- insert height of some class passes its \dimen, every later insert adds
+  -- its \floatingpenalty to \insertpenalties; at 10000 the cost is
+  -- awful_bad and the builder fires at best_page_break, a node of a page
+  -- harvested long ago. fire_up then walks the page list for a pointer that
+  -- is not on it and never returns (a silent C spin: every in-chain job of a
+  -- book timed out from the third list item of its first chapter on).
+  pcall(function() tex.insertpenalties = 0 end)
+  pcall(function() tex.lists.best_page_break = nil end)
+  pcall(function() tex.lists.least_page_cost = 1073741823 end) -- awful_bad
+  pcall(function() tex.lists.page_ins_head = nil end)
 end
 
 -- The engine keeps this file in the work directory while a keystroke waits
@@ -1255,6 +1586,9 @@ end
 -- page builder has not moved yet), as one continuous node list COPY-FREE.
 local function harvest_nodes()
   pcall(function() tex.triggerbuildpage() end)
+  if os.getenv('TDOM_TRACE_OUTPUT') then
+    texio.write_nl('term and log', 'TDOMTRACE harvest job=' .. tostring(JOB and JOB.id) .. ' vsize=' .. tostring(tex.vsize) .. ' goal=' .. tostring(tex.pagegoal) .. ' total=' .. tostring(tex.pagetotal) .. ' inspen=' .. tostring(tex.insertpenalties))
+  end
   local head = tex.lists.page_head
   local contrib = tex.lists.contrib_head
   -- detach both lists from TeX first, then reseed through the builder
@@ -1357,6 +1691,7 @@ function tdom_float(n, placement, ftype)
   local box = tex.box[TDOM_FLOATBOX]
   if not box then return end
   colstack = {}
+  ATTR_SIG = {}
   local saved_gfx = blk_gfx
   blk_gfx = false
   local saved_marks = pending_fmarks
@@ -1395,6 +1730,25 @@ local function encode_runs(items)
             chars[i] = unicode.utf8.char(pair[1] > 0 and pair[1] or 63)
           end
           r.t = table.concat(chars)
+          -- A run that needs exact pixels (mathematics, a math or legacy
+          -- font) also says where each glyph after the first stands (`gp`,
+          -- from the run's x) and, where `t` could not carry it, which slot
+          -- of the font each glyph is (`gc`): its picture can then be put
+          -- together from glyphs of pictures already made (exact-synth.js).
+          if r.ex then
+            r.ex = nil
+            if #r.g > 1 then
+              local gp = {}
+              for i, pair in ipairs(r.g) do gp[i] = math.floor((pair[2] - r.x) * 1000 + 0.5) / 1000 end
+              r.gp = gp
+            end
+            local gc, differs = {}, false
+            for i, pair in ipairs(r.g) do
+              gc[i] = pair[3]
+              if pair[3] ~= pair[1] then differs = true end
+            end
+            if differs then r.gc = gc end
+          end
           r.g = nil
         end
       end
@@ -1411,6 +1765,7 @@ function tdom_hf_box(boxnum, page, which)
   local box = tex.box[boxnum]
   if not box then return end
   colstack = {}
+  ATTR_SIG = {}
   local saved_marks = pending_fmarks
   pending_fmarks = {}
   local items = extract_items(box.list, box)
@@ -1485,6 +1840,7 @@ function tdom_report()
   local TR0 = os.gettimeofday and os.gettimeofday() or os.clock()
   local head = harvest_nodes()
   colstack = {}
+  ATTR_SIG = {}
   pending_fmarks = {}
   top_epochs = {}
   local items = extract_items(head, nil)
@@ -1515,10 +1871,39 @@ function tdom_report()
   local TR1 = os.gettimeofday and os.gettimeofday() or os.clock()
   local tm = nil
   if os.getenv('TDOM_TRACE_JOB') then
+    -- where the job's time went: its own CPU, the kernel's (page faults), and how many of those
+    local was, now = JOB.usage, JOB.usage and { fk.usage() }
     tm = {
+      userMs = was and math.floor((now[1] - was[1]) * 100 + 0.5) / 100 or nil,
+      sysMs = was and math.floor((now[2] - was[2]) * 100 + 0.5) / 100 or nil,
+      faults = was and now[3] - was[3] or nil,
+      cowFaults = was and now[4] - was[4] or nil,
+      -- fonts this job had to load: ones the checkpoint it was forked from did not have
+      fontsLoaded = JOB.fontMax and (function()
+        local names = {}
+        for id = JOB.fontMax + 1, font.max() do
+          local ok, f = pcall(font.getfont, id)
+          names[#names + 1] = ok and f and (tostring(f.name or f.fullname or '?'):sub(1, 60) .. '@' .. tostring(f.size and math.floor(f.size / 65536 * 100 + 0.5) / 100 or '?')) or ('#' .. id)
+        end
+        return #names > 0 and names or nil
+      end)() or nil,
       typeset = math.floor((TR0 - (T_JOB or TR0)) * 100000 + 0.5) / 100,
       harvest = math.floor((TR1 - TR0) * 100000 + 0.5) / 100,
       heapKb = collectgarbage('count'),
+      -- this job ran in a spare continuation: pages it read ahead, ms that
+      -- took, fonts it loaded ahead
+      spareTouched = SPARE.touched,
+      spareMs = SPARE.ms and math.floor(SPARE.ms * 100 + 0.5) / 100 or nil,
+      fontsAhead = SPARE.ahead,
+      warmMs = SPARE.warmMs and math.floor(SPARE.warmMs * 100 + 0.5) / 100 or nil,
+      -- epoch ms, to place the job between the orchestrator's own stamps
+      -- (seconds and the fraction apart: the encoder keeps few digits)
+      forkMs = T_RECV and T_FORKED and (T_FORKED - T_RECV) * 1000 or nil,
+      setupMs = T_FORKED and T_JOB and (T_JOB - T_FORKED) * 1000 or nil,
+      recvSec = T_RECV and math.floor(T_RECV) or nil,
+      recvFrac = T_RECV and (T_RECV - math.floor(T_RECV)) * 1000 or nil,
+      doneSec = os.gettimeofday and math.floor(TR1) or nil,
+      doneFrac = os.gettimeofday and (TR1 - math.floor(TR1)) * 1000 or nil,
       gcFloorKb = TDOM_GC_FLOOR,
       interactive = JOB.interactive,
     }
@@ -1535,8 +1920,18 @@ function tdom_report()
     CAPTURE_TOKEN = JOB.capture
     capture = JOB.capture
   end
-  local payload = jenc({
+  -- the fonts this job holds that the checkpoint it was forked from has not
+  -- ("<size in sp> <name>" lines)
+  local font_list = SPARE.fonts and JOB.fontBase and font_specs_since(JOB.fontBase) or nil
+  JOB.fontList = font_list
+  local payload = jenc_wire({
     tm = tm,
+    -- this job ran in a spare continuation: pages it read ahead, fonts it loaded ahead
+    spare = SPARE.touched and { pages = SPARE.touched, fonts = SPARE.ahead or 0 } or nil,
+    -- fonts this job itself had to load
+    fontLoads = JOB.fontBase and font.max() - JOB.fontBase - (SPARE.ahead or 0) or nil,
+    -- (the engine hands the list back when the caret comes to this block: SPARE)
+    fontList = font_list and font_list ~= '' and font_list or nil,
     block = JOB.id,
     capture = capture,
     gfx = blk_gfx,
@@ -1555,15 +1950,26 @@ function tdom_report()
     closure_error = JOB.error,
     tdomSourceCatcodesSafe = JOB.sourceCatcodesSafe == true,
     tdomActive = JOB.activeChars ~= '' and JOB.activeChars or nil,
+    tdomMathActive = JOB.mathActiveChars ~= '' and JOB.mathActiveChars or nil,
     trail = md5.sumhexa(table.concat(blk_trail or {}, '\n')),
     trailMarks = trail_marks,
     epochs = epochs,
     paintLate = paint_late,
     backend = resident_backend_profile(),
   })
+  local TJ = os.gettimeofday and os.gettimeofday() or os.clock()
   if head and not capture then node.flush_list(head) end
+  local TE = os.gettimeofday and os.gettimeofday() or os.clock()
   conn:send('GALLEY ' .. JOB.id .. ' ' .. #payload .. '\n')
   conn:send(payload)
+  if TRACE_USAGE and WORKDIR and JOB.keystroke then
+    local f = io.open(WORKDIR .. '/spare-trace.log', 'a')
+    if f then
+      f:write(string.format('payload %d bytes encode %.2f ms flush %.2f ms send %.2f ms\n', #payload, (TJ - TR1) * 1000,
+        (TE - TJ) * 1000, ((os.gettimeofday and os.gettimeofday() or os.clock()) - TE) * 1000))
+      f:close()
+    end
+  end
   payload, items = nil, nil -- not live across the collect
   local gc_started = os.gettimeofday and os.gettimeofday() or os.clock()
   checkpoint_gc(JOB.calibrate, JOB.interactive, (T_JOB or 0) > 0 and gc_started - T_JOB or 0)
@@ -1571,7 +1977,28 @@ function tdom_report()
   -- this child now becomes the next checkpoint in the chain
   CKPT = JOB.ckpt
   conn:send('CKPT ' .. CKPT .. ' ' .. fk.getpid() .. ' ' .. (TDOM_GC_FLOOR or 0) .. ' ' .. gc_ms .. '\n')
+  local keystroke, list = JOB.keystroke, JOB.fontList
   JOB = nil
+  SPARE.touched, SPARE.ms, SPARE.ahead, SPARE.base, SPARE.warmMs = nil, nil, nil, nil, nil
+  if SPARE.on and keystroke then
+    -- this job's pages are told to the next keystroke's spare (tdom_wait)
+    SPARE.owed = true
+    -- and the fonts it had that the checkpoint before it has not
+    -- (left as it is when it says the same: a spare that has loaded the
+    -- list is not asked again)
+    if list and list ~= (fk.fonts_get(CKPT, 1) or '') then
+      -- A font listed twice was loaded ahead and then loaded again by the
+      -- job: it is not one TeX finds again by its name and size (a package
+      -- defined it itself). Loading ahead only costs here: leave this point
+      -- of the document to ordinary jobs.
+      local seen, twice = {}, false
+      for line in list:gmatch('[^\n]+') do
+        twice = twice or seen[line] == true
+        seen[line] = true
+      end
+      fk.fonts_put(CKPT, not twice and list)
+    end
+  end
 end
 
 -- ------------------------------------------------------------ shipping
@@ -1763,19 +2190,251 @@ local function recv_exact(n)
   return table.concat(parts)
 end
 
-function tdom_wait()
+-- TDOM_TRACE_JOB: what a render child spent from its fork to its finished
+-- PDF (wall, its own CPU, the kernel's, page faults, copy-on-write faults).
+local function render_usage_start(kind)
+  if TRACE_USAGE then
+    RENDER_USAGE = { kind = kind, at = os.gettimeofday(), fk.usage() }
+  end
+end
+local function render_usage_end()
+  local was = RENDER_USAGE
+  if not was or not WORKDIR then return end
+  local now = { fk.usage() }
+  local f = io.open(WORKDIR .. '/spare-trace.log', 'a')
+  if f then
+    f:write(string.format('%s pid %d wall %.1f user %.1f sys %.1f faults %d cow %d\n', was.kind, fk.getpid(),
+      (os.gettimeofday() - was.at) * 1000, now[1] - was[1], now[2] - was[2], now[3] - was[3], now[4] - was[4]))
+    f:close()
+  end
+end
+
+-- ---- fonts ahead of the job
+--
+-- A block that is the first in the document to use a font (the first math,
+-- the first bold, a logo's small capital) loads it in every job: the
+-- checkpoint the job is forked from never has it. One paragraph of a book
+-- spent 17 of its 18 ms loading a 6 pt face for \LaTeX, at each keystroke.
+-- So a keystroke's job says which fonts it holds that its checkpoint does
+-- not, and the spare of the next keystroke loads them, by the name and size
+-- TeX was asked for and in the same order, before the job arrives. A font is
+-- a resource: the paragraph is set the same whether its fonts were loaded a
+-- moment earlier or in its middle (and TeX gives them the same numbers).
+
+-- "<size in sp> <name>" of every font above `base`, a line each; nil when
+-- one of them cannot be asked for again by name.
+function font_specs_since(base)
+  local lines = {}
+  for id = base + 1, font.max() do
+    local spec = FONT_SPEC[id]
+    if spec == nil then
+      local ok, f = pcall(font.getfont, id)
+      local name, size = ok and f and f.name, ok and f and tonumber(f.size)
+      spec = type(name) == 'string' and name ~= '' and not name:find('["\n\r]') and size and size > 0 and
+        string.format('%d %s', size, name) or false
+      FONT_SPEC[id] = spec
+    end
+    if not spec then return nil end
+    lines[#lines + 1] = spec
+  end
+  return table.concat(lines, '\n')
+end
+
+-- (the name goes to TeX as plain characters, whatever the document has made
+-- of the characters in it)
+function tdomwarmname(i)
+  tex.sprint(-2, '"' .. tostring(WARM_NAMES[i] or '') .. '"')
+end
+
+-- TeX lines that load the listed fonts and leave nothing else behind.
+local function font_load_lines(list)
+  local ok, primitive = pcall(function() return token.create('font').cmdname == 'def_font' end)
+  if not ok or not primitive then return nil end
+  local lines = { '\\begingroup' }
+  WARM_NAMES = {}
+  for size, name in list:gmatch('(%d+) ([^\n]+)') do
+    WARM_NAMES[#WARM_NAMES + 1] = name
+    lines[#lines + 1] = '\\font\\tdomwarmfont=\\directlua{tdomwarmname(' .. #WARM_NAMES .. ')} at ' .. size .. 'sp\\relax'
+  end
+  if #WARM_NAMES == 0 then return nil end
+  lines[#lines + 1] = '\\endgroup'
+  return lines
+end
+
+-- ---- the paragraph typeset once ahead of its keystroke
+--
+-- A job forked from a checkpoint typesets its paragraph with every cache
+-- cold: LuaTeX-ja's tables, the node allocator, Lua's strings. The same
+-- paragraph typeset a second time in the same process took a fraction of
+-- the time. So a spare, while it waits, typesets the characters of the
+-- paragraph its checkpoint's last keystroke sent (no command, brace, math
+-- shift, comment sign or active character: only characters TeX reads as
+-- letters, others and spaces) in a box it throws away, inside a group with
+-- \globaldefs=-1: every assignment, global or not, is undone at the end of
+-- the group, and no command of the paragraph runs. TDOM_NO_WARM=1 turns it off.
+local WARM = not os.getenv('TDOM_NO_WARM')
+local WARM_LIMIT = 6000 -- characters
+
+local function warm_text(body)
+  local ok, text = pcall(function()
+    local out, n, skip_name = {}, 0, false
+    for _, cp in utf8.codes(body) do
+      if n >= WARM_LIMIT then break end
+      local cat = tex.getcatcode(cp)
+      if skip_name and cat == 11 then
+        -- the rest of a command's name
+      else
+        skip_name = false
+        if cat == 0 then
+          skip_name = true
+        elseif cat == 11 or cat == 12 then
+          n = n + 1
+          out[n] = utf8.char(cp)
+        elseif cat == 10 or cat == 5 then
+          if n > 0 and out[n] ~= ' ' then
+            n = n + 1
+            out[n] = ' '
+          end
+        end
+      end
+    end
+    return table.concat(out, '', 1, n)
+  end)
+  return ok and text:find('%S') and text or nil
+end
+
+-- In a spare continuation: wait for the job. Returns its JOB line and body;
+-- or nothing, having handed TeX the fonts to load first (tdom_wait comes
+-- back here through SPARE.resume).
+local function spare_serve(rfd)
+  if SPARE.loading then
+    -- back from loading fonts
+    SPARE.loading = nil
+    SPARE.ahead = font.max() - SPARE.base
+    font_specs_since(SPARE.base) -- (described now, not while the job's report waits)
+  end
+  if SPARE.warming then
+    SPARE.warming = nil
+    SPARE.warmMs = (os.gettimeofday() - SPARE.warmAt) * 1000
+  elseif WARM and SPARE.warmBody and not SPARE.failed and not SPARE.loading then
+    -- the paragraph once, ahead of its keystroke (fonts first: the job's own
+    -- loading of them would differ from a warm-up's)
+    local fonts_waiting = SPARE.fonts and fk.fonts_get(CKPT + 1, SPARE.fontSeq) ~= nil
+    if not fonts_waiting then
+      local text = warm_text(SPARE.warmBody)
+      SPARE.warmBody = nil
+      if text then
+        SPARE.resume, SPARE.warming, SPARE.warmAt = rfd, true, os.gettimeofday()
+        WARM_TEXT = text
+        tex.print({ '\\begingroup\\globaldefs=-1\\relax\\setbox0=\\vbox{\\directlua{tex.sprint(-2, WARM_TEXT)}\\par}\\endgroup' })
+        return nil
+      end
+    end
+  end
   while true do
-    local line, err = conn:receive('*l')
+    local message, touched, ms = fk.spare_wait(rfd, SPARE.fonts and CKPT + 1 or -1, SPARE.fontSeq)
+    if message ~= false then
+      local line, body = message:match('^([^\n]*)\n(.*)$')
+      if not line then fk._exit(0) end
+      SPARE.touched, SPARE.ms = touched, ms
+      return line, body
+    end
+    local list, seq = fk.fonts_get(CKPT + 1, SPARE.fontSeq)
+    if list then
+      SPARE.fontSeq = seq
+      local lines = not SPARE.failed and font_load_lines(list)
+      if lines then
+        SPARE.resume, SPARE.loading = rfd, true
+        tex.print(lines)
+        return nil
+      end
+    end
+  end
+end
+
+-- This checkpoint's spare. In the parent: nothing. In the spare itself: as
+-- spare_serve.
+local function make_spare()
+  local spid, rfd = fk.spare_fork(PDF_FD)
+  if spid ~= 0 then
+    if spid and spid > 0 then SPARE.pid = spid end
+    return nil, nil, false
+  end
+  -- a forked child must not hold the inherited descriptor
+  conn:close()
+  conn = nil
+  SPARE.pid, SPARE.due, SPARE.owed = nil, false, false
+  SPARE.base, SPARE.fontSeq, SPARE.ahead, SPARE.failed = font.max(), 0, nil, nil
+  local line, body = spare_serve(rfd)
+  return line, body, true
+end
+
+function tdom_wait()
+  -- set in a spare continuation once its parent has handed it a job: the
+  -- JOB line and body the parent received
+  local spare_line, spare_body = nil, nil
+  if SPARE.resume then
+    -- a spare, back from loading fonts
+    local rfd = SPARE.resume
+    SPARE.resume = nil
+    spare_line, spare_body = spare_serve(rfd)
+    if not spare_line then return end -- (more fonts)
+  end
+  while true do
+    local line, err = spare_line, nil
+    -- (the job handed to this spare is this turn's command, once)
+    local handed_body = spare_body
+    spare_line, spare_body = nil, nil
+    if not line then
+      if not conn then fk._exit(0) end
+      -- What this checkpoint does once nothing has asked anything of it for
+      -- a moment (a render forked beside a job, or captured from it, comes
+      -- first):
+      while (SPARE.due or SPARE.owed) and not conn:dirty() and
+          not fk.wait_readable(conn:getfd(), SPARE.due and 8 or 15) do
+        if SPARE.due then
+          -- the continuation of the next keystroke's job
+          SPARE.due = false
+          if not SPARE.pid then
+            local in_spare
+            line, handed_body, in_spare = make_spare()
+            if in_spare and not line then return end -- the spare: TeX loads its fonts
+            if line then break end -- the spare, and here is its job
+          end
+        else
+          -- Say which pages the job that made this checkpoint read, for the
+          -- spare of the next keystroke. Listing them walks this process's
+          -- whole page table (0.1 to 0.5 s in a book): once per point of the
+          -- document and then every ten seconds, since one paragraph's
+          -- keystrokes read the same pages. (Dropped the moment something
+          -- does ask: false, and asked again.)
+          local pages, runs, ms = fk.hints_record(CKPT, 10000, conn:getfd())
+          SPARE.owed = pages == false
+          if pages and os.getenv('TDOM_TRACE_JOB') and WORKDIR then
+            local f = io.open(WORKDIR .. '/spare-trace.log', 'a')
+            if f then
+              f:write(string.format('record pid %d ckpt %d pages %d runs %d %.2f ms\n', fk.getpid(), CKPT, pages, runs, ms))
+              f:close()
+            end
+          end
+        end
+      end
+      if not line then line, err = conn:receive('*l') end
+    end
     if not line then
       fk._exit(0) -- orchestrator went away
     end
-    local cmd, a, b, c, d, mode, live_floor = line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)')
+    local cmd, a, b, c, d, mode, live_floor, key =
+      line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)')
     if cmd == 'DIE' then
       fk._exit(0)
     elseif cmd == 'PING' then
       conn:send('PONG ' .. CKPT .. '\n')
     elseif cmd == 'FAULT' then
       -- test-only fault injection: FAULT FORKFAIL <n> | FAULT WEDGE <n>
+      -- (a spare forked before the fault was set would not carry it)
+      drop_spare()
+      SPARE.on, SPARE.due = false, false
       if a == 'FORKFAIL' then
         FAULT_FORKFAIL = tonumber(b) or 0
       elseif a == 'WEDGE' then
@@ -1783,20 +2442,52 @@ function tdom_wait()
       elseif a == 'SILENT' then
         FAULT_SILENT = tonumber(b) or 0
       end
+    elseif cmd == 'SPARE' then
+      -- SPARE <newCkptIdx> <bodyLen>: the caret has come to the block this
+      -- checkpoint stands in front of. Make the spare continuation of its
+      -- first keystroke now. Body: the fonts that block's last job held
+      -- that this checkpoint has not (a job's fontList).
+      local tag = tonumber(a)
+      local len = tonumber(b) or 0
+      local list = len > 0 and recv_exact(len) or ''
+      if SPARE.on and tag == CKPT + 1 then
+        if SPARE.fonts and list ~= '' and list ~= (fk.fonts_get(tag, 1) or '') then fk.fonts_put(tag, list) end
+        if not SPARE.pid then SPARE.due = true end
+      end
     elseif cmd == 'JOB' or cmd == 'STEP' then
-      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B|C> <liveFloorKb>
+      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B|C> <liveFloorKb> [K]
+      -- (K: the job of the block a keystroke changed)
       local id = a
+      T_RECV = os.gettimeofday and os.gettimeofday() or nil
       local newckpt = tonumber(b) or (CKPT + 1)
       local len = tonumber(c) or 0
       local capture = d ~= '' and d ~= '-' and d or nil
-      local body = len > 0 and recv_exact(len) or ''
+      local body = handed_body or (len > 0 and recv_exact(len) or '')
       if FAULT_SILENT > 0 then
         -- body already consumed (protocol stays in sync); reply with nothing
         FAULT_SILENT = FAULT_SILENT - 1
         texio.write_nl('term and log', 'TDOMFAULT silent job=' .. tostring(id))
       else
       local wedge = take_wedge_fault()
-      local pid = cmd == 'STEP' and 0 or fork_for(id)
+      -- a keystroke's job goes to the spare continuation when there is one
+      local sparable = SPARE.on and cmd == 'JOB' and key == 'K' and not wedge
+      -- (and the next spare typesets its characters once ahead: warm_text)
+      if sparable and not handed_body then SPARE.warmBody = body end
+      local pid
+      if handed_body then
+        pid = 0 -- this process is that continuation
+      elseif cmd == 'STEP' then
+        -- this checkpoint itself moves on: a spare of the state it leaves is of no use
+        drop_spare()
+        SPARE.due = false
+        pid = 0
+      elseif sparable and SPARE.pid and fk.spare_send(line .. '\n' .. body) then
+        pid = SPARE.pid
+        SPARE.pid = nil
+      else
+        if sparable then SPARE.pid = nil end -- (spare_send let a spare that could not take the job go)
+        pid = fork_for(id)
+      end
       if pid == 0 then
         if wedge then
           os.execute('/bin/sleep 30')
@@ -1805,8 +2496,11 @@ function tdom_wait()
         -- Do not propagate a previous block's retained nodes into the next
         -- checkpoint generation. The parent keeps its own COW copy until
         -- CAPTURE or checkpoint retirement.
+        T_FORKED = os.gettimeofday and os.gettimeofday() or nil
         drop_capture()
-        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F', calibrate = mode == 'C' }
+        JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F', calibrate = mode == 'C',
+          keystroke = key == 'K', fontBase = handed_body and SPARE.base or font.max() }
+        SPARE.pid, SPARE.due, SPARE.owed = nil, false, false
         fk.set_interactive(JOB.interactive and 1 or 0)
         gc_base_kb = tonumber(live_floor) or 0
         gc_guard_kb, gc_guard_ms = nil, 0
@@ -1816,6 +2510,10 @@ function tdom_wait()
         -- spread over every job of the lineage.
         collectgarbage('stop')
         T_JOB = os.gettimeofday and os.gettimeofday() or os.clock()
+        if TRACE_USAGE then
+          JOB.usage = { fk.usage() }
+          JOB.fontMax = font.max()
+        end
         blk_labels = {}
         blk_refs = {}
         blk_counters = {}
@@ -1852,6 +2550,9 @@ function tdom_wait()
         return -- resume TeX: typeset, report, then \TDOMloop brings us back
       elseif pid then
         conn:send('FORKED ' .. id .. ' ' .. pid .. '\n')
+        -- the continuation of the next keystroke's job is made once this
+        -- checkpoint is idle (above)
+        if sparable and not SPARE.pid then SPARE.due = true end
       end
       end
     elseif cmd == 'RENDER' then
@@ -1869,6 +2570,7 @@ function tdom_wait()
         RENDER_MODE = true
         FLOAT_COPIES = {}
         FOOT_COPIES = {}
+        render_usage_start('render')
         reconnect('render', 0)
         assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish resident PDF')
         lfs.chdir(jobdir)
@@ -1877,6 +2579,7 @@ function tdom_wait()
           pcall(function()
             conn:send('DONE ' .. request .. '\n')
           end)
+          pcall(render_usage_end)
         end
         if luatexbase and luatexbase.add_to_callback then
           pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdom')
@@ -1906,6 +2609,7 @@ function tdom_wait()
           RENDER_MODE = true
           FLOAT_COPIES = {}
           FOOT_COPIES = {}
+          render_usage_start('capture')
           reconnect('render', 0)
           assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish captured PDF')
           lfs.chdir(jobdir)
@@ -1913,6 +2617,7 @@ function tdom_wait()
             pcall(function()
               conn:send('DONE ' .. request .. '\n')
             end)
+            pcall(render_usage_end)
           end
           if luatexbase and luatexbase.add_to_callback then
             pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdom')
@@ -1970,15 +2675,18 @@ function iso_fork(id, jobdir, body)
     reconnect('iso', 0)
     assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish isolated PDF')
     lfs.chdir(jobdir)
+    -- stop_run follows PDF finalization; finish_pdffile precedes the
+    -- font streams and EOF, forcing the receiver to poll an unfinished PDF.
     local notify = function()
+      fk.flush()
       pcall(function()
         conn:send('DONE ' .. id .. '\n')
       end)
     end
     if luatexbase and luatexbase.add_to_callback then
-      pcall(luatexbase.add_to_callback, 'finish_pdffile', notify, 'tdom')
+      pcall(luatexbase.add_to_callback, 'stop_run', notify, 'tdom')
     else
-      pcall(callback.register, 'finish_pdffile', notify)
+      pcall(callback.register, 'stop_run', notify)
     end
     inject_raw(body)
     return true
@@ -2019,6 +2727,20 @@ function tdom_real_root()
     return
   end
   collectgarbage('stop')
+  -- Warm the common heading faces only in the isolated-output sibling.
+  -- Doing this before the fork changes resident font attribute identities.
+  if os.getenv('TDOM_ISO_FONT_WARM') == '0' or not token.is_defined('Large') then
+    tdom_real_ready()
+    return
+  end
+  tex.print({
+    '\\begingroup\\setbox0=\\hbox{\\large large \\sffamily sans \\bfseries bold ' ..
+      '\\normalfont\\Large large \\sffamily sans \\bfseries bold}\\endgroup',
+    '\\directlua{tdom_real_ready()}',
+  })
+end
+
+function tdom_real_ready()
   reconnect('realroot', 0)
   tdom_real_wait()
   -- only an ISO child returns here: TeX resumes on the injected program
@@ -2131,12 +2853,32 @@ local function source_active_chars(body)
   return ok and found or '?'
 end
 
+-- The characters of `body` that run a macro when typed in mathematics
+-- (mathcode "8000: the prime, a comma under icomma, a document's own). A
+-- keystroke inside a formula is only taken for a keystroke of ordinary
+-- characters when it touches none of them (plain-preview.js).
+local function source_math_active_chars(body)
+  local ok, found = pcall(function()
+    local seen, out = {}, {}
+    for _, cp in utf8.codes(body) do
+      if cp >= 32 and cp < 0x110000 and not seen[cp] then
+        seen[cp] = true
+        local code = tex.getmathcode(cp)
+        if type(code) == 'table' and code[1] == 8 then out[#out + 1] = utf8.char(cp) end
+      end
+    end
+    return table.concat(out)
+  end)
+  return ok and found or '?'
+end
+
 function inject_job(body, ship)
   -- Typeset ON the main vertical list — full state continuity with the
   -- previous blocks (prevdepth, \everypar, spacefactor, open counters...).
   -- The dormant page collects the nodes; tdom_report harvests them.
   JOB.sourceCatcodesSafe = native_source_catcodes_safe(body)
   JOB.activeChars = source_active_chars(body)
+  JOB.mathActiveChars = source_math_active_chars(body)
   local lines = input_lines(body)
   lines[#lines + 1] = '\\par'
   if ship then

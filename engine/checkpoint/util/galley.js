@@ -111,3 +111,11 @@ export {
   stableFontKey,
   trailingGlueSpec,
 };
+
+// An index opens on a page of its own (theindex clears the page before it
+// starts, in every class), so where the text above it ended is not its
+// position. Compiled behind a strut of that height its heading was set at the
+// foot of the strut's page and the columns began one page late.
+export const opensOnFreshPage = (block) => /\\printindex\b/.test(block?.text ?? '');
+/** The on-page offset a block's isolated compile starts at (0.25bp grid). */
+export const compileOffset = (block) => (opensOnFreshPage(block) ? 0 : Math.round((block?.pageOffset ?? 0) * 4) / 4);

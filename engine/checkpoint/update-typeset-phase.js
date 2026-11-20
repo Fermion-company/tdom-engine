@@ -17,6 +17,8 @@ export async function runUpdateTypesetPhase(engine, {
   plainPreviewAdmission = null,
   coldBudgetMs = 0,
   coldResume = false,
+  // an edit (not a boot): a table of contents its pages do not show may wait
+  deferToc = false,
   callbacks,
 }) {
   const {
@@ -30,6 +32,9 @@ export async function runUpdateTypesetPhase(engine, {
     queueMovedOffsets,
     coldPreview = null,
   } = callbacks;
+  // The block typed into (one source-dirty block): its renders are the ones
+  // the next keystroke spares (render-pump.js, tex64-internal #103)
+  if (!coldResume && dirtySource.size === 1) engine.heldFocus = [...dirtySource][0];
   const dirtyBlocks = [];
   const depDirty = [];
   const changedLabels = new Set();
@@ -71,6 +76,7 @@ export async function runUpdateTypesetPhase(engine, {
   // a usable stopping point while later exact pixels on that page are cold.
   let firstDisplay = firstDirty;
   let lastDisplay = lastDirty;
+  const displayReplay = new Set();
   if (engine.previewPolicy === 'structured' && engine.foregroundRenderIds) {
     for (let k = 0; k < engine.blocks.length; k++) {
       const block = engine.blocks[k];
@@ -78,8 +84,19 @@ export async function runUpdateTypesetPhase(engine, {
       if (!chunkTargets(block).some(target => engine.chunks.get(target.key)?.forGalley !== block.galleyHash)) continue;
       // RENDER can use a retained input directly; it needs no foreground
       // replay merely because its exact pixels have not been requested yet.
-      if (engine.checkpoints.has(k) && (engine.blocks.length + 1 <= engine.maxCheckpoints ||
-          engine.editHold.includes(k) || engine.renderHold.has(k))) continue;
+      if (engine.checkpoints.has(k)) {
+        // The checkpoint in front of the block is still there: hold it for
+        // the render instead of replaying up to the block. An edit keeps
+        // only eight pins, so a page with more blocks than that dropped the
+        // pin of its last ones, and the first keystroke after a caret warm
+        // re-typeset fifteen blocks (0.4 s on the 389-page book) to draw one.
+        if (!(engine.blocks.length + 1 <= engine.maxCheckpoints ||
+            engine.editHold.includes(k) || engine.renderHold.has(k))) {
+          engine.renderHold.set(k, block.id);
+        }
+        continue;
+      }
+      displayReplay.add(k);
       firstDisplay = Math.min(firstDisplay, k);
       lastDisplay = Math.max(lastDisplay, k);
     }
@@ -121,6 +138,8 @@ export async function runUpdateTypesetPhase(engine, {
         };
         preview.cancel = started.cancel;
         preview.release = started.release;
+        // a rescue preview is shown when it lands; the walk never waits on it
+        preview.noWait = !!started.noWait;
         engine.coldPreviewActive = started;
         preview.compile = started.galley.catch(() => null).then((galley) => {
           preview.galley = galley;
@@ -158,7 +177,7 @@ export async function runUpdateTypesetPhase(engine, {
     const previewEtaMs = preview
       ? Math.max(0, (Number(preview.block.typesetCostMs) || 300) + 100 - (performance.now() - preview.startedAt))
       : 0;
-    if (preview && !previewAwaited && atCleanBoundary && i < firstDirty &&
+    if (preview && !preview.noWait && !previewAwaited && atCleanBoundary && i < firstDirty &&
         previewEtaMs < (engine.coldPreviewWaitMs ?? 1000) &&
         costTo(i) - previewEtaMs > (engine.coldPreviewFromMs ?? 500) / 2) {
       previewAwaited = true;
@@ -171,6 +190,51 @@ export async function runUpdateTypesetPhase(engine, {
       if (galley) {
         verdict = 'cold';
         break;
+      }
+    }
+    // A heavy clean block next, with the preview still out, and a budget the
+    // walk would overrun on it (so it stops cold right after it anyway):
+    // stepping it only holds the keystroke, and its replay competes with the
+    // preview's child for the cores. Wait for the preview instead, no longer
+    // than the step would take (by its estimate), then stop cold here either
+    // way: a preview that landed is shown in this reply, one still out gets
+    // the ordinary post-walk wait, and the step is the cold pass's to replay
+    // behind its idle gate (a keystroke then waits for no more than the
+    // rest of it). A failed preview leaves the walk to go on. On the
+    // 316-page book a box replayed for 3.1 s under load while its preview
+    // landed (tex64-internal #104).
+    // Once per block: the next walk that reaches it steps it. In a burst
+    // each keystroke queues behind the last reply, the cold pass never gets
+    // its idle gate, and every keystroke waited at the same boundary while
+    // the walk never moved on (six in a row on the 316-page book).
+    const nextReplayMs = 2 * (Number(engine.blocks[i]?.typesetCostMs) || 0);
+    const heavyMs = engine.coldHeavyStepMs ?? 500;
+    const waitedHere = engine.heavyWaitId != null && engine.heavyWaitId === engine.blocks[i]?.id;
+    if (waitedHere) engine.heavyWaitId = null;
+    if (preview && !preview.noWait && preview.galley === undefined && !coldResume && coldBudgetMs > 0 && !waitedHere &&
+        (engine.coldPreviewWaitMs ?? 1000) > 0 && atCleanBoundary && i < firstDirty && nextReplayMs > heavyMs &&
+        performance.now() - walkStartedAt + nextReplayMs > coldBudgetMs) {
+      const sinceStart = performance.now() - preview.startedAt;
+      const waitMs = Math.min(nextReplayMs, (engine.coldPreviewTimeoutMs ?? 15_000) - sinceStart - 500);
+      if (waitMs > 0) {
+        const waitedAt = performance.now();
+        let timer = null;
+        let poll = null;
+        await Promise.race([
+          preview.compile,
+          new Promise((resolve) => { timer = setTimeout(resolve, waitMs); }),
+          new Promise((resolve) => {
+            poll = setInterval(() => { if (engine.keystrokePending > 0) resolve(); }, 25);
+          }),
+        ]);
+        clearTimeout(timer);
+        clearInterval(poll);
+        if (walkTrace.length < 48) walkTrace.push([i, Math.round(performance.now() - waitedAt), 'w']);
+        if (preview.galley !== null) {
+          engine.heavyWaitId = engine.blocks[i]?.id ?? null;
+          verdict = 'cold';
+          break;
+        }
       }
     }
     // /status liveness marker: which block the foreground pass is on —
@@ -245,8 +309,7 @@ export async function runUpdateTypesetPhase(engine, {
       if (wasClean && !changed && !defEdit && !changedLabels.size && !preview) {
         let next = i;
         while (next < engine.blocks.length && !dirtySource.has(engine.blocks[next].id) &&
-          engine.blocks[next].galley && !(next >= firstDisplay && next <= lastDisplay &&
-            engine.foregroundRenderIds?.has(engine.blocks[next].id) && next !== i)) next++;
+          engine.blocks[next].galley && !displayReplay.has(next)) next++;
         // the nearest kept boundary at or before that block (the walk
         // replays from it up to the dirty block, as from its start)
         let to = Math.min(next, engine.blocks.length - 1);
@@ -317,7 +380,8 @@ export async function runUpdateTypesetPhase(engine, {
     // the resume walk still typesets it in its own lineage and replaces it.
     // Not while a newer keystroke waits for the lock: it carries newer text.
     let timer = null;
-    const galley = preview.galley !== undefined ? preview.galley : engine.keystrokePending > 0 ? null : await Promise.race([
+    const galley = preview.galley !== undefined ? preview.galley
+      : engine.keystrokePending > 0 || preview.noWait ? null : await Promise.race([
       preview.compile,
       new Promise((resolve) => { timer = setTimeout(() => resolve(null), engine.coldPreviewWaitMs ?? 1000); }),
     ]);
@@ -421,10 +485,27 @@ export async function runUpdateTypesetPhase(engine, {
   // shift the toc — iterate like latex reruns would, but per block.
   // Deferred to #chainAfterPass while chain work is pending (page numbers
   // are still moving until the suffix settles).
+  let tocDeferred = false;
+  const tocRuns = !engine.pendingChain;
   for (let pass = 0; pass < 3 && !engine.pendingChain; pass++) {
     const prov = paginateNow();
     const toc = computeToc(prov);
     if (toc.hash === engine.tocHash) break;
+    // An edit whose own pages show no table of contents (a line added in
+    // chapter five moves the headings after it to other pages) leaves it
+    // owed: once the typing is quiet the scheduler queues the settle pass
+    // that runs this same fixed point (background-scheduler.js,
+    // chain-pass.js chainAfterPass). On a 72-page book with a table of
+    // contents it took 0.5 to 3.7 s of the keystroke that added a line, and
+    // every keystroke behind it waited. (Not queued now: chain work pending
+    // in front of the paragraph typed in sends every later keystroke back to
+    // verifying the paragraph after it before it is shown.)
+    if (pass === 0 && deferToc && engine.blocks.some((block) => block.consumesToc) &&
+        !tocShownWithEdit(prov, engine.blocks, dirtySource)) {
+      engine.tocOwed = true;
+      tocDeferred = true;
+      break;
+    }
     engine.tocHash = toc.hash;
     for (const [ext, content] of Object.entries(toc.contents)) {
       writeFileSync(path.join(engine.workDir, `driver.${ext}`), content);
@@ -445,6 +526,7 @@ export async function runUpdateTypesetPhase(engine, {
     }
     if (!anyConsumer) break;
   }
+  if (tocRuns && !tocDeferred) engine.tocOwed = false; // (done here after all)
   timer.lap('toc');
 
   // ---- page-context-sensitive rescues ---------------------------------
@@ -460,4 +542,20 @@ export async function runUpdateTypesetPhase(engine, {
   timer.lap('pagectx');
   Object.assign(engine.lastWalkTrace, { typeset: typesetCount, stop: fgStop, verdict, ms: walkMs });
   engine._typesetResult = { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict, cold };
+}
+
+/** Whether a page that shows a block of `dirtySource` also shows a block that prints the table of contents. */
+function tocShownWithEdit(pages, blocks, dirtySource) {
+  const consumers = new Set(blocks.filter((block) => block.consumesToc).map((block) => block.id));
+  for (const page of pages) {
+    const ids = new Set((page.draw ?? []).map((draw) => draw.u?.blockId).filter(Boolean));
+    let edited = false;
+    let toc = false;
+    for (const id of ids) {
+      edited ||= dirtySource.has(id);
+      toc ||= consumers.has(id);
+    }
+    if (edited && toc) return true;
+  }
+  return false;
 }

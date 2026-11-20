@@ -1,4 +1,5 @@
-import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { importPathTeX } from './subfile.js';
+import { copyFileSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { prepareIsoCompileJob } from './iso-context.js';
 import { readIsoCompileResult } from './iso-result.js';
@@ -6,7 +7,7 @@ import { runColdIsoCompile, runForkIsoCompile } from './iso-runner.js';
 
 export async function isoCompile(
   engine,
-  { block, idx, why, forceCold, rescueCacheKey, needsRescue, awaitRender, isoCompileCold }
+  { block, idx, why, forceCold, rescueCacheKey, needsRescue, awaitRender, isoCompileCold, noCold = false }
 ) {
   // doomed-compile memo: the rescue key carries every input the compile
   // depends on, so a failure repeats deterministically — rethrow instead
@@ -32,13 +33,39 @@ export async function isoCompile(
       needsRescue,
       breakableRe: () => engine._breakableRe,
       packageBreakableRe: () => engine._packageBreakableRe,
-      defsPrelude: engine.defsPatch?.touches(block.text) ? engine.defsPatch.prelude : '',
+      defsPrelude: (engine.defsPatch?.touches(block.text) ? engine.defsPatch.prelude : '') +
+        (block.importDir ? importPathTeX(block.importDir) : ''),
     });
+  // a preview (noCold) never pays a cold compile: no fork runner now, none
+  if (noCold && !ck0) return null;
   engine.isoModeOf?.set(block.id, runner);
   mkdirSync(jobdir, { recursive: true });
   rmSync(pdf, { force: true });
   rmSync(statePath, { force: true });
   writeFileSync(path.join(jobdir, 'iso.tex'), isoTex);
+  // \printindex reads \jobname.ind beside the job: the index canonical made
+  // (engine-v3.js #syncResidentIndex), under both names an isolated run has.
+  // … and a contents list reads \jobname.toc (lof, lot) the same way.
+  if (/\\(?:tableofcontents|listoffigures|listoftables)\b/.test(block.text)) {
+    for (const ext of ['toc', 'lof', 'lot']) {
+      const list = path.join(engine.workDir, `driver.${ext}`);
+      for (const name of [`iso.${ext}`, `driver.${ext}`]) {
+        try {
+          if (existsSync(list)) copyFileSync(list, path.join(jobdir, name));
+          else rmSync(path.join(jobdir, name), { force: true });
+        } catch { /* printed without it, as on a first run */ }
+      }
+    }
+  }
+  if (/\\printindex\b/.test(block.text)) {
+    const index = path.join(engine.workDir, 'driver.ind');
+    for (const name of ['iso.ind', 'driver.ind']) {
+      try {
+        if (existsSync(index)) copyFileSync(index, path.join(jobdir, name));
+        else rmSync(path.join(jobdir, name), { force: true });
+      } catch { /* the block prints without an index, as on a first run */ }
+    }
+  }
   if (ck0) {
     const forked = await runForkIsoCompile(engine, {
       ck0,
@@ -48,7 +75,10 @@ export async function isoCompile(
       isoTex,
       awaitRender,
     });
-    if (!forked) return isoCompileCold();
+    if (!forked) {
+      rmSync(jobdir, { recursive: true, force: true }); // the retry (if any) makes its own
+      return isoCompileCold();
+    }
   } else {
     await runColdIsoCompile(engine, jobdir);
   }
@@ -59,6 +89,7 @@ export async function isoCompile(
     // this block and retry cold, whose verdict is final.
     engine.isoForkBroken.add(block.id);
     engine.diagnostics?.push(`${runner} rescue of ${block.id} left no artifacts — retrying cold`);
+    rmSync(jobdir, { recursive: true, force: true }); // the retry (if any) makes its own
     return isoCompileCold();
   }
   if (!existsSync(pdf) || !existsSync(statePath)) {

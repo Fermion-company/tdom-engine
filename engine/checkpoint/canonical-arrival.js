@@ -240,6 +240,8 @@ export async function verifyAgainstCanonical(engine, info, { applyFidelity, asyn
     }
     if (refidelity) {
       engine.fidelityEpoch++;
+      // an earlier galley's fidelity predates the demotion (#103)
+      for (const block of engine.blocks) block.exactHistory = null;
       asyncRepaginate();
     }
     if (demoted) {

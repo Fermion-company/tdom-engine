@@ -1,3 +1,4 @@
+import { totalmem } from 'node:os';
 import { stripComments } from './safety.js';
 
 // This only chooses a replay frontier; every source token still executes.
@@ -30,12 +31,32 @@ function tailCheckpoint(blocks, limit) {
  * keystroke could be typeset. Each dormant fork costs only the pages the
  * active process has dirtied since, so the ceiling is the memory knob.
  */
-export function checkpointBudgetFor(blockCount, { ceiling = 64, pageCount = null } = {}) {
+/**
+ * How many checkpoints the machine's memory carries for this document.
+ * A checkpoint is a fork; a fork that has run a Lua collection owns its heap
+ * outright, and over a long document every kept checkpoint has. With a
+ * preamble that holds 1 GB live (large CJK fonts, a book's package stack)
+ * twelve checkpoints, as many again for the shipping chain, a canonical
+ * compile and a Build filled a 16 GB Mac with 10 GB of swap and froze it.
+ * A quarter of physical memory is the budget; ordinary documents (100-300 MB
+ * live) never reach it. Fewer checkpoints only lengthen the replay towards a
+ * caret that moved far away.
+ */
+export function memoryCheckpointCeiling(heapFloorKb, { totalBytes = totalmem(), fraction = null } = {}) {
+  const live = Number(heapFloorKb) * 1024;
+  if (!(live > 0)) return Infinity;
+  const share = Number(fraction ?? process.env.TDOM_CHECKPOINT_MEMORY_FRACTION ?? 0.25);
+  if (!(share > 0)) return Infinity;
+  return Math.max(3, Math.floor((Number(totalBytes) * share) / live));
+}
+
+export function checkpointBudgetFor(blockCount, { ceiling = 64, pageCount = null, heapFloorKb = 0, totalBytes = undefined } = {}) {
   const count = Math.max(0, Math.floor(Number(blockCount) || 0));
   const top = Math.max(1, Math.floor(Number(ceiling) || 1));
   const pages = Math.floor(Number(pageCount));
   const pageBudget = Number.isFinite(pages) && pages > 0 ? pages + 1 : Infinity;
-  return Math.max(1, Math.min(top, count + 1, pageBudget));
+  const memory = memoryCheckpointCeiling(heapFloorKb, totalBytes === undefined ? {} : { totalBytes });
+  return Math.max(1, Math.min(top, count + 1, pageBudget, memory));
 }
 
 export function checkpointGrid(blockCount, maxCheckpoints) {

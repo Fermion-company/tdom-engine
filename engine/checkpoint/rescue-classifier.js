@@ -22,8 +22,11 @@ import { stripComments } from './safety.js';
 // algorithm[H] is exempt: an H placement never enters the float queue (it
 // typesets inline like any box), so the fast path already shows it — only
 // FLOATING algorithm blocks need the rescue.
+// \printindex reads an environment the source does not show: theindex is
+// \twocolumn in the standard classes and multicols in most others, pages
+// of it. On the dormant page it came out as one unbroken column set.
 const OUTPUT_HIJACK_RE =
-  /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded|wrapfigure|wraptable|sidewaysfigure|sidewaystable)\}|\\begin\{algorithm\*?\}(?!\[[^\]]*H)|\\begin\{tcolorbox\}\[[^\]]*breakable|\\includepdf\b/;
+  /\\begin\{(multicols\*?|paracol|longtable|landscape|mdframed|framed|shaded|wrapfigure|wraptable|sidewaysfigure|sidewaystable)\}|\\begin\{algorithm\*?\}(?!\[[^\]]*H)|\\begin\{tcolorbox\}\[[^\]]*breakable|\\includepdf\b|\\printindex\b/;
 
 // Ordinary forced breaks are retained by the native output absorb, including
 // material before/after the break. Isolating them loses page context and can
@@ -111,6 +114,43 @@ export function collectBreakableTcolorboxNames(preamble) {
     const options = readBalanced(source, at, '{', '}');
     if (options && /\bbreakable\b(?!\s*=\s*false\b)/.test(options.value)) names.push(name.value);
   }
+  // An environment that only wraps a breakable box splits like one. Books
+  // define their code and example boxes this way when the box needs
+  // arguments a tcolorbox declaration cannot take:
+  //   \NewDocumentEnvironment{codebox}{ O{} }{\begin{tcolorbox}[breakable,...]}{\end{tcolorbox}}
+  // A wrapper of a wrapper is found on the next round.
+  const wrappers =
+    /\\(NewDocumentEnvironment|DeclareDocumentEnvironment|RenewDocumentEnvironment|ProvideDocumentEnvironment|newenvironment|renewenvironment)\*?/g;
+  const opensBreakable = (code) => {
+    for (const open of code.matchAll(/\\(?:begin\s*\{tcolorbox\}|tcolorbox\b)\s*/g)) {
+      const options = readBalanced(code, open.index + open[0].length, '[', ']');
+      if (options && /\bbreakable\b(?!\s*=\s*false\b)/.test(options.value)) return true;
+    }
+    return names.some((known) => code.includes(`\\begin{${known}}`) || new RegExp(`\\\\${known.replace(/[@]/g, '\\$&')}(?![A-Za-z@])`).test(code));
+  };
+  for (let round = 0; round < 3; round++) {
+    const before = names.length;
+    for (const match of source.matchAll(wrappers)) {
+      let at = skipSpace(source, match.index + match[0].length);
+      const name = readBalanced(source, at, '{', '}');
+      if (!name || !/^[A-Za-z@0-9]+$/.test(name.value) || names.includes(name.value)) continue;
+      at = skipSpace(source, name.end);
+      if (/DocumentEnvironment$/.test(match[1])) {
+        const spec = readBalanced(source, at, '{', '}');
+        if (!spec) continue;
+        at = skipSpace(source, spec.end);
+      } else {
+        while (source[at] === '[') {
+          const optional = readBalanced(source, at, '[', ']');
+          if (!optional) break;
+          at = skipSpace(source, optional.end);
+        }
+      }
+      const begin = readBalanced(source, at, '{', '}');
+      if (begin && opensBreakable(begin.value)) names.push(name.value);
+    }
+    if (names.length === before) break;
+  }
   return [...new Set(names)];
 }
 
@@ -170,6 +210,24 @@ const namesRe = (names) => names.length
  * environments the PREAMBLE defines (\newtcolorbox/\newtcbtheorem with
  * a `breakable` option create page-splitting envs under custom names).
  */
+/** True when the document redefines \tableofcontents (or a list of figures or
+ * tables) to set it in columns: `\begin{multicols}{2}\@starttoc{toc}…`. The
+ * source line shows none of it, and on the dormant page a five-page contents
+ * list came out as one page. */
+export function tocTakesRealPage(text) {
+  const source = stripComments(text);
+  const redefinition =
+    /\\(?:RenewDocumentCommand|DeclareDocumentCommand|renewcommand\*?|def|gdef)\s*\{?\s*\\(?:tableofcontents|listoffigures|listoftables)\b/g;
+  for (const match of source.matchAll(redefinition)) {
+    const body = source.slice(match.index, match.index + 2000);
+    const stop = body.search(/\n\s*\n\s*\\(?:RenewDocumentCommand|DeclareDocumentCommand|NewDocumentCommand|renewcommand|newcommand|def)\b/);
+    if (/\\begin\s*\{(?:multicols\*?|paracol)\}|\\twocolumn\b/.test(stop > 0 ? body.slice(0, stop) : body)) return true;
+  }
+  return false;
+}
+
+const TOC_RE = /\\(?:tableofcontents|listoffigures|listoftables)\b/;
+
 export function needsRescue(text, {
   preHash,
   breakableFor,
@@ -178,6 +236,7 @@ export function needsRescue(text, {
   source,
   packageText = () => '',
   structuralSinks = [],
+  tocRealPage = false,
 }) {
   const live = stripComments(text); // `% \begin{longtable}` must not cost a rescue
   const aliasNeedsRescue = structuralSinks.some((sink) => RESCUE_STRUCTURAL_SINKS.has(sink));
@@ -195,9 +254,11 @@ export function needsRescue(text, {
     const packageNames = collectBreakableTcolorboxNames(packageText(pre))
       .filter((name) => !names.includes(name));
     packageBreakableRe = namesRe(packageNames);
+    tocRealPage = tocTakesRealPage(pre) || tocTakesRealPage(packageText(pre));
     breakableFor = preHash;
   }
-  const state = { breakableFor, breakableRe, packageBreakableRe };
+  const state = { breakableFor, breakableRe, packageBreakableRe, tocRealPage };
+  if (tocRealPage && TOC_RE.test(live)) return { needs: true, ...state };
   if (aliasNeedsRescue || OUTPUT_HIJACK_RE.test(live) || TITLE_RE.test(live)) {
     return { needs: true, ...state };
   }

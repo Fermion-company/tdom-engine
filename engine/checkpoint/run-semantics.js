@@ -43,6 +43,32 @@ export function isCertifiedLuaTeXPdfProfile(profile) {
     residentBackendProfileKey(profile) !== null;
 }
 
+// The verdict for the profile asked about last. Every empty rule of a line
+// asks with the same profile (LuaTeX-ja puts one between every two
+// characters), and each one used to build the profile key twice: 0.3 ms of
+// a keystroke on a page of Japanese text. The fields are compared again on
+// every call, so a profile object that changes is judged anew.
+const PROFILE_FIELDS = ['schema', 'engine', 'version', 'revision', 'outputMode', 'capture', 'emptyRuleSubtype', 'format'];
+let judged = null;
+function certifiedProfile(profile) {
+  if (judged && judged.profile === profile && PROFILE_FIELDS.every((field) => judged.fields[field] === profile[field])) {
+    return judged;
+  }
+  if (!profile || typeof profile !== 'object') return null;
+  const certified = isCertifiedLuaTeXPdfProfile(profile);
+  const fields = {};
+  for (const field of PROFILE_FIELDS) fields[field] = profile[field];
+  judged = {
+    profile,
+    fields,
+    certified,
+    layoutOnly: certified
+      ? Object.freeze({ tag: 'LayoutOnly', proof: 'CertifiedEmptyRule', profileKey: residentBackendProfileKey(profile) })
+      : null,
+  };
+  return judged;
+}
+
 /**
  * Pure fail-closed projection from one normalized resident run to its paint
  * semantics.  LayoutOnly still participates in stableRunLayoutRecord(); it
@@ -65,17 +91,12 @@ export function classifyResidentRun(run, profile) {
   if (Number(run.rw) < 0 || Number(run.rh) < 0 || Number(run.rd) < 0 ||
       Number(run.w) < 0 || Number(run.h) < 0) return reject('RUNNING_OR_NEGATIVE_DIMENSION');
   if (typeof run.rdir !== 'string' || typeof run.ra !== 'string') return reject('RULE_SCHEMA_INCOMPLETE');
-  if (!isCertifiedLuaTeXPdfProfile(profile)) return reject('PROFILE_MISMATCH');
+  const verdict = certifiedProfile(profile);
+  if (!verdict?.certified) return reject('PROFILE_MISMATCH');
 
   const subtype = Number(run.rs);
   if (!Number.isInteger(subtype)) return reject('RULE_SUBTYPE_MISSING');
-  if (subtype === Number(profile.emptyRuleSubtype)) {
-    return {
-      tag: 'LayoutOnly',
-      proof: 'CertifiedEmptyRule',
-      profileKey: residentBackendProfileKey(profile),
-    };
-  }
+  if (subtype === Number(profile.emptyRuleSubtype)) return verdict.layoutOnly;
   return {
     tag: 'OtherPaint',
     reason: Number(run.w) === 0 || Number(run.h) === 0

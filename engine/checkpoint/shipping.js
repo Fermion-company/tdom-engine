@@ -28,6 +28,7 @@ import { IMAKEIDX_READ_ONLY, labelCaptureShim } from './tex-templates.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
 import { ensureShim } from './forkshim.js';
 import { distinctCheckpointPeerCount } from './checkpoint-retirement.js';
+import { pdfPageSvgArgs } from './util/svg.js';
 
 const execFileP = promisify(execFile);
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -1265,7 +1266,7 @@ export class ShippingChain {
     // made page N and N+1 overwrite each other before readFileSync, which
     // either cancelled the atomic batch or returned the wrong page.
     const svgPath = path.join(path.dirname(pdf), `driver-ship-g${this.gen}-p${page}.svg`);
-    await execFileP('pdftocairo', ['-svg', '-f', String(page), '-l', String(page), pdf, svgPath], { timeout: 30_000 });
+    await execFileP('pdftocairo', pdfPageSvgArgs(page, pdf, svgPath), { timeout: 30_000 });
     const svg = readFileSync(svgPath, 'utf8');
     this.svgCache.set(key, svg);
     if (this.svgCache.size > 200) {

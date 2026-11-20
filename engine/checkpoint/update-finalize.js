@@ -1,7 +1,8 @@
 import { performance } from 'node:perf_hooks';
 import { reconcile } from './pagebuilder.js';
 import { nextEditHold, editPageRenderIds, focusRescueIds } from './update-helpers.js';
-import { buildPagePatches } from './page-patches.js';
+import { buildPagePatches, EAGER_PAGES } from './page-patches.js';
+import { pageHfSig } from './header-footer.js';
 import { buildUpdateResponse } from './update-response.js';
 import { residentPaintable } from './ship-pacing.js';
 
@@ -21,7 +22,7 @@ export function finalizeUpdate(engine, {
 }) {
   const {
     paginateNow, displayList, scheduleHeaders, enforceCheckpointCap, scheduleBackground,
-    shipUpdate, deferShipUpdate = shipUpdate, fidelitySummary,
+    shipUpdate, deferShipUpdate = shipUpdate, fidelitySummary, pumpOwedPages = () => {},
   } = callbacks;
   const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict, cold = null } = typesetResult;
   // pin the edit locus so the next keystroke is fork-once, typeset-once
@@ -31,7 +32,11 @@ export function finalizeUpdate(engine, {
   const pagesRaw = paginateNow();
   const prevPageCount = engine.pages.length;
   const { pages, reused, rebuilt } = reconcile(pagesRaw, engine.pages);
-  const { patches, dirtyPages } = buildPagePatches(pages, engine.pages, engine.hfSig, displayList);
+  // (the pages nearest the edit now, the others a few at a time afterwards:
+  // page-patches.js EAGER_PAGES. A boot delivers every page.)
+  const { patches, dirtyPages, later } = buildPagePatches(pages, engine.pages, (page) => pageHfSig(engine.hf, page.number), displayList,
+    { limit: rebooted ? Infinity : EAGER_PAGES });
+  if (dirtyPages.length) engine.owedFocus = dirtyPages[0];
   if (!advanceSrcRev) {
     // A cold resume owes the keystroke its page: when another walk already
     // typeset the block and published the page through the async channel,
@@ -46,6 +51,7 @@ export function finalizeUpdate(engine, {
     }
   }
   engine.pages = pages;
+  if (later) pumpOwedPages();
   // the edited pages' own rescues go first (engine #pumpRescues)
   if (!rebooted && dirtySource.size) engine.rescueFocus = focusRescueIds(pages, dirtySource, engine.rescueQueue);
   // header/footer respecification walks every page and hashes the result —

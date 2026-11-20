@@ -7,6 +7,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
@@ -16,19 +17,35 @@ import { resolveProjectInput, withProjectInputs } from './project-inputs.js';
 const execFileP = promisify(execFile);
 
 export function describeExternalBibliography(source, docDir, overlayDir = null) {
-  const clean = collectProjectSource(String(source || ''), docDir, overlayDir);
-  const addResources = [...clean.matchAll(/\\addbibresource\s*(?:\[[^\]]*\]\s*)?\{([^}]+)\}/g)]
-    .map((m) => m[1].trim())
-    .filter(Boolean);
-  const classic = [...clean.matchAll(/\\bibliography\s*\{([^}]+)\}/g)]
-    .flatMap((m) => m[1].split(','))
-    .map((name) => name.trim())
-    .filter(Boolean);
+  const facts = collectProjectFacts(String(source || ''), docDir, overlayDir);
+  const addResources = facts.flatMap((file) => file.addResources);
+  const classic = facts.flatMap((file) => file.classic);
   const kind = addResources.length ? 'biblatex' : classic.length ? 'bibtex' : null;
   if (!kind) return null;
 
   const data = kind === 'biblatex' ? addResources : classic;
-  const style = clean.match(/\\bibliographystyle\s*\{([^}]+)\}/)?.[1]?.trim() || 'plain';
+  const style = facts.find((file) => file.style)?.style || 'plain';
+  const citations = [];
+  for (const file of facts) {
+    for (const key of file.citations) if (!citations.includes(key)) citations.push(key);
+  }
+  const files = data.map((name) => {
+    const withExt = /\.bib$/i.test(name) ? name : `${name}.bib`;
+    return path.resolve(docDir, withExt);
+  });
+  const backend = kind === 'biblatex' && facts.some((file) => file.bibtexBackend) ? 'bibtex' : 'biber';
+  const signature = fnv1a(JSON.stringify({ kind, data, style, citations, backend }));
+  return { kind, data, style, citations, files, backend, signature };
+}
+
+// What one file says about the bibliography and which files it reads in.
+// The description is asked for at every edit, and it used to read and scan
+// every \input and \include file of the project each time (a book of ten
+// chapter files: 3.9 ms of every keystroke; the files of a larger one, more).
+// A file's facts are kept until the file changes (its size or the time it was
+// written: an unsaved overlay is written again at each edit of that file).
+function sourceFacts(text) {
+  const clean = stripComments(text);
   const citations = [];
   for (const m of clean.matchAll(/\\[a-zA-Z]*[cC]ite[a-zA-Z]*\*?\s*(?:\[[^\]]*\]\s*)*\{([^}]+)\}/g)) {
     for (const key of m[1].split(',')) {
@@ -36,32 +53,59 @@ export function describeExternalBibliography(source, docDir, overlayDir = null) 
       if (trimmed && !citations.includes(trimmed)) citations.push(trimmed);
     }
   }
-  const files = data.map((name) => {
-    const withExt = /\.bib$/i.test(name) ? name : `${name}.bib`;
-    return path.resolve(docDir, withExt);
-  });
-  const backend = kind === 'biblatex' && /backend\s*=\s*bibtex\b/i.test(clean) ? 'bibtex' : 'biber';
-  const signature = fnv1a(JSON.stringify({ kind, data, style, citations, backend }));
-  return { kind, data, style, citations, files, backend, signature };
+  return {
+    includes: [...clean.matchAll(/\\(?:input|include)\s*\{([^}]+)\}/g)]
+      .map((m) => m[1].trim())
+      .filter((rel) => rel && !/[\\#{}]/.test(rel)),
+    addResources: [...clean.matchAll(/\\addbibresource\s*(?:\[[^\]]*\]\s*)?\{([^}]+)\}/g)]
+      .map((m) => m[1].trim())
+      .filter(Boolean),
+    classic: [...clean.matchAll(/\\bibliography\s*\{([^}]+)\}/g)]
+      .flatMap((m) => m[1].split(','))
+      .map((name) => name.trim())
+      .filter(Boolean),
+    style: clean.match(/\\bibliographystyle\s*\{([^}]+)\}/)?.[1]?.trim() || null,
+    citations,
+    bibtexBackend: /backend\s*=\s*bibtex\b/i.test(clean),
+  };
 }
 
-function collectProjectSource(source, docDir, overlayDir, seen = new Set(), depth = 0) {
-  const clean = stripComments(source);
-  if (depth >= 8) return clean;
-  const parts = [clean];
-  for (const match of clean.matchAll(/\\(?:input|include)\s*\{([^}]+)\}/g)) {
-    let rel = match[1].trim();
-    if (!rel || /[\\#{}]/.test(rel)) continue;
-    const resolved = resolveProjectInput(rel, { docDir, overlayDir, extensions: ['.tex'] });
-    if (!resolved || seen.has(resolved.actualPath)) continue;
-    seen.add(resolved.actualPath);
-    try {
-      parts.push(collectProjectSource(readFileSync(resolved.readPath, 'utf8'), docDir, overlayDir, seen, depth + 1));
-    } catch {
-      /* TeX reports the missing include; bibliography stays last-good */
+const fileFacts = new Map(); // read path -> { size, mtimeMs, facts }
+let rootFacts = null; // { source, facts } of the root text last described
+
+function factsOfFile(readPath) {
+  const stat = statSync(readPath);
+  const held = fileFacts.get(readPath);
+  if (held && held.size === stat.size && held.mtimeMs === stat.mtimeMs) return held.facts;
+  const facts = sourceFacts(readFileSync(readPath, 'utf8'));
+  if (fileFacts.size >= 2048) fileFacts.clear();
+  fileFacts.set(readPath, { size: stat.size, mtimeMs: stat.mtimeMs, facts });
+  return facts;
+}
+
+/** The facts of the root text and of every file it reads in, in reading order. */
+function collectProjectFacts(source, docDir, overlayDir) {
+  if (rootFacts?.source !== source) rootFacts = { source, facts: sourceFacts(source) };
+  const all = [];
+  const seen = new Set();
+  const visit = (facts, depth) => {
+    all.push(facts);
+    if (depth >= 8) return;
+    for (const rel of facts.includes) {
+      const resolved = resolveProjectInput(rel, { docDir, overlayDir, extensions: ['.tex'] });
+      if (!resolved || seen.has(resolved.actualPath)) continue;
+      seen.add(resolved.actualPath);
+      let child;
+      try {
+        child = factsOfFile(resolved.readPath);
+      } catch {
+        continue; /* TeX reports the missing include; bibliography stays last-good */
+      }
+      visit(child, depth + 1);
     }
-  }
-  return parts.join('\n');
+  };
+  visit(rootFacts.facts, 0);
+  return all;
 }
 
 export async function prepareExternalBibliography({

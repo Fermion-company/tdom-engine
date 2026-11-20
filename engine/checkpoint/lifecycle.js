@@ -1,8 +1,10 @@
 import { rejectWaiter } from './waiters.js';
 import { clearShipPacing } from './ship-pacing.js';
+import { wakeRescues } from './rescue-scheduling.js';
 
 export async function closeEngine(engine) {
   engine.closed = true;
+  wakeRescues(engine);
   engine.bgAbort = true;
   // cancel every outstanding protocol wait (galley/ckpt/render/__hf …):
   // their timers — the header job's is 60s, and failures re-arm queued
@@ -49,4 +51,5 @@ export async function closeEngine(engine) {
   if (engine.server) engine.server.close();
   engine.checkpoints.clear();
   engine.peers.clear();
+  engine.isoPageCache = null;
 }

@@ -37,8 +37,18 @@ export function walkKillPaysOff({ blocks, jobIdx, jobElapsedMs, retainedIdx, min
   // ones (a checkpoint GC: 1.3-3 s for blocks of a few hundred ms under the
   // old 64MB allowance): the edit would wait for most of it
   if (warm && jobElapsedMs >= longStepMs) return true;
-  let lost = Math.max(0, jobElapsedMs);
-  for (let k = Math.max(0, Number.isInteger(retainedIdx) ? retainedIdx : jobIdx); k < jobIdx; k++) lost += replayMs(k);
+  // a step already past twice its measured replay speed is running under
+  // load (swap, a full compile beside it): its remaining time is no longer
+  // estimable from the block's cost, and the edit would wait for all of it
+  // (tex64-internal #103: a keystroke waited 2.0 s behind a 3.2 s step of a
+  // block measured at a fraction of that)
+  // (unless the replay behind it since the last retained boundary is the
+  // larger loss)
+  let behind = 0;
+  for (let k = Math.max(0, Number.isInteger(retainedIdx) ? retainedIdx : jobIdx); k < jobIdx; k++) behind += replayMs(k);
+  const expected = replayMs(jobIdx);
+  if (expected > 0 && jobElapsedMs >= Math.max(longStepMs, 2 * expected) && behind <= jobElapsedMs) return true;
+  let lost = Math.max(0, jobElapsedMs) + behind;
   if (lost < minMs) return true;
   const remaining = replayMs(jobIdx) - jobElapsedMs;
   return remaining > minMs && remaining > lost;

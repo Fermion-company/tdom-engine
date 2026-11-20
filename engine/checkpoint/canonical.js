@@ -19,6 +19,7 @@
 //   - a failed compile (mid-typing syntax errors) keeps the last good
 //     canonical result on screen and reports the TeX error.
 
+import { projectIndexCommand } from './index-tool.js';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -46,6 +47,8 @@ import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-in
 import { pdfEditGlyphs } from './pdf-edit-geometry.js';
 import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
 import { prepareSyncTeXBatchHelper, querySyncTeXRange } from './synctex-batch.js';
+import { parseJumpText, parseJumpTsv, parseJumpRecords, jumpRecords, jumpAnchor, locateJump, indexStartRecords } from './jump-sync.js';
+import { pdfPageSvgArgs } from './util/svg.js';
 
 const execFileP = promisify(execFile);
 const gunzipP = promisify(gunzip);
@@ -81,6 +84,9 @@ const BUILD_LEASE_DEFAULT_MS = 660_000;
 const BUILD_LEASE_MAX_MS = 900_000;
 const SYNCTEX_HELPER_PREPARE_MS = 15_000;
 const INDEX_TOOL_TIMEOUT_MS = 60_000;
+// How long a waiting viewer has to renew its display demand for the revision
+// that replaced the one it demanded (it does so as the update reaches it).
+const DEMAND_RENEW_MS = 500;
 const MUTABLE_COMPILE_ARTIFACT = /(?:^canon\.(?:fls|log|pdf|synctex\.gz)$|\.(?:aux|bcf|blg|idx|ind|ilg|glo|gls|glg|acn|acr|alg|lof|lot|nav|out|run\.xml|snm|toc|vrb)$)/;
 
 export class CanonicalRenderer {
@@ -88,19 +94,25 @@ export class CanonicalRenderer {
     workDir,
     docDir,
     overlayDir = null,
-    // Structured mode: canonical is the AUTHORITY, consumed when the user
-    // is DONE writing for a while or asks for it (export). While a complete
+    // Structured mode: canonical is the AUTHORITY, refreshed after a pause,
+    // at the staleness deadline, or on request (export). While a complete
     // provisional page is available, canonical is a background confirmation
     // pass. If the viewer has to retain an older page, requestDisplay()
     // promotes only that pending source revision to the display cadence.
     // Background cadence:
     //   - no compile yet: debounceMs (fast first baseline, one compile)
-    //   - after that: idleMs of continuous quiet (a real writing pause,
-    //     not a glance at the preview) AND the cost cooldown below.
+    //   - after that: idleMs of quiet OR maxStaleMs since the oldest
+    //     uncompiled edit, AND the cost cooldown below.
     // Opaque mode uses displayDebounceMs (canonical IS the display there).
     debounceMs = Number(process.env.TDOM_CANON_DEBOUNCE ?? 2500),
     idleMs = Number(process.env.TDOM_CANON_IDLE ?? 30_000),
+    maxStaleMs = Number(process.env.TDOM_CANON_MAX_STALE ?? 20_000),
     displayDebounceMs = Number(process.env.TDOM_CANON_DISPLAY_DEBOUNCE ?? 350),
+    // When canonical is the display (opaque mode, a fallback, or a viewer that
+    // demanded a revision), continuous typing must not keep the paper still:
+    // once the paper is this old, a running compile is no longer abandoned
+    // between passes for a newer edit; it lands, and the newer edit follows.
+    displayMaxWaitMs = Number(process.env.TDOM_CANON_DISPLAY_MAX_WAIT ?? 1000),
     residentDisplayState = null,
   }) {
     const resolvedWorkDir = path.resolve(workDir);
@@ -115,7 +127,17 @@ export class CanonicalRenderer {
     this.overlayDir = overlayDir ? existingRealpath(overlayDir) : null;
     this.debounceMs = debounceMs;
     this.idleMs = idleMs;
+    this.maxStaleMs = maxStaleMs;
+    this.authorityStaleSince = null;
     this.displayDebounceMs = displayDebounceMs;
+    this.displayMaxWaitMs = displayMaxWaitMs;
+    // First edit not yet on canonical paper (null once a generation lands).
+    this.displayStaleSince = null;
+    // When a viewer first demanded paper it still has not got. Carried across
+    // edits while each replaced revision was demanded too, so continuous
+    // typing cannot restart the viewer's wait (null once a generation lands,
+    // the viewer paints resident ink, or a revision goes undemanded).
+    this.viewerWaitSince = null;
     this.residentDisplayState = residentDisplayState;
     this.timer = null;
     this.timerDueAt = 0;
@@ -143,8 +165,8 @@ export class CanonicalRenderer {
     this.last = null; // last GOOD compile: {id, rev, srcHash, pdf, pageCount, paper, passes, ms}
     this.lastError = null; // {rev, message}
     // Demand-paced authority (docs/10 §I3): in structured mode the canonical
-    // output normally confirms a completed provisional view after a writing
-    // pause or export. Display demand can promote one pending revision.
+    // output confirms a provisional view after a pause or at its staleness
+    // deadline. Display demand can promote one pending revision.
     // Recompiles are paced by their own cost (a cooldown of
     // cooldownFactor × last compile time), which bounds canonical's CPU duty
     // cycle at ~1/(1+factor). The cap exists only so a pathological compile
@@ -223,8 +245,20 @@ export class CanonicalRenderer {
     void this.prepareSyncTeXHelper();
   }
 
+  // The hash walks the whole root source. A keystroke asked for it twice
+  // (is the last generation the compile of this text? is the job that runs
+  // one of this text?): 4 ms of a keystroke in an 800 KB single file, and
+  // more with every page. Both questions are answered without it when the
+  // answer cannot be yes: a text of another length is not the text that was
+  // hashed (the lengths are kept with the hashes), and a job of another
+  // revision is not asked about at all (schedule).
   #sourceHash(source, inputEpoch = this.inputEpoch) {
-    return fnv1a(`${inputEpoch}\0${source}`);
+    const hash = fnv1a(`${inputEpoch}\0${source}`);
+    this.hashedLengths ??= new Map();
+    this.hashedLengths.delete(hash);
+    this.hashedLengths.set(hash, source.length);
+    if (this.hashedLengths.size > 64) this.hashedLengths.delete(this.hashedLengths.keys().next().value);
+    return hash;
   }
 
   compilationIdentity(source) {
@@ -343,6 +377,8 @@ export class CanonicalRenderer {
   /** True when `generation` is the exact compile of `source` under the current inputs. */
   #generationCurrent(generation, source) {
     if (!generation || typeof source !== 'string') return false;
+    const hashedLength = this.hashedLengths?.get(generation.srcHash);
+    if (hashedLength !== undefined && hashedLength !== source.length) return false;
     if (generation.srcHash !== this.#sourceHash(source, generation.inputEpoch)) return false;
     if (generation.inputEpoch === this.inputEpoch) return true;
     return this.#inputsUnchangedSince(generation);
@@ -370,6 +406,9 @@ export class CanonicalRenderer {
     const job = this.pendingJob;
     this.pendingJob = null;
     this.lastError = null;
+    this.displayStaleSince = null;
+    this.viewerWaitSince = null;
+    this.authorityStaleSince = null;
     if (job) this.#clearDisplayDemand(job);
     try {
       this.onResult?.(this.info());
@@ -573,7 +612,18 @@ export class CanonicalRenderer {
     this.generations.set(generation.id, generation);
     // An export snapshot that a rebind overtook is retained for its caller
     // but never promoted: canonical must not move to an older revision.
-    if (promote) this.last = generation;
+    if (promote) {
+      this.last = generation;
+      this.displayStaleSince = null;
+      // Edits queued during this compile still owe paper. Keep the first
+      // one's age, not the latest keystroke's or the compile's finish time.
+      this.authorityStaleSince = this.pendingJob &&
+        (this.pendingJob.rev > generation.rev || this.pendingJob.inputEpoch > generation.inputEpoch)
+        ? (this.pendingJob.staleSince ?? this.pendingJob.scheduledAt) : null;
+      // The paper just moved. A viewer still demanding the newer pending
+      // revision waits for that one from now.
+      this.viewerWaitSince = this.#hasDisplayDemand(this.pendingJob) ? Date.now() : null;
+    }
     while (this.generations.size > GENERATION_MAX) {
       const oldestId = this.generations.keys().next().value;
       const oldest = this.generations.get(oldestId);
@@ -586,6 +636,9 @@ export class CanonicalRenderer {
     for (const generation of this.generations.values()) this.#retireGeneration(generation);
     this.generations.clear();
     this.last = null;
+    this.displayStaleSince = null;
+    this.authorityStaleSince = null;
+    this.viewerWaitSince = null;
     this.svgCache.clear();
     this.svgInFlight.clear();
     this.textCache.clear();
@@ -652,7 +705,9 @@ export class CanonicalRenderer {
     if (p.child) {
       if (authority) {
         this.authorityChildren.add(p.child);
-        if (this.buildLease || Date.now() < this.authorityPausedUntil) this.#pauseAuthorityChild(p.child);
+        if (this.buildLease || (Date.now() < this.authorityPausedUntil && this.#authorityStaleIn() > 0)) {
+          this.#pauseAuthorityChild(p.child);
+        }
       } else if (buildHeavy) {
         this.buildHeavyChildren.add(p.child);
         if (this.buildLease) this.#pauseBuildHeavyChild(p.child);
@@ -705,7 +760,7 @@ export class CanonicalRenderer {
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = null;
     if (this.buildLease) return;
-    const remaining = this.authorityPausedUntil - Date.now();
+    const remaining = Math.min(this.authorityPausedUntil - Date.now(), this.#authorityStaleIn());
     if (remaining > 0) {
       this.authorityResumeTimer = setTimeout(() => this.#resumeAuthority(), remaining);
       this.authorityResumeTimer.unref?.();
@@ -735,9 +790,14 @@ export class CanonicalRenderer {
    */
   deferAuthority(delayMs) {
     if (this.disposed || this.pressure !== 'authority') return false;
-    const delay = Math.max(0, Number(delayMs) || 0);
+    const staleIn = this.#authorityStaleIn();
+    if (staleIn <= 0) {
+      this.#resumeAuthority();
+      return false;
+    }
+    const delay = Math.min(Math.max(0, Number(delayMs) || 0), staleIn);
     if (!delay) return false;
-    this.authorityPausedUntil = Math.max(this.authorityPausedUntil, Date.now() + delay);
+    this.authorityPausedUntil = Math.min(Math.max(this.authorityPausedUntil, Date.now() + delay), Date.now() + staleIn);
     for (const child of this.authorityChildren) this.#pauseAuthorityChild(child);
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = setTimeout(() => this.#resumeAuthority(), delay);
@@ -899,7 +959,7 @@ export class CanonicalRenderer {
     const allowedSeeds = {};
     let seedBytes = 0;
     for (const [ext, content] of Object.entries(seedFiles ?? {})) {
-      if (!['aux', 'toc', 'lof', 'lot', 'out'].includes(ext) || typeof content !== 'string') continue;
+      if (!['aux', 'toc', 'lof', 'lot', 'out', 'ind'].includes(ext) || typeof content !== 'string') continue;
       seedBytes += Buffer.byteLength(content);
       if (seedBytes > 32 * 1024 * 1024) throw new Error('Build aux seed limit exceeded');
       allowedSeeds[ext] = content;
@@ -1091,6 +1151,7 @@ export class CanonicalRenderer {
       fallbackReason: this.pendingJob?.fallbackReason ?? this.runningJob?.fallbackReason ?? null,
       scheduledInMs: this.timer ? Math.max(0, this.timerDueAt - Date.now()) : null,
       displayDemandRev: this.displayDemand?.rev ?? null,
+      viewerWaitingMs: this.viewerWaitSince === null ? null : Date.now() - this.viewerWaitSince,
       error: this.lastError?.message ?? null,
       errorRev: this.lastError?.rev ?? 0,
       syncWarnings: this.last?.syncWarnings ?? [],
@@ -1130,11 +1191,13 @@ export class CanonicalRenderer {
     // A Build lease is exempt: the Build import owns the pending job it
     // creates here (commitBuildGeneration), whatever is already running.
     // A baseline that already failed for these bytes is not compiled again.
-    const srcHash = this.#sourceHash(source);
-    if (!this.buildLease && !this.pendingJob && (
-      this.runningJob?.rev === rev && this.runningJob.srcHash === srcHash ||
-      !this.running && this.lastError?.rev === rev && this.lastError.srcHash === srcHash
-    )) return;
+    // (the hash only when a job of this very revision runs or failed)
+    const sameRunning = this.runningJob?.rev === rev;
+    const sameFailed = !this.running && this.lastError?.rev === rev;
+    if (!this.buildLease && !this.pendingJob && (sameRunning || sameFailed)) {
+      const srcHash = this.#sourceHash(source);
+      if (sameRunning && this.runningJob.srcHash === srcHash || sameFailed && this.lastError.srcHash === srcHash) return;
+    }
     const waiting = this.pendingJob;
     if (!this.buildLease && waiting && this.timer && waiting.rev === rev && waiting.inputEpoch === this.inputEpoch &&
         waiting.source === source) {
@@ -1142,12 +1205,44 @@ export class CanonicalRenderer {
       this.#armPending(this.delayFor(waiting), { keepEarlier: true });
       return;
     }
-    this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: Date.now(), fallbackReason };
+    // A viewer that demanded the revision this edit replaces is still waiting
+    // for paper; one that let that revision pass undemanded painted it itself.
+    if (waiting && !this.#hasDisplayDemand(waiting)) this.viewerWaitSince = null;
+    const now = Date.now();
+    this.pendingJob = { source, rev, inputEpoch: this.inputEpoch, scheduledAt: now,
+      staleSince: waiting?.staleSince ?? now, fallbackReason };
+    this.authorityStaleSince ??= now;
+    this.displayStaleSince ??= Date.now();
     if (this.coldBaselineCatchup && !this.#hasColdBaselineCatchup(this.pendingJob)) {
       this.coldBaselineCatchup = null;
     }
     if (!this.#hasDisplayDemand(this.pendingJob)) this.displayDemand = null;
-    this.#armPending(this.delayFor());
+    // Authority re-arms the idle gate, but never the oldest edit's deadline.
+    // When canonical is the display, re-arming on every keystroke starved it:
+    // typing faster than displayDebounceMs never let a compile start, so the
+    // paper only moved once the hands stopped. Keep the earliest due time;
+    // the newest pending source is what the timer compiles when it fires.
+    // A viewer waiting on demanded paper is the same case in authority mode:
+    // each keystroke reset the idle gate before its demand came back, so a
+    // page that needed canonical never got it while typing went on.
+    const displayCadence = this.pressure !== 'authority' || Boolean(fallbackReason) ||
+      this.viewerWaitSince !== null;
+    this.#armPending(this.delayFor(), { keepEarlier: displayCadence });
+  }
+
+  /** The display paper has waited past displayMaxWaitMs for canonical. */
+  #displayStarved() {
+    // In authority mode only a waiting viewer makes the paper due, and its
+    // wait, not the first edit, is what has gone on too long.
+    const since = this.pressure === 'authority' ? this.viewerWaitSince : this.displayStaleSince;
+    return since !== null && Date.now() - since >= this.displayMaxWaitMs;
+  }
+
+  #authorityStaleIn() {
+    const job = this.pendingJob ?? this.runningJob;
+    if (this.pressure !== 'authority' || job?.fallbackReason || this.#hasDisplayDemand(job) ||
+        this.authorityStaleSince === null) return Infinity;
+    return this.maxStaleMs - (Date.now() - this.authorityStaleSince);
   }
 
   /** Promote existing work while one or more viewers cannot present this revision. */
@@ -1192,6 +1287,7 @@ export class CanonicalRenderer {
     this.activeDisplayDemandIds.add(demandId);
     if (residentImpossible) this.residentImpossibleDemandIds.add(demandId);
     this.displayDemand = { rev, inputEpoch: job.inputEpoch };
+    this.viewerWaitSince ??= Date.now();
     this.#armPending(this.delayFor(job), { keepEarlier: true });
     return { accepted: true, duplicate: false };
   }
@@ -1209,6 +1305,7 @@ export class CanonicalRenderer {
     this.residentImpossibleDemandIds.delete(demandId);
     if (this.activeDisplayDemandIds.size) return { released: true, pendingViewers: this.activeDisplayDemandIds.size };
     this.displayDemand = null;
+    this.viewerWaitSince = null;
     // Preserve the last edit's idle deadline. Never cancel a running compile
     // or create another job; a prior revision may be running independently.
     if (this.pressure === 'authority') this.#armPending(this.delayFor(job, { preserveIdleStart: true }));
@@ -1257,9 +1354,9 @@ export class CanonicalRenderer {
    * Delay before the next compile may start, measured from the LAST edit
    * (schedule() re-arms the timer on every edit, so this is an idle gate).
    * Authority (structured) mode: one fast baseline compile per document,
-   * then nothing until the user has been quiet for idleMs AND the
-   * cost-proportional cooldown has passed — active writing never pays a
-   * full compile. Opaque mode and a revision explicitly needed for display
+   * then idleMs of quiet OR maxStaleMs since the oldest uncompiled edit,
+   * always behind the cost-proportional cooldown. Opaque mode and a revision
+   * explicitly needed for display
    * use a short debounce plus a half-duty cost cooldown. Public for tests.
    */
   delayFor(job = this.pendingJob, { preserveIdleStart = false } = {}) {
@@ -1283,9 +1380,10 @@ export class CanonicalRenderer {
     }
     const elapsed = preserveIdleStart && Number.isFinite(job?.scheduledAt)
       ? Math.max(0, Date.now() - job.scheduledAt) : 0;
-    if (!this.last?.ms) return Math.max(0, this.debounceMs - elapsed); // fast first baseline
+    const stale = this.#authorityStaleIn();
+    if (!this.last?.ms) return Math.max(0, Math.min(this.debounceMs - elapsed, stale)); // fast first baseline
     const cooldown = Math.min(this.last.ms * this.cooldownFactor, this.cooldownCapMs);
-    return Math.max(0, this.idleMs - elapsed, cooldown - since);
+    return Math.max(0, Math.min(this.idleMs - elapsed, stale), cooldown - since);
   }
 
   /**
@@ -1363,9 +1461,28 @@ export class CanonicalRenderer {
     if (!this.pendingJob) return;
     if (this.buildLease) return;
     const job = this.pendingJob;
+    // Every keystroke renews the shipping foreground lease, so while typing
+    // goes on it never ends. Once the viewer has waited past
+    // displayMaxWaitMs the replay has had its chance and the paper is still
+    // missing: the demanded compile stops yielding to it.
     if (this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
-        Date.now() < this.authorityPausedUntil) {
+        Date.now() < this.authorityPausedUntil && !this.#displayStarved()) {
       this.#armPending(this.authorityPausedUntil - Date.now());
+      return;
+    }
+    if (waitForResident && !job.fallbackReason && this.pressure === 'authority' && !this.#hasDisplayDemand(job) &&
+        this.viewerWaitSince !== null) {
+      // The timer was kept for a viewer that demanded the revision this one
+      // replaced. It renews the demand as soon as this revision's pages reach
+      // it; without a renewal it painted them itself, and the job is ordinary
+      // authority work again.
+      const renew = job.scheduledAt + DEMAND_RENEW_MS - Date.now();
+      if (renew > 0) {
+        this.#armPending(Math.min(25, renew));
+        return;
+      }
+      this.viewerWaitSince = null;
+      this.#armPending(this.delayFor(job, { preserveIdleStart: true }));
       return;
     }
     if (waitForResident && !job.fallbackReason && this.pressure === 'authority' && this.#hasDisplayDemand(job) &&
@@ -1374,7 +1491,9 @@ export class CanonicalRenderer {
       // Give only this foreground cohort a bounded chance to supply exact
       // pixels, then allow its viewer's fulfillment to arrive. Cold queues,
       // isolated fallback, export/settle and canonical-only work never wait.
-      const remaining = job.scheduledAt + 2000 - Date.now();
+      // The bound runs from when the viewer began waiting: measured from each
+      // newest edit, typing faster than it renewed the chance forever.
+      const remaining = Math.min(job.scheduledAt, this.viewerWaitSince ?? Infinity) + 2000 - Date.now();
       const ack = Number.isFinite(state?.settledAt) ? state.settledAt + 500 - Date.now() : 0;
       const wait = state?.pending ? Math.min(25, remaining) : Math.min(ack, remaining);
       if (wait > 0) {
@@ -1423,6 +1542,22 @@ export class CanonicalRenderer {
         if (this.buildLease && job.inputEpoch === this.inputEpoch &&
             (!this.pendingJob || this.pendingJob.rev <= job.rev)) {
           this.pendingJob = job;
+        } else if (/^Command failed/.test(this.lastError.message) && this.killedRetryRev !== job.rev &&
+            !this.disposed && job.inputEpoch === this.inputEpoch &&
+            (!this.pendingJob || this.pendingJob.rev <= job.rev)) {
+          // The compile was ended from outside and TeX reported nothing (a
+          // Build that took over, a busy machine). Nothing else would start
+          // it again before the next edit, and until then the document has no
+          // canonical page: Live stayed behind the Build PDF. Once per revision.
+          this.killedRetryRev = job.rev;
+          this.pendingJob = job;
+          clearTimeout(this.timer);
+          this.timerDueAt = Date.now() + 2000;
+          this.timer = setTimeout(() => {
+            this.timer = null;
+            this.timerDueAt = 0;
+            this.#drain({ waitForResident: true });
+          }, 2000);
         }
       })
       .finally(() => {
@@ -1455,7 +1590,13 @@ export class CanonicalRenderer {
           source: this.pendingJob.source,
         };
       }
-      if (!this.timer) this.#armPending(this.delayFor(this.pendingJob));
+      // A timer armed during the compile used the previous compile's cost
+      // and end time. Rebase ordinary authority work onto the new cooldown.
+      const authority = this.pressure === 'authority' && !this.pendingJob.fallbackReason &&
+        !this.#hasDisplayDemand(this.pendingJob) && this.viewerWaitSince === null;
+      if (authority || !this.timer) {
+        this.#armPending(this.delayFor(this.pendingJob, { preserveIdleStart: authority }));
+      }
     }
   }
 
@@ -1519,7 +1660,8 @@ export class CanonicalRenderer {
       if (!changed) break;
       // Another pass of an obsolete snapshot only delays the revision the
       // viewer is waiting for. The first baseline is exempt (#compileObsolete).
-      if (superseding && this.#compileObsolete(rev, { pending: true })) throw superseded();
+      if (superseding && this.#compileObsolete(rev, { pending: true }) && !this.#displayStarved() &&
+          !(background && this.#authorityStaleIn() <= 0)) throw superseded();
     }
     // A rebind made a newer revision current while this snapshot compiled:
     // publishing it would move canonical backwards. Scheduled work stops
@@ -1621,13 +1763,16 @@ export class CanonicalRenderer {
       const key = fnv1a(readText(idx) ?? '');
       if (this.indexToolKeys.get(ind) === key && existsSync(ind)) continue;
       const before = readText(ind);
-      const args = ['-q', '-o', path.basename(ind), path.basename(idx)];
+      // the project's own processor and style when its latexmkrc names one
+      const project = projectIndexCommand(this.docDir, idx, ind);
+      const tool = project?.command ?? 'makeindex';
+      const args = project?.args ?? ['-q', '-o', path.basename(ind), path.basename(idx)];
       try {
         await this.#exec(
-          background ? 'nice' : 'makeindex',
-          background ? ['-n', String(niceLevel), 'makeindex', ...args] : args,
+          background ? 'nice' : tool,
+          background ? ['-n', String(niceLevel), tool, ...args] : args,
           {
-            cwd: path.dirname(idx),
+            cwd: project?.cwd ?? path.dirname(idx),
             timeout: INDEX_TOOL_TIMEOUT_MS,
             maxBuffer: 16 * 1024 * 1024,
             env: withProjectInputs(process.env, { docDir: this.docDir, overlayDir: this.overlayDir, recursive: true }),
@@ -1667,7 +1812,11 @@ export class CanonicalRenderer {
         args,
         {
           cwd: this.docDir,
-          timeout: Number(process.env.TDOM_CANON_TIMEOUT || 300_000),
+          // One pass of a 389-page book takes about three minutes alone and
+          // longer at background priority beside the resident boot; at five
+          // minutes it was killed every time and the document never got a
+          // canonical page (Live stayed off for the whole session).
+          timeout: Number(process.env.TDOM_CANON_TIMEOUT || 900_000),
           maxBuffer: 64 * 1024 * 1024,
           env: withProjectInputs(process.env, {
             docDir: this.docDir,
@@ -1971,6 +2120,74 @@ export class CanonicalRenderer {
     }
   }
 
+  /** Jump never compiles or relabels an old PDF as the editor's revision.
+   * Its lazy index is owned (and retired) by the immutable generation. */
+  async jumpToSource({ file, line, source, rootSource = source, rev } = {}) {
+    if (!file || !Number.isInteger(line) || line < 1 || typeof source !== 'string') return null;
+    const cur = this.#acquireGeneration(null);
+    if (!cur) return null;
+    try {
+      const current = () => cur.rev === rev && this.sourceMatches(rootSource, cur.id);
+      if (!current() || !cur.synctex) return null;
+      const syncFile = existingRealpath(file);
+      if (syncFile === path.join(this.workDir, 'canon.tex')) {
+        if (source !== rootSource) return null;
+      } else if (cur.inputManifest?.get(this.#inputIdentity(syncFile)) !==
+          createHash('sha256').update(source).digest('hex')) return null;
+      cur.jumpIndex ??= (async () => {
+        const textOptions = { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 };
+        const [compressed, rows] = await Promise.all([
+          readFile(cur.synctex),
+          this.#exec('pdftotext', ['-bbox-layout', cur.pdf, '-'], textOptions).then(result => parseJumpText(result.stdout))
+            .catch(async () => parseJumpTsv((await this.#exec('pdftotext', ['-tsv', cur.pdf, '-'], textOptions)).stdout)),
+        ]);
+        if (compressed.length > 8 * 1024 * 1024) return null;
+        const sync = await gunzipP(compressed, { maxOutputLength: 256 * 1024 * 1024 });
+        return { rows, records: parseJumpRecords(sync.toString('utf8'), this.workDir) };
+      })().catch(() => null);
+      const index = await cur.jumpIndex;
+      if (!index || !current()) return null;
+      const lines = source.split(/\r?\n/);
+      if (/\\printindex\b/.test(String(lines[line - 1] ?? '').replace(/(^|[^\\])%.*$/, '$1'))) {
+        // the line that prints the index: where the index starts
+        const start = indexStartRecords(index.records);
+        if (start.length) {
+          const transform = await this.#syncContentTransform(cur, start[0].page);
+          const shown = !transform ? [] : start.map(record =>
+            syncTeXResultToDisplayed(record, cur.papers?.[record.page - 1], transform)).filter(record => record.box);
+          const top = shown.reduce((best, record) => (!best || record.box.top < best.box.top ? record : best), null);
+          if (top && current()) return { page: top.page, boxes: [top.box], id: cur.id, srcRev: rev, line };
+        }
+      }
+      let anchor = jumpAnchor(lines, line);
+      const input = this.#syncInputPath(cur, syncFile);
+      const ownRaw = anchor.line !== line ? jumpRecords(index.records, input, line) : [];
+      const raw = jumpRecords(index.records, input, anchor.line);
+      const transforms = new Map();
+      await Promise.all([...new Set([...raw, ...ownRaw].map(r => r.page))].map(async page => {
+        transforms.set(page, await this.#syncContentTransform(cur, page));
+      }));
+      const displayed = records => records.flatMap(record => {
+        const transform = transforms.get(record.page);
+        if (!transform) return [];
+        const box = record.box ?? { left: record.x, right: record.x, top: record.y, bottom: record.y };
+        return [{ ...record, ...syncTeXResultToDisplayed({ ...record, box }, cur.papers?.[record.page - 1], transform) }];
+      });
+      // Opening/rule lines can carry their own title, caption or table row.
+      // Only an inkless line borrows the neighbouring source anchor.
+      let hit = anchor.line !== line && locateJump(index.rows, lines[line - 1] ?? '', displayed(ownRaw), false, true);
+      if (hit) anchor = { line, toEnd: false };
+      else hit = locateJump(index.rows, lines[anchor.line - 1] ?? '', displayed(raw), anchor.toEnd);
+      if (!hit) {
+        const candidates = await this.forwardSyncAll({ file: syncFile, line: anchor.line, column: 1, id: cur.id });
+        hit = locateJump(index.rows, lines[anchor.line - 1] ?? '', candidates.map(c => ({ ...c, ink: true })), anchor.toEnd);
+      }
+      return current() && hit ? { ...hit, id: cur.id, srcRev: rev, line: anchor.line } : null;
+    } finally {
+      this.#releaseGeneration(cur);
+    }
+  }
+
   async sourceEditBoxes({ file, page, startLine, endLine, id } = {}) {
     if (!file || ![page, startLine, endLine, id].every(Number.isInteger) ||
         page < 1 || startLine < 1 || endLine < startLine || endLine - startLine > 512) return null;
@@ -1985,7 +2202,7 @@ export class CanonicalRenderer {
         job = (async () => {
           const compressed = await readFile(cur.synctex);
           if (compressed.length > 8 * 1024 * 1024) return null;
-          const text = await gunzipP(compressed, { maxOutputLength: 32 * 1024 * 1024 });
+          const text = await gunzipP(compressed, { maxOutputLength: 256 * 1024 * 1024 });
           const boxes = parseSyncTeXSourceBoxes(text.toString('utf8'), {
             file: this.#syncInputPath(cur, file), page, startLine, endLine,
           });
@@ -2163,7 +2380,7 @@ export class CanonicalRenderer {
     let job;
     job = (async () => {
       try {
-        await this.#exec('pdftocairo', ['-svg', '-f', String(n), '-l', String(n), generation.pdf, out], {
+        await this.#exec('pdftocairo', pdfPageSvgArgs(n, generation.pdf, out), {
           timeout: 60_000,
         });
         const svg = readFileSync(out, 'utf8');

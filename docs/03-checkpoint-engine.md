@@ -9,7 +9,7 @@
 | `engine/checkpoint/engine-v3.js` | Node.js 側の orchestration。差分 block、checkpoint、page build、exact chunk、opaque/canonical 連携を扱う |
 | `engine/checkpoint/daemon.lua` | resident `lualatex` 内で動く Lua daemon。JOB/RENDER を受け、real MVL と metadata を返す |
 | `engine/checkpoint/tdomfork.c` | LuaTeX から POSIX `fork()` / `_exit()` / `waitpid()` などを呼ぶ C shim |
-| `engine/checkpoint/forkshim.js` | `tdomfork.c` を workDir に build する helper |
+| `engine/checkpoint/forkshim.js` / `forkshim-probe.lua` | 同梱・キャッシュ shim の検査と、必要時の build |
 | `engine/checkpoint/pagebuilder.js` | 収穫した node stream からページを組む JavaScript page builder |
 | `engine/checkpoint/canonical.js` | full `lualatex` の正本 compile と PDF/SVG/text 取得 |
 | `engine/checkpoint/shipping.js` / `shipd.lua` | `TDOM_SHIP=1` で動く任意の増分 canonical 経路 |
@@ -23,6 +23,26 @@
 ShippingChain は root bytes に加えて、現在の静的 expander が実際に読んだ project input の logical path・bytes・read order を revision snapshot に固定する。過去の include cache は snapshot/mirror に持ち込まない。既知の単一 brace-literal `\input` の plain-text 変更だけは、その input を読む root feed unit より前の page checkpoint から再開する。chain 専用 mirror が同じ logical path を immutable bytes で shadow し、変更前 child の input buffer を持つ unit 内 checkpoint は再利用しない。root と child の両方に既存の replay safety profile を適用する。未知 reader、`\include`、複数・削除・構造変更は baseline/canonical へ戻し、旧 shipping generation を新 `srcRev` に付け替えない。
 
 編集 wave の通常期限は700msである。直近 canonical の実測時間より500ms以上短い場合だけ最大3000msまで延長し、その表示猶予中は display-demand canonical を開始しない。これにより遅い ship と全文 compile を同時に走らせず、ship が拒否された時点では待機を即解除する。完全PDFの検証、ページ数、出力manifest、source snapshotの各 gateは期限を延長しても省略しない。
+
+`ensureShim` は `engine/checkpoint/prebuilt/tdomfork-<platform>-<arch>.so`、workDir の
+`tdomfork.so`、ローカル `cc` の順に試す。同梱版とキャッシュは隣の `.so.sha256` が
+現在の `tdomfork.c` の SHA-256 と一致することを確認する。どの経路でも
+`lualatex --luaonly forkshim-probe.lua <library>` でロードと全 API（`flush` を含む）を
+検査する。同梱版は workDir の一時ファイルにも検査を行い、検査済みのバイナリだけを
+rename してから stamp を書く。壊れたキャッシュは削除する。同一 workDir の同時取得は合流する。
+
+macOS の runtime build は通常の環境で失敗した場合、`xcrun --sdk macosx --show-sdk-path`、
+`xcode-select -p` 配下の MacOSX SDK、CommandLineTools の versioned SDK（新しい順）を試す。
+明示的な `SDKROOT` がある場合はその選択だけを使う。全体60秒、コンパイル1回15秒、
+SDK探索1回2秒、ロード検査1回5秒を上限とし、各試行をログに残す。
+`buildPrebuiltShim` は配布ビルド用の入口で、指定された platform/arch のバイナリと source stamp を作る。
+macOS 配布用の deployment target は既定11.0（明示指定を優先）とし、runner の OS バージョンに依存させない。
+ビルド環境には TeX を要求せず、利用前のロード検査は実際に使う LuaTeX で行う。
+
+shim 取得失敗は `TDOM_SHIM_UNAVAILABLE` と試行結果を持つ例外になる。
+`GET /status` の `structuredBootError` は成功時・文書再オープン時に `null`、boot 失敗時に
+`{ code, message }`（shim 失敗では `platform`, `arch`, `sourceHash`, `attempts` も含む）を返す。
+失敗後は従来どおり opaque 表示を続け、再オープンで structured boot を再試行する。
 
 ## 3.2 プロセスモデル
 
@@ -113,6 +133,15 @@ large math glyph、OpenType math、PUA/unencoded glyph、PDF literal などは d
 
 resident RENDER / CAPTURE と isolated RENDER の PDF は、TeX の論理幅の左右に元の用紙幅だけ余白を持つ。`render-padding.txt` の実測余白を chunk の `xBp` と画像幅へ反映し、文字原点と sourcebox の論理幅を保つ。負の x 座標に描く枠線も PDF 化の時点で失われず、最終的な表示範囲は物理ページが切り取る。
 
+### 3.5a dormant page の積算を block ごとに戻す
+
+resident の TeX は、どの block も高さ `\maxdimen` の 1 枚の page（dormant page）の上で組む。組んだ node は block ごとに取り出す（`harvest_nodes`）が、page builder が持つ積算（`\pagetotal` など page_so_far の一族）は TeX が自分では戻さない（page が「空」に戻らないので `freeze_page_specs` が走らない）。
+
+- `daemon.lua` は取り出しのたびにこの一族を 0 に戻す（`reseed_page`）。**Lua からの代入は効かない**。`tex.pagetotal = 0` は error にならず、何も変えない（LuaTeX 1.24: box 2 つ、代入、box 1 つのあと `\pagetotal` は 3 つ分を返す）。以前はこの代入だけだったので、積算は系統の全 block で増え続けていた。
+- 積算が `\maxdimen`（16383 pt。11 pt の本文で 933 行、約 23 ページ）に達すると、page builder が段落の途中で発火し、absorb が文書に無い eject の印を galley に入れる。自前の改ページの無い流れがそれより長い文書は、23 ページごとに 10 行短いページができていた（2,600 段落の 1 ファイル: LuaLaTeX の 191 ページに対して 193 ページ。page 数が違うので viewer は resident のページを出さない。400 段落: 同じ 30 ページだが 23 ページ目から割り付けが違う）。`\clearpage` のある文書（章ごとに改ページする本）は、そこで積算が切れるので当たらなかった。
+- 今は TeX 自身の代入で戻す（`reset_page_so_far`: `\pagetotal=0pt` ほかを 1 度だけ定義した macro に入れ、`tex.runtoks` で実行する。その時点の catcode に左右されない）。`TDOM_NO_PAGE_RESET=1` で以前の動作。
+- 確認: 2,600 段落の文書で resident の 191 ページすべての先頭行が LuaLaTeX の PDF と一致。`tests/long-flow.test.js`（400 pt の block 60 個: resident のページ数が LuaLaTeX と同じで eject の印が無い。戻さないと 30 個目より後の block に印が付く）。
+
 ## 3.6 `#updateInner()` の現行順序
 
 `open()`、`edit()`、`refresh()` は最終的に `#updateInner()` に入る。現在の大きな流れは次である。
@@ -131,6 +160,8 @@ resident RENDER / CAPTURE と isolated RENDER の PDF は、TeX の論理幅の�
 12. header/footer job を schedule する。
 13. dirty block の high-fidelity render と deferred chain を schedule する。
 14. `canonical.schedule(source, srcRev)` で正本 compile を予約する。
+
+beamer class は frame ごとに実ページ高と output routine を使うため、dormant galley のページ割りを表示できない。safety gate は `shipping-exact` 表示を選び、編集時は直前の canonical slides を保持する。差し替えには完成した Shipping 出力、または新しい canonical を使う。
 
 structured safety は raw 本文だけでは判定しない。preamble と展開済み project body にある
 ローカル定義（`newcommand` / primitive `def` / `let` / `newenvironment` / xparse 系）を軽量 lexer で読み、
@@ -173,7 +204,7 @@ warm/rescue の組版結果が同一でも、chunkの版が変わった場合は
 
 `/warm` は `offset` と任意の `filePath` を受け取り、そのソースファイルに属する block の前後を保持する。子ファイルの offset は子ファイルの本文長と照合し、親ファイルの同じ数値の位置へ置き換えない。`filePath` 省略時は従来どおり root を対象にする。offset 指定の warm が `ready` になり canonical がその時点のソースと一致していれば、サーバはキャレットの block の canonical-anchor 証明材料（ソース行ごとの SyncTeX 候補とページの paint index）を先に取得する。どちらも canonical generation ごとの cache に入り（SyncTeX は `synctex view` の呼び出し 1 回ずつがファイル全体を読み直すため、行数の多い block は編集後の予算内に取れない）、最初の打鍵の証明はそこから読む。
 
-同じページに欠けている exact chunk があれば、その block まで同じ中断可能な chain を準備し、既存の並列数制限付き render pump へ渡す。`/warm` の `page` 指定はそのページの先頭 block を起点にする。viewer は canonical の表示確定後とスクロール停止後に表示中のページを準備する。入力や文書切替による世代変更は既存の abort 経路で優先される。新しい warm が実行中の warm walk を置き換えるときは、実行中の子を kill せず次の block 境界で止める（replay の STEP 子は walk の唯一の続きで、kill すると再実行分が全部失われる）。止まった walk は到達した境界を editHold に固定し、新しい warm はそこから再開する。止まった後の最初の 1 打は warm の子を kill する（到達分は固定されない。docs/10 §10.4a）。
+同じページに欠けている exact chunk があれば、その block まで同じ中断可能な chain を準備し、既存の並列数制限付き render pump へ渡す。欠けている block の入口の checkpoint がどれも残っていれば（caret の block の前後の境界も含めて）walk はせず、render だけを頼んで ready を返す（warm は入口で scheduler を止めているので、打鍵が後回しにした chain work はここで scheduler に戻す）。数式のある段落を打っている間は、打鍵のたびにその段落が「最新の本文の画素が無い block」になる。以前は warm が毎回その段落と直後の block（本の見出しで 50〜85 ms）を組み直し、次の打鍵がその block の終わりを待っていた（2 秒ほど打ち続けたあとは 1 打ごとに 22〜68 ms）。walk が要る warm も、連打の間（直前の 2 打の間隔が 400 ms 未満で、最後の打鍵から 400 ms 以内）は始めず、打鍵が止まってから歩く。打ち続けている間に settle が後ろの block を組み直すと、その block の入口の checkpoint が無くなって warm が歩き始め、次の打鍵が 40〜60 ms 待っていた。待っている間に次の打鍵や warm が来れば、その warm は superseded で終わる。単独の 1 打（その前の打鍵が 400 ms より前）の warm は待たせない。`/warm` の `page` 指定はそのページの先頭 block を起点にする。viewer は canonical の表示確定後とスクロール停止後に表示中のページを準備する。入力や文書切替による世代変更は既存の abort 経路で優先される。新しい warm が実行中の warm walk を置き換えるときは、実行中の子を kill せず次の block 境界で止める（replay の STEP 子は walk の唯一の続きで、kill すると再実行分が全部失われる）。止まった walk は到達した境界を editHold に固定し、新しい warm はそこから再開する。止まった後の最初の 1 打は warm の子を kill する（到達分は固定されない。docs/10 §10.4a）。
 
 標準 class option の二段組と本文中の `\onecolumn` / `\twocolumn` は、page builder の結果を表示せず、resident LuaLaTeX の実定義・実列幅による行組みだけを canonical-addressed overlay に使う。列切替時の `\box255` はTeXプリミティブで通常boxへ移してから dormant pageへ戻し、active column mode / width を exit state vector に含める。overlay は編集位置が可視本文 region 内であることと、内部段落なら行数が変わらないことを確認し、TeXのline boxが変化したsuffixだけを物理列上で差し替える。mid-document geometry change と `\balance` は `safety.js` 側で structured path から外れる。margin note は canonical-only block である。footnote は扱うが、TeX と同じ page-spanning split を完全再現する実装ではない。
 

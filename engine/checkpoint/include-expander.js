@@ -4,7 +4,8 @@ import { fnv1a } from '../hash.js';
 import { segmentBody } from '../segmenter.js';
 import { resolveProjectInput } from '../project-inputs.js';
 import { expandInputParagraphs } from './mapped-inputs.js';
-import { cacheIncludeRead, resourceContentSig } from './include-cache.js';
+import { cacheIncludeRead, includeTextCurrent, overlayContentSig, resourceContentSig } from './include-cache.js';
+import { documentBodyRange } from './subfile.js';
 
 export function expandIncludes(segs, depth, context) {
   if (depth > 3) return segs;
@@ -26,7 +27,7 @@ export function expandIncludes(segs, depth, context) {
         continue;
       }
     }
-    const m = seg.text.match(/^\s*\\(input|include)\s*\{([^}]+)\}\s*$/);
+    const m = seg.text.match(/^\s*\\(input|include|subfile)\s*\{([^}]+)\}\s*$/);
     if (!m) {
       out.push(decorateExternalResources(seg, context));
       continue;
@@ -49,7 +50,8 @@ export function expandIncludes(segs, depth, context) {
           context,
           resolved.readPath,
           resolved.overlay,
-          depth === 0 ? segmentIndex + 1 : context.rootUnit
+          depth === 0 ? segmentIndex + 1 : context.rootUnit,
+          command === 'subfile'
         )
       : null;
     if (resolved) {
@@ -68,7 +70,13 @@ export function expandIncludes(segs, depth, context) {
       out.push(seg);
       continue;
     }
-    if (command === 'include') {
+    if (command === 'subfile') {
+      // subfiles.sty: the chapter's own preamble and \end{document} are
+      // skipped, the body runs in a group with the chapter's folder on the
+      // input paths. Without the expansion a book made of \subfile lines was
+      // one block, and every keystroke re-typeset all of it.
+      out.push(...wrapSubfileBlocks(expanded, rel, path.dirname(resolved.actualPath) + path.sep));
+    } else if (command === 'include') {
       // LaTeX's \include is an input bracketed by page flushes.  Record the
       // two edges as block metadata; buildStream injects the same page-builder
       // ejects without asking an isolated block compile to ship the previous
@@ -82,7 +90,11 @@ export function expandIncludes(segs, depth, context) {
 }
 
 export function includeOnlyFromSource(source) {
-  const match = String(source || '').match(/^[^%\n]*\\includeonly\s*\{([^}]*)\}/m);
+  const text = String(source || '');
+  // (asked with every keystroke of the whole root: a source that does not
+  // say the word is not read line by line for it. 0.45 ms on an 826 KB file.)
+  if (!text.includes('\\includeonly')) return null;
+  const match = text.match(/^[^%\n]*\\includeonly\s*\{([^}]*)\}/m);
   if (!match) return null;
   return new Set(match[1].split(',').map(normalizeIncludeName).filter(Boolean));
 }
@@ -91,17 +103,38 @@ function normalizeIncludeName(value) {
   return String(value || '').trim().replace(/\\/g, '/').replace(/\.tex$/i, '').replace(/^\.\//, '');
 }
 
-function expandTextFile(full, depth, context, readPath = full, overlay = false, rootUnit = null) {
+// Per project (keyed by its include cache): the expansion of each file that
+// reads no other file, for as long as its text stays the same.
+const leafExpansions = new WeakMap();
+const READS_ANOTHER_FILE = /\\(?:input|include|includeonly|subfile|subfileinclude|import|subimport|inputfrom|subinputfrom|includefrom|subincludefrom|InputIfFileExists|IfFileExists|printindex|bibliography|printbibliography|verbatiminput|lstinputlisting|inputminted)(?![A-Za-z@])/;
+
+function expandTextFile(full, depth, context, readPath = full, overlay = false, rootUnit = null, documentBody = false) {
   try {
     const st = statSync(readPath);
     const cached = context.includes.get(full);
-    const text = !overlay && cached && cached.mtime === st.mtimeMs && cached.readPath === readPath
+    const text = includeTextCurrent(cached, st, readPath, overlay)
       ? cached.text
       : readFileSync(readPath, 'utf8');
-    cacheIncludeRead(context.includes, full, { mtime: st.mtimeMs, readPath, text });
+    cacheIncludeRead(context.includes, full, { mtime: st.mtimeMs, size: st.size, readPath, text });
     context.watchInclude(readPath);
+    // A \subfile contributes only its document body; offsets stay those of
+    // the whole file so every block still maps to its real lines.
+    const range = documentBody ? documentBodyRange(text) : null;
+    const bodyStart = range ? range.start : 0;
+    const bodyText = range ? text.slice(range.start, range.end) : text;
+    // A keystroke re-expands the whole project. A file that reads no other
+    // file expands to the same blocks while its text is the same: a book of
+    // thirty chapters re-segmented all of them (1.6 MB) for one letter.
+    const leaf = !READS_ANOTHER_FILE.test(bodyText);
+    const memoKey = leaf ? `${readPath}|${documentBody ? 1 : 0}|${depth}|${JSON.stringify([...(context.literalEnvs ?? [])])}` : null;
+    const memos = leaf ? leafExpansions.get(context.includes) ?? leafExpansions.set(context.includes, new Map()).get(context.includes) : null;
+    const memo = memos?.get(full);
+    if (memo && memo.key === memoKey && memo.text === text && memo.rootUnit === rootUnit) {
+      return memo.segs.map((seg) => ({ ...seg }));
+    }
+    const diagnosticsBefore = context.diagnostics?.length ?? 0;
     const subs = expandIncludes(
-      expandInputParagraphs(segmentBody(text, 0, { literalEnvs: context.literalEnvs }), {
+      expandInputParagraphs(segmentBody(bodyText, bodyStart, { literalEnvs: context.literalEnvs }), {
         ...context,
         source: text,
         file: full,
@@ -113,7 +146,7 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
       { ...context, file: full, rootUnit }
     );
     const starts = lineStarts(text);
-    return subs.map((s) => {
+    const expanded = subs.map((s) => {
       const direct = !s.file;
       return {
         ...s,
@@ -123,9 +156,29 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
         hash: fnv1a(`${full}|${s.hash}`),
       };
     });
+    if (memos) {
+      // only what came from this file's own text, and said nothing while it did
+      if (subs.every((seg) => !seg.file) && (context.diagnostics?.length ?? 0) === diagnosticsBefore) {
+        memos.set(full, { key: memoKey, text, rootUnit, segs: expanded.map((seg) => ({ ...seg })) });
+      } else {
+        memos.delete(full);
+      }
+    }
+    return expanded;
   } catch {
     return null;
   }
+}
+
+function wrapSubfileBlocks(expanded, rel, dir) {
+  if (!expanded.length) return [];
+  const blocks = expanded.map((block) => ({ ...block, importDir: block.importDir ?? dir }));
+  blocks[0].subfileStart = true;
+  blocks[0].hash = fnv1a(`subfile-open|${rel}|${blocks[0].hash}`);
+  const last = blocks.length - 1;
+  blocks[last].subfileEnd = true;
+  blocks[last].hash = fnv1a(`subfile-close|${rel}|${blocks[last].hash}`);
+  return blocks;
 }
 
 function wrapIncludedBlocks(expanded, rel) {
@@ -164,7 +217,13 @@ function offsetPosition(text, starts, offset) {
 // block identity, by content (a touch changes nothing). A replacement
 // PNG/PDF/listing marks only its owning block dirty; the watcher then calls
 // engine.refresh(), preserving stale pixels until the fresh exact chunk lands.
+// Every command the scan below looks for; a block naming none of them (nearly
+// all of a book's 3,400) is returned as it is, without the comment strip and
+// the seven sweeps that ran for each one on every keystroke.
+const READS_A_RESOURCE = /\\(?:includegraphics|includepdf|lstinputlisting|verbatiminput|inputminted|addplot|input|include|printindex)/;
+
 function decorateExternalResources(seg, context) {
+  if (!READS_A_RESOURCE.test(seg.text)) return seg;
   const specs = [];
   const seenTex = new Set();
   let externalGraphics = false;
@@ -181,7 +240,7 @@ function decorateExternalResources(seg, context) {
       if (!st.isFile()) return null;
       context.watchInclude(resolved.readPath);
       const contentSig = resolved.overlay
-        ? fnv1a(readFileSync(resolved.readPath, 'utf8'))
+        ? overlayContentSig(context.includes, resolved.actualPath, resolved.readPath, st)
         : resourceContentSig(context.resources, resolved.readPath, st);
       specs.push(`${resolved.actualPath}:${resolved.readPath}:${contentSig}`);
       return resolved;

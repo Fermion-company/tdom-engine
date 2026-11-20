@@ -89,13 +89,14 @@ pixels を保持する。source acceptance と新しい文字の即時描画は�
 
 ## 10.3 diff と checkpoint rekey
 
-body は `segmentBody()` と `#expandIncludes()` で block 列になる。`diffBlocks()` は旧 block 列と新 block 列の hash を比較し、dirty block、removed block、共通 prefix/suffix を返す。
+body は `segmentBody()` と `#expandIncludes()` で block 列になる。`diffBlocks()` は旧 block 列と新 block 列の hash を比較し、dirty block、removed block、共通 prefix/suffix と、編集 window 内の未変更 block の対応を返す。
 
 現在の checkpoint 処理は次である。
 
 - prefix 内の checkpoint はそのまま残す。
-- suffix 内の checkpoint は index delta だけ移動し、`vstale` として残す。
-- 編集 window 内の checkpoint は `DIE` で捨てる。
+- suffix と、離れた編集領域の間の未変更 block の入口は `boundaryMap` の新 index へ移動し、`vstale` として残す。
+- 置換領域の入口も残す。直前の未変更 block の出口なので、次の block の本文が変わっても入口まで捨てる必要はない。削除だけの領域には入口を追加せず、後続 block の対応と衝突させない。
+- 対応のない編集領域内部の checkpoint は `DIE` で捨てる。
 - `pendingChain`、`renderHold`、`editHold` も同じ index 移動に追従する。
 
 つまり、現行実装は「編集位置以降を常に全破棄」ではない。suffix を残せる場合は残し、信用できないと分かった時点で async rebuild に回す。
@@ -117,6 +118,14 @@ foreground は nearest checkpoint から始まる。各 block について `#typ
 | `walked` | 文書末尾まで必要な foreground walk をした |
 
 現在の budget は、layout-coupled galley divergence が 8、local state ripple が 4 である。budget を超えた伝播は hot path で文書末尾まで追わず、`pendingChain` に入る。
+
+複数領域の編集では、途中の clean block の galley と exit state が一致し、定義変更・label 移動がなければ、次に必要な block の手前の保存済み checkpoint へ飛ぶ。実際に exact chunk が欠け、保持済み入口からの RENDER でも用意できない block だけが、このスキップを止める。編集ページ上にあるという理由だけで、描画済みの数式や graphics を再組版しない。state が変わった区間は引き続き順番に歩く。
+
+### 複数編集領域の計測
+
+複数領域の変更も文書順に処理する。キャレット warming は保存地点と exact pixel の準備に使い、編集領域の順番は変えない。未変更区間を飛ばす上記の条件は、warming の有無によらず同じである。
+
+`tools/bench-multi-locus.mjs /tmp/long12.tex --caret=0.5` はキャレット位置を事前に warm し、`--caret=none` は warm せず計測する。`wallMs` は編集応答、`caretPublishMs` と `lastPublishMs` はキャレット領域と全編集領域の新しい block が実際の patch に出るまでの時間である。本文未処理・cold preview・frozen・旧 chunk の block は数えない。block が公開されても、ページ上の別 block に exact pixel が欠ければ viewer はページを差し替えられないため、`caretPagePublishMs` / `lastPagePublishMs` と `pageUnpublishedAtNextEdit` を別に報告する。ページ側は viewer と同じく `pending-exact`・canonical-only・math glyph・未準備／旧 chunk を拒否し、canonical display demand と同じ source revision の成功した canonical event も観測する。両指標に公開経路の件数を付け、ブラウザの画像取得・raster・paint 時間は含めない。各標本は全編集 block の公開または timeout を待ち、次の編集は `edit()` 完了から最低120ms後に送る。timeout 件数と最後の drain までを含む `totalNativeJobs` も報告する。
 
 ## 10.4a cold prefix の時間予算
 
@@ -142,9 +151,9 @@ server は cold な編集応答に `canonicalAnchorRefused: 'cold-prefix'` を�
 cold stop の応答は編集 block をまだ組んでいないので、打鍵が紙面に出るのは resume の後になる（316 ページ、上限 12・grid 充填済み: 1.4〜4.7 s。ほぼ全部が最寄り境界からの再生距離）。cold preview は、その間の編集 block を walk の出発点の checkpoint から直接組んで先に見せる。
 
 - 条件: source-dirty block が 1 つだけ、定義の編集（§10.5）でない、rescue 対象の環境（§10.8）でない、今の text で `poisoned` でも deep-lineage の壁（`chainTimeouts`）の中でもない、cold resume 自身の walk でない、そして同じページに exact 画素の要る cold な block が他に無い（`firstDisplay`〜`lastDisplay` が編集 block だけ。ほかに要る block があれば、walk がそこへ着くまでページは描けない）。そのうえで、walk の出発点から編集 block までの推定再生コスト（clean block の `typesetCostMs` の和）が `TDOM_COLD_PREVIEW_FROM_MS`（既定 500。推定は最小標本なので、実際の再生は概ねその 2 倍）を超えたとき。
-- 出発点の checkpoint に、編集 block の JOB をもう 1 本送る。本文は通常の JOB と同じで、前に vstale lineage と同じ `#volatilePrelude`（直前 block の exit vector から counter・`\prevdepth`・`\if@nobreak`）、label 定義、`\lastskip` primer を付ける。直前の exit が `@nobreak` なら `\@afterheading` も付ける（本来の lineage には見出しの `\everypar` が残っている）。見出し以外が立てた `@nobreak` や、`\everypar` に題を持つ run-in 見出しでは近似になるが、どちらも置き換えられる。子の checkpoint 番号は `-1` で、`peer-message.js` は待たれていない `CKPT` を受理しないので、子は galley を返したあと DIE される。GALLEY を返さずに子が消えたら即座に失敗にし、使わなかった preview の子は kill する（walk が例外で抜けたときは次の update が kill する）。
+- 出発点の checkpoint に、編集 block の JOB をもう 1 本送る。本文は通常の JOB と同じで、前に vstale lineage と同じ `#volatilePrelude`（直前 block の exit vector から counter・`\prevdepth`・`\if@nobreak`）、label 定義、`\lastskip` primer を付ける。直前の exit が `@nobreak` なら `\@afterheading` も付ける（本来の lineage には見出しの `\everypar` が残っている）。見出し以外が立てた `@nobreak` や、`\everypar` に題を持つ run-in 見出しでは近似になるが、どちらも置き換えられる。子の checkpoint 番号は `-1` で、`peer-message.js` は待たれていない `CKPT` を受理しないので、子は galley を返したあと DIE される。GALLEY を返さずに子が消えたら即座に失敗にし、使わなかった preview の子は kill する（walk が例外で抜けたときは次の update が kill する）。待ちきれずに timeout した preview の子も kill する（まだ FORKED が届いていなければ届いたときに）。
 - 間の clean block を再生しないので、1 block 分の組版で済む（316 ページで 0.15〜0.40 s。再生は 2〜4 s）。間の block が変える untracked state（マクロ定義・フォント宣言など）は入らない。316 ページの 6 箇所では、font 参照の正規化前の番号を除いて galley が一致した。
-- walk は budget に加えて、preview が届いた時点でも完了済み block 境界で cold stop する。ただし残りの推定再生が閾値の半分以下なら、そのまま歩き切る。preview が届く見込みの時点（編集 block の組版コスト＋100 ms。`TDOM_COLD_PREVIEW_WAIT_MS` 未満のときだけ）でもなお残りが閾値の半分を超えるなら、walk は次の clean block を組まずに今の境界（出発点を含む）で preview を待ち、届いたらそこで cold stop する。両方の子が同じ core を取り合い、重い block 1 つの STEP は preview より長いため、並べて歩くと preview も応答も遅れた。preview が失敗するか `TDOM_COLD_PREVIEW_WAIT_MS` を過ぎたら、そのまま歩く。到達境界は §10.4a と同じく pin され、resume がその先を歩く。budget で止まったときは、preview を `TDOM_COLD_PREVIEW_WAIT_MS`（既定 1000）まで待つ。編集 block の入口で止まったときは preview を使わない。
+- walk は budget に加えて、preview が届いた時点でも完了済み block 境界で cold stop する。ただし残りの推定再生が閾値の半分以下なら、そのまま歩き切る。preview が届く見込みの時点（編集 block の組版コスト＋100 ms。`TDOM_COLD_PREVIEW_WAIT_MS` 未満のときだけ）でもなお残りが閾値の半分を超えるなら、walk は次の clean block を組まずに今の境界（出発点を含む）で preview を待ち、届いたらそこで cold stop する。両方の子が同じ core を取り合い、重い block 1 つの STEP は preview より長いため、並べて歩くと preview も応答も遅れた。preview が失敗するか `TDOM_COLD_PREVIEW_WAIT_MS` を過ぎたら、そのまま歩く。次の clean block の推定再生（`typesetCostMs` の 2 倍）が 500 ms を超え、組めば budget を越える（組んだ直後に cold stop する）ときは、preview がまだ出ていれば、その block を組まずに境界で preview を待つ。待つのはその推定再生の時間まで（preview の timeout は越えない）で、届いても届かなくてもそこで cold stop する（届かなければ下の budget 停止と同じく待ち続ける。preview が失敗したときだけ歩き続ける）。重い block を組むと、その間打鍵を待たせるうえ preview の子と core を取り合った（316 ページで 1 つの box が負荷下で 3.1 s。tex64-internal #104）。組まずに残した block は、次にそこへ着いた walk が組む（待つのは block ごとに 1 回で、`heavyWaitId`）。連打の間は次の打鍵が前の応答の後ろに並んでいて cold pass の idle gate が来ないので、毎回待つと停止点がその境界から動かなかった（316 ページで 6 打続けて同じ境界で待った）。間が空けば cold pass が idle gate の後に組み、その step は kill しない（毎打鍵 kill すると、打鍵が続く間その block を越えられず、resume がいつまでも来なかった）。どちらの場合も、その block の再生は最初の打鍵から次の打鍵へ移るだけで、合計は増えない。到達境界は §10.4a と同じく pin され、resume がその先を歩く。budget で止まったときは、preview を `TDOM_COLD_PREVIEW_WAIT_MS`（既定 1000）まで待つ。編集 block の入口で止まったときは preview を使わない。
 - preview は `tdomColdPreview` 付きの galley として adopt する。block は `coldDirty` に残り、自分の lineage で組む walk（resume・caret warm・chain）が置き換える。その walk が preview を「変化なし」と見て、下流を確かめずに収束しないようにするため、次の 2 点を守る。
   - 各 walk（foreground・`#retypesetChain`・chain pass）は、preview の galley を比較の witness にしない（`before.hash` を持たない）。置き換えた walk は必ず次の block を確かめに進む。
   - block の `stateVec` は編集前のまま残す。後続 block はその exit state を前提に組まれているので、置き換えた walk は native の exit state をそれと比べ、counter が動いていれば §10.4 どおり下流へ運ぶ。
@@ -154,7 +163,7 @@ cold stop の応答は編集 block をまだ組んでいないので、打鍵が
 - preview は証明の入力にしない。次の打鍵の `previousGalley` には preview の前の galley を渡す。resident edit admission・plain preview・canonical anchor の base の witness にも使わない。壊れた TeX の last-good 保持（`broken-galley.js`）と stale-first rescue の複製では印を外す。
 - `coldDirty` は文書ごとの状態で、open と resident tree の破棄で空にし、resume が失敗したときも空にする（rescue pump は `coldDirty` が空くのを待つ）。
 - 応答の `stats.coldPreview` には block・推定再生コスト・preview の所要時間・walk 時間・adopt の有無が、`/status` の `coldPreviews` には adopt 数が出る。`TDOM_COLD_PREVIEW=0` で無効になる。
-- `/edit` の応答と SSE `update` の `timing` には、打鍵の client 時刻・server の受信・engine の完了（epoch ms）に加えて、`lock`（`#update` に入った時刻と lock を取れた時刻、そのとき chain を持っていたもの `heldBy`: update・warm・cold・grid と実行中の job の block と経過 ms）、`walk`（foreground walk の出発点・編集範囲と、block ごとの ms と印。c=clean・d=dirty、x=galley か exit state が変化、r=rescue、p=その時点で preview が届いていた）、`coldWalk`（直近の cold walk の block ごとの ms）が出る。
+- `/edit` の応答と SSE `update` の `timing` には、打鍵の client 時刻・server の受信・engine の完了（epoch ms）に加えて、`lock`（`#update` に入った時刻と lock を取れた時刻、そのとき chain を持っていたもの `heldBy`: update・warm・cold・grid と実行中の job の block と経過 ms）、`walk`（foreground walk の出発点・編集範囲と、block ごとの ms と印。c=clean・d=dirty、x=galley か exit state が変化、r=rescue、p=その時点で preview が届いていた、w=重い block の手前で preview を待った ms）、`coldWalk`（直近の cold walk の block ごとの ms）が出る。
 - 実測（316 ページ、上限 12、grid 充填済み、warm なしで 6 章へ 1 打鍵）: 紙面に出るまで 0.82〜1.43 s（従来 1.35〜4.7 s）。内訳は応答 0.38〜0.61 s と、その 0.4〜0.8 s 後に届く exact 画素の late patch。
 
 ## 10.4c 編集 block の先行 RENDER
@@ -166,6 +175,195 @@ exact 画素の要る block（`needsRender`）を編集すると、render pump �
 - JOB が返した galley に `tdomEarlyRender` として付け、pump はその galley が block に付いていて本文が同じときだけ、その PDF を切り出す（`render-pump.js`）。後の update が block を別の state で組み直して galley が替われば使わない。次の打鍵の preempt では子が kill され、PDF の置き場は galley が替わったとき（`#adoptGalley`）か 30 s 後に消える。JOB が失敗したときもその場で捨てる。last-good 保持と stale-first rescue の複製では印を外す。置き場を作れなかったときは送らず、pump がふだんどおり描く。
 - pump が自分で送る RENDER も、galley を組んだ JOB の prelude（`tdomRenderPrelude`。vstale でない checkpoint の JOB だけが残す）を本文の前に付けるので、先行 RENDER が kill された打鍵でも参照番号は galley と揃う。isolated rescue などその prelude の無い galley は、従来どおり primer だけを付ける。
 
+## 10.4d 打鍵の JOB を受ける予備の子（spare continuation）
+
+編集 block の JOB は、その block の入口の checkpoint から fork した子が組む。fork したばかりの子には二つの費用が毎打鍵かかっていた。
+
+- **フォントの読み直し**: block が文書の中でその font を最初に使う場所（最初の数式、最初の太字、`\LaTeX` ロゴの小さい A など）だと、入口の checkpoint はその font を持たないので、JOB のたびに読み込む。389 ページの本の章ウィンドウでは、3 行の地の文が 18 ms のうち 17 ms を 6 pt の 1 書体の読み込みに使っていた（同じ子でもう一度組むと 1.5 ms）。章ウィンドウは各章が前文の font だけで始まるので、特に当たりやすい。
+- **ページの読み込み直し**: 子の page table は空で、親と共有するメモリを読むたびに fault が起きる（同じ段落で 4,400 回、kernel 時間 5 ms）。fault の費用は fork の世代が深いほど上がる（1 世代 1.7 µs、400 世代 15 µs / page）。
+
+そこで、編集 block の JOB を渡したあと、checkpoint は次の打鍵の JOB を受ける子を先に fork しておく（`daemon.lua` の `SPARE`、`tdomfork.c` の「a spare continuation」）。
+
+- engine は、編集で本文が変わった block の JOB に `K` を付ける（`keystrokeSource`。open と reboot では付けない）。checkpoint は `K` の JOB を渡したあと 8 ms 何も来なければ予備の子を fork する（`fk.spare_fork`）。先行 RENDER など続けて来る命令を先に通すためである。
+- 予備の子は、(1) 直前の JOB が checkpoint に無くて持っていた font を、TeX に頼まれたとおりの名前と大きさで、同じ順に読み込む（group の中の `\font\tdomwarmfont=… at …sp`。名前は文書の catcode に左右されないよう plain な文字で渡す）。(2) 直前の JOB の page table にあったページを 1 byte ずつ読む。(3) pipe で JOB を待つ。次の `K` の JOB は fork せずにこの子へ渡す（`fk.spare_send`）。
+- font は資源であり、少し前に読み込んであっても段落の組み結果は変わらない。同じ順に読み込めば font 番号も同じになる（単体の LuaLaTeX で、19 書体を先に読み込んだ版と読み込まない版の出力 SVG が一致することを確かめた）。順が変わった場合は番号だけが変わる。galley は自分の font 表を持つので表示は変わらない。
+- JOB は `fontList`（checkpoint の `font.max()` より上の font の「大きさ 名前」）、`fontLoads`（JOB 自身が読み込んだ数）、`spare`（予備の子が先に読んだ pages と fonts）を galley に付けて返す。caret が block に来たとき（`warmEditOffset` が ready）、engine はその block の `fontList` を付けて `SPARE` を送るので、最初の 1 打にも予備の子がある。
+- ページの一覧は、JOB を終えて checkpoint になった子が、15 ms 何も来なくなってから取る（`fk.hints_record`。自分の page table を答える sysctl `vm.self_region_footprint` と `mach_vm_page_range_query`）。page table 全体を歩くので本では 0.1〜0.5 秒かかる。同じ場所（同じ checkpoint 番号）では 10 秒に 1 回までとし、命令が来たら中断する。JOB が**書いた**ページ（予備の子で先に複製を作れば copy-on-write の fault も減る）は調べない。ページごとの記録（`mach_vm_page_info`）を読むと、系統全体が共有する memory object を世代の数だけ lock する。89 世代目の checkpoint では一覧 1 回に 1 秒かかり、その間、同じ文書の JOB・予備の子・RENDER が lock を待って止まった（72 ページの本の数式段落で、紙面が 5 打鍵ぶん動かなかった）。
+- 予備の子は checkpoint の状態の写しである。checkpoint が STEP で先へ進むとき、fault 注入を受けたときは捨てる。checkpoint が終われば pipe が閉じて予備の子も終わる。予備の子を持つ pipe の書き口は checkpoint だけが持つ（他の子は fork 直後に閉じる）。
+- 読み込んでも JOB がまた読み込む font（package が自分で定義した font。一覧に同じ行が 2 度出る）がある場所では、先読みをやめる（`fk.fonts_put(tag, false)`）。先読み中に TeX の error が出た予備の子は、それ以上読み込まない。
+- (4) font を読み込んだあと、予備の子はその checkpoint の直前の打鍵の本文から、TeX が文字（catcode 11・12）と空白として読む文字だけを取り出し（命令・波括弧・`$`・`%`・active 文字は除く）、`\begingroup\globaldefs=-1` の中の捨てる `\vbox` で一度組む（`warm_text`）。LuaTeX-ja の表、node の確保、Lua の文字列が温まる。`\globaldefs=-1` で global な代入も group の終わりで戻り、段落の命令は一つも実行しない。72 ページの本の段落で子の組版 8.4 → 6.0〜6.7 ms、fault 550 → 250。`TDOM_NO_WARM=1` で止める。和文・脚注・label・太字・数式・active 文字を含む段落で、打鍵ごとの galley と終状態が通常の fork と一致することをテストで確かめている。
+- `vm.self_region_footprint` の無い環境（古い macOS、Linux）では `fk.hints_init()` が false を返し、従来どおり毎回 fork する。`TDOM_NO_SPARES=1` は全体を、`TDOM_NO_FONT_AHEAD=1` は font の先読みだけを止める。`TDOM_TRACE_JOB=1` では JOB ごとの user / kernel 時間、fault 数、読み込んだ font 名が `[job-gc]` に出る。
+
+実機（packaged beta、389 ページの本の章ウィンドウ、150 ms 間隔の打鍵）: TeX 側の組版 23 → 6 ms、打鍵から紙面まで中央値 48 → 30 ms。
+
+一覧は系統全体で 1 つ（最後に打った段落のもの）である。font の使用を消しても、その段落で打ち続ける間は一覧に残る。予備の子は先読みした font を自分のメモリに持つ（和文 1 書体で 10〜20 MB）。
+
+## 10.4e galley の中の空の罫の送り方
+
+LuaTeX-ja は和文の文字と文字の間に空の罫（`empty_rule`、幅 0）を 1 つずつ置く。daemon はそれを 1 つずつ、engine が「描かれない」と証明するための生の証拠（RuleRunV2: 16 項目。node の属性の一覧 `ra` を含む）付きで送る。和文の段落の galley の bytes の 6 割がこれである（4 行の段落で 45 KB 中 27 KB。文字の run は 15 KB）。1 行の中の罫は場所 `x` と属性の 1 項目（文字クラス）だけが違い、2〜5 種類が交互に並ぶ。
+
+- engine へ送る galley（`jenc_wire`）では、同じ run の一覧の中で先に丸ごと書いた罫と `x` 以外が同じ罫を `{"rq":[j,x]}` と書く（`j` はその一覧の中で丸ごと書いた罫を 0 から数えた番号。直近 8 個から探す）。engine は message を読んだその場で（`peer.js` → `rule-pack.js`）罫を丸ごとに戻す。項目も並びも同じなので、galley の hash、layout witness、証明は丸ごと送ったときと同じになる。`jenc` 自体の bytes（reference encoder と一致）は変えていない。`TDOM_NO_RULE_PACK=1` で全部を丸ごと送る。
+- 属性の一覧の署名（`rule_attr_signature`）は、1 回の walk の間、属性 list ごとに覚える（同じ属性の node は list を共有する）。
+
+72 ページの本の 4 行の段落で、送る bytes は 44.6 → 22.9 KB、2 行の地の文で 34.3 → 16.1 KB。子の中の時間は encode で約 0.2 ms、harvest で 0.5〜0.8 ms 減る。罫そのものを daemon で捨てれば約 3 ms 減るが、`stableRunLayoutRecord` が layout witness に空の罫を含めている（`run-semantics.js`）ので捨てない。
+
+## 10.4f 打鍵が続く間は編集 block の RENDER を出さない
+
+組み合わせ表示（docs/09 §9.5a）のできる block を続けて打つと、これまでは打鍵ごとに RENDER を 1 本、JOB と一緒に送っていた（#103 の held。前の 1 本が飛んでいる間は送らない）。絵 1 枚には約 110 ms かかる（子が段落を組んで PDF を出すまで約 70 ms。うち約 50 ms は本文の和文 font を含む 5 書体の埋め込み。pdftocairo と切り出しに 32〜38 ms）。150 ms 間隔の打鍵では次のことが起きていた。
+
+- 絵が次の打鍵に間に合わなくなると（72 ページの本の 4 行の段落で約 2 秒後から）、遅れて届いた絵のためにページが 1 打鍵に 2 回届き、子の仕事が次の打鍵の JOB と重なる（組版 16 → 21〜31 ms）。
+- 他の仕事で CPU が埋まっていると、この重なりで打鍵が 2〜3 倍遅くなる。
+
+一方、組み合わせ表示の行は、block 自身の絵が届く前と後で見た目が変わらない（docs/09 §9.5b。本文は glyph、数式は照合済みの絵か字形）。打鍵ごとの絵は、読む人には見えない差し替えのために作っていた。
+
+そこで、次の 2 つを満たす打鍵では、JOB と一緒の RENDER を送らない（`render-pump.js` の `typedInBurst`、`block.renderDeferred`）。
+
+1. 前の打鍵からの間隔が `BURST_GAP_MS`（400 ms。`#jobBlock` が「打鍵が続いている」とみなす境と同じ）以下である。
+2. block の直前の galley が組み合わせ表示で見せられていた（`block.composedFor === block.galleyHash`。`stream.js` が行を組み合わせたときに記す）。
+
+- 絵は pump が作る。block の今の galley が組み合わせ表示で見せられている間は、最後の打鍵から `BURST_PAUSE_MS`（450 ms）待つ。打鍵が止まると RENDER が 1 本だけ出て、block 自身の絵が届く。
+- 組み合わせられなかった galley（一度も描いていない glyph を数式に打った、など。ページは前の galley を見せていて、打った文字は出ていない）は、update が終わりしだい待たずに描く（`deferredRenderQuietMs` が 0）。次の打鍵は 2 を満たさないので、従来どおり JOB と一緒に RENDER を送る。
+- 止まった後の最初の 1 打、間隔が 400 ms を超える打鍵、組み合わせ表示のできない block（図・box・float・脚注・rescue）は、従来どおりである。
+- 紙面の上で editor が開いている間も従来どおりである。その editor（`web/app.js` の `provisionalStageKeepsEditor`）は、数式の位置を block 自身の絵で確かめるので、前の絵からの切り出しを見せるページを commit しない。表示側が絵の glyph の位置（`/chunk-glyphs`）を読むのは、この editor が開いているときと、それを開く click のときだけなので、server はその読み出しを engine に伝える（`notePaperEditor`）。そこから `PAPER_EDITOR_MS`（30 秒）の間は、どの打鍵も RENDER を送り、待たせてあった絵もすぐ描く。
+- `composedFor` は、block がその場で編集されたときだけ次の block object へ引き継ぐ（`segmenter.js` の `diffBlocks`。`exactHistory` と同じ条件）。
+- 手元の絵の galley は `exactHistory` に残り続ける（`holdExactGalley` は描かれた galley を捨てない）。打鍵が続く間、切り出しの元は打ち始めの絵のままである。
+- `TDOM_RENDER_EVERY_KEY=1` で従来の動作に戻る。`TDOM_BURST_GAP_MS` と `TDOM_BURST_PAUSE_MS` で境と待ち時間を変えられる。`renderStats.burstSkipped`（RENDER を送らなかった打鍵）と `renderStats.afterBurst`（pump が後から作った絵）で数えられる。
+
+実機（packaged beta、72 ページの本、150 ms 間隔で 30 打鍵、打った文字が紙面に出るまでの中央値。同じ build で `TDOM_RENDER_EVERY_KEY=1` と交互に 2 往復）:
+
+- 4 行の段落の行末: 従来 45 ms（28/30 打鍵）と 53 ms（30/30） → 27 ms と 28 ms（どちらも 30/30）。16 打鍵目からの遅れが無くなった。
+- 数式の中: 従来 45 ms（30/30）と 69 ms（28/30） → 31 ms と 31 ms（どちらも 30/30）。
+- 章ウィンドウ（389 ページの本）の数式の中: 従来 31 ms と 29 ms → 26 ms と 28 ms（どれも 30/30）。
+- 30 打鍵の間に送る RENDER は 30 本 → 1〜2 本、止まった後に 1 本。
+- 紙面の上の editor を開いたまま、その数式へ 150 ms 間隔で 12 打鍵（1 ページの文書。打鍵は source の側から入れた）: RENDER を送らなかった打鍵は 0 で、`TDOM_RENDER_EVERY_KEY=1` のときと同じく 1 打鍵に 1 本。editor を開かずに同じ打鍵をすると、字形の揃った 9 打鍵目から送らない。
+- 30 打鍵目の画面（組み合わせ表示）と、止まって block 自身の絵が届いた後の画面の差は、段落の範囲で 91 画素（40/255 以上。2560×1640 の画面）。
+
+## 10.4g 打鍵のたびに文書やページの全体へ触れていた処理
+
+1 文字の打鍵でも、文書の長さやページの文字数に比例する仕事が 2 つ残っていた。どちらも 1 ファイル 30 ページの文書（和文の地の文。1 ページ 1,470 command、195 KB）で見つけた。
+
+- **shipping chain への問い合わせ**（`ship-pacing.js` の `deferShipUpdate`）: 表示できる打鍵の replay は打鍵が止まるまで持っておく。持っている間に次の打鍵が来ると、chain に「今の source は chain の source と 1 unit しか違わないか」を尋ねていた（`replayableFrom`）。chain はそのために root の source 全体を unit に切り直す（30 ページで 2.5 ms。ページ数に比例する）。1 ファイルの文書では、これが打鍵ごとに走っていた。持っている打鍵と同じ block をその場で変えただけの打鍵（block の追加・削除・分割・結合が無く、間に別の revision も無い）では尋ねない。engine は update ごとに「その場で変えた 1 つの block」の id を渡す（`#updateInner` の `editedInPlace`）。尋ねなくても正しさは変わらない。持っていた text を replay するとき `resume()` が unit を切って比べ直し、2 つ以上違えば reboot を求める。`TDOM_SHIP_CHECK_EVERY_KEY=1` で毎回尋ねる。
+- **ページの display list**（`display-list.js`）: 打鍵のあったページは毎回 command を全部作り直し、ページ全体の JSON を hash していた。変わるのは 1〜2 行である。glyph と罫だけの行の command は行（`stream.js` が block ごとに持つ unit）に付けて覚え、同じ場所に立っている間はそのまま使う（`LINE_COMMANDS`）。ページの hash は command ごとの hash（command に付けて覚える）をつないだものにした。内容だけで決まる点は同じで、新しい command だけを直列化する。font の表は行の下で変わらない（family の降格は全 block の行を作り直す）。`TDOM_NO_LINE_REUSE=1` で従来どおり全部作る。
+
+engine だけで測ると、この文書の打鍵の paginate は 3.5 ms → 1.1 ms（同じ負荷で交互に 2 往復）。実機（packaged beta、150 ms 間隔で 30 打鍵、同じ build で交互に 2 往復）では、打った文字が紙面に出るまで 29 ms と 34 ms → 26 ms と 25 ms、engine の時間は 15〜18 ms → 12 ms。
+
+## 10.4h 紙面の差し替え：変わっていない行の要素を残す
+
+viewer（`web/app.js`）は、打鍵のあったページの SVG を毎回まるごと作り、古い SVG と入れ替えていた。変わるのは 1〜2 行でも、browser はページの全要素を作り直し、配置し直し、描き直す。和文の密なページ（1 文字 1 要素で約 1,500 要素）では、入れ替えのあとの layout が 1 打鍵に 13〜18 ms かかっていた（viewer の profile。入れ替えの時刻より後なので、「紙面に出るまで」の計測には入っていなかった）。TeX が段落を組む時間より長い。
+
+- ページの SVG は「開始 tag、SVG に描く command 1 つにつき 1 要素、終了 tag」の列として作る（`svgParts`）。commit したページはこの列を覚える（`div.provisionalSvgParts`）。SVG の子はこの列の順に並び、ほかに子を足したり消したりする code は無い。
+- 次のページを stage するとき、列の先頭と末尾で前のページと同じ部分を数え（`svgPartsCut`）、**違う部分だけ**を HTML として解析する。commit では、古い SVG をそのまま残し、違う部分の要素だけを入れ替える（`spliceSvgChildren`）。同じ列なら同じ要素である。要素を作ったあとに変わるのは font の読み込み待ちの印だけで、比較からは外す。
+- stage のあとでページが別のものに替わっていたら（stage が比べた列と commit 済みの列が違う）、commit の時に SVG 全体を作って比べ直す（`patchProvisionalSvg`）。用紙が違う、子の数が列と合わない、などのときは従来どおりまるごと入れ替える。chunk の窓（`<div class="chunkwin">`）は従来どおり毎回作り直す。
+- `globalThis.__tdomWholePageCommit = true` で、従来どおり全体を作って入れ替える。
+
+実機（packaged beta、1 ファイル 30 ページの文書の密なページ、150 ms 間隔で 30 打鍵）:
+
+- viewer の 1 打鍵あたりの時間: 入れ替え後の layout 13.2 ms → 0.03 ms、stage（HTML の解析）4.3 ms → 1.0 ms、受信から commit まで 5.3 ms → 1.9 ms。
+- 打った文字の commit まで（中央値）: 26 ms → 18 ms。その変更を含む描画 frame が終わるまで（変更の 2 frame 後の `requestAnimationFrame`）: 46 ms → 28 ms。
+- 30 打鍵のあと、ページの SVG は同じ列から作り直した SVG と一致する（`outerHTML` の比較）。
+
+## 10.4i 1 ファイルの長い文書で打鍵のたびに全文へ触れていた処理
+
+1 ファイル 2,600 段落（191 ページ、826 KB）の文書を packaged app の engine の CPU profile で見ると、1 文字の打鍵で source 全体を読む処理が並んでいた（章ごとの file に分かれた本では root が小さいので目立たない）。
+
+- **local な alias の走査**（`structural-aliases.js` の `maskIgnored`・`collectDefinitions`・`usedStructuralAliases`）: 3 つとも source を 1 文字ずつ進んでいたが、何かをするのは `\`（mask では `%` も）の位置だけである。次の `\` まで `indexOf` で飛ぶ。sink に届く定義が文書に 1 つも無ければ、use の走査はしない（use を記録するのはそういう定義だけ）。結果は変わらない: 手元の TeX source 692 個と TeX Live の package・文書 676 個（15.5 MB）で、前の実装と 4,104 通りの結果がすべて一致。6.7 ms → 約 1 ms。
+- **canonical の source hash**（`canonical.js` の `schedule`）: 「直前の generation はこの text の compile か」「走っている job はこの text のものか」を確かめるために、root の全文の hash を打鍵ごとに 2 回取っていた（4.3 ms）。hash と一緒に text の長さを覚え、長さが違えば hash を取らずに「違う」と答える。走っている job・失敗した job の revision が今の revision でなければ、そもそも尋ねない。
+- **打鍵のあったページの近くの block 探し**（`update-helpers.js` の `editPageRenderIds`）: 全ページの全行から配列を 2 つずつ作っていた（1.8 ms）。該当する block のあるページだけ配列を作る。
+- **source の text の送り方**（`server.js` の `serializeDom`・`domDeltaBody`、`web/app.js` の `applySnapshotDelta`）: snapshot は source file の全文を持つ。打鍵のたびに全 file の text を JSON にし、打った file は全文を viewer へ送っていた（この文書で 29 万字、event は 578 KB）。text が前と同じ file は前の JSON を使い、変わった file は「どこから何文字消して何を入れるか」（`engine/text-splice.js` の `textSplice`）だけを送る。viewer は持っている text に当てはめ、当てはめられなければ snapshot 全体を取り直す。`TDOM_NO_SOURCE_SPLICE=1` で全文を送る。
+
+実機（この文書の中ほどで 150 ms 間隔 30 打鍵）: engine 21.5 ms → 14〜15 ms、打った文字の commit まで 44 ms → 35 ms（§3.5a の修正の前は、ページ数の食い違いで resident のページが出ず 0/30）。このとき残っていた snapshot の作成（`dom` 段 6〜7 ms: 打った位置より後の block は root の中の offset が動くので、1,300 個の entry を作り直して比べていた）は §10.4k で外した。
+
+## 10.4j overlay の file を打鍵のたびに読み直さない
+
+保存していない editor の内容は overlay の file として TeX へ渡る。overlay は server が書き直すたびに変わり、書かれた時刻だけでは「変わっていない」と言えない（時刻の刻みが粗い filesystem では、同じ刻みの中の 2 回の書き込みが同じ時刻になる）ので、展開のたびに毎回読んでいた（`mapped-inputs.js`・`include-expander.js`）。本の 1 章だけを live にする host は残りの章を空の overlay で送るので、打鍵のたびに約 40 個の file を読んでいた（packaged app の engine の profile で 1.0〜1.5 ms）。file を読む block（`\input`・`\include` の行）は、中身の同一性のためにもう一度読んで hash していた。
+
+- overlay は、読んだときと同じ時刻・同じ大きさで、**読んだ時点ですでに `OVERLAY_REST_MS`（3 秒）以上書かれていなかった**ものだけ cache から取る（`include-cache.js` の `includeTextCurrent`、cache の `settled`）。読んだ後の書き込みは、その時刻より新しい時刻を必ず持つ。書かれたばかりの overlay（打っている章）は従来どおり毎回読む。project 自身の file の規則（書かれた時刻）は変えていない。
+- 中身の hash は、直前の展開が読んだ（または持っている）text から 1 度だけ取る（`overlayContentSig`）。file の時刻か大きさが違えば読む。
+- `TDOM_READ_OVERLAYS_ALWAYS=1` で毎回読む。
+
+章ウィンドウの打鍵で、engine の `readFileSync` は 1.0 → 0.36 ms、`prepareUpdate` は 3.1 → 2.75 ms（同じ build で交互に 1 往復）。
+
+## 10.4k snapshot：動いただけの block を作り直さない・送らない
+
+打鍵のたびに viewer へ届く snapshot（source map）は、block ごとの entry の列である。1 ファイルの文書では、打った位置より後の block はすべて root の中の offset が動く。191 ページ・2,600 block の文書の中ほどで 1 文字打つと、engine は 1,300 個の entry を作り直し、server はそれを JSON にして前の版と比べ、viewer へ 86 KB 送っていた。改行を 1 つ打つと、後ろの block は行番号も変わるので 1,300 個が丸ごと送られた（0.9 MB）。
+
+- **entry は core と place に分かれる**（`inspector.js` の `buildDomSnapshot`）。core は block が何であるか（種類、図、source の行と桁、label、edit region）、place は block がどこにあるか（列の中の番号、載っているページ、root の中の offset）。core が前のままかどうかは、作り直さずに確かめる: block が持つ object（galley、fidelity、edit region の list、text）が同じで、行と桁が root の行頭表（`SourceStore.lineStarts`）に照らして同じなら、前の core である。place だけが動いた block の entry は、前の entry と core の部品をすべて共有する新しい object になり、`domEntriesDifferInPlaceOnly` が中身を読まずにそう判定できる。複数の file にまたがる block、`\maketitle` を持つ block（前付の region が付く）は従来どおり毎回作る。
+- **行だけがずれた block**（上に行が増えた・減った）。core を前の core から作る: source と edit region の行だけを動かした複製で、残りの部品は共有する。何行ずれたかは core の `source` をさかのぼれば分かる（`domEntryLinesMovedBy`。viewer が数版前の snapshot を持っていても足し合わせる）。
+- **block の載っているページ**（`pagesOfBlocks`）。全ページの全行（この文書で 7,800 行）を毎回読んでいた。engine の memo に置き、行の list が別の object になったページ（打鍵 1 回で 1 ページ）だけを読み直して、そのページの block の list だけを作り替える。渡した list は書き換えない（前の snapshot の entry が持っている）。ページ番号が昇順でない紙面は毎回読む。
+- **送り方**（`server.js` の `domDeltaBody`、`web/app.js` の `applySnapshotDelta`）。送るまで何も JSON にしない（全文の JSON は、前の版を持たない viewer に全体を送るときだけ作る）。block の列は「前の列の先頭 `head` 個、名前を挙げた block、末尾 `tail` 個」（`cut`）で表し、block は名前ではなく位置で指す。丸ごと送る block は `blocks` と位置の `at`。同じだけ動いた block の並びは 1 つの run にまとめる: `shift` は `[from, to, by, places]`（root の中の offset が `by` 文字、列の番号が `places` だけ先）、`lines` は `[from, to, down]`（行が `down` 行だけ下）。ページが変わった block は 1 個ずつ（`moved`、位置で指す）。viewer は持っている snapshot に当てはめ、どれか 1 つでも当てはまらなければ全体を取り直す。core から作っていない entry（`.bbl` の block など）は、従来どおり JSON で比べる。
+- `SourceStore` の行頭表は、edit のたびに全文を 1 文字ずつ見て作っていた。行末から次の行末へ `indexOf` で進む。
+
+engine と server・viewer の該当 code だけを通した計測（上の文書の中ほど、12 打鍵の中央値）:
+
+| 打鍵 | server 側（snapshot を作って差分にする） | viewer 側（読んで当てはめる） | 送る量 |
+|---|---|---|---|
+| 1 文字 | 11.1 → 1.7 ms | 1.0 → 0.14 ms | 86 KB → 1.5 KB |
+| 改行 1 つ | 13.6 → 3.6 ms | 3.8 → 0.5 ms | 895 KB → 0.9 KB |
+| 新しい段落 | 3.0 ms | 0.3 ms | 6.2 KB |
+
+3 種類の打鍵とも、viewer が当てはめた snapshot・server の snapshot・何も覚えていない状態から作った snapshot が、block ごとに一致する（JSON の byte まで）。
+
+## 10.4l event stream：ページの描画命令を変更として送る
+
+update の event は、触れたページの display list を丸ごと運ぶ。打鍵で変わるのは 1〜2 行なのに、密なページ（72 ページの本の 1 ページで 2,000 命令、約 200 KB）では、打鍵のたびに全命令を JSON にして stream へ書き、viewer が読んで parse し、全命令の要素（SVG の断片）を書き出していた。engine が update を返してから viewer に event が届くまでが、普通のページより 3〜4 ms 長かった。
+
+- **命令の JSON は命令と一緒に持つ**（`server.js` の `jsonOfCommand`）。命令は list が作られた後は変わらない（変わらなかった行の命令は build をまたいで同じ object: §10.4g）ので、JSON にするのは新しい命令だけになる。
+- **stream ごとの差分**（`cutAtLists`・`broadcastAtLists`・`streamListJson`）。`/events?lists=cut` で開いた stream について、server はページごとに「その stream へ最後に送った list」を覚える。次にそのページの list を送るときは、先頭から一致する命令（`head` 個）と末尾から一致する命令（`tail` 個）を省き、間の命令だけを `{n, base, of, head, tail, mid}` として list の位置に入れる（`base` は基準の list の番号、`of` はその命令数、`n` はこの list の番号）。その stream で初めてのページは `{n, all}`。一致は object の同一性で見て、違う object は JSON で比べる。
+- **食い違いが起きない理由**。基準は「同じ stream に、順に流したもの」だけで、`/doc` など stream の外で渡した list は基準にしない。viewer は event を parse した直後、その event を表示に使うかどうかに関係なく list を組み立てて覚える（`web/app.js` の `resolveStreamLists`）。stream が接続し直されたら両側とも空から始める。それでも当てはまらない list が来たら（`base`・`of` が合わない）、viewer は stream を取り直して文書を読み直す。
+- **viewer の要素**。組み立てた list の先頭と末尾の命令は、viewer が持っている object そのものである。命令の要素も命令と一緒に持ち（`pieceOfCommand`。要素が命令の外に依存するのは font が届いたかどうかだけ）、変わらなかった行の要素は書き出さない。
+- stream を自分で読むほかの client（test、`lists=cut` を付けない接続）と、`/edit` の応答の report は、従来どおりの list を受け取る。`TDOM_LISTS_WHOLE=1` で全 client に従来の list を送る。
+
+`tests/server-api.test.js` は、cut の stream と通常の stream を同時に開いて打鍵し、cut の stream を viewer の code で組み立てた event が通常の stream の event と一致することを確かめる。要素の文字列は、実ページ 96 回分（128,682 命令、font が届く前・途中・後）で前の実装と一致した。
+
+## 10.4m 打ち始めの 1 打鍵：同じ galley を受け取り直しても units を捨てない
+
+block の units（`units.js`。page builder が並べるもので、units が同じ object であることが「そのページは変わっていない」の根拠になる）は、galley を adopt するたびに捨てて作り直していた（`galley-adoption.js`）。打鍵の後、engine は打った block から先を組み直して checkpoint を作り直す。開いた直後も同じである。その walk が通った block は、**前と同じ中身の galley** を受け取り直すだけなのに units が別の object になり、次の pagination は「そこから先のページが全部変わった」と見て、ページを組み直し、display list を作り直していた。払うのは次の打鍵、つまり打ち始めの 1 打鍵である。
+
+- 191 ページ・2,600 block の 1 ファイル文書: 開いた後の最初の打鍵の前に 2,491 block、3 秒休んだ後の打鍵の前に 1,150 block の units が入れ替わっていて、その打鍵は 184 ページ・92 ページを作り直した（engine だけの計測で `paginate` 段 361 ms・167 ms。続く打鍵は 1〜2 ms）。packaged app の同じ文書では最初の打鍵の `paginate` が 64 ms。
+- 10 ページの文書でも、最初の打鍵が 10 ページ中 6 ページを作り直していた。
+
+`adoptGalleyBlock` は、adopt した galley が units の元になった galley と同じ（hash が同じ）で、`stream.js` の `buildStream` が読むほかのもの（fidelity の中身、rescued・gfx・needsRender、galley の backend、自分の絵が届いているかどうか）も変わっていなければ、units をそのまま残す（`unitsStillHold`）。絵が前の galley のもののまま（`buildStream` が毎回「何で代えるか」を決め直す場合）、組み立てた絵（synth）が残っている場合、rescue の chunk を持ってきた galley、stale のまま持ち越した galley、paint 待ち・cold preview の galley は、従来どおり作り直す。`TDOM_REBUILD_UNITS_ALWAYS=1` で毎回捨てる。
+
+上の 191 ページの文書で、最初の打鍵・休んだ後の打鍵とも、作り直すのは打った段落のある 1 ページだけになった（`paginate` 2.3 ms・1.7 ms）。`tests/units-kept.test.js` は、開いた直後と休んだ後の打鍵が段落のあるページだけを差し替えること、できあがったページが開き直した engine のページと一致することを確かめる（`TDOM_REBUILD_UNITS_ALWAYS=1` では落ちる）。
+
+## 10.4n 後ろのページを全部動かす打鍵：近いページだけ先に、残りは小分けで
+
+段落が 1 行増える（減る）打鍵は、その後ろの改ページすべてをまたいで 1 行ずつ送る。改ページを強制するもの（章の切れ目など）に当たるまで、後ろのページは全部変わる。191 ページ・2,600 段落の 1 つの流れの中ほどでは 96 ページである。ここに 3 つの問題が重なっていた。
+
+- **engine**: その打鍵の中で 96 ページの display list を作っていた（`paginate` 段 150〜190 ms。打鍵に答える thread の上）。
+- **server**: 96 ページの list を 1 つの event（18 MB）で送っていた。event stream は 1 client あたり 8 MB より多く溜めると接続を切る（`SSE_MAX_BUFFER`。止まった client のために溜め続けないための上限）。この event はそれを超えるので、**viewer の stream が切られ、EventSource が繋ぎ直すまでの約 3 秒、どの打鍵も紙面に出なかった**（packaged app、70 打鍵のうち行が増えた打鍵から 20 打鍵）。切られた event の中身（後ろのページ）は viewer に届かないままだった。
+- **viewer**: 届いたページは見えていなくても全部組み立てていた（markup、parse、差し替え、browser の layout）。stage は revision ごとのものなので、commit されるまでは打鍵のたびに作り直してもいた。
+
+直したのは 3 か所である。
+
+- **1 回の update が作る display list は、編集位置に近い 4 ページまで**（`page-patches.js` の `buildPagePatches` の `limit`、`EAGER_PAGES`）。残りのページは「owed」として、viewer が今その番号のページに何を表示しているか（最後に送った list の hash）だけを覚える。engine は打鍵の合間に 4 ページずつ作って async の経路（`kind: 'patches'`）で送る（`engine-v3.js` の `#pumpOwedPages`。直前の編集位置に近いページから。update が走っている間は待つ）。owed のページは、後から作った list が viewer の表示と同じなら送らない。次の打鍵は自分のページだけを作り、まだ owed のページは pump に任せる。headers が全ページで変わったとき・async の到着が後ろを全部動かしたとき（`async-repaginate.js`）も同じ扱いになる。boot は従来どおり全ページを一度に作る。`getDisplayLists()`（`/doc`）は owed のページの list もその場で作って返す。`TDOM_EAGER_PAGES=0` で従来どおり全部一度に、`=<n>` で枚数を変える。
+- **viewer は、4 ページ以上を組み立てる update では、pane に近くないページを組み立てない**（`web/app.js` の `renderPage` の `mayDefer`、`nearSight`）。見えているページから 2 ページより遠いページは、中身を持たない stage になる（まだ何も表示していない shell も同じ。長い文書では、scroll したことのないページの多くは空の shell で、canonical の絵も近づいたときに読む）。commit にとっては「見えていない、まだ ready でないページ」で、何とも結ばれず、今の表示を保つ（§4.5 の `away`。exact pixel を待つ見えないページと同じ）。scroll・resize で pane に近づいたら、後回しにした list で組み立てる（`stageDeferredNearSight`）。canonical のページが先に届けば組み立てない。shell がまだ無いページ（文書の最初の表示）は従来どおり全部組み立てる。紙面上の editor が開いている間は後回しにしない（そのときの commit は全ページを一緒に替えるので、後回しのページがあれば先に組み立てる。canonical がまだ無く layout 待ちのページがある間も同じ）。`globalThis.__tdomStageAllPages = true` で常に全部。
+
+- **stream の上限は、書く前に見る**（`server.js` の `writeEvent`）。上限は「読んでいない client」のためのものなので、その client がまだ受け取っていない量で判断し、いま書く event の大きさは数えない。追いついている client には、どんな大きさの event も 1 つは届く（長い文書の reboot は今も全ページを 1 つの update で送る）。
+
+engine だけの計測（上の文書、行が増える打鍵）: 223 ms → 39〜44 ms（`paginate` 193 → 10〜11 ms）、その打鍵の report は 17.9 MB → 0.75 MB。残りの 92 ページは 23 回の event（最大 0.77 MB）に分かれ、打鍵の 0.3〜0.4 秒後までに届く。届いた list を順に当てはめた結果は、engine の全ページの list と一致する。`tests/owed-pages.test.js` は `buildPagePatches` の規則を場合ごとに確かめ、TeX を通して「打鍵の応答は近い 4 ページ、残りは後から、全ページが届く、開き直した engine のページと行が一致する」を確かめる。`tests/deferred-pages.test.js` は viewer 自身の stage・commit の code で、近いページだけが組み立てられ、後回しのページが表示を保ち、近づくと組み立てられることを確かめる。
+
+## 10.4o 打鍵のたびに全 block・全ページをなめていた小さな処理
+
+2,600 block・191 ページの文書の engine の profile に、1 つ 0.5〜1.3 ms の「全部を見る」処理が並んでいた。どれも結果は変えずに、見なくてよいものを見ないようにした。
+
+- **`queueMovedOffsets`**（`rescue-offsets.js`。`pagectx` 段のすべて）: rescue されていない block について「package の breakable な箱を開くか」を見るために、全 block の galley の item をたどっていた。文書の package がそういう箱を 1 つも作らない（判定の正規表現が無い）なら、rescue されていない block には見るものが無い。1.3 ms。
+- **closure の memo**（`segmenter.js` の `documentBounds`）: block ごとの closure の結果は、literal な環境と conditional の集合が「同じ object」である間だけ使い回す。1 ファイルの文書では root の text が打鍵のたびに変わるので、集合も毎回新しく作られ、全 block の closure を毎回読み直していた。名前が同じなら前の集合をそのまま渡す。0.7 ms。
+- **`\includeonly` の検索**（`include-expander.js` の `includeOnlyFromSource`）: 行頭からの正規表現で root 全文を毎回走査していた。その語を含まない source は走査しない。0.45 ms（826 KB）。
+- **打ったページの近くの block**（`update-helpers.js` の `editPageRenderIds`。打鍵ごとに 3 回呼ばれる）: 全ページの全行を歩いていた。ページにある block の集合を、ページの行の list（作られた後は変わらない）と一緒に持つ。0.6 ms。
+- **units の stamp**（`units.js` の `rebuildUnits`。打鍵ごとに 3〜4 回、全 block）: 「chunk の世代・fidelity の世代・galley の hash」を block ごとに文字列につないで比べていた。3 つの値のまま比べる。
+
+## 10.4p 行が増えた次の打鍵と、開いた直後の打鍵
+
+§10.4n の後も、行が増えた打鍵の**次の**打鍵は 86〜121 ms かかっていた（普段は 23 ms）。engine は 0.3〜0.4 秒のあいだ 0.8 MB の event を 23 回送り、viewer は読むのに engine が作るより長くかかるので、次の打鍵の自分のページの event がその列の後ろで待っていた。owed のページは、**最後の打鍵から `OWED_QUIET_MS`（300 ms）経つまで送らない**（`engine-v3.js` の `#pumpOwedPages`）。打っている間は遠いページは古いままで、手が止まると届く。`TDOM_OWED_QUIET_MS=0` で間を置かない。
+
+開いた直後の最初の打鍵には、打鍵の外でできる仕事が乗っていた（191 ページの文書で、engine に入る前の `anchorBase` 6.3 ms、`segment` 7.5 ms（普段 2.5）、打鍵の後の `dom` 3.9 ms）。
+
+- **snapshot の entry を、組み直しをまたいで保つ**（`inspector.js`）。block を組み直す walk は、同じ箱の galley と、同じ中身の edit region の list を、別の object で渡してくる。entry の core は「galley が同じ object」「region の list が同じ object」のときだけ使い回していたので、walk が通った block は全部作り直しになり、前の snapshot と別の object になって、server は中身を JSON にして比べていた。label・reference が同じ galley（`sameGalleyParts`）、言っていることが同じ region の list（`sameRegionSpecs`）なら、同じ core・同じ entry のままにする。
+- **walk が静まったら snapshot を温める**（`engine-v3.js` の `#warmSnapshotSoon`）。打鍵の外で galley を adopt したら、150 ms 何も adopt されず update も走っていない時点で `getDOM()` を 1 回呼ぶ。walk が通った block の確かめ直し（1 block 1.7 µs）は、最初の打鍵の手前（`anchorBase` は打鍵の前の snapshot を取る）ではなく、ここで済む。
+- **closure の判定を最初の読み込みで残す**（`update-prepare.js`）。block ごとの closure の memo は block があるときだけ作っていたので、開いた直後は空で、最初の打鍵が全 block を判定していた（2.2 ms）。最初の読み込みでも作る（そこでは何も保留しない）。
+- `editPageRenderIds` が呼ばれるたびに作っていた「文書の block の id の集合」を、block の list と一緒に持つ（list は update のたびに新しく作られ、書き換えられない）。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。
@@ -174,22 +372,32 @@ body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironm
 
 ## 10.6 deferred chain
 
-`#queueChainWork(kind, from, labels)` は `settle` または `rebuild` を `pendingChain` に登録する。
+`#queueChainWork(kind, from, labels, queuedAt, through = from)` は `settle` または `rebuild` を `pendingChain` に登録する。
 
 | kind | 内容 |
 | --- | --- |
 | `settle` | counter などの動いた exit state を下流へ追い、clean block で一致したら止まる |
 | `rebuild` | suffix を信用せず、下流を serial に再組版する |
 
-`#scheduleBackground()` は、編集後 300ms の idle gate を待ってから `#runChainPass()` を lock 内で走らせる。次の編集が来ると `bgAbort` で止まり、進捗位置から後で再開する。
+`#scheduleBackground()` は、編集後 300ms の idle gate、または最初の登録から `TDOM_CHAIN_MAX_STALE`（既定2000ms）の期限を待って `#runChainPass()` を lock 内で走らせる。登録時刻 `queuedAt` は仕事の合流・中断・cold carry の再登録でも引き継ぐ。期限を過ぎた仕事は打鍵間の空き時間で再開し、新しい打鍵による preemption と lock の優先順位は維持する。期限は開始の待機上限で、伝播全体の完了時間ではない。最低優先の grid 充填には期限を適用しない。次の編集が来ると `bgAbort` で止まり、進捗位置から後で再開する。最後の round の後に仕事が残り、pass が前に進んでいれば（grid は境界を実体化した数で見る）、同じ gate の後ろで次の task を走らせる（無操作のまま 8 回まで）。進んでいない grid の計画は捨て、次の予約で `gridMissing` から立て直す（以前は残った仕事を次の編集まで誰も走らせず、chain を待つ呼び出しが止まった）。
 
-settle は `from`（入口 state が古い最初の block）より前の block では収束を判定しない。`from` の境界が退役していると pass はその手前の checkpoint から再生するが、そこで galley と exit state が一致しても、foreground が更新済みの block を再現しただけで、動いた state が収まった証拠にはならない（cold resume が何度か走ると、その pin が `editHold` から押し出されて起きる）。
+settle は再開位置 `from` に加え、合流した伝播の最も後ろの未検証位置 `through` を保持する。新しい仕事との合流では `from` の最小値と `through` の最大値を残し、両方を編集による index 変更と cold carry に引き継ぐ。収束は両位置を通過してから判定する。早い位置で再現できた clean block だけでは、離れた後続の伝播が完了した証拠にならない。`from` の境界が退役していると pass はその手前の checkpoint から再生するが、そこで galley と exit state が一致しても、foreground が更新済みの block を再現しただけで、動いた state が収まった証拠にはならない（cold resume が何度か走ると、その pin が `editHold` から押し出されて起きる）。
+
+`settle` / `rebuild` の blocks phase は `from` の continuation を所有し、cap と off-grid 回収の両方から保護する（`propagationCheckpointHold`）。Shipping 有効時は共有予算の optional coverage を先に減らし、無効時は既存の grid・edit/render hold に追加して保持する。次の編集がページ内の境界で `editHold` の 8 枠を埋めても、この所有権は残る。数値の `from` だけを保存すると、その continuation の回収後は古い grid 境界から同じ区間を再生する。低い ceiling で打鍵間に次の grid 境界まで届かない場合、この再生が入力停止まで繰り返されていた。再生途中で中断し `from` を手前へ戻すときは、元の `from` を `through` にも残す。更新済みの prefix を再現しただけで未検証の suffix まで収束したと判定しないためである。打鍵による JOB の中断と lock の優先順位は変わらない。
+
+label が動いた伝播中に CAPTURE 可能な block の exact chunk が古い／未作成なら、`work.render` に block id・galley hash・入口境界を記録し、入口と出口を保持する。既存 render pump の `propagation` 項目は idle gate と通常の編集 cohort の待機を通らず、既存の並列数制限内で先に処理する。chain は 5ms ごとに中断を確認しながらその項目を待ち、次の打鍵が中断したら同じ所有者から再開する。CAPTURE が中断され RENDER へ戻る場合も、galley の JOB が使った volatile state・label 定義を含む prelude を再利用する。入口も出口も先に回収してしまうと、番号を更新した galley の画素が「入力停止から 3 秒後」の isolated render に回っていた。すでに foreground が galley を更新した block も、画素が古ければこの対象になる。
 
 ## 10.7 references と toc
 
 label が動いたとき、後方で定義された label を前方 block が参照していることがある。foreground 中に `pendingChain` が無ければ、ref index から候補 block を取り、必要なものだけ再組版する。
 
-`toc` は provisional pagination から `.toc` 内容を合成し、hash が動けば toc consumer block を再組版する。最大 3 pass である。chain work が pending のときは、`#chainAfterPass()` 側で同じ処理を行う。
+`toc` は provisional pagination から `.toc` 内容を合成し、hash が動けば toc consumer block を再組版する。最大 3 pass である。chain work が pending のときは、`#chainAfterPass()` 側で同じ処理を行う。編集（boot・reboot・retry 以外）で目次が動いたときは、編集した block の載るページに目次が無ければ、この場で組み直さず `engine.tocOwed` を立てる（`deferToc`）。scheduler は打鍵が止まって quiet gate を過ぎてから目次の block から settle を積み、`#chainAfterPass()` が同じ固定点を回して公開する。すぐ積まないのは、編集 block より前から始まる chain work が pending だと、以後の打鍵が prose keystroke として扱われず、後ろの block の検証を待ってから見せることになるため。非同期の再ページ割りが見つけた目次のずれも同じく owed にする。`#chainAfterPass()` は目次の block を組み直し終えてから `tocHash` を更新する（途中で打鍵に止められたら、次の pass がもう一度組む）。打鍵が止まって積まれた目次だけの settle（`tocOnly`）は、終わる前に打鍵が来れば owed に戻す（積まれたままだと、以後の打鍵はまた後ろの段落の検証を待つ）。打鍵が続いている間（最後の打鍵から 300 ms 以内）に期限切れで始まった pass も、目次は組まずに owed にして残す（目次の組み直しは本で 0.5 s かかり、打鍵の合間ごとに始まっては次の打鍵に止められていた）。prose keystroke の判定は、labels の無い after 段の settle（残りは目次だけで、`plainBlockId` が残っていれば後ろの段落は変わらなかった）を妨げにしない。72 ページの本で行が 1 行増える打鍵は、見出しが次のページへ移って目次の組み直しに 0.5〜3.7 s かかり、後ろの打鍵もそれを待っていた。
+
+## 10.7a 柱とノンブルの job が届いたとき
+
+見出しが別のページへ移る、ページ数が変わる、といった編集のあとは、柱とノンブルを組む job（`header-scheduler.js`）が走り、届くと `asyncRepaginate` が display list を作り直す。作り直すのは、**そのページ自身の柱・ノンブルが変わったページだけ**である（`header-footer.js` の `pageHfSig`。ページの display list は `dl.hfSig` に自分のページの entry の署名を持ち、`buildPagePatches` はそれが変わったページだけを組み直す）。
+
+以前は map 全体の署名で比べていたため、job が届くたびに全ページの display list を、打鍵を受けるスレッドの上で一度に作り直していた（72 ページの本で 20〜45 ms。柱が変わったのは数ページ）。段落に 1 行足す打鍵のたびに起きる。最初の job（open 直後。全ページが仮のノンブルから本物の柱へ変わる）は今も全ページを作り直す。
 
 ## 10.8 page-context rescue
 
@@ -198,6 +406,18 @@ label が動いたとき、後方で定義された label を前方 block が参
 `mdframed` や breakable `tcolorbox` のような block は、page 上の offset によって分割結果が変わることがある。
 
 現行実装は foreground で長い re-rescue chain を走らせない。`#queueMovedOffsets()` が offset 差分を見て rescue queue に積み、exact pipeline が async に fixed point へ近づける。表示中は stale galley/chunk と canonical overlay が残る。
+
+rescue pump は一度に一件だけ処理する。編集・caret の対象ページの rescue は quiet gate を通らず、foreground 完了と caret focus の更新で待機を即座に解除する（`rescue-scheduling.js`）。起床後に対象 id と最新の cache key を読み直し、待機中の編集や別 block の cold resume があれば再び譲る。backlog は従来の800ms（有効な shipping baseline があれば shipping 優先窓）を保持する。200ms の poll は通知のない状態変更のための上限であり、編集完了後に必ず払う待ち時間ではない。
+
+multicols の内側は段落や textbox ごとに分割せず、一つの layout block として実 output routine で組み直す。この rescue は resident RENDER の120ms gate、isolated **render** の3秒 gateとは別経路である。救済PDFが完了した後の SVG 変換は `iso-pages.js` の2レーンで処理し、全ページが揃ってから従来どおり galley/chunk を採択する。変換失敗時も実行中のもう一件を待ってから失敗を返すため、cold retry やディレクトリ削除と競合しない。ページ数によらず converter は最大2本、ISO組版は直列のままである。
+
+real-output root は接続を通知する前に、その sibling 内の捨てる box で標準の `large`・`Large` の roman/sans/bold を準備する。ISO child が毎回見出し用フォントを初期化する費用を起動時へ移す。通常の resident checkpoint はこの準備を通らず、font attribute の識別子も従来どおりである。root の前文・寿命・保持数は変えず、本文の箱・counter・label・列幅を再利用する機構ではない。`TDOM_ISO_FONT_WARM=0` で停止できる。
+
+ISO の `DONE` は `stop_run` で stdio を flush してから送る。`finish_pdffile` は font stream と EOF の生成より前なので完了通知には使わない。受信側の EOF 検査は残すが、正常終了では25msのreadiness pollを待たない。
+
+複数ページの救済PDFは、`iso-page-cache.js` が `qpdf` のJSONからページごとの完全な描画入力を照合する。内容streamだけでなく、font本体、image、form、継承されたresources・用紙寸法・crop・rotationと、その間接参照先をSHA-256に含める。counter・label・列幅・fontの変更は、今回LuaLaTeXが生成したPDFの変化として判定する。任意のTeX状態から未変更を推測しない。未知のcatalog機能、循環・欠損参照、解析の上限超過、`qpdf`不在・失敗は全ページ変換へ戻る。再利用するのは同じページ番号のSVG bytesだけで、今回のPDF・編集座標・galleyと完成bundleの採択は従来どおり更新する。
+
+cache はengineごとに最大8MiB・64ページで、終了時に解放する。`TDOM_ISO_PAGE_CACHE=0` は無効化、`TDOM_ISO_PAGE_CACHE_VERIFY=1` はcache hitも再変換し、全SVG bytesの一致を検査する。`tools/bench-rescue-latency.mjs` は変換数・cache hit/miss・DONE時のEOFを記録し、`--import ./tools/profile-iso.mjs` は計測専用の環境・font・shipout別wall/CPU/heap標本を残す。
 
 ## 10.9 壊れた TeX の凍結と決定性の境界
 
@@ -222,7 +442,7 @@ hot path の最後に `#shipUpdate(source)`、`canonical.schedule(source, srcRev
 
 `#scheduleBackground()` は chain と resident render を予約する。
 
-- pending chain があれば idle 後に chain pass を走らせる。
+- pending chain があれば idle または伝播の待機期限後に chain pass を走らせる。
 - 編集した source block と同じページの exact block は、foreground walk の前に input/capture 境界を最大8個保持する。walk 後にも未変更の exact neighbor を描画 queue に加える。boot で queue に入らなかった render hold と、描画済みの hold は通常の checkpoint 上限へ戻し、保持を再作成しない。
 - dirty block 数が `TDOM_RENDER_HOT_MAX` 以下なら、needsRender な hot block を resident exact-render queue に積む。display math と native closure 済みの graphics（float/insert/eject を含まないもの）は foreground JOB の node list を post-block checkpoint に世代付きで保持し、queue 側は CAPTURE を先に試す。これにより block source の二重組版を避ける。保持 list が退役・世代不一致なら、pre-block checkpoint の従来 RENDER へ自動 fallback する。
 - resident の PDF descriptor は boot で読み書き可能にし、各 JOB/CAPTURE/RENDER/ISO fork の直前に現在の bytes と位置を匿名ファイルへ複製する。子だけが複製先を継続し、出力時に専用 job directory へ移す。TikZ/hyperref が先に PDF object を作っていても cold compile は不要。装飾は過去画像を再利用せず、その編集で組版した node list を ship する。graphics の chunk identity には source hash も含め、寸法を変えない色・underlay 編集でも再描画する。エラーで凍結した galley は以前の paint identity を維持する。
@@ -234,7 +454,7 @@ display list は本文 glyph と行単位の exact chunk を別素材として�
 
 各 edit report と async patch は、その時点の font manifest を page patch と同時に送る。client は新しい `@font-face` を登録し、face の decode が完了するまでページ群の提示を待つ。画面外の準備中に該当 run が透明でも、表示中の完成ページは保持する。
 
-`canonical.schedule()` は source/rev を保存して timer を張るだけで、full `lualatex` compile は edit response を待たせない。完成した provisional 面を提示できる structured モードでは、初回だけ `debounceMs`（既定2500ms）で baseline を取得し、以降は最終編集後の `idleMs`（既定30s）とコスト比例 cooldown（factor 2、cap 600s）を満たしてから確定する。opaque モードでは `displayDebounceMs`（既定350ms）と display cooldown（factor 1、cap 60s）を使い、長文書の連続再組版を抑える。
+`canonical.schedule()` は source/rev を保存して timer を張るだけで、full `lualatex` compile は edit response を待たせない。完成した provisional 面を提示できる structured モードでは、初回だけ `debounceMs`（既定2500ms）で baseline を取得し、以降は最終編集後の `idleMs`（既定30s）か、正本に未反映の最古の編集から `maxStaleMs`（`TDOM_CANON_MAX_STALE`、既定20s）の早い方で予約する。いずれもコスト比例 cooldown（factor 2、cap 600s）を満たしてから開始する。20s は通常の打鍵ごとの再コンパイルを避けつつ、連続編集でも番号・参照・目次の更新機会を確保する間隔である。長い compile では cooldown が優先され、完了までには組版時間も加わる。初回 baseline の debounce にも同じ待機期限を掛ける。期限後の通常 authority compile は、新しい編集が来ても aux fixed point までの pass を打ち切らず、shipping の優先窓による停止も期限で解除する。実行中に届いた編集は、その最初の到着時刻を次の待機期限に引き継ぎ、次回 timer は完了時点の実測コストから cooldown を計算し直す。opaque モードでは `displayDebounceMs`（既定350ms）と display cooldown（factor 1、cap 60s）を使い、長文書の連続再組版を抑える。
 
 欠けた数式・不一致のページ構成・編集位置の未証明などで新しい紙面を提示できない場合、client は `POST /canonical/display-demand` に現在の `documentEpoch`・`srcRev`・表示側の `demandId` を送る。その版の既存予約だけを display cadence へ早め、追加の組版は作らない。完成したresidentページ群を実際に提示できたら同IDの `fulfilled: true` を送り、全表示側の需要が解消した未開始予約だけを通常のauthority cadenceへ戻す。待機の起点は最終編集時刻を保つ。同版を再び保留した場合やiframeを再作成した場合は新IDで再取得でき、遅延したfulfilledは別表示側の需要を消さない。IDは128文字、現在の版の既出IDは最大64件とし、同IDの重複はtimerを延長・再有効化しない。開始済み・成功済み・失敗済みの組版を需要通知から追加・取消・再試行しない。需要は対象の完了・失敗・別版への更新・文書resetで終わり、後続の無関係な編集は通常のauthority cadenceに戻る。`canonical.info()` の `scheduledInMs` は予約までの残り時間、`compiling` は実組版中、`displayDemandRev` は需要対象の版を示す。`ensure()`（export 経路）は渡された snapshot だけを compile し、途中の打鍵を連続して追いかけない。
 
@@ -291,3 +511,15 @@ canonical anchor（plain・mixed 共通）の契約の前提（信頼境界）: 
 文字入力、MathLive の選択変更、スクロール、ズーム、リサイズは同じフレーム予約を共有する。位置の調整が必要なフレームでは、その調整とカーソル描画を一度に行う。クリックで確定した位置と新しい PDF geometry の採択は同期で反映し、古い描画予約を取り消す。
 
 未反映の入力に対しては、直前の紙面で証明したカーソル位置を保つ。新しいモデル全体の caret を計算してから捨てる処理は行わない。通常の選択表示はページ寸法を一度読み、全マーカーを detached fragment に作って一度で置き換える。選択文字数に比例して layout read と DOM write を交互に行わない。IME 未確定文字だけは、候補位置に必要な実ブラウザ寸法を表示後に読む。
+
+## 10.12a canonical のページの数式を click したとき、SyncTeX が段落末の行を返す場合
+
+canonical のページの click は、reverse SyncTeX が返した source の行から edit region を決める（`web/app.js` の `resolveOpaqueEditRegion`）。数式は「その行を含む math region」の中から、forward SyncTeX の箱が click 点を含むものを選ぶ。
+
+段落によっては、inline 数式の node が自分の行を持たない（同じ段落に verbatim 風の macro がある 72 ページの本の段落で確認。標準の `synctex edit` でも同じ）。数式の上を click しても SyncTeX は段落を終えた行（直後の空行）を返し、その行を含む math region は無いので、何も開かなかった。forward SyncTeX もその数式の位置を返さない。
+
+- **ink で探す**（`inlineMathCopies`・`inlineMathUnderPoint`）。SyncTeX の答えには、その行を持つ箱（`anchors`）が付いてくる。段落を終えた行の箱は、その段落の印字行である。返った行を含む block、またはその行の直前（2 行以内）で終わる block の inline 数式について、数式自身の glyph（math field が並べたもの）を、その印字行の範囲に印字された glyph の中から探す（`TdomDirectEditGeometry.mathMaps`）。**その数式が、source にある回数とちょうど同じ回数だけ印字されているときだけ**採る。そのとき印字の順（行、次に左から）が source の順であり、pointer の下の copy がどの数式かが決まる。本文の数字や参照番号など、同じに見える ink が他にあれば回数が合わず、何も開かない（従来どおり）。この経路は、従来の探し方が何も見つけなかったときだけ通る。
+- **次の canonical へ付いていく**（`inlineMathBoundsByInk`、`stageDirectEditorForOpaqueBatch`）。開いている editor は、新しい canonical のページが届くたびに、新しい世代の同じ region の位置へ移される。その位置も forward SyncTeX で求めていたので、この種の数式では見つからず、editor が閉じられていた。ink で開いた editor（`openedByInk`）は、前の世代で数式があった点を新しい世代の reverse SyncTeX に尋ね、同じ方法で数式の copy を探す。
+
+`tests/inline-math-click.test.js` は、math field と glyph の照合を代役にして、採る・採らないの規則（回数が合う、同じ数式が 2 つ、数式の中の数式、範囲の外、display 数式）と、次の世代への追従を確かめる。packaged app では、72 ページの本の該当の `$2$` を実際に click して editor が開き、4 打鍵、9 秒の休止、さらに 2 打鍵がすべて source の 36 行の数式に入ることを確かめた。小さな文書の通常の数式 click（12 打鍵）は変わらない。
+

@@ -1,5 +1,13 @@
 import { maybeHoldRenderCheckpoint } from './render-hold.js';
 
+// A resumed propagation owns its continuation even when the next edit's
+// page fills every edit pin. Shipping's shared cap charges these owners
+// against optional coverage; without Shipping they are additional pins.
+export function propagationCheckpointHold(work) {
+  return work?.phase === 'blocks' && (work.kind === 'settle' || work.kind === 'rebuild')
+    ? [work.from, ...(work.render ? [work.render.from, work.render.from + 1] : [])] : [];
+}
+
 export function distinctCheckpointPeerCount(checkpoints) {
   return new Set(checkpoints.values()).size;
 }

@@ -224,7 +224,15 @@ function maskIgnored(source) {
   const at = (i) => (blank[i] && source[i] !== '\n' && source[i] !== '\r' ? ' ' : source[i]);
   for (const match of source.matchAll(LITERAL_RE)) mark(match.index, match.index + match[0].length);
 
+  // (only a percent sign or a backslash that is not blanked does anything
+  // here: the scan goes from one to the next instead of character by
+  // character. 800 KB of a single-file document cost 1.5 ms a keystroke.)
+  const next = /[%\\]/g;
   for (let i = 0; i < source.length; ) {
+    next.lastIndex = i;
+    const hit = next.exec(source);
+    if (!hit) break;
+    i = hit.index;
     const c = at(i);
     if (c === ' ') {
       i++;
@@ -379,15 +387,14 @@ function addDefinition(
   defs.set(key, record);
 }
 
-function collectDefinitions(source) {
+export function collectDefinitions(source) {
   const masked = maskIgnored(source);
   const defs = new Map();
   const spans = [];
   for (let i = 0; i < masked.length; ) {
-    if (masked[i] !== '\\') {
-      i++;
-      continue;
-    }
+    // (from backslash to backslash: nothing else starts a definition)
+    i = masked.indexOf('\\', i);
+    if (i < 0) break;
     const command = readControl(masked, i);
     if (!command) {
       i++;
@@ -963,16 +970,24 @@ function maskSpans(source, spans) {
 }
 
 function usedStructuralAliases(bodyInfo, defs) {
-  const source = maskSpans(bodyInfo.masked, bodyInfo.spans);
   const found = [];
+  // (a use is only ever recorded for a definition that may reach a sink:
+  // with none in the document there is nothing to look for)
+  let reaching = false;
+  for (const record of defs.values()) {
+    if (record?.may?.size) {
+      reaching = true;
+      break;
+    }
+  }
+  if (!reaching) return found;
+  const source = maskSpans(bodyInfo.masked, bodyInfo.spans);
   const exactMemo = new Map();
   const unresolvedMemo = new Map();
   const selfContainedMemo = new Map();
   for (let i = 0; i < source.length; ) {
-    if (source[i] !== '\\') {
-      i++;
-      continue;
-    }
+    i = source.indexOf('\\', i);
+    if (i < 0) break;
     const control = readControl(source, i);
     if (!control) {
       i++;
@@ -1045,6 +1060,72 @@ export function classifyStructuralAliases(preamble, body) {
   propagate(defs);
   const preambleUses = usedStructuralAliases(preInfo, defs);
   const uses = usedStructuralAliases(bodyInfo, defs);
+  return classification(defs, preambleUses, uses);
+}
+
+// The same verdict for a body given as its blocks, in order. A keystroke
+// changes one of them: the scan of every other block is kept (one letter in
+// a 389-page book re-read 1.6 MB of source, about 80 ms). A block is scanned
+// on its own, which is what the joined text gives too: blocks are joined by a
+// blank line and each closes its own groups.
+let blockScan = null; // { infos: Map(text -> info), signature, uses: Map(text -> found) }
+export function classifyStructuralAliasesOfBlocks(preamble, texts) {
+  const preInfo = collectDefinitions(preamble);
+  const infos = new Map();
+  const defining = [];
+  for (const text of texts) {
+    let info = infos.get(text);
+    if (!info) {
+      info = blockScan?.infos.get(text) ?? collectDefinitions(text);
+      infos.set(text, info);
+    }
+  }
+  // Definitions are document-wide: every use is judged against all of them.
+  const bodyDefs = new Map();
+  for (const [text, info] of infos) {
+    if (!info.defs.size) continue;
+    defining.push(text);
+    for (const [key, record] of info.defs) {
+      const have = bodyDefs.get(key);
+      if (!have) {
+        // (a copy: merging and propagation write into the records)
+        bodyDefs.set(key, { ...record, bodies: [...record.bodies], direct: new Set(record.direct),
+          deps: new Set(record.deps), may: new Set(record.may) });
+        continue;
+      }
+      if (have.definitionKind !== record.definitionKind) have.definitionKind = 'ambiguous';
+      have.bodies.push(...record.bodies);
+      for (const sink of record.direct) have.direct.add(sink);
+      have.start = Math.min(have.start ?? record.start, record.start);
+      have.end = Math.max(have.end ?? record.end, record.end);
+    }
+  }
+  // A block that defines the same name twice in different ways is already
+  // 'ambiguous' in its own record; across blocks the loop above says so.
+  const defs = new Map();
+  mergeDefinitions(defs, preInfo.defs);
+  mergeDefinitions(defs, bodyDefs);
+  propagate(defs);
+  const preambleUses = usedStructuralAliases(preInfo, defs);
+  const signature = [preamble, ...defining].join('\u0000');
+  const kept = blockScan?.signature === signature ? blockScan.uses : null;
+  const usesByText = new Map();
+  const uses = [];
+  let offset = 0;
+  for (const text of texts) {
+    let found = usesByText.get(text);
+    if (!found) {
+      found = kept?.get(text) ?? usedStructuralAliases(infos.get(text), defs);
+      usesByText.set(text, found);
+    }
+    for (const use of found) uses.push(offset ? { ...use, at: use.at + offset } : use);
+    offset += text.length + 2;
+  }
+  blockScan = { infos, signature, uses: usesByText };
+  return classification(defs, preambleUses, uses);
+}
+
+function classification(defs, preambleUses, uses) {
   const implicitPageBindings = [...defs.values()].filter((record) =>
     ['\\output', '\\shipout', '\\RawShipout'].includes(record.key)
   );

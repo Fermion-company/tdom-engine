@@ -1,5 +1,6 @@
 import { clearShipPacing } from './ship-pacing.js';
 import { makeChunkMap } from './constructor-state.js';
+import { LabelTable } from './label-table.js';
 
 export function resetOpenState(engine, text, file) {
   engine.shipDocumentEpoch = (engine.shipDocumentEpoch ?? 0) + 1;
@@ -31,7 +32,7 @@ export function resetOpenState(engine, text, file) {
   engine.canonicalPageCount = null;
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
-  engine.labelTable = new Map();
+  engine.labelTable = new LabelTable();
   engine.hrefTable = new Map();
   engine.blockLabelIdx = new Map();
   engine.blockRefIdx = new Map();
@@ -43,6 +44,7 @@ export function resetOpenState(engine, text, file) {
   // a fresh document gets a fresh chance at the structured layer
   engine.mode = 'structured';
   engine.modeReasons = [];
+  engine.structuredBootError = null;
   engine.previewPolicy = 'structured';
   engine.previewReasons = [];
   // An opaque predecessor left the canonical at display pressure; the new
@@ -68,10 +70,19 @@ export function resetOpenState(engine, text, file) {
   engine.renderHold = new Map();
   engine.coldPreviewHolds = new Map();
   engine.coldDirty = new Set(); // a cold keystroke of the previous document never resumes here
+  // the previous document's rescue previews and held renders (#103)
+  engine.coldRescuePreviews = new Map();
+  engine.coldPreviewAdopted = new Map();
+  engine.heldRenders = new Map();
+  engine.heldRenderIds = new Map();
+  engine.heldFocus = null;
+  // the previous document's isolated compiles do not hold this one's up
+  engine.isoSerial = null;
   engine.coldTrace = null;
   engine.rescueQueue = new Map();
   engine.rescueFocus = new Set();
   engine.tocHash = null;
+  engine.tocOwed = false;
   engine.hf = new Map();
   engine.hfSig = null;
   engine.hfPending = null;

@@ -26,6 +26,7 @@ import {
   withReplaceablePreviewJob,
 } from '../engine/checkpoint/build-lease-preview.js';
 import { abortBackgroundJob } from '../engine/checkpoint/abort-background-job.js';
+import { scheduleBackground } from '../engine/checkpoint/background-scheduler.js';
 import { classifyDocument } from '../engine/checkpoint/safety.js';
 import { sourceClosure } from '../engine/checkpoint/closure.js';
 import { classifyStructuralAliases } from '../engine/checkpoint/structural-aliases.js';
@@ -33,7 +34,9 @@ import { ShippingChain } from '../engine/checkpoint/shipping.js';
 import { makeShippingChain, shippingInputState } from '../engine/checkpoint/shipping-manager.js';
 import { renderIsolatedBlock } from '../engine/checkpoint/isolated-render.js';
 import { isoCompile } from '../engine/checkpoint/iso-compile.js';
-import { segmentBody } from '../engine/segmenter.js';
+import { segmentBody, diffBlocks } from '../engine/segmenter.js';
+import { preserveCheckpointSuffix } from '../engine/checkpoint/checkpoint-preservation.js';
+import { runUpdateTypesetPhase } from '../engine/checkpoint/update-typeset-phase.js';
 import { finalizeShippingExactUpdate } from '../engine/checkpoint/update-finalize.js';
 import { classifyResidentEdit } from '../engine/checkpoint/resident-edit-admission.js';
 import { plainPreviewWitness, canDeferPlainVerification } from '../engine/checkpoint/plain-preview.js';
@@ -78,6 +81,205 @@ const available = await promisify(execFile)('lualatex', ['--version'], { timeout
 const opts = available ? {} : { skip: 'lualatex not installed' };
 
 const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+function multiLocusFixture(indices = [2, 9, 16]) {
+  const oldBlocks = Array.from({ length: 20 }, (_, index) => ({
+    id: `b${index}`, text: `Paragraph ${index} with $x+1$ inline.`, hash: `h${index}`,
+    start: index * 100, end: index * 100 + 99,
+    galley: { closure: 'native', items: [], labels: [] },
+    galleyHash: `g${index}`, stateVec: '[0,0,0,0]', closure: { native: true },
+  }));
+  const segs = oldBlocks.map((block, index) => ({ ...block,
+    text: block.text + (indices.includes(index) ? 'x' : ''),
+    hash: block.hash + (indices.includes(index) ? 'x' : ''),
+  }));
+  const diff = diffBlocks(oldBlocks, segs, () => { throw new Error('unexpected new block'); });
+  const checkpoints = new Map(oldBlocks.map((_, index) => [index, { send() {} }]));
+  const preserved = preserveCheckpointSuffix({ checkpoints, renderHold: new Map(), editHold: indices,
+    bounds: diff.bounds });
+  const engine = { blocks: diff.blocks, ...preserved, pages: [], previewPolicy: 'structured',
+    coldDirty: new Set(), pendingChain: null, warmFocus: { id: 'b9' },
+    chunks: new Map(), maxCheckpoints: 8, labelTable: new Map(), hrefTable: new Map(),
+    labelCount: new Map(), vanishedLabels: new Set(), refIndex: new Map(), tocHash: 'toc',
+    foregroundRenderIds: new Set(diff.dirty), diagnostics: [] };
+  const visited = [];
+  const callbacks = {
+    nearestCheckpoint: (index) => Math.max(...[...engine.checkpoints.keys()].filter(key => key <= index)),
+    typesetBlock: async (index) => {
+      visited.push(index);
+      engine.checkpoints.set(index + 1, { send() {} });
+      return { ...engine.blocks[index].galley, hash: `g${index}${indices.includes(index) ? 'x' : ''}`,
+        stateVec: '[0,0,0,0]' };
+    },
+    adoptGalley: (block, galley) => {
+      block.galley = galley;
+      block.galleyHash = galley.hash;
+      block.stateVec = galley.stateVec;
+      engine.coldDirty.delete(block.id);
+    },
+    queueChainWork: () => { throw new Error('unexpected propagation'); },
+    retypesetChain: () => { throw new Error('unexpected dependency'); },
+    paginateNow: () => [], computeToc: () => ({ hash: 'toc' }), queueMovedOffsets() {},
+  };
+  const options = { oldBlocks, diff, dirtySource: diff.dirty, firstDirty: indices[0],
+    timer: { lap() {} }, defRe: /\\def\b/, callbacks };
+  return { engine, options, visited };
+}
+
+test('multi-locus: every changed region retains its input checkpoint', () => {
+  const { engine } = multiLocusFixture();
+  for (const index of [2, 9, 16]) {
+    assert.ok(engine.checkpoints.has(index), `input ${index} survived`);
+    assert.equal(!!engine.checkpoints.get(index).vstale, index !== 2);
+  }
+});
+
+test('multi-locus: fresh exact neighbors do not force replay between converged regions', async () => {
+  const { engine, options, visited } = multiLocusFixture();
+  for (const index of [5, 12]) {
+    Object.assign(engine.blocks[index], { needsRender: true, fidelity: { blockExact: true } });
+    engine.foregroundRenderIds.add(`b${index}`);
+    engine.chunks.set(`b${index}`, { forGalley: `g${index}` });
+  }
+  await runUpdateTypesetPhase(engine, options);
+  assert.deepEqual(visited, [2, 3, 9, 10, 16, 17]);
+  assert.equal(engine._typesetResult.verdict, 'clean');
+});
+
+test('multi-locus: a missing exact neighbor whose input is resident is held for its render, not replayed', async () => {
+  for (const held of [false, true]) {
+    const { engine, options, visited } = multiLocusFixture();
+    Object.assign(engine.blocks[5], { needsRender: true, fidelity: { blockExact: true } });
+    engine.foregroundRenderIds.add('b5');
+    if (held) engine.editHold.push(5);
+    await runUpdateTypesetPhase(engine, options);
+    assert.equal(visited.includes(5), false);
+    // an input nothing pinned yet is pinned now, so it outlives the walk
+    assert.equal(engine.renderHold.has(5), !held);
+  }
+  // without the checkpoint in front of it the block is replayed, as before
+  const { engine, options, visited } = multiLocusFixture();
+  Object.assign(engine.blocks[5], { needsRender: true, fidelity: { blockExact: true } });
+  engine.foregroundRenderIds.add('b5');
+  engine.checkpoints.delete(5);
+  await runUpdateTypesetPhase(engine, options);
+  assert.equal(visited.includes(5), true);
+});
+
+test('multi-locus: a real state ripple must cross clean blocks before skipping', async () => {
+  const { engine, options, visited } = multiLocusFixture();
+  const typeset = options.callbacks.typesetBlock;
+  options.callbacks.typesetBlock = async (index) => ({ ...await typeset(index),
+    stateVec: index >= 2 && index < 8 ? '[1,0,0,0]' : '[0,0,0,0]' });
+  await runUpdateTypesetPhase(engine, options);
+  assert.deepEqual(visited, [2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17]);
+});
+
+test('multi-locus native edits drain to a fresh engine after an intervening keystroke', opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-multi-locus-'));
+  const paragraphs = Array.from({ length: 24 }, (_, index) =>
+    `Locus${index} ordinary prose with $x+1$ inline. ` + 'A sentence to fill the line. '.repeat(8) +
+    (index === 7 || index === 15 ? '\n\n\\newpage' : ''));
+  const source = ['\\documentclass{article}', '\\begin{document}', ...paragraphs, '\\end{document}'].join('\n\n');
+  const engine = new CheckpointEngine({ workDir: path.join(root, 'edited') });
+  let finalSource, signature;
+  try {
+    await engine.open(source);
+    await drain(engine);
+    await engine.warmEditOffset(source.indexOf('Locus18'));
+    const ids = [2, 10, 18].map(index => engine.blocks.find(block => block.text.includes(`Locus${index} `)).id);
+    const oldHashes = ids.map(id => engine.blocks.find(block => block.id === id).galleyHash);
+    const edited = source.replace('Locus2 ', 'Locus2X ').replace('Locus10 ', 'Locus10X ').replace('Locus18 ', 'Locus18X ');
+    const report = await engine.edit(0, source.length, edited);
+    assert.equal(report.stats.multiLocus, undefined);
+    for (let index = 0; index < ids.length; index++) {
+      assert.notEqual(engine.blocks.find(block => block.id === ids[index]).galleyHash, oldHashes[index]);
+    }
+    const at = engine.getSource().indexOf('Locus18X') + 'Locus18X'.length;
+    const next = await engine.edit(at, at, 'Y');
+    await drain(engine);
+    assert.equal(engine.srcRev, next.srcRev, 'deferred work creates no source generation');
+    assert.equal(engine.coldDirty.size, 0);
+    finalSource = engine.getSource();
+    signature = engine.blocks.map(block => [block.galleyHash, block.stateVec]);
+  } finally {
+    await engine.close();
+    if (finalSource === undefined) rmSync(root, { recursive: true, force: true });
+  }
+  // One resident engine at a time on the shared 16GB development machine.
+  const fresh = new CheckpointEngine({ workDir: path.join(root, 'fresh') });
+  try {
+    await fresh.open(finalSource);
+    await drain(fresh);
+    assert.deepEqual(signature, fresh.blocks.map(block => [block.galleyHash, block.stateVec]));
+  } finally {
+    await fresh.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('propagation deadline survives repeated edits and resumes without another idle gate', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  const work = { kind: 'settle', from: 2, phase: 'blocks', labels: new Set(), queuedAt: Date.now() };
+  const engine = { pendingChain: work, bgAbort: false, editPending: 0, lastEditAt: Date.now(),
+    blocks: [], renderHold: new Map(), renderWant: new Set(), diagnostics: [] };
+  const starts = [];
+  const callbacks = {
+    locked: (fn) => fn(),
+    runChainPass: () => { starts.push(Date.now()); engine.bgAbort = true; },
+    enforceCheckpointCap() {},
+  };
+  // Every keystroke aborts and replaces the scheduler, as #update does.
+  for (let edit = 0; edit < 17; edit++) {
+    engine.bgAbort = false;
+    engine.lastEditAt = Date.now();
+    scheduleBackground(engine, [], callbacks);
+    assert.equal(starts.length, 0, 'the quiet gate still applies before the bound');
+    engine.bgAbort = true;
+    t.mock.timers.tick(120);
+    await engine.bgTask;
+  }
+  engine.bgAbort = false;
+  engine.lastEditAt = Date.now();
+  scheduleBackground(engine, [], callbacks);
+  assert.deepEqual(starts, [102_040], 'overdue work runs while keystrokes are still arriving');
+  await engine.bgTask;
+  engine.bgAbort = false;
+  scheduleBackground(engine, [], callbacks);
+  await engine.bgTask;
+  assert.equal(starts.length, 2, 'preemption does not restart the stale clock');
+  assert.deepEqual(engine.diagnostics, []);
+});
+
+test('propagation deadline keeps edit priority and leaves grid work idle-gated', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  const engine = { pendingChain: { kind: 'rebuild', queuedAt: 90_000 }, bgAbort: false,
+    editPending: 1, lastEditAt: Date.now(), blocks: [], renderHold: new Map(), renderWant: new Set(), diagnostics: [] };
+  let runs = 0;
+  const callbacks = { locked: (fn) => fn(), runChainPass: () => { runs++; }, enforceCheckpointCap() {} };
+  scheduleBackground(engine, [], callbacks);
+  await engine.bgTask;
+  assert.equal(runs, 0, 'an overdue pass cannot run ahead of a waiting keystroke');
+  engine.editPending = 0;
+  let grantLock;
+  callbacks.locked = (fn) => new Promise((resolve) => { grantLock = () => resolve(fn()); });
+  scheduleBackground(engine, [], callbacks);
+  engine.editPending = 1;
+  grantLock();
+  await engine.bgTask;
+  assert.equal(runs, 0, 'an edit arriving while the pass waits for the lock also wins');
+  engine.editPending = 0;
+  callbacks.locked = (fn) => fn();
+  engine.pendingChain = { kind: 'grid', queuedAt: 90_000 };
+  callbacks.runChainPass = () => { runs++; engine.pendingChain = null; };
+  scheduleBackground(engine, [], callbacks);
+  t.mock.timers.tick(299);
+  await Promise.resolve();
+  assert.equal(runs, 0, 'grid materialization gets no propagation deadline');
+  t.mock.timers.tick(25);
+  await engine.bgTask;
+  assert.equal(runs, 1, 'the ordinary idle gate still opens');
+});
 
 test('Build lease settles active preview jobs and gates queued replacements', async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-preview-build-lease-'));
@@ -2371,11 +2573,20 @@ sharedTest('steady-state keystrokes stay fork-once (edit-locus pin)', opts, asyn
     const r = await eng.edit(p, p + cur.length, next);
     worstWall = Math.max(worstWall, performance.now() - t0);
     worstBlocks = Math.max(worstBlocks, r.stats.blocksTypeset);
-    assert.equal(r.stats.chainVerdict, 'clean', 'a plain word edit must not queue chain work');
+    // A plain word edit queues no chain work beyond the verification of the
+    // block after it, which a prose keystroke leaves for after its answer
+    // (plain-preview.js).
+    assert.ok(r.stats.chainVerdict === 'clean' || r.stats.chainVerdict === 'verify',
+      `a plain word edit must not queue chain work (got ${r.stats.chainVerdict})`);
+    if (r.stats.chainVerdict === 'verify') {
+      assert.equal(eng.pendingChain?.plainBlockId, eng.blocks.find((b) => b.text.includes(next))?.id,
+        'only the neighbour verification is left');
+    }
   }
   assert.ok(worstBlocks <= 4, `edited + verification only (got ${worstBlocks})`);
   assert.ok(worstWall < 1500, `steady-state keystroke took ${worstWall.toFixed(0)}ms`);
   await drain(eng);
+  assert.equal(eng.pendingChain, null, 'the verification left behind finishes');
 });
 
 sharedTest('a tail edit right after a mid edit is NOT charged the distance', opts, async () => {
@@ -2390,6 +2601,7 @@ sharedTest('a tail edit right after a mid edit is NOT charged the distance', opt
   const mid = src.indexOf('MIDWORD');
   assert.ok(mid >= 0);
   await eng.edit(mid, mid + 'MIDWORD'.length, 'MIDWORQ');
+  const midBlock = eng.blocks.find((block) => block.text.includes('MIDWORQ'));
   // immediately — the old design would replay every block from mid to tail
   const tail = eng.getSource().indexOf('TAILWORD');
   assert.ok(tail >= 0);
@@ -2407,10 +2619,13 @@ sharedTest('a tail edit right after a mid edit is NOT charged the distance', opt
   // an edit in the LAST block hits end-of-document instead of a clean
   // verification block — that is convergence too, as long as nothing is
   // deferred
+  // (the mid edit's own neighbour verification may still be waiting: a
+  // prose keystroke leaves it for after its answer, plain-preview.js)
+  const onlyMidVerification = eng.pendingChain?.plainBlockId === midBlock?.id;
   assert.ok(
     r.stats.chainVerdict === 'clean' ||
-      (r.stats.chainVerdict === 'walked' && !r.stats.chainPending),
-    `no deferred work for a plain tail edit (got ${r.stats.chainVerdict})`
+      (r.stats.chainVerdict === 'walked' && (!r.stats.chainPending || onlyMidVerification)),
+    `no deferred work for a plain tail edit (got ${r.stats.chainVerdict}, pending ${JSON.stringify(r.stats.chainPending)})`
   );
   // revert both
   const t2 = eng.getSource().indexOf('TAILWORQ');
@@ -4064,4 +4279,57 @@ test('a cumulative patch carries every block of the lineage and refuses conflict
   assert.equal(mergeCumulativeAnchorPatch(own, [{ blockId: 'alpha', pages: alphaPages, visualCut: true }]), null);
   // nothing to merge keeps the patch untouched
   assert.equal(mergeCumulativeAnchorPatch(own, []), own);
+});
+
+
+for (const [what, packages, typed] of [
+  ['a box', ['\\usepackage{tikz}'],
+    '\\begin{tikzpicture}\\draw[fill=blue!10] (0,0) rectangle (9,2); \\node[text width=8cm] at (4.5,1) {Typed label TEXT};\\end{tikzpicture}'],
+  ['a paragraph with inline math', [],
+    'A paragraph with $\\int_0^1 x^2\\,dx = \\frac{1}{3}$ inline, whose Typed label TEXT grows.'],
+]) test(`${what} typed into continuously keeps showing its last exact generation while the newer text renders (tex64-internal #103)`, opts, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'tdom-held-exact-'));
+  const e = new CheckpointEngine({ workDir: path.join(root, 'work') });
+  const doc = [
+    '\\documentclass{article}', ...packages, '\\begin{document}',
+    'Opening paragraph before the drawing.', '',
+    typed, '',
+    'Closing paragraph after the drawing.', '',
+    '\\end{document}', '',
+  ].join('\n');
+  try {
+    await e.open(doc);
+    await e.renderTask.catch(() => {});
+    const box = () => e.blocks.find((b) => b.text.includes('Typed label'));
+    assert.ok(box()?.needsRender, 'the block needs exact pixels');
+    assert.equal(e.chunks.get(box().id)?.forGalley, box().galleyHash, 'painted before the burst');
+    // a burst: keystrokes 120 ms apart, each typed while the last renders
+    let held = 0;
+    let blocked = 0;
+    const seen = (patches) => {
+      const id = box().id;
+      const cmds = patches.flatMap((patch) => patch.displayList?.commands ?? []).filter((c) => c.src === id);
+      if (cmds.some((c) => c.op === 'pending-exact' || (c.op === 'chunk' && c.st))) blocked++;
+      else if (cmds.some((c) => c.op === 'chunk') && e.chunks.get(id)?.forGalley !== box().galleyHash) held++;
+    };
+    // the landed pixels of an earlier keystroke reach the page between updates
+    e.onAsyncPatches = ({ patches }) => seen(patches);
+    for (let k = 0; k < 24; k++) {
+      const at = e.getSource().indexOf('label TEXT') + 'label TEXT'.length + k;
+      const report = await e.edit(at, at, String.fromCharCode(97 + (k % 26)));
+      seen(report.patches);
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    e.onAsyncPatches = null;
+    assert.ok(held > 0, `the page laid the box out from a painted earlier generation (held ${held}, blocked ${blocked})`);
+    assert.equal(blocked, 0, 'no keystroke page was left waiting on the box');
+    // once typing stops the current text gets its own pixels, and the history goes
+    await e.renderTask.catch(() => {});
+    const until = Date.now() + 20_000;
+    while (Date.now() < until && e.chunks.get(box().id)?.forGalley !== box().galleyHash) await new Promise((r) => setTimeout(r, 50));
+    assert.equal(e.chunks.get(box().id)?.forGalley, box().galleyHash, 'the final text has its own pixels');
+  } finally {
+    await e.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

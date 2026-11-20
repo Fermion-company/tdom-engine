@@ -481,7 +481,11 @@ async function openPaced(work) {
           eng.canonicalPageCount !== eng.pages.length) && Date.now() - t0 < 120_000) {
     await new Promise((r) => setTimeout(r, 100));
   }
-  assert.equal(eng.shipping?.info?.().baselineReady, true);
+  if (eng.shipping?.info?.().baselineReady !== true) {
+    // a failed open must not leave its chain holding the test file open
+    await eng.close();
+    assert.fail('the paced document opens with its shipping baseline');
+  }
   return { eng, arrivals };
 }
 
@@ -526,9 +530,13 @@ test('a paintable keystroke holds its replay until typing pauses (tex64-internal
 
 test('an idle chain retires and the next caret move boots it again (tex64-internal #72)', opts, async () => {
   process.env.TDOM_SHIP = '1';
-  process.env.TDOM_SHIP_IDLE_MS = '2500';
+  // The short quiet period starts after the open: armed at the open itself,
+  // it retired the chain while the canonical pass was still arriving, and
+  // the open found no baseline (under load; the chain then leaked)
   const { eng } = await openPaced(path.join(WORK, 'idle'));
   try {
+    process.env.TDOM_SHIP_IDLE_MS = '2500';
+    await eng.warmEditOffset(eng.getSource().indexOf('Paragraph 2'));
     const t0 = Date.now();
     while (!eng.shipIdleRetired && Date.now() - t0 < 30_000) {
       await new Promise((r) => setTimeout(r, 100));
@@ -826,5 +834,60 @@ test('four healthy structural rebaselines do not exhaust shipping recovery', opt
     else process.env.TDOM_CANON_COOLDOWN = previousCanonicalCooldown;
     delete process.env.TDOM_SHIP_CATCHUP_MS;
     await eng.close();
+  }
+});
+
+test('a held keystroke in the block the held one changed does not ask the chain to cut the source again', async () => {
+  const { deferShipUpdate } = await import('../engine/checkpoint/ship-pacing.js');
+  let asked = 0;
+  const shipped = [];
+  const engine = {
+    srcRev: 1,
+    shipDeferred: null,
+    shipDeferTimer: null,
+    shipping: { replayableFrom: () => { asked++; return answer; } },
+  };
+  let answer = true;
+  const run = (text) => shipped.push(text);
+  const key = (text, block) => {
+    engine.srcRev++;
+    deferShipUpdate(engine, text, null, run, block);
+    clearTimeout(engine.shipDeferTimer);
+  };
+  try {
+    key('a', 'b7'); // nothing held yet: nothing to ask
+    assert.equal(asked, 0);
+    assert.deepEqual({ text: engine.shipDeferred.text, block: engine.shipDeferred.block }, { text: 'a', block: 'b7' });
+    key('ab', 'b7'); // the same block, the next revision
+    key('abc', 'b7');
+    assert.equal(asked, 0, 'typing on in one block never asks');
+    assert.equal(engine.shipDeferred.text, 'abc');
+    assert.equal(shipped.length, 0, 'and stays held');
+
+    // another block: the chain is asked, and a source it cannot replay in one unit ships the held text first
+    answer = false;
+    key('abc+x', 'b9');
+    assert.ok(asked > 0, 'asked');
+    assert.deepEqual(shipped, ['abc', 'abc+x']);
+    assert.equal(engine.shipDeferred, null);
+
+    // an update that changed more than one block in place carries no block: asked
+    shipped.length = 0;
+    answer = true;
+    key('p', 'b9');
+    asked = 0;
+    key('pq', null);
+    assert.equal(asked, 1);
+    key('pqr', 'b9'); // the held one carries no block
+    assert.equal(asked, 2);
+    // a revision between the two that this function never saw: asked
+    key('pqrs', 'b9');
+    assert.equal(asked, 2);
+    engine.srcRev++; // (an update that neither held nor shipped)
+    key('pqrst', 'b9');
+    assert.equal(asked, 3);
+    assert.equal(shipped.length, 0);
+  } finally {
+    clearTimeout(engine.shipDeferTimer);
   }
 });

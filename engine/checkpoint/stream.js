@@ -1,4 +1,13 @@
 import { parsePlacement } from './pagebuilder.js';
+import { exactFallbackCompatible, exactFallbackEligible } from './galley-adoption.js';
+import { composeExactLines } from './exact-parts.js';
+import { synthChunkFor, synthChunkKey } from './exact-synth.js';
+
+// TDOM_NO_EXACT_SYNTH=1: never put a formula's picture together (exact-synth.js)
+const NO_SYNTH = !!process.env.TDOM_NO_EXACT_SYNTH;
+// TDOM_EXACT_WHOLE_LINES=1: an exact line whose block has its own picture is
+// shown from that picture whole, text included, as it was before 2026-11-19.
+const WHOLE_LINES = !!process.env.TDOM_EXACT_WHOLE_LINES;
 
 /**
  * galley items -> the page builder's input stream. The items ARE the real
@@ -8,18 +17,75 @@ import { parsePlacement } from './pagebuilder.js';
  * cached per block (unitsSig), so page identity survives unrelated edits.
  */
 export function buildStream(block, chunks) {
-  const galley = block.galley;
-  const items = galley?.items ?? [];
-  const floats = galley?.floats ?? [];
-  const fid = block.fidelity;
   // Fidelity display policy (best available first):
   //   fresh chunk > STALE chunk (the previous edit's TeX pixels — old but
   //   clean) > glyph bridge (only where every glyph is at least mappable)
   //   > blank (no-bridge lines, canonical-only blocks).
   // A fast-but-wrong display is never an option; a ~100ms-old exact one is.
   const bc = chunks.get(block.id);
-  const bcFresh = !!bc && bc.forGalley === block.galleyHash;
-  const blockExact = !!(block.gfx || fid?.blockExact);
+  // A block whose current galley is still being rendered is laid out from
+  // the newest earlier galley whose pixels have landed (galley-adoption
+  // holdExactGalley): lines, pixels and fidelity of one generation, a
+  // keystroke behind the text, instead of a page held until the typing
+  // stops (#103).
+  if (bc?.forGalley === block.galleyHash && block.exactHistory) block.exactHistory = null; // its own pixels are in
+  const candidate = block.needsRender && !block.rescued && bc && bc.forGalley !== block.galleyHash
+    ? block.exactHistory?.get(bc.forGalley) : null;
+  // Better than a keystroke behind: the block's current lines, their text
+  // drawn by the glyph layer and every run that needs exact pixels cut out
+  // of that painted galley's picture (exact-parts.js). Only when each such
+  // run is in the picture as it is now; a keystroke inside a formula leaves
+  // the block to the held galley as before.
+  // (only out of a picture whose glyphs stand where its galley's runs do,
+  // render-chunks.js anchorGlyphs: the cut-outs are taken by those places)
+  const why = process.env.TDOM_TRACE_PARTS ? [] : null;
+  const composable = !block.gfx && !block.fidelity?.blockExact && !block.fidelity?.canonicalOnly &&
+    exactFallbackEligible(block.galley);
+  let composed = candidate && bc.anchored && composable
+    ? composeExactLines(block.galley, block.fidelity, candidate.galley, candidate.fidelity, why) : null;
+  // A keystroke inside the formula: no run of the picture in hand is the new
+  // one. Its picture is then put together from the outlines of glyphs the
+  // engine has drawn before (exact-synth.js), and the lines are composed out
+  // of that picture instead, each run at its own place.
+  let partsChunk = null;
+  if (!composed && candidate && composable && !NO_SYNTH) {
+    const synth = synthChunkFor(block, chunks);
+    if (synth) {
+      composed = composeExactLines(block.galley, block.fidelity, block.galley, block.fidelity, why);
+      if (composed) partsChunk = synthChunkKey(block.id);
+    } else why?.push('no picture could be put together');
+  } else if (bc?.forGalley === block.galleyHash && chunks.has(synthChunkKey(block.id))) {
+    chunks.delete(synthChunkKey(block.id)); // its own pixels are in
+  }
+  // (shown composed: a keystroke that follows quickly sends no RENDER of
+  // its own, render-pump.js typedInBurst)
+  if (composed) block.composedFor = block.galleyHash;
+  // The block's own picture is in. Its exact lines keep the look they had
+  // while it was on its way: the text drawn by the glyph layer, and of the
+  // picture only the runs that need exact pixels (`reveal`: the line is the
+  // block's picture as before, shown through one opening per such run).
+  // Shown whole, the text of the line changed its weight the moment the
+  // picture landed (the picture is the PDF's outlines, the glyph layer the
+  // browser's text), a tenth of a second after every keystroke; the owner
+  // chose text that stays as it is (2026-11-19).
+  const revealed = !composed && !candidate && composable && !WHOLE_LINES && block.needsRender && !block.rescued &&
+      bc?.forGalley === block.galleyHash && bc.anchored
+    ? composeExactLines(block.galley, block.fidelity, block.galley, block.fidelity, null) : null;
+  // TDOM_TRACE_PARTS=1: why a block whose pixels are behind was or was not composed
+  if (why && block.needsRender && bc && bc.forGalley !== block.galleyHash) {
+    console.error('[parts]', block.id, composed ? `composed ${composed.size} line(s)${partsChunk ? ' from a picture put together' : ''}` : 'not composed:',
+      composed ? '' : !candidate ? 'no painted galley held' : !bc.anchored ? 'picture not anchored'
+        : block.gfx || block.fidelity?.blockExact ? 'whole-block graphics' : block.fidelity?.canonicalOnly ? 'canonical only'
+          : !exactFallbackEligible(block.galley) ? 'floats, footnotes or rescued lines' : why.join('; '));
+  }
+  const held = !composed && candidate && exactFallbackCompatible(candidate.galley, block.galley) ? candidate : null;
+  const galley = held?.galley ?? block.galley;
+  const galleyHash = held ? bc.forGalley : block.galleyHash;
+  const fid = held ? held.fidelity : block.fidelity;
+  const blockExact = !!((held ? galley.gfx : block.gfx) || fid?.blockExact);
+  const items = galley?.items ?? [];
+  const floats = galley?.floats ?? [];
+  const bcFresh = !!bc && bc.forGalley === galleyHash;
   const canonicalOnly = !!fid?.canonicalOnly;
 
   const stream = [];
@@ -125,19 +191,26 @@ export function buildStream(block, chunks) {
         !!bc && !bcFresh && (fid?.exactLines ?? 0) > 0 &&
         ((flags & 3) === 0 || (flags & 4) !== 0) && hasRuns;
       let gfxChunk = null;
+      const parted = composed?.get(ii) ?? null;
       if (it.chunk) {
-        gfxChunk = { blockId: it.chunk, yOff: it.coff ?? 0, w: chunks.get(it.chunk)?.wBp ?? galley.w };
+        gfxChunk = { blockId: it.chunk, yOff: it.coff ?? 0, w: chunks.get(it.chunk)?.logicalWBp ?? chunks.get(it.chunk)?.wBp ?? galley.w };
         if (it.full) gfxChunk.full = 1; // real shipped page: owns folio/hf
+      } else if (parted) {
+        // (its text as glyphs, its exact runs as cut-outs: `parts` below)
       } else if (wantExact && bc && !useCurrentSafeLine) {
-        gfxChunk = { blockId: block.id, yOff, w: galley.w, stale: bcFresh ? undefined : 1 };
+        // held: an earlier generation's lines and pixels (display only: its
+        // glyph geometry is not the current source's, #103)
+        gfxChunk = { blockId: block.id, yOff, w: galley.w, stale: bcFresh ? undefined : 1, held: held ? 1 : undefined };
       }
+      // (the block's own picture, current: its text is drawn by the glyph layer)
+      const reveal = gfxChunk && bcFresh && !held && !it.chunk ? revealed?.get(ii) ?? null : null;
       // no exact pixels yet: mappable glyphs may bridge the render latency;
       // unmappable ones (and verification-demoted blocks) show nothing
       // rather than something wrong
       const lineNoBridge =
         canonicalOnly || ((flags & 2) !== 0 && !useCurrentSafeLine) ||
         (blockExact && !!fid?.noBridge && !useCurrentSafeLine);
-      const suppress = !gfxChunk && (canonicalOnly || (wantExact && lineNoBridge));
+      const suppress = !gfxChunk && !parted && (canonicalOnly || (wantExact && lineNoBridge));
       const unit = {
         blockId: block.id,
         li: li++,
@@ -150,14 +223,22 @@ export function buildStream(block, chunks) {
         ln: {
           descent: it.d ?? 0,
           boxH: it.h ?? 0,
-          runs: suppress ? [] : (it.runs ?? []),
+          runs: parted ? parted.runs : suppress ? [] : (it.runs ?? []),
+          // exact runs of this line as cut-outs of the block's picture in
+          // hand, made for an earlier galley (display-list.js partCommands),
+          // or of the picture put together for this one (`partsChunk`)
+          parts: parted ? parted.parts : undefined,
+          partsChunk: parted && partsChunk ? partsChunk : undefined,
+          // the line's own picture is shown only where these runs are, the
+          // other runs are drawn by the glyph layer (display-list.js)
+          reveal: reveal ? { runs: reveal.runs, parts: reveal.parts } : undefined,
           // Even when fidelity forbids painting a glyph bridge, the real run
           // extents remain useful as transparent source-line hit geometry.
           editRuns: it.runs ?? [],
           // An empty run list is not proof that the printed line is empty.
           // Keep the missing exact-paint requirement after suppressing its
           // browser glyphs, including graphics with only partial text runs.
-          pendingExact: !gfxChunk && (suppress || blockExact) ? 1 : undefined,
+          pendingExact: !gfxChunk && !parted && (suppress || blockExact) ? 1 : undefined,
           gfxChunk,
           backend: galley?.backend ?? null,
         },

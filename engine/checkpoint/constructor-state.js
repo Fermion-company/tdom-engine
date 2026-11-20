@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { SourceStore } from '../source-store.js';
 import { CanonicalRenderer } from './canonical.js';
+import { LabelTable } from './label-table.js';
 
 /** Chunk store with a write generation: every set/delete bumps `.rev`, so
  * rebuildUnits can skip its per-block signature sweep when nothing about
@@ -10,6 +11,9 @@ import { CanonicalRenderer } from './canonical.js';
 export function makeChunkMap() {
   const m = new Map();
   m.rev = 0;
+  // the outline of every formula glyph seen in a checked picture, by font
+  // and slot (exact-synth.js): not a chunk, and not counted in `rev`
+  m.outlines = new Map();
   const set = m.set.bind(m);
   const del = m.delete.bind(m);
   m.set = (k, v) => {
@@ -50,7 +54,7 @@ export function initializeEngineState(
   engine.counters = [...baseCounters];
   engine.preHash = null;
   engine.preambleEditRegions = [];
-  engine.labelTable = new Map(); // key -> value (for reboot injection)
+  engine.labelTable = new LabelTable(); // key -> value (for reboot injection)
   engine.hrefTable = new Map(); // key -> hyperref anchor (\@currentHref at \label)
   // incremental label/ref bookkeeping — the hot path must never scan
   // every block × every label (O(L×B) melts on long documents)
@@ -60,7 +64,7 @@ export function initializeEngineState(
   engine.refIndex = new Map(); // label key -> Set<blockId> of referencing blocks
   engine.vanishedLabels = new Set(); // keys whose defining count dropped to 0
   engine.fonts = new Map(); // fid -> {file,name,size,fmt, family, remap}
-  engine.fontFiles = new Map(); // familyKey -> absolute path
+  engine.fontFiles = new Map(); // familyKey -> absolute path, or { collection, face } for one face of a .ttc
   engine.pages = [];
   engine.chunks = makeChunkMap(); // chunkKey -> {svg, wBp, hBp, v} exact renders
   engine.isoCache = new Map(); // rescue key -> isolated compile result
@@ -85,6 +89,7 @@ export function initializeEngineState(
   engine.backendName = 'checkpoint';
   engine.diagnostics = [];
   engine.tocHash = null;
+  engine.tocOwed = false; // an edit left the table of contents for the settle pass (update-typeset-phase.js)
   engine.includes = new Map(); // path -> {mtime, readPath, text, announcedText} (include-cache.js)
   engine.resourceReads = new Map(); // read path -> {mtime, size, hash, announcedHash} (include-cache.js)
   engine.watchers = new Map(); // path -> {close()} re-arming watch handle (include-expander.js)
@@ -103,6 +108,7 @@ export function initializeEngineState(
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
   engine.confirmedLiveHeapKb = 0;
+  engine.budgetedHeapKb = 0;
   engine.calibrateInitialHeap = false;
 
   // canonical layer: the exact-output authority (see file header)
@@ -164,6 +170,7 @@ export function initializeEngineState(
   engine.shipping = process.env.TDOM_SHIP === '1' ? makeShipping() : null;
   engine.mode = 'structured'; // 'structured' | 'opaque'
   engine.modeReasons = [];
+  engine.structuredBootError = null;
   engine.previewPolicy = 'structured'; // 'structured' | 'canonical-anchor' | 'shipping-exact'
   engine.previewReasons = [];
   engine.opaqueStickyPre = null; // preamble hash a dynamic demotion sticks to

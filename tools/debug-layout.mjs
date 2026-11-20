@@ -79,7 +79,7 @@ if (prev !== texSource || !existsSync(path.join(dir, 'main.pdf'))) {
   await run();
 }
 const svg = path.join(dir, `p${PAGE}.svg`);
-execFileSync('pdftocairo', ['-svg', '-f', String(PAGE), '-l', String(PAGE), path.join(dir, 'main.pdf'), svg]);
+execFileSync('pdftocairo', ['-svg', '-f', String(PAGE), '-l', String(PAGE), '-noshrink', '-nocenter', path.join(dir, 'main.pdf'), svg]);
 const svgText = readFileSync(svg, 'utf8');
 const truth = [];
 {

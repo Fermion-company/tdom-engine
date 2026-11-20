@@ -62,7 +62,7 @@ import { buildDisplayList } from './display-list.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
 import { computeToc, pageSpecs, hfJobBody } from './page-metadata.js';
 import { chunkTargets } from './chunk-targets.js';
-import { focusRescueIds } from './update-helpers.js';
+import { editPageRenderIds, focusRescueIds } from './update-helpers.js';
 import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, includeOnlyFromSource, watchInclude } from './include-expander.js';
 import { announceIncludeReads, announceResourceReads, inputReadCurrent } from './include-cache.js';
@@ -82,8 +82,8 @@ import { sourceClosure } from './closure.js';
 import { mayCaptureNativeBlock, mayNeedRender, releaseRenderHold } from './render-hold.js';
 import { collectFrozenBlockIds, collectFrozenBlocks } from './frozen-blocks.js';
 import { queueIsolatedRender, renderIsolatedBlock } from './isolated-render.js';
-import { preemptResidentRenders, queueRender as queueRenderHelper } from './render-pump.js';
-import { startResidentRender } from './resident-render.js';
+import { PAPER_EDITOR_MS, preemptResidentRenders, queueRender as queueRenderHelper, typedInBurst } from './render-pump.js';
+import { startResidentRender, supersededLanding } from './resident-render.js';
 import { withReplaceablePreviewJob } from './build-lease-preview.js';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 import { queueMovedOffsets as queueMovedOffsetsHelper } from './rescue-offsets.js';
@@ -91,7 +91,8 @@ import { isPathInside } from '../project-inputs.js';
 import { instrumentEditRegions } from '../edit-regions.js';
 import { scheduleBackground as scheduleBackgroundHelper } from './background-scheduler.js';
 import { typesetBlock as typesetBlockHelper } from './typeset-dispatch.js';
-import { rescueBlock as rescueBlockHelper } from './rescue-block.js';
+import { rescueBlock as rescueBlockHelper, isoGalley } from './rescue-block.js';
+import { trailingGlueSpec } from './util/galley.js';
 import { runChainPass as runChainPassHelper, chainAfterPass as chainAfterPassHelper } from './chain-pass.js';
 import { runUpdateTypesetPhase } from './update-typeset-phase.js';
 import { prepareUpdate } from './update-prepare.js';
@@ -105,8 +106,11 @@ import {
   verifyAgainstCanonical as verifyAgainstCanonicalHelper,
 } from './canonical-arrival.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
-import { adoptGalleyBlock } from './galley-adoption.js';
-import { checkpointBudgetFor, checkpointKeepSet, nearestCheckpoint,
+import { pageHfSig } from './header-footer.js';
+import { buildPagePatches } from './page-patches.js';
+import { adoptGalleyBlock, exactFallbackEligible, exitStateVec } from './galley-adoption.js';
+import { cropRenderTargets } from './render-chunks.js';
+import { checkpointBudgetFor, checkpointKeepSet, memoryCheckpointCeiling, nearestCheckpoint,
   nextTypesetCost,
   gridMissingBoundaries,
 } from './checkpoint-selection.js';
@@ -116,6 +120,7 @@ import {
   enforceCheckpointCap as enforceCheckpointCapHelper,
   retireOffGrid as retireOffGridHelper,
   sharedCheckpointBudget,
+  propagationCheckpointHold,
 } from './checkpoint-retirement.js';
 import {
   bootShipping as bootShippingHelper,
@@ -140,6 +145,7 @@ import {
   buildVolatilePrelude,
 } from './tex-templates.js';
 import { isoCompile as isoCompileHelper } from './iso-compile.js';
+import { rescueWaitMs, waitForRescueChange, wakeRescues } from './rescue-scheduling.js';
 import { fnv1a } from '../hash.js';
 import { buildJobBlockBody } from './job-body.js';
 import { classifyPlainPreviewEdit } from './plain-preview.js';
@@ -153,6 +159,18 @@ const BASE_COUNTERS = [
 const HEADING_RE = /^\s*\\(chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
 const JOB_TIMEOUT = Number(process.env.TDOM_JOB_TIMEOUT || 12_000);
 const BOOT_TIMEOUT = 60_000;
+// The owed display lists (page-patches.js): how many pages one slice builds
+// and sends, how long a slice waits while a keystroke is being answered, and
+// how long after the last keystroke the slices start. While the typing goes
+// on they wait: sent between the keys, twenty-three events of 0.8 MB took
+// the viewer longer to read than the engine to make, and the next
+// keystroke's own page stood in line behind them (shown after 121 ms where
+// 23 is usual). The pages they bring are far from the edit.
+const WARM_SNAPSHOT_QUIET_MS = 150;
+const OWED_SLICE_PAGES = 4;
+const OWED_BUSY_WAIT_MS = 20;
+const OWED_QUIET_MS = Number(process.env.TDOM_OWED_QUIET_MS) >= 0 && process.env.TDOM_OWED_QUIET_MS !== ''
+  ? Number(process.env.TDOM_OWED_QUIET_MS) : 300;
 // Definition-bearing body edits: a macro/environment/length defined (or
 // undefined) in a BODY block can change the meaning of every later block in
 // ways the exit-state vector cannot see. Such edits forfeit checkpoint-suffix
@@ -226,6 +244,8 @@ export class CheckpointEngine {
     if (this.bgActive && !this.coldWalking) {
       abortBackgroundJob(this, 'background pass pre-empted by a document switch');
     }
+    // (the task may be asleep in its idle gate: background-scheduler.js)
+    this.bgGateWake?.();
     await this.bgTask.catch(() => {});
     return this.#locked(async () => {
       await this.canonical.resetDocument(nextDir, nextOverlay);
@@ -296,10 +316,17 @@ export class CheckpointEngine {
     const ids = new Set(page?.draw?.map(draw => draw.u?.blockId));
     const block = this.blocks.find(item => ids.has(item.id));
     if (!block) return { status: 'rejected', reason: 'unknown-page' };
-    return this.warmEditOffset(block.start, block.file ?? this.file);
+    return this.warmEditOffset(block.start, block.file ?? this.file, { caret: false });
   }
 
-  async warmEditOffset(offset, file = this.file) {
+  /** Exact-pixel chunks a block publishes (status reporting). */
+  chunkTargetsOf(block) {
+    return this.#chunkTargets(block);
+  }
+
+  // `caret`: the offset is where the editor's caret is (the host's focus),
+  // not the top of a page the viewer is showing (warmPage).
+  async warmEditOffset(offset, file = this.file, { caret = true } = {}) {
     // A caret move is the earliest sign of editing: it boots a retired chain.
     if (!this.closed) this.#noteShipActivity();
     const sourceFile = path.resolve(this.docDir, file);
@@ -324,21 +351,64 @@ export class CheckpointEngine {
       return index === this.blocks.length - 1 && numericOffset >= end;
     });
     if (target < 0) return { status: 'rejected', reason: 'outside-body' };
+    if (caret) this.caretWarm = { target, sourceRev };
+    // The caret's own boundaries outlive a later warm for a page the viewer
+    // shows. That warm pins the page's first block and its unrendered ones;
+    // the caret's pins came after them and fell off the end of the list, the
+    // checkpoint in front of the caret's block was retired, and the first
+    // keystroke replayed from the top of the page (7 blocks, 0.3 s measured,
+    // every time the paper had been scrolled or a canonical had landed after
+    // the caret was placed).
+    const caretTarget = this.caretWarm?.sourceRev === sourceRev && this.caretWarm.target !== target &&
+      this.caretWarm.target < this.blocks.length ? this.caretWarm.target : null;
+    const caretPins = caretTarget === null ? [] : [caretTarget, caretTarget + 1];
 
     // A page is published atomically. Warm its missing exact neighbors too;
     // a fast edited chunk alone cannot replace an otherwise unpaintable page.
     const targetId = this.blocks[target].id;
     // and bring the caret page's queued rescues to the front of the pump
     const focus = focusRescueIds(this.pages, new Set([targetId]), this.rescueQueue);
-    if (focus.size) this.rescueFocus = focus;
-    const pageIds = new Set(this.pages.filter(page => page.draw?.some(draw => draw.u?.blockId === targetId))
-      .flatMap(page => page.draw.map(draw => draw.u?.blockId)));
+    if (focus.size) {
+      this.rescueFocus = focus;
+      wakeRescues(this);
+    }
+    // (the pages an edit of this block will publish together: its own and
+    // the ones a straddling block ties to it. A keystroke replays from the
+    // checkpoint before the first block there whose exact pixels are stale,
+    // so a tied page left out of the warm sent the first keystrokes of a
+    // book back to a distant checkpoint: 2.3 s each, measured)
+    const pageIds = new Set([
+      ...this.pages.filter(page => page.draw?.some(draw => draw.u?.blockId === targetId))
+        .flatMap(page => page.draw.map(draw => draw.u?.blockId)),
+      ...editPageRenderIds(this.blocks, this.pages, new Set([targetId])),
+    ]);
     const missing = this.blocks.map((block, index) => ({ block, index })).filter(({ block }) =>
       pageIds.has(block.id) && block.needsRender && this.#chunkTargets(block).some(chunk =>
         this.chunks.get(chunk.key)?.forGalley !== block.galleyHash));
-    const first = Math.min(target, ...missing.map(item => item.index));
-    const last = Math.max(target, ...missing.map(item => item.index));
+    // (a caret on this page whose boundaries are gone is walked to as well)
+    const caretOwed = caretTarget !== null && pageIds.has(this.blocks[caretTarget].id) &&
+      !(this.checkpoints.has(caretTarget) && this.checkpoints.has(caretTarget + 1)) ? [caretTarget] : [];
+    const first = Math.min(target, ...caretOwed, ...missing.map(item => item.index));
+    const last = Math.max(target, ...caretOwed, ...missing.map(item => item.index));
     this.warmInfo = { status: 'scheduled', sourceRev, target, offset: numericOffset, file: sourceFile };
+    // While the typing goes on, a warm that would have to walk waits for it
+    // to pause. The host sends a warm after every keystroke; a walk begun
+    // between two of them holds the chain lock for the block it is in, and
+    // the next keystroke waits for that block (in a book, the heading after
+    // the paragraph: 40 to 60 ms of every other keystroke once the settle
+    // pass had started moving the blocks behind the caret). The walk is for
+    // the pixels around the caret, and the text there is still moving. A
+    // lone keystroke (the one before it more than 400 ms back) is not held.
+    const walks = caretOwed.length > 0 || !this.checkpoints.has(target) || !this.checkpoints.has(target + 1) ||
+      missing.some(item => !this.checkpoints.has(item.index));
+    const sinceEdit = Date.now() - (this.lastEditAt ?? 0);
+    if (walks && (this.editGapMs ?? Infinity) < 400 && sinceEdit < 400) {
+      await new Promise((resolve) => setTimeout(resolve, 400 - sinceEdit));
+      if (this.closed || request !== this.warmSeq || sourceRev !== this.srcRev || this.editPending > 0) {
+        return { status: 'superseded', sourceRev, target };
+      }
+      return this.warmEditOffset(offset, file, { caret });
+    }
     // Cursor movement outranks background rescue/settle work, but never an
     // edit. Reuse the established abort path so a deep LuaTeX-ja job cannot
     // hold the foreground lock until its timeout.
@@ -348,6 +418,8 @@ export class CheckpointEngine {
     // it threw the replay away (viewer page, file focus and caret warms for
     // one region each restarted from the same distant checkpoint).
     if (!this.warming && !this.coldWalking) abortBackgroundJob(this, 'background pass pre-empted by edit-locus warming');
+    // (the task may be asleep in its idle gate: background-scheduler.js)
+    this.bgGateWake?.();
     await this.bgTask.catch(() => {});
     // A keystroke that arrived meanwhile owns the next turn of the lock: it
     // set bgAbort and is waiting for the same task this warm waited for.
@@ -366,11 +438,31 @@ export class CheckpointEngine {
       // Pin before walking: #jobBlock retires off-grid parents as soon as a
       // successor exists, so a late pin would lose the exact boundary we are
       // warming for the first keystroke.
-      this.editHold = [...new Set([target, target + 1, ...this.editHold])]
+      // The page's blocks that still lack exact pixels are pinned too: their
+      // render runs after the walk has passed them, from the checkpoint in
+      // front of each. Left unpinned, a document that affords three
+      // checkpoints retired those before the render started, the warm ended
+      // "ready" with the headings of the page still unrendered, and the first
+      // keystrokes replayed from the start of the book to draw them.
+      this.editHold = [...new Set([target, target + 1, ...caretPins, ...missing.map(item => item.index), ...this.editHold])]
         .filter((idx) => idx >= 0 && idx <= this.blocks.length)
-        .slice(0, 8);
-      if (!missing.length && this.checkpoints.has(target) && this.checkpoints.has(target + 1)) {
+        .slice(0, 8 + caretPins.length + Math.min(16, missing.length));
+      // A block without its pixels needs the walk only for the checkpoint in
+      // front of it: its render starts there. With that checkpoint standing
+      // (pinned just above) the render is asked for and nothing is typeset.
+      // Typing in a paragraph with a formula, the paragraph is without the
+      // pixels of its newest text after every keystroke: the caret's warm
+      // walked each time, typeset the paragraph again and the heading after
+      // it (50 to 85 ms in a book), and the next keystroke waited for that
+      // block to end (22 to 68 ms of every keystroke once the typing had
+      // gone on for two seconds).
+      const unreached = missing.filter(item => !this.checkpoints.has(item.index));
+      if (!unreached.length && !caretOwed.length && this.checkpoints.has(target) && this.checkpoints.has(target + 1)) {
+        for (const item of missing) this.#queueRender(item.block.id, { interactiveRev: sourceRev });
         this.#enforceCheckpointCap();
+        // (this warm stopped the scheduler on its way in: chain work a
+        // keystroke left for later goes back to it, as after a walk)
+        this.#kickPendingChain();
         const ready = {
           status: 'ready',
           sourceRev,
@@ -380,6 +472,7 @@ export class CheckpointEngine {
           ms: performance.now() - startedAt,
         };
         this.warmInfo = ready;
+        this.#offerSpare(target);
         return ready;
       }
       const from = this.#nearestCheckpoint(first);
@@ -409,6 +502,43 @@ export class CheckpointEngine {
         this.bgWalkTarget = null;
         endWalkRetain(this);
       }
+      // A block the walk typeset for the first time on the resident path only
+      // now knows it wants exact pixels: it was not among the pins above, the
+      // checkpoint in front of it is gone again, and its render fell to the
+      // slow isolated queue. On the 389-page book two such blocks (a
+      // paragraph with a footnote, one with a quote) were still unrendered
+      // 30 s after the caret arrived, and the first keystroke waited for
+      // them (1.0 to 1.3 s). Walk the page once more, with those pinned.
+      const stillOwed = () => this.blocks.map((block, index) => ({ block, index })).filter(({ block, index }) =>
+        pageIds.has(block.id) && block.needsRender && !this.checkpoints.has(index) &&
+        this.#chunkTargets(block).some(chunk => this.chunks.get(chunk.key)?.forGalley !== block.galleyHash))
+        .map(item => item.index);
+      const late = replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev ? [] : stillOwed();
+      if (late.length) {
+        this.editHold = [...new Set([target, target + 1, ...caretPins, ...late, ...this.editHold])].slice(0, 24 + caretPins.length);
+        const again = this.#nearestCheckpoint(Math.min(...late));
+        this.bgActive = true;
+        this.warming = true;
+        this.bgWalkTarget = target;
+        try {
+          const more = await this.#retypesetChain(
+            again,
+            Math.max(...late),
+            (idx, blockChanged) => {
+              changed ||= blockChanged;
+              const block = this.blocks[idx];
+              if (pageIds.has(block.id) && block.needsRender) this.#queueRender(block.id, { interactiveRev: sourceRev });
+            },
+            () => this.bgAbort || this.editPending > 0 || request !== this.warmSeq || sourceRev !== this.srcRev
+          );
+          if (more < 0) replayed = more;
+        } finally {
+          this.bgActive = false;
+          this.warming = false;
+          this.bgWalkTarget = null;
+        }
+        for (const index of late) if (!missing.some(item => item.index === index)) missing.push({ block: this.blocks[index], index });
+      }
       if (replayed < 0 || this.bgAbort || request !== this.warmSeq || sourceRev !== this.srcRev) {
         // Pin the boundary this walk reached so the warm that superseded it
         // resumes there rather than at the walk's starting checkpoint.
@@ -419,7 +549,27 @@ export class CheckpointEngine {
         this.#kickPendingChain();
         return { status: 'superseded', sourceRev, target };
       }
-      this.editHold = [...new Set([target, target + 1, from + replayed, ...this.editHold])].slice(0, 8);
+      // The walk asks for a render as it typesets a block, and it stops in
+      // front of the last one it was sent to: that block kept its checkpoint
+      // and never got its render (the last block of the caret's pages on the
+      // 389-page book, every time; the first keystroke then waited 0.45 s
+      // for it). Ask for every page block that is still without its pixels.
+      for (let index = 0; index < this.blocks.length; index++) {
+        const item = this.blocks[index];
+        if (!pageIds.has(item.id) || !item.needsRender || !this.checkpoints.has(index)) continue;
+        if (!this.#chunkTargets(item).some(chunk => this.chunks.get(chunk.key)?.forGalley !== item.galleyHash)) continue;
+        this.#queueRender(item.id, { interactiveRev: sourceRev });
+        if (!missing.some(entry => entry.index === index)) missing.push({ block: item, index });
+      }
+      // (still pinned while their render is queued; the next edit's own
+      // pins replace these)
+      const unrendered = missing.map(item => item.index).filter((idx) => {
+        const block = this.blocks[idx];
+        return block?.needsRender && this.#chunkTargets(block).some(chunk =>
+          this.chunks.get(chunk.key)?.forGalley !== block.galleyHash);
+      }).slice(0, 16);
+      this.editHold = [...new Set([target, target + 1, from + replayed, ...unrendered, ...this.editHold])]
+        .slice(0, 8 + unrendered.length);
       this.#enforceCheckpointCap();
       // A cached rescue can replace its PDF chunk without changing any
       // measured boxes or exit state. Its new version must reach page DLs.
@@ -434,6 +584,7 @@ export class CheckpointEngine {
         ms: performance.now() - startedAt,
       };
       this.warmInfo = result;
+      if (result.status === 'ready') this.#offerSpare(target);
       return result;
     });
     this.bgTask = run.then(() => {}, () => {});
@@ -460,16 +611,33 @@ export class CheckpointEngine {
   async yieldWarmForBuild({ timeoutMs = 3000 } = {}) {
     if (!this.warming) return { yielded: false, warming: false };
     this.bgAbort = true;
-    const walk = this.bgTask.catch(() => {}).then(() => 'done');
+    const task = this.bgTask;
+    if (this.buildWarmYield?.task !== task) {
+      const warmSeq = this.warmSeq, updateSeq = this.updateSeq;
+      const info = this.warmInfo;
+      const yielding = { task };
+      this.buildWarmYield = yielding;
+      void task.catch(() => {}).then(async () => {
+        // Allow the acquire handler to install its lease before resuming.
+        // This continuation also runs when the HTTP yield timed out.
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await this.canonical.waitForBuildLease();
+        if (this.closed || this.warming || this.updating || this.editPending > 0 ||
+            this.warmSeq !== warmSeq || this.updateSeq !== updateSeq) return;
+        this.bgAbort = false;
+        if (info?.sourceRev === this.srcRev && Number.isFinite(info?.offset)) {
+          await this.warmEditOffset(info.offset, info.file);
+        } else this.#kickPendingChain();
+      }).catch(err => this.diagnostics.push(err.message)).finally(() => {
+        if (this.buildWarmYield === yielding) this.buildWarmYield = null;
+      });
+    }
+    let timer;
     const outcome = await Promise.race([
-      walk,
-      new Promise((resolve) => setTimeout(() => resolve('timeout'), timeoutMs)),
+      task.catch(() => {}).then(() => 'done'),
+      new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), timeoutMs); }),
     ]);
-    // The superseded walk leaves the abort flag set (warmEditOffset and
-    // #update reset it for their own runs). Clear it here as they do, so the
-    // deferred chain is not stalled until the next edit; an update that set
-    // it meanwhile resets it again inside its own lock.
-    if (outcome === 'done' && !this.warming && !this.updating) this.bgAbort = false;
+    clearTimeout(timer);
     return { yielded: outcome === 'done', warming: this.warming };
   }
 
@@ -482,6 +650,10 @@ export class CheckpointEngine {
   }
 
   getDisplayLists() {
+    // (a page whose list is still owed to the viewers gets it here; it stays owed)
+    for (const page of this.pages) {
+      if (!page.dl || page.dl.hfSig !== pageHfSig(this.hf, page.number)) page.dl = this.#displayList(page);
+    }
     return displayLists(this.pages);
   }
 
@@ -517,6 +689,8 @@ export class CheckpointEngine {
       chunkTargets: (b) => this.#chunkTargets(b),
       file: this.file,
       position: (file, offset) => this.store.position(file, offset),
+      lineStarts: (file) => this.store.lineStarts(file),
+      memo: (this.domMemo ??= {}),
       labelTable: this.labelTable,
       preambleEditRegions: this.closureDeferred ? [] : this.preambleEditRegions,
     });
@@ -599,6 +773,20 @@ export class CheckpointEngine {
 
   // ------------------------------------------------------------- typeset
 
+  /**
+   * The caret stands in block `target`: the checkpoint in front of it makes
+   * the spare continuation of the first keystroke now, with the fonts the
+   * block's last job had to load (daemon.lua SPARE).
+   */
+  #offerSpare(target) {
+    const ck = this.checkpoints.get(target);
+    const block = this.blocks[target];
+    if (!ck || !block || ck.vstale) return;
+    const fonts = Buffer.from(block.galley?.fontList ?? '', 'utf8');
+    ck.send(`SPARE ${target + 1} ${fonts.length}\n`);
+    if (fonts.length) ck.sendRaw(fonts);
+  }
+
   async #jobBlock(idx, override = null, replayToken = null) {
     const block = this.blocks[idx];
     const jobStarted = performance.now();
@@ -679,7 +867,12 @@ export class CheckpointEngine {
       // the largest live heap measured in this root (reset with the root: a
       // galley kept from an older root does not carry its floor over)
       const liveFloor = this.confirmedLiveHeapKb || 0;
-      ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}\n`);
+      const sentAt = process.env.TDOM_TRACE_JOB ? performance.timeOrigin + performance.now() : 0;
+      // K: the job of the block a keystroke changed. Its checkpoint keeps a
+      // spare continuation ready for the next keystroke (daemon.lua SPARE).
+      const keystroke = !advance && !override && this.updating && !this.bgActive && !this.warming &&
+        !!this.keystrokeSource?.has(block.id);
+      ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}${keystroke ? ' K' : ''}\n`);
       ck.sendRaw(body);
       // The block this edit changed ships its exact RENDER beside its JOB,
       // forked from the same entry state with the JOB's own prelude (label
@@ -690,10 +883,40 @@ export class CheckpointEngine {
       // update, only the first keystroke after a pause with none waiting
       // behind it, and never for a block the pump can CAPTURE from this
       // JOB's node list.
+      // A block the page can lay out from an earlier painted galley
+      // (tex64-internal #103) sends it on every keystroke instead, one at a
+      // time: the next keystroke does not kill it, and the pixels it lands
+      // for this galley are shown until the block's newer text has its own
+      // (holdExactGalley, #landHeldRender). Continuous typing keeps the
+      // client's one request in flight, about a second apart on the 316-page
+      // book: every edit looked like one after a pause, its RENDER was killed
+      // by the next, and a box typed into got no exact pixels until the
+      // typing stopped. (A block the pump can CAPTURE keeps the cheaper
+      // CAPTURE; the pump holds that one the same way, render-pump.js.)
+      const pause = (this.editGapMs ?? 0) > 400 && !(this.keystrokePending > 0);
+      const holdable = this.#holdableRender(block);
+      // Keys closer together than the picture takes, in a block the page
+      // shows composed: no RENDER beside this JOB, the pump makes the
+      // picture when the typing pauses (render-pump.js typedInBurst).
+      const ownKeystroke = !override && !advance && block.sourceChanged && this.updating && !this.bgActive;
+      const burst = ownKeystroke && holdable && typedInBurst(this, block);
+      if (ownKeystroke) {
+        block.renderDeferred = burst;
+        if (burst && this.renderStats) this.renderStats.burstSkipped = (this.renderStats.burstSkipped ?? 0) + 1;
+      }
+      const hold = holdable && !burst && !this.heldRenders?.has(block.id);
+      // TDOM_TRACE_RENDER=1: whether the edited block's exact RENDER left with its JOB, and why not
+      if (process.env.TDOM_TRACE_RENDER && block.sourceChanged && block.needsRender && this.updating) {
+        console.error('[early-render]', block.id, JSON.stringify({
+          override: !!override, advance, capture: capture !== '-', mayCapture: mayCaptureNativeBlock(block),
+          vstale: !!ck.vstale, bgActive: !!this.bgActive, already: this.earlyRenderUpdate === this.updateSeq,
+          holdable, heldInFlight: !!this.heldRenders?.has(block.id), pause, gap: this.editGapMs, burst,
+        }));
+      }
       if (!override && !advance && !(capture !== '-' && mayCaptureNativeBlock(block)) &&
           block.sourceChanged && block.needsRender && !ck.vstale &&
           this.updating && !this.bgActive && this.coldPreviewEarlyRender && this.earlyRenderUpdate !== this.updateSeq &&
-          (this.editGapMs ?? 0) > 400 && !(this.keystrokePending > 0)) {
+          (hold || (!holdable && pause))) {
         try {
           early = startResidentRender(this, {
             block,
@@ -703,6 +926,7 @@ export class CheckpointEngine {
             awaitRender: (key, timeout) => this.#await(key, timeout),
           });
           this.earlyRenderUpdate = this.updateSeq;
+          if (hold) this.#holdRender(block.id, early);
           const unused = early;
           setTimeout(() => unused.discard(), 30_000).unref?.();
         } catch (err) {
@@ -714,7 +938,24 @@ export class CheckpointEngine {
       const [galley, nextCheckpoint] = await Promise.all([galleyP, ckptP]);
       nextCheckpoint.replayToken = replayToken;
       this.confirmedLiveHeapKb = Math.max(this.confirmedLiveHeapKb || 0, nextCheckpoint.gcFloorKb || 0);
-      if (process.env.TDOM_TRACE_JOB) console.error('[job-gc]', jobId, JSON.stringify({ interactive, gcMs: nextCheckpoint.gcMs, ...galley.tm }));
+      // the live heap is first known here, during the boot walk, and it
+      // grows with the document: keep the checkpoint budget inside memory
+      if (this.confirmedLiveHeapKb > (this.budgetedHeapKb || 0) * 1.1) {
+        this.budgetedHeapKb = this.confirmedLiveHeapKb;
+        const bounded = checkpointBudgetFor(this.blocks.length, {
+          ceiling: this.checkpointCeiling,
+          pageCount: this.canonicalPageCount,
+          heapFloorKb: this.confirmedLiveHeapKb,
+        });
+        if (bounded < this.maxCheckpoints) {
+          this.maxCheckpoints = bounded;
+          this.checkpointKeepCache = null;
+        }
+      }
+      if (process.env.TDOM_TRACE_JOB) {
+        console.error('[job-gc]', jobId, JSON.stringify({ interactive, gcMs: nextCheckpoint.gcMs, ...galley.tm, sentAt,
+          bothAt: performance.timeOrigin + performance.now(), step: advance, bodyBytes: body.length }));
+      }
       // a keystroke waiting on this background step waited for its collect
       // too (report timing: lock.gcWaitedMs)
       if (!interactive) this.bgGcMsTotal = (this.bgGcMsTotal ?? 0) + (nextCheckpoint.gcMs ?? 0);
@@ -751,7 +992,7 @@ export class CheckpointEngine {
       // the pump takes it only for this galley (render-pump.js)
       if (early) galley.tdomEarlyRender = early;
       // the pump's own RENDER of this galley uses the same label definitions
-      if (!override && !ck.vstale) galley.tdomRenderPrelude = jobPrelude;
+      if (!override) galley.tdomRenderPrelude = jobPrelude;
       return galley;
     } catch (err) {
       early?.discard();
@@ -920,7 +1161,9 @@ export class CheckpointEngine {
       source: () => this.store.get(this.file) ?? '',
       packageText: (preamble) => projectPackageText(preamble, { docDir: this.docDir, overlayDir: this.overlayDir }),
       structuralSinks,
+      tocRealPage: this._tocRealPage === true,
     });
+    this._tocRealPage = result.tocRealPage === true;
     if (result.breakableFor !== this._breakableFor) this._breakableFor = result.breakableFor;
     if (result.breakableRe !== this._breakableRe) this._breakableRe = result.breakableRe;
     if (result.packageBreakableRe !== this._packageBreakableRe) this._packageBreakableRe = result.packageBreakableRe;
@@ -942,6 +1185,7 @@ export class CheckpointEngine {
       blocks: this.blocks,
       labelTable: this.labelTable,
       preHash: this.#rescuePre(block),
+      tocHash: this.tocHash,
     });
   }
 
@@ -1019,8 +1263,8 @@ export class CheckpointEngine {
     const ck = this.checkpoints.get(fromIdx);
     // the gates typeset-dispatch applies before an in-chain JOB
     if (!block || !ck || !(fromIdx < idx) || this.poisoned.get(block.id) === fnv1a(block.text) ||
-        (this.chainTimeouts ?? 0) > 0 ||
-        this.#needsRescue(block.text, block.structuralSinks)) return null;
+        (this.chainTimeouts ?? 0) > 0) return null;
+    if (this.#needsRescue(block.text, block.structuralSinks)) return this.#coldRescuePreview(idx);
     const { body, jobId: blockJobId, refSnapshot, prelude: jobPrelude } = buildJobBlockBody({
       block,
       idx,
@@ -1059,13 +1303,19 @@ export class CheckpointEngine {
     // and an unused one is killed
     this.renderPids ??= new Map();
     this.renderPids.set(jobId, 0);
+    let gone = false;
     const poll = setInterval(() => {
       const pid = this.renderPids.get(jobId);
       if (!(pid > 0)) return;
-      try { process.kill(pid, 0); } catch { this._reject(key, new Error(`cold preview child of ${block.id} exited`)); }
+      try { process.kill(pid, 0); } catch {
+        gone = true;
+        this._reject(key, new Error(`cold preview child of ${block.id} exited`));
+      }
     }, 200);
     let settled = false;
+    let reported = false;
     const galley = galleyP.then((g) => {
+      reported = true;
       if (g.closure === 'error') {
         release();
         return null;
@@ -1080,6 +1330,18 @@ export class CheckpointEngine {
     }).finally(() => {
       settled = true;
       clearInterval(poll);
+      // no galley (its wait timed out, the walk gave up on it): the child
+      // may still be spinning, and nobody would kill it later (#104)
+      if (!reported && !gone) {
+        const pid = this.renderPids.get(jobId);
+        if (pid > 0) {
+          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        } else {
+          this.cancelledJobIds ??= new Set();
+          this.cancelledJobIds.add(jobId); // killed when FORKED arrives
+          setTimeout(() => this.cancelledJobIds?.delete(jobId), 30_000).unref?.();
+        }
+      }
       this.renderPids.delete(jobId);
     });
     const cancel = () => {
@@ -1115,6 +1377,171 @@ export class CheckpointEngine {
   }
 
   /**
+   * Cold preview of a block that needs an isolated compile (a breakable box,
+   * a multicols; tex64-internal #103). After an edit upstream the chain up
+   * to such a block is cold, and the block's own rescue waits for the resume
+   * walk to reach it: on the 316-page book, typing in a box two dozen
+   * chapters below an earlier edit showed nothing until the typing stopped
+   * (9.7 s after the last key). Compile it now instead, off the chain lock,
+   * with the entry state the walk would re-seed (the stale predecessor's
+   * exit vector, as for any cold preview). Its cache key is the rescue's
+   * own, so the resume walk that reaches the block with the same entry
+   * reuses the result instead of compiling again.
+   *
+   * One compile per block at a time: a keystroke during the compile does not
+   * start another; the one in flight is shown when it lands (the page keeps
+   * the block's previous pixels until then, like a stale-first rescue) and a
+   * compile of the text typed meanwhile follows at once. The walk never
+   * waits for it (noWait): a fork-real compile of a box takes about a
+   * second, longer than the keystroke should be held.
+   */
+  #coldRescuePreview(idx) {
+    const block = this.blocks[idx];
+    // the fork runners only: a cold compile (5+ s) is never a preview
+    if (!this.realRoot?.pid || this.isoForkBroken.has(block.id)) return null;
+    this.coldRescuePreviews ??= new Map();
+    const flight = this.coldRescuePreviews.get(block.id);
+    if (flight) {
+      flight.again = true;
+      return null;
+    }
+    const run = this.#startColdRescueCompile(block, idx);
+    if (!run) return null;
+    return {
+      galley: run.galley,
+      noWait: true,
+      // not adopted by the walk: it lands through #adoptLateColdPreview
+      cancel: () => {
+        if (run.unused) return;
+        run.unused = true;
+        if (run.done && run.result) this.#adoptLateColdPreview(block.id, run, run.result);
+      },
+      release: () => {},
+    };
+  }
+
+  #startColdRescueCompile(block, idx) {
+    // the fork runners only (a follow-up compile checks again)
+    if (!this.realRoot?.pid || this.isoForkBroken.has(block.id)) return null;
+    const key = this.#rescueCacheKey(block, idx);
+    if (this.isoFailCache.has(key)) return null;
+    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block), tocHash: this.tocHash });
+    const text = block.text;
+    const seq = ++this.coldPreviewSeq;
+    // the galley it may replace: the one on the block now (a stale-first copy
+    // of it counts as it: tdomKeptOf), or a preview adopted since
+    const run = { seq, key, text, base: block.galley?.tdomKeptOf ?? block.galley, unused: false, again: false, galley: null };
+    this.coldRescuePreviews.set(block.id, run);
+    const cached = this.#isoCacheGet(key);
+    const compiled = cached != null ? Promise.resolve(cached)
+      : withReplaceablePreviewJob(this, 'cold-rescue-preview',
+        () => this.#isoCompile(block, idx, 'cold preview', false, { noCold: true, expectKey: key }))
+        .then((iso) => {
+          if (iso) this.#isoCacheSet(key, iso, baseKey);
+          return iso;
+        });
+    run.galley = compiled.then((iso) => {
+      if (!iso) return null;
+      const galley = isoGalley(iso);
+      galley.tdomColdPreview = { iso: true, text, seq };
+      return galley;
+    }).catch((err) => {
+      this.diagnostics.push(`cold preview of ${block.id}: ${err?.message ?? err}`);
+      return null;
+    });
+    void run.galley.then((galley) => {
+      run.done = true;
+      run.result = galley;
+      if (this.coldRescuePreviews.get(block.id) === run) this.coldRescuePreviews.delete(block.id);
+      if (galley && run.unused) this.#adoptLateColdPreview(block.id, run, galley);
+      else if (run.again) this.#followColdRescuePreview(block.id, text);
+    }).catch((err) => this.diagnostics.push(`cold preview of ${block.id}: ${err?.message ?? err}`));
+    return run;
+  }
+
+  /**
+   * A rescued block edited on a warm chain keeps its previous galley
+   * (stale-first, rescue-block.js); its isolated preview is compiled beside
+   * the walk and shown when it lands, like a cold one (#adoptLateColdPreview).
+   */
+  #warmRescuePreview(idx) {
+    const block = this.blocks[idx];
+    if (!block || !this.coldPreviewEnabled || this.mode !== 'structured' || this.previewPolicy !== 'structured') return;
+    // Only for the block a keystroke's own walk is typing into (its galley
+    // predates its text), within a burst: after a lone edit the pump
+    // compiles the same inputs at once, and a settle or resume walk passing
+    // a rescued block is no reason to compile ahead of the pump.
+    if (!block.sourceChanged || !this.updating || this.bgActive || (this.chainTimeouts ?? 0) > 0 ||
+        this.poisoned.get(block.id) === fnv1a(block.text)) return;
+    // (editGapMs is this keystroke's own: the time since the one before)
+    if (!(this.keystrokePending > 0) && !((this.editGapMs ?? Infinity) < 1500)) return;
+    this.coldRescuePreviews ??= new Map();
+    const flight = this.coldRescuePreviews.get(block.id);
+    if (flight) {
+      flight.again = true;
+      return;
+    }
+    const run = this.#startColdRescueCompile(block, idx);
+    if (run) run.unused = true;
+  }
+
+  /** A rescue preview the walk did not wait for: show it once it lands. */
+  #adoptLateColdPreview(blockId, run, galley) {
+    void this.#locked(async () => {
+      if (this.closed || this.mode !== 'structured') return;
+      const block = this.blocks.find((b) => b.id === blockId);
+      // the block's own walk typeset it (coldDirty cleared), or a newer
+      // preview of it is already on the page
+      this.coldPreviewAdopted ??= new Map();
+      // (a block whose galley predates its text: a cold stop, or a warm
+      // stale-first rescue still waiting for its exact compile)
+      const wasCold = !!block && this.coldDirty.has(blockId);
+      if (!block || !(wasCold || block.sourceChanged) || block.galley === galley ||
+          (this.coldPreviewAdopted.get(blockId) ?? 0) >= run.seq ||
+          (block.galley?.tdomColdPreview?.seq ?? 0) >= run.seq) return;
+      // never over a galley newer than the one the compile started from (an
+      // exact rescue of later text that landed meanwhile)
+      // (the same galley kept stale-first is a copy of it: tdomKeptOf); never
+      // over a frozen or deferred block's held output either
+      const current = block.galley;
+      if ((current?.tdomKeptOf ?? current) !== run.base && !current?.tdomColdPreview?.iso) return;
+      if (current?.tdomFrozen || current?.tdomDeferred) return;
+      // Downstream blocks were typeset against the old exit state: keep it
+      // (as the walk does for a preview it adopts, update-typeset-phase.js).
+      const exitState = block.stateVec;
+      this.#adoptGalley(block, galley);
+      block.stateVec = exitState;
+      this.coldPreviewAdopted.set(blockId, run.seq);
+      // still owes its own typeset in its own lineage (docs/10 §10.4a), or
+      // its exact rescue (queued); a preview of text typed over since is
+      // older than the block's text
+      if (wasCold) this.coldDirty.add(blockId);
+      if (run.text !== block.text) block.sourceChanged = true;
+      this.coldPreviews = (this.coldPreviews ?? 0) + 1;
+      this.#asyncRepaginate();
+    }).catch((err) => this.diagnostics.push(`cold preview of ${blockId}: ${err?.message ?? err}`)).finally(() => {
+      try {
+        if (run.again) this.#followColdRescuePreview(blockId, run.text);
+      } catch (err) {
+        this.diagnostics.push(`cold preview of ${blockId}: ${err?.message ?? err}`);
+      }
+    });
+  }
+
+  /** Text typed during a rescue preview's compile: compile it next. */
+  #followColdRescuePreview(blockId, compiledText) {
+    if (this.closed || this.mode !== 'structured' || this.coldRescuePreviews?.has(blockId) ||
+        !this.coldPreviewEnabled || this.previewPolicy !== 'structured' || (this.chainTimeouts ?? 0) > 0) return;
+    const idx = this.blocks.findIndex((b) => b.id === blockId);
+    const block = this.blocks[idx];
+    if (!block || block.text === compiledText || !(this.coldDirty.has(blockId) || block.sourceChanged) ||
+        this.poisoned.get(block.id) === fnv1a(block.text) ||
+        !this.#needsRescue(block.text, block.structuralSinks)) return;
+    const run = this.#startColdRescueCompile(block, idx);
+    if (run) run.unused = true;
+  }
+
+  /**
    * First-ever rescue during a boot walk: compile it on the walk while the
    * walk's rescue budget (TDOM_BOOT_RESCUE_MS of compile time, default 45 s)
    * lasts and both fork peers are up, so /open publishes measured pages
@@ -1126,12 +1553,19 @@ export class CheckpointEngine {
    */
   async #bootIsoCompile(idx, cacheKey) {
     if (!(this.bootRescueBudgetMs > 0) || !this.realRoot?.pid || !this.checkpoints.get(0)) return null;
+    // the walk holds the chain lock: never behind another isolated compile
+    // (a preview or an async rescue; #isoCompile runs one at a time)
+    if ((this.isoQueued ?? 0) > 0) return null;
     const block = this.blocks[idx];
     const started = performance.now();
     let outcome = 'boot-failed';
     try {
-      const iso = await this.#isoCompile(block, idx, 'boot rescue');
-      this.#isoCacheSet(cacheKey, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) }));
+      const iso = await this.#isoCompile(block, idx, 'boot rescue', false, { expectKey: cacheKey });
+      if (!iso) {
+        outcome = 'boot-skipped'; // its inputs moved while it waited: the async pump takes it
+        return null;
+      }
+      this.#isoCacheSet(cacheKey, iso, rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block), tocHash: this.tocHash }));
       outcome = 'boot';
       return iso;
     } finally {
@@ -1155,7 +1589,7 @@ export class CheckpointEngine {
   #isoBaseGet(block, idx) {
     const disk = this.#isoDiskCache();
     if (!disk) return undefined;
-    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) });
+    const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block), tocHash: this.tocHash });
     const found = disk.getBase(baseKey);
     if (process.env.TDOM_TRACE_ISO_CACHE) {
       console.error('[iso-cache] lookup', block.id, 'idx', idx, 'base', baseKey, 'prev', this.blocks[idx - 1]?.id,
@@ -1182,6 +1616,7 @@ export class CheckpointEngine {
         stateJobBody: (iso) => this.#stateJobBody(iso),
         pumpRescues: () => this.#pumpRescues(),
         brokenBlockGalley: (blockIdx, frozen) => this.#brokenBlockGalley(blockIdx, frozen),
+        previewRescue: (blockIdx) => this.#warmRescuePreview(blockIdx),
       });
     } finally {
       this.rescuingIdx = null;
@@ -1236,7 +1671,53 @@ export class CheckpointEngine {
     return { runner: this.isoModeOf.get(block.id) ?? null, iso };
   }
 
-  async #isoCompile(block, idx, why, forceCold = false) {
+  /**
+   * One isolated compile at a time. The async pump, the boot walk and a
+   * cold rescue preview (#103) share it: two compiles of one block's text
+   * would share its job directory (iso-context.js), and a fork whose PDF
+   * strays to the root's work dir is claimed on the assumption that nothing
+   * else ships there (iso-runner.js).
+   */
+  #isoCompile(block, idx, why, forceCold = false, options = {}) {
+    this.isoQueued = (this.isoQueued ?? 0) + 1;
+    const run = (this.isoSerial ?? Promise.resolve()).then(async () => {
+      try {
+        return await this.#isoCompileNow(block, idx, why, forceCold, options);
+      } finally {
+        this.isoQueued--; // before the caller resumes: a boot walk's next rescue sees it free
+      }
+    });
+    this.isoSerial = run.catch(() => {});
+    return run;
+  }
+
+  async #isoCompileNow(block, idx, why, forceCold = false, { noCold = false, expectKey = null } = {}) {
+    if (expectKey != null) {
+      // The caller keyed its result when it queued the compile; the inputs
+      // are read now, after the serial wait (a preview, a Build lease), in
+      // which a walk may have moved the block's entry state or page offset.
+      // A result compiled from other inputs must never be stored under that
+      // key (memory and disk): give up, the caller queues the current key.
+      const at = this.blocks.findIndex((b) => b.id === block.id);
+      if (at < 0 || this.#rescueCacheKey(this.blocks[at], at) !== expectKey) return null;
+      block = this.blocks[at];
+      idx = at;
+    }
+    // a preview runs on the fork runners or not at all (a block the fork
+    // broke on, or a root rebooted, while it waited)
+    if (noCold && (this.isoForkBroken.has(block.id) || !this.realRoot?.pid)) return null;
+    // a preview that fails is no verdict on the fork runner: its compile
+    // does not fall back to cold, so it must not strand the block on cold
+    // rescues for the session either
+    const forkBroken = this.isoForkBroken.has(block.id);
+    try {
+      return await this.#isoCompileHelperCall(block, idx, why, forceCold, noCold, expectKey);
+    } finally {
+      if (noCold && !forkBroken) this.isoForkBroken.delete(block.id);
+    }
+  }
+
+  #isoCompileHelperCall(block, idx, why, forceCold, noCold, expectKey) {
     return isoCompileHelper(this, {
       block,
       idx,
@@ -1245,7 +1726,11 @@ export class CheckpointEngine {
       rescueCacheKey: (targetBlock, blockIdx) => this.#rescueCacheKey(targetBlock, blockIdx),
       needsRescue: (blockText, structuralSinks) => this.#needsRescue(blockText, structuralSinks),
       awaitRender: (key, timeout) => this.#await(key, timeout),
-      isoCompileCold: () => this.#isoCompile(block, idx, why, true),
+      // a preview never falls back to a cold compile (5+ s): it has none.
+      // The cold retry reads the inputs again, after the fork's second:
+      // it checks the key again too.
+      isoCompileCold: () => (noCold ? Promise.resolve(null) : this.#isoCompileNow(block, idx, why, true, { expectKey })),
+      noCold,
     });
   }
 
@@ -1347,6 +1832,19 @@ export class CheckpointEngine {
    * Idempotent — safe to call after any checkpoint-creating pass.
    */
   #enforceCheckpointCap(continuation = null) {
+    // A render hold keeps a checkpoint warm for a block that may want exact
+    // pixels later. Where memory sets the budget that is a fork the document
+    // cannot afford to keep for nothing: a book that affords three
+    // checkpoints sat on nine more after its boot, each holding a block no
+    // render was queued for. Keep only the ones a render is waiting on.
+    if (this.renderHold.size && this.#memoryBound()) {
+      for (const [idx, id] of [...this.renderHold]) {
+        const block = this.blocks[idx];
+        const wanted = this.renderWant.has(id) || this.foregroundRenderIds?.has(id) ||
+          this.rendering?.has(id + ':' + block?.galleyHash);
+        if (!wanted) this.renderHold.delete(idx);
+      }
+    }
     const active = [...this.checkpoints].filter(([, peer]) => peer === this.jobInput).map(([index]) => index);
     const activeRender = checkpointIndicesForPeers(
       this.checkpoints,
@@ -1355,7 +1853,7 @@ export class CheckpointEngine {
     const budget = sharedCheckpointBudget({
       maxCheckpoints: this.maxCheckpoints,
       checkpoints: this.checkpoints,
-      shippingEnabled: !!this.shipping,
+      shippingEnabled: this.#shippingAffordable(),
       currentJob: this.currentJob,
       activeResidentRenders: this.activeResidentRenderCheckpoints,
     });
@@ -1365,7 +1863,8 @@ export class CheckpointEngine {
       editHold: [0, ...this.editHold, ...active, ...(continuation === null ? [] : [continuation])],
       coveragePins: this.editHold,
       renderHold: this.renderHold,
-      activeHold: [...activeRender, ...this.#coldPreviewHeld()],
+      activeHold: [...activeRender, ...this.#coldPreviewHeld(), ...propagationCheckpointHold(this.pendingChain),
+        ...(Number.isInteger(this.rescueCursor) ? [this.rescueCursor] : [])],
       maxPeers: budget.residentLimit,
       dyingPids: this.dyingPids,
     });
@@ -1381,7 +1880,7 @@ export class CheckpointEngine {
       idx,
       keep: this.#checkpointKeepSet(),
       checkpoints: this.checkpoints,
-      editHold: [...this.editHold, ...this.#coldPreviewHeld()],
+      editHold: [...this.editHold, ...this.#coldPreviewHeld(), ...propagationCheckpointHold(this.pendingChain)],
       renderHold: this.renderHold,
       block: this.foregroundRenderIds && !this.foregroundRenderIds.has(this.blocks[idx]?.id)
         ? null : this.blocks[idx],
@@ -1408,9 +1907,28 @@ export class CheckpointEngine {
     return mayNeedRender(block);
   }
 
+  /**
+   * A caret warm pins the checkpoints of the page's unrendered blocks past
+   * the usual eight (warmEditOffset). Each is let go once its block has its
+   * exact pixels, so the extra forks live for the seconds the renders take.
+   */
+  #releaseWarmPins() {
+    if (this.editHold.length <= 8) return;
+    const waiting = (idx) => {
+      const block = this.blocks[idx];
+      return !!block?.needsRender && this.#chunkTargets(block).some(chunk =>
+        this.chunks.get(chunk.key)?.forGalley !== block.galleyHash);
+    };
+    const kept = this.editHold.filter((idx, position) => position < 8 || waiting(idx));
+    if (kept.length === this.editHold.length) return;
+    this.editHold = kept;
+    this.#enforceCheckpointCap();
+  }
+
   /** A held checkpoint has served its render (or the hold went stale):
    * resume normal measured-skeleton retirement. */
   #releaseRenderHold(idx) {
+    this.#releaseWarmPins();
     if (!releaseRenderHold(this.renderHold, idx)) return;
     this.#enforceCheckpointCap();
   }
@@ -1469,6 +1987,64 @@ export class CheckpointEngine {
     });
   }
 
+  /** A held RENDER (#103): one per block, spared by the next keystroke. */
+  #holdRender(blockId, early) {
+    early.held = true;
+    this.heldRenders ??= new Map();
+    this.heldRenders.set(blockId, early);
+    this.heldRenderIds ??= new Map();
+    this.heldRenderIds.set(early.requestId, blockId);
+    const settled = () => {
+      if (this.heldRenders?.get(blockId) === early) this.heldRenders.delete(blockId);
+      this.heldRenderIds?.delete(early.requestId);
+    };
+    early.done.then(settled, settled);
+  }
+
+  /** Whether a block's early RENDER can be held (#103): one whose page can
+   * lay it out from an earlier painted galley meanwhile. */
+  #holdableRender(block) {
+    return exactFallbackEligible(block.galley) && !!block.needsRender && !block.fidelity?.canonicalOnly;
+  }
+
+  /**
+   * A held RENDER whose galley a newer keystroke has replaced (#103): crop
+   * its PDF for that galley's hash once it lands, while the block's newer
+   * galleys have no pixels of their own, so the page lays the block out from
+   * it (stream.js). The next update's pagination picks the chunk up; with
+   * none waiting, a repagination publishes it.
+   */
+  #landHeldRender(blockId, galley, hash, early) {
+    early.used = true; // the pump never crops it for a later galley
+    void early.done.then(async () => {
+      // still wanted: the block holds this galley, its own pixels are not
+      // in, and no newer held galley has painted (checked again after the
+      // crop, which awaits pdftocairo while the pump may land the current)
+      const wanted = () => !this.closed && this.mode === 'structured' &&
+        supersededLanding(this.blocks.find((b) => b.id === blockId), this.chunks, hash) === 'held';
+      if (!wanted()) return;
+      const staged = new Map([[blockId, this.chunks.get(blockId)]]);
+      await cropRenderTargets({
+        jobdir: early.jobdir, pdf: early.pdf, prefix: 'chunk', forGalley: hash, chunks: staged,
+        targets: [{ key: blockId, page: 1, w: galley.w, h: galley.h + galley.d }],
+        anchor: { key: blockId, galley },
+      });
+      if (!wanted()) return;
+      const landed = staged.get(blockId);
+      landed.v = Math.max(landed.v, (this.chunks.get(blockId)?.v ?? 0) + 1);
+      this.chunks.set(blockId, landed);
+      // a waiting keystroke paginates with it anyway; otherwise publish now,
+      // or right after the update that holds the chain (its display list may
+      // already name the chunk version this replaced)
+      if (!(this.editPending > 0)) {
+        void this.#locked(async () => this.#asyncRepaginate())
+          .catch((err) => this.diagnostics.push(`held render ${blockId}: ${err?.message ?? err}`));
+      }
+    }).catch(() => {}).finally(() => {
+      rmSync(early.jobdir, { recursive: true, force: true });
+    });
+  }
+
   #normalizeGalleyFonts(galley) {
     normalizeGalleyFonts(galley, {
       registerFont: (key, meta) => this.#registerFont(key, meta),
@@ -1482,7 +2058,16 @@ export class CheckpointEngine {
     const replacedEarly = block.galley?.tdomColdPreview?.early;
     if (replacedEarly && replacedEarly !== galley.tdomColdPreview?.early) replacedEarly.discard();
     const replacedEarlyRender = block.galley?.tdomEarlyRender;
-    if (replacedEarlyRender && replacedEarlyRender !== galley.tdomEarlyRender) replacedEarlyRender.discard();
+    if (replacedEarlyRender && replacedEarlyRender !== galley.tdomEarlyRender) {
+      // a held RENDER still paints the galley it was sent for (#103), when
+      // that galley joins the block's history behind an earlier painted one
+      // (holdExactGalley) and has no pixels of its own yet
+      const joins = exactFallbackEligible(block.galley) && block.exactHistory?.size > 0 &&
+        this.chunks.get(block.id)?.forGalley !== block.galleyHash;
+      if (joins && replacedEarlyRender.held && !replacedEarlyRender.used && !replacedEarlyRender.discarded) {
+        this.#landHeldRender(block.id, block.galley, block.galleyHash, replacedEarlyRender);
+      } else replacedEarlyRender.discard();
+    }
     if (!galley.tdomColdPreview && this.coldPreviewHolds?.size) {
       // a walk replaced the block's preview: its checkpoint has no RENDER left
       for (const peer of [...this.coldPreviewHolds.keys()]) this.#releaseColdPreviewHold(peer, block.id);
@@ -1504,6 +2089,10 @@ export class CheckpointEngine {
       headingRe: HEADING_RE,
       applyFidelity: (b, g) => this.#applyFidelity(b, g),
     });
+    // (outside a keystroke: a walk that passes many blocks. What the snapshot
+    // keeps per block is read again once the walk has gone quiet, so the next
+    // keystroke does not pay for it: #warmSnapshotSoon)
+    if (this.bgActive || !this.updating) this.#warmSnapshotSoon();
     // A conservative source scan can request capture for a construct whose
     // harvested nodes ultimately need no exact pixels.  Release that retained
     // list immediately instead of keeping it until checkpoint retirement.
@@ -1545,6 +2134,8 @@ export class CheckpointEngine {
     this.diagnostics.push(`fidelity gate: font ${familyKey} failed in the browser — demoted to exact preview`);
     this.fidelityEpoch++;
     for (const block of this.blocks) {
+      // an earlier galley's fidelity predates the demotion (#103)
+      block.exactHistory = null;
       if (block.galley) this.#applyFidelity(block, block.galley);
     }
     this.#asyncRepaginate();
@@ -1639,6 +2230,8 @@ export class CheckpointEngine {
         abortBackgroundJob(this, 'background walk pre-empted by an edit');
       }
     } else abortBackgroundJob(this);
+    // (the task may be asleep in its idle gate: background-scheduler.js)
+    this.bgGateWake?.();
     await this.bgTask.catch(() => {});
     try {
       const report = await this.#locked(async () => {
@@ -1652,6 +2245,14 @@ export class CheckpointEngine {
         this.updating = true;
         this.bgAbort = false;
         this.updateSeq++;
+        // A table of contents queued while the typing paused goes back to
+        // being owed: pending in front of the paragraph typed in, it sent
+        // every keystroke until it finished back to verifying the paragraph
+        // after it first (update-typeset-phase.js deferToc).
+        if (keystroke && this.pendingChain?.tocOnly) {
+          this.pendingChain = null;
+          this.tocOwed = true;
+        }
         try {
           preemptResidentRenders(this);
           return await this.#updateInner({ ...args, announceDocumentReset });
@@ -1659,6 +2260,7 @@ export class CheckpointEngine {
           this.updating = false;
           this.foregroundRenderIds = null;
           this.progress = null; // /status liveness marker
+          wakeRescues(this);
         }
       });
       if (documentResetPending) this.onDocumentResetComplete?.({ report });
@@ -1776,7 +2378,7 @@ export class CheckpointEngine {
     // the settle/rebuild it carried, which the document still owes.
     if (coldResume && !dirtySource.size) {
       if (chainCarry?.kind) {
-        this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels);
+        this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels, chainCarry.queuedAt, chainCarry.through);
         this.#kickPendingChain();
       }
       return null;
@@ -1828,6 +2430,8 @@ export class CheckpointEngine {
     // A boot (or reboot) walk may compile first-ever rescues inline
     // (#bootIsoCompile) for this much compile time in total.
     this.bootRescueBudgetMs = rebooted || editLabel === 'open' ? this.bootRescueMs : 0;
+    // the blocks an edit of the document changed (their jobs are marked K: #jobBlock)
+    this.keystrokeSource = rebooted || editLabel === 'open' ? null : dirtySource;
     try {
       await runUpdateTypesetPhase(this, {
         oldBlocks,
@@ -1841,6 +2445,7 @@ export class CheckpointEngine {
         // walk has no prefix to defer.
         coldBudgetMs: rebooted || retry || editLabel === 'open' ? 0 : this.coldPrefixBudgetMs,
         coldResume,
+        deferToc: !rebooted && !retry && editLabel !== 'open',
         callbacks: {
           nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
           typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),
@@ -1891,7 +2496,11 @@ export class CheckpointEngine {
     this.bootRescueBudgetMs = 0;
     // The settle/rebuild a cold walk carried through its resume is queued
     // again behind this update's own verdict (docs/10 §10.6 merging).
-    if (chainCarry?.kind) this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels);
+    if (chainCarry?.kind) this.#queueChainWork(chainCarry.kind, chainCarry.from, chainCarry.labels, chainCarry.queuedAt, chainCarry.through);
+    // the one block this update changed in place, if that is all it did
+    // (ship-pacing.js deferShipUpdate)
+    const editedInPlace = !rebooted && !coldResume && diff && !diff.added?.length && !diff.removed?.length &&
+      dirtySource.size === 1 ? [...dirtySource][0] : null;
     return finalizeUpdate(this, {
       text,
       editLabel,
@@ -1911,8 +2520,9 @@ export class CheckpointEngine {
         enforceCheckpointCap: () => this.#enforceCheckpointCap(),
         scheduleBackground: (fgStop, dirtyBlocks, options) => this.#scheduleBackground(fgStop, dirtyBlocks, options),
         shipUpdate: (sourceText, changes) => this.#shipNow(sourceText, changes),
-        deferShipUpdate: (sourceText, changes) => this.#shipLater(sourceText, changes),
+        deferShipUpdate: (sourceText, changes) => this.#shipLater(sourceText, changes, editedInPlace),
         fidelitySummary: () => this.#fidelitySummary(),
+        pumpOwedPages: () => this.#pumpOwedPages(),
       },
     });
   }
@@ -1957,7 +2567,24 @@ export class CheckpointEngine {
     });
   }
 
+  /** True while memory, not the document, bounds the checkpoint budget (a
+   * preamble holding more than a gigabyte live on a 16 GB machine). */
+  #memoryBound() {
+    return memoryCheckpointCeiling(this.confirmedLiveHeapKb) < this.checkpointCeiling;
+  }
+
+  /** The shipping chain is a second lineage of forks with heaps of its own,
+   * and it shares the checkpoint budget: under a memory bound of three it
+   * left the resident chain two, so every keystroke replayed the blocks of
+   * its page again (0.4-0.8 s where 0.17-0.24 s is possible) and the pages
+   * beside it never got their exact pixels. A document that depends on
+   * shipped pages (shipping-exact) keeps the chain. */
+  #shippingAffordable() {
+    return !!this.shipping && (this.previewPolicy === 'shipping-exact' || !this.#memoryBound());
+  }
+
   #queueShipBoot() {
+    if (!this.#shippingAffordable()) return;
     queueShipBootHelper(this, () => this.#bootShipping());
   }
 
@@ -1973,13 +2600,23 @@ export class CheckpointEngine {
     immediateShipUpdate(this, text, projectInputChanges, (t, c) => this.#shipUpdate(t, c));
   }
 
-  #shipLater(text, projectInputChanges = null) {
-    deferShipUpdate(this, text, projectInputChanges, (t, c) => this.#shipUpdate(t, c));
+  #shipLater(text, projectInputChanges = null, editedBlock = null) {
+    deferShipUpdate(this, text, projectInputChanges, (t, c) => this.#shipUpdate(t, c), editedBlock);
   }
 
   /** The viewer asked for canonical pixels of the current revision. */
   noteDisplayDemand() {
     return noteDisplayDemandHelper(this, (t, c) => this.#shipUpdate(t, c));
+  }
+
+  /**
+   * A viewer read the glyph places of a block's picture (/chunk-glyphs): an
+   * editor is open on the paper, or a click is opening one. For a while the
+   * block typed into gets its picture beside every keystroke again
+   * (render-pump.js typedInBurst).
+   */
+  notePaperEditor() {
+    this.paperEditorUntil = Date.now() + PAPER_EDITOR_MS;
   }
 
   #noteShipActivity() {
@@ -2041,6 +2678,7 @@ export class CheckpointEngine {
       this.maxCheckpoints = checkpointBudgetFor(this.blocks.length, {
         ceiling: this.checkpointCeiling,
         pageCount: this.canonicalPageCount,
+        heapFloorKb: this.confirmedLiveHeapKb,
       });
       if (this.maxCheckpoints !== prior) {
         this.checkpointKeepCache = null;
@@ -2092,7 +2730,14 @@ export class CheckpointEngine {
       const staged = `${target}.${process.pid}.tmp`;
       writeFileSync(staged, next, 'utf8');
       renameSync(staged, target);
-    } catch { /* the resident keeps its last index; canonical still shows the right one */ }
+    } catch { return; /* the resident keeps its last index; canonical still shows the right one */ }
+    // Typeset the index now, as a changed project input, instead of on the
+    // next keystroke: until it is in, the resident paper is pages shorter
+    // than canonical and the first edits after opening a book could not be
+    // shown (and the keystroke itself paid for the index).
+    if (this.blocks.some((block) => /\\printindex\b/.test(block.text))) {
+      setTimeout(() => { if (!this.closed) this.onResidentInputChange?.(target); }, 0);
+    }
   }
 
   async #cropCanonicalChunks(info) {
@@ -2134,7 +2779,7 @@ export class CheckpointEngine {
           for (;;) {
             if (this.closed || !this.rescueQueue.size) return;
             bid = [...this.rescueFocus].find((id) => this.rescueQueue.has(id)) ??
-              this.rescueQueue.keys().next().value;
+              this.#nextRescueInOrder();
             // A cold keystroke's resume (docs/10 §10.4a) outranks isolated
             // rescue adoption: the adopt walk holds the chain lock for seconds
             // and the keystroke's page is not on screen until the resume runs.
@@ -2143,12 +2788,9 @@ export class CheckpointEngine {
             // re-typesets the same path, and the resume would only re-show
             // the held galley (tex64-internal #94: 2.4-3.0 s edits waited
             // for it).
-            const resumeOnlyFor = this.coldDirty.size > 0 && [...this.coldDirty].every((id) => id === bid);
-            const coldAhead = (this.coldDirty.size > 0 || this.pendingChain?.kind === 'cold') && !resumeOnlyFor;
-            const waiting = this.editPending > 0 || coldAhead ||
-              !this.rescueFocus.has(bid) && Date.now() - (this.lastEditAt ?? 0) < shippingPriorityQuietMs(this, 800);
-            if (!waiting) break;
-            await new Promise((r) => setTimeout(r, 200));
+            const waitMs = rescueWaitMs(this, bid);
+            if (!waitMs) break;
+            await waitForRescueChange(this, waitMs);
           }
           await withReplaceablePreviewJob(this, 'async-rescue', async () => {
             // Keep the latest-wins entry while the Build gate is closed. A
@@ -2171,8 +2813,33 @@ export class CheckpointEngine {
         }
       } finally {
         this.rescuePumping = false;
+        if (Number.isInteger(this.rescueCursor)) {
+          this.rescueCursor = null;
+          if (!this.closed) this.#enforceCheckpointCap();
+        }
       }
     })();
+  }
+
+  /** The queued rescue to adopt next: the first one at or after the boundary
+   * the last adoption left (rescueCursor), in document order, so one pass
+   * over the document adopts the backlog. Re-queued entries (an offset that
+   * moved) sit at the end of the queue and would send the walk back. */
+  #nextRescueInOrder() {
+    const first = this.rescueQueue.keys().next().value;
+    if (this.rescueQueue.size < 2) return first;
+    const from = Number.isInteger(this.rescueCursor) ? this.rescueCursor : 0;
+    let ahead = null;
+    let aheadIdx = Infinity;
+    let lowest = null;
+    let lowestIdx = Infinity;
+    for (let i = 0; i < this.blocks.length; i++) {
+      const id = this.blocks[i].id;
+      if (!this.rescueQueue.has(id)) continue;
+      if (i < lowestIdx) { lowest = id; lowestIdx = i; }
+      if (i >= from && i < aheadIdx) { ahead = id; aheadIdx = i; break; }
+    }
+    return ahead ?? lowest ?? first;
   }
 
   async #asyncRescueOne(bid, key) {
@@ -2194,11 +2861,24 @@ export class CheckpointEngine {
     const rescueStartedAt = performance.now();
     let rescueCompileMs = 0;
     let rescueCached = true;
+    // a cold preview compiling these very inputs caches its result: wait for
+    // it instead of paying the same compile twice
+    const previewing = this.coldRescuePreviews?.get(bid);
+    if (previewing?.key === key) await previewing.galley;
     if (this.#isoCacheGet(key) === undefined) {
       rescueCached = false;
-      const iso = await this.#isoCompile(block, idx, 'async exact rescue');
+      // the disk index of the inputs the key names (read before the compile
+      // waits for its turn, like the key itself)
+      const baseKeyNow = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block), tocHash: this.tocHash });
+      const iso = await this.#isoCompile(block, idx, 'async exact rescue', false, { expectKey: key });
+      if (!iso) {
+        // its inputs moved while it waited for its turn: queue the current key
+        const at = this.blocks.findIndex((b) => b.id === bid);
+        if (at >= 0) this.rescueQueue.set(bid, this.#rescueCacheKey(this.blocks[at], at));
+        return;
+      }
       rescueCompileMs = performance.now() - rescueStartedAt;
-      const baseKey = rescueBaseKey(block, idx, { blocks: this.blocks, preHash: this.#rescuePre(block) });
+      const baseKey = baseKeyNow;
       if (process.env.TDOM_TRACE_ISO_CACHE) {
         console.error('[iso-cache] set', bid, 'idx', idx, 'base', baseKey, 'key', key, 'prev', this.blocks[idx - 1]?.id,
           'state', this.blocks[idx - 1]?.stateVec, 'pre', this.preHash);
@@ -2212,8 +2892,11 @@ export class CheckpointEngine {
       if (waiting) this.rescueAdoptWaiting--;
       waiting = false;
     };
+    const lockAskedAt = performance.now();
+    const timing = { lockMs: 0, walkMs: 0, walked: null, from: null, at: null };
     const outcome = await this.#locked(async () => {
       stopWaiting();
+      timing.lockMs = Math.round(performance.now() - lockAskedAt);
       if (this.mode !== 'structured') return 'done';
       idx = this.blocks.findIndex((b) => b.id === bid);
       if (idx < 0) return 'done';
@@ -2227,6 +2910,19 @@ export class CheckpointEngine {
       }
       const before = block.galleyHash + '|' + block.stateVec;
       const beforeChunksRev = this.chunks.rev;
+      if (this.#adoptRescueInPlace(block, key)) {
+        timing.inPlace = true;
+        timing.adopted = 1;
+        for (const l of block.galley?.labels ?? []) {
+          if (l.v !== undefined) {
+            this.labelTable.set(l.k, l.v);
+            if (l.h != null) this.hrefTable.set(l.k, l.h);
+          }
+        }
+        this.#asyncRepaginate();
+        this.#queueMovedOffsets();
+        return 'done';
+      }
       // cache hit inside → the exact galley adopts in milliseconds; the
       // chain continues to convergence exactly like a foreground edit,
       // but YIELDS to an incoming edit and re-queues so the propagation
@@ -2234,10 +2930,33 @@ export class CheckpointEngine {
       // job instead of waiting out a deep-lineage spin (#update).
       this.bgActive = true;
       let n;
+      const walkFrom = this.#nearestCheckpoint(idx);
+      // Queued rescues further on whose result is already compiled (a
+      // reopened document finds them on disk) ride this walk: it typesets
+      // every block up to the last of them and each adopts its result as the
+      // walk reaches it. One at a time, each paid its own replay from the
+      // nearest checkpoint: reopening the 72-page book adopted 23 stored
+      // results in 60 s, of which the same 253 blocks were replayed twice
+      // (8.7 s each) and another 170-180 twice more.
+      const riders = [];
+      if (this.rescueQueue.size) {
+        const at = new Map(this.blocks.map((item, index) => [item.id, index]));
+        for (const [otherId, otherKey] of this.rescueQueue) {
+          const index = at.get(otherId);
+          if (!(index > idx) || this.#rescueCacheKey(this.blocks[index], index) !== otherKey) continue;
+          if (this.#isoCacheGet(otherKey) === undefined) continue;
+          riders.push({ id: otherId, key: otherKey, index });
+        }
+      }
+      const walkTo = riders.reduce((last, rider) => Math.max(last, rider.index), idx);
+      const walkStartedAt = performance.now();
+      timing.from = walkFrom;
+      timing.at = idx;
+      timing.riders = riders.length;
       try {
         n = await this.#retypesetChain(
-          this.#nearestCheckpoint(idx),
-          idx,
+          walkFrom,
+          walkTo,
           (index, changed) => {
             const successor = this.blocks[index];
             if (changed && successor.needsRender) this.#queueRender(successor.id);
@@ -2251,23 +2970,50 @@ export class CheckpointEngine {
         throw err;
       } finally {
         this.bgActive = false;
+        timing.walkMs = Math.round(performance.now() - walkStartedAt);
+        timing.walked = n ?? null;
       }
       // retypesetChain swallows a killed job into an early break — treat
       // any abort-flagged pass as pre-empted so the queue entry retries
       if (n < 0 || this.bgAbort) return 'aborted';
-      for (const l of block.galley?.labels ?? []) {
-        if (l.v !== undefined) {
-          this.labelTable.set(l.k, l.v);
-          if (l.h != null) this.hrefTable.set(l.k, l.h);
+      const adopted = [block];
+      for (const rider of riders) {
+        const other = this.blocks[rider.index];
+        // adopted by the walk: the block now carries the result its queue
+        // entry asked for (a kept, stale copy means the walk met other inputs)
+        if (other?.id !== rider.id || this.rescueQueue.get(rider.id) !== rider.key ||
+            !other.galley || other.galley.tdomStale || this.#rescueCacheKey(other, rider.index) !== rider.key) continue;
+        this.rescueQueue.delete(rider.id);
+        adopted.push(other);
+      }
+      timing.adopted = adopted.length;
+      for (const item of adopted) {
+        for (const l of item.galley?.labels ?? []) {
+          if (l.v !== undefined) {
+            this.labelTable.set(l.k, l.v);
+            if (l.h != null) this.hrefTable.set(l.k, l.h);
+          }
         }
       }
       // Re-adopting identical geometry still registers a new chunk version.
       // Publishing only layout changes leaves the page requesting a retired
       // SVG/glyph version, so an atomic viewer waits for it indefinitely.
-      if (before !== block.galleyHash + '|' + block.stateVec || this.chunks.rev !== beforeChunksRev) {
+      if (before !== block.galleyHash + '|' + block.stateVec || this.chunks.rev !== beforeChunksRev || adopted.length > 1) {
         this.#asyncRepaginate();
       }
       this.#queueMovedOffsets();
+      // The boot backlog is adopted in document order. Keep the boundary
+      // just behind this block while more wait: the next adoption resumes
+      // from here instead of replaying from the grid. With the grid a heavy
+      // document affords (three checkpoints for a book on 16 GB) each of 77
+      // adoptions replayed about a thousand blocks, half an hour in all.
+      // (the walk verifies a block or two past the adopted one: the boundary
+      // it stopped at is the newest checkpoint just behind them)
+      let frontier = null;
+      if (this.rescueQueue.size) {
+        for (let k = walkTo + 4; k > walkTo; k--) if (this.checkpoints.has(k)) { frontier = k; break; }
+      }
+      this.rescueCursor = frontier;
       // the resume walk left checkpoints at the blocks it re-typeset — collapse
       // back to the grid so the boot rescue storm can't creep the live set
       this.#enforceCheckpointCap();
@@ -2282,6 +3028,9 @@ export class CheckpointEngine {
       outcome,
       at: Date.now(),
       queued: this.rescueQueue.size,
+      // where the time of an adoption goes: waiting for the chain lock, then
+      // the walk from the nearest checkpoint to the block and on to convergence
+      ...timing,
     });
     if (this.rescueLog.length > 200) this.rescueLog.splice(0, this.rescueLog.length - 200);
     if (outcome === 'aborted') {
@@ -2294,6 +3043,34 @@ export class CheckpointEngine {
       }
       if (this.closed) this.rescueQueue.delete(bid);
     }
+  }
+
+  /**
+   * A rescue result that leaves the block's exit exactly as the chain already
+   * has it (same state vector, same labels, same trailing glue) replaces the
+   * block's galley where it stands: everything after the block was typeset
+   * from that exit, so no checkpoint moves and nothing is replayed. A code
+   * box that breaks at another height on its page is the usual case. Paid
+   * through the walk, each such result replayed from the nearest checkpoint:
+   * reopening the 389-page book spent 487 s of its 737 s in eight walks of
+   * up to 3,383 blocks, most of them for boxes whose exit had not moved.
+   */
+  #adoptRescueInPlace(block, key) {
+    const held = block.galley;
+    const iso = this.#isoCacheGet(key);
+    if (!iso || !held?.state || !block.stateVec) return false;
+    if (held.tdomFrozen || held.tdomDeferred || held.tdomColdPreview || held.tdomPendingPaint) return false;
+    if (this.coldDirty?.has(block.id) || this.poisoned.has(block.id)) return false;
+    if (exitStateVec(iso, this.counters) !== block.stateVec) return false;
+    const labelKey = (labels) => JSON.stringify((labels ?? []).map((l) => [l.k, l.v ?? null, l.h ?? null]));
+    if (labelKey(iso.labels) !== labelKey(held.labels)) return false;
+    let widthSp = 0;
+    try { widthSp = JSON.parse(block.stateVec).at(-1) ?? 0; } catch { widthSp = 0; }
+    if (JSON.stringify(trailingGlueSpec(iso, widthSp)) !== JSON.stringify(trailingGlueSpec(held, widthSp))) return false;
+    const exit = block.stateVec;
+    this.#adoptGalley(block, isoGalley(iso));
+    block.stateVec = exit;
+    return true;
   }
 
   /**
@@ -2315,9 +3092,10 @@ export class CheckpointEngine {
    * the moving exit state converges (trusting the same verification the
    * foreground uses); 'rebuild' distrusts the suffix entirely (definition
    * edits, untracked-state leaks) and never converges early. rebuild
-   * subsumes settle; overlapping requests keep the earliest start.
+   * subsumes settle; merged requests keep every unfinished frontier.
    */
-  #queueChainWork(kind, from, labels) {
+  #queueChainWork(kind, from, labels, queuedAt = Date.now(), through = from) {
+    through = Math.max(from, through);
     let cur = this.pendingChain;
     // Grid materialization is the lowest priority: any other chain work
     // replaces it (the scheduler re-queues it once the queue drains).
@@ -2326,6 +3104,7 @@ export class CheckpointEngine {
       if (!cur) this.pendingChain = { kind: 'grid', from: 0, phase: 'blocks', labels: new Set(), budget: 16 };
       return;
     }
+    if (cur) cur.queuedAt = Math.min(cur.queuedAt ?? queuedAt, queuedAt);
     if (kind === 'cold') {
       // The cold walk outranks deferred chain work: its resume update
       // re-queues whatever settle/rebuild was pending (carry).
@@ -2337,15 +3116,16 @@ export class CheckpointEngine {
       this.pendingChain = {
         kind: 'cold',
         from,
+        queuedAt: cur?.queuedAt ?? queuedAt,
         phase: 'blocks',
         labels: new Set(),
         coldIds: new Set(this.coldDirty),
-        carry: cur ? { kind: cur.kind, from: cur.from, labels: new Set(cur.labels) } : null,
+        carry: cur ? { kind: cur.kind, from: cur.from, through: cur.through ?? cur.from, labels: new Set(cur.labels), queuedAt: cur.queuedAt } : null,
       };
       return;
     }
     if (!cur) {
-      this.pendingChain = { kind, from, phase: 'blocks', labels: new Set(labels) };
+      this.pendingChain = { kind, from, through, phase: 'blocks', labels: new Set(labels), queuedAt };
       return;
     }
     if (cur.kind === 'cold') {
@@ -2354,13 +3134,19 @@ export class CheckpointEngine {
         ? {
             kind: carry.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle',
             from: Math.min(carry.from, from),
+            through: Math.max(carry.from, carry.through ?? carry.from, through),
             labels: new Set([...carry.labels, ...(labels ?? [])]),
+            queuedAt: Math.min(carry.queuedAt ?? queuedAt, queuedAt),
           }
-        : { kind, from, labels: new Set(labels) };
+        : { kind, from, through, labels: new Set(labels), queuedAt };
       return;
     }
     cur.kind = cur.kind === 'rebuild' || kind === 'rebuild' ? 'rebuild' : 'settle';
     delete cur.plainBlockId;
+    delete cur.tocOnly; // (it carries other work now)
+    // A clean island before another pending frontier cannot prove that
+    // later propagation finished. Keep both ends when merging requests.
+    cur.through = Math.max(cur.from, cur.through ?? cur.from, through);
     cur.from = Math.min(cur.from, from);
     cur.phase = 'blocks';
     for (const k of labels ?? []) cur.labels.add(k);
@@ -2419,6 +3205,15 @@ export class CheckpointEngine {
       gridWanted: () =>
         process.env.TDOM_GRID_FILL !== '0' && !this.closed && !this.gridFill.stalled &&
         this.gridMissing().length > 0,
+      queueOwedToc: () => {
+        const consumer = this.blocks.findIndex((block) => block.consumesToc);
+        if (consumer < 0) this.tocOwed = false;
+        else {
+          this.#queueChainWork('settle', consumer, []);
+          // (only the table of contents: a keystroke hands it back, #update)
+          if (this.pendingChain && !this.pendingChain.carry) this.pendingChain.tocOnly = true;
+        }
+      },
       queueGrid: () => {
         if (process.env.TDOM_GRID_FILL === '0') return false;
         if (this.shipBooting || this.warming || this.updating || this.pendingChain) return false;
@@ -2434,7 +3229,7 @@ export class CheckpointEngine {
       nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
       typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),
       adoptGalley: (block, galley) => this.#adoptGalley(block, galley),
-      queueRender: (blockId) => this.#queueRender(blockId),
+      queueRender: (blockId, options) => this.#queueRender(blockId, options),
       asyncRepaginate: () => this.#asyncRepaginate(),
       chainAfterPass: (work) => this.#chainAfterPass(work),
       enforceCheckpointCap: () => this.#enforceCheckpointCap(),
@@ -2476,7 +3271,16 @@ export class CheckpointEngine {
     queueRenderHelper(this, blockId, {
       awaitRender: (key, timeout) => this.#await(key, timeout),
       renderIsolated: (block, idx) => this.#renderIsolated(block, idx),
-      asyncRepaginate: () => this.#asyncRepaginate(),
+      // a held render (#103) can land while an update holds the chain:
+      // publish after it instead of paginating beside it
+      asyncRepaginate: () => {
+        if (!this.updating) return this.#asyncRepaginate();
+        if (this.editPending > 0) return undefined; // the waiting keystroke paginates with it
+        void this.#locked(async () => this.#asyncRepaginate())
+          .catch((err) => this.diagnostics.push(`render repagination: ${err?.message ?? err}`));
+        return undefined;
+      },
+      holdable: (block) => this.#holdableRender(block),
       chunkTargets: (block) => this.#chunkTargets(block),
       releaseRenderHold: (idx) => this.#releaseRenderHold(idx),
     }, options);
@@ -2498,8 +3302,56 @@ export class CheckpointEngine {
     );
   }
 
+  // The source snapshot keeps an entry per block for as long as the block's
+  // galley, fidelity and place are what they were (inspector.js). A walk that
+  // typesets blocks again without changing them (after opening, after a
+  // keystroke) hands each a new galley and fidelity object: the first
+  // snapshot after it reads every such block again (1.7 µs each: 4.5 ms on a
+  // 191-page file), and that snapshot was the first keystroke's, taken
+  // before the engine even started on it. Read here instead, once no galley
+  // has been adopted for a moment and no update runs.
+  #warmSnapshotSoon() {
+    clearTimeout(this.warmSnapshotTimer);
+    this.warmSnapshotTimer = setTimeout(() => {
+      this.warmSnapshotTimer = null;
+      if (this.closed || this.mode !== 'structured') return;
+      if (this.updating) return this.#warmSnapshotSoon();
+      try { this.getDOM(); } catch { /* the keystroke's own snapshot reports whatever is wrong */ }
+    }, WARM_SNAPSHOT_QUIET_MS);
+    this.warmSnapshotTimer.unref?.();
+  }
+
+  // The display lists an update left owed (page-patches.js EAGER_PAGES):
+  // built a few pages at a time, nearest the last edit first, and sent
+  // through the async channel like any repaint. A keystroke goes first:
+  // while an update runs, the next slice waits.
+  #pumpOwedPages() {
+    if (this.owedPagesTimer) return;
+    this.owedPaging = true;
+    // (not before the typing has paused: OWED_QUIET_MS)
+    const quietIn = () => Math.max(0, OWED_QUIET_MS - (Date.now() - (this.lastEditAt ?? 0)));
+    this.owedPagesTimer = setTimeout(() => {
+      this.owedPagesTimer = null;
+      if (this.closed || this.mode !== 'structured') {
+        this.owedPaging = false;
+        return;
+      }
+      if (this.updating || quietIn() > 0) return this.#pumpOwedPages();
+      const { patches, later } = buildPagePatches(this.pages, this.pages, (page) => pageHfSig(this.hf, page.number),
+        (page) => this.#displayList(page), { limit: OWED_SLICE_PAGES, focus: this.owedFocus ?? null, owedToo: true });
+      if (patches.length && this.onAsyncPatches) {
+        this.rev++;
+        this.onAsyncPatches({ rev: this.rev, fonts: this.getFontManifest(), patches });
+      }
+      this.owedPaging = later > 0;
+      if (later > 0) this.#pumpOwedPages();
+    }, Math.max(this.updating ? OWED_BUSY_WAIT_MS : 0, quietIn()));
+    this.owedPagesTimer.unref?.();
+  }
+
   #asyncRepaginate() {
-    asyncRepaginateHelper(this, {
+    return asyncRepaginateHelper(this, {
+      pumpOwedPages: () => this.#pumpOwedPages(),
       paginateNow: () => this.#paginateNow(),
       displayList: (page) => this.#displayList(page),
       computeToc: (pages) => this.#computeToc(pages),
@@ -2618,6 +3470,17 @@ export class CheckpointEngine {
     return this.#update({ editLabel: 'external-include', projectInputChanges });
   }
 
+  /** Re-read what only the resident job reads (driver.ind): the source and
+   * the project's files are unchanged, so canonical is left alone — telling
+   * it otherwise made it compile again, deliver the same index and ask for
+   * this refresh once more. */
+  async refreshResidentInputs() {
+    return this.#update({
+      editLabel: 'resident-input',
+      projectInputChanges: { changed: [], removed: [], unknown: false },
+    });
+  }
+
   invalidateProjectInputs(paths = []) {
     const changed = new Set(paths.map((file) => path.resolve(file)));
     for (const [identity, cached] of this.includes) {
@@ -2634,7 +3497,7 @@ export class CheckpointEngine {
       geometry: this.geometry,
       chunks: this.chunks,
       hf: this.hf,
-      hfSig: this.hfSig,
+      hfSig: pageHfSig(this.hf, page.number),
       fonts: this.fonts,
       twinMetrics: this.twinMetrics,
     });

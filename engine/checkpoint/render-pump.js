@@ -2,6 +2,61 @@ import { renderResidentBlock } from './resident-render.js';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 import { withReplaceablePreviewJob } from './build-lease-preview.js';
 
+// Typing faster than an exact picture is made (docs/10 §10.4f).
+//
+// A block the page shows composed (stream.js: its text by the glyph layer,
+// every run that needs exact pixels cut out of a verified picture or put
+// together from verified outlines) looks the same before and after its own
+// picture lands. Rendering it beside every keystroke's JOB (#103) then buys
+// nothing the reader can see, and costs a lualatex child that embeds the
+// document's fonts and a pdftocairo, about 110 ms of another core per
+// keystroke: at 150 ms a key it starts to miss the next key after a couple
+// of seconds, the late picture is delivered as a second page patch, and the
+// child's work overlaps the next keystroke's own job.
+//
+// So while the keys come closer together than BURST_GAP (what the engine
+// already takes for typing that goes on, #jobBlock `pause`) and the block's
+// last galley was shown composed, the keystroke sends no RENDER; the pump
+// makes the picture once the typing has paused for BURST_PAUSE. A galley
+// that cannot be composed after all is rendered at once, as before.
+//
+// Not while an editor is open on the paper. It maps its formula through the
+// block's own picture (web/app.js provisionalStageKeepsEditor) and commits no
+// page that shows cut-outs of an earlier one, so there the picture of every
+// keystroke is what the reader sees. The viewer reads the glyph places of a
+// picture (/chunk-glyphs) only for such an editor or for the click that
+// opens one; for PAPER_EDITOR_MS after such a read every keystroke sends its
+// RENDER as before, and a picture left for the pause is made at once.
+// TDOM_RENDER_EVERY_KEY=1: the earlier behaviour.
+const EVERY_KEY = !!process.env.TDOM_RENDER_EVERY_KEY;
+const envMs = (name, fallback) => {
+  const n = Number(process.env[name]);
+  return process.env[name] != null && Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+export const BURST_GAP_MS = envMs('TDOM_BURST_GAP_MS', 400);
+export const BURST_PAUSE_MS = envMs('TDOM_BURST_PAUSE_MS', 450);
+export const PAPER_EDITOR_MS = envMs('TDOM_PAPER_EDITOR_MS', 30_000);
+
+/** A viewer read a picture's glyph places a moment ago (engine.notePaperEditor). */
+const editorOnPaper = (engine, now = Date.now()) => now < (engine?.paperEditorUntil ?? 0);
+
+/** Whether `block`, about to be typeset for a keystroke, is typed into
+ * faster than its picture is made while the page shows it composed. */
+export function typedInBurst(engine, block, now = Date.now()) {
+  return !EVERY_KEY && block?.galleyHash != null && block.composedFor === block.galleyHash &&
+    (engine.editGapMs ?? Infinity) <= BURST_GAP_MS && !editorOnPaper(engine, now);
+}
+
+/** How long after the last keystroke the pump makes the picture of a block
+ * whose keystroke sent no RENDER (`renderDeferred`): the pause, while the
+ * page shows the block's current galley composed; no time at all when that
+ * galley could not be composed (the page then shows an earlier one, and the
+ * typed character is not on it) or an editor is open on the paper. */
+export function deferredRenderQuietMs(block, engine = null, now = Date.now()) {
+  if (editorOnPaper(engine, now)) return 0;
+  return block?.composedFor != null && block.composedFor === block.galleyHash ? BURST_PAUSE_MS : 0;
+}
+
 /** Exact pixels are replaceable latency work. A new edit must not wait behind
  * boot/backlog renders that already occupy every pump lane. Cancel resident
  * render children while the update lock is held. Queued block ids stay in
@@ -12,6 +67,11 @@ import { withReplaceablePreviewJob } from './build-lease-preview.js';
 export function preemptResidentRenders(engine) {
   for (const [requestId, pid] of [...(engine.renderPids ?? [])]) {
     if (!requestId.startsWith('rr@')) continue;
+    // a held RENDER of the block being typed into (tex64-internal #103):
+    // its pixels are shown until the newer text has its own. Only that
+    // block's: typing that moves on leaves no pile of spared renders.
+    const heldFor = engine.heldRenderIds?.get(requestId);
+    if (heldFor != null && heldFor === engine.heldFocus) continue;
     if (pid > 0) {
       try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
     } else {
@@ -32,7 +92,7 @@ export function preemptResidentRenders(engine) {
  * storm — CPU saturation slows the resident fork jobs by orders of
  * magnitude), paused while a foreground update runs.
  */
-export function queueRender(engine, blockId, callbacks, { interactiveRev = null } = {}) {
+export function queueRender(engine, blockId, callbacks, { interactiveRev = null, propagation = false } = {}) {
   // audits compare block identity (galleyHash + stateVec) — the exact
   // preview chunks the RENDER tier produces never enter the equation,
   // while its fork holds cost ~500MB each on Linux (the Lua GC dirties
@@ -45,7 +105,8 @@ export function queueRender(engine, blockId, callbacks, { interactiveRev = null 
   const currentInteractive = currentRev !== null &&
     (interactiveRev === currentRev || previous?.interactiveRev === currentRev) ? currentRev : null;
   engine.renderWant.delete(blockId); // re-insertion moves it to the back = newest
-  engine.renderWant.set(blockId, { interactiveRev: currentInteractive });
+  engine.renderWant.set(blockId, { interactiveRev: currentInteractive,
+    propagation: propagation || previous?.propagation || false });
   if (currentInteractive !== null) {
     if (engine.interactiveRenderCohort?.rev !== currentInteractive) {
       engine.interactiveRenderCohort = {
@@ -58,6 +119,14 @@ export function queueRender(engine, blockId, callbacks, { interactiveRev = null 
   pumpRenders(engine, callbacks);
 }
 
+// The RENDER that left beside a block's own JOB (engine #jobBlock, docs/10
+// §10.4b/c) and is still this block's: the pump has only its PDF to crop.
+function sentRender(block) {
+  const cold = block?.galley?.tdomColdPreview;
+  const sent = cold ? cold.early : block?.galley?.tdomEarlyRender;
+  return sent && !sent.used && !sent.discarded && !sent.failure && sent.text === block.text ? sent : null;
+}
+
 function pumpRenders(engine, callbacks) {
   const MAX = Number(process.env.TDOM_RENDER_CONCURRENCY || 2);
   if (engine.renderPumping >= MAX) return;
@@ -66,38 +135,77 @@ function pumpRenders(engine, callbacks) {
     try {
       while (engine.renderWant.size) {
         if (engine.updating) {
-          await new Promise((r) => setTimeout(r, 25));
+          // (the update that queued this edit's block ends within
+          // milliseconds: look again soon when its RENDER is already out)
+          const waiting = [...engine.renderWant.keys()].some((queuedId) => {
+            const queuedBlock = engine.blocks.find((b) => b.id === queuedId);
+            return sentRender(queuedBlock) ||
+              (queuedBlock?.renderDeferred && deferredRenderQuietMs(queuedBlock, engine) === 0);
+          });
+          await new Promise((r) => setTimeout(r, waiting ? 2 : 25));
           continue;
         }
+        // Propagation owns a live JOB/CAPTURE boundary until its pixels
+        // land; serve it before that owner is lost to another keystroke.
+        // It shares these same lanes with the foreground cohort.
         // The foreground's complete cohort supplies the next editable ink.
         // Prioritize it over newer cold work, including changed neighbors
         // needed by the viewer's atomic page commit. Backlog retains the
         // shipping priority window; an edit only waits for its own debounce.
-        let id, interactive = false;
-        for (const [candidate, queued] of engine.renderWant) {
-          const current = Number.isSafeInteger(queued?.interactiveRev) && queued.interactiveRev > 0 &&
-            queued.interactiveRev === engine.srcRev;
-          if (current || !interactive) {
-            id = candidate;
-            interactive = current;
+        if (engine.closed) break;
+        let id, interactive = false, propagation = false, priority = -1;
+        // A block already rendering (a held render the keystroke spared,
+        // #103) would park this lane behind it: take another block's first,
+        // and queue behind it only when every queued block is rendering.
+        for (const skipBusy of [true, false]) {
+          for (const [candidate, queued] of engine.renderWant) {
+            if (skipBusy && engine.renderBusy?.has(candidate)) continue;
+            const current = Number.isSafeInteger(queued?.interactiveRev) && queued.interactiveRev > 0 &&
+              queued.interactiveRev === engine.srcRev;
+            const rank = queued?.propagation ? 2 : current ? 1 : 0;
+            if (rank > priority || (rank === priority && rank < 2)) {
+              id = candidate;
+              interactive = current;
+              propagation = !!queued?.propagation;
+              priority = rank;
+            }
           }
+          if (id !== undefined) break;
         }
         // Backlog (typically the previous keystroke's page) does not share the
         // machine with the current edit's own render: the page being typed on
         // waits for that one.
         const cohort = engine.interactiveRenderCohort;
-        if (!interactive && cohort?.rev === engine.srcRev && cohort.active.size > 0) {
+        if (!interactive && !propagation && cohort?.rev === engine.srcRev && cohort.active.size > 0) {
           await new Promise((r) => setTimeout(r, 25));
           continue;
         }
         const configuredQuiet = Number(process.env.TDOM_RENDER_QUIET_MS ?? 120);
         const renderQuiet = Number.isFinite(configuredQuiet) ? Math.max(0, configuredQuiet) : 120;
-        const quietMs = interactive ? renderQuiet : shippingPriorityQuietMs(engine, renderQuiet);
+        // The quiet period keeps an edit burst from forking a lualatex per
+        // keystroke. A block whose RENDER already left beside its JOB forks
+        // nothing here: its PDF only has to be cropped. Held behind the
+        // quiet period, the typed character reached the paper 142 ms after
+        // the keystroke (120 ms of it this wait) although its pixels were
+        // typeset within the first 50, and in a burst it never did: the page
+        // showed the previous keystroke's picture until the typing stopped.
+        const wanted = engine.blocks.find((b) => b.id === id);
+        const cropOnly = interactive && !!sentRender(wanted);
+        // A keystroke of a burst sent no RENDER for this block (typedInBurst):
+        // its picture is made when the typing pauses, or at once when the
+        // page could not compose the galley after all.
+        const deferred = interactive && !cropOnly && !!wanted?.renderDeferred;
+        // (TDOM_RENDER_HOLD_MS, for a diagnostic session: keep those pixels
+        // back that long, to look at what the page shows before they land)
+        const quietMs = propagation ? 0 : cropOnly ? Math.max(0, Number(process.env.TDOM_RENDER_HOLD_MS) || 0)
+          : deferred ? deferredRenderQuietMs(wanted, engine)
+            : interactive ? renderQuiet : shippingPriorityQuietMs(engine, renderQuiet);
         const remaining = quietMs - (Date.now() - (engine.lastEditAt ?? 0));
         if (remaining > 0) {
           await new Promise((r) => setTimeout(r, Math.min(25, remaining)));
           continue;
         }
+        if (cropOnly && engine.renderStats) engine.renderStats.sentTaken = (engine.renderStats.sentTaken ?? 0) + 1;
         await withReplaceablePreviewJob(engine, 'resident-render', async () => {
           // The queue entry remains present while the Build gate is closed.
           // Re-read it after waking because a newer edit may replace its tag.
@@ -120,12 +228,20 @@ function pumpRenders(engine, callbacks) {
               return;
             }
             if (!block.needsRender) return;
-            const ready = await renderBlock(engine, block, callbacks).catch((err) => {
+            if (block.renderDeferred) {
+              block.renderDeferred = false;
+              if (engine.renderStats) engine.renderStats.afterBurst = (engine.renderStats.afterBurst ?? 0) + 1;
+            }
+            // the edit's own block: the next keystroke spares its render (#103)
+            const hold = interactive && block.id === engine.heldFocus && !!callbacks.holdable?.(block);
+            const ready = await renderBlock(engine, block, callbacks, hold).catch((err) => {
               if (!err?.tdomSuperseded) engine.diagnostics.push(`render ${id}: ${err?.message ?? err}`);
               // An edit pre-empted it; its page still waits for these pixels
               // (typically the previous keystroke's). Only queued ids survive
               // preemption, so put it back behind the edit's own cohort.
-              else if (!engine.renderWant.has(id)) engine.renderWant.set(id, { interactiveRev: null });
+              else if (!engine.renderWant.has(id)) engine.renderWant.set(id, {
+                interactiveRev: null, propagation: !!queued.propagation,
+              });
               return false;
             });
             if (cohort && !ready) cohort.unavailable = true;
@@ -152,12 +268,18 @@ function pumpRenders(engine, callbacks) {
   engine.renderTask = Promise.all([engine.renderTask.catch(() => {}), drain]).then(() => {});
 }
 
-function renderBlock(engine, block, callbacks) {
+function renderBlock(engine, block, callbacks, hold = false) {
   // Per-block serialization keeps two generations from sharing the same
   // job directory. Protocol replies themselves carry unique request ids.
   engine.renderLocks ??= new Map();
   const prev = engine.renderLocks.get(block.id) ?? Promise.resolve();
-  const run = prev.then(() => renderBlockInner(engine, block, callbacks));
+  engine.renderBusy ??= new Map();
+  engine.renderBusy.set(block.id, (engine.renderBusy.get(block.id) ?? 0) + 1);
+  const run = prev.then(() => renderBlockInner(engine, block, callbacks, hold)).finally(() => {
+    const left = (engine.renderBusy.get(block.id) ?? 1) - 1;
+    if (left > 0) engine.renderBusy.set(block.id, left);
+    else engine.renderBusy.delete(block.id);
+  });
   engine.renderLocks.set(
     block.id,
     run.catch(() => {})
@@ -165,10 +287,19 @@ function renderBlock(engine, block, callbacks) {
   return run;
 }
 
-async function renderBlockInner(engine, block, callbacks) {
+async function renderBlockInner(engine, block, callbacks, hold = false) {
   const { awaitRender, renderIsolated, asyncRepaginate, chunkTargets, releaseRenderHold } = callbacks;
   const idx = engine.blocks.indexOf(block);
   if (idx < 0 || !block.galley) return false; // superseded (reboot nulls galleys)
+  // A galley older than the block's text (a cold stop left it untypeset):
+  // RENDER would ship the NEW text's pixels under the OLD galley's hash, and
+  // a page laying the block out from that galley (stream.js, #103) would
+  // pair old lines with new pixels. The walk that typesets it queues it
+  // again; until then its checkpoint owes this render nothing.
+  if (block.sourceChanged) {
+    releaseRenderHold(idx);
+    return false;
+  }
   // one render per (block, content); stale results are discarded so a
   // fast typist never sees an outdated exact image over live glyphs
   const forGalley = block.galleyHash;
@@ -206,8 +337,7 @@ async function renderBlockInner(engine, block, callbacks) {
   // the RENDER that went out beside the preview's JOB (docs/10 §10.4b) or
   // beside the edited block's own JOB (§10.4c): the galley it was sent for
   // carries it, so a later state change (a new galley) never takes its PDF
-  const sent = cold ? cold.early : block.galley?.tdomEarlyRender;
-  const early = sent && !sent.used && !sent.discarded && !sent.failure && sent.text === block.text ? sent : null;
+  const early = sentRender(block);
   if (!ck && !captureCk && !early) {
     // checkpoint retired off the grid (long documents keep ~64): the
     // Neither exact path has a resident owner: RENDER needs the state AT the
@@ -219,6 +349,9 @@ async function renderBlockInner(engine, block, callbacks) {
     await renderResidentBlock(engine, {
       block,
       idx,
+      // tex64-internal #103: the next keystroke spares it; its pixels paint
+      // this galley while the block's newer text renders (stream.js)
+      hold,
       ck,
       checkpointIndex,
       prelude,

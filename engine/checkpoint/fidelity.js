@@ -82,6 +82,44 @@ export function lineFidelity(item, fonts, backend = null) {
   return { exact, noBridge, mixedTextMath: nativeText && math };
 }
 
+// A glyph the browser cannot address through the font's cmap (luaotfload
+// parks unencoded glyphs in the private use planes; daemon.lua line_xb).
+const UNADDRESSABLE = /[\uE000-\uF8FF\u{F0000}-\u{10FFFF}]/u;
+
+/**
+ * The runs of a line that only TeX-derived pixels may show: math, a
+ * substituted or unservable font, an unaddressable glyph, and every rule
+ * the glyph layer is not certain of (lineFidelity): one of no area (a
+ * strut), which a PDF backend may still paint as a hairline, and one with a
+ * running dimension, as a fraction bar and the bar of a root have.
+ * Indices into `item.runs`. Every other run of the line is one the glyph
+ * layer draws as it does on a safe line, so a line with a formula in it
+ * splits into text the browser draws and runs it takes from an exact
+ * picture (stream.js, exact-parts.js). null when the line cannot be split
+ * that way: a run without the extents a cut-out needs.
+ */
+export function exactRunIndices(item, fonts, backend = null) {
+  const exact = [];
+  const runs = item?.runs ?? [];
+  for (let k = 0; k < runs.length; k++) {
+    const run = runs[k];
+    if (run?.rule) {
+      const semantics = classifyResidentRun(run, backend);
+      if (semantics.tag === 'LayoutOnly') continue;
+      if (semantics.tag !== 'Reject' && Number(run.w) > 0 && Number(run.h) > 0) continue; // drawn as a rectangle
+      if (![run.x, run.w, run.dy ?? 0, run.h].every(Number.isFinite) || run.w < 0 || run.h < 0) return null;
+      exact.push(k);
+      continue;
+    }
+    if (!run?.t) continue;
+    const meta = fonts.get(run.f);
+    if (!run.m && !meta?.mth && fontTier(meta) === 'native' && !UNADDRESSABLE.test(run.t)) continue;
+    if (![run.x, run.w, run.dy ?? 0, run.gh, run.gd].every(Number.isFinite) || !(run.w > 0)) return null;
+    exact.push(k);
+  }
+  return exact;
+}
+
 function scanRuns(runs, fonts, visit) {
   for (const r of runs ?? []) {
     if (r.rule || !r.t) continue; // rules are exact by construction
@@ -97,6 +135,9 @@ function scanRuns(runs, fonts, visit) {
  *   exact        any part of the block needs an exact preview chunk
  *   itemFlags    per top-level item (index-aligned): bit1 = exact line,
  *                bit2 = no glyph bridge, bit4 = native text mixed with math
+ *   exactRuns    per exact line (index-aligned, sparse): the runs only an
+ *                exact picture may show (exactRunIndices), null when the
+ *                line cannot be split
  *   floats       float n -> {exact, noBridge}
  *   ins          ins ordinal (k-th footnote item) -> {exact, noBridge}
  *   lines/exactLines  counts for the inspector
@@ -108,6 +149,7 @@ function scanRuns(runs, fonts, visit) {
 export function classifyGalley(galley, fonts) {
   const items = galley?.items ?? [];
   const itemFlags = new Array(items.length).fill(0);
+  const exactRuns = [];
   let lines = 0;
   let exactLines = 0;
   let noBridge = false;
@@ -121,6 +163,7 @@ export function classifyGalley(galley, fonts) {
       if (f.exact) {
         exactLines++;
         itemFlags[i] |= 1;
+        exactRuns[i] = exactRunIndices(it, fonts, galley?.backend);
       }
       if (f.noBridge) {
         noBridge = true;
@@ -148,6 +191,7 @@ export function classifyGalley(galley, fonts) {
     canonicalOnly: false,
     noBridge,
     itemFlags,
+    exactRuns,
     floats,
     ins,
     lines,

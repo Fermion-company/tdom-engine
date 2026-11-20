@@ -10,15 +10,19 @@ export async function drain(eng, timeoutMs = 180_000) {
     // in-flight async rescue is invisible to rescueQueue.size alone
     // coldDirty: a budgeted keystroke's block waits for its cold resume
     // (docs/10 §10.4a), which runs after the chain pass hands it back
+    // owedPaging: display lists an update left to be built a few pages at a
+    // time (page-patches.js EAGER_PAGES)
     const busy =
       eng.pendingChain || eng.bgActive || eng.rescuePumping || (eng.rescueQueue?.size ?? 0) > 0 ||
-      (eng.coldDirty?.size ?? 0) > 0;
+      (eng.coldDirty?.size ?? 0) > 0 || eng.tocOwed || eng.owedPaging;
     if (!busy) {
       await new Promise((r) => setTimeout(r, 400));
       if (
         !eng.pendingChain &&
+        !eng.tocOwed &&
         !eng.bgActive &&
         !eng.rescuePumping &&
+        !eng.owedPaging &&
         (eng.rescueQueue?.size ?? 0) === 0 &&
         (eng.coldDirty?.size ?? 0) === 0
       )

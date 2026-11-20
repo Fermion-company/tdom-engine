@@ -1,3 +1,7 @@
+import { holdsPackedRules, unpackRuleRuns } from './rule-pack.js';
+
+const TRACE_JOB = !!process.env.TDOM_TRACE_JOB;
+
 export class Peer {
   constructor(sock, engine) {
     sock.setNoDelay(true);
@@ -29,10 +33,17 @@ export class Peer {
         if (this.buf.length < len) return;
         const payload = this.buf.subarray(0, len).toString('utf8');
         this.buf = this.buf.subarray(len);
+        const headerAt = this.pendingHeader.at;
         this.pendingHeader = null;
         let json = null;
         try {
           json = JSON.parse(payload);
+          if (holdsPackedRules(payload)) unpackRuleRuns(json);
+          if (TRACE_JOB && kind === 'GALLEY' && json.tm) {
+            json.tm.headerAt = headerAt;
+            json.tm.parsedAt = performance.timeOrigin + performance.now();
+            json.tm.bytes = len;
+          }
         } catch (err) {
           this.engine.diagnostics.push(`bad ${kind} payload from pid ${this.pid}: ${err.message}`);
         }
@@ -61,7 +72,8 @@ export class Peer {
           this.pendingHeader = { kind: 'TWIN', id: null, len: Number(parts[1]) };
           break;
         case 'GALLEY':
-          this.pendingHeader = { kind: 'GALLEY', id: parts[1], len: Number(parts[2]) };
+          this.pendingHeader = { kind: 'GALLEY', id: parts[1], len: Number(parts[2]),
+            at: TRACE_JOB ? performance.timeOrigin + performance.now() : 0 };
           break;
         case 'CKPT':
           this.engine._onMessage(this, { kind: 'CKPT', idx: Number(parts[1]), pid: Number(parts[2]), gcFloorKb: Number(parts[3]), gcMs: Number(parts[4]) });

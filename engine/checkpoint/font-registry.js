@@ -4,6 +4,7 @@ import { fnv1a } from '../hash.js';
 import { mapLegacyFont } from './mathmap.js';
 import { walkItemRuns, stableFontKey } from './util/galley.js';
 import { resolveFont } from './util/fs.js';
+import { findCollectionFace } from './font-collection.js';
 
 /**
  * Rewrite the galley's numeric daemon font ids to stable keys BEFORE
@@ -51,6 +52,7 @@ export function registerFont(key, meta, { fonts, fontFiles, demotedFamilies }) {
   // layer must not fake those at all.
   let familyKey;
   let tier;
+  let face = -1;
   if (legacy) {
     familyKey = 'twin-' + legacy.twin;
     if (!fontFiles.has(familyKey)) {
@@ -61,6 +63,12 @@ export function registerFont(key, meta, { fonts, fontFiles, demotedFamilies }) {
   } else if (browserLoadable && meta.file && existsSync(meta.file)) {
     familyKey = 'f-' + fnv1a(meta.file);
     if (!fontFiles.has(familyKey)) fontFiles.set(familyKey, meta.file);
+    tier = 'native';
+  } else if (/\.(ttc|otc)$/i.test(base) && meta.file && existsSync(meta.file) &&
+      (face = findCollectionFace(meta.file, meta.name)) >= 0) {
+    // one face of a collection, served as a font of its own (font-collection.js)
+    familyKey = 'f-' + fnv1a(`${meta.file}#${face}`);
+    if (!fontFiles.has(familyKey)) fontFiles.set(familyKey, { collection: meta.file, face });
     tier = 'native';
   } else {
     familyKey = 'f-' + fnv1a(meta.file || meta.name || String(key));

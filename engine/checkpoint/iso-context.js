@@ -2,7 +2,7 @@ import path from 'node:path';
 import { fnv1a } from '../hash.js';
 import { documentBounds } from '../segmenter.js';
 import { buildIsoCompileSource } from './tex-templates.js';
-import { trailingGlueSpec } from './util/galley.js';
+import { trailingGlueSpec, compileOffset } from './util/galley.js';
 
 export function prepareIsoCompileJob({
   block,
@@ -101,7 +101,7 @@ export function prepareIsoCompileJob({
   // moved-offset comparison all use the same grid, so float-noise drifts
   // can never force a recompile, and both engines compile identical
   // galleys for offsets inside one quantum (condition D stays exact)
-  const entryOff = Math.round((block.pageOffset ?? 0) * 4) / 4;
+  const entryOff = compileOffset(block);
   const topskipW =
     typeof geometry?.topskip === 'object'
       ? geometry.topskip.w ?? 0

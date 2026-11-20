@@ -1,13 +1,24 @@
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch } from './safety.js';
-import { classifyStructuralAliases } from './structural-aliases.js';
+import { classifyStructuralAliases, classifyStructuralAliasesOfBlocks } from './structural-aliases.js';
 import { firstDirtyIndex, nextEditHold, editPageRenderIds } from './update-helpers.js';
 import { checkpointBudgetFor } from './checkpoint-selection.js';
 import { preserveCheckpointSuffix } from './checkpoint-preservation.js';
 import { sourceClosure } from './closure.js';
 import { planPreamblePatch } from './preamble-patch.js';
 import { projectPackageText } from './rescue-classifier.js';
+import { synthChunkKey } from './exact-synth.js';
+
+// Asked of every block on every update; the answer belongs to the text.
+const columnSwitchMemo = new WeakMap(); // block -> { text, uses }
+function usesColumnSwitch(block) {
+  const kept = columnSwitchMemo.get(block);
+  if (kept && kept.text === block.text) return kept.uses;
+  const uses = bodyUsesColumnSwitch(block.text);
+  columnSwitchMemo.set(block, { text: block.text, uses });
+  return uses;
+}
 
 export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, callbacks }) {
   const { opaqueUpdate, deferClosureUpdate, bootRoot, scheduleStructuredReprobe, expandIncludes, unindexBlock } = callbacks;
@@ -18,6 +29,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   const bounds = documentBounds(text);
   const preamble = text.slice(bounds.preamble.start, bounds.preamble.end);
   engine.literalEnvs = bounds.literalEnvs;
+  engine.documentConditionals = bounds.conditionals ?? null;
   const preHash = fnv1a(preamble);
 
   // Keep both the old page tree and its block boundaries while the user is
@@ -58,6 +70,8 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   let segs = segmentBody(bodyText, bounds.body.start, {
     structuralEvents: rawStructuralGate.segmentEvents,
     literalEnvs: bounds.literalEnvs,
+    // (a keystroke scans only around what it changed)
+    memo: engine.bodySegmentMemo ??= {},
   });
   segs = expandIncludes(segs, 0, {
     structuralEvents: rawStructuralGate.segmentEvents,
@@ -67,10 +81,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   // segmenter and block rescue classifier. Analyse the expanded project body
   // before granting structured display; an exact canonical page is the only
   // honest surface when a locally-defined structural alias is actually used.
-  const expandedStructuralGate = classifyStructuralAliases(
-    preamble,
-    segs.map((seg) => seg.text).join('\n\n')
-  );
+  const expandedStructuralGate = classifyStructuralAliasesOfBlocks(preamble, segs.map((seg) => seg.text));
   const structuralReasons = [
     ...rawStructuralGate.reasons,
     ...expandedStructuralGate.reasons,
@@ -79,10 +90,27 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
     ...rawStructuralGate.shippingExactUses,
     ...expandedStructuralGate.shippingExactUses,
   ];
-  if (engine.blocks.length) {
+  {
+    // One verdict per block text, kept while the document's literal
+    // environments and conditionals are the same objects (documentBounds
+    // hands the same ones out for an unchanged root) and the block is entered
+    // with the same carried depth: a keystroke re-read all 3,400 blocks of a
+    // book for the one that changed.
+    // (also on the first load, where nothing is held back whatever a block
+    // says: left to the first keystroke, the verdicts of every block were
+    // read then, 2.2 ms of it on a 191-page file)
+    const hold = engine.blocks.length > 0;
+    const kept = engine.closureMemo?.literalEnvs === bounds.literalEnvs &&
+      engine.closureMemo.conditionals === bounds.conditionals ? engine.closureMemo.byText : null;
+    const byText = new Map();
+    let carried = 0;
     for (const seg of segs) {
-      const closure = sourceClosure(seg.text, { literalEnvs: bounds.literalEnvs });
-      if (!closure.closed) {
+      const known = kept?.get(seg.text);
+      const closure = known && known.carried === carried ? known.closure : sourceClosure(seg.text, {
+        literalEnvs: bounds.literalEnvs, documentConditionals: bounds.conditionals, carried });
+      if (closure.closed) byText.set(seg.text, { carried, closure });
+      carried = closure.closed ? closure.carry ?? 0 : carried;
+      if (!closure.closed && hold) {
         timer.lap('closure');
         return {
           response: deferClosureUpdate(editLabel, timer, {
@@ -93,6 +121,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
         };
       }
     }
+    engine.closureMemo = { literalEnvs: bounds.literalEnvs, conditionals: bounds.conditionals, byText };
   }
   const diff = diffBlocks(engine.blocks, segs, () => engine.idSeq++);
   engine.blocks = diff.blocks;
@@ -103,13 +132,14 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   engine.maxCheckpoints = checkpointBudgetFor(engine.blocks.length, {
     ceiling: engine.checkpointCeiling,
     pageCount: engine.canonicalPageCount,
+    heapFloorKb: engine.confirmedLiveHeapKb,
   });
   if (shippingExactUses.length) {
     engine.previewPolicy = 'shipping-exact';
     engine.previewReasons = [...new Set(shippingExactUses.flatMap((use) =>
       use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)
     ))];
-  } else if (engine.blocks.some((block) => bodyUsesColumnSwitch(block.text))) {
+  } else if (engine.blocks.some(usesColumnSwitch)) {
     engine.previewPolicy = 'canonical-anchor';
     engine.previewReasons = [...new Set([...engine.previewReasons, 'body column switch'])];
   }
@@ -124,7 +154,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
     engine.renderWant.delete(id);
     engine.rescueQueue.delete(id);
     for (const key of engine.chunks.keys()) {
-      if (key === id || key.startsWith(id + '#') || key.startsWith(id + '@')) {
+      if (key === id || key.startsWith(id + '#') || key.startsWith(id + '@') || key === synthChunkKey(id)) {
         engine.chunks.delete(key);
       }
     }
@@ -207,6 +237,15 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
       patch = null;
     }
   }
+  // an earlier galley typeset under another preamble is no stand-in for a
+  // block's current one (stream.js exactHistory, tex64-internal #103)
+  if (preHash !== engine.preHash) {
+    for (const b of engine.blocks) {
+      if (!b.exactHistory) continue;
+      b.exactHistory = null;
+      b.units = null;
+    }
+  }
   if (patch) {
     engine.preHash = preHash;
     engine.defsPatch = patch.prelude ? patch : null;
@@ -246,7 +285,15 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
     engine.progress = { phase: 'boot' }; // /status: preamble reload running
     try {
       await bootRoot();
+      engine.structuredBootError = null;
     } catch (err) {
+      engine.structuredBootError = {
+        code: err.code === 'TDOM_SHIM_UNAVAILABLE' ? err.code : 'TDOM_STRUCTURED_BOOT_FAILED',
+        message: err.message,
+        ...(err.code === 'TDOM_SHIM_UNAVAILABLE' ? {
+          platform: err.platform, arch: err.arch, sourceHash: err.sourceHash, attempts: err.attempts,
+        } : {}),
+      };
       engine.opaqueStickyPre = preHash;
       scheduleStructuredReprobe(preHash);
       return { response: opaqueUpdate(editLabel, timer, [`structured boot failed: ${err.message}`]) };

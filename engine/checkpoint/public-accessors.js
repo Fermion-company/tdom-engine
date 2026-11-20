@@ -1,3 +1,4 @@
+import { collectionFaceFile } from './font-collection.js';
 import { existsSync, readFileSync } from 'node:fs';
 
 export function source(store, file) {
@@ -14,6 +15,7 @@ export function geometry(geo) {
 
 export function fontFile(fontFiles, key) {
   const p = fontFiles.get(key);
+  if (p && typeof p === 'object') return collectionFaceFile(p.collection, p.face);
   if (!p || !existsSync(p)) return null;
   return readFileSync(p);
 }

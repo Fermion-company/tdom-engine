@@ -166,6 +166,25 @@ export async function runChainPass(engine, callbacks) {
       return;
     }
     if (work.phase === 'blocks') {
+      // Ship changed display math while its JOB/CAPTURE owners are still
+      // resident. Retiring both hands it to the pause-only isolated queue.
+      // This wait yields to an edit; the frontier retains both owners until
+      // the bounded render pump has finished or the galley is superseded.
+      const finishRender = async () => {
+        const pending = work.render;
+        if (!pending) return true;
+        const block = engine.blocks.find(b => b.id === pending.id);
+        if (block?.galleyHash === pending.hash) {
+          queueRender(block.id, { propagation: true });
+          while (!engine.bgAbort && (engine.renderWant.has(block.id) || engine.renderBusy?.has(block.id))) {
+            await new Promise(resolve => setTimeout(resolve, 5));
+          }
+          if (engine.bgAbort) return false;
+        }
+        delete work.render;
+        return true;
+      };
+      if (work.render && !(await finishRender())) return;
       let sinceRepaint = 0;
       // highest galley-less index at pass start — the walk fills galleys at
       // its own index only, so "holes at >= j" is j <= lastNoGalley (the
@@ -178,11 +197,12 @@ export async function runChainPass(engine, callbacks) {
         }
       }
       let j = nearestCheckpoint(Math.min(work.from, engine.blocks.length));
-      // Blocks below `from` only replay up to the first stale entry state
-      // (its boundary can have retired): reproducing one proves nothing.
-      const staleFrom = work.from;
+      // A retired boundary needs prefix replay; merged work can also have
+      // clean islands before its last frontier. Neither proves convergence.
+      const staleFrom = Math.max(work.from, work.through ?? work.from);
       while (j < engine.blocks.length) {
         if (engine.bgAbort) {
+          work.through = Math.max(work.from, work.through ?? work.from);
           work.from = Math.min(work.from, j);
           return;
         }
@@ -194,6 +214,7 @@ export async function runChainPass(engine, callbacks) {
         try {
           galley = await typesetBlock(j);
         } catch {
+          work.through = Math.max(work.from, work.through ?? work.from);
           work.from = Math.min(work.from, j);
           return; // killed by an incoming edit — resume afterwards
         }
@@ -206,16 +227,22 @@ export async function runChainPass(engine, callbacks) {
           if (l.h != null) engine.hrefTable.set(l.k, l.h);
         }
         const changed = block.galleyHash !== before.hash || block.stateVec !== before.state;
+        const render = block.needsRender && galley.capture &&
+          engine.chunks.get(block.id)?.forGalley !== block.galleyHash;
         if (changed) {
           delete work.plainBlockId;
-          if (block.needsRender) queueRender(block.id);
+          if (block.needsRender && !render) queueRender(block.id);
           if (++sinceRepaint >= 8) {
             asyncRepaginate();
             sinceRepaint = 0;
           }
         }
+        if (render) {
+          work.render = { id: block.id, hash: block.galleyHash, from: j };
+        }
         j++;
         work.from = Math.max(work.from, j);
+        if (work.render && !(await finishRender())) return;
         if (work.kind === 'settle' && before.hadGalley && !changed && j > lastNoGalley && j > staleFrom) {
           break; // exit state converged — the untouched suffix is exact
         }
@@ -235,6 +262,9 @@ export async function runChainPass(engine, callbacks) {
     enforceCheckpointCap();
   }
 }
+
+// (the time since the last keystroke after which the typing counts as stopped)
+const TOC_QUIET_MS = 300;
 
 /**
  * Post-settle dependency passes — the async twins of the foreground's
@@ -263,12 +293,17 @@ export async function chainAfterPass(engine, work, callbacks) {
       if (n < 0) return;
     }
   }
-  for (let pass = 0; pass < 3; pass++) {
+  // A pass that runs while the typing goes on (chain work past its deadline)
+  // leaves the table of contents owed: typesetting it took half a second
+  // and the next keystroke killed it, gap after gap. The scheduler queues it
+  // once the typing is quiet (background-scheduler.js).
+  const typing = Date.now() - (engine.lastEditAt ?? 0) < TOC_QUIET_MS;
+  if (typing && engine.blocks.some((block) => block.consumesToc)) engine.tocOwed = true;
+  for (let pass = 0; pass < 3 && !typing; pass++) {
     if (engine.bgAbort) return;
     const prov = paginateNow();
     const toc = computeToc(prov);
     if (toc.hash === engine.tocHash) break;
-    engine.tocHash = toc.hash;
     for (const [ext, content] of Object.entries(toc.contents)) {
       writeFileSync(path.join(engine.workDir, `driver.${ext}`), content);
     }
@@ -281,8 +316,12 @@ export async function chainAfterPass(engine, work, callbacks) {
       const n = await retypesetChain(nearestCheckpoint(c), c, () => {}, () => engine.bgAbort);
       if (n < 0) return;
     }
+    // (only now: a pass stopped by a keystroke before its table of contents
+    // was typeset again must find the hash still different and do it again)
+    engine.tocHash = toc.hash;
     if (!anyConsumer) break;
   }
+  if (!typing) engine.tocOwed = false;
   queueMovedOffsets();
   asyncRepaginate();
 }

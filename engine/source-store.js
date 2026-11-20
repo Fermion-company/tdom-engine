@@ -29,6 +29,11 @@ export class SourceStore {
     return replacement.length - (end - start);
   }
 
+  /** The offsets at which the lines of `name` start (the array is replaced by an edit, never changed). */
+  lineStarts(name) {
+    return this.files.get(name)?.lineStarts ?? null;
+  }
+
   /** offset -> { line (1-based), column (1-based) } */
   position(name, offset) {
     const f = this.files.get(name);
@@ -46,9 +51,9 @@ export class SourceStore {
 }
 
 function computeLineStarts(text) {
+  // (from one line end to the next, not character by character: this runs
+  // on the whole file with every edit)
   const starts = [0];
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === '\n') starts.push(i + 1);
-  }
+  for (let at = text.indexOf('\n'); at !== -1; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
   return starts;
 }

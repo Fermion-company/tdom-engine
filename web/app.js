@@ -18,6 +18,60 @@
 const editor = document.getElementById('editor');
 const editorHighlightEl = document.getElementById('editor-highlight');
 const pagesEl = document.getElementById('pages');
+
+// ---- outer paper ---------------------------------------------------------
+// When the host keeps one chapter of a long document live, the server names
+// the paper of its last full Build (/status `outer`, server.js). Its sheets
+// before and after the chapter stand around the live pages as pictures, so
+// the reader scrolls one paper. They are no pages of this document: nothing
+// below edits, stages or verifies them.
+let outerPaper = null;
+const outerBeforeEl = document.createElement('div');
+const outerAfterEl = document.createElement('div');
+outerBeforeEl.className = outerAfterEl.className = 'outer-run';
+pagesEl.append(outerBeforeEl, outerAfterEl);
+let outerAspect = '';
+function outerSheet(sheet, key) {
+  const div = document.createElement('div');
+  div.className = 'outer-page';
+  div.dataset.sheet = sheet;
+  if (outerAspect) div.style.aspectRatio = outerAspect;
+  const img = document.createElement('img');
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  img.draggable = false;
+  img.alt = '';
+  img.src = `/outer/${sheet}.svg?k=${encodeURIComponent(key)}`;
+  div.appendChild(img);
+  return div;
+}
+function applyOuterPaper(next) {
+  const paper = activePaperGeometry();
+  const aspect = paper.width > 0 && paper.height > 0 ? `${paper.width} / ${paper.height}` : outerAspect;
+  const key = next?.key ?? null;
+  const sameSheets = (outerPaper?.key ?? null) === key;
+  if (sameSheets && aspect === outerAspect) return;
+  // the live page on screen stays where it is while sheets appear above it
+  const anchor = pagesEl.querySelector('.page');
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  outerAspect = aspect;
+  if (sameSheets) {
+    for (const div of pagesEl.querySelectorAll('.outer-page')) div.style.aspectRatio = aspect;
+  } else {
+    outerPaper = next ?? null;
+    const before = [];
+    const after = [];
+    if (outerPaper) {
+      for (let sheet = 1; sheet <= outerPaper.before; sheet++) before.push(outerSheet(sheet, key));
+      for (let sheet = outerPaper.afterFrom; sheet <= outerPaper.pages; sheet++) after.push(outerSheet(sheet, key));
+    }
+    outerBeforeEl.replaceChildren(...before);
+    outerAfterEl.replaceChildren(...after);
+  }
+  if (anchor?.isConnected && Number.isFinite(anchorTop)) {
+    pagesEl.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+  }
+}
 const statusEl = document.getElementById('status');
 const inspectorEl = document.getElementById('inspector');
 const layoutViewEl = document.getElementById('layout-view');
@@ -535,6 +589,7 @@ async function boot(expectedDocumentEpoch = null) {
   const eventEpoch = stateEventEpoch;
   bootComplete = false;
   const doc = await fetch('/doc', { cache: 'no-store' }).then((r) => r.json());
+  if (typeof doc.boot === 'string') serverBootId = doc.boot;
   if (requestEpoch !== bootRequestEpoch) return;
   if (expectedDocumentEpoch !== null && Number(doc.documentEpoch) !== Number(expectedDocumentEpoch)) {
     if (documentReset.canAdopt(expectedDocumentEpoch)) {
@@ -622,6 +677,8 @@ function adoptDoc(doc) {
   editor.value = doc.source;
   syncEditorHighlight();
   pagesEl.textContent = '';
+  // the outer paper's sheets are not this document's pages: they stay
+  pagesEl.append(outerBeforeEl, outerAfterEl);
   pageDivs.clear();
   provisionalStages.clear();
   committedPageSrcs.clear();
@@ -706,8 +763,15 @@ function displayListSrcs(dl) {
  * blank page whose stage is not ready joins nothing: it stays blank, and
  * next to a blank shell no reflow can duplicate or drop a line. On a
  * document's first presentation every page is blank, and tying them made
- * the whole document one group (tex64-internal #83). */
-function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () => true, ready = () => true) {
+ * the whole document one group (tex64-internal #83). A page the reader
+ * cannot see (`away`) whose stage is not ready joins nothing either: it
+ * keeps what it shows until its own pixels land. A keystroke that adds a
+ * line moves one line across every page break of the chapter, which tied
+ * every page of it to the one being typed on; the pages never scrolled to
+ * have no exact pixels yet, and the paper stood still until the next
+ * canonical compile (measured: all 14 keystrokes of a run unanswered). */
+function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () => true, ready = () => true,
+  away = () => false) {
   const root = new Map(stages.map(stage => [stage.dl.page, stage.dl.page]));
   const find = page => {
     while (root.get(page) !== page) page = root.get(page);
@@ -721,11 +785,18 @@ function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () 
     else map.set(key, page);
   };
   const staged = new Map(stages.map(stage => [stage.dl.page, stage]));
-  const waiting = stage => !painted(stage.dl.page) && !ready(stage);
+  const waiting = stage => !ready(stage) && (!painted(stage.dl.page) || away(stage.dl.page));
+  // A page still waiting for exact pixels that no edit touched (the replay
+  // towards a keystroke re-delivers such pages of a long document) ties its
+  // neighbour only through what the two actually share, not by standing
+  // next to it: otherwise the page being typed on waited for every picture
+  // of the chapter before it.
+  const loose = stage => !ready(stage) && !editGroup.has(stage.dl.page);
   for (const stage of stages) {
     const page = stage.dl.page;
     if (waiting(stage)) continue;
-    if (root.has(page - 1) && !waiting(staged.get(page - 1)) && (painted(page) || painted(page - 1))) join(page, page - 1);
+    if (root.has(page - 1) && !waiting(staged.get(page - 1)) && (painted(page) || painted(page - 1)) &&
+        !loose(stage) && !loose(staged.get(page - 1))) join(page, page - 1);
     stage.srcs ??= displayListSrcs(stage.dl);
     for (const src of stage.srcs) note(pageOfSrc, src, page);
     for (const src of committedSrcs.get(page) ?? []) note(pageOfSrc, src, page);
@@ -739,6 +810,29 @@ function provisionalCommitGroups(stages, committedSrcs, editGroup, painted = () 
     groups.get(group).push(stage);
   }
   return [...groups.values()];
+}
+
+// What keeps a staged page from being shown as it is: canonical-only ink,
+// exact pixels not rendered yet, browser math, a stale picture.
+const owesExactInk = cmd => cmd.op === 'canon' || cmd.op === 'pending-exact' ||
+  cmd.op === 'glyphs' && cmd.math || cmd.op === 'chunk' && cmd.st;
+
+// The pages whose paper crosses the pane now. Read once per turn of the
+// event loop: an update stages every page it delivers in one go.
+let sightMemo = null;
+function pagesInSight() {
+  if (sightMemo) return sightMemo;
+  const sight = new Set();
+  const viewport = pagesEl.getBoundingClientRect();
+  if (viewport.height > 0) {
+    for (const [page, div] of pageDivs) {
+      const bounds = div.getBoundingClientRect();
+      if (bounds.bottom > viewport.top && bounds.top < viewport.bottom) sight.add(page);
+    }
+  }
+  sightMemo = sight;
+  queueMicrotask(() => { sightMemo = null; });
+  return sight;
 }
 
 function pagePainted(page) {
@@ -766,6 +860,8 @@ function stageProvisionalPatches(patches, flash, pageCount = null, editIds = nul
   }
   const delivered = patches.filter(patch => patch.type === 'replace-page').map(patch => patch.displayList.page);
   if (delivered.length) traceStage('deliver', null, { pages: delivered });
+  // (a warm or an exact render that lands gives the page's pictures new versions)
+  if (delivered.length) scheduleChunkPrefetch();
   for (const patch of patches) {
     if (patch.type === 'replace-page') {
       const dl = patch.displayList;
@@ -788,7 +884,11 @@ function stageProvisionalPatches(patches, flash, pageCount = null, editIds = nul
     return;
   }
   if (committedCanonicalGeneration?.rev === appliedSrcRev &&
-      committedCanonicalGeneration.epoch === documentReset.adoptedEpoch) return;
+      committedCanonicalGeneration.epoch === documentReset.adoptedEpoch) {
+    committedCanonicalGeneration.residentLayoutCompatible =
+      provisionalDisplayLists.size === committedCanonicalGeneration.pageCount && !provisionalPendingLayout.size;
+    return;
+  }
   // An async chunk patch may replace only one page of an unfinished reflow.
   // Carry every other unpublished DL, including across a new source edit;
   // otherwise the first ready page can erase ink still waiting on another.
@@ -804,11 +904,17 @@ function stageProvisionalPatches(patches, flash, pageCount = null, editIds = nul
       for (const n of displayLists.keys()) if (n >= patch.from) displayLists.delete(n);
     }
   }
+  const building = [];
   for (const [n, dl] of displayLists) {
     const previous = provisionalStages.get(n);
     if (replaced.has(n) || !previous || previous.sourceRev !== appliedSrcRev ||
-        previous.documentEpoch !== documentReset.adoptedEpoch) renderPage(dl, flash);
+        previous.documentEpoch !== documentReset.adoptedEpoch) building.push(dl);
   }
+  // (of an update of many pages, those the reader is not near are put off:
+  // renderPage. Fewer than four are simply built.)
+  const mayDefer = building.length >= 4;
+  if (mayDefer) traceStage('many', null, { pages: building.length });
+  for (const dl of building) renderPage(dl, flash, mayDefer);
   queueMicrotask(tryCommitProvisionalStages);
 }
 
@@ -821,20 +927,91 @@ function shippingPresentationBlocked() {
     queuedDirectOpenings.length > 0 || flushingDirectPresentation || opaqueBatchCommitDepth > 0;
 }
 
-function scheduleViewportWarm() {
+// The first keystroke on a page stages it from its display list, and every
+// chunk picture on it is then loaded for the first time: 8 pictures and
+// 25-35 ms on a page of code boxes, on top of the keystroke itself. The
+// pictures of the pages the reader is looking at are asked for ahead of that,
+// so they come from the browser's cache when the page is staged. Only
+// pictures with a fixed address are kept there (chunkImageSrc).
+// (the picture objects are kept: one that is let go has to be read from the
+// cache and parsed again when its page is staged, 20 ms for eight of them)
+const prefetchedChunks = new Map(); // src -> Image, most recently asked for last
+let chunkPrefetchTimer = null;
+function prefetchVisibleChunks() {
+  if (typeof serverBootId !== 'string' || documentReset.pending || usesCanonicalSurface()) return;
+  const viewport = pagesEl.getBoundingClientRect();
+  const visible = new Set();
+  for (const [page, div] of pageDivs) {
+    const bounds = div.getBoundingClientRect();
+    if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) continue;
+    for (const n of [page - 1, page, page + 1]) visible.add(n);
+  }
+  for (const n of visible) {
+    for (const cmd of provisionalDisplayLists.get(n)?.commands ?? []) {
+      if (cmd.op !== 'chunk') continue;
+      const src = chunkImageSrc(cmd);
+      let image = prefetchedChunks.get(src);
+      if (image) prefetchedChunks.delete(src);
+      else {
+        image = new Image();
+        image.src = src;
+        void image.decode?.().catch(() => {});
+      }
+      prefetchedChunks.set(src, image);
+    }
+  }
+  while (prefetchedChunks.size > 256) prefetchedChunks.delete(prefetchedChunks.keys().next().value);
+  // The source map too: the next keystroke's update brings only the change
+  // from the one this viewer holds (adoptPushedSnapshot). Held as of now,
+  // that change is the edited block; held from before the pages settled, it
+  // was every block of the document (1.4 MB on a 72-page book).
+  if (Number.isSafeInteger(appliedSrcRev) && appliedSrcRev > 0) {
+    provisionalSnapshotCache.delete(`${documentReset.adoptedEpoch}:${appliedSrcRev}`);
+    void loadProvisionalSnapshot(appliedSrcRev).catch(() => {});
+  }
+}
+function scheduleChunkPrefetch() {
+  if (chunkPrefetchTimer !== null) return;
+  chunkPrefetchTimer = window.setTimeout(() => {
+    chunkPrefetchTimer = null;
+    prefetchVisibleChunks();
+  }, 200);
+}
+
+// `owedOnly`: asked because a page in sight holds a commit back, not because
+// the reader moved; then only such a page is worth a warm.
+function scheduleViewportWarm({ owedOnly = false } = {}) {
+  scheduleChunkPrefetch();
+  if (owedOnly && viewportWarmTimer !== null) return;
   window.clearTimeout(viewportWarmTimer);
   viewportWarmTimer = window.setTimeout(() => {
+    viewportWarmTimer = null;
     if (documentReset.pending || usesCanonicalSurface() || directEditor || inFlight || composing) return;
     const viewport = pagesEl.getBoundingClientRect();
     const center = (viewport.top + viewport.bottom) / 2;
     let nearest = null;
     let distance = Infinity;
+    // A page in sight still waiting for exact pixels that the edit in hand
+    // did not touch (the engine renders the edit's own pages itself): a page
+    // left stale while it was out of sight and now scrolled to, or one that
+    // took a block from the page after it. It is warmed before the page at
+    // the centre, and it asks for the canonical compile it did not ask for
+    // while out of sight.
+    let owed = null;
+    let owedDistance = Infinity;
     for (const [page, div] of pageDivs) {
       const bounds = div.getBoundingClientRect();
       if (bounds.bottom <= viewport.top || bounds.top >= viewport.bottom) continue;
       const gap = Math.abs((bounds.top + bounds.bottom) / 2 - center);
       if (gap < distance) { nearest = page; distance = gap; }
+      const stage = provisionalStages.get(page);
+      if (stage && !stage.ready && !pageEditGroup.has(page) && stage.dl.commands.some(owesExactInk)) {
+        requestCanonicalDisplay({ residentImpossible: stage.dl.commands.some(cmd => cmd.op === 'canon') });
+        if (gap < owedDistance) { owed = page; owedDistance = gap; }
+      }
     }
+    if (owed !== null) nearest = owed;
+    else if (owedOnly) return;
     if (nearest === null) return;
     const key = `${documentReset.adoptedEpoch}:${appliedSrcRev}:${nearest}`;
     if (viewportWarmKey === key) return;
@@ -869,9 +1046,44 @@ function flushDirectPresentationUpdates() {
   for (const commit of commits) commit();
 }
 
+// Why the paper is or is not following the source, for a diagnostic session:
+// call window.__tdomViewerState() in the frame's console.
+globalThis.__tdomViewerState = (pages = []) => ({
+  pages: pages.map((n) => {
+    const stage = provisionalStages.get(n);
+    const dl = stage?.dl ?? provisionalDisplayLists.get(n);
+    const owed = (dl?.commands ?? []).filter(cmd => cmd.op === 'canon' || cmd.op === 'pending-exact' ||
+      cmd.op === 'glyphs' && cmd.math || cmd.op === 'chunk' && cmd.st);
+    return { page: n, staged: !!stage, ready: !!stage?.ready, rev: stage?.sourceRev ?? null,
+      painted: pageDivs.get(n)?.className ?? null, owed: owed.length,
+      owedBy: [...new Set(owed.map(cmd => `${cmd.op}${cmd.st ? ':stale' : ''}:${cmd.src}`))].slice(0, 8) };
+  }),
+  appliedSrcRev,
+  residentPages: provisionalDisplayLists.size,
+  pendingLayout: [...provisionalPendingLayout].slice(0, 20),
+  staged: provisionalStages.size,
+  stagedReady: [...provisionalStages.values()].filter(stage => stage.ready).length,
+  removed: provisionalRemovedPages.size,
+  canonical: committedCanonicalGeneration && { ...committedCanonicalGeneration },
+  reported: canonical && { rev: canonical.rev, pageCount: canonical.pageCount },
+  canonicalSurface: usesCanonicalSurface(),
+  resetPending: documentReset.pending,
+});
+
 function tryCommitProvisionalStages() {
-  if (directPresentationBlocked()) return;
-  if (usesCanonicalSurface() || documentReset.pending) return;
+  resyncPendingLayout();
+  if (directPresentationBlocked()) return traceStage('hold', null, { why: 'direct-presentation' });
+  if (usesCanonicalSurface() || documentReset.pending) return traceStage('hold', null, { why: 'canonical-surface' });
+  // Canonical may have replaced an incomplete or differently paginated
+  // resident layout and cleared its stages. Its next delta cannot certify
+  // physical page addresses, even if every delivered chunk is drawable.
+  if (committedCanonicalGeneration?.epoch === documentReset.adoptedEpoch &&
+      committedCanonicalGeneration.rev < appliedSrcRev &&
+      committedCanonicalGeneration.residentLayoutCompatible === false) {
+    for (const page of pageDivs.keys()) pageDirtyRev.set(page, appliedSrcRev);
+    requestCanonicalDisplay({ residentImpossible: true });
+    return traceStage('hold', null, { why: 'layout-incompatible' });
+  }
   if (!provisionalStages.size && !provisionalRemovedPages.size) return;
   const residentPageCount = provisionalDisplayLists.size;
   const stages = [...provisionalStages.values()].sort((a, b) => a.dl.page - b.dl.page);
@@ -885,7 +1097,7 @@ function tryCommitProvisionalStages() {
     provisionalRemovedPages
   )) {
     requestCanonicalDisplay({ residentImpossible: true });
-    return;
+    return traceStage('hold', null, { why: 'page-transaction', residentPageCount });
   }
   // Removing the page that owns a live editor would disconnect its native
   // focus/selection (and possibly an IME composition). Keep the exact path
@@ -899,6 +1111,14 @@ function tryCommitProvisionalStages() {
   );
   const pageCountMismatch = canonicalPageCount !== null &&
     canonicalPageCount !== residentPageCount;
+  if ((canonical?.rev === appliedSrcRev && pageCountMismatch) ||
+      (provisionalPendingLayout.size && (pageCountMismatch || provisionalRemovedPages.size)) ||
+      (provisionalRemovedPages.size && !stages.length)) {
+    for (const page of pageDivs.keys()) pageDirtyRev.set(page, appliedSrcRev);
+    requestCanonicalDisplay({ residentImpossible: true });
+    return traceStage('hold', null, { why: 'page-count', residentPageCount, canonicalPageCount,
+      pendingLayout: provisionalPendingLayout.size, removed: provisionalRemovedPages.size });
+  }
   if (canonicalPageCount === null || pageCountMismatch) requestCanonicalDisplay();
   const stageReady = stage => stage.ready && stage.sourceRev === appliedSrcRev &&
     stage.documentEpoch === documentReset.adoptedEpoch &&
@@ -911,21 +1131,48 @@ function tryCommitProvisionalStages() {
   // first canonical, about four minutes after opening (tex64-internal #83).
   const residentCountSettled = canonicalPageCount === null && !provisionalPendingLayout.size;
   let committing = stages;
+  // (the pages a partial commit leaves staged on purpose: out of sight, not ready)
+  let sight = null;
   if (!stages.every(stageReady)) {
     // While the page count is settled, a ready group (provisionalCommitGroups)
     // does not wait for another: typically a page elsewhere still waiting for
     // exact pixels (the previous keystroke's, or a running head the edit
     // touched) would hold back the page being typed on now. Numbers on far
     // pages may briefly lag until theirs land.
-    if (pageCountMismatch || (canonicalPageCount === null && !residentCountSettled) ||
-        provisionalRemovedPages.size || directEditor) return;
+    // A page count that differs from canonical's, or a tail being removed,
+    // waits for every page the reader can see; pages out of sight that still
+    // owe exact pixels keep what they show until they are scrolled to
+    // (scheduleViewportWarm) or the next canonical lands.
+    sight = pagesInSight();
+    const owedInSight = stages.filter(stage => !stageReady(stage) && sight.has(stage.dl.page));
+    const tailInSight = [...provisionalRemovedPages].some(page => sight.has(page));
+    if (((pageCountMismatch || provisionalRemovedPages.size) && (owedInSight.length || tailInSight)) ||
+        (canonicalPageCount === null && !residentCountSettled) || directEditor) {
+      // (where no page is taken without the others, the pages put off while
+      // out of sight are built after all: renderPage `mayDefer`)
+      if ((canonicalPageCount === null && !residentCountSettled) || directEditor) buildDeferredStages();
+      if (owedInSight.length) scheduleViewportWarm({ owedOnly: true });
+      return traceStage('hold', null, { why: 'not-all-ready', residentPageCount, canonicalPageCount,
+        pendingLayout: provisionalPendingLayout.size, removed: provisionalRemovedPages.size, editor: !!directEditor,
+        waiting: stages.filter(stage => !stageReady(stage)).map(stage => stage.dl.page).slice(0, 12) });
+    }
     // no canonical has made the shells yet: the resident count does
     if (residentCountSettled) for (let n = 1; n <= residentPageCount; n++) ensureShell(n);
-    if (stages.some(stage => !pageDivs.has(stage.dl.page))) return;
-    committing = provisionalCommitGroups(stages, committedPageSrcs, pageEditGroup, pagePainted, stageReady)
+    // (a count canonical does not have yet: its new pages get their shells
+    // when they are committed, as when every page is ready)
+    if (!pageCountMismatch && stages.some(stage => !pageDivs.has(stage.dl.page))) {
+      return traceStage('hold', null, { why: 'no-shell' });
+    }
+    committing = provisionalCommitGroups(stages, committedPageSrcs, pageEditGroup, pagePainted, stageReady,
+      page => !sight.has(page))
       .filter(group => group.every(stageReady)).flat()
       .sort((a, b) => a.dl.page - b.dl.page);
-    if (!committing.length) return;
+    if (!committing.length) {
+      if (owedInSight.length) scheduleViewportWarm({ owedOnly: true });
+      return traceStage('hold', null, { why: 'no-ready-group',
+        waiting: stages.filter(stage => !stageReady(stage)).map(stage => stage.dl.page).slice(0, 12) });
+    }
+    if (owedInSight.length) scheduleViewportWarm({ owedOnly: true });
   }
   const editorStage = committing.find(stage => stage.dl.page === directEditor?.pageNumber);
   const editorRegion = editorStage ? directEditorRegionInSnapshot(editorStage.snapshot, directEditor) : null;
@@ -942,12 +1189,40 @@ function tryCommitProvisionalStages() {
   } else for (const stage of committing) provisionalStages.delete(stage.dl.page);
   for (const stage of committing) {
     const { dl, staging, sourceRev, snapshot } = stage;
-    traceStage('commit', dl.page, { sourceRev });
+    // (for a diagnostic session: the blocks this page shows from an earlier
+    // galley's pixels, i.e. not yet what the source says now)
+    traceStage('commit', dl.page, Array.isArray(globalThis.__tdomStageTrace)
+      ? { sourceRev,
+        held: [...new Set(dl.commands.filter(cmd => cmd.op === 'chunk' && cmd.held && !cmd.part).map(cmd => cmd.src))],
+        parts: dl.commands.filter(cmd => cmd.op === 'chunk' && cmd.part).length }
+      : { sourceRev });
     committedPageSrcs.set(dl.page, stage.srcs ?? displayListSrcs(dl));
     pageEditGroup.delete(dl.page);
     let div = pageDivs.get(dl.page);
     if (!div) div = ensureShell(dl.page);
-    div.querySelector(':scope > svg:not(.tdom-canonical-delta)')?.remove();
+    const committedSvg = div.querySelector(':scope > svg:not(.tdom-canonical-delta)');
+    let stagedSvg = staging.firstElementChild?.localName === 'svg' ? staging.firstElementChild : null;
+    // (the lines that did not change keep their elements: patchProvisionalSvg)
+    let kept = false;
+    const cut = stagedSvg ? stage.svgCut : null;
+    if (cut) {
+      if (committedSvg && !globalThis.__tdomWholePageCommit && div.provisionalSvgParts === cut.base &&
+          committedSvg.childNodes.length === cut.base.length - 2) {
+        spliceSvgChildren(committedSvg, cut.head, cut.base.length - 2 - cut.tail, [...stagedSvg.childNodes]);
+        kept = true;
+      } else {
+        // the page is not the one this stage was cut against any more: its whole SVG after all
+        const whole = document.createElement('div');
+        whole.innerHTML = stage.svgParts.join('');
+        whole.querySelectorAll('text[data-font-pending]').forEach(node => node.removeAttribute('data-font-pending'));
+        stagedSvg.replaceWith(whole.firstElementChild);
+        stagedSvg = staging.firstElementChild;
+      }
+    }
+    if (!kept) kept = patchProvisionalSvg(committedSvg, div.provisionalSvgParts, stagedSvg, stage.svgParts);
+    if (kept) stagedSvg.remove();
+    else committedSvg?.remove();
+    div.provisionalSvgParts = stage.svgParts ?? null;
     div.querySelectorAll('.chunkwin').forEach(e => e.remove());
     div.append(...staging.childNodes);
     div.provisionalEpoch = (div.provisionalEpoch ?? 0) + 1;
@@ -964,7 +1239,10 @@ function tryCommitProvisionalStages() {
   provisionalRemovedPages.clear();
   residentPageCountAuthoritative = canonicalPageCount === residentPageCount;
   for (const stage of committing) updateCanonState(stage.dl.page);
-  if (residentPageCountAuthoritative && committing === stages && stages.every(stage => {
+  // (what a partial commit left staged is out of the reader's sight)
+  const shown = committing === stages ||
+    stages.every(stage => committing.includes(stage) || !sight.has(stage.dl.page));
+  if (residentPageCountAuthoritative && shown && committing.every(stage => {
     const page = pageDivs.get(stage.dl.page);
     return !page.classList.contains('is-final') || Number(page.dataset.canonPresentedRev) >= stage.sourceRev;
   })) fulfillCanonicalDisplay();
@@ -974,6 +1252,52 @@ function tryCommitProvisionalStages() {
     void refreshDirectEditGeometry();
   }
   updateBadge();
+}
+
+// A page marked "no layout yet" (a block whose first galley had not arrived
+// when this viewer read the document) is cleared by the patch that brings
+// the layout. A viewer that loads while a long document is still booting can
+// miss that patch: the engine sent it before the snapshot was applied. The
+// mark then stayed for the whole session, the resident page count never
+// counted as settled, and no keystroke was shown before the next canonical
+// (a 389-page book: 20 pages marked, the engine holding none). While marks
+// remain, ask the engine again and take the pages it has laid out since.
+let pendingLayoutResyncAt = 0;
+let pendingLayoutResyncing = false;
+function resyncPendingLayout() {
+  // Also while canonical found the resident paper paginated differently. That
+  // verdict is taken once, when the generation is committed; a Build taken as
+  // canonical arrives while the boot's rescues are still landing (387 pages
+  // against 389), and the pages that follow come as patches of single pages,
+  // which never say how many pages there are now. The book then held every
+  // keystroke as "layout-incompatible" although the engine had all 389.
+  const mismatched = committedCanonicalGeneration?.epoch === documentReset.adoptedEpoch &&
+    committedCanonicalGeneration.residentLayoutCompatible === false;
+  if (pendingLayoutResyncing || (!provisionalPendingLayout.size && !mismatched)) return;
+  if (usesCanonicalSurface() || documentReset.pending) return;
+  if (typeof fetch !== 'function' || typeof performance === 'undefined') return;
+  const now = performance.now();
+  if (now - pendingLayoutResyncAt < 4000) return;
+  pendingLayoutResyncAt = now;
+  pendingLayoutResyncing = true;
+  const rev = appliedSrcRev;
+  const epoch = documentReset.adoptedEpoch;
+  fetch('/doc').then(response => response.json()).then((doc) => {
+    if (appliedSrcRev !== rev || documentReset.adoptedEpoch !== epoch || documentReset.pending) return;
+    if (Number(doc.report?.srcRev ?? doc.report?.rev) !== Number(rev)) return;
+    if (doc.documentEpoch != null && epoch != null && Number(doc.documentEpoch) !== Number(epoch)) return;
+    const settled = dl => !dl.commands?.some(cmd => cmd.op === 'pending-exact' && cmd.wholePage);
+    const recount = mismatched && (doc.pages ?? []).length !== provisionalDisplayLists.size &&
+      (doc.pages ?? []).every(settled);
+    const laidOut = (doc.pages ?? []).filter(dl => recount || (provisionalPendingLayout.has(dl.page) && settled(dl)));
+    if (!laidOut.length) return;
+    stageProvisionalPatches(laidOut.map(displayList => ({ type: 'replace-page', displayList })), false, doc.pages.length);
+    if (committedCanonicalGeneration && committedCanonicalGeneration.epoch === documentReset.adoptedEpoch &&
+        provisionalDisplayLists.size === committedCanonicalGeneration.pageCount && !provisionalPendingLayout.size) {
+      committedCanonicalGeneration.residentLayoutCompatible = true;
+    }
+    tryCommitProvisionalStages();
+  }).catch(() => {}).finally(() => { pendingLayoutResyncing = false; });
 }
 
 let lastCanonicalDisplayDemand = '';
@@ -1055,7 +1379,7 @@ function provisionalChunkGlyphs(commands, chunks) {
   for (const command of commands) {
     if (command.op !== 'chunk') continue;
     const data = chunks[index++];
-    if (!(data?.width > 0)) continue;
+    if (command.held || !(data?.width > 0)) continue;
     const scale = command.w / data.width;
     const top = command.y - command.sy;
     for (const glyph of data.glyphs) {
@@ -1070,7 +1394,77 @@ function provisionalChunkGlyphs(commands, chunks) {
   return glyphs;
 }
 
-function renderPage(dl, flash) {
+// One version of a chunk in one document of one server process is one
+// picture (server.js /chunk): with all three in the URL the browser keeps it.
+let serverBootId = null; // from /doc and /status: known before the first page is staged
+function chunkImageSrc(cmd) {
+  const boot = serverBootId;
+  const fixed = typeof boot === 'string' && boot
+    ? `&e=${documentReset.adoptedEpoch}&b=${encodeURIComponent(boot)}` : '';
+  return `/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}${fixed}`;
+}
+
+// A page the reader is not near is not built when its update arrives. A
+// keystroke that makes a paragraph a line longer moves one line across every
+// page break after it: in the middle of a 191-page single flow, 96 pages
+// arrive in one update. Building them all (their markup, parsing it, then
+// the browser's layout of 96 pages) held this thread for three seconds,
+// during which twenty keystrokes went unshown, and each key that followed
+// built them all again, because a stage belongs to one revision.
+// Such a page gets a stage with nothing built in it: to the commit it is a
+// page out of sight that is not ready, which joins nothing and keeps what it
+// shows (provisionalCommitGroups `away`), exactly like a page out of sight
+// that waits for exact pixels. It is built when it comes near the pane
+// (stageDeferredNearSight), or never, if canonical pages arrive first.
+// A page that shows nothing yet is put off too: in a long document most
+// pages never scrolled to are empty shells (their canonical picture is
+// loaded when they come near, canonicalStageObserver), and built as their
+// lists arrived, a tenth of a second each, they kept the page being typed
+// on from being shown for the next six keystrokes.
+// Only an update of many pages is treated so; a keystroke's own page or two
+// are built as they come, and a page that has no shell yet (the first
+// presentation of a document) always is. globalThis.__tdomStageAllPages =
+// true: build every page of every update, as before.
+const NEAR_SIGHT_PAGES = 2; // (a page this close to one in sight is built)
+function nearSight(page) {
+  if (!pageDivs.has(page)) return true; // (no place yet)
+  const sight = pagesInSight();
+  for (let step = -NEAR_SIGHT_PAGES; step <= NEAR_SIGHT_PAGES; step++) if (sight.has(page + step)) return true;
+  return false;
+}
+let deferredStageFrame = 0;
+function stageDeferredNearSight() {
+  if (deferredStageFrame) return;
+  deferredStageFrame = requestAnimationFrame(() => {
+    deferredStageFrame = 0;
+    if (usesCanonicalSurface() || documentReset.pending) return;
+    const pages = [];
+    for (const [page, stage] of provisionalStages) if (stage.deferred && nearSight(page)) pages.push(page);
+    for (const page of pages) {
+      const stage = provisionalStages.get(page);
+      // (the page's list did not change since it was put off, whatever revisions came after)
+      if (stage?.deferred) renderPage(provisionalDisplayLists.get(page) ?? stage.dl, false);
+    }
+  });
+}
+/** Builds every page that was put off (a commit that takes no page without the others needs them all). */
+function buildDeferredStages() {
+  let built = 0;
+  for (const [page, stage] of [...provisionalStages]) {
+    if (!stage.deferred) continue;
+    renderPage(provisionalDisplayLists.get(page) ?? stage.dl, false);
+    built++;
+  }
+  return built;
+}
+const listOwesExactInk = new WeakMap(); // a display list -> whether a command of it owes exact ink
+function owesExactInkAnywhere(dl) {
+  let owes = listOwesExactInk.get(dl);
+  if (owes === undefined) listOwesExactInk.set(dl, owes = dl.commands.some(owesExactInk));
+  return owes;
+}
+
+function renderPage(dl, flash, mayDefer = false) {
   if (usesCanonicalSurface()) return;
   const div = pageDivs.get(dl.page);
   // Stage the entire next surface off-DOM. A dirty mixed text/math line
@@ -1085,34 +1479,60 @@ function renderPage(dl, flash) {
   // while its neighboring page reveals this provisional transaction.
   pageDirtyRev.set(dl.page, sourceRev);
   if (div) div.dataset.provPending = '1';
-  if (dl.commands.some(cmd => cmd.op === 'canon' || cmd.op === 'pending-exact' ||
-      cmd.op === 'glyphs' && cmd.math || cmd.op === 'chunk' && cmd.st)) {
+  if (owesExactInkAnywhere(dl)) {
     traceStage('blocked', dl.page);
     stage.srcs = displayListSrcs(dl);
     committedPageSrcs.set(dl.page, new Set([...(committedPageSrcs.get(dl.page) ?? []), ...stage.srcs]));
-    requestCanonicalDisplay({ residentImpossible: dl.commands.some(cmd => cmd.op === 'canon') });
+    // A page the reader cannot see waits without asking for a canonical
+    // compile: three pages of a 72-page book that owed exact pixels asked on
+    // every keystroke, and LuaLaTeX compiled the whole book back to back for
+    // as long as the typing lasted. The page asks when it is scrolled to.
+    const impossible = dl.commands.some(cmd => cmd.op === 'canon');
+    if (impossible || pagesInSight().has(dl.page)) requestCanonicalDisplay({ residentImpossible: impossible });
+    return;
+  }
+  // (with an editor open on the paper every page commits together,
+  // tryCommitProvisionalStages: nothing is put off then)
+  if (mayDefer && !directEditor && !globalThis.__tdomStageAllPages && !nearSight(dl.page)) {
+    stage.deferred = true;
     return;
   }
   traceStage('stage', dl.page);
   const families = [...new Set(dl.commands.filter(cmd => cmd.op === 'glyphs' && cmd.fam).map(cmd => cmd.fam))];
   injectFonts(families);
   const staging = document.createElement('div');
-  staging.innerHTML = svgFor(dl);
+  stage.svgParts = svgParts(dl);
+  // (only what differs from the page as it stands is parsed: patchProvisionalSvg)
+  const base = div?.provisionalSvgParts ?? null;
+  const cut = svgPartsCut(base, stage.svgParts);
+  if (cut) {
+    stage.svgCut = { base, head: cut.head, tail: cut.tail };
+    staging.innerHTML = stage.svgParts[0] +
+      stage.svgParts.slice(cut.head + 1, stage.svgParts.length - 1 - cut.tail).join('') + '</svg>';
+  } else staging.innerHTML = stage.svgParts.join('');
   for (const cmd of dl.commands) {
     if (cmd.op !== 'chunk') continue;
     const W = geometry.paperwidth;
     const H = geometry.paperheight;
     const shiftPct = (cmd.sy / cmd.w) * 100;
+    // A part (display-list.js partCommands) is a window narrower than its
+    // picture: one run of a formula, cut out of the picture made for an
+    // earlier galley and set where the run stands now. The picture keeps
+    // its own width and is moved left as well as up behind the window.
+    const part = cmd.part && cmd.cw > 0
+      ? `width:${(cmd.cw / cmd.w) * 100}%;max-width:none;margin-left:-${(cmd.sx / cmd.w) * 100}%;` : '';
     staging.insertAdjacentHTML(
       'beforeend',
-      `<div class="chunkwin${cmd.st ? ' stale' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%">` +
-        `<img class="chunk" src="/chunk/${encodeURIComponent(cmd.chunk)}.svg?v=${cmd.cv ?? 0}" style="margin-top:-${shiftPct}%" draggable="false"></div>`
+      `<div class="chunkwin${cmd.st ? ' stale' : ''}${cmd.held ? ' held' : ''}${cmd.part ? ' part' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%;${chunkShowClip(cmd)}">` +
+        `<img class="chunk" src="${chunkImageSrc(cmd)}" style="${part}margin-top:-${shiftPct}%" draggable="false"></div>`
     );
   }
   const ready = () => {
     if (provisionalStages.get(dl.page) !== stage || usesCanonicalSurface() ||
         sourceRev !== appliedSrcRev || stage.documentEpoch !== documentReset.adoptedEpoch) return;
-    if (families.some(family => !readyFonts.has(family))) return;
+    if (families.some(family => !readyFonts.has(family))) {
+      return traceStage('fonts-waiting', dl.page, { families: families.filter(family => !readyFonts.has(family)) });
+    }
     // Font promises can resolve while the SVG is still detached. Its
     // pending markers must be cleared here as well as in injectFonts().
     staging.querySelectorAll('text[data-font-pending]').forEach(node => node.removeAttribute('data-font-pending'));
@@ -1122,18 +1542,43 @@ function renderPage(dl, flash) {
     tryCommitProvisionalStages();
   };
   const images = [...staging.querySelectorAll('img')];
+  // one decode per picture: the trace reads the same promises the stage waits for
+  const decodes = images.map(img => img.decode());
+  // Where each glyph of a chunk's picture sits decides one thing here:
+  // whether an editor open on the paper stays with this stage
+  // (provisionalStageKeepsEditor). The server reads it from the chunk's PDF,
+  // tens of milliseconds for a chunk it has not read yet, and the edited
+  // block's chunk is new on every keystroke. With no editor on the paper the
+  // stage does not wait for it; a click loads a chunk's geometry when it
+  // needs it (loadChunkInputGeometry).
+  const chunkGeometry = directEditor ? Promise.all(images.map(loadChunkInputGeometry)).then(chunks => {
+    stage.glyphs = provisionalChunkGlyphs(dl.commands, chunks);
+  }) : null;
   if (Array.isArray(globalThis.__tdomStageTrace)) {
-    void Promise.all(images.map(img => img.decode())).then(() => traceStage('decoded', dl.page, { images: images.length }), () => {});
+    const shown = new Set([...(div?.querySelectorAll('img.chunk') ?? [])].map(img => img.getAttribute('src')));
+    const freshImages = images.filter(img => !shown.has(img.getAttribute('src')));
+    const fresh = freshImages.length;
+    const stagedAt = performance.now();
+    void Promise.all(decodes).then(() => {
+      const detail = freshImages.slice(0, 3).map(img => {
+        const entry = performance.getEntriesByName(new URL(img.getAttribute('src'), location.href).href).pop();
+        return { src: img.getAttribute('src'), win: img.parentElement?.className, fetchStart: entry ? Math.round(entry.startTime - stagedAt) : null,
+          fetchMs: entry ? Math.round(entry.duration) : null, wait: entry ? Math.round(entry.responseStart - entry.requestStart) : null,
+          kb: entry ? Math.round(entry.encodedBodySize / 1024) : null, cached: entry ? entry.transferSize === 0 : null };
+      });
+      traceStage('decoded', dl.page, { images: images.length, fresh, detail, ms: Math.round(performance.now() - stagedAt) });
+    }, () => {});
+    void chunkGeometry?.then(() => traceStage('geometry', dl.page), () => {});
+    void Promise.all(families.map(family => fontLoads.get(family))).then(() => traceStage('fonts', dl.page), () => {});
   }
   const pending = [
     loadProvisionalSnapshot(sourceRev).then(snapshot => { stage.snapshot = snapshot; traceStage('snapshot', dl.page); }),
-    ...images.map(img => img.decode()),
-    Promise.all(images.map(loadChunkInputGeometry)).then(chunks => {
-      stage.glyphs = provisionalChunkGlyphs(dl.commands, chunks);
-    }),
+    ...decodes,
+    ...(chunkGeometry ? [chunkGeometry] : []),
     ...families.map(family => fontLoads.get(family)),
   ];
-  void Promise.all(pending).then(ready).catch(() => {
+  void Promise.all(pending).then(ready).catch((error) => {
+    traceStage('load-failed', dl.page, { error: String(error?.message ?? error).slice(0, 160) });
     // A failed load can be a superseded source/chunk response. It cannot
     // prove resident impossibility; the bounded canonical grace still ends
     // if a persistent failure prevents the next page from committing.
@@ -1142,50 +1587,154 @@ function renderPage(dl, flash) {
   });
 }
 
+// The text of a line whose exact picture is shown only where it has to be
+// (a chunk command's `show`, display-list.js): drawn by the glyph layer so
+// that it looks as it did before the picture landed. It is ink only: the
+// line's editing, hit testing and geometry go by its picture and its source
+// hit box, as they do for a line shown whole from the picture.
+const OVER_TEXT_ATTRS = ' data-ov="1" pointer-events="none"';
+
+/** The openings of a picture window as a clip path: [x, y, w, h] on the page,
+ * as percentages of the window. One polygon, each opening walked the same
+ * way round and joined to the next by a line walked there and back. */
+function chunkShowClip(cmd) {
+  if (!Array.isArray(cmd.show) || !(cmd.w > 0) || !(cmd.h > 0)) return '';
+  const pct = (value) => `${Math.round(Math.max(0, Math.min(100, value)) * 1000) / 1000}%`;
+  const corners = [];
+  const starts = [];
+  for (const box of cmd.show) {
+    if (!Array.isArray(box) || box.length !== 4 || !box.every(Number.isFinite)) return '';
+    const left = pct(((box[0] - cmd.x) / cmd.w) * 100), right = pct(((box[0] + box[2] - cmd.x) / cmd.w) * 100);
+    const top = pct(((box[1] - cmd.y) / cmd.h) * 100), bottom = pct(((box[1] + box[3] - cmd.y) / cmd.h) * 100);
+    starts.push(`${left} ${top}`);
+    corners.push(`${left} ${top}`, `${right} ${top}`, `${right} ${bottom}`, `${left} ${bottom}`, `${left} ${top}`);
+  }
+  // nothing to show: the window stays in place for geometry, with no ink
+  if (!corners.length) return 'clip-path:polygon(0 0,0 0,0 0);';
+  return `clip-path:polygon(${[...corners, ...starts.reverse()].join(',')});`;
+}
+
 /** Unified SVG page: TeX-positioned glyph runs, rules, chunk images, folio. */
 function svgFor(dl, className = '') {
+  return svgParts(dl, className).join('');
+}
+
+// The element a command draws into the page's SVG ('' when it draws none
+// there), kept with the command: the commands of the lines a keystroke did
+// not change are the objects this stream already carried (resolveStreamLists),
+// and their elements were written out again for every keystroke (1 ms of a
+// dense page's 2,000 commands). The one thing outside the command a piece
+// depends on is whether its font has arrived.
+const commandPiece = new WeakMap(); // a command -> { piece, ready }
+function pieceOfCommand(cmd) {
+  const ready = cmd.op !== 'glyphs' || !cmd.fam || readyFonts.has(cmd.fam);
+  const kept = commandPiece.get(cmd);
+  if (kept && kept.ready === ready) return kept.piece;
+  const piece = commandMarkup(cmd);
+  commandPiece.set(cmd, { piece, ready });
+  return piece;
+}
+function commandMarkup(cmd) {
+  const lineAttr = cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`;
+  if (cmd.op === 'glyphs') {
+    let fontAttrs;
+    if (cmd.fam) {
+      // checkpoint backend: real TeX font, TeX positions; disable browser
+      // shaping so run-start x + font advances reproduce TeX exactly
+      const pending = readyFonts.has(cmd.fam) ? '' : ' data-font-pending="1"';
+      fontAttrs = ` font-family="${escapeXml(cmd.fam)}" data-font-family="${escapeXml(cmd.fam)}"${pending} style="font-kerning:none;font-variant-ligatures:none;letter-spacing:0"`;
+    } else {
+      const it = cmd.font === 'italic' || cmd.font === 'bolditalic' ? ` font-style="italic"` : '';
+      const b = cmd.font === 'bold' || cmd.font === 'bolditalic' ? ` font-weight="bold"` : '';
+      fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
+    }
+    if (cmd.ov && Array.isArray(cmd.runs)) {
+      // (one element for the runs of a line that look alike, each at its own place)
+      return `<text y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}"${OVER_TEXT_ATTRS} xml:space="preserve">` +
+        cmd.runs.map(([x, text]) => `<tspan x="${x}">${escapeXml(text)}</tspan>`).join('') + '</text>';
+    }
+    return `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-width="${cmd.w ?? 0}" data-gh="${cmd.gh ?? 0}" data-gd="${cmd.gd ?? 0}"${cmd.ov ? OVER_TEXT_ATTRS : ` data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}`} xml:space="preserve">${escapeXml(cmd.text)}</text>`;
+  }
+  if (cmd.op === 'rule' && cmd.w > 0 && cmd.h > 0) {
+    return `<rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}" fill="${cmd.color || '#1a1a1a'}"${cmd.ov ? OVER_TEXT_ATTRS : ` data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}`}/>`;
+  }
+  if (cmd.op === 'editbox') {
+    return `<rect class="tdom-edit-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}" data-edit="${escapeXml(cmd.edit)}"/>`;
+  }
+  if (cmd.op === 'sourcebox') {
+    return `<rect class="tdom-source-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}"${lineAttr}${cmd.ink ? ' data-ink="1"' : ''}${cmd.math ? ' data-math="1"' : ''}${cmd.stale ? ' data-stale="1"' : ''}${cmd.complex ? ' data-complex="1"' : ''}/>`;
+  }
+  // (exact-render chunks are drawn as HTML <img> overlays, see renderPage)
+  if (cmd.op === 'folio') {
+    return `<text x="${cmd.x}" y="${cmd.y}" font-size="10" font-family="${FONT_FAMILY.regular}" fill="#1a1a1a" text-anchor="middle">${escapeXml(cmd.text)}</text>`;
+  }
+  return '';
+}
+
+// The page's SVG as its pieces: the opening tag, one element a command that
+// draws into it (in the commands' order), the closing tag. A commit keeps the
+// elements whose piece did not change (patchProvisionalSvg).
+function svgParts(dl, className = '') {
   const parts = [
     `<svg${className ? ` class="${escapeXml(className)}"` : ''} viewBox="0 0 ${geometry.paperwidth} ${geometry.paperheight}" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">`,
   ];
   for (const cmd of dl.commands) {
-    const lineAttr = cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`;
-    if (cmd.op === 'glyphs') {
-      let fontAttrs;
-      if (cmd.fam) {
-        // checkpoint backend: real TeX font, TeX positions; disable browser
-        // shaping so run-start x + font advances reproduce TeX exactly
-        const pending = readyFonts.has(cmd.fam) ? '' : ' data-font-pending="1"';
-        fontAttrs = ` font-family="${escapeXml(cmd.fam)}" data-font-family="${escapeXml(cmd.fam)}"${pending} style="font-kerning:none;font-variant-ligatures:none;letter-spacing:0"`;
-      } else {
-        const it = cmd.font === 'italic' || cmd.font === 'bolditalic' ? ` font-style="italic"` : '';
-        const b = cmd.font === 'bold' || cmd.font === 'bolditalic' ? ` font-weight="bold"` : '';
-        fontAttrs = ` font-family="${FONT_FAMILY[cmd.font] || FONT_FAMILY.regular}"${it}${b}`;
-      }
-      parts.push(
-        `<text x="${cmd.x}" y="${cmd.y}" font-size="${cmd.size}"${fontAttrs} fill="${cmd.color || '#1a1a1a'}" data-width="${cmd.w ?? 0}" data-gh="${cmd.gh ?? 0}" data-gd="${cmd.gd ?? 0}" data-src="${cmd.src}"${lineAttr}${cmd.math ? ' data-math="1"' : ''}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''} xml:space="preserve">${escapeXml(cmd.text)}</text>`
-      );
-    } else if (cmd.op === 'rule' && cmd.w > 0 && cmd.h > 0) {
-      parts.push(
-        `<rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}" fill="${cmd.color || '#1a1a1a'}" data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}/>`
-      );
-    } else if (cmd.op === 'editbox') {
-      parts.push(
-        `<rect class="tdom-edit-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}" data-edit="${escapeXml(cmd.edit)}"/>`
-      );
-    } else if (cmd.op === 'sourcebox') {
-      parts.push(
-        `<rect class="tdom-source-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}"${lineAttr}${cmd.ink ? ' data-ink="1"' : ''}${cmd.math ? ' data-math="1"' : ''}${cmd.stale ? ' data-stale="1"' : ''}${cmd.complex ? ' data-complex="1"' : ''}/>`
-      );
-    } else if (cmd.op === 'chunk') {
-      // exact-render chunks are drawn as HTML <img> overlays (see renderPage)
-    } else if (cmd.op === 'folio') {
-      parts.push(
-        `<text x="${cmd.x}" y="${cmd.y}" font-size="10" font-family="${FONT_FAMILY.regular}" fill="#1a1a1a" text-anchor="middle">${escapeXml(cmd.text)}</text>`
-      );
-    }
+    const piece = pieceOfCommand(cmd);
+    if (piece) parts.push(piece);
   }
   parts.push('</svg>');
-  return parts.join('');
+  return parts;
+}
+
+// A keystroke changes a line or two of its page, and the page was replaced
+// whole: the old SVG removed, the new one put in. The browser then lays out
+// and paints every element of the page again; on a dense page of Japanese
+// text (an element a character, 1,500 of them) that was 18 ms of layout
+// after every keystroke, more than the engine takes to typeset it.
+//
+// The elements of an SVG built by svgParts stand in the order of its pieces
+// and nothing else adds or removes one. So the committed SVG stays, and of
+// the staged one only the elements between the pieces that are the same at
+// the start and the same at the end are moved in, in place of the old ones.
+// Same piece, same element: the one change made to an element after it is
+// built, clearing its font-pending mark, is left out of the comparison (the
+// mark is cleared on the page as soon as the font is ready, injectFonts).
+// Anything unexpected (another paper, a count that does not match the
+// pieces) leaves the page to be replaced whole, as before.
+//
+// The staged page is cut the same way before it is parsed (renderPage): of
+// a page whose committed pieces are known, only the pieces between the
+// shared start and end become elements, and the commit puts exactly those
+// in. If the page is no longer the one the stage was cut against, the whole
+// SVG is built at the commit instead.
+// globalThis.__tdomWholePageCommit = true: build and replace whole, always.
+const fontSettled = piece => (piece.includes(' data-font-pending="1"') ? piece.replace(' data-font-pending="1"', '') : piece);
+// How many pieces two pages share at their start and at their end.
+function svgPartsCut(oldParts, newParts) {
+  if (globalThis.__tdomWholePageCommit || !Array.isArray(oldParts) || !Array.isArray(newParts)) return null;
+  const oldCount = oldParts.length - 2;
+  const newCount = newParts.length - 2;
+  if (oldCount < 0 || newCount < 0 || oldParts[0] !== newParts[0]) return null;
+  const same = (a, b) => a === b || fontSettled(a) === fontSettled(b);
+  let head = 0;
+  while (head < oldCount && head < newCount && same(oldParts[head + 1], newParts[head + 1])) head++;
+  let tail = 0;
+  while (tail < oldCount - head && tail < newCount - head && same(oldParts[oldCount - tail], newParts[newCount - tail])) tail++;
+  return { head, tail };
+}
+// The children [head, end) of `svg` make room for `fresh`.
+function spliceSvgChildren(svg, head, end, fresh) {
+  const stale = Array.prototype.slice.call(svg.childNodes, head, end);
+  const before = svg.childNodes[end] ?? null;
+  for (const node of stale) node.remove();
+  for (const node of fresh) svg.insertBefore(node, before);
+}
+function patchProvisionalSvg(oldSvg, oldParts, newSvg, newParts) {
+  const cut = oldSvg && newSvg ? svgPartsCut(oldParts, newParts) : null;
+  if (!cut || oldSvg.childNodes.length !== oldParts.length - 2 || newSvg.childNodes.length !== newParts.length - 2) return false;
+  spliceSvgChildren(oldSvg, cut.head, oldParts.length - 2 - cut.tail,
+    Array.prototype.slice.call(newSvg.childNodes, cut.head, newParts.length - 2 - cut.tail));
+  return true;
 }
 
 function removePagesFrom(from) {
@@ -2095,9 +2644,15 @@ async function stageDirectEditorForOpaqueBatch(batch) {
         y: (session.printBounds.top + session.printBounds.bottom) / 2,
       }
     : { page: session.pageNumber };
-  const bounds = session.kind === 'text'
+  let bounds = session.kind === 'text'
     ? await canonicalTextRegionBounds(region, snapshot, batch.id)
     : await canonicalSourceBounds(region, null, batch.id, near);
+  // (an inline formula SyncTeX cannot place, opened by its ink, is followed
+  // into the new generation the same way: resolveOpaqueEditRegion, inlineMathUnderPoint)
+  if (!bounds && session.kind === 'math' && session.openedByInk) {
+    bounds = await inlineMathBoundsByInk(region, snapshot, batch.id, near);
+    if (directEditor?.sessionId !== session.sessionId) return { sessionId: session.sessionId, mapping: null };
+  }
   if (!bounds || !Number.isInteger(Number(bounds.page))) {
     return { sessionId: session.sessionId, mapping: null };
   }
@@ -2421,7 +2976,9 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   for (const [, entry] of [...batch.expected].sort((a, b) => a[0] - b[0])) {
     entry.apply();
   }
-  committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch, pageCount: batch.pageCount };
+  committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch, pageCount: batch.pageCount,
+    residentLayoutCompatible: provisionalDisplayLists.size === batch.pageCount && !provisionalPendingLayout.size };
+  resyncPendingLayout();
   for (const [page, dl] of provisionalDisplayLists) committedPageSrcs.set(page, displayListSrcs(dl));
   pageEditGroup.clear();
   provisionalStages.clear();
@@ -2755,7 +3312,7 @@ function ensureShell(n) {
   no.textContent = `page ${n}`;
   div.appendChild(no);
   const after = [...pageDivs.entries()].filter(([k]) => k > n).sort((a, b) => a[0] - b[0])[0];
-  pagesEl.insertBefore(div, after ? after[1] : null);
+  pagesEl.insertBefore(div, after ? after[1] : outerAfterEl);
   pageDivs.set(n, div);
   return div;
 }
@@ -3079,6 +3636,8 @@ async function pollStatus() {
     if (!r.ok) throw new Error(String(r.status));
     const s = await r.json();
     lastEngineStatus = s;
+    if (typeof s.boot === 'string') serverBootId = s.boot;
+    applyOuterPaper(s.outer ?? null);
     const statusDocumentEpoch = Number(s.documentEpoch);
     if (documentReset.adoptedEpoch > 0 &&
         Number.isInteger(statusDocumentEpoch) && statusDocumentEpoch > documentReset.adoptedEpoch) {
@@ -3235,7 +3794,18 @@ pagesEl.addEventListener('click', async (ev) => {
   if (src) {
     const dom = await fetch('/dom').then((r) => r.json());
     block = dom.blocks.find((b) => b.id === src);
-    if (block) location = block.source;
+    if (block) {
+      location = block.source;
+      // Typeset nodes carry their line within the block: answer the line
+      // that was clicked, not the block's first line.
+      const relative = Number(ev.target?.closest?.('[data-line]')?.dataset?.line);
+      const start = Number(block.source?.start?.line);
+      const end = Number(block.source?.end?.line);
+      if (Number.isInteger(relative) && relative >= 0 && Number.isFinite(start) &&
+          (!Number.isFinite(end) || start + relative <= end)) {
+        location = { file: block.source.file, line: start + relative, column: 1 };
+      }
+    }
   }
   if (!location && embeddedHost) location = await syncLocationForClick(ev, clickedPage);
   if (!location || !stillCurrent()) return;
@@ -3541,19 +4111,145 @@ function loadMathWysiwyg() {
   return mathWysiwygModulePromise;
 }
 
+// The newest snapshot received, the base the next one is a change from.
+let provisionalSnapshotHeld = null; // { epoch, snapshot }
+
+/** A full snapshot from an earlier one and the server's change list; null when they do not fit. */
+function applySnapshotDelta(base, delta) {
+  const held = base.blocks ?? [];
+  // The list of blocks is the held one with a stretch replaced: its first
+  // `head` blocks, the blocks named, its last `tail`.
+  if (!Array.isArray(delta.cut)) return null;
+  const [head, tail, named] = delta.cut;
+  if (!Number.isSafeInteger(head) || !Number.isSafeInteger(tail) || !Array.isArray(named) ||
+      head < 0 || tail < 0 || head + tail > held.length) return null;
+  const blocks = named.length === 0 && head + tail === held.length
+    ? held.slice()
+    : [...held.slice(0, head), ...named.map(() => null), ...held.slice(held.length - tail)];
+  // the blocks sent whole, each with where it stands
+  const at = delta.at ?? [];
+  const changed = delta.blocks ?? [];
+  if (at.length !== changed.length) return null;
+  for (let k = 0; k < changed.length; k++) {
+    const i = at[k];
+    if (!Number.isSafeInteger(i) || i < 0 || i >= blocks.length) return null;
+    const name = i >= head && i < head + named.length ? named[i - head] : blocks[i]?.id;
+    if (String(name) !== String(changed[k].id)) return null;
+    blocks[i] = changed[k];
+  }
+  // a named block that was not sent is one of the stretch replaced
+  let replaced = null;
+  for (let k = 0; k < named.length; k++) {
+    if (blocks[head + k]) continue;
+    if (!replaced) {
+      replaced = new Map();
+      for (let j = head; j < held.length - tail; j++) replaced.set(String(held[j].id), held[j]);
+    }
+    const found = replaced.get(String(named[k]));
+    if (!found) return null;
+    blocks[head + k] = found;
+  }
+  // (a block that only stands elsewhere now: its place in the list, its pages, its offsets in the root file)
+  for (const [i, index, pages, span] of delta.moved ?? []) {
+    if (!Number.isSafeInteger(i) || i < 0 || i >= blocks.length) return null;
+    const next = { ...blocks[i], index, pages };
+    // (a block of an included file carries no offsets in the root file)
+    if (span == null) delete next.span;
+    else next.span = span;
+    blocks[i] = next;
+  }
+  // (blocks in a row that moved by the same amount: `by` characters in the root file, `places` in the list)
+  for (const run of delta.shift ?? []) {
+    const [from, to, by, places] = run;
+    if (![from, to, by, places].every(Number.isSafeInteger) || from < 0 || to < from || to > blocks.length) return null;
+    for (let i = from; i < to; i++) {
+      const block = blocks[i];
+      if (by && !block.span) return null;
+      blocks[i] = block.span
+        ? { ...block, index: block.index + places, span: { start: block.span.start + by, end: block.span.end + by } }
+        : { ...block, index: block.index + places };
+    }
+  }
+  // (blocks in a row that stand `down` lines further in their file, the same otherwise: a line was added above them)
+  for (const run of delta.lines ?? []) {
+    const [from, to, down] = run;
+    if (![from, to, down].every(Number.isSafeInteger) || from < 0 || to < from || to > blocks.length) return null;
+    const lower = (source) => ({ ...source,
+      start: { ...source.start, line: source.start.line + down }, end: { ...source.end, line: source.end.line + down } });
+    for (let i = from; i < to; i++) {
+      const block = blocks[i];
+      if (!block.source?.start || !block.source.end || !Array.isArray(block.editRegions) ||
+          block.editRegions.some(region => !region.source?.start || !region.source.end)) return null;
+      blocks[i] = { ...block, source: lower(block.source),
+        editRegions: block.editRegions.map(region => ({ ...region, source: lower(region.source) })) };
+    }
+  }
+  const sourceByFile = new Map((base.sources ?? []).map(source => [source.file, source]));
+  for (const source of delta.sources ?? []) {
+    if (!Array.isArray(source.splice)) { sourceByFile.set(source.file, source); continue; }
+    // (the file's text as a change of the text held: where, how many characters go, what comes)
+    const before = sourceByFile.get(source.file);
+    const [at, gone, came] = source.splice;
+    if (typeof before?.text !== 'string' || typeof came !== 'string' || !Number.isSafeInteger(at) || !Number.isSafeInteger(gone) ||
+        at < 0 || gone < 0 || at + gone > before.text.length) return null;
+    sourceByFile.set(source.file, { ...before, text: before.text.slice(0, at) + came + before.text.slice(at + gone) });
+  }
+  // (the files in the order held, when no list of them came)
+  const sources = [];
+  for (const file of delta.files ?? (base.sources ?? []).map(source => source.file)) {
+    const source = sourceByFile.get(file);
+    if (!source) return null;
+    sources.push(source);
+  }
+  const { delta: _delta, cut: _cut, files: _files, moved: _moved, shift: _shift, lines: _lines, at: _at, ...rest } = delta;
+  return { ...rest, blocks, sources };
+}
+
+// The update that brings a revision also brings its source map, as a change
+// from the one before (server.js updateDomPush). Applied when this viewer
+// holds that one; otherwise loadProvisionalSnapshot asks as usual.
+function adoptPushedSnapshot(delta, eventEpoch) {
+  const epoch = documentReset.adoptedEpoch;
+  const held = provisionalSnapshotHeld?.epoch === epoch ? provisionalSnapshotHeld.snapshot : null;
+  if (!held || Number(eventEpoch) !== epoch || !Number.isSafeInteger(held.domStamp) ||
+      Number(delta?.delta?.base) !== Number(held.domStamp)) return;
+  const snapshot = applySnapshotDelta(held, delta);
+  if (!snapshot || snapshot.sourceCurrent === false || Number(snapshot.documentEpoch) !== epoch ||
+      !Number.isSafeInteger(Number(snapshot.srcRev)) || Number(snapshot.srcRev) < Number(held.srcRev)) return;
+  provisionalSnapshotHeld = { epoch, snapshot };
+  provisionalSnapshotCache.set(`${epoch}:${Number(snapshot.srcRev)}`, Promise.resolve(snapshot));
+  while (provisionalSnapshotCache.size > 4) provisionalSnapshotCache.delete(provisionalSnapshotCache.keys().next().value);
+}
+
 async function loadProvisionalSnapshot(sourceRev) {
   const epoch = documentReset.adoptedEpoch;
   const key = `${epoch}:${sourceRev}`;
   if (!provisionalSnapshotCache.has(key)) {
-    const pending = fetch('/dom', { cache: 'no-store' }).then(async response => {
+    // the snapshot of this very revision (server.js domCache): a request
+    // queued behind the next keystroke would come back one revision newer
+    // The snapshot is the whole document. With an earlier revision of it in
+    // hand, ask only for what changed since (server.js domDeltaBody).
+    const held = provisionalSnapshotHeld?.epoch === epoch && Number.isSafeInteger(provisionalSnapshotHeld.snapshot.domStamp)
+      ? provisionalSnapshotHeld.snapshot : null;
+    const request = (base) => fetch(`/dom?srcRev=${encodeURIComponent(sourceRev)}${base ? `&base=${encodeURIComponent(base.domStamp)}` : ''}`,
+      { cache: 'no-store' }).then(async response => {
       if (!response.ok) throw new Error('Unready source mapping');
-      const snapshot = await response.json();
+      let snapshot = await response.json();
+      if (snapshot.delta) {
+        snapshot = base && Number(snapshot.delta.base) === Number(base.domStamp) ? applySnapshotDelta(base, snapshot) : null;
+        if (!snapshot) return request(null);
+      }
       if (snapshot.sourceCurrent === false || Number(snapshot.srcRev) !== Number(sourceRev) ||
           Number(snapshot.documentEpoch) !== epoch || documentReset.adoptedEpoch !== epoch) {
         throw new Error('Superseded source mapping');
       }
+      if (!provisionalSnapshotHeld || provisionalSnapshotHeld.epoch !== epoch ||
+          Number(provisionalSnapshotHeld.snapshot.srcRev) <= Number(snapshot.srcRev)) {
+        provisionalSnapshotHeld = { epoch, snapshot };
+      }
       return snapshot;
     });
+    const pending = request(held);
     provisionalSnapshotCache.set(key, pending);
     pending.catch(() => {
       if (provisionalSnapshotCache.get(key) === pending) provisionalSnapshotCache.delete(key);
@@ -4077,6 +4773,105 @@ function sourceDistanceToRegion(region, location) {
   return 0;
 }
 
+// The inline formulas of the paragraph SyncTeX named, each with its printed
+// copy, for a paragraph whose formulas SyncTeX itself cannot place.
+// `location` is SyncTeX's answer for a point of the paragraph: the line it
+// gave (which the paragraph's block holds, or which ended the paragraph just
+// after it) and the boxes that carry that line (`anchors`), which for the
+// line that ended a paragraph are the paragraph's printed lines. The
+// formulas are found by their ink. Each formula's own glyphs (as a math
+// field lays them out) are looked for among the glyphs printed there, and a
+// formula is taken only when it is printed there exactly as many times as
+// the source has it: then the copies, in reading order, are the source's
+// formulas in their order. Anything else printed alike (a digit in the
+// prose, a reference number) makes the count differ, and that formula is
+// left out.
+async function inlineMathCopies(snapshot, location, pageNumber, id, stillCurrent) {
+  const geometry = window.TdomDirectEditGeometry;
+  const Mathfield = customElements.get('math-field');
+  const line = Number(location?.line);
+  if (!geometry?.mathMaps || !Mathfield || !Number.isFinite(line)) return [];
+  const printedLines = (location.anchors ?? []).filter(item => Number(item.page) === pageNumber && item.box &&
+    [item.box.left, item.box.right, item.box.top, item.box.bottom].every(Number.isFinite));
+  if (!printedLines.length) return [];
+  const extent = { left: Math.min(...printedLines.map(item => item.box.left)), right: Math.max(...printedLines.map(item => item.box.right)),
+    top: Math.min(...printedLines.map(item => item.box.top)), bottom: Math.max(...printedLines.map(item => item.box.bottom)) };
+  const regions = (snapshot?.blocks ?? []).filter(block => sameSourceFile(block.source?.file, location.file) &&
+    Number.isInteger(block.source?.start?.line) && Number.isInteger(block.source?.end?.line) &&
+    block.source.start.line <= line && line <= block.source.end.line + 2)
+    .flatMap(block => (block.editRegions ?? [])
+      .filter(item => item.kind === 'math' && !item.display && sameSourceFile(item.source?.file, location.file))
+      .map(item => ({ ...item, blockSource: block.source ?? null })))
+    .sort((a, b) => a.source.start.line - b.source.start.line || a.source.start.column - b.source.start.column);
+  if (!regions.length || regions.length > 24) return [];
+  const glyphs = await canonicalGlyphs(pageNumber, id);
+  if (!stillCurrent() || !glyphs.length) return [];
+  const byValue = new Map();
+  for (const region of regions) {
+    if (!byValue.has(region.value)) byValue.set(region.value, []);
+    byValue.get(region.value).push(region);
+  }
+  const found = [];
+  const probe = new Mathfield();
+  try {
+    probe.mathVirtualKeyboardPolicy = 'manual';
+    probe.setAttribute('aria-hidden', 'true');
+    Object.assign(probe.style, { position: 'fixed', left: '-10000px', top: '0', opacity: '0', pointerEvents: 'none' });
+    document.body.appendChild(probe);
+    for (const [value, same] of byValue) {
+      probe.value = shouldWrapAligned(value) ? wrapAligned(value) : value;
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      if (!stillCurrent()) return [];
+      const copies = geometry.mathMaps(probe, glyphs, extent).map(({ map }) => ({ map,
+        left: Math.min(...map.map(g => g.left)), top: Math.min(...map.map(g => g.top)), bottom: Math.max(...map.map(g => g.bottom)) }));
+      // (printed as many times as the source has it, or it is not known which copy is which)
+      if (copies.length !== same.length) continue;
+      // reading order: by printed line, then from the left
+      copies.sort((a, b) => (Math.abs((a.top + a.bottom) - (b.top + b.bottom)) > 8 ? (a.top + a.bottom) - (b.top + b.bottom) : a.left - b.left));
+      copies.forEach(({ map }, order) => found.push({ region: same[order], map, extent }));
+    }
+  } finally { probe.remove(); }
+  return found;
+}
+const inkBounds = (map, pageNumber) => ({ page: pageNumber,
+  left: Math.min(...map.map(g => g.left)), right: Math.max(...map.map(g => g.right)),
+  top: Math.min(...map.map(g => g.top)), bottom: Math.max(...map.map(g => g.bottom)) });
+
+// The inline formula printed under `point` (a click SyncTeX answered with a
+// line no formula holds). Two formulas that cover the point alike leave it
+// undecided: null.
+async function inlineMathUnderPoint(snapshot, location, pageNumber, point, id, stillCurrent) {
+  if (!point) return null;
+  const geometry = window.TdomDirectEditGeometry;
+  const hits = (await inlineMathCopies(snapshot, location, pageNumber, id, stillCurrent)).filter(({ map, extent }) => {
+    if (point.x < extent.left - 3 || point.x > extent.right + 3 || point.y < extent.top - 3 || point.y > extent.bottom + 3) return false;
+    const glyph = geometry.nearest(map, point);
+    return glyph && point.x >= glyph.left - 2 && point.x <= glyph.right + 2 && point.y >= glyph.top - 1 && point.y <= glyph.bottom + 1;
+  });
+  if (!hits.length) return null;
+  // (a formula inside a larger one is not the formula clicked: `2` in `x^2`)
+  hits.sort((a, b) => b.map.length - a.map.length);
+  if (hits.length > 1 && hits[1].map.length === hits[0].map.length) return null;
+  return { region: hits[0].region, printBounds: inkBounds(hits[0].map, pageNumber) };
+}
+
+// Where an inline formula is printed in canonical generation `id`, for a
+// formula SyncTeX cannot place: asked of the paragraph printed at `near`
+// (where the formula stood in the generation before).
+async function inlineMathBoundsByInk(region, snapshot, id, near) {
+  if (!region || region.kind !== 'math' || region.display || !Number.isInteger(Number(near?.page)) ||
+      ![near.x, near.y].every(Number.isFinite)) return null;
+  const location = await fetch('/synctex', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ page: Number(near.page), x: near.x, y: near.y, id }),
+  }).then(response => (response.ok ? response.json() : null)).catch(() => null);
+  if (!location?.file) return null;
+  const key = JSON.stringify([region.source?.file, region.source?.start, region.source?.end]);
+  const copy = (await inlineMathCopies(snapshot, location, Number(near.page), id, () => true))
+    .find(item => JSON.stringify([item.region.source?.file, item.region.source?.start, item.region.source?.end]) === key);
+  return copy ? inkBounds(copy.map, Number(near.page)) : null;
+}
+
 async function resolveOpaqueEditRegion(page, event) {
   if (!page) page = pageAtClientPoint(event);
   if (!usesDirectEditSurface(page)) return null;
@@ -4275,6 +5070,19 @@ async function resolveOpaqueEditRegion(page, event) {
   // nor an exact math box. Reverse SyncTeX returns the nearest source line,
   // but proximity is navigation data, not proof that editable ink was hit.
   if (!clickedWord) return null;
+  // SyncTeX names a formula's own source line only where the formula's nodes
+  // carry it. In some paragraphs (seen where a verbatim macro stands in the
+  // same paragraph) a click on an inline formula gives the line that ended
+  // the paragraph instead: no block holds that line, no formula was looked
+  // at above, and the click opened nothing. There the formula is found by
+  // its ink (inlineMathUnderPoint): taken only when exactly one formula of
+  // the paragraph that ends at that line is printed under the pointer.
+  const inkMath = await inlineMathUnderPoint(domSnapshot, location, pageNumber, point, presented.id, stillPresented);
+  if (!stillPresented()) return null;
+  if (inkMath) {
+    return { ...inkMath, byInk: true,
+      caretOffset: caretOffsetForOpaqueRegion(inkMath.region, location, clickedWord, inkMath.printBounds, point) };
+  }
   for (const block of blocks) {
     const regions = (block.editRegions ?? [])
       .filter((region) => sameSourceFile(region.source?.file, location.file))
@@ -5049,7 +5857,12 @@ async function loadChunkInputGeometry(img) {
   const key = decodeURIComponent(url.pathname.slice('/chunk/'.length).replace(/\.svg$/, ''));
   const version = url.searchParams.get('v');
   const cacheKey = `${epoch}:${key}:${version}`;
-  if (!chunkGlyphCache.has(cacheKey)) {
+  // most recently used last: a page of code boxes holds more than a few
+  const known = chunkGlyphCache.get(cacheKey);
+  if (known) {
+    chunkGlyphCache.delete(cacheKey);
+    chunkGlyphCache.set(cacheKey, known);
+  } else {
     const pending = fetch(`/chunk-glyphs?key=${encodeURIComponent(key)}&v=${version}&e=${epoch}`)
       .then(async response => {
         if (!response.ok) throw new Error('Unready chunk mapping');
@@ -5064,7 +5877,7 @@ async function loadChunkInputGeometry(img) {
     pending.catch(() => {
       if (chunkGlyphCache.get(cacheKey) === pending) chunkGlyphCache.delete(cacheKey);
     });
-    while (chunkGlyphCache.size > 24) chunkGlyphCache.delete(chunkGlyphCache.keys().next().value);
+    while (chunkGlyphCache.size > 512) chunkGlyphCache.delete(chunkGlyphCache.keys().next().value);
   }
   const pending = chunkGlyphCache.get(cacheKey);
   // The node owns this immutable geometry for as long as its ink is on
@@ -5081,7 +5894,8 @@ async function chunkGlyphsOnPage(page, sourceId) {
   };
   const src = CSS.escape(sourceId);
   const glyphs = [];
-  for (const chunk of page.querySelectorAll(`.chunkwin[data-src="${src}"]:not(.stale)`)) {
+  // (a held chunk shows an earlier generation: its glyphs map no current source)
+  for (const chunk of page.querySelectorAll(`.chunkwin[data-src="${src}"]:not(.stale):not(.held)`)) {
     const img = chunk.querySelector('img');
     if (!img?.complete || !img.naturalWidth) continue;
     const imageSrc = img.getAttribute('src');
@@ -6280,6 +7094,8 @@ async function activateDirectEditorAtPoint(event) {
         resolved.printBounds,
         resolved.caretOffset
       );
+      // (found by its ink: followed by its ink too when the next canonical pages land)
+      if (resolved.byInk && directEditor?.region?.id === resolved.region.id) directEditor.openedByInk = true;
     }
     return;
   }
@@ -6530,7 +7346,11 @@ function findZoomAnchorPage(clientX, clientY) {
   }, null)?.page ?? null;
 }
 
+// The Jump marker ends with any operation of the reader's own; setZoom is
+// shared by the toolbar, pinch and Cmd+wheel.
+let dismissSyncMarker = () => {};
 function setZoom(z, origin = null) {
+  dismissSyncMarker();
   const anchorPage = origin && Number.isFinite(origin.x) && Number.isFinite(origin.y)
     ? findZoomAnchorPage(origin.x, origin.y)
     : null;
@@ -6611,7 +7431,10 @@ window.addEventListener('resize', () => {
 pagesEl.addEventListener('scroll', () => {
   if (directEditor) scheduleDirectEditorVisuals(true);
   scheduleViewportWarm();
+  stageDeferredNearSight();
 }, { passive: true });
+// (a pane that was hidden or resized brings other pages near)
+if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferredNearSight()).observe(pagesEl);
 // Embed mode (?embed=1): a host app (e.g. TeX64) shows only the pages —
 // no topbar, no pane title, no inspector — and owns the editor, pushing
 // edits through POST /edit. The host passes its own look so the preview
@@ -6642,6 +7465,37 @@ pagesEl.addEventListener('scroll', () => {
         if (div.getBoundingClientRect().bottom - top > 4) return n;
       }
       return sortedPages()[0]?.[0] ?? 1;
+    };
+    // With an outer paper the host counts sheets of the whole paper: the
+    // sheets before the chapter, the live pages, the sheets after it.
+    const firstBelowTop = (run, top) => {
+      let lo = 0, hi = run.childElementCount;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (run.children[mid].getBoundingClientRect().bottom - top > 4) hi = mid;
+        else lo = mid + 1;
+      }
+      return lo;
+    };
+    const paperPageCount = () => outerBeforeEl.childElementCount + sortedPages().length + outerAfterEl.childElementCount;
+    const paperTopPage = () => {
+      const top = pagesEl.getBoundingClientRect().top;
+      const before = outerBeforeEl.childElementCount;
+      const inBefore = firstBelowTop(outerBeforeEl, top);
+      if (inBefore < before) return inBefore + 1;
+      const entries = sortedPages();
+      const live = entries.findIndex(([, div]) => div.getBoundingClientRect().bottom - top > 4);
+      if (live >= 0) return before + live + 1;
+      const after = outerAfterEl.childElementCount;
+      return before + entries.length + Math.max(1, Math.min(after, firstBelowTop(outerAfterEl, top) + 1));
+    };
+    const paperPageElement = (n) => {
+      const wanted = Math.max(1, Math.min(paperPageCount(), Number.isFinite(n) ? Math.round(n) : 1));
+      const before = outerBeforeEl.childElementCount;
+      if (wanted <= before) return outerBeforeEl.children[wanted - 1];
+      const entries = sortedPages();
+      if (wanted <= before + entries.length) return entries[wanted - before - 1][1];
+      return outerAfterEl.children[wanted - before - entries.length - 1] ?? null;
     };
     const visiblePageSnapshot = () => {
       const entries = sortedPages();
@@ -6726,10 +7580,10 @@ pagesEl.addEventListener('scroll', () => {
             documentEpoch: documentReset.adoptedEpoch,
             ready: previewReady(visible.required),
             presentationPending: pending,
-            pageCount: visible.entries.length,
+            pageCount: outerPaper ? paperPageCount() : visible.entries.length,
             pageCountAuthoritative: residentPageCountAuthoritative,
             zoom,
-            page: visible.topPage,
+            page: outerPaper ? paperTopPage() : visible.topPage,
             srcRev: appliedSrcRev,
             viewportToken: embedViewportToken,
             status: lastEngineStatus,
@@ -6758,6 +7612,7 @@ pagesEl.addEventListener('scroll', () => {
         Math.abs(entry[0] - wanted) < Math.abs(best[0] - wanted) ? entry : best
       );
     };
+    let syncScrollTop = null;
     const scrollPageToViewport = (page, paperY = 0, center = false) => {
       const viewport = pagesEl.getBoundingClientRect();
       const pageRect = page.getBoundingClientRect();
@@ -6767,71 +7622,239 @@ pagesEl.addEventListener('scroll', () => {
       const target = pagesEl.scrollTop + pageRect.top - viewport.top + withinPage -
         (center ? pagesEl.clientHeight / 2 : 0);
       pagesEl.scrollTo({ top: Math.max(0, target), behavior: 'auto' });
+      syncScrollTop = pagesEl.scrollTop;
       scheduleEmbedSnapshot();
     };
     const scrollToPage = (n) => {
+      dismissSyncMarker();
+      if (outerPaper) {
+        const element = paperPageElement(Number(n));
+        if (element) scrollPageToViewport(element);
+        return;
+      }
       const entry = pageEntryFor(Number(n));
       if (!entry) return;
       scrollPageToViewport(entry[1]);
     };
-    const refineSyncToSource = async (data) => {
+    // A newer Jump or the reader's own move makes a pending refinement stale:
+    // it must neither scroll back nor bring the marker back.
+    let syncRefineGeneration = 0;
+    const syncPaperCurrent = (page, rev, id) => {
+      if (!page?.classList.contains('is-final')) return false;
+      return Number(page?.dataset.canonPresentedRev) === rev &&
+        canonicalIdFromSrc(page.dataset.canonPresentedSrc) === id;
+    };
+    const refineSyncToSource = async (data, wantsMarker = false) => {
+      const generation = syncRefineGeneration;
+      const documentEpoch = documentReset.adoptedEpoch;
+      const srcRev = appliedSrcRev;
       const file = String(data.sourceFile ?? '');
       const line = Number(data.sourceLine);
-      if (!file || !Number.isFinite(line)) return false;
+      const current = () => generation === syncRefineGeneration && !documentReset.pending &&
+        documentEpoch === documentReset.adoptedEpoch && srcRev === appliedSrcRev;
+      if (!file || !Number.isInteger(line) || line < 1) return false;
       let dom;
       try {
         const response = await fetch('/dom', { cache: 'no-store' });
-        if (!response.ok) return false;
-        dom = await response.json();
-      } catch {
-        return false;
-      }
-      const blocks = (dom?.blocks ?? []).filter((block) =>
-        block?.id && sameSourceFile(block.source?.file, file) &&
-        Number(block.source?.start?.line) <= line && Number(block.source?.end?.line) >= line
-      ).sort((a, b) =>
-        (Number(a.source.end.line) - Number(a.source.start.line)) -
-        (Number(b.source.end.line) - Number(b.source.start.line))
-      );
-      for (const block of blocks) {
+        if (response.ok) dom = await response.json();
+      } catch { /* the canonical lookup can still succeed */ }
+      if (!current()) return false;
+      const blocks = (dom?.sourceCurrent !== false && Number(dom?.srcRev) === srcRev &&
+        Number(dom?.documentEpoch) === documentEpoch ? dom.blocks ?? [] : []).flatMap(block =>
+          (block.sourceRanges ?? [block.source]).filter(source => sameSourceFile(source?.file, file))
+            .map(source => ({ ...block, source }))
+        ).sort((a, b) => {
+          const distance = block => Math.max(Number(block.source.start.line) - line, line - Number(block.source.end.line), 0);
+          return distance(a) - distance(b) ||
+            (a.source.end.line - a.source.start.line) - (b.source.end.line - b.source.start.line);
+        });
+      let estimated = false;
+      for (const block of blocks.slice(0, 3)) {
         const relativeLine = line - Number(block.source.start.line);
+        const candidates = [];
         for (const [, page] of sortedPages()) {
-          const nodes = [...page.querySelectorAll(`[data-src="${CSS.escape(String(block.id))}"][data-line]`)]
-            .filter((node) => {
-              const rect = node.getBoundingClientRect();
-              return rect.width > 0 && rect.height > 0;
-            });
-          if (!nodes.length) continue;
-          const values = [...new Set(nodes.map((node) => Number(node.dataset.line)).filter(Number.isFinite))];
-          if (!values.length) continue;
-          const targetLine = values.includes(relativeLine)
-            ? relativeLine
-            : values.reduce((best, value) =>
-              Math.abs(value - relativeLine) < Math.abs(best - relativeLine) ? value : best
-            );
-          const exact = nodes.filter((node) => Number(node.dataset.line) === targetLine);
-          const ink = exact.filter((node) =>
-            !node.classList.contains('tdom-source-hit') &&
-            !node.classList.contains('tdom-edit-hit')
-          );
-          // Rescue/source-hit rectangles can cover a whole tcolorbox. They
-          // are useful for click mapping but too broad for a precise jump.
-          if (!ink.length) continue;
-          const rects = ink.map((node) => node.getBoundingClientRect());
-          const top = Math.min(...rects.map((rect) => rect.top));
-          const bottom = Math.max(...rects.map((rect) => rect.bottom));
-          const viewport = pagesEl.getBoundingClientRect();
-          pagesEl.scrollTo({
-            top: Math.max(0, pagesEl.scrollTop + (top + bottom) / 2 - viewport.top - pagesEl.clientHeight / 2),
-            behavior: 'auto',
-          });
-          scheduleEmbedSnapshot();
-          return true;
+          if (page.classList.contains('is-final')) continue;
+          for (const node of page.querySelectorAll(`[data-src="${CSS.escape(String(block.id))}"][data-line]`)) {
+            const rect = node.getBoundingClientRect();
+            if (!(rect.width > 0 && rect.height > 0)) continue;
+            const ink = !node.classList.contains('tdom-source-hit') && !node.classList.contains('tdom-edit-hit') &&
+              !node.classList.contains('chunkwin') && ['text', 'tspan', 'use'].includes(node.tagName?.toLowerCase());
+            candidates.push({ page, node, ink, distance: Math.abs(Number(node.dataset.line) - relativeLine) });
+          }
         }
+        candidates.sort((a, b) => a.distance - b.distance || Number(b.ink) - Number(a.ink));
+        const first = candidates[0];
+        if (!first) continue;
+        // A block that begins by clearing the page (\chapter) leaves an
+        // inkless trace on the page it closes and its heading on the next.
+        // When that next page already shows canonical pixels it is not among
+        // the candidates, and the trace alone put the band one page early, at
+        // the end of the chapter before (389-page book, measured). The trace
+        // of a block that runs over several pages is no position.
+        if (!first.ink && (block.pages?.length ?? 0) > 1) continue;
+        const nodes = candidates.filter(c => c.page === first.page && c.distance === first.distance && c.ink === first.ink);
+        const rects = nodes.map(c => c.node.getBoundingClientRect());
+        const top = Math.min(...rects.map(r => r.top)), bottom = Math.max(...rects.map(r => r.bottom));
+        const pageRect = first.page.getBoundingClientRect();
+        const scale = pageRect.height / activePaperGeometry(first.page).height;
+        const knownInk = first.ink && first.distance === 0 && Number(first.page.dataset.provRev) === srcRev;
+        // Without the line's own ink the block is all there is to go by: the
+        // line sits about as far down the block as it does in its source.
+        const blockLines = Math.max(1, Number(block.source.end.line) - Number(block.source.start.line));
+        const fraction = Math.max(0, Math.min(1, relativeLine / blockLines));
+        const estimateTop = top + (bottom - top) * fraction;
+        const estimateBox = { left: 0, top: estimateTop - pageRect.top, width: pageRect.width, height: 1 };
+        scrollPageToViewport(first.page, (knownInk ? (top + bottom) / 2 - pageRect.top : estimateTop - pageRect.top) / scale, true);
+        if (wantsMarker) {
+          placeSyncMarker(first.page, knownInk ? {
+            left: Math.min(...rects.map(r => r.left)) - pageRect.left - 2,
+            top: top - pageRect.top - 1,
+            width: Math.max(...rects.map(r => r.right)) - Math.min(...rects.map(r => r.left)) + 4,
+            height: bottom - top + 2,
+          } : estimateBox, false);
+        }
+        estimated = true;
+        break;
+      }
+      let hit = null, awaitingPage = null;
+      while (current()) {
+        if (hit && canonical?.rev === srcRev && canonical.id !== hit.id) hit = null;
+        if (!hit) {
+          try {
+            const response = await fetch('/synctex/jump', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ file, line, documentEpoch, srcRev }),
+            });
+            if (!response.ok) return false;
+            const result = await response.json();
+            if (!current()) return false;
+            if (result.documentEpoch !== documentEpoch || result.srcRev !== srcRev) return false;
+            if (result.boxes?.length) hit = result;
+            else if (!result.pending) return false;
+            else requestCanonicalDisplay({ residentImpossible: true });
+          } catch { return false; }
+        }
+        if (hit) {
+          const page = pageDivs.get(Number(hit.page));
+          const boxes = hit.boxes;
+          const y = (Math.min(...boxes.map(b => b.top)) + Math.max(...boxes.map(b => b.bottom))) / 2;
+          if (page && awaitingPage !== page) {
+            awaitingPage = page;
+            scrollPageToViewport(page, y, true);
+            updateCanonState(Number(hit.page));
+          }
+          // A new mapping must not be painted on old canonical pixels or on
+          // a resident pagination that the authority has yet to replace.
+          if (syncPaperCurrent(page, srcRev, hit.id)) {
+            scrollPageToViewport(page, y, true);
+            if (wantsMarker) {
+              const scale = page.clientWidth / activePaperGeometry(page).width;
+              placeSyncMarker(page, boxes.map(b => ({ left: b.left * scale - 2, top: b.top * scale - 1,
+                width: (b.right - b.left) * scale + 4, height: (b.bottom - b.top) * scale + 2 })), true);
+            }
+            return true;
+          }
+        }
+        await new Promise(resolve => setTimeout(resolve, 250));
       }
       return false;
     };
+    // The host's Jump marks where it landed, as the static PDF viewer does:
+    // a box over the typeset source line that fades out.
+    let syncMarkerTimer = null;
+    const clearSyncMarker = () => {
+      clearTimeout(syncMarkerTimer);
+      syncMarkerTimer = null;
+      for (const node of document.querySelectorAll('.tdom-sync-marker')) node.remove();
+    };
+    const placeSyncMarker = (page, boxOrBoxes, exact = true) => {
+      clearSyncMarker();
+      const boxes = (Array.isArray(boxOrBoxes) ? boxOrBoxes : [boxOrBoxes])
+        .filter((box) => box && box.width > 0 && box.height > 0);
+      if (!page?.isConnected || !boxes.length) return;
+      if (!exact) {
+        // Only roughly known (the last Build's position after edits, or a
+        // place inside a block drawn as one picture): say "about here" with a
+        // soft band across the page, never with a box around a line that
+        // may not be the right one.
+        const top = Math.min(...boxes.map(b => b.top)), bottom = Math.max(...boxes.map(b => b.top + b.height));
+        const pageHeight = page.clientHeight || 1;
+        const height = Math.min(pageHeight, Math.max(bottom - top, pageHeight * 0.045));
+        const middle = (top + bottom) / 2;
+        boxes.length = 0;
+        boxes.push({ left: 0, top: Math.max(0, Math.min(pageHeight - height, middle - height / 2)),
+          width: page.clientWidth, height });
+      }
+      for (const box of boxes) {
+        const marker = document.createElement('div');
+        marker.className = 'tdom-sync-marker';
+        marker.dataset.exact = String(exact);
+        marker.style.left = `${box.left}px`;
+        marker.style.top = `${box.top}px`;
+        marker.style.width = `${box.width}px`;
+        marker.style.height = `${box.height}px`;
+        page.appendChild(marker);
+      }
+      syncMarkerTimer = setTimeout(clearSyncMarker, 2600);
+    };
+    dismissSyncMarker = () => {
+      syncRefineGeneration += 1;
+      syncScrollTop = null;
+      if (syncMarkerTimer !== null) clearSyncMarker();
+    };
+    for (const type of ['wheel', 'pointerdown', 'touchstart']) {
+      pagesEl.addEventListener(type, () => dismissSyncMarker(), { passive: true, capture: true });
+    }
+    document.addEventListener('keydown', () => dismissSyncMarker(), true);
+    window.addEventListener('resize', () => dismissSyncMarker());
+    // SyncTeX's block (paper points from the top) on this page, in page pixels.
+    const syncBlockBox = (page, data) => {
+      const paper = activePaperGeometry(page);
+      const scale = page.clientWidth / Math.max(1, Number(paper.width));
+      // Several rectangles (one per run of typeset lines) when the host sent them.
+      const blocks = Array.isArray(data.blocks)
+        ? data.blocks.filter((block) => block && ['x', 'y', 'width', 'height'].every((key) => Number.isFinite(Number(block[key]))))
+        : [];
+      if (blocks.length > 1) {
+        return blocks.slice(0, 32).map((block) => ({
+          left: Number(block.x) * scale - 2, top: Number(block.y) * scale - 1,
+          width: Number(block.width) * scale + 4, height: Number(block.height) * scale + 2,
+        }));
+      }
+      const blockX = Number(data.blockX), blockY = Number(data.blockY);
+      const blockWidth = Number(data.blockWidth), blockHeight = Number(data.blockHeight);
+      if ([blockX, blockY, blockWidth, blockHeight].every(Number.isFinite) && blockWidth > 0 && blockHeight > 0) {
+        return { left: blockX * scale - 2, top: blockY * scale - 1, width: blockWidth * scale + 4, height: blockHeight * scale + 2 };
+      }
+      const x = Number(data.x), y = Number(data.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      return { left: x * scale - 10, top: y * scale - 10, width: 20, height: 20 };
+    };
     const scrollToSync = (data) => {
+      if (outerPaper) {
+        // The host's page is a sheet of the Build paper. Outside the chapter
+        // it is the place itself: this frame has no source there to refine it.
+        const sheet = Math.round(Number(data.page));
+        const outside = sheet <= outerPaper.before ? outerBeforeEl.children[sheet - 1]
+          : sheet >= outerPaper.afterFrom ? outerAfterEl.children[sheet - outerPaper.afterFrom] : null;
+        if (outside) {
+          const blockY = Number(data.blockY);
+          const blockHeight = Number(data.blockHeight);
+          const y = Number.isFinite(blockY)
+            ? blockY + (Number.isFinite(blockHeight) ? blockHeight / 2 : 0)
+            : Number(data.y);
+          scrollPageToViewport(outside, Number.isFinite(y) ? y : 0, true);
+          embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
+          clearSyncMarker();
+          if (data.marker !== false && typeof data.viewportToken !== 'string') {
+            placeSyncMarker(outside, syncBlockBox(outside, data), data.approximate !== true);
+          }
+          syncRefineGeneration += 1;
+          requestAnimationFrame(scheduleEmbedSnapshot);
+          return;
+        }
+        data = { ...data, page: sheet - outerPaper.before };
+      }
       const entry = pageEntryFor(Number(data.page));
       if (!entry) return;
       const [, page] = entry;
@@ -6842,10 +7865,23 @@ pagesEl.addEventListener('scroll', () => {
         : Number(data.y);
       scrollPageToViewport(page, Number.isFinite(y) ? y : 0, true);
       embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
-      void refineSyncToSource(data);
+      // A viewport handoff (the host mirroring where the static PDF was
+      // scrolled when Live takes over, e.g. at the first keystroke) is not
+      // a Jump: it carries a viewportToken and must never draw a marker.
+      const wantsMarker = data.marker !== false && typeof data.viewportToken !== 'string';
+      clearSyncMarker();
+      // The host's position comes from the last Build. It is exact only for
+      // a line this frame cannot look up at all; for a source line it is a
+      // first approximation that the current revision confirms or replaces.
+      if (wantsMarker) placeSyncMarker(page, syncBlockBox(page, data), !data.sourceFile && data.approximate !== true);
+      syncRefineGeneration += 1;
+      void refineSyncToSource(data, wantsMarker);
       requestAnimationFrame(scheduleEmbedSnapshot);
     };
-    pagesEl.addEventListener('scroll', scheduleEmbedSnapshot, { passive: true });
+    pagesEl.addEventListener('scroll', () => {
+      if (syncScrollTop !== null && Math.abs(pagesEl.scrollTop - syncScrollTop) > 1) dismissSyncMarker();
+      scheduleEmbedSnapshot();
+    }, { passive: true });
     window.addEventListener('message', (ev) => {
       const d = ev.data;
       if (!d || d.source !== 'tdom-host') return;
@@ -6863,8 +7899,8 @@ pagesEl.addEventListener('scroll', () => {
       else if (d.action === 'zoom-fit') setZoom(1);
       else if (d.action === 'goto-page') scrollToPage(Number(d.page));
       else if (d.action === 'goto-sync') scrollToSync(d);
-      else if (d.action === 'page-prev') scrollToPage(currentTopPage() - 1);
-      else if (d.action === 'page-next') scrollToPage(currentTopPage() + 1);
+      else if (d.action === 'page-prev') scrollToPage((outerPaper ? paperTopPage() : currentTopPage()) - 1);
+      else if (d.action === 'page-next') scrollToPage((outerPaper ? paperTopPage() : currentTopPage()) + 1);
       else if (d.action === 'search') runLiveSearch(d.query, d.findPrevious === true);
     });
     setInterval(postEmbedSnapshot, 400);
@@ -6894,6 +7930,8 @@ function chips(list, cls = '') {
 }
 
 function renderInspector(report, rtt) {
+  // the inspector pane is not shown inside a host
+  if (embeddedHost) return;
   const s = report.stats;
   const deps = report.dirtyDependencies.map((d) => `${d.kind}:${d.key} → ${d.affected.join(', ')}`);
   const phases = Object.entries(s)
@@ -7047,13 +8085,70 @@ function escapeHtml(s) {
 
 // ---------------------------------------------------------------- SSE
 
-const sse = new EventSource('/events');
-sse.onmessage = (ev) => {
-  try {
-    stateEventEpoch++;
-    receivePreviewEvent(JSON.parse(ev.data));
-  } catch { /* ignore malformed events */ }
-};
+// A page's display list comes whole the first time this stream carries it
+// and after that as its change from the one before: the commands between
+// those that are the same at the start and at the end (server.js
+// broadcastAtLists). The lists are kept here as they arrive, whatever the
+// viewer then does with the event, so the next change always has its base.
+// The commands of the shared start and end are the objects held: nothing
+// here ever changes a command it was sent.
+const streamLists = new Map(); // page -> { n, commands }: the list this stream last carried for the page
+/** Puts every display list of an event in place; false when one cannot be made from what is held. */
+function resolveStreamLists(msg) {
+  const patches = Array.isArray(msg?.patches) ? msg.patches : Array.isArray(msg?.report?.patches) ? msg.report.patches : null;
+  if (!patches) return true;
+  for (const patch of patches) {
+    const dl = patch?.type === 'replace-page' ? patch.displayList : null;
+    if (!dl) continue;
+    const sent = dl.commands;
+    // (a plain list: the server keeps no base for this page either)
+    if (Array.isArray(sent)) { streamLists.delete(dl.page); continue; }
+    if (!sent || typeof sent !== 'object' || !Number.isSafeInteger(sent.n)) return false;
+    let commands = sent.all;
+    if (!Array.isArray(commands)) {
+      const held = streamLists.get(dl.page);
+      const { head, tail, mid } = sent;
+      if (!held || held.n !== sent.base || held.commands.length !== sent.of || !Array.isArray(mid) ||
+          !Number.isSafeInteger(head) || !Number.isSafeInteger(tail) || head < 0 || tail < 0 || head + tail > held.commands.length) return false;
+      commands = head === held.commands.length && !mid.length
+        ? held.commands
+        : [...held.commands.slice(0, head), ...mid, ...held.commands.slice(held.commands.length - tail)];
+    }
+    dl.commands = commands;
+    streamLists.set(dl.page, { n: sent.n, commands });
+  }
+  return true;
+}
+let sse = null;
+function openEventStream() {
+  const stream = new EventSource('/events?lists=cut');
+  sse = stream;
+  // (a stream that connects again is another stream to the server: it starts from whole lists)
+  stream.onopen = () => { if (sse === stream) streamLists.clear(); };
+  stream.onmessage = (ev) => {
+    if (sse !== stream) return;
+    try {
+      stateEventEpoch++;
+      const tracing = Array.isArray(globalThis.__tdomStageTrace);
+      if (tracing) traceStage('event', null, { bytes: ev.data.length });
+      const msg = JSON.parse(ev.data);
+      if (!resolveStreamLists(msg)) {
+        // Not reachable while both ends keep to the stream's order. If it
+        // ever is, nothing built on this event can be trusted: take a new
+        // stream and the document as the server has it.
+        console.warn('[tdom] a display list could not be made from the one held; reloading the document');
+        stream.close();
+        streamLists.clear();
+        openEventStream();
+        void boot();
+        return;
+      }
+      if (tracing) traceStage('parsed', null, { kind: msg.kind });
+      receivePreviewEvent(msg);
+    } catch { /* ignore malformed events */ }
+  };
+}
+openEventStream();
 function receivePreviewEvent(msg) {
   try {
     if (msg.kind === 'reset-pending') {
@@ -7071,6 +8166,14 @@ function receivePreviewEvent(msg) {
       // New-engine canonical/update events may arrive before reset completes.
       // /doc is the single atomic snapshot adopted after both sides agree.
       return;
+    }
+    if (msg.kind === 'warm' && msg.warm && !['scheduled', 'running', 'superseded', 'rejected', 'error'].includes(msg.warm.status) &&
+        Number(msg.warm.sourceRev) === Number(appliedSrcRev)) {
+      // The caret has settled on a block: fetch the source mapping now. The
+      // first keystroke there otherwise fetches the whole document's mapping
+      // (10 MB for a book, 170 ms) before its page may be shown; with this
+      // one in hand it asks only for what the keystroke changed.
+      void loadProvisionalSnapshot(appliedSrcRev).catch(() => {});
     }
     if (Number.isInteger(Number(msg.documentEpoch)) &&
         Number(msg.documentEpoch) !== documentReset.adoptedEpoch) {
@@ -7185,6 +8288,7 @@ function receivePreviewEvent(msg) {
       return;
     }
     if (msg.kind === 'update' && msg.report.rev > appliedRev) {
+      if (msg.dom) adoptPushedSnapshot(msg.dom, msg.documentEpoch);
       applyReport(msg.report);
       renderInspector(msg.report, null);
       // Editor-source sync exists for OTHER clients' edits (a second tab
@@ -7193,7 +8297,12 @@ function receivePreviewEvent(msg) {
       // every page's display list) once per keystroke. While we are the
       // editing client (focused editor or an in-flight POST of ours), the
       // patches in this report are all we need.
-      if (document.activeElement !== editor && !inFlight) {
+      // Embedded in a host there is no editor of this page to keep in step:
+      // the host owns the source. There this fetch ran on every keystroke
+      // (the whole document, every page's display list: 11 MB for a
+      // 389-page book), holding the server's one thread while the pictures
+      // of the page just edited waited behind it.
+      if (!embeddedHost && document.activeElement !== editor && !inFlight) {
         fetch('/doc')
           .then((r) => r.json())
           .then((doc) => {

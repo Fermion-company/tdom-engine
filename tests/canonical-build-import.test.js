@@ -101,6 +101,28 @@ test('Build import validates the current root and every project input recorded b
   }
 });
 
+test('Build import takes a document that calls Lua, and refuses one that escapes to the shell', async () => {
+  const withChild = (text) => {
+    const data = fixture();
+    writeFileSync(data.child, text);
+    data.candidate.inputs = [descriptor(data.main), descriptor(data.child), descriptor(data.image)];
+    return data;
+  };
+  const validate = (data) => validateCanonicalBuildImport({
+    candidate: data.candidate, projectRoot: data.root, mainFile: 'main.tex',
+    source: readFileSync(data.main, 'utf8'), effectiveProjectInput: () => null,
+  });
+  const lua = withChild('\\directlua{tex.print("x")} and \\lua_now:n { texio.write_nl("log", "y") }\n');
+  const shell = withChild('\\immediate\\write18{date > now.txt}\n');
+  try {
+    assert.equal((await validate(lua)).accepted, true);
+    assert.deepEqual(await validate(shell), { accepted: false, reason: 'dynamic-input-command-unsupported' });
+  } finally {
+    rmSync(lua.root, { recursive: true, force: true });
+    rmSync(shell.root, { recursive: true, force: true });
+  }
+});
+
 test('Build import rejects an overlay whose bytes differ from the compiled child', async () => {
   const data = fixture();
   try {

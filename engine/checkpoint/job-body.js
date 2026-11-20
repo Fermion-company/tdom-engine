@@ -1,3 +1,4 @@
+import { subfileOpenTeX, subfileCloseTeX } from './subfile.js';
 import { labelDefBody, startsAddvspace } from './util/tex.js';
 import { trailingGlueSpec } from './util/galley.js';
 import { instrumentEditRegions } from '../edit-regions.js';
@@ -62,8 +63,12 @@ export function buildJobBlockBody({
       const val = labelTable.get(key);
       const cs = key.startsWith('cite:') ? `b@${key.slice(5)}` : `r@${key}`;
       if (val === undefined) {
-        // vanished label: neutralize stale definitions in this lineage
-        defs.push(`\\global\\expandafter\\let\\csname ${cs}\\endcsname\\relax`);
+        // vanished label: neutralize stale definitions in this lineage.
+        // Only one the engine has held: a key it never held is defined, if
+        // at all, by the document's own means (label-table.js), and stays.
+        if (labelTable.ever?.has(key) ?? true) {
+          defs.push(`\\global\\expandafter\\let\\csname ${cs}\\endcsname\\relax`);
+        }
       } else if (key.startsWith('cite:')) {
         defs.push(`\\global\\@namedef{${cs}}{${val}}`);
       } else {
@@ -94,5 +99,12 @@ export function buildJobBlockBody({
     body = Buffer.from(prelude + edit.text, 'utf8');
     jobId = block.id;
   }
-  return { body, jobId, refSnapshot, prelude };
+  // A \subfile chapter's group and paths belong to every job of its first
+  // and last block, the state continuation of a rescued block included: a
+  // group opened by one and never closed (or the reverse) would unbalance
+  // the whole lineage.
+  const open = subfileOpenTeX(block);
+  const close = subfileCloseTeX(block);
+  if (open || close) body = Buffer.concat([Buffer.from(open, 'utf8'), body, Buffer.from(close, 'utf8')]);
+  return { body, jobId, refSnapshot, prelude: open + prelude };
 }

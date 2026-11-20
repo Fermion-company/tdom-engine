@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from './engine/checkpoint/engine-v3.js';
+import { editPageRenderIds } from './engine/checkpoint/update-helpers.js';
 import {
   buildTerminalCanonicalPatch,
   captureCanonicalAnchorBase,
@@ -41,7 +42,7 @@ import {
 import { certifyCanonicalBlock } from './engine/checkpoint/canonical-paint-index.js';
 import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read-proof.js';
 import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
-import { buildLeasePreviewSettlement } from './engine/checkpoint/build-lease-preview.js';
+import { acquirePreviewBuildLease } from './engine/checkpoint/build-lease-preview.js';
 import { watchInclude } from './engine/checkpoint/include-expander.js';
 import { includeHoldsText, inputReadCurrent, rebindIncludeRead } from './engine/checkpoint/include-cache.js';
 import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
@@ -59,6 +60,10 @@ import {
   prepareExternalBibliography,
 } from './engine/project-bibliography.js';
 import { isPathInside } from './engine/project-inputs.js';
+import { domEntriesDifferInPlaceOnly, domEntryLinesMovedBy, filesOfRegions, serializeDomBlock } from './engine/checkpoint/inspector.js';
+import { textSplice } from './engine/text-splice.js';
+import { fnv1a } from './engine/hash.js';
+import { pdfPageSvgArgs } from './engine/checkpoint/util/svg.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 4633);
@@ -491,10 +496,321 @@ let queue = Promise.resolve();
 let engineBusy = 0;
 let engineBusySince = 0;
 const openRequests = new OpenRequestCache(8);
+// The viewer's source-mapping snapshot (/dom?srcRev=N) of the revision an
+// update just produced. Served from the queue it waited behind the NEXT
+// edit, and continuous typing always has one queued: it came back one
+// revision newer than the page it was for, which the viewer rejects, so no
+// provisional page committed until the typing stopped (tex64-internal #103).
+// While a viewer asks for snapshots, each update's is built at the end of
+// its own queue turn, before the next edit starts, and served as is.
+// Built when the NEXT queued operation starts, the last moment the update's
+// state is intact: the keystroke's own reply never waits for it, the next
+// edit pays it (as it paid the queued /dom request before). An async
+// repagination of the same source marks it dirty: its block spans still
+// hold, only the pages a block spans may have moved; it is still served
+// while an edit is running or queued (the alternative is the superseded
+// snapshot), and rebuilt through the queue otherwise.
+let domCache = null; // { srcRev, epoch, dirty, parts }
+let domInterestUntil = 0;
+let lastQueueResult = null;
+function cacheDomBeforeNext() {
+  const result = lastQueueResult;
+  if (Date.now() > domInterestUntil || !result?.stats || !Number.isSafeInteger(result.srcRev)) return;
+  if (result.srcRev !== engine?.srcRev) return;
+  if (domCache?.srcRev === engine.srcRev && domCache.epoch === documentEpoch && !domCache.dirty) return;
+  // A viewer that was handed this revision's snapshot (with the update, or
+  // on request) keeps it and does not ask for the revision again. Built anew
+  // here after every exact render that landed between two keystrokes, the
+  // snapshot cost the next keystroke 2.8 ms for a request that never came
+  // (a 72-page book, a paragraph with formulas). Whoever does ask is served
+  // on request, as before.
+  if (domCache?.srcRev === engine.srcRev && domCache.epoch === documentEpoch && domServed?.srcRev === engine.srcRev) return;
+  try {
+    rememberDom(domPayload(result));
+  } catch {
+    domCache = null;
+  }
+}
+
+// The snapshot is the whole document (a 389-page book: about 10 MB), and the
+// viewer asks for one per keystroke. It is serialized block by block so a
+// viewer that holds an earlier revision can be sent only what changed since.
+// A revision repaginated in place is serialized again under the same number,
+// so a base is named by the stamp of the serialization the viewer received.
+const domEarlier = []; // serializations before domCache's, newest last
+let domStamp = 0;
+let domServed = null; // the serialization last handed to a viewer (kept whatever was made since)
+// The text of every source file travels in the snapshot. It was serialized
+// again for every file with every keystroke, and the file typed in was sent
+// whole (a single-file document of 190 pages: 290,000 characters to the
+// viewer with each key). A file whose text is the one serialized before
+// keeps that serialization, and a change goes out as the stretch that came
+// and went (domDeltaBody; the viewer holds the text before it).
+// TDOM_NO_SOURCE_SPLICE=1: every changed file whole, as before.
+const NO_SOURCE_SPLICE = !!process.env.TDOM_NO_SOURCE_SPLICE;
+const sourceJsonKept = new Map(); // file -> { text, json }
+function sourceJson(source) {
+  const plain = typeof source?.file === 'string' && typeof source.text === 'string' && Object.keys(source).length === 2;
+  const kept = plain ? sourceJsonKept.get(source.file) : null;
+  if (kept && kept.text === source.text) return kept.json;
+  const json = JSON.stringify(source);
+  if (plain) {
+    if (sourceJsonKept.size > 2048) sourceJsonKept.clear();
+    sourceJsonKept.set(source.file, { text: source.text, json });
+  }
+  return json;
+}
+// Nothing of a block is serialized until it is sent: a keystroke's change
+// names the blocks that differ by looking at the entries themselves (the same
+// object, or the same parts in another place: inspector.js), and the whole
+// document as one string is made only for a viewer that holds no earlier one.
+function serializeDom(payload) {
+  const { blocks = [], sources = [], ...rest } = payload;
+  const order = blocks.map((block) => String(block.id));
+  const files = sources.map((source) => source.file);
+  const tail = JSON.stringify(rest).slice(1); // `"rev":…}`
+  const stamp = ++domStamp;
+  const lazy = (object, name, make) => Object.defineProperty(object, name, {
+    configurable: true,
+    get() {
+      const value = make();
+      Object.defineProperty(object, name, { value, writable: true, configurable: true });
+      return value;
+    },
+  });
+  const parts = {
+    srcRev: payload.srcRev, stamp, order, files, tail,
+    // the blocks themselves, in order
+    entries: blocks,
+    // (the texts themselves, to send a change of one as a splice: domDeltaBody)
+    texts: new Map(sources.map((source) => [source.file, Object.keys(source).length === 2 ? source.text : null])),
+    sourceOf: new Map(sources.map((source) => [source.file, source])),
+  };
+  // the whole document as one string, only for a viewer that holds no earlier one
+  lazy(parts, 'body', () => `{"domStamp":${stamp},"blocks":[${blocks.map(serializeDomBlock).join(',')}],` +
+    `"sources":[${sources.map(sourceJson).join(',')}]${tail.length > 1 ? ',' : ''}${tail}`);
+  return parts;
+}
+function rememberDom(payload) {
+  const parts = serializeDom(payload);
+  if (domCache && domCache.epoch !== documentEpoch) domEarlier.length = 0;
+  else if (domCache?.parts) {
+    domEarlier.push(domCache.parts);
+    while (domEarlier.length > 4) domEarlier.shift();
+  }
+  domCache = { srcRev: payload.srcRev, epoch: documentEpoch, dirty: false, parts };
+  return parts;
+}
+// A viewer that stages provisional pages asks /dom for every revision before
+// it shows it: one round trip per keystroke, behind whatever else this
+// thread is doing (13 ms of a 65 ms keystroke on a 72-page book). While such
+// a viewer is listening, the edit's own update carries the change from the
+// serialization before it; a viewer holding that one applies it, any other
+// asks as before.
+function updateDomPush(report, raw) {
+  if (Date.now() > domInterestUntil || !sseClients.size || !report?.stats ||
+      !Number.isSafeInteger(report.srcRev) || report.srcRev !== engine?.srcRev) return '';
+  try {
+    // From the serialization a viewer was last given, not the newest one: a
+    // repagination since (an exact render landing, the settle pass) makes a
+    // newer one that no viewer has seen.
+    const base = domServed?.stamp;
+    const parts = rememberDom(domPayload(report, raw));
+    const delta = domDeltaBody(parts, base);
+    if (delta) {
+      domInterestUntil = Date.now() + 5_000;
+      domServed = parts;
+    }
+    return delta ?? '';
+  } catch {
+    return '';
+  }
+}
+const sameList = (a, b) => {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+/** The snapshot as a change from the serialization stamped `base`, or null when that one is not held. */
+function domDeltaBody(parts, base) {
+  if (!Number.isSafeInteger(base) || base === parts.stamp) return null;
+  const earlier = domServed?.stamp === base ? domServed : domEarlier.findLast((item) => item.stamp === base);
+  if (!earlier) return null;
+  // The list of blocks is the earlier one with a stretch replaced: its first
+  // `head` blocks, the blocks named, its last `tail` (a keystroke that adds
+  // or removes no block: all of it and nothing named). Blocks are told
+  // apart place by place, and their names are not sent again (2,600 names
+  // with every keystroke of a 191-page file).
+  const n = parts.order.length;
+  const m = earlier.order.length;
+  let head = 0;
+  while (head < n && head < m && parts.order[head] === earlier.order[head]) head++;
+  let tail = 0;
+  while (tail < n - head && tail < m - head && parts.order[n - 1 - tail] === earlier.order[m - 1 - tail]) tail++;
+  const named = parts.order.slice(head, n - tail);
+  if (new Set(named).size !== named.length) return null;
+  let replaced = null; // the earlier blocks of the stretch, by name
+  for (let j = head; j < m - tail; j++) {
+    replaced ??= new Map();
+    if (replaced.has(earlier.order[j])) return null;
+    replaced.set(earlier.order[j], earlier.entries[j]);
+  }
+  // A block that only stands elsewhere now (another place in the list of
+  // blocks, other pages, other offsets in the root file) is sent as that
+  // place, not whole. A character typed into a single-file document moves
+  // the offsets of every block after it: 394 of 400 blocks, 258 KB with
+  // every keystroke, where their places take 16 KB. A keystroke that makes
+  // a chapter one page longer moves every block after it to another page:
+  // 1.2 MB on a 72-page book.
+  // Blocks in a row that moved by the same amount, on the pages they were
+  // on, are sent as one run `[from, to, by, places]`: `by` characters further
+  // in the root file, `places` further in the list. A character typed in the
+  // middle of a 191-page file moved 1,300 blocks: 52 KB of places with every
+  // keystroke, now one run.
+  const blocks = [];
+  const at = [];
+  const moved = [];
+  const shift = [];
+  let run = null;
+  // …and blocks in a row that stand `down` lines further in their file, the
+  // same otherwise (a line added above them): `[from, to, down]`.
+  const lines = [];
+  let lineRun = null;
+  const entries = parts.entries;
+  for (let i = 0; i < n; i++) {
+    const now = entries[i];
+    const was = i < head ? earlier.entries[i] : i >= n - tail ? earlier.entries[i - n + m] : replaced?.get(parts.order[i]);
+    if (was === now) continue;
+    if (!domEntriesDifferInPlaceOnly(was, now)) {
+      const down = domEntryLinesMovedBy(was, now);
+      if (down === null) {
+        // (entries not made from one core: by what they say)
+        const text = serializeDomBlock(now);
+        if (was && serializeDomBlock(was) === text) continue;
+        if (!onlyMoved(was, now)) {
+          blocks.push(text);
+          at.push(i);
+          continue;
+        }
+      } else if (down) {
+        if (lineRun && lineRun[1] === i && lineRun[2] === down) lineRun[1] = i + 1;
+        else lines.push(lineRun = [i, i + 1, down]);
+      }
+    }
+    const by = was.span && now.span ? now.span.start - was.span.start : 0;
+    const places = now.index - was.index;
+    const inRun = (was.span == null) === (now.span == null) && Number.isSafeInteger(places) && Number.isSafeInteger(by) &&
+      (!now.span || now.span.end - was.span.end === by) && sameList(was.pages ?? [], now.pages ?? []);
+    if (!inRun) {
+      moved.push(`[${i},${JSON.stringify(now.index)},${JSON.stringify(now.pages)},${JSON.stringify(now.span ?? null)}]`);
+      continue;
+    }
+    if (!by && !places) continue; // (stands where it stood)
+    if (run && run[1] === i && run[2] === by && run[3] === places) run[1] = i + 1;
+    else shift.push(run = [i, i + 1, by, places]);
+  }
+  const sources = parts.files.flatMap((file) => {
+    const before = earlier.texts.get(file);
+    const after = parts.texts.get(file);
+    if (typeof before !== 'string' || typeof after !== 'string') {
+      const text = sourceJson(parts.sourceOf.get(file));
+      return earlier.sourceOf.has(file) && sourceJson(earlier.sourceOf.get(file)) === text ? [] : [text];
+    }
+    if (before === after) return [];
+    if (NO_SOURCE_SPLICE) return [sourceJson(parts.sourceOf.get(file))];
+    const [from, gone, came] = textSplice(before, after);
+    // (worth it only when the change is a small part of the file)
+    if (came.length * 2 + 64 >= after.length) return [sourceJson(parts.sourceOf.get(file))];
+    return [`{"file":${JSON.stringify(file)},"splice":[${from},${gone},${JSON.stringify(came)}]}`];
+  });
+  return `{"domStamp":${parts.stamp},"delta":{"base":${base}},"cut":[${head},${tail},${JSON.stringify(named)}],` +
+    `"files":${sameList(earlier.files, parts.files) ? 'null' : JSON.stringify(parts.files)},` +
+    `"blocks":[${blocks.join(',')}],"at":${JSON.stringify(at)},"moved":[${moved.join(',')}],"shift":${JSON.stringify(shift)},` +
+    `"lines":${JSON.stringify(lines)},"sources":[${sources.join(',')}]${parts.tail.length > 1 ? ',' : ''}${parts.tail}`;
+}
+/** What an edit became, for a client that asked for no more (`slim`). */
+function editAnswer(report) {
+  return { srcRev: report?.srcRev ?? null, rev: report?.rev ?? null, slim: true };
+}
+/** Whether two serializations of one block differ in nothing but its index, its pages and its offsets in the root file. */
+function onlyMoved(was, now) {
+  if (!was || !now || was.editRegions !== now.editRegions) return false;
+  const rest = ({ index: _index, pages: _pages, span: _span, editRegions: _regions, ...other }) => JSON.stringify(other);
+  return rest(was) === rest(now);
+}
+
+// ---- outer paper -------------------------------------------------------
+// A host that keeps only one chapter of a long document live (the other
+// chapter files arrive as empty overlays) names the paper of the document's
+// last full Build: its sheets before `before + 1` and from `afterFrom` on
+// are shown around the live pages, as pictures. They are not this
+// document's output and nothing here typesets or verifies them.
+// Names this server process in URLs whose content is fixed for its lifetime
+// (the same localhost port is reused across restarts).
+const BOOT_ID = `${process.pid.toString(36)}${Date.now().toString(36)}`;
+let outerPaper = null; // { key, pdf, before, afterFrom, pages, dir }
+const outerRenders = new Map(); // sheet -> Promise<svg path>
+let outerRendering = 0;
+const outerWaiters = [];
+function setOuterPaper(spec) {
+  outerRenders.clear();
+  if (!spec) {
+    outerPaper = null;
+    return null;
+  }
+  const pdf = typeof spec.pdfPath === 'string' && path.isAbsolute(spec.pdfPath) ? path.resolve(spec.pdfPath) : null;
+  const pages = Number(spec.pages);
+  const before = Number(spec.before);
+  const afterFrom = Number(spec.afterFrom);
+  if (!pdf || !Number.isInteger(pages) || pages < 1 || !Number.isInteger(before) || before < 0 || before > pages ||
+      !Number.isInteger(afterFrom) || afterFrom <= before || afterFrom > pages + 1) {
+    throw new Error('outer paper requires {pdfPath, pages, before, afterFrom}');
+  }
+  const st = statSync(pdf);
+  const paper = `${fnv1a(pdf)}-${Math.round(st.mtimeMs)}-${st.size}`;
+  const dir = path.join(engine.workDir, 'outer-paper', paper);
+  mkdirSync(dir, { recursive: true });
+  outerPaper = { key: `${paper}-${before}-${afterFrom}`, pdf, before, afterFrom, pages, dir };
+  return outerPaper;
+}
+async function outerPageSvg(sheet) {
+  const paper = outerPaper;
+  if (!paper || !Number.isInteger(sheet) || sheet < 1 || sheet > paper.pages ||
+      (sheet > paper.before && sheet < paper.afterFrom)) return null;
+  const file = path.join(paper.dir, `${sheet}.svg`);
+  if (existsSync(file)) return file;
+  let pending = outerRenders.get(sheet);
+  if (!pending) {
+    pending = (async () => {
+      // a reader scrolling through a book asks for many sheets at once
+      if (outerRendering >= 2) await new Promise((resolve) => outerWaiters.push(resolve));
+      outerRendering++;
+      try {
+        const tmp = `${file}.${process.pid}.tmp`;
+        await execFileP('pdftocairo', pdfPageSvgArgs(sheet, paper.pdf, tmp), { timeout: 30_000 });
+        renameSync(tmp, file);
+        return file;
+      } finally {
+        outerRendering--;
+        outerWaiters.shift()?.();
+        outerRenders.delete(sheet);
+      }
+    })();
+    outerRenders.set(sheet, pending);
+  }
+  return pending;
+}
+
 function withEngine(fn) {
   engineBusy++;
   if (engineBusy === 1) engineBusySince = Date.now();
-  const run = queue.then(fn).catch((error) => {
+  const run = queue.then(async () => {
+    cacheDomBeforeNext();
+    const result = await fn();
+    lastQueueResult = result;
+    return result;
+  }).catch((error) => {
     // A failed open/reboot must not strand both frames in reset-pending.
     // The reset event lets the child resnapshot the last state it can
     // honestly render; its ready gate still keeps the host's static PDF up
@@ -848,22 +1164,142 @@ const sseClients = new Set();
 // patch payload in this process forever: past the high-water mark we drop
 // the connection — EventSource reconnects and resyncs by itself.
 const SSE_MAX_BUFFER = 8 * 1024 * 1024;
-function broadcastRaw(jsonStr) {
-  const data = `data: ${jsonStr}\n\n`;
-  for (const res of sseClients) {
-    try {
-      res.write(data);
-      if (res.writableLength > SSE_MAX_BUFFER) {
-        sseClients.delete(res);
-        res.destroy();
-      }
-    } catch {
+function writeEvent(res, jsonStr) {
+  try {
+    // The mark is for a client that is not reading: it is looked at before
+    // the event is written, so it counts what the client has left untaken,
+    // not the event in hand. Looked at after the write, one event larger
+    // than the mark (a reboot's pages of a long document; before
+    // page-patches.js EAGER_PAGES, a keystroke that moved 96 pages) cut off
+    // a viewer that was keeping up: nothing reached it for the three seconds
+    // EventSource takes to connect again, and what was sent meanwhile was lost.
+    if (res.writableLength > SSE_MAX_BUFFER) {
       sseClients.delete(res);
+      res.destroy();
+      return;
     }
+    res.write(`data: ${jsonStr}\n\n`);
+  } catch {
+    sseClients.delete(res);
   }
 }
+function broadcastRaw(jsonStr) {
+  for (const res of sseClients) writeEvent(res, jsonStr);
+}
+
+// ---- display lists on the event stream -----------------------------------
+// An update carries the display list of every page it touched: all the
+// commands of the page, of which a keystroke changes a line or two. On a
+// dense page that is 200 KB serialized, written, read and parsed with every
+// key, and a node built in the viewer for each of its 2,000 commands.
+//
+// A command is never changed once its list is built (display-list.js keeps
+// the commands of an unchanged line from one build to the next), so its JSON
+// is kept with it. And a stream that asked for it (`/events?lists=cut`) is
+// sent, for a page it was sent before, only the commands between the ones
+// that are the same at the start and at the end: `{n, base, of, head, tail,
+// mid}` in place of the list, where `base` numbers the list that stream was
+// last sent for the page and `n` this one. The first list of a page on a
+// stream travels whole (`{n, all}`). Everything is relative to what went
+// out on that same stream, in order: there is nothing a viewer could hold
+// that the server does not know of. Any other client gets plain lists.
+// TDOM_LISTS_WHOLE=1: plain lists for every client, as before.
+const LISTS_WHOLE = !!process.env.TDOM_LISTS_WHOLE;
+const commandJson = new WeakMap(); // a command -> its JSON
+function jsonOfCommand(command) {
+  if (command === null || typeof command !== 'object') return JSON.stringify(command) ?? 'null';
+  let text = commandJson.get(command);
+  if (text === undefined) commandJson.set(command, text = JSON.stringify(command));
+  return text;
+}
+const listNumbers = new WeakMap(); // a list of commands -> the number it travels under
+let listCount = 0;
+function numberOfList(commands) {
+  let n = listNumbers.get(commands);
+  if (n === undefined) listNumbers.set(commands, n = ++listCount);
+  return n;
+}
+const listStreams = new WeakMap(); // an event stream that asked for cuts -> Map(page -> the commands last sent on it)
+const LIST_SLOT = `\u0001tdom-list-${Math.random().toString(36).slice(2)}-`;
+const wholeListJson = (commands) => `[${commands.map(jsonOfCommand).join(',')}]`;
+/** What stands in place of a page's list on a stream that takes cuts; remembers the list as sent. */
+function streamListJson(sent, displayList) {
+  const now = displayList.commands;
+  const n = numberOfList(now);
+  const old = sent.get(displayList.page);
+  sent.set(displayList.page, now);
+  if (old) {
+    const same = (a, b) => a === b || jsonOfCommand(a) === jsonOfCommand(b);
+    const most = Math.min(old.length, now.length);
+    let head = 0;
+    while (head < most && same(old[head], now[head])) head++;
+    let tail = 0;
+    while (tail < most - head && same(old[old.length - 1 - tail], now[now.length - 1 - tail])) tail++;
+    // (worth it when most of the page stays)
+    if ((now.length - head - tail) * 2 <= now.length) {
+      const mid = [];
+      for (let i = head; i < now.length - tail; i++) mid.push(jsonOfCommand(now[i]));
+      return `{"n":${n},"base":${numberOfList(old)},"of":${old.length},"head":${head},"tail":${tail},"mid":[${mid.join(',')}]}`;
+    }
+  }
+  return `{"n":${n},"all":${wholeListJson(now)}}`;
+}
+/**
+ * A payload's JSON cut at its display lists: the text around them and the
+ * lists, or null when it carries none (or nobody listening takes cuts).
+ */
+function cutAtLists(payload) {
+  if (LISTS_WHOLE) return null;
+  let taken = false;
+  for (const res of sseClients) if (listStreams.has(res)) { taken = true; break; }
+  if (!taken) return null;
+  const lists = [];
+  const stub = (patches) => patches.map((patch) => {
+    const displayList = patch?.type === 'replace-page' ? patch.displayList : null;
+    if (!displayList || !Array.isArray(displayList.commands) || !Number.isSafeInteger(displayList.page)) return patch;
+    lists.push(displayList);
+    return { ...patch, displayList: { ...displayList, commands: `${LIST_SLOT}${lists.length - 1}` } };
+  });
+  let light = null;
+  if (Array.isArray(payload?.patches)) light = { ...payload, patches: stub(payload.patches) };
+  else if (Array.isArray(payload?.report?.patches)) light = { ...payload, report: { ...payload.report, patches: stub(payload.report.patches) } };
+  if (!light || !lists.length) return null;
+  const json = JSON.stringify(light);
+  const pieces = [];
+  let from = 0;
+  for (let i = 0; i < lists.length; i++) {
+    const slot = JSON.stringify(`${LIST_SLOT}${i}`);
+    const at = json.indexOf(slot, from);
+    if (at < 0) return null;
+    pieces.push(json.slice(from, at));
+    from = at + slot.length;
+  }
+  pieces.push(json.slice(from));
+  return { pieces, lists };
+}
+const joinAtLists = (pieces, values) => {
+  let text = pieces[0];
+  for (let i = 0; i < values.length; i++) text += values[i] + pieces[i + 1];
+  return text;
+};
+/** Sends an event cut by cutAtLists: to each stream its own form of the lists. Returns the event with plain lists (made only if asked for). */
+function broadcastAtLists({ pieces, lists }, before = '', after = '') {
+  let whole = null;
+  const plain = () => (whole ??= joinAtLists(pieces, lists.map((displayList) => wholeListJson(displayList.commands))));
+  let bytes = 0;
+  for (const res of sseClients) {
+    const sent = listStreams.get(res);
+    const json = sent ? joinAtLists(pieces, lists.map((displayList) => streamListJson(sent, displayList))) : plain();
+    bytes ||= json.length;
+    writeEvent(res, before || after ? `${before}${json}${after}` : json);
+  }
+  return { plain, bytes };
+}
 function broadcast(payload) {
-  broadcastRaw(JSON.stringify({ documentEpoch, ...payload }));
+  const event = { documentEpoch, ...payload };
+  const cut = cutAtLists(event);
+  if (cut) broadcastAtLists(cut);
+  else broadcastRaw(JSON.stringify(event));
 }
 
 let pendingDocumentReset = null;
@@ -907,7 +1343,20 @@ engine.onDocumentResetComplete = ({ report } = {}) => {
 
 // async patches (TikZ renders, late chain discoveries) from the checkpoint engine
 engine.onAsyncPatches = (partial) => {
+  if (domCache) domCache.dirty = true;
   broadcast({ kind: 'patches', rev: partial.rev, fonts: partial.fonts, patches: partial.patches });
+};
+// The index canonical made reached the resident job (engine-v3.js
+// #syncResidentIndex): typeset the index block now and publish it.
+engine.onResidentInputChange = () => {
+  withEngine(async () => {
+    if (!engine.refreshResidentInputs) return lastReport;
+    lastReport = await engine.refreshResidentInputs();
+    broadcast({ kind: 'update', report: lastReport });
+    return lastReport;
+  }).catch((error) => {
+    console.warn('[tdom] resident input refresh failed:', error?.message || error);
+  });
 };
 engine.onExternalChange = (changedInput) => {
   const changedFile = typeof changedInput === 'string' ? path.resolve(changedInput) : null;
@@ -964,6 +1413,7 @@ engine.onExternalChange = (changedInput) => {
 // like the edit response would have, including the anchor the keystroke
 // could not plan at the time (its context waited in pendingColdAnchor).
 engine.onDeferredUpdate = (report) => {
+  if (domCache) domCache.dirty = true; // a cold resume repaginated this source
   const stash = pendingColdAnchor;
   pendingColdAnchor = null;
   if (pendingDocumentReset || !report) return;
@@ -1171,9 +1621,18 @@ function geometry() {
     : { paperwidth: 612, paperheight: 792 };
 }
 
+// The block the edit-page report is about: the caret's while it was warmed
+// for the current source, else the last keystroke's.
+function editPageFocus() {
+  const warm = engine.warmInfo;
+  if (Number.isInteger(warm?.target) && warm.sourceRev === engine.srcRev) return warm.target;
+  return engine.lastWalkTrace?.firstDirty ?? null;
+}
+
 function docPayload() {
   return {
     documentEpoch,
+    boot: BOOT_ID,
     backend,
     mode: engine.mode,
     modeReasons: engine.modeReasons,
@@ -1252,14 +1711,18 @@ function bibliographySourceLocation(generatedText, generatedLine = null) {
   return null;
 }
 
-function domPayload() {
-  const dom = engine.getDOM();
+// `raw` is the engine's snapshot and may be shared with other readers of the
+// same state: it is left as it is.
+function domPayload(report = lastReport, raw = engine.getDOM()) {
+  const dom = { ...raw };
   dom.documentEpoch = documentEpoch;
   // An unfinished construct advances sourceRev while deliberately keeping
   // the previous block spans. It cannot supply a new editable ink snapshot.
-  dom.sourceCurrent = !lastReport.stats?.closureDeferred;
-  const sourceFiles = new Set((dom.blocks ?? []).flatMap(block =>
-    (block.editRegions ?? []).map(region => region.source?.file).filter(Boolean)));
+  dom.sourceCurrent = !report?.stats?.closureDeferred;
+  const sourceFiles = new Set();
+  for (const block of dom.blocks ?? []) {
+    if (block.editRegions?.length) for (const file of filesOfRegions(block.editRegions)) sourceFiles.add(file);
+  }
   dom.sources = dom.sourceCurrent ? [...sourceFiles].flatMap(file => {
     // Root text is never expanded. Included files retain the exact original
     // text read during segmentation, including unsaved overlay contents.
@@ -1268,23 +1731,33 @@ function domPayload() {
       : engine.includes?.get(file)?.text;
     return typeof text === 'string' ? [{ file, text }] : [];
   }) : [];
-  const byId = new Map(engine.blocks.map((block) => [block.id, block]));
-  for (const item of dom.blocks ?? []) {
-    if (path.resolve(item.source?.file || '') !== path.join(engine.workDir, 'driver.bbl')) continue;
+  const bbl = path.join(engine.workDir, 'driver.bbl');
+  let byId = null;
+  let blocks = null;
+  for (let index = 0; index < (dom.blocks ?? []).length; index++) {
+    const item = dom.blocks[index];
+    const file = item.source?.file;
+    if (typeof file !== 'string' || !file.endsWith('driver.bbl') || path.resolve(file) !== bbl) continue;
     // A .bbl is generated output.  Its rendered prose can be navigated back
     // to the owning .bib entry, but it must never be offered as inline text:
     // replacing a title/author fragment in driver.bbl would be overwritten
     // by the next Biber run and could target the wrong field.
-    item.editRegions = [];
+    byId ??= new Map(engine.blocks.map((block) => [block.id, block]));
+    blocks ??= dom.blocks.slice();
     const location = bibliographySourceLocation(byId.get(item.id)?.text || '');
-    if (!location) continue;
-    item.source = {
+    const { editRegions: _regions, ...rest } = item;
+    blocks[index] = location ? {
+      ...rest,
+      source: {
+        file: location.file,
+        start: { line: location.line, column: location.column },
+        end: { line: location.line, column: location.column },
+      },
       file: location.file,
-      start: { line: location.line, column: location.column },
-      end: { line: location.line, column: location.column },
-    };
-    item.file = location.file;
+      editRegions: [],
+    } : { ...rest, editRegions: [] };
   }
+  if (blocks) dom.blocks = blocks;
   return dom;
 }
 
@@ -1314,6 +1787,82 @@ function activeSourceLine(file, line) {
     try { text = readFileSync(projectFile, 'utf8'); } catch { return ''; }
   }
   return String(text).split(/\r?\n/)[line - 1] ?? '';
+}
+
+// SyncTeX records glue and boxes, not characters: a click on the first word
+// of a source line returns the line above (that word follows the previous
+// line's end-of-line space), and a paragraph's first word or a page box can
+// return the paragraph's last line or another file. The canonical PDF's word
+// boxes name the clicked word and its neighbours; the source line that holds
+// them is the answer. Returns null to keep SyncTeX's own location.
+const syncWord = (value) => {
+  const text = String(value ?? '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+  return text.slice(0, 64);
+};
+const syncSourceWords = (line) => String(line ?? '')
+  .replace(/(^|[^\\])%.*$/, '$1')
+  .replace(/\\[A-Za-z@]+\*?/g, ' ')
+  .split(/[\s{}[\]()~]+/)
+  .map(syncWord)
+  .filter(Boolean);
+async function wordsAtPaperPoint({ page, x, y, id }) {
+  const pages = await engine.canonical.pageTextBoxes(id).catch(() => null);
+  const boxes = pages?.[page - 1];
+  if (!Array.isArray(boxes) || !boxes.length) return null;
+  const hit = boxes.find((box) => x >= box.left - 1 && x <= box.right + 1 && y >= box.top - 1 && y <= box.bottom + 1);
+  if (!hit) return null;
+  const mid = (box) => (box.top + box.bottom) / 2;
+  const height = Math.max(1, hit.bottom - hit.top);
+  const line = boxes.filter((box) => Math.abs(mid(box) - mid(hit)) < height / 2).sort((a, b) => a.left - b.left);
+  const at = line.indexOf(hit);
+  const center = (box) => box ? { x: (box.left + box.right) / 2, y: mid(box) } : null;
+  return {
+    word: hit.text, prev: line[at - 1]?.text ?? null, next: line[at + 1]?.text ?? null,
+    prevPoint: center(line[at - 1]), nextPoint: center(line[at + 1]),
+  };
+}
+async function refineSyncHitByWords({ page, x, y, id, hit, resolveFile }) {
+  const context = await wordsAtPaperPoint({ page, x, y, id });
+  const word = syncWord(context?.word);
+  if (!word) return null;
+  const prev = syncWord(context.prev);
+  const next = syncWord(context.next);
+  const candidates = new Map();
+  const add = (file, line, near) => {
+    if (!file || !Number.isInteger(line) || line < 1) return;
+    const key = `${file}\0${line}`;
+    const existing = candidates.get(key);
+    if (!existing || near < existing.near) candidates.set(key, { file, line, near });
+  };
+  for (let delta = -15; delta <= 3; delta += 1) add(hit.file, hit.line + delta, Math.abs(delta));
+  // Neighbouring words on the same typeset line are a second opinion on the
+  // file when the point itself fell onto a page or column box.
+  for (const point of [context.nextPoint, context.prevPoint]) {
+    if (!point) continue;
+    const other = await engine.canonical.reverseSync({ page, x: point.x, y: point.y, id }).catch(() => null);
+    const file = other ? resolveFile(other.file) : null;
+    if (file) for (let delta = -2; delta <= 2; delta += 1) add(file, other.line + delta, 20 + Math.abs(delta));
+  }
+  const score = (text) => {
+    const words = syncSourceWords(text);
+    let best = 0;
+    words.forEach((item, i) => {
+      if (item !== word) return;
+      best = Math.max(best, 1);
+      if (prev && words[i - 1] === prev) best = Math.max(best, 2);
+      if (next && words[i + 1] === next) best = Math.max(best, 2);
+      if (prev && next && words[i - 1] === prev && words[i + 1] === next) best = 3;
+    });
+    return best;
+  };
+  let best = null;
+  for (const candidate of candidates.values()) {
+    const value = score(activeSourceLine(candidate.file, candidate.line));
+    if (value && (!best || value > best.value || (value === best.value && candidate.near < best.near))) best = { ...candidate, value };
+  }
+  if (!best || (best.value === 1 && word.length < 4)) return null;
+  if (score(activeSourceLine(hit.file, hit.line)) >= best.value) return null;
+  return { file: best.file, line: best.line };
 }
 
 async function validatedForwardSyncAll(location, id) {
@@ -1636,8 +2185,23 @@ async function resolveTerminalCanonicalAnchor(plan, epoch, anchorEpoch, prefetch
   });
 }
 
+// TDOM_TRACE_HTTP=1: every request with how long it took, and every stretch
+// in which this process's one thread answered nothing (for latency work).
+if (process.env.TDOM_TRACE_HTTP) {
+  let last = performance.now();
+  setInterval(() => {
+    const now = performance.now();
+    if (now - last > 6) console.log(`[http-trace] blocked ${Math.round(now - last - 1)} ms until ${Math.round(now)}`);
+    last = now;
+  }, 1).unref();
+}
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
+  if (process.env.TDOM_TRACE_HTTP) {
+    const startedAt = performance.now();
+    res.on('finish', () => console.log(
+      `[http-trace] ${req.method} ${url.pathname.slice(0, 40)} ${Math.round(startedAt)} +${Math.round(performance.now() - startedAt)} ms`));
+  }
   try {
     if (req.method === 'GET' && url.pathname === '/') return serveStatic(res, 'index.html');
     if (req.method === 'GET' && url.pathname.startsWith('/host/web/')) {
@@ -1671,21 +2235,43 @@ const server = http.createServer(async (req, res) => {
       return json(res, {
         up: true,
         pid: process.pid,
+        boot: BOOT_ID,
         port: PORT,
         busy: engineBusy > 0,
         queued: engineBusy,
         busyMs: engineBusy > 0 ? Date.now() - engineBusySince : 0,
         mode: engine.mode,
+        structuredBootError: engine.structuredBootError ?? null,
         previewPolicy: engine.previewPolicy,
         rev: engine.rev,
         srcRev: engine.srcRev,
         documentEpoch,
+        outer: outerPaper && { key: outerPaper.key, before: outerPaper.before, afterFrom: outerPaper.afterFrom, pages: outerPaper.pages },
         unchangedInputEvents: engine.unchangedInputEvents,
         diffStats: engine.diffStats ?? null,
         // preamble edits served without a reboot (tex64-internal #93)
         preamblePatches: engine.preamblePatches ?? 0,
         lastPreamblePatch: engine.lastPreamblePatch ?? null,
         // the last foreground walk, without its per-block rows
+        // the last keystroke's phases (engine timer) and its way through the server
+        lastEdit: lastReport?.timing ? {
+          srcRev: lastReport.srcRev,
+          queueMs: lastReport.timing.clientEditAtEpochMs ? lastReport.timing.receivedAtEpochMs - lastReport.timing.clientEditAtEpochMs : null,
+          engineMs: lastReport.timing.engineDoneAtEpochMs - lastReport.timing.receivedAtEpochMs,
+          // of that: before the engine took the edit (the request queue, the
+          // overlay files), and waiting for the chain lock and who held it
+          enterMs: lastReport.timing.lock?.entryAtEpochMs
+            ? lastReport.timing.lock.entryAtEpochMs - lastReport.timing.receivedAtEpochMs : null,
+          lockMs: lastReport.timing.lock?.lockedAtEpochMs
+            ? lastReport.timing.lock.lockedAtEpochMs - lastReport.timing.lock.entryAtEpochMs : null,
+          heldBy: lastReport.timing.lock?.heldBy ?? null,
+          planMs: lastReport.timing.plannedAtEpochMs ? lastReport.timing.plannedAtEpochMs - lastReport.timing.engineDoneAtEpochMs : null,
+          sendMs: lastReport.timing.sentAtEpochMs ? lastReport.timing.sentAtEpochMs - lastReport.timing.plannedAtEpochMs : null,
+          reportKb: lastReport.timing.reportBytes ? Math.round(lastReport.timing.reportBytes / 1024) : null,
+          phases: Object.fromEntries(Object.entries(lastReport.stats ?? {})
+            .filter(([key, value]) => /(Ms|Us)$/.test(key) && Number.isFinite(value))
+            .map(([key, value]) => (key.endsWith('Us') ? [key.slice(0, -2), Math.round(value / 1000)] : [key.slice(0, -2), Math.round(value)]))),
+        } : null,
         lastWalk: engine.lastWalkTrace ? {
           from: engine.lastWalkTrace.from, firstDirty: engine.lastWalkTrace.firstDirty,
           lastDirty: engine.lastWalkTrace.lastDirty, typeset: engine.lastWalkTrace.typeset ?? null,
@@ -1694,6 +2280,21 @@ const server = http.createServer(async (req, res) => {
           skips: (engine.lastWalkTrace.blocks ?? []).filter(([, , f]) => String(f).startsWith('skip>')).map(([k, , f]) => `${k}${f.slice(4)}`),
         } : null,
         progress: engine.progress ?? null,
+        // where an edit can resume from, and what the caret pinned
+        checkpoints: [...(engine.checkpoints?.keys() ?? [])].sort((x, y) => x - y),
+        // the blocks the last edit publishes with its page, and why a walk
+        // would start before the edited one (measurement drivers)
+        editPage: [...(engine.foregroundRenderIds ?? (Number.isInteger(editPageFocus()) && engine.blocks[editPageFocus()]
+          ? new Set([engine.blocks[editPageFocus()].id,
+            ...editPageRenderIds(engine.blocks, engine.pages, new Set([engine.blocks[editPageFocus()].id]))]) : []))].map((id) => {
+          const idx = engine.blocks.findIndex((b) => b.id === id); const b = engine.blocks[idx];
+          return b ? { id, idx, render: !!b.needsRender, rescued: !!b.rescued, galley: !!b.galley,
+            stale: !!b.needsRender && (engine.chunkTargetsOf?.(b) ?? []).some((t) => engine.chunks.get(t.key)?.forGalley !== b.galleyHash),
+            ckpt: engine.checkpoints.has(idx), held: engine.editHold.includes(idx) || engine.renderHold.has(idx), want: engine.renderWant?.has(id) ?? false,
+            chunks: (engine.chunkTargetsOf?.(b) ?? []).map((t) => (engine.chunks.get(t.key) ? (engine.chunks.get(t.key).forGalley === b.galleyHash ? 'fresh' : 'old') : 'none')).join(','), head: String(b.text ?? '').trim().slice(0, 24) } : { id };
+        }).sort((x, y) => (x.idx ?? 0) - (y.idx ?? 0)),
+        checkpointBudget: engine.maxCheckpoints ?? null,
+        editHold: engine.editHold ?? [],
         // pages the resident layout has right now (async rescues and
         // repaginations move it between edit reports)
         residentPages: engine.pages?.length ?? null,
@@ -1741,28 +2342,13 @@ const server = http.createServer(async (req, res) => {
           ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs < 1_000 || ttlMs > 900_000)) {
         return json(res, { error: 'invalid build lease' }, 400);
       }
-      // A lease normally arrives before /open through the host's local gate.
-      // Never grant an orphaned lease after a client timeout when a reset has
-      // already entered its resident bootstrap. The host retries this explicit
-      // busy response before spawning TeX; old/unreachable engines remain its
-      // separate compatibility fallback.
-      if (!pendingDocumentReset && !engine.shipBooting && engine.warming) {
-        // A caret warm walk (up to tens of seconds on a long document) is
-        // resumable: let it stop at its next block boundary instead of
-        // making the explicit Build retry until the whole walk finishes.
-        await engine.yieldWarmForBuild?.({ timeoutMs: 3000 });
-      }
-      if (pendingDocumentReset || engine.shipBooting || engine.warming) {
-        // Name the phase so a slow Build can be attributed to the exact
-        // bootstrap stage that held its lease.
-        const blockedBy = pendingDocumentReset ? 'document-reset' : engine.shipBooting ? 'shipping-boot' : 'warming';
-        return json(res, { ok: false, acquired: false, reason: 'resident-bootstrap-active', blockedBy, retryAfterMs: 250 }, 409);
-      }
-      const result = engine.canonical.acquireBuildLease(requestId, ttlMs);
-      if (!result.acquired) return json(res, { ok: false, ...result }, result.reason === 'lease-busy' ? 409 : 503);
-      const settlement = buildLeasePreviewSettlement(result, engine.buildLeasePreviewJobs);
-      if (settlement) return json(res, settlement, 503);
-      const identity = binding.bound ? {
+      const result = await acquirePreviewBuildLease(engine, {
+        requestId, ttlMs, documentReset: () => pendingDocumentReset,
+      });
+      if (!result.acquired) return json(res, { ok: false, ...result },
+        ['lease-busy', 'resident-bootstrap-active'].includes(result.reason) ? 409 : 503);
+      const bound = buildLeaseBinding(body.projectRoot, body.mainFile)?.bound === true;
+      const identity = bound ? {
         documentEpoch,
         srcRev: engine.srcRev,
         ...engine.canonical.compilationIdentity(engine.getSource()),
@@ -1770,8 +2356,8 @@ const server = http.createServer(async (req, res) => {
       return json(res, {
         ok: true,
         ...result,
-        bound: binding.bound,
-        reason: binding.bound ? null : 'document-mismatch',
+        bound,
+        reason: bound ? null : 'document-mismatch',
         identity,
       });
     }
@@ -2062,7 +2648,35 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/dom') {
       // Source and block ranges mutate at different points of an async
       // edit. Snapshot them together after the queued mutation completes.
-      return json(res, await withEngine(() => domPayload()));
+      domInterestUntil = Date.now() + 5_000;
+      const wantRev = Number(url.searchParams.get('srcRev'));
+      const baseRev = url.searchParams.has('base') ? Number(url.searchParams.get('base')) : NaN;
+      const send = (parts) => {
+        const body = domDeltaBody(parts, baseRev) ?? parts.body;
+        domServed = parts;
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(body);
+      };
+      if (Number.isSafeInteger(wantRev) && domCache?.srcRev === wantRev && domCache.epoch === documentEpoch &&
+          (!domCache.dirty || engineBusy > 0)) {
+        return send(domCache.parts);
+      }
+      const trace = process.env.TDOM_TRACE_HTTP ? [performance.now()] : null;
+      const payload = await withEngine(() => { trace?.push(performance.now()); const built = domPayload(); trace?.push(performance.now()); return built; });
+      // a revision asked for by number is kept: the next one is sent as a change from it
+      if (Number.isSafeInteger(wantRev) && payload.srcRev === wantRev && payload.srcRev === engine.srcRev &&
+          payload.documentEpoch === documentEpoch) {
+        const parts = rememberDom(payload);
+        trace?.push(performance.now());
+        send(parts);
+        if (trace) {
+          trace.push(performance.now());
+          console.log(`[http-trace] /dom queue ${(trace[1] - trace[0]).toFixed(1)} payload ${(trace[2] - trace[1]).toFixed(1)} ` +
+            `serialize ${(trace[3] - trace[2]).toFixed(1)} delta+send ${(trace[4] - trace[3]).toFixed(1)} ms`);
+        }
+        return;
+      }
+      return json(res, payload);
     }
     if (req.method === 'POST' && url.pathname === '/synctex') {
       const body = JSON.parse(await readBody(req));
@@ -2103,14 +2717,48 @@ const server = http.createServer(async (req, res) => {
       if (!isPathInside(activeProject.docDir, file)) {
         return json(res, { error: 'source location is outside the project' }, 404);
       }
+      const resolveFile = (candidate) => {
+        let resolved = path.resolve(String(candidate ?? ''));
+        if (resolved === canonicalSource) resolved = activeProject.filePath;
+        else if (activeProject.overlayDir && isPathInside(activeProject.overlayDir, resolved)) {
+          resolved = path.join(activeProject.docDir, path.relative(activeProject.overlayDir, resolved));
+        }
+        return isPathInside(activeProject.docDir, resolved) ? resolved : null;
+      };
+      const refined = await refineSyncHitByWords({
+        page, x: px, y: py, id: body.id == null ? null : Number(body.id),
+        hit: { file, line: hit.line }, resolveFile,
+      }).catch(() => null);
+      const line = refined?.line ?? hit.line;
+      if (refined) file = refined.file;
       return json(res, {
         file,
-        line: hit.line,
-        column: hit.column,
-        lineText: activeSourceLine(file, hit.line),
+        line,
+        column: refined ? 1 : hit.column,
+        lineText: activeSourceLine(file, line),
         anchor,
         anchors,
+        ...(refined ? { refinedByText: true } : {}),
       });
+    }
+    if (req.method === 'POST' && url.pathname === '/synctex/jump') {
+      const body = JSON.parse(await readBody(req));
+      const epoch = documentEpoch, rev = engine.srcRev;
+      const file = canonicalInputForProjectFile(body.file);
+      const line = Number(body.line);
+      if (!file || !Number.isSafeInteger(line) || line < 1) return json(res, { error: 'invalid source location' }, 400);
+      const pending = () => ({ pending: true, documentEpoch, srcRev: engine.srcRev });
+      if (pendingDocumentReset || engineBusy || Number(body.documentEpoch) !== epoch || Number(body.srcRev) !== rev) {
+        return json(res, pending());
+      }
+      const rootSource = engine.getSource();
+      const projectFile = path.resolve(activeProject.docDir, body.file);
+      let source = projectFile === path.resolve(activeProject.filePath) ? rootSource : projectInputOverride(projectFile);
+      if (source == null) { try { source = readFileSync(projectFile, 'utf8'); } catch { return json(res, { found: false }); } }
+      const hit = await engine.canonical.jumpToSource({ file, line, source, rootSource, rev });
+      if (documentEpoch !== epoch || engine.srcRev !== rev || engineBusy || pendingDocumentReset) return json(res, pending());
+      if (hit) return json(res, { ...hit, documentEpoch: epoch });
+      return json(res, { ...pending(), pending: engine.canonical.info().errorRev !== rev && !engine.canonical.sourceMatches(rootSource) });
     }
     if (req.method === 'POST' && url.pathname === '/synctex/forward') {
       const body = JSON.parse(await readBody(req));
@@ -2173,6 +2821,26 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end(svg);
     }
+    if (req.method === 'POST' && url.pathname === '/outer') {
+      const body = JSON.parse((await readBody(req)) || '{}');
+      try {
+        const paper = setOuterPaper(body.clear === true ? null : body);
+        return json(res, { ok: true, key: paper?.key ?? null });
+      } catch (error) {
+        return json(res, { error: error.message }, 400);
+      }
+    }
+    if (req.method === 'GET' && url.pathname.startsWith('/outer/')) {
+      const sheet = Number(url.pathname.slice('/outer/'.length).replace(/\.svg$/, ''));
+      const file = url.searchParams.get('k') === outerPaper?.key ? await outerPageSvg(sheet).catch(() => null) : null;
+      if (!file) {
+        res.writeHead(404, { 'Cache-Control': 'no-store' });
+        return res.end('no outer page');
+      }
+      // the key names the Build paper by its bytes' time and size
+      res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'private, max-age=86400' });
+      return res.end(readFileSync(file));
+    }
     if (req.method === 'GET' && url.pathname === '/ship-glyphs') {
       const chain = engine.shipping;
       const gen = Number(url.searchParams.get('g')), rev = Number(url.searchParams.get('r'));
@@ -2217,6 +2885,8 @@ const server = http.createServer(async (req, res) => {
       const version = Number(url.searchParams.get('v'));
       const requestedEpoch = url.searchParams.get('e');
       if (requestedEpoch != null && Number(requestedEpoch) !== documentEpoch) return json(res, { glyphs: [] }, 404);
+      // (only an editor on the paper, or the click that opens one, asks for this)
+      engine.notePaperEditor?.();
       const chunk = engine.chunks.get(key);
       if (!chunk || chunk.v !== version) return json(res, { glyphs: [] }, 404);
       chunk.editGlyphs ??= (chunk.editCanonicalId != null
@@ -2240,9 +2910,19 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(404);
         return res.end('unknown chunk');
       }
+      // A chunk's pixels change under a stable block id, but never under one
+      // version of it: named with this process and this document as well,
+      // the picture is the same forever. A page re-staged for a keystroke
+      // then takes its unchanged pictures (every code box on it) from the
+      // browser instead of asking for each again.
+      const requestedDocument = url.searchParams.get('e');
+      if (requestedDocument != null && Number(requestedDocument) !== documentEpoch) {
+        return json(res, { error: 'superseded chunk' }, 404);
+      }
+      const immutable = requestedVersion != null && requestedDocument != null && url.searchParams.get('b') === BOOT_ID;
       res.writeHead(200, {
         'Content-Type': 'image/svg+xml',
-        'Cache-Control': 'no-cache', // chunk content changes under a stable block id
+        'Cache-Control': immutable ? 'private, max-age=31536000, immutable' : 'no-cache',
       });
       return res.end(svg);
     }
@@ -2305,12 +2985,16 @@ const server = http.createServer(async (req, res) => {
         Connection: 'keep-alive',
       });
       res.write(':ok\n\n');
+      // (a viewer that keeps the lists it is sent takes later ones as cuts: broadcastAtLists)
+      if (url.searchParams.get('lists') === 'cut') listStreams.set(res, new Map());
       sseClients.add(res);
       req.on('close', () => sseClients.delete(res));
       return;
     }
     if (req.method === 'POST' && url.pathname === '/edit') {
+      const editTrace = process.env.TDOM_TRACE_HTTP ? [['start', performance.now()]] : null;
       const body = JSON.parse(await readBody(req));
+      editTrace?.push(['body', performance.now()]);
       const { start, end, text } = body;
       if (typeof start !== 'number' || typeof end !== 'number' || typeof text !== 'string') {
         return json(res, { error: 'edit requires {start, end, text}' }, 400);
@@ -2330,12 +3014,18 @@ const server = http.createServer(async (req, res) => {
       const anchorDiagnostics = {};
       const anchorAcceptedAt = performance.now();
       const nowEpoch = Date.now();
+      let domPush = '';
+      // One snapshot of the engine's blocks before the edit and one after,
+      // for everything in this request that reads them.
+      let domBefore = null;
+      let domAfter = null;
+      const blocksBefore = () => (domBefore ??= engine.getDOM()).blocks;
       const anchorClientEditAt = canonicalAnchorClientEditTimestamp(
         body.clientEditAtEpochMs,
         nowEpoch
       );
       try {
-        lastReport = await withEngine(async () => {
+        const editInQueue = async () => {
           // optional optimistic-concurrency guard: a client that states the
           // source revision its offsets were computed against gets a 409
           // instead of a silent mis-application when it fell behind
@@ -2360,6 +3050,7 @@ const server = http.createServer(async (req, res) => {
               )
             : null;
           anchorEdit = rootChanged ? { start, end, text } : childAnchorEdit;
+          editTrace?.push(['childAnchor', performance.now()]);
           if (ENABLE_CANONICAL_ANCHOR && anchorEdit) {
             const certificate = engine.canonical.generationCertificate();
             if (certificate && certificate.rev === engine.srcRev &&
@@ -2367,7 +3058,7 @@ const server = http.createServer(async (req, res) => {
                 engine.canonical.sourceMatches(current, certificate.id)) {
               anchorBaseSnapshot = captureCanonicalAnchorBase({
                 blocks: engine.blocks,
-                domBlocks: engine.getDOM().blocks,
+                domBlocks: blocksBefore(),
                 edit: anchorEdit,
                 certificate,
                 diagnostics: anchorDiagnostics,
@@ -2391,7 +3082,7 @@ const server = http.createServer(async (req, res) => {
               const joinDiagnostics = {};
               const candidate = captureCanonicalAnchorBase({
                 blocks: engine.blocks,
-                domBlocks: engine.getDOM().blocks,
+                domBlocks: blocksBefore(),
                 edit: anchorEdit,
                 certificate,
                 diagnostics: joinDiagnostics,
@@ -2408,7 +3099,9 @@ const server = http.createServer(async (req, res) => {
               anchorDiagnostics.reason = 'canonical-behind';
             }
           }
+          editTrace?.push(['anchorBase', performance.now()]);
           const overlayDelta = applyProjectOverlays(activeProject, body);
+          editTrace?.push(['overlay', performance.now()]);
           // The autosave of this keystroke can reach the engine first, through
           // the watcher, while this request waits behind an earlier edit: an
           // overlay of the bytes the engine already read is no input change
@@ -2546,6 +3239,18 @@ const server = http.createServer(async (req, res) => {
           await materializeProjectBibliography(next, activeProject);
           engine.invalidateProjectInputs?.([path.join(engine.workDir, 'driver.bbl')]);
           return engine.refresh({ changed: [path.join(engine.workDir, 'driver.bbl')] });
+        };
+        editTrace?.push(['prepared', performance.now()]);
+        lastReport = await withEngine(async () => {
+          editTrace?.push(['queue', performance.now()]);
+          const report = await editInQueue();
+          editTrace?.push(['engine', performance.now()]);
+          // Still this edit's turn of the queue, its state intact: the source
+          // map the viewer needs before it shows this revision goes out with
+          // the update instead of being asked for afterwards.
+          domPush = updateDomPush(report, domAfter = engine.getDOM());
+          editTrace?.push(['dom', performance.now()]);
+          return report;
         });
       } catch (err) {
         if (err?.status === 409) {
@@ -2553,7 +3258,7 @@ const server = http.createServer(async (req, res) => {
         }
         throw err;
       }
-      if (inputUnchanged) return json(res, lastReport);
+      if (inputUnchanged) return json(res, body.slim === true ? editAnswer(lastReport) : lastReport);
       // when this keystroke reached the server and left the engine (epoch ms)
       lastReport.timing = {
         clientEditAtEpochMs: Number.isFinite(Number(body.clientEditAtEpochMs)) ? Number(body.clientEditAtEpochMs) : null,
@@ -2576,7 +3281,7 @@ const server = http.createServer(async (req, res) => {
       const anchorPlan = ENABLE_CANONICAL_ANCHOR && !coldEdit && anchorInputSafe && lastReport.rebooted !== true
         ? planTerminalCanonicalAnchor({
             blocks: engine.blocks,
-            domBlocks: engine.getDOM().blocks,
+            domBlocks: (domAfter ?? engine.getDOM()).blocks,
             report: lastReport,
             geometry: engine.getGeometry(),
             lineage: anchorPriorLineage,
@@ -2682,11 +3387,39 @@ const server = http.createServer(async (req, res) => {
       }
       // one serialization for both consumers: the SSE fanout and the HTTP
       // response used to stringify the full report (all patches) twice
-      const reportJson = JSON.stringify(lastReport);
+      // (what the server itself adds between the engine and the viewers; the
+      // report on the wire was serialized before these three are set)
+      lastReport.timing.plannedAtEpochMs = Date.now();
+      // (to a stream that takes cuts, each page's list goes as its change from the one before: broadcastAtLists)
+      const reportCut = cutAtLists({ report: lastReport });
+      let reportJson = reportCut ? null : JSON.stringify(lastReport);
+      if (reportJson !== null) lastReport.timing.reportBytes = reportJson.length;
       completeDocumentReset(resetEpoch);
-      broadcastRaw(`{"kind":"update","documentEpoch":${documentEpoch},"report":${reportJson}}`);
+      const eventHead = `{"kind":"update","documentEpoch":${documentEpoch}${domPush ? `,"dom":${domPush}` : ''},"report":`;
+      let plainReport = null;
+      if (reportCut) {
+        // (the pieces are those of `{"report":…}`: its opening and closing go with the event's own)
+        const pieces = reportCut.pieces.slice();
+        pieces[0] = pieces[0].slice('{"report":'.length);
+        pieces[pieces.length - 1] = pieces[pieces.length - 1].slice(0, -1);
+        const sent = broadcastAtLists({ pieces, lists: reportCut.lists }, eventHead, '}');
+        lastReport.timing.reportBytes = sent.bytes;
+        plainReport = sent.plain;
+      } else {
+        broadcastRaw(`${eventHead}${reportJson}}`);
+      }
+      lastReport.timing.sentAtEpochMs = Date.now();
+      if (editTrace) {
+        editTrace.push(['sent', performance.now()]);
+        console.log('[http-trace] /edit ' + editTrace.slice(1).map(([name, at], i) => `${name} ${(at - editTrace[i][1]).toFixed(1)}`).join(' ') +
+          ` | engine phases ${JSON.stringify(Object.fromEntries(Object.entries(lastReport.stats ?? {}).filter(([k]) => /Us$/.test(k)).map(([k, v]) => [k.slice(0, -2), Math.round(v / 100) / 10])))}`);
+      }
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(reportJson);
+      // A client that only wants to know which revision its edit became (a
+      // host whose viewers follow the event stream) asks for that alone:
+      // the report is every page the edit moved, 60 KB for a keystroke and
+      // megabytes for one that reflows a chapter, parsed for one number.
+      res.end(body.slim === true ? JSON.stringify(editAnswer(lastReport)) : reportJson ?? plainReport());
       if (anchorPlan) void resolveTerminalCanonicalAnchor(anchorPlan, documentEpoch, anchorEpoch, anchorProofPrefetch);
       return;
     }
@@ -2751,6 +3484,8 @@ const server = http.createServer(async (req, res) => {
             overlayDir: context.overlayDir,
             force: true,
           });
+          // another document's Build paper is not this one's; the host names it again
+          if (context.filePath !== activeProject.filePath) setOuterPaper(null);
           activeProject = context;
           ensureProjectOutputDirectories(text);
           await materializeProjectBibliography(text, activeProject);

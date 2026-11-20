@@ -84,8 +84,23 @@ function bracedArgument(text, at) {
 // `literalEnvs` names the literal environments the preamble declares
 // (\lstnewenvironment and friends, see literalEnvironmentNames): a
 // listing that quotes \end{document} or an unbalanced brace is closed.
-export function sourceClosure(text, { literalEnvs = null } = {}) {
+/** Conditionals the document declares itself (\newif\ifdraft). */
+export function declaredConditionals(text) {
+  const names = new Set();
+  for (const match of String(text ?? '').matchAll(/\\newif\s*\\(if[A-Za-z@]+)/g)) names.add(match[1]);
+  return names;
+}
+
+// `documentConditionals` are the document's own switches (declaredConditionals)
+// and `carried` the number of them an earlier block left open. A book wraps
+// its chapter list in one: `\ifshortbuild\else` … forty \subfile lines …
+// `\fi`. Read alone, the last of those blocks holds an unexpected \fi, and
+// every edit of the book was deferred as unfinished source. A conditional of
+// TeX's own that a block leaves open is still unfinished typing.
+// The result's `carry` is what this block leaves open for the next.
+export function sourceClosure(text, { literalEnvs = null, documentConditionals = null, carried = 0 } = {}) {
   const envs = [];
+  let carriedLeft = Math.max(0, Number(carried) || 0);
   const conditionals = [];
   const loops = [];
   const customConditionals = new Set();
@@ -260,9 +275,11 @@ export function sourceClosure(text, { literalEnvs = null } = {}) {
       loops.pop();
       conditionals.pop();
     } else if (CONDITIONALS.has(name) || customConditionals.has(name)) conditionals.push(name);
+    else if (documentConditionals?.has(name)) conditionals.push(`#${name}`);
     else if (name === 'fi') {
-      if (!conditionals.length) return fail('unexpected:fi', i);
-      conditionals.pop();
+      if (conditionals.length) conditionals.pop();
+      else if (carriedLeft > 0) carriedLeft--;
+      else return fail('unexpected:fi', i);
     }
     i = end;
   }
@@ -272,6 +289,24 @@ export function sourceClosure(text, { literalEnvs = null } = {}) {
   if (groups) return fail('group', text.length);
   if (math.length) return fail(`math:${math.at(-1)}`, text.length);
   if (loops.length) return fail('loop', text.length);
-  if (conditionals.length) return fail(`conditional:${conditionals.at(-1)}`, text.length);
-  return { closed: true, reason: null, at: text.length };
+  const unfinished = conditionals.filter((name) => !name.startsWith('#'));
+  if (unfinished.length) return fail(`conditional:${unfinished.at(-1)}`, text.length);
+  const carry = carriedLeft + conditionals.length;
+  return carry ? { closed: true, reason: null, at: text.length, carry } : { closed: true, reason: null, at: text.length };
+}
+
+/** How many document conditionals the blocks before each block leave open
+ * (index-aligned with `blocks`). */
+export function carriedConditionals(blocks, options = {}) {
+  const out = new Array(blocks.length).fill(0);
+  if (!options.documentConditionals?.size) return out;
+  let carried = 0;
+  for (let i = 0; i < blocks.length; i++) {
+    out[i] = carried;
+    const text = blocks[i]?.text ?? '';
+    if (!text.includes('\\if') && !text.includes('\\fi')) continue;
+    const closure = sourceClosure(text, { ...options, carried });
+    if (closure.closed) carried = closure.carry ?? 0;
+  }
+  return out;
 }

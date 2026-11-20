@@ -122,13 +122,34 @@ export function immediateShipUpdate(engine, text, projectInputChanges, run) {
   run(text, projectInputChanges);
 }
 
-/** Hold a paintable keystroke's replay until typing pauses. */
-export function deferShipUpdate(engine, text, projectInputChanges, run) {
-  if (engine.shipDeferred && !engine.shipping?.replayableFrom?.(text)) {
+// TDOM_SHIP_CHECK_EVERY_KEY=1: ask the chain on every held keystroke, as before.
+const CHECK_EVERY_KEY = !!process.env.TDOM_SHIP_CHECK_EVERY_KEY;
+
+/**
+ * Hold a paintable keystroke's replay until typing pauses.
+ *
+ * `editedBlock` is the id of the one block this keystroke changed in place
+ * (no block added, removed, split or merged), or null. The chain replays one
+ * changed unit, so a second held keystroke may wait only while the source
+ * still differs from the chain's in one unit. Asking the chain cuts the
+ * whole root source into units again (replayableFrom: 2.5 ms on a 30-page
+ * file, and more with every page), on every keystroke of a one-file
+ * document. A keystroke in the block the held keystroke changed, with no
+ * revision between the two, leaves the same blocks unchanged as before, so
+ * the question is not asked. Nothing rests on that: when the held text is
+ * replayed, resume() cuts and compares the units itself and asks for a
+ * reboot if more than one differs, which is what asking here would have
+ * led to as well.
+ */
+export function deferShipUpdate(engine, text, projectInputChanges, run, editedBlock = null) {
+  const held = engine.shipDeferred;
+  const sameBlock = !CHECK_EVERY_KEY && !!held && editedBlock != null && held.block === editedBlock &&
+    held.srcRev === engine.srcRev - 1;
+  if (held && !sameBlock && !engine.shipping?.replayableFrom?.(text)) {
     immediateShipUpdate(engine, text, projectInputChanges, run);
     return;
   }
-  engine.shipDeferred = { text, projectInputChanges, srcRev: engine.srcRev };
+  engine.shipDeferred = { text, projectInputChanges, srcRev: engine.srcRev, block: editedBlock };
   clearTimeout(engine.shipDeferTimer);
   engine.shipDeferTimer = setTimeout(() => flushDeferredShipUpdate(engine, run, { yieldToCanonical: true }), shipCatchupMs());
   engine.shipDeferTimer.unref?.();

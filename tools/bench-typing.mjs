@@ -19,6 +19,7 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
 const texFile = args.find((a) => !a.startsWith('--')) ?? path.join(ROOT, 'samples', 'stress-test-ja.tex');
 const KEYS = Number((args.find((a) => a.startsWith('--keys=')) ?? '--keys=10').slice(7));
+const RAW = args.includes('--raw');
 
 const source = readFileSync(path.resolve(texFile), 'utf8');
 const work = path.join(os.tmpdir(), `tdom-bench-${process.pid}`);
@@ -45,11 +46,13 @@ try {
   const t0 = Date.now();
   await eng.open(source);
   await drain(eng);
+  if (eng.mode !== 'structured' || !eng.pages.length) throw new Error(`Resident boot failed: ${eng.diagnostics.join('; ')}`);
   console.log(`boot ${(Date.now() - t0) / 1000 | 0}s, blocks=${eng.blocks.length}, pages=${eng.pages.length}`);
 
   for (const [label, basePos] of loci(eng.getSource())) {
     const walls = [];
     const typesets = [];
+    const samples = [];
     let pos = basePos;
     let worstVerdict = 'clean';
     for (let k = 0; k < KEYS; k++) {
@@ -57,6 +60,8 @@ try {
       const t = performance.now();
       const r = await eng.edit(pos, pos, ch);
       walls.push(performance.now() - t);
+      if (RAW) samples.push({ wall: walls.at(-1), blocks: r.stats.blocksTypeset,
+        walk: structuredClone(eng.lastWalkTrace), lock: eng.lastLock });
       typesets.push(r.stats.typesetMs ?? 0);
       if (r.stats.chainVerdict && r.stats.chainVerdict !== 'clean' && r.stats.chainVerdict !== 'walked') {
         worstVerdict = r.stats.chainVerdict;
@@ -73,6 +78,7 @@ try {
         `max=${percentile(walls, 100).toFixed(0)}ms (typeset p95=${percentile(typesets, 95).toFixed(0)}ms) ` +
         `verdicts=${worstVerdict}`
     );
+    if (RAW) console.log(JSON.stringify({ label, samples }));
   }
 } finally {
   await eng.close();
