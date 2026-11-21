@@ -71,6 +71,7 @@ export function pageSpecs(pages, blocks, initialStyle) {
   let rmark = '';
   for (const page of pages) {
     let thisstyle = null;
+    const fancy = [];
     // TeX mark semantics: \leftmark = botmark's left (LAST mark on the
     // page), \rightmark = firstmark's right (FIRST mark on the page, or
     // the carried value when the page has no marks)
@@ -89,6 +90,8 @@ export function pageSpecs(pages, blocks, initialStyle) {
         lmark = ev.a;
         if (firstRight === null) firstRight = ev.b;
         rmark = ev.b;
+      } else if (ev.k === 'fancy') {
+        fancy.push([ev.a, ev.b]);
       } else if (ev.k === 'markr') {
         if (firstRight === null) firstRight = ev.a;
         rmark = ev.a;
@@ -103,6 +106,7 @@ export function pageSpecs(pages, blocks, initialStyle) {
       style: thisstyle ?? style,
       lmark,
       rmark: firstRight ?? rmarkAtStart,
+      ...(fancy.length ? { fancy } : {}),
     });
     folio = (page.folio ?? folio) + 1;
   }
@@ -124,6 +128,12 @@ export function hfJobBody(specs) {
     L.push(`\\gdef\\thepage{\\csname @${s.fmt}\\endcsname\\c@page}`);
     L.push(`\\def\\leftmark{${s.lmark}}`);
     L.push(`\\def\\rightmark{${s.rmark}}`);
+    // the body's \fancyhead/\fancyfoot/\fancyhf of this page, in order: the
+    // job runs the specs in page order, so each page sees every earlier one
+    for (const [kind, args] of s.fancy ?? []) {
+      const name = kind === 'hf' ? 'fancyhf' : `fancy${kind}`;
+      L.push(`\\ifdefined\\TDOM@${name}\\TDOM@${name}${args}\\fi`);
+    }
     // reset then apply the page style (an unknown style leaves all empty)
     L.push('\\def\\@oddhead{}\\def\\@evenhead{}\\def\\@oddfoot{}\\def\\@evenfoot{}');
     L.push(`\\csname ps@${s.style}\\endcsname`);

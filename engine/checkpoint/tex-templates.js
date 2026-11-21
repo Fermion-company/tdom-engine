@@ -76,7 +76,7 @@ export function labelCaptureShim({ save, capture, after = () => '', ltx = null }
 // Page-style events (tdom_event): the resident driver and a cold isolated
 // run both install these, so a rescued block reports the same events
 // whichever runner compiled it (the disk cache does not tell them apart).
-const PAGE_STYLE_EVENT_SHIMS = [
+const PAGE_STYLE_EVENT_SHIMS_BASE = [
   '\\let\\TDOMpagestyle\\pagestyle',
   "\\renewcommand\\pagestyle[1]{\\TDOMpagestyle{#1}\\directlua{tdom_event('style','\\luaescapestring{#1}','')}}",
   '\\let\\TDOMthispagestyle\\thispagestyle',
@@ -84,6 +84,19 @@ const PAGE_STYLE_EVENT_SHIMS = [
   '\\let\\TDOMpagenumbering\\pagenumbering',
   "\\renewcommand\\pagenumbering[1]{\\TDOMpagenumbering{#1}\\directlua{tdom_event('pagenum','\\luaescapestring{#1}','')}}",
 ];
+// fancyhdr's \fancyhead/\fancyfoot/\fancyhf in the body (a running head
+// set per chapter) change the header the next pages print; the header job
+// runs from the preamble's state, so it replays them in page order
+// (page-metadata.js). The originals are reached through their \newcommand
+// internals (\\fancyhead): a plain \let of the outer macro would call the
+// shim again (tdom-engine #17).
+const FANCY_EVENT_SHIMS = ['head', 'foot', 'hf'].map((kind) => {
+  const name = kind === 'hf' ? 'fancyhf' : `fancy${kind}`;
+  return `\\ifdefined\\${name}\\expandafter\\let\\expandafter\\TDOM@${name}\\csname\\string\\${name}\\endcsname` +
+    `\\renewcommand\\${name}[2][]{\\TDOM@${name}[#1]{#2}` +
+    `\\directlua{tdom_event('fancy','${kind}','\\luaescapestring{\\detokenize{[#1]{#2}}}')}}\\fi`;
+});
+const PAGE_STYLE_EVENT_SHIMS = [...PAGE_STYLE_EVENT_SHIMS_BASE, ...FANCY_EVENT_SHIMS];
 // \markboth/\markright report their marks as page-style events too
 const MARK_EVENT_SHIMS = [
   '\\let\\TDOMmarkboth\\markboth',

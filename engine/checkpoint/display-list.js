@@ -40,6 +40,12 @@ function hashCommands(commands) {
   return fnv1a(joined);
 }
 
+/** The chunk holding page `page`'s head (`h`) or foot (`f`) band cut from a
+ * canonical page: used when that band is drawn with graphics. */
+export function hfBandChunkKey(page, which) {
+  return `__hf-${page}-${which}`;
+}
+
 export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twinMetrics }) {
   const geo = geometry;
   const L = 72 + (geo.oddsidemargin ?? 0);
@@ -206,16 +212,45 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
   // \@oddhead/\@oddfoot with the page's real folio format, style and
   // marks). \@outputpage geometry: head box bottom at topmargin+headheight,
   // foot baseline \footskip below the text area.
-  const hfEntry = ownsPage ? null : hf?.get(page.number);
+  // A page shipped whole (iso `full` chunk) is cropped to the text area, so
+  // its own head and foot are not in the picture. The header job reads the
+  // page's style events (a \thispagestyle{empty} in it included), so its
+  // entry is still the page's furniture; only the provisional folio, which
+  // knows no style, is withheld (tdom-engine #17: running heads and folios
+  // vanished from every page a two-column block filled).
+  const hfEntry = hf?.get(page.number);
   if (hfEntry) {
-    paintHfItems(commands, hfEntry.h, L, 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0), {
-      fonts,
-      twinMetrics,
-    });
-    paintHfItems(commands, hfEntry.f, L, T + geo.textheight + (geo.footskip ?? 30), {
-      fonts,
-      twinMetrics,
-    });
+    const headBand = { top: 0, bottom: T };
+    const footBand = { top: T + geo.textheight, bottom: geo.paperheight };
+    for (const [which, anchorY, band] of [
+      ['h', 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0), headBand],
+      ['f', T + geo.textheight + (geo.footskip ?? 30), footBand],
+    ]) {
+      // (one overlay picture in the head may paint the foot too: either
+      // band with graphics takes both from the canonical page)
+      if (!hfEntry.hg && !hfEntry.fg) {
+        paintHfItems(commands, hfEntry[which], L, anchorY, { fonts, twinMetrics });
+        continue;
+      }
+      // Graphics in the head or foot (TikZ against `current page`): the
+      // canonical page's own band, when one has been cut for this page
+      // (canonical-arrival.js cropCanonicalHeaderBands).
+      const key = hfBandChunkKey(page.number, which);
+      const meta = chunks.get(key);
+      if (!meta || !(band.bottom > band.top)) continue;
+      commands.push({
+        op: 'chunk',
+        chunk: key,
+        x: 0,
+        y: r2(band.top),
+        w: r2(meta.wBp),
+        h: r2(meta.hBp),
+        sy: 0,
+        ch: r2(meta.hBp),
+        cv: meta.v ?? 0,
+        src: '_hf',
+      });
+    }
   } else if (!ownsPage) {
     // header job hasn't landed yet: provisional plain folio (replaced by
     // the TeX-typeset footer as soon as the async job reports)
