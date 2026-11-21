@@ -6,6 +6,7 @@ import {
   canonicalCropWitness, certifiedCanonicalCrop,
 } from './canonical-crop.js';
 import { cropSvgAt } from './util/svg.js';
+import { hfBandChunkKey } from './display-list.js';
 
 const PAPER_EPSILON_PT = 0.5;
 
@@ -111,6 +112,9 @@ export function onCanonicalResult(
  * the isolated queue serves what drift keeps this pass from reaching.
  */
 export async function cropCanonicalChunks(engine, info, { asyncRepaginate }) {
+  await cropCanonicalHeaderBands(engine, info, { asyncRepaginate }).catch((err) => {
+    engine.diagnostics?.push?.(`header band crop failed: ${err?.message ?? err}`);
+  });
   if (engine.mode !== 'structured' || engine.srcRev !== info.rev) return;
   if (engine.previewPolicy !== 'structured') return;
   // Page-count equality only avoids needless proof work; it does not prove
@@ -250,4 +254,63 @@ export async function verifyAgainstCanonical(engine, info, { applyFidelity, asyn
       );
     }
   }
+}
+
+/**
+ * A head or foot drawn with graphics (TikZ `remember picture, overlay`
+ * against `current page`, rules as PDF literals) cannot be painted from the
+ * header job's runs: the pictures need the shipped page's positions. The
+ * canonical page has that band as printed; cut it once per canonical
+ * generation for every page whose header entry asks for it (daemon.lua
+ * tdom_hf_box `hg`/`fg`). The band is the page's furniture, not its text,
+ * so an older generation's band stays right while the page count holds
+ * (tdom-engine #17: running heads, folios and note rules vanished from the
+ * provisional pages until the next canonical, a minute later).
+ */
+export async function cropCanonicalHeaderBands(engine, info, { asyncRepaginate }) {
+  if (engine.mode !== 'structured' || !engine.hf?.size || info?.error) return;
+  const geo = engine.geometry;
+  const pageCount = Number(info?.pageCount) || 0;
+  if (!geo || !(geo.paperheight > 0) || !(geo.paperwidth > 0) || !pageCount) return;
+  if (engine.pages.length !== pageCount) return;
+  const T = 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
+  const footTop = T + (geo.textheight ?? 0);
+  const bands = { h: [0, T], f: [footTop, geo.paperheight] };
+  let budget = Number(process.env.TDOM_HF_CROP_MAX || 80);
+  const updates = new Map();
+  for (const [page, entry] of engine.hf) {
+    if (budget <= 0) break;
+    if (!(page >= 1 && page <= pageCount)) continue;
+    const wanted = (entry?.hg || entry?.fg) ? ['h', 'f'].filter((which) =>
+      engine.chunks.get(hfBandChunkKey(page, which))?.canonicalId !== info.id) : [];
+    if (!wanted.length) continue;
+    budget--;
+    const svg = await engine.canonical.pageSVG(page, info.id).catch(() => null);
+    if (!svg || engine.closed) continue;
+    if (engine.pages.length !== pageCount) return;
+    for (const which of wanted) {
+      const [top, bottom] = bands[which];
+      if (!(bottom > top)) continue;
+      const key = hfBandChunkKey(page, which);
+      const prev = engine.chunks.get(key);
+      engine.chunks.set(key, {
+        svg: cropSvgAt(svg, 0, top, geo.paperwidth, bottom - top),
+        wBp: geo.paperwidth,
+        hBp: bottom - top,
+        v: (prev?.v ?? 0) + 1,
+        canonicalId: info.id,
+      });
+      updates.set(page, { ...(updates.get(page) ?? {}), [`${which}cv`]: (prev?.v ?? 0) + 1 });
+    }
+  }
+  if (!updates.size) return;
+  // a new map: each changed page's own head/foot signature moves, so just
+  // those display lists are built again (header-footer.js pageHfSig)
+  const map = new Map(engine.hf);
+  for (const [page, versions] of updates) {
+    const entry = map.get(page);
+    if (entry) map.set(page, { ...entry, ...versions });
+  }
+  engine.hf = map;
+  asyncRepaginate();
 }

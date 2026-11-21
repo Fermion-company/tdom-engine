@@ -963,6 +963,49 @@ local function curcolor()
   return colstack[#colstack] or '#000000'
 end
 
+-- The color luacolor gives a node (its attribute value -> the PDF color
+-- operator luacolor will write at shipout). luacolor's value table is a
+-- private upvalue of getvalue(); it is read once and kept by reference, so
+-- colors registered later are found too. Without it every glyph and rule a
+-- luacolor document colors (luwa-ul loads it) was painted black on the
+-- browser-drawn layer over an exact picture (tdom-engine #17).
+local LUACOLOR_MAP = nil
+local function luacolor_map()
+  if LUACOLOR_MAP == nil then
+    LUACOLOR_MAP = false
+    pcall(function()
+      local getvalue = oberdiek.luacolor.getvalue
+      for i = 1, 16 do
+        local name, value = debug.getupvalue(getvalue, i)
+        if not name then break end
+        if name == 'map' and type(value) == 'table' then
+          LUACOLOR_MAP = value
+          break
+        end
+      end
+    end)
+  end
+  return LUACOLOR_MAP or nil
+end
+local LUACOLOR_PARSED = {}
+local function node_color(n)
+  local attr = n and luacolor_attribute()
+  local value = attr and node.has_attribute(n, attr)
+  if value then
+    local map = luacolor_map()
+    local data = map and map[value]
+    if type(data) == 'string' then
+      local col = LUACOLOR_PARSED[data]
+      if col == nil then
+        col = parse_color(data) or false
+        LUACOLOR_PARSED[data] = col
+      end
+      if col then return col end
+    end
+  end
+  return curcolor()
+end
+
 -- RuleRunV2 retains the raw LuaTeX evidence that `rule=true` used to erase.
 -- In particular subtype=3 is empty_rule in certified LuaTeX PDF profiles:
 -- it participates in layout but the production backend emits no paint.
@@ -1047,7 +1090,7 @@ local function emit_leader_rule(n, parent, x, dy0, out)
   local d = lead.depth or 0
   if h < -1073741823 then h = 26214 end
   if d < -1073741823 then d = 0 end
-  out[#out + 1] = rule_run(lead, x, dy0 - bp(h), w, h, d, curcolor())
+  out[#out + 1] = rule_run(lead, x, dy0 - bp(h), w, h, d, node_color(lead))
   return true
 end
 
@@ -1071,7 +1114,8 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       local fi = seen_fonts[n.font]
       local gy = dy0 - bp(n.yoffset or 0)
       local gx = x + bp(n.xoffset or 0)
-      if not run or run.f ~= n.font or run.dy ~= gy or run.c ~= curcolor() or
+      local gc = node_color(n)
+      if not run or run.f ~= n.font or run.dy ~= gy or run.c ~= gc or
           (run.m and true or false) ~= in_math then
         flush()
         run = {
@@ -1079,7 +1123,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
           s = fi and fi.size or 10,
           dy = gy,
           x = gx,
-          c = curcolor(),
+          c = gc,
           m = in_math and 1 or nil,
           g = {},
           gh = 0,
@@ -1155,7 +1199,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       if w and w < -1073741823 then w = parent and parent.width or 0 end
       if h and h < -1073741823 then h = parent and parent.height or 0 end
       if d and d < -1073741823 then d = parent and parent.depth or 0 end
-      out[#out + 1] = rule_run(n, x, dy0 - bp(h), w, h, d, curcolor())
+      out[#out + 1] = rule_run(n, x, dy0 - bp(h), w, h, d, node_color(n))
       x = x + bp(w or 0)
     elseif id == MATH then
       -- inline math on/off marker: the surrounding line must be shown as
@@ -1224,7 +1268,7 @@ walk_v = function(box, x0, baseline_dy, out, math_mode)
       if h and h < -1073741823 then h = 26214 end
       if d and d < -1073741823 then d = 0 end
       if w and w < -1073741823 then w = box.width end
-      out[#out + 1] = rule_run(n, x0, y, w, h, d, curcolor())
+      out[#out + 1] = rule_run(n, x0, y, w, h, d, node_color(n))
       y = y + bp(h) + bp(d)
     elseif id == GLUE then
       y = y + bp(node.effective_glue(n, box) or 0)
@@ -1767,13 +1811,22 @@ function tdom_hf_box(boxnum, page, which)
   colstack = {}
   ATTR_SIG = {}
   local saved_marks = pending_fmarks
+  local saved_gfx = blk_gfx
   pending_fmarks = {}
+  blk_gfx = false
   local items = extract_items(box.list, box)
+  local gfx = blk_gfx
+  blk_gfx = saved_gfx
   pending_fmarks = saved_marks
   -- string key: consecutive integer keys would json-encode as an array
   local key = 'p' .. page
   hf_pages[key] = hf_pages[key] or {}
   hf_pages[key][which] = items
+  -- PDF literals (TikZ, often `remember picture, overlay` placed against
+  -- `current page`): the runs neither carry that paint nor stand where the
+  -- shipped page puts them. The preview takes this band from the canonical
+  -- page instead (display-list.js, tdom-engine #17).
+  if gfx then hf_pages[key][which .. 'g'] = 1 end
 end
 
 function tdom_hf_flush()

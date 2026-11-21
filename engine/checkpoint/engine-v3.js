@@ -103,6 +103,7 @@ import { buildClosureDeferredResponse } from './update-response.js';
 import {
   onCanonicalResult as onCanonicalResultHelper,
   cropCanonicalChunks as cropCanonicalChunksHelper,
+  cropCanonicalHeaderBands as cropCanonicalHeaderBandsHelper,
   verifyAgainstCanonical as verifyAgainstCanonicalHelper,
 } from './canonical-arrival.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
@@ -3413,6 +3414,13 @@ export class CheckpointEngine {
       awaitGalley: (key, timeout) => this.#await(key, timeout),
       registerFont: (key, meta) => this.#registerFont(key, meta),
       asyncRepaginate: () => this.#asyncRepaginate(),
+      // heads drawn with graphics take their band from the latest canonical
+      cropHeaderBands: () => {
+        const info = this.canonical.info();
+        if (!info?.id) return;
+        cropCanonicalHeaderBandsHelper(this, info, { asyncRepaginate: () => this.#asyncRepaginate() })
+          .catch((err) => this.diagnostics.push(`header band crop failed: ${err?.message ?? err}`));
+      },
     });
   }
 

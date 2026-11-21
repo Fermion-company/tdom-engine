@@ -78,6 +78,7 @@ function runHeaderJob(engine, helpers, specs, sig) {
           // this thread: header-footer.js pageHfSig. TDOM_TRACE_HF=1 times it.)
           const landedAt = TRACE_HF ? performance.now() : 0;
           const did = asyncRepaginate();
+          helpers.cropHeaderBands?.();
           if (TRACE_HF) {
             const ms = (value) => (value ?? 0).toFixed(1);
             console.error(`[hf] landed: ${engine.pages.length} pages in ${ms(performance.now() - landedAt)} ms` +
