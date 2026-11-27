@@ -308,6 +308,7 @@ export function buildDriverSource({
   L.push('\\directlua{tdom_num(\'interlinepenalty\',\\number\\interlinepenalty)}');
   L.push('\\directlua{tdom_num(\'footinsfactor\',\\number\\count\\footins)}');
   L.push('\\directlua{tdom_dim(\'atmaxdepth\',\\number\\dimexpr\\@maxdepth\\relax)}');
+  L.push('\\directlua{tdom_newpage_geometry()}');
   // \raggedbottom leaves \@textbottom = \vskip\z@\@plus.0001fil; flushbottom
   // keeps it \relax — the page builder needs to know which world it's in
   L.push('\\ifx\\@textbottom\\relax\\directlua{tdom_num(\'raggedbottom\',0)}' +

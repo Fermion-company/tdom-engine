@@ -1,12 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { paginationAuxChange } from '../engine/checkpoint/shipping-seeds.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   beginShippingAttempt,
   bootShipping,
   makeShippingChain,
+  queueShipBoot,
   settleShippingBaseline,
   shippingBootDelay,
   shippingInputState,
@@ -90,6 +92,83 @@ async function cleanup(engine, ...chains) {
   rmSync(engine.workDir, { recursive: true, force: true });
 }
 
+test('fresh matching seeds wake the first physical-page boot already waiting on its timer', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const engine = fakeEngine();
+  let boots = 0;
+  const boot = async () => { boots++; };
+  try {
+    engine.previewPolicy = 'canonical-anchor';
+    engine.shipping = { done: true };
+    engine.shipDesiredCanonicalId = 3;
+    engine.canonical = { last: null, sourceMatches: () => true };
+    queueShipBoot(engine, boot);
+    t.mock.timers.tick(10);
+    assert.equal(boots, 0);
+    engine.canonical.last = { id: 3, rev: 0, seedFiles: { aux: 'seed' } };
+    queueShipBoot(engine, boot);
+    t.mock.timers.tick(10);
+    assert.equal(boots, 0);
+    engine.canonical.last.rev = engine.srcRev;
+    queueShipBoot(engine, boot);
+    t.mock.timers.tick(0);
+    assert.equal(boots, 1);
+    t.mock.timers.tick(800);
+    assert.equal(boots, 1);
+  } finally {
+    await cleanup(engine);
+  }
+});
+
+test('a certified physical chain waits for current pagination seeds before rebuilding immediately', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const engine = fakeEngine();
+  const calls = [];
+  const boot = async () => calls.push(engine.canonical.last.pageCount);
+  try {
+    engine.previewPolicy = 'canonical-anchor';
+    engine.shipping = { done: true, baselinePages: 1, rootPeer: { alive: false } };
+    engine.shipRetry.lastCertifiedSnapshot = 'old';
+    engine.shipDesiredCanonicalId = 5;
+    const seed = { id: 5, rev: engine.srcRev, seedFiles: { aux: 'seed' }, pageCount: 1, inputEpoch: 2 };
+    engine.canonical = { inputEpoch: 2, last: seed, sourceMatches: () => true };
+    queueShipBoot(engine, boot);
+    t.mock.timers.tick(10);
+    assert.deepEqual(calls, []);
+    seed.pageCount = 2;
+    seed.inputEpoch = 1;
+    queueShipBoot(engine, boot);
+    t.mock.timers.tick(10);
+    assert.deepEqual(calls, []);
+    seed.inputEpoch = 2;
+    queueShipBoot(engine, boot);
+    t.mock.timers.tick(0);
+    assert.deepEqual(calls, [2]);
+    t.mock.timers.tick(800);
+    assert.deepEqual(calls, [2]);
+  } finally {
+    await cleanup(engine);
+  }
+});
+
+test('a replay may seed numeric page references but never other label fields or commands', () => {
+  const aux = (key, value, page, dest, total) =>
+    `\\relax \n\\newlabel{${key}}{{${value}}{${page}}{}{${dest}}{}}\n\\gdef \\@abspage@last{${total}}\n`;
+  const a = aux('last', 'iii', 1, 'page.last', 1);
+  const b = aux('last', 'iii', 2, 'page.last', 2);
+  assert.equal(paginationAuxChange(a, b, 1, 2), true);
+  assert.equal(paginationAuxChange(b, a, 2, 1), true);
+  for (const unsafe of [
+    aux('other', 'iii', 2, 'page.last', 2),
+    aux('last', 'iv', 2, 'page.last', 2),
+    aux('last', 'iii', 2, 'other', 2),
+    aux('last', 'iii', 'ii', 'page.last', 2),
+    b.replace('\\relax', '\\par'),
+    b + '\\relax\n',
+  ]) assert.equal(paginationAuxChange(a, unsafe, 1, 2), false);
+  assert.equal(paginationAuxChange(a, b, 1, 3), false);
+});
+
 test('late shipping budget stays below the last canonical and has a hard cap', () => {
   assert.equal(usefulShippingCutoffMs(0), 700);
   assert.equal(usefulShippingCutoffMs(900), 700);
@@ -112,6 +191,34 @@ test('a rejected current wave releases the canonical display fallback', async ()
     assert.equal(released, 1);
     chain.onWaveOutcome({ gen: chain.gen, outcome: 'published' });
     assert.equal(released, 1);
+  } finally {
+    await cleanup(engine, chain);
+  }
+});
+
+test('a late page-count refusal reseeds from an undo that already restored the exact PDF', async () => {
+  const engine = fakeEngine();
+  let boots = 0;
+  const chain = makeShippingChain(engine, () => { boots++; });
+  engine.shipping = chain;
+  engine.previewPolicy = 'canonical-anchor';
+  engine.canonical = {
+    inputEpoch: 4, sourceMatches: () => true,
+    last: { id: 9, rev: engine.srcRev, inputEpoch: 4, pageCount: 1, seedFiles: { aux: 'restored' } },
+  };
+  chain.baselinePages = 2;
+  chain.acceptedSnapshotId = engine.shipDesiredInputSnapshot = 'current';
+  engine.shipGenRev.set(chain.gen, engine.srcRev);
+  engine.shipGenSnapshot.set(chain.gen, 'previous');
+  const rejected = { gen: chain.gen, outcome: 'rejected', reason: 'page-count-changed' };
+  try {
+    chain.onWaveOutcome(rejected);
+    assert.equal(boots, 0, 'a stale snapshot cannot reset the current chain');
+    engine.shipGenSnapshot.set(chain.gen, 'current');
+    chain.onWaveOutcome(rejected);
+    chain.onWaveOutcome(rejected);
+    assert.equal(engine.shipDesiredCanonicalId, 9);
+    assert.equal(boots, 1);
   } finally {
     await cleanup(engine, chain);
   }
@@ -222,6 +329,25 @@ test('a baseline built on an older production canonical seed is kept and replaye
   } finally {
     await cleanup(engine, chain);
   }
+});
+
+test('a child edit received during boot gets checked by replay before starting a second baseline', async () => {
+  const engine = fakeEngine('root source');
+  const file = path.join(engine.docDir, 'child.tex');
+  engine.shippingIncludeTrace = [{ actualPath: file, command: 'input', depth: 0, rootUnit: 1 }];
+  engine.includes.set(file, { mtime: 1, text: 'before' });
+  const chain = attachChain(engine);
+  const attempt = begin(engine, chain);
+  try {
+    engine.srcRev++;
+    engine.includes.set(file, { mtime: 2, text: 'after' });
+    engine.shipPendingInputChanges = { text: 'root source', projectInputChanges: { changed: [file], removed: [], unknown: false } };
+    let replays = 0;
+    const result = settleShippingBaseline(engine, chain, event(attempt), () => assert.fail('unexpected reboot'), () => replays++);
+    assert.equal(result.outcome, 'certified-behind');
+    assert.equal(replays, 1);
+    assert.equal(engine.shipRetry.lastCertifiedSnapshot, attempt.snapshotId);
+  } finally { await cleanup(engine, chain); }
 });
 
 test('a certified baseline of another lineage is neutral and a new baseline is asked for', async () => {

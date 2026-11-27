@@ -28,7 +28,8 @@ export function exactRunKey(run) {
     return ['rule', run.rv, run.rs, run.rw, run.rh, run.rd, run.ri, run.rl, run.rr, run.rdir, run.ra,
       r3(run.dy), r3(run.w), r3(run.h), run.c ?? ''].join('\u0001');
   }
-  return [run.t, run.f, r3(run.s), run.c ?? '', run.m ? 1 : 0, r3(run.dy), r3(run.w), r3(run.gh), r3(run.gd)].join('\u0001');
+  return [run.t, run.f, r3(run.s), run.c ?? '', run.m ? 1 : 0, r3(run.dy), r3(run.w), r3(run.gh), r3(run.gd),
+    run.gc?.join(','), run.gp?.join(',')].join('\u0001');
 }
 
 // The box a run's ink is cut out by, from the baseline of its line: a glyph
@@ -108,7 +109,7 @@ export function composeExactLines(galley, fidelity, painted, paintedFidelity, wh
       twin.used = true;
       next = twin.at + 1;
       parts.push({
-        x: run.x, w: run.w, top: inkTop(run), h: inkHeight(run),
+        runIndex: k, x: run.x, w: run.w, top: inkTop(run), h: inkHeight(run),
         sx: twin.run.x, sy: twin.baseline + inkTop(twin.run),
       });
     }

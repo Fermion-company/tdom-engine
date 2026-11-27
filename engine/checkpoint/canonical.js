@@ -19,6 +19,7 @@
 //   - a failed compile (mid-typing syntax errors) keeps the last good
 //     canonical result on screen and reports the TeX error.
 
+import { paginationAuxChange } from './shipping-seeds.js';
 import { projectIndexCommand } from './index-tool.js';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -33,6 +34,7 @@ import {
   existsSync,
   rmSync,
   copyFileSync,
+  linkSync,
   renameSync,
   realpathSync,
   statSync,
@@ -41,12 +43,12 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { fnv1a } from '../hash.js';
-import { withProjectInputs, isPathInside } from '../project-inputs.js';
+import { withProjectInputs, isPathInside, originalSearchInput } from '../project-inputs.js';
 import { parseFlsFiles, MAX_FLS_INPUTS } from './fls.js';
 import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-index.js';
 import { pdfEditGlyphs } from './pdf-edit-geometry.js';
-import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
-import { prepareSyncTeXBatchHelper, querySyncTeXRange } from './synctex-batch.js';
+import { readSyncTeXSourcePage, sourceBoxesOnPage } from './pdf-source-boxes.js';
+import { forgetSyncTeXBatchHelper, prepareSyncTeXBatchHelper, querySyncTeXRange } from './synctex-batch.js';
 import { parseJumpText, parseJumpTsv, parseJumpRecords, jumpRecords, jumpAnchor, locateJump, indexStartRecords } from './jump-sync.js';
 import { pdfPageSvgArgs } from './util/svg.js';
 
@@ -105,7 +107,7 @@ export class CanonicalRenderer {
     //     uncompiled edit, AND the cost cooldown below.
     // Opaque mode uses displayDebounceMs (canonical IS the display there).
     debounceMs = Number(process.env.TDOM_CANON_DEBOUNCE ?? 2500),
-    idleMs = Number(process.env.TDOM_CANON_IDLE ?? 30_000),
+    idleMs = process.env.TDOM_CANON_IDLE === undefined ? null : Number(process.env.TDOM_CANON_IDLE),
     maxStaleMs = Number(process.env.TDOM_CANON_MAX_STALE ?? 20_000),
     displayDebounceMs = Number(process.env.TDOM_CANON_DISPLAY_DEBOUNCE ?? 350),
     // When canonical is the display (opaque mode, a fallback, or a viewer that
@@ -125,8 +127,10 @@ export class CanonicalRenderer {
     this.workDir = existingRealpath(resolvedWorkDir);
     this.docDir = docDir ? existingRealpath(docDir) : this.workDir;
     this.overlayDir = overlayDir ? existingRealpath(overlayDir) : null;
+    this.realInputDocDir = this.docDir;
+    this.realInputOverlayDir = this.overlayDir;
     this.debounceMs = debounceMs;
-    this.idleMs = idleMs;
+    this.configuredIdleMs = idleMs;
     this.maxStaleMs = maxStaleMs;
     this.authorityStaleSince = null;
     this.displayDebounceMs = displayDebounceMs;
@@ -183,12 +187,12 @@ export class CanonicalRenderer {
     this.displayCooldownFactor = Number(process.env.TDOM_CANON_DISPLAY_COOLDOWN ?? 1);
     this.displayCooldownCapMs = Number(process.env.TDOM_CANON_DISPLAY_COOLDOWN_CAP ?? 60_000);
     this.generations = new Map(); // id -> retained canonical record, oldest first
-    this.svgCache = new Map(); // `${id}:${page}` -> svg string (LRU)
-    this.svgInFlight = new Map(); // `${id}:${page}` -> shared conversion promise
+    this.svgCache = new Map(); // immutable PDF hash + page -> SVG (LRU)
+    this.svgInFlight = new Map(); // same PDF bytes and page share a conversion
     this.textCache = new Map(); // id -> [string] (pdftotext page texts)
     this.textInFlight = new Map(); // id -> shared pdftotext promise
     this.textBoxCache = new Map(); // id -> [[{text,left,top,right,bottom}]]
-    this.textBoxInFlight = new Map(); // id -> shared pdftotext -bbox promise
+    this.textBoxInFlight = new Map(); // generation or generation:page -> shared Poppler job
     // pdf.js is opened once per immutable generation and paint-safe pages are
     // extracted lazily. Canonical arrival prewarms the document parser; an
     // edit then pays only the candidate pages, not every page of a 500-page
@@ -204,6 +208,7 @@ export class CanonicalRenderer {
     // page.  Resolve that PDF content matrix lazily per retained page.
     this.syncTransformCache = new Map(); // `${id}:${page}` -> affine matrix | null (unsafe)
     this.syncTransformInFlight = new Map(); // `${id}:${page}` -> shared probe
+    this.sourcePageCache = new Map(); // up to four recent sheets across all generations
     this.sourceBoxInFlight = new Set(); // source-box reads must finish before document reset removes artifacts
     this.svgOutputSeq = 0;
     this.onResult = null; // callback({...info}) after every compile attempt
@@ -288,8 +293,11 @@ export class CanonicalRenderer {
       try { real = path.join(realpathSync(path.dirname(resolved)), path.basename(resolved)); }
       catch { real = resolved; }
     }
-    if (this.overlayDir && isPathInside(this.overlayDir, real)) {
-      return path.join(this.docDir, path.relative(this.overlayDir, real));
+    if (this.realInputOverlayDir && isPathInside(this.realInputOverlayDir, real)) {
+      return path.join(this.docDir, path.relative(this.realInputOverlayDir, real));
+    }
+    if (this.realInputDocDir !== this.docDir && isPathInside(this.realInputDocDir, real)) {
+      return path.join(this.docDir, path.relative(this.realInputDocDir, real));
     }
     return real;
   }
@@ -322,23 +330,35 @@ export class CanonicalRenderer {
     return sha256;
   }
 
-  /** Manifest of the project inputs the compile that just finished read. */
-  #inputManifestFromRecorder() {
+  #recordedProjectInputs() {
     let text;
     try { text = readFileSync(path.join(this.workDir, 'canon.fls'), 'utf8'); } catch { return null; }
     const files = parseFlsFiles(text, this.docDir);
     if (!files) return null;
     const rootTex = path.join(this.workDir, 'canon.tex');
-    const manifest = new Map();
+    const inputs = [];
     for (const recorded of files.inputs) {
       if (files.outputs.has(recorded)) continue;
       const logical = this.#inputIdentity(recorded);
-      if (logical === rootTex || manifest.has(logical)) continue;
-      if (!isPathInside(this.docDir, logical) && !isPathInside(this.workDir, logical)) continue;
+      if (logical === rootTex) continue;
+      if (isPathInside(this.docDir, logical) || isPathInside(this.workDir, logical)) inputs.push([logical, recorded]);
+    }
+    return inputs;
+  }
+
+  /** Manifest of the project inputs the compile that just finished read. */
+  #inputManifestFromRecorder(syncInputAliases, verifyBytes) {
+    const inputs = this.#recordedProjectInputs();
+    if (!inputs) return null;
+    let manifest = verifyBytes ? new Map() : null;
+    for (const [logical, recorded] of inputs) {
+      // Forward queries about retained paper need the input that TeX read
+      // even if a new edit created or removed an overlay since then.
+      if (this.overlayDir || originalSearchInput(recorded) !== recorded) rememberSyncInputAlias(syncInputAliases, logical, recorded);
+      if (!manifest || manifest.has(logical)) continue;
       const sha256 = this.#effectiveInputHash(logical);
-      if (!sha256) return null;
-      manifest.set(logical, sha256);
-      if (manifest.size > MAX_FLS_INPUTS) return null;
+      if (!sha256 || manifest.size >= MAX_FLS_INPUTS) manifest = null;
+      else manifest.set(logical, sha256);
     }
     return manifest;
   }
@@ -374,14 +394,50 @@ export class CanonicalRenderer {
     return true;
   }
 
+  #rootDigest(source) {
+    if (this.digestedRoot?.source !== source) {
+      this.digestedRoot = { source, digest: createHash('sha256').update(source).digest('hex') };
+    }
+    return this.digestedRoot.digest;
+  }
+
   /** True when `generation` is the exact compile of `source` under the current inputs. */
   #generationCurrent(generation, source) {
     if (!generation || typeof source !== 'string') return false;
-    const hashedLength = this.hashedLengths?.get(generation.srcHash);
-    if (hashedLength !== undefined && hashedLength !== source.length) return false;
-    if (generation.srcHash !== this.#sourceHash(source, generation.inputEpoch)) return false;
-    if (generation.inputEpoch === this.inputEpoch) return true;
-    return this.#inputsUnchangedSince(generation);
+    if (generation.rootDigest) {
+      if (generation.rootLength !== source.length || generation.rootDigest !== this.#rootDigest(source)) return false;
+    } else {
+      const length = this.hashedLengths?.get(generation.srcHash);
+      if (length !== undefined && length !== source.length) return false;
+      if (generation.srcHash !== this.#sourceHash(source, generation.inputEpoch)) return false;
+    }
+    return generation.inputEpoch === this.inputEpoch || this.#inputsUnchangedSince(generation);
+  }
+
+  // Undo can restore paper that has already been superseded by another
+  // successful compile. Give its immutable PDF and source map a new, increasing
+  // presentation ID. Existing readers keep their previous paths and revision.
+  #restoreRetained(source, rev) {
+    for (const prior of [...this.generations.values()].reverse()) {
+      if (prior === this.last || !prior.rootDigest || !this.#generationCurrent(prior, source)) continue;
+      const id = ++this.idSeq;
+      const pdf = path.join(this.workDir, `canon-${id}.pdf`);
+      const synctex = prior.synctex ? path.join(this.workDir, `canon-${id}.synctex.gz`) : null;
+      try { linkSync(prior.pdf, pdf); } catch { return null; }
+      try {
+        if (synctex) linkSync(prior.synctex, synctex);
+      } catch {
+        rmSync(pdf, { force: true });
+        return null;
+      }
+      const restored = {
+        ...prior, id, pdf, synctex, rev, inputEpoch: this.inputEpoch, srcHash: this.#sourceHash(source),
+        readers: 0, retired: false, filesDeleted: false, editGlyphs: undefined, rebound: (prior.rebound ?? 0) + 1,
+      };
+      this.#registerGeneration(restored);
+      return restored;
+    }
+    return null;
   }
 
   /**
@@ -391,9 +447,12 @@ export class CanonicalRenderer {
    * and never runs under a Build lease, whose adoption owns the pending job.
    */
   #reconcile(source, rev) {
-    const last = this.last;
+    let last = this.last;
     if (!last || this.disposed || this.resetting || !Number.isSafeInteger(rev) || rev < last.rev) return false;
-    if (!this.#generationCurrent(last, source)) return false;
+    if (!this.#generationCurrent(last, source)) {
+      last = this.#restoreRetained(source, rev);
+      if (!last) return false;
+    }
     if (last.rev !== rev || last.inputEpoch !== this.inputEpoch) {
       last.rev = rev;
       last.inputEpoch = this.inputEpoch;
@@ -432,12 +491,20 @@ export class CanonicalRenderer {
 
   #syncInputPath(generation, file) {
     const resolved = path.resolve(file);
-    return generation?.syncInputMap?.get(resolved) ?? resolved;
+    const exact = generation?.syncInputMap?.get(resolved);
+    if (exact || !generation) return exact ?? resolved;
+    if (!generation.syncInputAliases && generation.syncInputMap) {
+      generation.syncInputAliases = new Map();
+      for (const [logical, recorded] of generation.syncInputMap) {
+        rememberSyncInputAlias(generation.syncInputAliases, this.#inputIdentity(logical), recorded);
+      }
+    }
+    return generation.syncInputAliases?.get(this.#inputIdentity(resolved)) ?? resolved;
   }
 
   #logicalInputPath(generation, file) {
     const resolved = path.resolve(file);
-    return generation?.syncOutputMap?.get(resolved) ?? resolved;
+    return generation?.syncOutputMap?.get(resolved) ?? originalSearchInput(resolved);
   }
 
   #resolveGeneration(id = null) {
@@ -471,8 +538,12 @@ export class CanonicalRenderer {
     if (!generation || generation.retired) return;
     generation.retired = true;
     const prefix = `${generation.id}:`;
-    for (const key of this.svgCache.keys()) {
-      if (key.startsWith(prefix)) this.svgCache.delete(key);
+    const svgOwner = generation.pdfHash ?? generation.id;
+    if (![...this.generations.values()].some(other => other !== generation &&
+        (other.pdfHash ?? other.id) === svgOwner)) {
+      for (const key of this.svgCache.keys()) {
+        if (key.startsWith(`${svgOwner}:`)) this.svgCache.delete(key);
+      }
     }
     this.textCache.delete(generation.id);
     this.textBoxCache.delete(generation.id);
@@ -484,6 +555,9 @@ export class CanonicalRenderer {
     }
     for (const key of this.syncTransformCache.keys()) {
       if (key.startsWith(prefix)) this.syncTransformCache.delete(key);
+    }
+    for (const key of this.sourcePageCache.keys()) {
+      if (key.startsWith(prefix)) this.sourcePageCache.delete(key);
     }
     if ((generation.readers ?? 0) === 0) this.#deleteGenerationFiles(generation);
   }
@@ -635,6 +709,7 @@ export class CanonicalRenderer {
   #clearGenerations() {
     for (const generation of this.generations.values()) this.#retireGeneration(generation);
     this.generations.clear();
+    this.digestedRoot = null;
     this.last = null;
     this.displayStaleSince = null;
     this.authorityStaleSince = null;
@@ -803,6 +878,33 @@ export class CanonicalRenderer {
     this.authorityResumeTimer = setTimeout(() => this.#resumeAuthority(), delay);
     this.authorityResumeTimer.unref?.();
     return true;
+  }
+
+  // Only carry verified page numbers into this exact job. It is checked again under the
+  // compiler lock; later input or an unrelated export cannot inherit it.
+  noteRepagination(rev, pagination) {
+    const job = this.pendingJob;
+    if (!job || job.rev !== rev || job.inputEpoch !== this.inputEpoch) return;
+    job.repaginated = true;
+    if (!pagination || this.last?.pageCount !== pagination.from || this.last.seedFiles?.aux !== pagination.before ||
+        !paginationAuxChange(pagination.before, pagination.after, pagination.from, pagination.to)) return;
+    job.pagination = { ...pagination, baseline: this.last.id };
+  }
+
+  #placePaginationSeed(job) {
+    const hint = job.pagination;
+    if (!hint || this.last?.id !== hint.baseline || job.inputEpoch !== this.inputEpoch) return false;
+    const aux = path.join(this.workDir, 'canon.aux');
+    const staged = aux + '.pagination-tmp';
+    try {
+      if (readFileSync(aux, 'utf8') !== hint.before) return false;
+      writeFileSync(staged, hint.after, 'utf8');
+      renameSync(staged, aux);
+      return true;
+    } catch {
+      try { rmSync(staged, { force: true }); } catch { /* preserve the normal compile */ }
+      return false;
+    }
   }
 
   /** Release a shipping foreground lease after replay rejects the revision. */
@@ -1087,6 +1189,8 @@ export class CanonicalRenderer {
       id,
       rev,
       srcHash: prepared.sourceHash,
+      rootDigest: this.#rootDigest(source),
+      rootLength: source.length,
       inputEpoch: prepared.inputEpoch,
       pdf: keptPdf,
       synctex: keptSynctex,
@@ -1154,6 +1258,7 @@ export class CanonicalRenderer {
       viewerWaitingMs: this.viewerWaitSince === null ? null : Date.now() - this.viewerWaitSince,
       error: this.lastError?.message ?? null,
       errorRev: this.lastError?.rev ?? 0,
+      ...(this.lastError?.code && { errorCode: this.lastError.code }),
       syncWarnings: this.last?.syncWarnings ?? [],
       authorityPaused: this.authorityPausedPids.size > 0,
       authorityChildren: this.authorityChildren.size,
@@ -1171,7 +1276,7 @@ export class CanonicalRenderer {
    * touches, and it does nothing but store the newest source and arm a
    * timer. The compile itself never blocks an edit.
    */
-  schedule(source, rev, { fallbackReason = null } = {}) {
+  schedule(source, rev, { fallbackReason = null, firstPaper = false } = {}) {
     if (this.disposed) return;
     // audit runs (fuzz on CI) compare provisional state only — a full
     // lualatex per engine would OOM a 7GB hosted runner for nothing
@@ -1227,7 +1332,11 @@ export class CanonicalRenderer {
     // page that needed canonical never got it while typing went on.
     const displayCadence = this.pressure !== 'authority' || Boolean(fallbackReason) ||
       this.viewerWaitSince !== null;
-    this.#armPending(this.delayFor(), { keepEarlier: displayCadence });
+    // On a real project open the reader is already waiting for the first
+    // sheet. Start its standalone typeset beside the resident boot walk.
+    // Edits, the boot sample and imported Build PDFs keep their own cadence.
+    const startBaseline = firstPaper && !this.last && !this.runningJob && !this.buildLease;
+    this.#armPending(startBaseline ? 0 : this.delayFor(), { keepEarlier: displayCadence });
   }
 
   /** The display paper has waited past displayMaxWaitMs for canonical. */
@@ -1350,6 +1459,15 @@ export class CanonicalRenderer {
     }, wait);
   }
 
+  // A paragraph in a short article should not wait out the idle window of
+  // a book. Use the last successful full compile as a measure of its cost.
+  // Even a cached, subsecond compile waits for a real pause in typing.
+  get idleMs() {
+    if (this.configuredIdleMs != null) return this.configuredIdleMs;
+    const cost = this.last?.ms;
+    return cost > 0 ? Math.min(30_000, Math.max(1500, 2 * cost)) : 30_000;
+  }
+
   /**
    * Delay before the next compile may start, measured from the LAST edit
    * (schedule() re-arms the timer on every edit, so this is an idle gate).
@@ -1360,7 +1478,18 @@ export class CanonicalRenderer {
    * use a short debounce plus a half-duty cost cooldown. Public for tests.
    */
   delayFor(job = this.pendingJob, { preserveIdleStart = false } = {}) {
-    const since = Date.now() - this.lastEndAt;
+    const now = Date.now();
+    const since = now - this.lastEndAt;
+    const demanded = this.#hasDisplayDemand(job);
+    const needsPDF = demanded && this.residentImpossibleDemandIds.size > 0;
+    // The viewer may spend part of this source revision's quiet period
+    // checking the resident layout. A definitive refusal must not restart
+    // that same debounce from the time its display request reached us.
+    const quiet = needsPDF && Number.isFinite(job.scheduledAt) ? Math.max(0, now - job.scheduledAt) : 0;
+    // A complete native replay already established that this PDF cannot
+    // paint the new page sequence. Only a waiting viewer gets the faster
+    // start; the cost cooldown below still limits sustained recompilation.
+    const displayWait = needsPDF && job.repaginated ? 0 : Math.max(0, this.displayDebounceMs - quiet);
     // One bounded exception to the display cooldown: the first canonical
     // baseline may land for revision N after an already-accepted edit made
     // revision N+1 the only presentable source. If that edit has no resident
@@ -1369,14 +1498,13 @@ export class CanonicalRenderer {
     // behind a successfully landed first baseline; later compiles retain the
     // normal duty-cycle bound. The credit persists across the first
     // baseline's result broadcast so a viewer's soft demand can escalate.
-    if (this.#hasColdBaselineCatchup(job) && this.#hasDisplayDemand(job) &&
-        this.residentImpossibleDemandIds.size) return this.displayDebounceMs;
-    if (this.pressure !== 'authority' || job?.fallbackReason || this.#hasDisplayDemand(job)) {
+    if (needsPDF && this.#hasColdBaselineCatchup(job)) return displayWait;
+    if (this.pressure !== 'authority' || job?.fallbackReason || demanded) {
       // canonical is needed for display — stay responsive on small
       // documents, but never let a long document compile back-to-back
-      if (!this.last?.ms) return this.displayDebounceMs;
+      if (!this.last?.ms) return displayWait;
       const cool = Math.min(this.last.ms * this.displayCooldownFactor, this.displayCooldownCapMs);
-      return Math.max(this.displayDebounceMs, cool - since);
+      return Math.max(displayWait, cool - since);
     }
     const elapsed = preserveIdleStart && Number.isFinite(job?.scheduledAt)
       ? Math.max(0, Date.now() - job.scheduledAt) : 0;
@@ -1411,7 +1539,7 @@ export class CanonicalRenderer {
     this.running = this.#compile({ source, rev, inputEpoch, compileEpoch })
       .catch((err) => {
         if (compileEpoch !== this.compileEpoch || err?.tdomSuperseded) return;
-        this.lastError = { rev, message: String(err?.message || err) };
+        this.lastError = { rev, message: String(err?.message || err), code: err?.code };
       })
       .finally(() => {
         this.running = null;
@@ -1534,6 +1662,7 @@ export class CanonicalRenderer {
         this.lastError = {
           rev: job.rev,
           message: String(err?.message || err),
+          code: err?.code,
           srcHash: this.#sourceHash(job.source, job.inputEpoch),
         };
         // execFile's wall timeout keeps advancing while SIGSTOP holds a
@@ -1606,14 +1735,15 @@ export class CanonicalRenderer {
     // package the preamble no longer loads wrote it): forget it and compile
     // once more from nothing, which is exactly the unseeded behaviour. The
     // failed run already removed its mutable aux files.
-    const seeded = this.projectSeedsPlaced === true;
+    const projectSeeded = this.projectSeedsPlaced === true;
+    const seeded = this.#placePaginationSeed(job) || projectSeeded;
     this.projectSeedsPlaced = false;
     try {
       return await this.#compileOnce(job);
     } catch (error) {
       const epoch = job.compileEpoch ?? this.compileEpoch;
       if (!seeded || error?.tdomSuperseded || this.disposed || epoch !== this.compileEpoch) throw error;
-      this.#dropProjectSeeds();
+      if (projectSeeded) this.#dropProjectSeeds();
       return this.#compileOnce(job);
     }
   }
@@ -1640,6 +1770,7 @@ export class CanonicalRenderer {
           }
         })
         .join(',');
+    const startedAt = Date.now();
     let passes = 0;
     let log = '';
     let before = auxState();
@@ -1671,7 +1802,9 @@ export class CanonicalRenderer {
     const pdf = path.join(this.workDir, 'canon.pdf');
     const pageCount = pageCountFrom(log);
     if (!existsSync(pdf) || !pageCount) {
-      throw new Error(texErrorFrom(log) || 'lualatex produced no PDF');
+      const error = new Error(texErrorFrom(log) || 'lualatex produced no PDF');
+      if (/^(?:warning\s+\(pdf backend\):\s*)?no pages of output\.\s*$/im.test(log)) error.code = 'TDOM_PREVIEW_NO_PAGES';
+      throw error;
     }
     // keep the PDF under a per-compile name: a page-SVG request racing the
     // NEXT compile must still read the pixels it was issued against
@@ -1695,13 +1828,18 @@ export class CanonicalRenderer {
     }
     // Only a compile no input change interrupted can vouch for the bytes it
     // read; otherwise the generation keeps epoch-only identity.
-    const inputManifest = inputEpoch === this.inputEpoch ? this.#inputManifestFromRecorder() : null;
+    const syncInputAliases = new Map();
+    const inputManifest = this.#inputManifestFromRecorder(syncInputAliases, inputEpoch === this.inputEpoch);
     const generation = {
       id,
       rev,
       srcHash,
+      rootDigest: this.#rootDigest(source),
+      rootLength: source.length,
       inputEpoch,
+      syncInputAliases,
       inputManifest,
+      startedAt,
       pdf: kept,
       synctex: hasSynctex ? keptSynctex : null,
       pdfHash: sha256File(kept),
@@ -1735,6 +1873,12 @@ export class CanonicalRenderer {
       this.lastError = null;
       return generation;
     } catch (error) {
+      // A failing package can have a macro-generated filename. Capture
+      // what TeX actually opened before its temporary recorder is removed.
+      if (this.onFailedInputs && !this.disposed && !error?.tdomSuperseded &&
+          compileEpoch === this.compileEpoch && inputEpoch === this.inputEpoch) {
+        try { this.onFailedInputs(this.#recordedProjectInputs() ?? [], rev, startedAt); } catch { /* keep the TeX error */ }
+      }
       try { this.#removeMutableCompileArtifacts(); } catch { /* preserve the compile error */ }
       throw error;
     }
@@ -1775,7 +1919,7 @@ export class CanonicalRenderer {
             cwd: project?.cwd ?? path.dirname(idx),
             timeout: INDEX_TOOL_TIMEOUT_MS,
             maxBuffer: 16 * 1024 * 1024,
-            env: withProjectInputs(process.env, { docDir: this.docDir, overlayDir: this.overlayDir, recursive: true }),
+            env: withProjectInputs(process.env, { docDir: this.docDir, sourceDir: this.sourceDir, overlayDir: this.overlayDir, recursive: true }),
           },
           { authority: background, buildHeavy: !background }
         );
@@ -1820,6 +1964,7 @@ export class CanonicalRenderer {
           maxBuffer: 64 * 1024 * 1024,
           env: withProjectInputs(process.env, {
             docDir: this.docDir,
+            sourceDir: this.sourceDir,
             overlayDir: this.overlayDir,
             recursive: true,
           }),
@@ -2188,9 +2333,38 @@ export class CanonicalRenderer {
     }
   }
 
-  async sourceEditBoxes({ file, page, startLine, endLine, id } = {}) {
-    if (!file || ![page, startLine, endLine, id].every(Number.isInteger) ||
-        page < 1 || startLine < 1 || endLine < startLine || endLine - startLine > 512) return null;
+  async #sourceBoxPage(cur, page) {
+    const key = `${cur.id}:${page}`;
+    if (this.sourcePageCache.has(key)) {
+      const sheet = this.sourcePageCache.get(key);
+      this.sourcePageCache.delete(key);
+      this.sourcePageCache.set(key, sheet);
+      return sheet;
+    }
+    cur.sourcePageReads ??= new Map();
+    if (!cur.sourcePageReads.has(page)) {
+      const read = readSyncTeXSourcePage(cur.synctex, page).then(sheet => {
+        if (sheet && sheet.bytes <= 1024 * 1024 && sheet.lines.length <= 16384 &&
+            !cur.retired && !this.disposed && !this.resetting) {
+          this.sourcePageCache.set(key, sheet);
+          if (this.sourcePageCache.size > 4) this.sourcePageCache.delete(this.sourcePageCache.keys().next().value);
+        }
+        return sheet;
+      }).finally(() => cur.sourcePageReads.delete(page));
+      cur.sourcePageReads.set(page, read);
+    }
+    return cur.sourcePageReads.get(page);
+  }
+
+  async sourceEditBoxes({ file, page, startLine, endLine, id, wholePage = false } = {}) {
+    if (!file || !Number.isInteger(id) || !Number.isInteger(page) || page < 1) return null;
+    if (wholePage) {
+      // One bounded physical sheet regardless of how many source lines
+      // belong to a longtable. The native reader caps output at 4096 boxes.
+      startLine = 1;
+      endLine = Number.MAX_SAFE_INTEGER;
+    } else if (![startLine, endLine].every(Number.isInteger) ||
+        startLine < 1 || endLine < startLine || endLine - startLine > 512) return null;
     const cur = this.#acquireGeneration(id);
     if (!cur) return null;
     try {
@@ -2200,10 +2374,9 @@ export class CanonicalRenderer {
       if (!cur.sourceBoxCache.has(key)) {
         let job;
         job = (async () => {
-          const compressed = await readFile(cur.synctex);
-          if (compressed.length > 8 * 1024 * 1024) return null;
-          const text = await gunzipP(compressed, { maxOutputLength: 256 * 1024 * 1024 });
-          const boxes = parseSyncTeXSourceBoxes(text.toString('utf8'), {
+          const sheet = await this.#sourceBoxPage(cur, page);
+          if (!sheet || this.disposed || this.resetting) return null;
+          const boxes = sourceBoxesOnPage(sheet, {
             file: this.#syncInputPath(cur, file), page, startLine, endLine,
           });
           if (!boxes || this.disposed || this.resetting) return null;
@@ -2364,7 +2537,7 @@ export class CanonicalRenderer {
     if (!cur) return null;
     const n = Number(page);
     if (!Number.isInteger(n) || n < 1 || n > cur.pageCount) return null;
-    const key = `${cur.id}:${n}`;
+    const key = `${cur.pdfHash ?? cur.id}:${n}`;
     if (this.svgCache.has(key)) {
       const svg = this.svgCache.get(key);
       this.svgCache.delete(key); // LRU refresh
@@ -2402,11 +2575,16 @@ export class CanonicalRenderer {
     return job;
   }
 
-  async pageTextBoxes(id = null) {
+  async pageTextBoxes(id = null, pageNumber = null) {
     const cur = this.#resolveGeneration(id);
-    if (!cur) return null;
-    if (this.textBoxCache.has(cur.id)) return this.textBoxCache.get(cur.id);
-    const pending = this.textBoxInFlight.get(cur.id);
+    if (!cur || pageNumber !== null && (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > cur.pageCount)) return null;
+    const full = this.textBoxCache.get(cur.id) ?? this.textBoxInFlight.get(cur.id);
+    if (full) {
+      const pages = await full;
+      return pages && pageNumber !== null ? pages.slice(pageNumber - 1, pageNumber) : pages;
+    }
+    const key = pageNumber === null ? cur.id : cur.id + ':' + pageNumber;
+    const pending = this.textBoxInFlight.get(key);
     if (pending) return pending;
 
     const generation = this.#acquireGeneration(cur.id);
@@ -2414,12 +2592,13 @@ export class CanonicalRenderer {
     let job;
     job = (async () => {
       try {
-        const result = await this.#exec('pdftotext', ['-bbox-layout', generation.pdf, '-'], {
+        const range = pageNumber === null ? [] : ['-f', String(pageNumber), '-l', String(pageNumber)];
+        const result = await this.#exec('pdftotext', [...range, '-bbox-layout', generation.pdf, '-'], {
           timeout: 60_000,
           maxBuffer: 64 * 1024 * 1024,
         });
         const pages = parsePdfTextBoxes(result.stdout || '');
-        if (!generation.retired) this.textBoxCache.set(generation.id, pages);
+        if (!generation.retired && pageNumber === null) this.textBoxCache.set(generation.id, pages);
         return pages;
       } catch {
         return null;
@@ -2427,9 +2606,9 @@ export class CanonicalRenderer {
         this.#releaseGeneration(generation);
       }
     })().finally(() => {
-      if (this.textBoxInFlight.get(cur.id) === job) this.textBoxInFlight.delete(cur.id);
+      if (this.textBoxInFlight.get(key) === job) this.textBoxInFlight.delete(key);
     });
-    this.textBoxInFlight.set(cur.id, job);
+    this.textBoxInFlight.set(key, job);
     return job;
   }
 
@@ -2501,9 +2680,9 @@ export class CanonicalRenderer {
   }
 
   /** The canonical PDF bytes (export path). */
-  pdfBytes() {
-    if (!this.last) return null;
-    return readFileSync(this.last.pdf);
+  pdfBytes(id = null) {
+    const generation = this.#resolveGeneration(id);
+    return generation ? readFileSync(generation.pdf) : null;
   }
 
   /** Mark non-source inputs dirty. The next schedule/ensure compiles again
@@ -2521,6 +2700,14 @@ export class CanonicalRenderer {
         }
       }
     }
+    // Saves and restores can preserve file size, inode and timestamp. A
+    // reported change requires fresh bytes before retained paper can match.
+    if (paths) {
+      for (const logical of paths) {
+        this.inputHashCache.delete(logical);
+        this.inputHashCache.delete(this.#effectiveInputPath(logical));
+      }
+    } else this.inputHashCache.clear();
     this.inputInvalidations.set(this.inputEpoch, paths);
     while (this.inputInvalidations.size > INPUT_INVALIDATION_MAX) {
       this.inputInvalidations.delete(this.inputInvalidations.keys().next().value);
@@ -2538,7 +2725,7 @@ export class CanonicalRenderer {
    * pages or aux files. Abort an in-flight compile, drop only this renderer's
    * canon artifacts, and retarget TeX's search root.
    */
-  async resetDocument(docDir = this.docDir, overlayDir = this.overlayDir) {
+  async resetDocument(docDir = this.docDir, overlayDir = this.overlayDir, sourceDir = docDir) {
     this.resetting = true;
     this.compileEpoch++;
     clearTimeout(this.authorityResumeTimer);
@@ -2573,7 +2760,10 @@ export class CanonicalRenderer {
       this.buildHeavyChildren.clear();
       this.buildPausedPids.clear();
       this.docDir = path.resolve(docDir);
+      this.sourceDir = sourceDir;
       this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
+      this.realInputDocDir = existingRealpath(this.docDir);
+      this.realInputOverlayDir = this.overlayDir && existingRealpath(this.overlayDir);
       this.projectSeedKey = null;
       this.projectSeedsPlaced = false;
       this.#clearGenerations();
@@ -2591,6 +2781,7 @@ export class CanonicalRenderer {
 
   dispose() {
     this.disposed = true;
+    forgetSyncTeXBatchHelper(this.workDir);
     this.compileEpoch++;
     clearTimeout(this.authorityResumeTimer);
     this.authorityResumeTimer = null;
@@ -2626,6 +2817,11 @@ export class CanonicalRenderer {
     this.#clearGenerations();
     this.#removeWorkArtifacts();
   }
+}
+
+function rememberSyncInputAlias(aliases, logical, recorded) {
+  const unique = !aliases.has(logical) || aliases.get(logical) === recorded;
+  aliases.set(logical, unique ? recorded : null);
 }
 
 function existingRealpath(value) {

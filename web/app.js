@@ -81,6 +81,7 @@ const workspacePaneEl = document.getElementById('workspace-pane');
 const previewPaneEl = document.getElementById('preview-pane');
 const initialParams = new URLSearchParams(location.search);
 const embeddedHost = initialParams.get('embed') === '1';
+let embeddedViewport = () => null;
 const embedActivationId = initialParams.get('activationId') ?? '';
 
 let splitRatio = 48;
@@ -144,6 +145,7 @@ let mathCaretProbe = null;
 let mathCaretProbeSeq = 0;
 const mathCaretOffsetCache = new Map();
 const canonicalTextBoxesCache = new Map();
+const canonicalPageWordsCache = new Map();
 const canonicalGlyphCache = new Map();
 const canonicalSourceBoxCache = new Map();
 const chunkGlyphCache = new Map();
@@ -161,17 +163,18 @@ async function canonicalGlyphs(pageNumber, id) {
   }
   return canonicalGlyphCache.get(key);
 }
-async function canonicalSourceEditBoxes(pageNumber, id, region) {
+async function canonicalSourceEditBoxes(pageNumber, id, region, wholePage = false) {
   const source = region?.source;
-  if (!source?.file || !Number.isInteger(source.start?.line) || !Number.isInteger(source.end?.line)) return [];
+  if (!source?.file || !wholePage && (!Number.isInteger(source.start?.line) || !Number.isInteger(source.end?.line))) return [];
   const epoch = documentReset.adoptedEpoch;
   if (documentReset.pending) return [];
-  const key = `${epoch}:${id}:${pageNumber}:${source.file}:${source.start.line}:${source.end.line}`;
+  const range = wholePage ? { wholePage: true } : { startLine: source.start.line, endLine: source.end.line };
+  const key = `${epoch}:${id}:${pageNumber}:${source.file}:${wholePage ? 'page' : range.startLine + ':' + range.endLine}`;
   if (!canonicalSourceBoxCache.has(key)) {
     const pending = fetch('/canonical/source-boxes', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id, page: pageNumber, documentEpoch: epoch, file: source.file,
-        startLine: source.start.line, endLine: source.end.line }),
+        ...range }),
     }).then(r => r.ok ? r.json() : null).then(data =>
       data?.id === id && data?.page === pageNumber && data?.documentEpoch === epoch &&
       !documentReset.pending && documentReset.adoptedEpoch === epoch ? data.boxes ?? [] : []).catch(() => []);
@@ -189,6 +192,7 @@ const documentReset = new window.TdomDocumentResetCoordinator({ hostRequired: em
 let resetBootInFlight = false;
 const presentedDomSnapshots = new Map();
 const presentedDomFetches = new Map();
+const canonicalPageRetries = new WeakMap();
 const opaqueCanonicalBatches = new Map();
 let opaqueBatchCommitDepth = 0;
 let shipWaveBatch = null;
@@ -225,6 +229,7 @@ const shipPages = new Map();
 let appliedSrcRev = 0;
 const pageDirtyRev = new Map(); // page -> srcRev of the last provisional patch
 let lastRemoveRev = 0; // srcRev of the last provisional remove-pages patch
+let documentStartSrcRev = null;
 let canonicalAnchorPreview = null;
 let canonicalAnchorPendingPatch = null;
 const canonicalAnchorEditStartedAt = new Map(); // srcRev -> inferred server-accept time on renderer clock
@@ -562,13 +567,12 @@ async function ensurePresentedDomSnapshot(id, rev, epoch = documentReset.adopted
   const key = presentedSnapshotKey(numericId, numericRev, epoch);
   if (presentedDomSnapshots.has(key)) return presentedDomSnapshots.get(key);
   if (presentedDomFetches.has(key)) return presentedDomFetches.get(key);
-  const pending = fetch('/dom', { cache: 'no-store' })
-    .then((response) => response.ok ? response.json() : null)
+  const cached = provisionalSnapshotCache.get(`${epoch}:${numericRev}`);
+  const pending = (cached ?? fetch(`/dom?srcRev=${numericRev}&printedEpoch=${epoch}`, { cache: 'no-store' })
+    .then((response) => response.ok ? response.json() : null))
     .then((snapshot) => {
-      // /dom always describes the current editor source. It is a valid hit
-      // map for a canonical generation only while both source revisions are
-      // identical. Keeping this immutable snapshot lets an already printed
-      // page resolve a second location while the next compile is pending.
+      // An already captured revision or a new response must describe the
+      // exact source of the printed generation before it can map clicks.
       if (!snapshot || snapshot.sourceCurrent === false || Number(snapshot.srcRev) !== numericRev ||
           Number(snapshot.documentEpoch) !== epoch || documentReset.adoptedEpoch > epoch) return null;
       presentedDomSnapshots.set(key, snapshot);
@@ -637,6 +641,7 @@ function beginClientDocumentReset(epoch) {
   if (!documentReset.begin(epoch)) return false;
   deferredDirectPresentationEvents.length = 0;
   deferredDirectPresentationCommits.clear();
+  shipGlyphCache.clear();
   provisionalStages.clear();
   committedPageSrcs.clear();
   pageEditGroup.clear();
@@ -649,11 +654,13 @@ function beginClientDocumentReset(epoch) {
   cancelDirectOpenings();
   closeDirectEditor();
   directEditRevisits.length = 0;
+  retirePendingFormulas();
   if (embeddedHost) {
     window.parent.postMessage({
       source: 'tdom-embed',
       activationId: embedActivationId,
       action: 'reset-pending',
+      viewport: embeddedViewport(),
       documentEpoch: Number(epoch),
     }, '*');
   }
@@ -669,6 +676,7 @@ function adoptDoc(doc) {
   cancelDirectOpenings();
   closeDirectEditor();
   directEditRevisits.length = 0;
+  retirePendingFormulas();
   cancelObsoleteOpaqueBatches();
   geometry = doc.geometry;
   backend = doc.backend ?? 'checkpoint';
@@ -696,6 +704,7 @@ function adoptDoc(doc) {
   previewReasons = doc.previewReasons ?? [];
   document.body.classList.toggle('is-opaque-document', usesCanonicalSurface());
   canonical = doc.canonical ?? null;
+  documentStartSrcRev = doc.documentStartSrcRev ?? null;
   if (shipWaveBatch) cancelShipWaveBatch(shipWaveBatch);
   shipPages.clear();
   appliedRev = doc.report.rev;
@@ -753,6 +762,23 @@ function displayListSrcs(dl) {
     if (cmd.src && !String(cmd.src).startsWith('_')) srcs.add(cmd.src); // '_…' is page furniture
   }
   return srcs;
+}
+
+// A failed native job can reuse the last galley's chunk with a different
+// reveal mask. Keep the actual page and its matching click map when that is
+// its only change. A moved block, new picture or changed neighbour must paint.
+function onlyRejectedInkChanged(previous, next, rejected) {
+  if (!previous || !rejected.size || previous.commands.length !== next.commands.length) return false;
+  return next.commands.every((cmd, i) => {
+    const old = previous.commands[i];
+    if (old === cmd) return true;
+    if (cmd.op === 'chunk' && old.op === 'chunk' && cmd.src === old.src && rejected.has(cmd.src)) {
+      const { show: oldMask, ...oldInk } = old;
+      const { show: newMask, ...newInk } = cmd;
+      return JSON.stringify(oldInk) === JSON.stringify(newInk);
+    }
+    return JSON.stringify(old) === JSON.stringify(cmd);
+  });
 }
 
 /** Staged pages that must change together (docs/04 §4.5): consecutive
@@ -918,8 +944,12 @@ function stageProvisionalPatches(patches, flash, pageCount = null, editIds = nul
   queueMicrotask(tryCommitProvisionalStages);
 }
 
+function holdingDirectOpeningPaper() {
+  return Boolean(openingDirectInput?.sink && !openingDirectInput.waitingForShipMap);
+}
+
 function directPresentationBlocked() {
-  return Boolean(openingDirectInput?.sink) || flushingDirectPresentation;
+  return holdingDirectOpeningPaper() || flushingDirectPresentation;
 }
 
 function shippingPresentationBlocked() {
@@ -1024,18 +1054,18 @@ function scheduleViewportWarm({ owedOnly = false } = {}) {
 }
 
 function flushDirectPresentationUpdates() {
-  if (openingDirectInput?.sink || flushingDirectPresentation || documentReset.pending) return;
+  if (holdingDirectOpeningPaper() || flushingDirectPresentation || documentReset.pending) return;
   // Replay source events in order, while keeping their intermediate surfaces
   // offscreen. Delta patches cannot be replaced by only the last event.
   flushingDirectPresentation = true;
   try {
-    while (deferredDirectPresentationEvents.length && !openingDirectInput?.sink) {
+    while (deferredDirectPresentationEvents.length && !holdingDirectOpeningPaper()) {
       deferredDirectPresentationEvents.shift()();
     }
   } finally {
     flushingDirectPresentation = false;
   }
-  if (openingDirectInput?.sink || documentReset.pending) return;
+  if (holdingDirectOpeningPaper() || documentReset.pending) return;
   for (const pageNumber of pageDivs.keys()) updateCanonState(pageNumber);
   for (const batch of opaqueCanonicalBatches.values()) tryCommitOpaqueCanonicalBatch(batch);
   tryCommitProvisionalStages();
@@ -1196,10 +1226,23 @@ function tryCommitProvisionalStages() {
         held: [...new Set(dl.commands.filter(cmd => cmd.op === 'chunk' && cmd.held && !cmd.part).map(cmd => cmd.src))],
         parts: dl.commands.filter(cmd => cmd.op === 'chunk' && cmd.part).length }
       : { sourceRev });
-    committedPageSrcs.set(dl.page, stage.srcs ?? displayListSrcs(dl));
+    const srcs = stage.srcs ?? displayListSrcs(dl);
+    committedPageSrcs.set(dl.page, srcs);
     pageEditGroup.delete(dl.page);
     let div = pageDivs.get(dl.page);
     if (!div) div = ensureShell(dl.page);
+    const prior = div.paintedResidentPage;
+    if (prior && snapshot.rejectedBlocks?.length && !provisionalRemovedPages.size && !pageCountMismatch &&
+        residentPageCount === pageDivs.size && prior.width === stage.paperWidth && prior.height === stage.paperHeight) {
+      const rejected = new Set(snapshot.rejectedBlocks.filter(id => srcs.has(id)));
+      if (onlyRejectedInkChanged(prior.dl, dl, rejected)) {
+        div.dataset.provNativeHold = '1';
+        delete div.dataset.provPending;
+        continue;
+      }
+    }
+    delete div.dataset.provNativeHold;
+    div.paintedResidentPage = { dl, width: stage.paperWidth, height: stage.paperHeight };
     const committedSvg = div.querySelector(':scope > svg:not(.tdom-canonical-delta)');
     let stagedSvg = staging.firstElementChild?.localName === 'svg' ? staging.firstElementChild : null;
     // (the lines that did not change keep their elements: patchProvisionalSvg)
@@ -1226,6 +1269,7 @@ function tryCommitProvisionalStages() {
     div.querySelectorAll('.chunkwin').forEach(e => e.remove());
     div.append(...staging.childNodes);
     div.provisionalEpoch = (div.provisionalEpoch ?? 0) + 1;
+    retirePendingFormulas(div);
     div.provisionalSnapshot = snapshot;
     div.dataset.prov = '1';
     div.dataset.provRev = String(sourceRev);
@@ -1353,6 +1397,7 @@ function provisionalStageKeepsEditor(stage, region) {
       sourceContainsPosition({ source }, region.source.start) && sourceContainsPosition({ source }, region.source.end)));
   if (owners.length !== 1) return false;
   const owner = owners[0];
+  if (stage.snapshot.rejectedBlocks?.includes(owner.id)) return false;
   const identical = (owner.editRegions ?? []).filter(item => item.kind === session.kind &&
     directEditValuesEqual(session.kind, item.value, region.value));
   // A same-valued neighbor cannot prove that the edited occurrence stayed
@@ -1379,6 +1424,7 @@ function provisionalChunkGlyphs(commands, chunks) {
   for (const command of commands) {
     if (command.op !== 'chunk') continue;
     const data = chunks[index++];
+    for (const glyph of command.partGlyphs ?? []) glyphs.push({ ...glyph, sourceId: command.src });
     if (command.held || !(data?.width > 0)) continue;
     const scale = command.w / data.width;
     const top = command.y - command.sy;
@@ -1526,6 +1572,7 @@ function renderPage(dl, flash, mayDefer = false) {
       `<div class="chunkwin${cmd.st ? ' stale' : ''}${cmd.held ? ' held' : ''}${cmd.part ? ' part' : ''}" data-src="${cmd.src}"${cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`} style="left:${(cmd.x / W) * 100}%;top:${(cmd.y / H) * 100}%;width:${(cmd.w / W) * 100}%;height:${(cmd.h / H) * 100}%;${chunkShowClip(cmd)}">` +
         `<img class="chunk" src="${chunkImageSrc(cmd)}" style="${part}margin-top:-${shiftPct}%" draggable="false"></div>`
     );
+    if (cmd.partGlyphs) staging.lastElementChild.partGlyphs = cmd.partGlyphs;
   }
   const ready = () => {
     if (provisionalStages.get(dl.page) !== stage || usesCanonicalSurface() ||
@@ -1551,7 +1598,8 @@ function renderPage(dl, flash, mayDefer = false) {
   // block's chunk is new on every keystroke. With no editor on the paper the
   // stage does not wait for it; a click loads a chunk's geometry when it
   // needs it (loadChunkInputGeometry).
-  const chunkGeometry = directEditor ? Promise.all(images.map(loadChunkInputGeometry)).then(chunks => {
+  const chunkGeometry = directEditor ? Promise.all(images.map(img =>
+    img.parentElement.classList.contains('held') ? null : loadChunkInputGeometry(img))).then(chunks => {
     stage.glyphs = provisionalChunkGlyphs(dl.commands, chunks);
   }) : null;
   if (Array.isArray(globalThis.__tdomStageTrace)) {
@@ -1636,6 +1684,13 @@ function pieceOfCommand(cmd) {
 }
 function commandMarkup(cmd) {
   const lineAttr = cmd.line == null ? '' : ` data-line="${escapeXml(String(cmd.line))}"`;
+  if (cmd.op === 'canonical-tail') {
+    if (![cmd.x, cmd.y, cmd.w, cmd.h, cmd.dx].every(Number.isFinite) || !(cmd.w > 0 && cmd.h > 0) ||
+        !Number.isSafeInteger(cmd.page) || !Number.isSafeInteger(cmd.generation)) return '';
+    const source = `/canonical/${cmd.page}.svg?c=${cmd.generation}`;
+    const id = `tdom-tail-${cmd.page}-${cmd.generation}-${cmd.x}-${cmd.y}`;
+    return `<g transform="translate(${cmd.dx} 0)" pointer-events="none"><clipPath id="${id}"><rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}"/></clipPath><image clip-path="url(#${id})" width="${geometry.paperwidth}" height="${geometry.paperheight}" href="${source}"/></g>`;
+  }
   if (cmd.op === 'glyphs') {
     let fontAttrs;
     if (cmd.fam) {
@@ -1657,6 +1712,14 @@ function commandMarkup(cmd) {
   }
   if (cmd.op === 'rule' && cmd.w > 0 && cmd.h > 0) {
     return `<rect x="${cmd.x}" y="${cmd.y}" width="${cmd.w}" height="${cmd.h}" fill="${cmd.color || '#1a1a1a'}"${cmd.ov ? OVER_TEXT_ATTRS : ` data-src="${cmd.src}"${lineAttr}${cmd.edit ? ` data-edit="${escapeXml(cmd.edit)}"` : ''}`}/>`;
+  }
+  if (cmd.op === 'chunk' && cmd.partRule) {
+    const [x, y, w, h] = cmd.partRule;
+    return `<rect class="tdom-source-hit" x="${x}" y="${y}" width="${w}" height="${h}" fill="transparent" stroke="transparent" stroke-width="1" data-src="${cmd.src}"${lineAttr} data-math="1" data-part="rule"/>`;
+  }
+  if (cmd.op === 'chunk' && cmd.partGlyphs?.length) {
+    const first = cmd.partGlyphs[0], last = cmd.partGlyphs.at(-1);
+    return `<rect class="tdom-source-hit" x="${first.left}" y="${first.top}" width="${last.right - first.left}" height="${first.bottom - first.top}" fill="transparent" data-src="${cmd.src}"${lineAttr} data-math="1" data-part="1"/>`;
   }
   if (cmd.op === 'editbox') {
     return `<rect class="tdom-edit-hit" x="${cmd.x}" y="${cmd.y}" width="${Math.max(cmd.w, 0.5)}" height="${Math.max(cmd.h, 0.5)}" fill="transparent" data-src="${cmd.src}" data-edit="${escapeXml(cmd.edit)}"/>`;
@@ -1749,7 +1812,7 @@ function removePagesFrom(from) {
 }
 
 function applyReport(report) {
-  if (openingDirectInput?.sink) {
+  if (holdingDirectOpeningPaper()) {
     deferredDirectPresentationEvents.push(() => applyReport(report));
     return;
   }
@@ -1760,6 +1823,7 @@ function applyReport(report) {
   injectFonts(report.fonts);
   appliedRev = report.rev;
   appliedSrcRev = report.srcRev ?? appliedSrcRev;
+  openingDirectInput?.checkShipMap?.();
   const wasCanonicalSurface = usesCanonicalSurface();
   previewPolicy = report.previewPolicy ?? previewPolicy;
   previewReasons = report.previewReasons ?? previewReasons;
@@ -1898,11 +1962,17 @@ function applyReport(report) {
   for (const patch of provisionalPatches) {
     if (patch.type === 'replace-page') updateCanonState(patch.displayList.page);
   }
+  void previewSourceFormula(report).catch(() => {});
   updateBadge();
 }
 
-function clearCanonicalAnchorPreview() {
+function removeCanonicalDeltaLayers() {
+  for (const [key, ink] of pendingFormulas) if (ink.slot.anchorRev) forgetPendingFormula(key);
   pagesEl.querySelectorAll('svg.tdom-canonical-delta').forEach((node) => node.remove());
+}
+
+function clearCanonicalAnchorPreview() {
+  removeCanonicalDeltaLayers();
   canonicalAnchorPreview = null;
   canonicalAnchorPendingPatch = null;
 }
@@ -1919,6 +1989,7 @@ function discardPendingCanonicalAnchor() {
  * Only the committed delta goes; a newer anchor still pending (addressed to
  * this very image) is retried instead of being dropped with it. */
 function retireCanonicalAnchorOnPage(div, presentedRev) {
+  retirePendingFormulas(div);
   const anchor = canonicalAnchorPreview;
   if (!anchor?.retiring || !(Number(presentedRev) >= Number(anchor.targetSrcRev ?? anchor.srcRev))) return;
   div.querySelectorAll('svg.tdom-canonical-delta').forEach((node) => node.remove());
@@ -1982,7 +2053,9 @@ function tryApplyPendingCanonicalAnchor() {
       const mask = pagePatch.masks[index];
       if (!mask || ![mask.left, mask.top, mask.right, mask.bottom].every(Number.isFinite)) return false;
       const baseMask = patch.visualCut === true ? pagePatch.baseMasks[index] : null;
-      const background = canonicalAnchorBackground(page, mask, baseMask);
+      const tail = pagePatch.commands?.find(command => command.op === 'canonical-tail' &&
+        command.y === baseMask?.top && command.x >= baseMask.left && command.x + command.w <= baseMask.right);
+      const background = canonicalAnchorBackground(page, mask, baseMask, tail);
       if (!background) {
         // A solid mask is exact only when the canonical ink sits on a locally
         // uniform background. Gradients, artwork, and frames fail closed.
@@ -2007,8 +2080,9 @@ function tryApplyPendingCanonicalAnchor() {
     discardPendingCanonicalAnchor();
     return false;
   }
-  pagesEl.querySelectorAll('svg.tdom-canonical-delta').forEach((node) => node.remove());
+  removeCanonicalDeltaLayers();
   for (const transaction of transactions) {
+    for (const [key, ink] of pendingFormulas) if (ink.sourceSnapshot && ink.page === transaction.page) forgetPendingFormula(key);
     transaction.page.insertAdjacentHTML(
       'beforeend',
       svgFor({ page: transaction.pageNumber, commands: transaction.commands }, 'tdom-canonical-delta')
@@ -2023,7 +2097,7 @@ function tryApplyPendingCanonicalAnchor() {
     baseGeneration: patch.baseGeneration,
     baseRev: patch.baseRev,
     visualCut: patch.visualCut === true,
-    pages: pagePatches.map((page) => ({ page: page.page })),
+    pages: pagePatches.map(page => ({ page: page.page, tails: page.commands?.filter(c => c.op === 'canonical-tail') ?? [] })),
   };
   canonicalAnchorPendingPatch = null;
   for (const { page } of transactions) {
@@ -2032,9 +2106,59 @@ function tryApplyPendingCanonicalAnchor() {
     requestAnimationFrame(() => page.classList.add('fading'));
     setTimeout(() => page.classList.remove('patched', 'fading'), 1200);
   }
+  if (directEditor?.committedIme) paintDirectSelection();
   updateBadge();
   reportCanonicalAnchorPresented(patch, pagePatches, committedAt);
-  fulfillCanonicalDisplay();
+  const session = directEditor;
+  const editorPage = pagePatches.find(p => p.page === session?.pageNumber);
+  if (session?.sentEdit && session.kind === 'text' && editorPage && session.geometryValue !== session.readValue()) {
+    void followTextAnchor(session, patch, editorPage).catch(() => false).then(followed => {
+      if (directEditor !== session || appliedSrcRev !== patch.srcRev) return;
+      if (followed) fulfillCanonicalDisplay();
+      else requestCanonicalDisplay({ residentImpossible: usesCanonicalSurface() });
+    });
+  } else fulfillCanonicalDisplay();
+  return true;
+}
+
+// An anchor redraw may arrive long before the next PDF. The focused
+// editor needs the geometry of the text the user actually sees, including
+// untouched lines from the immutable PDF underneath the printed delta.
+async function followTextAnchor(session, patch, pagePatch) {
+  const page = pageDivs.get(session.pageNumber);
+  const svg = page?.querySelector(':scope > svg.tdom-canonical-delta');
+  const base = session.printedTextMap;
+  if (!svg || !base || base.id !== patch.baseGeneration || patch.visualCut) return false;
+  const snapshot = await loadProvisionalSnapshot(patch.srcRev).catch(() => null);
+  if (!snapshot || Number(snapshot.srcRev) !== patch.srcRev || !svg.isConnected || directEditor !== session ||
+      documentReset.pending || Number(snapshot.documentEpoch) !== documentReset.adoptedEpoch ||
+      appliedSrcRev !== patch.srcRev || Number(page.dataset.canonPresentedId) !== base.id) return false;
+  const region = directEditorRegionInSnapshot(snapshot, session);
+  if (!region) return false;
+  const owner = snapshot.blocks.find(block => block.editRegions?.some(r => r.id === region.id &&
+    directSourceRangeKey(r) === directSourceRangeKey(region)));
+  if (!owner || !(patch.blockIds ?? [patch.blockId]).includes(owner.id) ||
+      owner.editRegions.filter(item => item.kind === 'text' && printedKey(item.value) === printedKey(region.value)).length !== 1) return false;
+  const nodes = [...svg.querySelectorAll('text[data-src]')].filter(node => node.dataset.src === owner.id &&
+    node.dataset.math !== '1' && !node.hasAttribute('data-font-pending'));
+  if (!nodes.length) return false;
+  const original = base.map.filter(g => !pagePatch.masks.some(box => {
+    const x = (g.left + g.right) / 2;
+    return x >= box.left && x <= box.right && g.baseline >= box.top && g.baseline <= box.bottom;
+  }));
+  // A single horizontal run per baseline gives a unique reading order.
+  // A column break or a repeated phrase falls back to the full PDF map.
+  if (base.map.some((g, i, a) => i && g.baseline < a[i - 1].baseline - 0.25)) return false;
+  const { glyphs } = directSvgGeometry(page, nodes);
+  if (!glyphs.length) return false;
+  const combined = [...original, ...glyphs.map(g => ({ ...g, fromAnchor: true }))].sort((a, b) =>
+    Math.abs(a.baseline - b.baseline) <= 0.25 ? a.left - b.left : a.baseline - b.baseline);
+  const matches = window.TdomDirectEditGeometry.textMaps(region.value, combined);
+  if (matches.length !== 1 || !matches[0].map.some(g => g.fromAnchor)) return false;
+  session.glyphMap = matches[0].map;
+  session.geometryValue = region.value;
+  paintDirectSelection();
+  alignOpaqueNativeCaretAnchor();
   return true;
 }
 
@@ -2088,7 +2212,7 @@ function canonicalAnchorWithinDeadline(patch) {
     performance.now() - startedAt < limit;
 }
 
-function canonicalAnchorBackground(page, mask, baseMask = null) {
+function canonicalAnchorBackground(page, mask, baseMask = null, tail = null) {
   const image = page?.querySelector('img.canon');
   if (!image?.naturalWidth || !image?.naturalHeight) return null;
   let cached = canonicalAnchorCanvasCache.get(image);
@@ -2168,18 +2292,19 @@ function canonicalAnchorBackground(page, mask, baseMask = null) {
     } catch {
       return null;
     }
-    if (!raster.ringPixelsUniform({
-      data: imageData.data,
-      width: imageData.width,
-      height: imageData.height,
-      originX: pixelLeft,
-      originY: pixelTop,
-      sx,
-      sy,
-      mask,
-      baseMask,
-      background: rgb,
-    })) return null;
+    const pixels = {
+      data: imageData.data, width: imageData.width, height: imageData.height,
+      originX: pixelLeft, originY: pixelTop, sx, sy, background: rgb,
+    };
+    if (!raster.ringPixelsUniform({ ...pixels, mask, baseMask })) return null;
+    if (tail) {
+      // A PDF advance is not an ink boundary (italic overhang, punctuation).
+      // Copy the printed tail only when its four cutting edges are blank.
+      const crop = { left: tail.x, right: tail.x + tail.w, top: tail.y, bottom: tail.y + tail.h };
+      const interior = { left: crop.left + 0.4, right: crop.right - 0.4,
+        top: crop.top + 0.4, bottom: crop.bottom - 0.4 };
+      if (!raster.ringPixelsUniform({ ...pixels, mask: crop, baseMask: interior })) return null;
+    }
   }
   return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
 }
@@ -2220,6 +2345,27 @@ function applyCanonicalAnchorPatch(patch, { allowVisualCut = false } = {}) {
 
 // ------------------------------------------------- canonical (exact) layer
 
+// The first visible page can be only a strip above the page the reader is
+// using. Keep that first page for viewport handoff; the toolbar follows a
+// visible edit, then the page with the largest fraction in view.
+function activePaperPage(first, last, pageAt, viewport, editor) {
+  const editBox = editor?.element?.matches(':focus-within') ? editor.element.getBoundingClientRect() : null;
+  const editingInView = editBox && editBox.bottom > viewport.top && editBox.top < viewport.bottom;
+  let best = first, fraction = 0;
+  for (let n = first; n <= last; n++) {
+    const page = pageAt(n);
+    if (!page) continue;
+    const rect = page.getBoundingClientRect();
+    if (rect.top >= viewport.bottom) break;
+    const overlap = Math.min(rect.bottom, viewport.bottom) - Math.max(rect.top, viewport.top);
+    if (overlap <= 0 || rect.height <= 0) continue;
+    if (editingInView && editor.element.parentElement === page) return n;
+    const visible = overlap / Math.min(rect.height, viewport.bottom - viewport.top);
+    if (visible > fraction) { best = n; fraction = visible; }
+  }
+  return best;
+}
+
 function activePaperGeometry(page = null) {
   const displayedWidth = Number(page?.dataset?.canonPaperW);
   const displayedHeight = Number(page?.dataset?.canonPaperH);
@@ -2252,10 +2398,12 @@ function activePaperGeometry(page = null) {
 
 function prepareOpaqueShell(div) {
   if (!div || !usesCanonicalSurface()) return;
-  div.querySelector(':scope > svg')?.remove();
+  div.querySelector(':scope > svg:not(.tdom-canonical-delta)')?.remove();
   div.querySelectorAll('.chunkwin').forEach((element) => element.remove());
   div.classList.remove('patched', 'fading');
   delete div.dataset.prov;
+  delete div.dataset.provNativeHold;
+  div.paintedResidentPage = null;
   const current = div.querySelector('img.canon');
   div.classList.toggle('awaiting-canonical', !current);
   // Never stretch old exact pixels to a new compile's paper size. Existing
@@ -2464,7 +2612,8 @@ function rememberDirectEditorRevisit(session) {
   if (old >= 0) directEditRevisits.splice(old, 1);
   directEditRevisits.push({ epoch: documentReset.adoptedEpoch, sessionId: session.sessionId,
     displayRegion, displaySourceText, sourceRegion: session.sourceRegion, sourceText: session.sourceText,
-    value: String(session.readValue()), replacement: session.kind === 'math'
+    value: String(session.readValue()), fieldValue: session.kind === 'math' ? session.control.value : null,
+    replacement: session.kind === 'math'
       ? session.formattedSource : latexEscapeText(session.readValue()),
     tokens: session.revisitTokens, offsets: session.revisitOffsets });
   let cost = directEditRevisits.reduce((sum, item) => sum + item.sourceText.length + item.displaySourceText.length, 0);
@@ -2474,12 +2623,14 @@ function rememberDirectEditorRevisit(session) {
   }
 }
 
-async function restoreDirectEditorRevisit(session, opening, offset) {
+async function restoreDirectEditorRevisit(session, opening, offset, pendingHit = null) {
   const record = session.revisit;
   if (!record) return offset;
   const reply = await session.presentationAnchorDone;
   if (directEditor !== session || opening && openingDirectInput !== opening) return null;
-  if (!reply || reply.baseValue !== record.replacement || !Number.isInteger(record.offsets[offset])) return null;
+  const editedOffset = pendingHit?.sessionId === record.sessionId && pendingHit.value === record.value
+    ? pendingHit.offset : record.offsets[offset];
+  if (!reply || reply.baseValue !== record.replacement || !Number.isInteger(editedOffset)) return null;
   const region = { ...session.sourceRegion, value: record.value, sourceValue: reply.baseValue,
     source: { file: reply.file, start: reply.start, end: reply.end } };
   // Parsing the retained model must preserve every logical boundary before
@@ -2504,7 +2655,12 @@ async function restoreDirectEditorRevisit(session, opening, offset) {
     start: record.offsets[glyph.start], end: record.offsets[glyph.end] }))
     .filter(glyph => Number.isInteger(glyph.start) && Number.isInteger(glyph.end) && glyph.end > glyph.start);
   session.geometryValue = session.lastVisibleValue;
-  return record.offsets[offset];
+  const ink = pendingHit?.ink ?? [...pendingFormulas.values()].find(item => item.sessionId === record.sessionId);
+  if (ink) {
+    session.formulaSlot = ink.slot;
+    session.formulaBasis = ink.basis;
+  }
+  return editedOffset;
 }
 
 function requestDirectEditorPresentationAnchor(session) {
@@ -2645,7 +2801,7 @@ async function stageDirectEditorForOpaqueBatch(batch) {
       }
     : { page: session.pageNumber };
   let bounds = session.kind === 'text'
-    ? await canonicalTextRegionBounds(region, snapshot, batch.id)
+    ? await canonicalTextRegionBounds(region, snapshot, batch.id, session.pageNumber)
     : await canonicalSourceBounds(region, null, batch.id, near);
   // (an inline formula SyncTeX cannot place, opened by its ink, is followed
   // into the new generation the same way: resolveOpaqueEditRegion, inlineMathUnderPoint)
@@ -2976,10 +3132,19 @@ function tryCommitOpaqueCanonicalBatch(batch) {
   for (const [, entry] of [...batch.expected].sort((a, b) => a[0] - b[0])) {
     entry.apply();
   }
+  if (directEditor?.committedIme) paintDirectSelection();
   committedCanonicalGeneration = { id: batch.id, rev: batch.rev, epoch: batch.documentEpoch, pageCount: batch.pageCount,
     residentLayoutCompatible: provisionalDisplayLists.size === batch.pageCount && !provisionalPendingLayout.size };
   resyncPendingLayout();
-  for (const [page, dl] of provisionalDisplayLists) committedPageSrcs.set(page, displayListSrcs(dl));
+  for (const [page, dl] of provisionalDisplayLists) {
+    committedPageSrcs.set(page, displayListSrcs(dl));
+    const div = pageDivs.get(page);
+    if (div) {
+      delete div.dataset.provNativeHold;
+      div.paintedResidentPage = committedCanonicalGeneration.residentLayoutCompatible && !usesCanonicalSurface()
+        ? { dl, width: geometry.paperwidth, height: geometry.paperheight } : null;
+    }
+  }
   pageEditGroup.clear();
   provisionalStages.clear();
   provisionalRemovedPages.clear();
@@ -3095,6 +3260,12 @@ function tryCommitShipWaveBatch(batch) {
  */
 function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
   const current = div.querySelector('img.canon');
+  const retry = canonicalPageRetries.get(div);
+  if (retry && (retry.src !== src || retry.rev !== generation?.rev || current?.dataset.src === src)) {
+    clearTimeout(retry.timer);
+    canonicalPageRetries.delete(div);
+    delete div.dataset.canonRetries;
+  }
   const activeShipBatch = generation?.shipWaveKey && shipWaveBatch?.key === generation.shipWaveKey
     ? shipWaveBatch
     : null;
@@ -3161,6 +3332,9 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
     return current;
   }
   canonicalStageObserver?.unobserve(div);
+  // Layout updates still register their visible pages with the generation
+  // barrier, but only the retry timer may start the next image request.
+  if (!activeShipBatch && canonicalPageRetries.get(div)?.timer) return current;
   if (div.dataset.canonPending === src) return current;
   div.dataset.canonPending = src;
 
@@ -3192,8 +3366,12 @@ function queueCanonicalImageSwap(div, src, paper = null, generation = null) {
     if (div.dataset.canonWanted === src && div.isConnected) {
       const attempts = Number(div.dataset.canonRetries ?? 0) + 1;
       div.dataset.canonRetries = String(attempts);
-      window.setTimeout(() => {
-        if (div.dataset.canonWanted === src && !div.dataset.canonPending) {
+      const next = { src, rev: generation?.rev, timer: null };
+      canonicalPageRetries.set(div, next);
+      next.timer = window.setTimeout(() => {
+        next.timer = null;
+        if (div.isConnected && canonicalPageRetries.get(div) === next &&
+            div.dataset.canonWanted === src && !div.dataset.canonPending) {
           updateCanonState(Number(div.dataset.page));
         }
       }, Math.min(3000, 150 * 2 ** Math.min(attempts - 1, 5)));
@@ -3323,12 +3501,12 @@ function syncCanonical() {
   if (canonical && canonical.id) {
     // Dirty marks are retired with the actual generation commit. Metadata
     // can precede image decode and a newer edit by several event turns.
-    // Canonical-only pages (beyond the provisional count) get shells only
-    // when this compile covers the CURRENT source.  After /open, the cold
-    // renderer can still describe the previous document for the idle
-    // debounce window; letting that stale pageCount create shells briefly
-    // resurrected old pages (for example a 1-page document showed /2).
-    if (canonical.rev >= appliedSrcRev && canonical.rev >= lastRemoveRev) {
+    // On an empty viewport the opening revision identifies the first PDF
+    // belonging to this document. Later page-count changes wait for the
+    // current source, so older layouts cannot bring deleted pages back.
+    const firstPaper = !pageDivs.size && Number.isSafeInteger(documentStartSrcRev) &&
+      canonical.rev >= documentStartSrcRev && !documentReset.pending;
+    if (firstPaper || (canonical.rev >= appliedSrcRev && canonical.rev >= lastRemoveRev)) {
       for (let n = 1; n <= canonical.pageCount; n++) {
         if (!pageDivs.has(n)) ensureShell(n);
       }
@@ -3370,6 +3548,10 @@ function updateCanonState(n) {
   if (directPresentationBlocked()) return;
   const div = pageDivs.get(n);
   if (!div) return;
+  // Starting a paper edit pauses new replay waves. Keep the visible PDF
+  // until the replacement also covers the source under the user's caret.
+  if ((shippingPresentationBlocked() || openingDirectInput?.waitingForShipMap) &&
+      presentedShippingPageState(div)?.rev > (canonical?.rev ?? 0)) return;
   const anchorCanonical = canonicalAnchorForPage(n);
   if (anchorCanonical) {
     // A canonical compile for an intermediate keystroke may arrive while a
@@ -3439,7 +3621,7 @@ function updateCanonState(n) {
     targetSrc && img?.dataset.src === targetSrc && div.dataset.canonPresentedSrc === targetSrc
   );
   const retainingCanonical = img && div.classList.contains('is-final') && (
-    div.dataset.provPending === '1' || targetSrc || canonical?.id && n > canonical.pageCount
+    div.dataset.provPending === '1' || div.dataset.provNativeHold === '1' || targetSrc || canonical?.id && n > canonical.pageCount
   );
   const emptyCanonicalFallback = !fresh &&
     emptyStructuredCanonicalFallback(n, div, img);
@@ -3874,13 +4056,13 @@ function mathRowEnd(value, wantedRow) {
 }
 
 function preserveMathAuxCommands(baseValue, nextValue) {
-  const base = String(baseValue ?? '');
+  const base = window.TdomMathMacros.withoutComments(String(baseValue ?? ''));
   let next = String(nextValue ?? '');
   const auxiliaries = [];
-  const pattern = /\\(?:label\{(?:[^{}]|\\.)*\}|(?:notag|nonumber)\b)/g;
+  const pattern = /(\\(?:label\{(?:[^{}]|\\.)*\}|(?:notag|nonumber)\b))|\\(?:[A-Za-z@]+|[\s\S])|%[^\n]*/g;
   let match;
   while ((match = pattern.exec(base))) {
-    if (!next.includes(match[0])) {
+    if (match[1] && !next.includes(match[0])) {
       auxiliaries.push({ command: match[0], row: mathRowAt(base, match.index) });
     }
   }
@@ -3893,10 +4075,14 @@ function preserveMathAuxCommands(baseValue, nextValue) {
   return next;
 }
 
-function mathSourceTokens(value) {
+function mathSourceTokens(value, comments = null) {
   const text = String(value ?? ''), tokens = [], textModes = [false];
-  for (const match of text.matchAll(/\\(?:[A-Za-z@]+|[\s\S])|[\s\S]/gu)) {
+  for (const match of text.matchAll(/\\(?:[A-Za-z@]+|[\s\S])|%[^\n]*(?:\n[ \t]*)?|[\s\S]/gu)) {
     const token = match[0], at = match.index;
+    if (token[0] === '%') {
+      comments?.push({ tokenIndex: tokens.length, index: at, text: token });
+      continue;
+    }
     if (token === '{') textModes.push(textModes.at(-1) || /\\(?:text(?:normal|rm|sf|tt|bf|it|sl|sc|up)?|operatorname|begin|end)\*?\s*$/.test(text.slice(0, at)));
     if (!/\s/u.test(token) || token.startsWith('\\') || textModes.at(-1)) tokens.push(match);
     if (token === '}' && textModes.length > 1) textModes.pop();
@@ -3917,15 +4103,36 @@ function directEditValuesEqual(kind, a, b) {
   return JSON.stringify(printedTokens(a)) === JSON.stringify(printedTokens(b));
 }
 
+// If MathLive renames a command or normalizes braces, the original tokens
+// may no longer provide splice offsets. Keep comments at token boundaries so
+// they cannot split a new control word or swallow the unchanged suffix.
+function restoreMathComments(next, original, after, comments) {
+  if (!comments.length) return next;
+  let head = 0, tail = 0;
+  while (head < original.length && head < after.length && original[head][0] === after[head][0]) head++;
+  while (tail < original.length - head && tail < after.length - head &&
+      original[original.length - tail - 1][0] === after[after.length - tail - 1][0]) tail++;
+  let result = '', cursor = 0;
+  for (const note of comments) {
+    const slot = note.tokenIndex <= head ? note.tokenIndex :
+      note.tokenIndex >= original.length - tail ? after.length - (original.length - note.tokenIndex) : after.length - tail;
+    const at = slot ? after[slot - 1].index + after[slot - 1][0].length : 0;
+    result += next.slice(cursor, at) + note.text;
+    if (at < next.length && !note.text.includes('\n')) result += '\n';
+    cursor = at;
+  }
+  return result + next.slice(cursor);
+}
+
 // Keep source line breaks/spacing when MathLive only changes a local span.
 // Its initial serialization often removes all display-environment newlines;
 // sending that normalization as an edit invalidates unrelated source lines.
 function preserveMathSourceLayout(raw, previous, next) {
   raw = String(raw ?? ''); previous = String(previous ?? ''); next = String(next ?? '');
-  const before = mathSourceTokens(previous), after = mathSourceTokens(next), original = mathSourceTokens(raw);
+  const comments = [], before = mathSourceTokens(previous), after = mathSourceTokens(next), original = mathSourceTokens(raw, comments);
   // This splice needs identical source tokens, including virtual markers.
   // Printed-value equality intentionally ignores empty MathLive placeholders.
-  if (JSON.stringify(before.map(token => token[0])) !== JSON.stringify(original.map(token => token[0]))) return next;
+  if (JSON.stringify(before.map(token => token[0])) !== JSON.stringify(original.map(token => token[0]))) return restoreMathComments(next, original, after, comments);
   if (previous === next) return raw;
   let start = 0, end = before.length, newEnd = after.length;
   while (start < end && start < newEnd && before[start][0] === after[start][0]) start++;
@@ -3946,13 +4153,20 @@ function preserveMathSourceLayout(raw, previous, next) {
       /\s/u.test(next.slice(after[newEnd - 1].index + after[newEnd - 1][0].length, after[newEnd].index))) inserted += ' ';
   if (!inserted && start > 0 && start < after.length && /\\[A-Za-z]+$/.test(prefix) && /^[A-Za-z]/.test(suffix) &&
       /\s/u.test(next.slice(after[start - 1].index + after[start - 1][0].length, after[start].index))) inserted = ' ';
-  const candidate = prefix + inserted + suffix;
+  const inside = comments.filter(note => note.index >= rawStart && note.index < rawEnd);
+  const notes = inside.map(note => note.text).join('');
+  // A swallowed end-of-line followed by the old closing line can become a
+  // blank paragraph inside display math. Keep the replacement on that line.
+  const beforeClosingLine = notes && /^[ \t]*[\r\n]/.test(suffix);
+  const candidate = beforeClosingLine && inserted
+    ? prefix + notes + inserted + suffix
+    : prefix + inserted + notes + (beforeClosingLine ? suffix.replace(/^[ \t]*\r?\n/, '') : suffix);
   // A structural edit can pair unrelated braces as a common suffix, moving
   // harmless outer whitespace into an environment name or text argument.
   // Preserve formatting only when the resulting source still tokenizes as
   // the requested value; otherwise use the unchanged MathLive serialization.
   return JSON.stringify(mathSourceTokens(candidate).map(token => token[0])) ===
-    JSON.stringify(after.map(token => token[0])) ? candidate : next;
+    JSON.stringify(after.map(token => token[0])) ? candidate : restoreMathComments(next, original, after, comments);
 }
 
 function shouldWrapAligned(value) {
@@ -4282,13 +4496,15 @@ async function editRegionById(id, page = null) {
   const snapshot = await editSnapshotForPage(page);
   for (const block of snapshot.blocks ?? []) {
     const region = (block.editRegions ?? []).find((item) => item.id === id);
-    if (region) return { ...region, blockSource: block.source ?? null };
+    if (region) return page && !usesDirectEditSurface(page) && snapshot.rejectedBlocks?.includes(block.id)
+      ? null : { ...region, blockSource: block.source ?? null };
   }
   return null;
 }
 
 async function editBlockBySourceId(id, page = null) {
   const snapshot = await editSnapshotForPage(page);
+  if (page && !usesDirectEditSurface(page) && snapshot.rejectedBlocks?.includes(id)) return null;
   return (snapshot.blocks ?? []).find((block) => block.id === id) ?? null;
 }
 
@@ -4478,21 +4694,25 @@ async function canonicalSourceBounds(region, pageNumber = null, requestedId = ca
   return sourceRows ? { ...selected, sourceRows } : selected;
 }
 
-async function canonicalTextBoxes(requestedId = canonical?.id) {
+async function canonicalTextBoxes(requestedId = canonical?.id, page = null) {
   const id = Number(requestedId);
   if (!Number.isFinite(id)) return [];
-  if (canonicalTextBoxesCache.has(id)) return canonicalTextBoxesCache.get(id);
+  const full = canonicalTextBoxesCache.get(id);
+  if (full) return page === null ? full : full.slice(page - 1, page);
+  const cache = page === null ? canonicalTextBoxesCache : canonicalPageWordsCache;
+  const key = page === null ? id : id + ':' + page;
+  if (cache.has(key)) return cache.get(key);
   try {
-    const response = await fetch(`/canonical/boxes?c=${id}`, { cache: 'no-store' });
+    const response = await fetch(`/canonical/boxes?c=${id}${page === null ? '' : '&page=' + page}`, { cache: 'no-store' });
     if (!response.ok) return [];
     // Poppler already returns word rectangles after page `/Rotate`; do not
     // rotate them again. Their space is the canonical SVG viewport.
     const pages = (await response.json()).pages ?? [];
     // Cache under the ID that was actually requested, never whichever
     // canonical happened to become global while the request was awaiting.
-    canonicalTextBoxesCache.set(id, pages);
-    while (canonicalTextBoxesCache.size > 4) {
-      canonicalTextBoxesCache.delete(canonicalTextBoxesCache.keys().next().value);
+    cache.set(key, pages);
+    while (cache.size > (page === null ? 4 : 16)) {
+      cache.delete(cache.keys().next().value);
     }
     return pages;
   } catch {
@@ -4500,37 +4720,35 @@ async function canonicalTextBoxes(requestedId = canonical?.id) {
   }
 }
 
-async function canonicalTextMatches(value, pageNumber = null, requestedId = canonical?.id) {
-  const wanted = printedKey(value);
-  if (!wanted) return [];
-  const pages = await canonicalTextBoxes(requestedId);
+function textMatchesOnPage(wanted, words, pageNumber) {
   const matches = [];
-  const pageIndexes = Number.isInteger(pageNumber)
-    ? [pageNumber - 1]
-    : pages.map((_, index) => index);
-  for (const pageIndex of pageIndexes) {
-    const words = pages[pageIndex] ?? [];
-    for (let start = 0; start < words.length; start++) {
-      let joined = '';
-      for (let end = start; end < words.length && joined.length <= wanted.length; end++) {
-        joined += printedKey(words[end].text);
-        if (joined === wanted) {
-          const group = words.slice(start, end + 1);
-          matches.push({
-            page: pageIndex + 1,
-            left: Math.min(...group.map((item) => item.left)),
-            top: Math.min(...group.map((item) => item.top)),
-            right: Math.max(...group.map((item) => item.right)),
-            bottom: Math.max(...group.map((item) => item.bottom)),
-            words: group,
-          });
-          break;
-        }
-        if (!wanted.startsWith(joined)) break;
+  for (let start = 0; start < words.length; start++) {
+    let joined = '';
+    for (let end = start; end < words.length && joined.length <= wanted.length; end++) {
+      joined += printedKey(words[end].text);
+      if (joined === wanted) {
+        const group = words.slice(start, end + 1);
+        matches.push({
+          page: pageNumber,
+          left: Math.min(...group.map((item) => item.left)),
+          top: Math.min(...group.map((item) => item.top)),
+          right: Math.max(...group.map((item) => item.right)),
+          bottom: Math.max(...group.map((item) => item.bottom)),
+          words: group,
+        });
+        break;
       }
+      if (!wanted.startsWith(joined)) break;
     }
   }
   return matches;
+}
+
+async function canonicalTextMatches(value, pageNumber = null, requestedId = canonical?.id) {
+  const wanted = printedKey(value);
+  if (!wanted) return [];
+  const pages = await canonicalTextBoxes(requestedId, pageNumber);
+  return pages.flatMap((words, index) => textMatchesOnPage(wanted, words, pageNumber ?? index + 1));
 }
 
 async function canonicalTextBounds(value, pageNumber = null, near = null, requestedId = canonical?.id) {
@@ -4559,19 +4777,32 @@ async function canonicalTextRegionMappings(selected, snapshot, requestedId) {
   if (!selected?.source || !snapshot || !printedKey(selected.value)) return [];
   const epoch = documentReset.adoptedEpoch;
   if (documentReset.pending || Number(snapshot.documentEpoch) !== epoch) return [];
+  const valueKey = printedKey(selected.value);
   const identical = new Map();
+  const mixedOwner = new Map();
+  let sourceCopies = 0, soleOwner = null;
   for (const block of snapshot.blocks ?? []) {
+    const mixed = block.type === 'paragraph' &&
+      block.sourceRanges?.some(range => sameSourceFile(range.file, selected.source.file)) &&
+      block.sourceRanges.some(range => !sameSourceFile(range.file, selected.source.file));
     for (const region of block.editRegions ?? []) {
-      if (region.kind === 'text' && printedKey(region.value) === printedKey(selected.value) &&
-          sameSourceFile(region.source?.file, selected.source.file)) {
-        identical.set(directSourceRangeKey(region), { ...region, blockSource: block.source ?? null });
-      }
+      if (region.kind !== 'text' || printedKey(region.value) !== valueKey) continue;
+      sourceCopies++;
+      soleOwner = block;
+      if (!mixed && !sameSourceFile(region.source?.file, selected.source.file)) continue;
+      const key = directSourceRangeKey(region);
+      // A repeated inclusion can put one source span in more than one place.
+      // Only a uniquely owned span has a known position in its paragraph.
+      if (mixed || mixedOwner.has(key)) mixedOwner.set(key, identical.has(key) ? null : block);
+      identical.set(key, { ...region, blockSource: block.source ?? null });
     }
   }
   // Escaped text may be represented by a proven combined source span.
   if (!identical.has(directSourceRangeKey(selected))) identical.set(directSourceRangeKey(selected), selected);
-  const regions = [...identical.values()].sort((a, b) =>
-    a.source.start.line - b.source.start.line || a.source.start.column - b.source.start.column);
+  const regions = [...identical.values()];
+  const owners = regions.map(region => mixedOwner.get(directSourceRangeKey(region)));
+  const inOneMixedParagraph = choices => Boolean(owners[choices[0]]) &&
+    choices.every(index => owners[index] === owners[choices[0]]);
   const key = `text-mapping:${epoch}:${requestedId}:${printedKey(selected.value)}:` + JSON.stringify(regions.map(directSourceRangeKey));
   if (canonicalRegionBoundsCache.has(key)) return canonicalRegionBoundsCache.get(key);
   const matches = await canonicalTextMatches(selected.value, null, requestedId);
@@ -4587,6 +4818,11 @@ async function canonicalTextRegionMappings(selected, snapshot, requestedId) {
     body: JSON.stringify({ id: requestedId, locations }),
   }).then(response => response.ok ? response.json() : null).catch(() => null);
   if (!forward?.results?.length || documentReset.pending || documentReset.adoptedEpoch !== epoch) return [];
+  // A paragraph with inline math can forward-map only to the formula and a
+  // continuation line. In that case the inverse blank-line record still
+  // supplies the printed paragraph boxes for both text and formula.
+  const uniqueParagraph = regions.length === 1 && matches.length === 1 && sourceCopies === 1 &&
+    soleOwner.type === 'paragraph';
   const occurrences = [];
   for (const printBounds of matches) {
     const word = printBounds.words[0];
@@ -4595,19 +4831,36 @@ async function canonicalTextRegionMappings(selected, snapshot, requestedId) {
       probeOwners[result?.locationIndex] === index && Number(result.page) === printBounds.page &&
       x >= result.box?.left - 2 && x <= result.box?.right + 2 &&
       word.bottom >= result.box?.top - 2 && word.top <= result.box?.bottom + 2) ? [index] : []);
-    if (!choices.length) continue;
+    if (!choices.length && !uniqueParagraph) continue;
     const location = await fetch('/synctex', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id: requestedId, page: printBounds.page,
         x, y: (word.top + word.bottom) / 2 }),
     }).then(response => response.ok ? response.json() : null).catch(() => null);
     if (documentReset.pending || documentReset.adoptedEpoch !== epoch) return [];
+    if (!choices.length) {
+      const region = regions[0];
+      const paragraph = region.blockSource;
+      if (location?.lineText !== '' || !sameSourceFile(location.file, region.source.file) ||
+          !sameSourceFile(paragraph?.file, location.file) || location.line !== region.source.end.line + 1 ||
+          !sourceNearLine(paragraph, location, 1) ||
+          !sourceNearLine(paragraph, { file: region.source.file, line: region.source.start.line })) continue;
+      const anchors = (location.anchors ?? []).filter(a => a.page === printBounds.page && a.box);
+      const inParagraph = printBounds.words.every(w => anchors.some(({ box }) =>
+        (w.left + w.right) / 2 >= box.left && (w.left + w.right) / 2 <= box.right &&
+        (w.top + w.bottom) / 2 >= box.top && (w.top + w.bottom) / 2 <= box.bottom));
+      const sharesBox = forward.results.some(r => r.page === printBounds.page && r.box &&
+        anchors.some(({ box }) => ['left', 'right', 'top', 'bottom'].every(k => Math.abs(r.box[k] - box[k]) < 0.01)));
+      if (!inParagraph || !sharesBox) continue;
+      choices = [0];
+    }
     // Paragraph-end SyncTeX nodes often report the following blank line.
     // Forward boxes prove the source span; a compatible inverse location
     // can narrow it, but a line-only mismatch must not discard that proof.
-    if (sameSourceFile(location?.file, selected.source.file) &&
-        Number.isInteger(Number(location.line)) && Number(location.line) > 0) {
-      const precise = choices.filter(index => sourceContainsPosition(regions[index], location));
+    if (location?.file && Number.isInteger(Number(location.line)) && Number(location.line) > 0 &&
+        (Number(location.column) > 1 || !inOneMixedParagraph(choices))) {
+      const precise = choices.filter(index => sameSourceFile(regions[index].source.file, location.file) &&
+        sourceContainsPosition(regions[index], location));
       if (precise.length) choices = precise;
     }
     occurrences.push({ printBounds, location, choices });
@@ -4637,13 +4890,18 @@ async function canonicalTextRegionMappings(selected, snapshot, requestedId) {
     const choices = occurrence.choices;
     const group = occurrences.filter(item => !assigned.has(item) &&
       JSON.stringify(item.choices) === JSON.stringify(choices));
-    const line = regions[choices[0]].source.start.line;
-    // A line-only inverse mapping can cover several identical fragments.
-    // Only a complete, nonoverlapping same-line group has a source/PDF order.
-    if (group.length !== choices.length ||
-        choices.some((index, at) => regions[index].source.start.line !== line || regions[index].source.end.line !== line ||
-          at > 0 && regions[choices[at - 1]].source.end.column > regions[index].source.start.column)) return [];
-    group.forEach((item, at) => assigned.set(item, choices[at]));
+    if (group.length !== choices.length) return [];
+    // The inspector and Poppler both enumerate a paragraph in expanded
+    // reading order. Source line numbers restart in each included file.
+    let ordered = choices;
+    if (!inOneMixedParagraph(choices)) {
+      ordered = [...choices].sort((a, b) => regions[a].source.start.column - regions[b].source.start.column);
+      const first = regions[ordered[0]].source;
+      if (ordered.some((index, at) => !sameSourceFile(regions[index].source.file, first.file) ||
+          regions[index].source.start.line !== first.start.line || regions[index].source.end.line !== first.start.line ||
+          at > 0 && regions[ordered[at - 1]].source.end.column > regions[index].source.start.column)) return [];
+    }
+    group.forEach((item, at) => assigned.set(item, ordered[at]));
     choices.forEach(index => remaining.delete(index));
   }
   if (remaining.size) return [];
@@ -4655,14 +4913,42 @@ async function canonicalTextRegionMappings(selected, snapshot, requestedId) {
   return result;
 }
 
-async function canonicalTextRegionBounds(region, snapshot, requestedId) {
+async function canonicalTextRegionBounds(region, snapshot, requestedId, previousPage) {
+  const source = region.source;
+  if (source && region.value === (region.sourceValue ?? region.value)) {
+    // The same phrase may appear thousands of times throughout a book.
+    // When the owner is on one sheet, follow its exact source row through
+    // the new generation before asking SyncTeX about every printed copy.
+    const owners = snapshot.blocks.filter(block => block.editRegions?.some(item => item.kind === 'text' &&
+      item.source?.file === source.file && item.source.start.line === source.start.line &&
+      item.source.start.column === source.start.column && item.source.end.line === source.end.line &&
+      item.source.end.column === source.end.column));
+    const owner = owners.length === 1 ? owners[0] : null;
+    if (owner?.type === 'paragraph' && owner.editRegions.filter(item =>
+        item.kind === 'text' && item.source.file === source.file && item.source.start.line <= source.end.line && item.source.end.line >= source.start.line &&
+        printedKey(item.value) === printedKey(region.value)).length === 1) {
+      if (source.start.line === source.end.line && owner.pages?.length === 1) {
+        const page = owner.pages[0];
+        const [boxes, glyphs, sheets] = await Promise.all([canonicalSourceEditBoxes(page, requestedId, region),
+          canonicalGlyphs(page, requestedId), canonicalTextBoxes(requestedId, page)]);
+        if (documentReset.pending || snapshot.documentEpoch !== documentReset.adoptedEpoch) return null;
+        const found = boxes.filter(row => !row.empty && row.parentKind === 'vbox' && row.line === source.start.line)
+          .map(row => textOnNativeRow(region, row, page, glyphs, sheets[0] ?? [])).filter(Boolean);
+        if (found.length === 1) return found[0].printBounds;
+      }
+      if (Number.isInteger(previousPage)) {
+        const match = await textAtParagraphEnd(region, snapshot, previousPage, requestedId);
+        if (match) return match.printBounds;
+      }
+    }
+  }
   const mappings = await canonicalTextRegionMappings(region, snapshot, requestedId);
   return mappings.find(item => directSourceRangeKey(item.region) === directSourceRangeKey(region))?.printBounds ?? null;
 }
 
 async function canonicalWordAtPoint(pageNumber, point, requestedId = canonical?.id) {
   if (!Number.isInteger(pageNumber) || !point) return null;
-  const words = (await canonicalTextBoxes(requestedId))[pageNumber - 1] ?? [];
+  const words = (await canonicalTextBoxes(requestedId, pageNumber))[0] ?? [];
   const readingIndex = words.findIndex((word) =>
     point.x >= word.left - 1 && point.x <= word.right + 1 &&
     point.y >= word.top - 2 && point.y <= word.bottom + 2
@@ -4712,7 +4998,7 @@ async function refreshDirectEditorExactBounds(pageNumber) {
   if (!currentRegion || !directEditValuesEqual(session.kind, printedValue, value)) return;
   let bounds = null;
   if (session.kind === 'text') {
-    bounds = await canonicalTextRegionBounds(currentRegion, presented.snapshot, presented.id);
+    bounds = await canonicalTextRegionBounds(currentRegion, presented.snapshot, presented.id, pageNumber);
     if (bounds?.page !== pageNumber) return;
   } else {
     bounds = await canonicalSourceBounds(currentRegion, pageNumber, presented.id, session.printBounds ? {
@@ -4773,39 +5059,130 @@ function sourceDistanceToRegion(region, location) {
   return 0;
 }
 
-// The inline formulas of the paragraph SyncTeX named, each with its printed
-// copy, for a paragraph whose formulas SyncTeX itself cannot place.
-// `location` is SyncTeX's answer for a point of the paragraph: the line it
-// gave (which the paragraph's block holds, or which ended the paragraph just
-// after it) and the boxes that carry that line (`anchors`), which for the
-// line that ended a paragraph are the paragraph's printed lines. The
-// formulas are found by their ink. Each formula's own glyphs (as a math
-// field lays them out) are looked for among the glyphs printed there, and a
-// formula is taken only when it is printed there exactly as many times as
-// the source has it: then the copies, in reading order, are the source's
-// formulas in their order. Anything else printed alike (a digit in the
-// prose, a reference number) makes the count differ, and that formula is
-// left out.
-async function inlineMathCopies(snapshot, location, pageNumber, id, stillCurrent) {
+function sourceNearLine(source, location, trailingLines = 0) {
+  return sameSourceFile(source?.file, location.file) &&
+    Number.isInteger(source?.start?.line) && Number.isInteger(source?.end?.line) &&
+    source.start.line <= location.line && location.line <= source.end.line + trailingLines;
+}
+
+function mixedParagraphsAtLine(snapshot, location, pageNumber) {
+  if (!location?.file) return [];
+  return (snapshot.blocks ?? []).filter(block => block.type === 'paragraph' && block.pages?.includes(pageNumber) &&
+    block.sourceRanges?.some(range => sourceNearLine(range, location)) &&
+    block.sourceRanges.some(range => !sameSourceFile(range.file, location.file)));
+}
+
+async function inlineSourceLineBoxes(pageNumber, id, block, line) {
+  // Explicit \par commands can leave thousands of source lines in one
+  // inspector block. The native query accepts ranges spanning at most 512
+  // lines. Its enclosing row and child boxes are local to the printed sheet.
+  const source = block.source;
+  const region = source.end.line - source.start.line > 512
+    ? { source: { file: source.file, start: { line }, end: { line } } } : block;
+  return inlineSourceRows(await canonicalSourceEditBoxes(pageNumber, id, region), line);
+}
+
+function inlineSourceRows(boxes, line) {
+  const parents = new Set(boxes.filter(box => box.line === line && box.parentKind === 'hbox').map(box => box.parentId));
+  return boxes.filter(box => !box.empty && (box.line === line || parents.has(box.id)));
+}
+
+function singleLineInk(map, page, unique) {
+  const baseline = map[0]?.baseline;
+  if (!Number.isFinite(baseline) || !map.every(g => Math.abs(g.baseline - baseline) < 0.5)) return null;
+  return { ...inkBounds(map, page), baseline, unique };
+}
+
+// The same ink can have several TeX spellings. A complete inline formula
+// between two identified prose runs on one printed line has a source witness
+// even when counting copies of the literal formula cannot distinguish them.
+function witnessedInlineFormula(group, occurrence, textInk, candidates, snapshot, glyphs) {
+  const bounds = inkBounds(occurrence.map, occurrence.pageNumber);
+  const centers = occurrence.map.map(atom => (atom.top + atom.bottom) / 2);
+  const midline = (bounds.top + bounds.bottom) / 2;
+  const regions = group.filter(region => {
+    const index = candidates.findIndex(item => item.id === region.id);
+    const left = candidates[index - 1], right = candidates[index + 1];
+    const before = textInk.get(left), after = textInk.get(right);
+    if (region.display || !before || !after || !(before.unique || after.unique) ||
+        before.page !== bounds.page || after.page !== bounds.page ||
+        Math.abs(before.baseline - after.baseline) > 0.5 ||
+        before.right > bounds.left || after.left < bounds.right ||
+        midline < before.top || midline > before.bottom || midline < after.top || midline > after.bottom) return false;
+    // Both words can repeat elsewhere on a sheet. The interval they
+    // identify must contain only this copy, including after a line reflow.
+    // Font boxes on tightly spaced lines overlap. Their glyph centers
+    // distinguish the neighboring numerator or denominator from this row.
+    const rowCenter = (before.top + before.bottom) / 2;
+    const top = Math.min(rowCenter, ...centers) - 0.1, bottom = Math.max(rowCenter, ...centers) + 0.1;
+    if (glyphs.some(g => {
+      const x = (g.left + g.right) / 2, y = (g.top + g.bottom) / 2;
+      return x > before.right && x < after.left && y >= top && y <= bottom &&
+        !occurrence.map.some(atom => x >= atom.left && x <= atom.right && y >= atom.top && y <= atom.bottom);
+    })) return false;
+    const source = region.source;
+    if (left.source.file !== source.file || right.source.file !== source.file ||
+        source.start.line !== source.end.line || left.source.end.line !== source.start.line ||
+        right.source.start.line !== source.end.line) return false;
+    const text = sourceTextForRegion(snapshot, region);
+    if (text === undefined) return false;
+    const start = lineColToOffset(text, source.start.line, source.start.column);
+    const end = start + String(region.sourceValue ?? region.value).length;
+    const open = text.slice(start + left.source.end.column - source.start.column, start).trim();
+    const close = text.slice(end, end + right.source.start.column - source.end.column).trim();
+    return open === '$' && close === '$' || open === '\\(' && close === '\\)';
+  });
+  return regions.length === 1 ? regions[0] : null;
+}
+
+// Match MathLive's complete expression against the glyphs on SyncTeX's
+// source row. Copies correspond in reading order when their counts agree;
+// otherwise the adjacent printed prose must identify the source expression.
+async function inlineMathCopies(snapshot, location, pageNumber, id, stillCurrent, sourceValue = null, forwardRows = null, requireProse = false, measureStructures = false, printedGlyphs = null) {
   const geometry = window.TdomDirectEditGeometry;
   const Mathfield = customElements.get('math-field');
   const line = Number(location?.line);
   if (!geometry?.mathMaps || !Mathfield || !Number.isFinite(line)) return [];
-  const printedLines = (location.anchors ?? []).filter(item => Number(item.page) === pageNumber && item.box &&
+  // SyncTeX may assign an entire paragraph to the last included file.
+  // The inspector emits regions in expanded input order, including when
+  // an inclusion returns to an earlier line in its parent file.
+  const mixed = mixedParagraphsAtLine(snapshot, location, pageNumber);
+  if (mixed.length > 1) return [];
+  const blocks = snapshot?.blocks ?? [];
+  const exact = blocks.filter(block => block.type === 'paragraph' &&
+    block.editRegions?.some(region => region.kind === 'math' && !region.display && sourceNearLine(region.source, location)));
+  // SyncTeX can name the blank line ending a paragraph. Only extend the
+  // source search onto that line if it names no inline formula itself.
+  // Otherwise identical formulas two lines earlier inflate the copy count.
+  // Reverse SyncTeX can include a whole-column vbox alongside the real
+  // line. In repeated paragraphs that would count unrelated copies too.
+  const rows = forwardRows ?? (sourceValue === null && !mixed.length && exact.length === 1
+    ? await inlineSourceLineBoxes(pageNumber, id, exact[0], line) : []);
+  if (!stillCurrent()) return [];
+  const printedLines = (rows.length ? rows : location.anchors ?? []).filter(item => Number(item.page) === pageNumber && item.box &&
     [item.box.left, item.box.right, item.box.top, item.box.bottom].every(Number.isFinite));
   if (!printedLines.length) return [];
   const extent = { left: Math.min(...printedLines.map(item => item.box.left)), right: Math.max(...printedLines.map(item => item.box.right)),
     top: Math.min(...printedLines.map(item => item.box.top)), bottom: Math.max(...printedLines.map(item => item.box.bottom)) };
-  const regions = (snapshot?.blocks ?? []).filter(block => sameSourceFile(block.source?.file, location.file) &&
-    Number.isInteger(block.source?.start?.line) && Number.isInteger(block.source?.end?.line) &&
-    block.source.start.line <= line && line <= block.source.end.line + 2)
-    .flatMap(block => (block.editRegions ?? [])
-      .filter(item => item.kind === 'math' && !item.display && sameSourceFile(item.source?.file, location.file))
-      .map(item => ({ ...item, blockSource: block.source ?? null })))
-    .sort((a, b) => a.source.start.line - b.source.start.line || a.source.start.column - b.source.start.column);
+  const owners = mixed.length ? mixed : exact.length ? exact : blocks;
+  const exactRows = !mixed.length && exact.length && (rows.length || sourceValue !== null);
+  const regions = owners.flatMap(block => (block.editRegions ?? [])
+      .filter(item => item.kind === 'math' && !item.display && (sourceValue === null || item.value === sourceValue) && (mixed.length ||
+        sameSourceFile(item.source?.file, location.file) &&
+        (exactRows ? sourceNearLine(item.source, location) :
+          sourceNearLine(block.source, location, 2) || sourceNearLine(item.source, location, 2))))
+      .map(item => ({ ...item, blockSource: block.source ?? null })));
+  if (!mixed.length) regions.sort((a, b) => a.source.start.line - b.source.start.line || a.source.start.column - b.source.start.column);
   if (!regions.length || regions.length > 24) return [];
-  const glyphs = await canonicalGlyphs(pageNumber, id);
+  const glyphs = printedGlyphs ?? await canonicalGlyphs(pageNumber, id);
   if (!stillCurrent() || !glyphs.length) return [];
+  const rowGlyphs = glyphs.filter(g => {
+    const x = (g.left + g.right) / 2, y = (g.top + g.bottom) / 2;
+    return x >= extent.left - 1 && x <= extent.right + 1 && y >= extent.top - 2 && y <= extent.bottom + 2;
+  });
+  const neighbors = exactRows && exact.length === 1 ? exact[0].editRegions.filter(item =>
+    sourceNearLine(item.source, location)) : [];
+  let textInk;
   const byValue = new Map();
   for (const region of regions) {
     if (!byValue.has(region.value)) byValue.set(region.value, []);
@@ -4822,13 +5199,35 @@ async function inlineMathCopies(snapshot, location, pageNumber, id, stillCurrent
       probe.value = shouldWrapAligned(value) ? wrapAligned(value) : value;
       await new Promise(resolve => requestAnimationFrame(resolve));
       if (!stillCurrent()) return [];
-      const copies = geometry.mathMaps(probe, glyphs, extent).map(({ map }) => ({ map,
+      const copies = geometry.mathMaps(probe, rowGlyphs, extent, { contiguous: true }).map(({ map }) => ({ map,
         left: Math.min(...map.map(g => g.left)), top: Math.min(...map.map(g => g.top)), bottom: Math.max(...map.map(g => g.bottom)) }));
-      // (printed as many times as the source has it, or it is not known which copy is which)
-      if (copies.length !== same.length) continue;
+      const counted = !requireProse && copies.length === same.length;
+      if (!counted) {
+        if (!copies.length || !neighbors.some(item => item.kind === 'text')) continue;
+        if (!textInk) {
+          textInk = new Map();
+          for (const item of neighbors) {
+            if (item.kind !== 'text' || neighbors.some(other => other !== item && other.kind === 'text' && other.value === item.value)) continue;
+            const hits = geometry.textMaps(item.value, rowGlyphs);
+            const ink = hits.length === 1 && singleLineInk(hits[0].map, pageNumber, true);
+            if (ink) textInk.set(item, ink);
+          }
+        }
+      }
       // reading order: by printed line, then from the left
       copies.sort((a, b) => (Math.abs((a.top + a.bottom) - (b.top + b.bottom)) > 8 ? (a.top + a.bottom) - (b.top + b.bottom) : a.left - b.left));
-      copies.forEach(({ map }, order) => found.push({ region: same[order], map, extent }));
+      copies.forEach(({ map }, order) => {
+        const region = counted ? same[order] :
+          witnessedInlineFormula(same, { map, pageNumber }, textInk, neighbors, snapshot, rowGlyphs);
+        if (!region) return;
+        const item = { region, map, extent };
+        if ((sourceValue !== null || measureStructures) && /\\(?:[dt]?frac|sqrt)\b/.test(value)) {
+          if (!geometry.completeDisplayMap(probe, map)) return;
+          item.structures = geometry.printedMathStructures(probe, map, glyphs);
+          if (!item.structures?.length) return;
+        }
+        found.push(item);
+      });
     }
   } finally { probe.remove(); }
   return found;
@@ -4842,17 +5241,73 @@ const inkBounds = (map, pageNumber) => ({ page: pageNumber,
 // undecided: null.
 async function inlineMathUnderPoint(snapshot, location, pageNumber, point, id, stillCurrent) {
   if (!point) return null;
+  const primary = await inlineMathCopies(snapshot, location, pageNumber, id, stillCurrent);
+  const hit = inlineFormulaHit(primary, pageNumber, point);
+  if (hit || !stillCurrent()) return hit;
+  return inlineMathFromForwardRows(snapshot, pageNumber, point, id, stillCurrent);
+}
+
+// SyncTeX's native row query accepts a single input file and up to 513
+// consecutive source lines. A sheet can contain disjoint chapters.
+async function* pageSourceRowGroups(files, pageNumber, id, stillCurrent) {
+  for (const [file, uniqueLines] of files) {
+    const lines = [...uniqueLines].sort((a, b) => a - b);
+    for (let i = 0; i < lines.length;) {
+      const first = i++;
+      while (i < lines.length && lines[i] - lines[first] <= 512) i++;
+      const source = { file, start: { line: lines[first] }, end: { line: lines[i - 1] } };
+      const boxes = await canonicalSourceEditBoxes(pageNumber, id, { source });
+      if (!stillCurrent()) return;
+      yield { file, uniqueLines, boxes };
+    }
+  }
+}
+
+async function inlineMathFromForwardRows(snapshot, pageNumber, point, id, stillCurrent, requireProse = false, owner = null) {
+  // A glyph supplied by a macro default can reverse-map to the end of the
+  // root document. Query native forward boxes by page and source range, then
+  // verify the complete formula at the physical point before selecting it.
+  const files = new Map();
+  for (const block of owner ? [owner] : snapshot.blocks ?? []) {
+    if (block.type !== 'paragraph' || !block.pages?.includes(pageNumber)) continue;
+    for (const item of block.editRegions ?? []) {
+      const source = item.source;
+      if (item.kind !== 'math' || item.display || !source?.file) continue;
+      if (!files.has(source.file)) files.set(source.file, new Set());
+      files.get(source.file).add(source.start.line);
+    }
+  }
+  const copies = [];
+  for await (const { file, uniqueLines, boxes } of pageSourceRowGroups(files, pageNumber, id, stillCurrent)) {
+    const candidates = new Set(boxes.filter(({ empty, line, box }) => !empty && uniqueLines.has(line) &&
+      point.x >= box.left - 2 && point.x <= box.right + 2 && point.y >= box.top - 2 && point.y <= box.bottom + 2).map(row => row.line));
+    for (const line of candidates) {
+      const rows = inlineSourceRows(boxes, line);
+      const matches = await inlineMathCopies(snapshot, { file, line }, pageNumber, id, stillCurrent, null, rows, requireProse, Boolean(owner));
+      if (!stillCurrent()) return null;
+      copies.push(...matches);
+    }
+  }
+  return inlineFormulaHit(copies, pageNumber, point);
+}
+
+function inlineFormulaHit(copies, pageNumber, point) {
   const geometry = window.TdomDirectEditGeometry;
-  const hits = (await inlineMathCopies(snapshot, location, pageNumber, id, stillCurrent)).filter(({ map, extent }) => {
+  const hits = copies.filter(({ map, extent }) => {
     if (point.x < extent.left - 3 || point.x > extent.right + 3 || point.y < extent.top - 3 || point.y > extent.bottom + 3) return false;
     const glyph = geometry.nearest(map, point);
     return glyph && point.x >= glyph.left - 2 && point.x <= glyph.right + 2 && point.y >= glyph.top - 1 && point.y <= glyph.bottom + 1;
   });
   if (!hits.length) return null;
+  // A denominator on the preceding line can reach the click tolerance
+  // around a numerator. Prefer glyphs which physically contain the point.
+  const direct = hits.filter(({ map }) => map.some(g => point.x >= g.left && point.x <= g.right &&
+    point.y >= g.top && point.y <= g.bottom));
+  const choices = direct.length ? direct : hits;
   // (a formula inside a larger one is not the formula clicked: `2` in `x^2`)
-  hits.sort((a, b) => b.map.length - a.map.length);
-  if (hits.length > 1 && hits[1].map.length === hits[0].map.length) return null;
-  return { region: hits[0].region, printBounds: inkBounds(hits[0].map, pageNumber) };
+  choices.sort((a, b) => b.map.length - a.map.length);
+  if (choices.length > 1 && choices[1].map.length === choices[0].map.length) return null;
+  return { ...choices[0], printBounds: inkBounds(choices[0].map, pageNumber) };
 }
 
 // Where an inline formula is printed in canonical generation `id`, for a
@@ -4872,6 +5327,296 @@ async function inlineMathBoundsByInk(region, snapshot, id, near) {
   return copy ? inkBounds(copy.map, Number(near.page)) : null;
 }
 
+// Hit-test the immutable paper at the inverse translation. Bind the result
+// to the new source only if its unchanged suffix identifies the same bytes.
+async function editAtPrintedTail(page, event, tail, snapshot, current) {
+  const presented = presentedPageState(page), pageNumber = Number(page.dataset.page);
+  const scale = page.getBoundingClientRect().width / activePaperGeometry(page).width;
+  if (!presented || presented.id !== tail.generation || !(scale > 0)) return null;
+  const oldEvent = { clientX: event.clientX - tail.dx * scale, clientY: event.clientY, target: page };
+  const owner = presented.snapshot.blocks.find(b => b.id === tail.src);
+  const point = paperPointForClick(oldEvent, page);
+  if (!owner || !point) return null;
+  const math = await inlineMathFromForwardRows(presented.snapshot, pageNumber, point, presented.id, current, false, owner);
+  if (!current()) return null;
+  const oldHit = math ?? await resolveOpaqueEditRegion(page, oldEvent);
+  if (!oldHit || !current()) return null;
+  const old = oldHit.region, before = sourceTextForRegion(presented.snapshot, old);
+  const after = snapshot.sources.find(source => source.file === old.source.file)?.text;
+  if (typeof before !== 'string' || typeof after !== 'string' ||
+      !owner?.editRegions?.some(r => directSourceRangeKey(r) === directSourceRangeKey(old))) return null;
+  const oldStart = lineColToOffset(before, old.source.start.line, old.source.start.column);
+  const newStart = oldStart + after.length - before.length;
+  if (newStart < 0 || after.slice(newStart) !== before.slice(oldStart)) return null;
+  const regions = snapshot.blocks.find(b => b.id === tail.src)?.editRegions?.filter(r =>
+    r.kind === old.kind && r.value === old.value && r.source?.file === old.source.file &&
+    lineColToOffset(after, r.source.start.line, r.source.start.column) === newStart &&
+    sourceTextForRegion(snapshot, r) === after) ?? [];
+  if (regions.length !== 1) return null;
+  let map, slot = null;
+  if (old.kind === 'math') {
+    const copy = math ?? await locateInlineSourceFormula(pageNumber, presented, owner, old, new Map(), current);
+    map = copy?.map;
+    if (map?.length && current()) {
+      const geometry = window.TdomDirectEditGeometry, paper = activePaperGeometry(page);
+      const shapes = await geometry.formulaPageShapes(presented.image);
+      const original = geometry.isolatedFormulaSlot(shapes, map, paper, copy.structures);
+      const rect = original?.rect;
+      // The rest of the page was not translated. The edit overlay must
+      // stay entirely inside the crop, including room for newly typed ink.
+      if (rect && rect.left >= tail.x && rect.top >= tail.y && rect.bottom <= tail.y + tail.h &&
+          Math.min(rect.right, tail.x + tail.w) >= Math.max(...map.map(g => g.right))) {
+        slot = { ...original, paper, src: presented.src, rev: String(presented.rev), anchorRev: snapshot.srcRev,
+          rect: { ...rect, left: rect.left + tail.dx, right: Math.min(rect.right, tail.x + tail.w) + tail.dx },
+          color: getComputedStyle(page).backgroundColor,
+          key: JSON.stringify([snapshot.documentEpoch, pageNumber, presented.src, snapshot.srcRev, directSourceRangeKey(regions[0])]) };
+      }
+    }
+  } else if (old.kind === 'text' && oldHit.printBounds?.words) {
+    const glyphs = await canonicalGlyphs(pageNumber, presented.id);
+    map = window.TdomDirectEditGeometry.textMap(old.value, oldHit.printBounds.words, glyphs);
+  }
+  if (!current() || !map?.length || !map.every(g => g.left >= tail.x - 0.35 && g.right <= tail.x + tail.w + 0.35 &&
+      g.top >= tail.y - 0.35 && g.bottom <= tail.y + tail.h + 0.35)) return null;
+  map = map.map(g => ({ ...g, left: g.left + tail.dx, right: g.right + tail.dx }));
+  return { snapshot, region: regions[0], map, printBounds: inkBounds(map, pageNumber),
+    projectedRev: snapshot.srcRev, slot, caretOffset: old.kind === 'text' ? oldHit.caretOffset : null };
+}
+
+// A certified delta may be newer than the PDF underneath. Open its text
+// against the exact source revision and hit-test the SVG actually on paper.
+async function editAtAnchorInk(page, event) {
+  const svg = page.querySelector(':scope > svg.tdom-canonical-delta');
+  if (!svg) return undefined;
+  const underPointer = node => {
+    const r = node.getBoundingClientRect();
+    return event.clientX >= r.left && event.clientX < r.right && event.clientY >= r.top && event.clientY < r.bottom;
+  };
+  if (![...svg.querySelectorAll('rect')].some(underPointer)) return undefined;
+  const nodes = [...svg.querySelectorAll('text[data-src]')];
+  const hit = nodes.find(underPointer);
+  const anchor = canonicalAnchorPreview;
+  if (!anchor || anchor.srcRev !== appliedSrcRev) return null;
+  const point = paperPointForClick(event, page);
+  if (!point) return null;
+  const tail = anchor.pages.find(p => p.page === Number(page.dataset.page))?.tails?.find(t =>
+    point.x >= t.x + t.dx && point.x < t.x + t.dx + t.w && point.y >= t.y && point.y < t.y + t.h);
+  if (!hit && !tail) return null;
+  const snapshot = await loadProvisionalSnapshot(anchor.srcRev).catch(() => null);
+  if (!snapshot || Number(snapshot.srcRev) !== anchor.srcRev || canonicalAnchorPreview !== anchor ||
+      !svg.isConnected || appliedSrcRev !== anchor.srcRev || documentReset.pending ||
+      Number(snapshot.documentEpoch) !== documentReset.adoptedEpoch) return null;
+  if (tail) return editAtPrintedTail(page, event, tail, snapshot, () => svg.isConnected &&
+    canonicalAnchorPreview === anchor && anchor.srcRev === appliedSrcRev && !documentReset.pending);
+  const block = snapshot.blocks.find(b => b.id === hit.dataset.src);
+  const line = nodes.filter(n => n.dataset.src === hit.dataset.src && n.dataset.line === hit.dataset.line);
+  const { glyphs } = directSvgGeometry(page, line);
+  const geometry = window.TdomDirectEditGeometry;
+  const matches = [];
+  for (const region of block?.editRegions ?? []) {
+    if (region.kind !== 'text') continue;
+    for (const { map } of geometry.textMaps(region.value, glyphs, true)) {
+      if (!map.some(g => point.x >= g.left && point.x <= g.right && point.y >= g.top && point.y <= g.bottom)) continue;
+      matches.push({ region, snapshot, map, printBounds: inkBounds(map, Number(page.dataset.page)),
+        caretOffset: geometry.hit(map, point) });
+    }
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function textOnNativeRow(region, row, pageNumber, glyphs, words) {
+  const lineGlyphs = glyphs.filter(g => Math.abs(g.baseline - row.y) <= 0.25 &&
+    g.left >= row.box.left - 0.25 && g.right <= row.box.right + 0.25);
+  const maps = window.TdomDirectEditGeometry.textMaps(region.value, lineGlyphs);
+  if (maps.length !== 1) return null;
+  const map = maps[0].map, ink = inkBounds(map, pageNumber);
+  const matches = textMatchesOnPage(printedKey(region.value), words, pageNumber).filter(m =>
+    Math.abs(m.left - ink.left) <= 1 && Math.abs(m.right - ink.right) <= 1 &&
+    m.words.every(w => (w.top + w.bottom) / 2 >= ink.top && (w.top + w.bottom) / 2 <= ink.bottom));
+  return matches.length === 1 ? { region, map, printBounds: matches[0] } : null;
+}
+
+function textOnParagraphRows(region, rows, page, glyphs, words) {
+  // Keep Poppler's reading order, but only inside the native paragraph
+  // rows. A Japanese closing punctuation mark may hang half a cell beyond
+  // the measure, so test each glyph's center rather than its right edge.
+  const inMeasure = (item, box) => {
+    const x = (item.left + item.right) / 2;
+    return x >= box.left - 0.25 && x <= box.right + 0.25;
+  };
+  const rowWords = words.filter(word => rows.some(row => row.y >= word.top && row.y <= word.bottom &&
+    inMeasure(word, row.box)));
+  const matches = textMatchesOnPage(printedKey(region.value), rowWords, page);
+  if (matches.length !== 1) return null;
+  const printBounds = matches[0];
+  const map = window.TdomDirectEditGeometry.textMap(region.value, printBounds.words, glyphs);
+  if (!map.length || !map.every(g => rows.some(row => Math.abs(row.y - g.baseline) <= 0.25 &&
+      inMeasure(g, row.box)))) return null;
+  return { region, map, printBounds };
+}
+
+// A line ending at a blank paragraph separator can be tagged with the
+// separator in the native hbox tree, including in the second column of
+// a sheet. Require both its printed glyphs and an inverse source anchor.
+async function textAtParagraphEnd(region, snapshot, page, id, location = null) {
+  const source = region.source;
+  if (region.value !== (region.sourceValue ?? region.value)) return null;
+  const lines = sourceTextForRegion(snapshot, region)?.split('\n');
+  if (lines?.[source.end.line]?.trim() !== '') return null;
+  const separator = { source: { file: source.file, start: { line: source.end.line + 1 }, end: { line: source.end.line + 1 } } };
+  const [rows, glyphs, sheets] = await Promise.all([canonicalSourceEditBoxes(page, id, separator),
+    canonicalGlyphs(page, id), canonicalTextBoxes(id, page)]);
+  const paragraphRows = rows.filter(row => !row.empty && row.parentKind === 'vbox' && row.line === separator.source.start.line);
+  const match = textOnParagraphRows(region, paragraphRows, page, glyphs, sheets[0] ?? []);
+  if (!match) return null;
+  const word = match.printBounds.words[0];
+  const inverse = location ?? await fetch('/synctex', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id, page, x: (word.left + word.right) / 2, y: (word.top + word.bottom) / 2 }),
+  }).then(r => r.ok ? r.json() : null).catch(() => null);
+  if (!sameSourceFile(inverse?.file, source.file)) return null;
+  const onSource = inverse.line >= source.start.line && inverse.line <= separator.source.start.line;
+  return onSource && inverse.lineText === lines[inverse.line - 1]?.replace(/\r$/, '') &&
+    !documentReset.pending && Number(snapshot.documentEpoch) === documentReset.adoptedEpoch ? match : null;
+}
+
+// Resolve a complete prose run on the displayed sheet. A matching string
+// alone is insufficient: its actual PDF glyphs must share the TeX baseline
+// and horizontal extent of exactly one source row.
+async function textAtNativeRow(snapshot, pageNumber, id, point, word, stillCurrent) {
+  const geometry = window.TdomDirectEditGeometry;
+  const token = printedKey(word?.text);
+  if (!token || point.x < word.left || point.x > word.right || point.y < word.top || point.y > word.bottom) return null;
+  const files = new Map(), candidates = [];
+  for (const block of snapshot.blocks ?? []) {
+    if (block.type !== 'paragraph' || block.pages?.length !== 1 || block.pages[0] !== pageNumber) continue;
+    for (const region of block.editRegions ?? []) {
+      const source = region.source;
+      if (region.kind !== 'text' || !source?.file || source.start.line !== source.end.line ||
+          !printedKey(region.value).includes(token)) continue;
+      if (!files.has(source.file)) files.set(source.file, new Set());
+      files.get(source.file).add(source.start.line);
+      candidates.push({ ...region, blockSource: block.source });
+    }
+  }
+  if (!candidates.length) return null;
+  const glyphs = await canonicalGlyphs(pageNumber, id);
+  if (!stillCurrent()) return null;
+  const underPointer = glyphs.filter(g => point.x >= g.left && point.x <= g.right && point.y >= g.top && point.y <= g.bottom);
+  if (!underPointer.length) return null;
+  const hits = [];
+  for await (const { file, boxes } of pageSourceRowGroups(files, pageNumber, id, stillCurrent)) {
+    const sourceRows = boxes.filter(row => !row.empty && row.parentKind === 'vbox');
+    for (const row of sourceRows) {
+      if (point.x < row.box.left || point.x > row.box.right ||
+          !underPointer.some(g => Math.abs(g.baseline - row.y) <= 0.25)) continue;
+      for (const region of candidates) {
+        if (region.source.file !== file || region.source.start.line !== row.line ||
+            region.value !== (region.sourceValue ?? region.value)) continue;
+        const match = textOnNativeRow(region, row, pageNumber, glyphs, word.pageWords);
+        if (!match?.printBounds.words.includes(word.pageWords[word.readingIndex]) ||
+            !match.map.some(g => point.x >= g.left && point.x <= g.right && point.y >= g.top && point.y <= g.bottom)) continue;
+        // A wrapped line or repeated inclusion can assign multiple physical
+        // rows to the same TeX line. Require a single printed occurrence.
+        if (sourceRows.some(other => other !== row && other.line === row.line &&
+            textOnNativeRow(region, other, pageNumber, glyphs, word.pageWords))) continue;
+        hits.push({ region, printBounds: match.printBounds, caretOffset: geometry.hit(match.map, point) });
+      }
+    }
+  }
+  return stillCurrent() && hits.length === 1 ? hits[0] : null;
+}
+
+// Locate an alignment cell in the displayed generation before matching the
+// ink inside it. Repeated headers on a later sheet point to their original
+// editable source row; identical formulas in neighboring cells stay distinct.
+const tableRowsCache = new WeakMap();
+function tableRowsByFile(regions) {
+  let files = tableRowsCache.get(regions);
+  if (files) return files;
+  files = new Map();
+  for (const region of regions) {
+    const file = region.source?.file;
+    if (region.tableRow == null || !file) continue;
+    if (!files.has(file)) files.set(file, new Map());
+    const rows = files.get(file);
+    if (!rows.has(region.tableRow)) rows.set(region.tableRow, []);
+    rows.get(region.tableRow).push(region);
+  }
+  tableRowsCache.set(regions, files);
+  return files;
+}
+
+async function editAtTableCell(snapshot, pageNumber, id, point, stillCurrent) {
+  const geometry = window.TdomDirectEditGeometry;
+  let cell;
+  for (const block of snapshot.blocks ?? []) {
+    if (!block.pages?.includes(pageNumber) || !block.editRegions?.length) continue;
+    for (const [file, rows] of tableRowsByFile(block.editRegions)) {
+      const boxes = await canonicalSourceEditBoxes(pageNumber, id, { source: { file } }, true);
+      if (!stillCurrent()) return null;
+      const found = geometry.locateTableCell(rows, boxes, { point });
+      if (found && cell) return null;
+      if (found) cell = found;
+    }
+  }
+  if (!cell || !stillCurrent()) return null;
+  const hits = await tableCellInk(cell, pageNumber, id, stillCurrent);
+  const hit = hits && inlineFormulaHit(hits, pageNumber, point);
+  return hit && { ...hit, byInk: true, caretOffset: geometry.hit(hit.map, point) };
+}
+
+async function tableCellInk({ box, regions }, pageNumber, id, stillCurrent, target = null) {
+  const geometry = window.TdomDirectEditGeometry;
+  const glyphs = (await canonicalGlyphs(pageNumber, id)).filter(g => {
+    const x = (g.left + g.right) / 2, y = (g.top + g.bottom) / 2;
+    return x >= box.left && x <= box.right && y >= box.top - 1 && y <= box.bottom + 1;
+  });
+  if (!glyphs.length || !stillCurrent()) return null;
+  const hits = [];
+  const values = new Map();
+  for (const region of regions) {
+    if (target && (region.kind !== target.kind || region.value !== target.value)) continue;
+    const key = JSON.stringify([region.kind, region.value]);
+    if (!values.has(key)) values.set(key, []);
+    values.get(key).push(region);
+  }
+  let field;
+  try {
+    for (const same of values.values()) {
+      const { kind, value } = same[0];
+      let copies;
+      if (kind === 'math') {
+        const Mathfield = customElements.get('math-field');
+        if (!Mathfield) return null;
+        if (!field) {
+          field = new Mathfield();
+          field.readOnly = true;
+          field.inert = true;
+          field.mathVirtualKeyboardPolicy = 'manual';
+          Object.assign(field.style, { position: 'fixed', left: '-10000px', top: '0', visibility: 'hidden' });
+          document.body.appendChild(field);
+        }
+        field.value = value;
+        await new Promise(resolve => requestAnimationFrame(resolve));
+        if (!stillCurrent()) return null;
+        copies = geometry.mathMaps(field, glyphs, box, { contiguous: true });
+      } else copies = geometry.textMaps(value, glyphs);
+      if (copies.length !== same.length) continue;
+      copies.forEach(({ map }, index) => {
+        const hit = { region: same[index], map, extent: box };
+        if (target && /\\(?:[dt]?frac|sqrt)\b/.test(value)) {
+          if (!geometry.completeDisplayMap(field, map)) return;
+          hit.structures = geometry.printedMathStructures(field, map, glyphs);
+          if (!hit.structures?.length) return;
+        }
+        hits.push(hit);
+      });
+    }
+  } finally { field?.remove(); }
+  return hits;
+}
+
 async function resolveOpaqueEditRegion(page, event) {
   if (!page) page = pageAtClientPoint(event);
   if (!usesDirectEditSurface(page)) return null;
@@ -4884,12 +5629,44 @@ async function resolveOpaqueEditRegion(page, event) {
     const current = presentedPageState(page);
     return current?.id === presented.id && current?.rev === presented.rev && current?.src === presented.src;
   };
-  const location = await syncLocationForClick(event, page);
-  if (!stillPresented()) return null;
   const domSnapshot = presented.snapshot;
+  const cell = await editAtTableCell(domSnapshot, pageNumber, presented.id, point, stillPresented);
+  if (cell || !stillPresented()) return cell;
   const clickedWord = await canonicalWordAtPoint(pageNumber, point, presented.id);
   if (!stillPresented()) return null;
+  // A fraction or script is often smaller than the prose next to it. Try
+  // the native source rows on this sheet first. Size only selects a lookup:
+  // both neighboring words, the source delimiters and the printed math
+  // must prove the same occurrence before the host can edit it.
+  if (clickedWord?.pageWords.some(neighbor =>
+    neighbor.bottom - neighbor.top > 1.2 * (clickedWord.bottom - clickedWord.top) &&
+    neighbor.right >= clickedWord.left - 36 && neighbor.left <= clickedWord.right + 36 &&
+    neighbor.bottom >= clickedWord.top && neighbor.top <= clickedWord.bottom)) {
+    const ink = await inlineMathFromForwardRows(domSnapshot, pageNumber, point, presented.id, stillPresented, true);
+    if (!stillPresented()) return null;
+    if (ink) return { ...ink, byInk: true, caretOffset: caretOffsetForOpaqueRegion(ink.region, null, clickedWord, ink.printBounds, point) };
+  }
+  const prose = await textAtNativeRow(domSnapshot, pageNumber, presented.id, point, clickedWord, stillPresented);
+  if (!stillPresented()) return null;
+  if (prose) return prose;
+  const location = await syncLocationForClick(event, page);
+  if (!stillPresented()) return null;
   const word = printedKey(clickedWord?.text);
+  if (word && location?.file && Number.isInteger(location.line)) {
+    const sourceLine = location.lineText?.trim() === '' ? location.line - 1 : location.line;
+    const candidates = (domSnapshot.blocks ?? []).flatMap(block => block.type === 'paragraph'
+      ? (block.editRegions ?? []).filter(region => region.kind === 'text' && region.source?.start.line <= sourceLine && region.source.end.line >= sourceLine &&
+        sameSourceFile(region.source.file, location.file) && printedKey(region.value).includes(word)) : []);
+    if (candidates.length === 1) {
+      const match = await textAtParagraphEnd(candidates[0], domSnapshot, pageNumber, presented.id, location);
+      if (!stillPresented()) return null;
+      if (match?.printBounds.words.includes(clickedWord.pageWords[clickedWord.readingIndex]) &&
+          match.map.some(g => point.x >= g.left && point.x <= g.right && point.y >= g.top && point.y <= g.bottom)) {
+        return { region: match.region, printBounds: match.printBounds,
+          caretOffset: window.TdomDirectEditGeometry.hit(match.map, point) };
+      }
+    }
+  }
   const resolveRepeatedInk = async candidate => {
     const valueKey = region => region.kind === 'math'
       ? JSON.stringify(mathSourceTokens(region.value).map(token => token[0])) : printedKey(region.value);
@@ -4998,11 +5775,12 @@ async function resolveOpaqueEditRegion(page, event) {
     return { region: hit.region, printBounds,
       caretOffset: caretOffsetForOpaqueRegion(hit.region, location, clickedWord, printBounds, point) };
   };
+  const mixed = mixedParagraphsAtLine(domSnapshot, location, pageNumber);
   const printedCandidates = [];
   for (const block of domSnapshot.blocks ?? []) {
     for (const item of block.editRegions ?? []) {
       if (item.kind !== 'text' ||
-          location?.file && !sameSourceFile(item.source?.file, location.file) ||
+          location?.file && !mixed.includes(block) && !sameSourceFile(item.source?.file, location.file) ||
           word && !printedKey(item.value).includes(word)) continue;
       const bounds = await canonicalTextBounds(item.value, pageNumber, point, presented.id);
       if (!bounds || point.x < bounds.left - 2 || point.x > bounds.right + 2 ||
@@ -5023,36 +5801,78 @@ async function resolveOpaqueEditRegion(page, event) {
     )[0]);
   }
   if (!location?.file || !Number.isFinite(Number(location.line))) return null;
+  let inkLookup;
+  const mathByInk = async () => {
+    inkLookup ??= inlineMathUnderPoint(domSnapshot, location, pageNumber, point, presented.id, stillPresented);
+    const ink = await inkLookup;
+    if (!stillPresented() || !ink) return null;
+    return { ...ink, byInk: true,
+      caretOffset: caretOffsetForOpaqueRegion(ink.region, location, clickedWord, ink.printBounds, point) };
+  };
+  if (mixed.length) {
+    // A paragraph can begin in the root and end with display math from a
+    // child. Its outer SyncTeX box may name either file. Only a complete
+    // expression on the clicked source row and actual glyph can open it.
+    const displays = mixed.flatMap(block => (block.editRegions ?? []).filter(region =>
+      region.kind === 'math' && region.display && sourceNearLine(region.source, location)));
+    const copies = [];
+    for (const region of displays) {
+      const match = await locateDisplaySourceFormula(pageNumber, presented, region, stillPresented);
+      if (!stillPresented()) return null;
+      if (match) copies.push({ ...match, region, extent: inkBounds(match.map, pageNumber) });
+    }
+    const hit = inlineFormulaHit(copies, pageNumber, point);
+    if (hit) return { ...hit, caretOffset: window.TdomDirectEditGeometry.hit(hit.map, point) };
+    return mathByInk();
+  }
   const sourceColumn = sourceColumnForOpaqueClick(location, point);
   const atPoint = { ...location, column: sourceColumn };
-  const blocks = (domSnapshot.blocks ?? []).filter((block) =>
-    sameSourceFile(block.source?.file, location.file) &&
-    Number(location.line) >= Number(block.source?.start?.line) &&
-    Number(location.line) <= Number(block.source?.end?.line)
-  );
+  // A paragraph may start in the root and continue in an included file.
+  // Each editable region retains its own source in that case.
+  const blocks = (domSnapshot.blocks ?? []).filter(block => sourceNearLine(block.source, location) ||
+    block.editRegions?.some(item => sourceNearLine(item.source, location)));
 
   // Prefer the exact forward SyncTeX boxes for math on this source line.
   // This avoids converting proportional TeX glyph advances into a source
   // column by a linear character-count ratio.
+  const sourceMath = blocks.flatMap(block => (block.editRegions ?? [])
+    .filter(item => item.kind === 'math' && sourceNearLine(item.source, location))
+    .map(item => ({ ...item, blockSource: block.source ?? null })));
+  // Inline expressions on one source row share a native line box. The row
+  // and complete glyph match already identify the expression; spawning a
+  // forward SyncTeX query per expression first can hold a click for seconds.
+  if (sourceMath.length && sourceMath.every(region => !region.display)) {
+    const ink = await mathByInk();
+    if (ink || !stillPresented()) return ink;
+  }
   const spatialMath = [];
-  for (const block of blocks) {
-    for (const item of block.editRegions ?? []) {
-      if (item.kind !== 'math' || !sameSourceFile(item.source?.file, location.file) ||
-          Number(location.line) < Number(item.source?.start?.line) ||
-          Number(location.line) > Number(item.source?.end?.line)) continue;
-      const region = { ...item, blockSource: block.source ?? null };
-      const bounds = await canonicalSourceBounds(region, pageNumber, presented.id, point);
-      if (!stillPresented()) return null;
-      if (!bounds || point.x < bounds.left - 3 || point.x > bounds.right + 3 ||
-          point.y < bounds.top - 3 || point.y > bounds.bottom + 3) continue;
-      spatialMath.push({
-        region,
-        printBounds: bounds,
-        caretOffset: caretOffsetForOpaqueRegion(region, location, clickedWord, bounds, point),
-      });
-    }
+  for (const region of sourceMath) {
+    const bounds = await canonicalSourceBounds(region, pageNumber, presented.id, point);
+    if (!stillPresented()) return null;
+    if (!bounds || point.x < bounds.left - 3 || point.x > bounds.right + 3 ||
+        point.y < bounds.top - 3 || point.y > bounds.bottom + 3) continue;
+    spatialMath.push({
+      region,
+      printBounds: bounds,
+      caretOffset: caretOffsetForOpaqueRegion(region, location, clickedWord, bounds, point),
+    });
   }
   if (spatialMath.length) {
+    // Inline expressions on one source line often share a forward SyncTeX
+    // rectangle. Its midpoint and a projected column do not identify the
+    // printed expression, even in a single-file document.
+    if (spatialMath.every(item => !item.region.display)) {
+      // Even a unique source range may describe just a numerator or
+      // denominator box. Match the full expression before placing its caret.
+      if (sourceMath.some(region => region.display)) {
+        const ink = await mathByInk();
+        if (!stillPresented() || ink) return ink;
+      }
+      if (spatialMath.length === 1) return resolveRepeatedInk(spatialMath[0]);
+      const precise = Number(location.column) > 1
+        ? spatialMath.filter(item => sourceContainsPosition(item.region, location)) : [];
+      return precise.length === 1 ? resolveRepeatedInk(precise[0]) : null;
+    }
     spatialMath.sort((a, b) => {
       const aContains = sourceContainsPosition(a.region, atPoint) ? 0 : 1;
       const bContains = sourceContainsPosition(b.region, atPoint) ? 0 : 1;
@@ -5077,12 +5897,8 @@ async function resolveOpaqueEditRegion(page, event) {
   // at above, and the click opened nothing. There the formula is found by
   // its ink (inlineMathUnderPoint): taken only when exactly one formula of
   // the paragraph that ends at that line is printed under the pointer.
-  const inkMath = await inlineMathUnderPoint(domSnapshot, location, pageNumber, point, presented.id, stillPresented);
-  if (!stillPresented()) return null;
-  if (inkMath) {
-    return { ...inkMath, byInk: true,
-      caretOffset: caretOffsetForOpaqueRegion(inkMath.region, location, clickedWord, inkMath.printBounds, point) };
-  }
+  const inkMath = await mathByInk();
+  if (!stillPresented() || inkMath) return inkMath;
   for (const block of blocks) {
     const regions = (block.editRegions ?? [])
       .filter((region) => sameSourceFile(region.source?.file, location.file))
@@ -5218,7 +6034,7 @@ function chooseRegionByGeometry(candidates, target, event, page, src) {
   ) ?? null;
 }
 
-async function provisionalRegionAtPoint(page, sourceId, candidates, event) {
+async function provisionalRegionAtPoint(page, sourceId, candidates, event, rule = null) {
   const point = paperPointForClick(event, page);
   const surfaces = [...pageDivs.values()].filter(surface =>
     surface.querySelector(`.chunkwin[data-src="${CSS.escape(sourceId)}"]`));
@@ -5229,7 +6045,7 @@ async function provisionalRegionAtPoint(page, sourceId, candidates, event) {
   const current = () => pages.every(p => p.surface.isConnected && p.surface.provisionalEpoch === p.epoch);
   if (!current()) return null;
   const clickedGlyphs = pages.find(p => p.surface === page)?.glyphs ?? [];
-  if (!clickedGlyphs.some(g => point.x >= g.left - 2 && point.x <= g.right + 2 && point.y >= g.top - 1 && point.y <= g.bottom + 1)) return undefined;
+  if (!rule && !clickedGlyphs.some(g => point.x >= g.left - 2 && point.x <= g.right + 2 && point.y >= g.top - 1 && point.y <= g.bottom + 1)) return undefined;
   const geometry = window.TdomDirectEditGeometry;
   const groups = new Map();
   for (const region of candidates) {
@@ -5239,51 +6055,86 @@ async function provisionalRegionAtPoint(page, sourceId, candidates, event) {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(region);
   }
-  let probe = null;
-  const matches = [];
-  try {
-    for (const group of groups.values()) {
-      const region = group[0];
-      if (region.kind === 'math') {
-        const Mathfield = customElements.get('math-field');
-        if (!Mathfield) continue;
-        if (!probe) {
-          probe = new Mathfield();
-          probe.mathVirtualKeyboardPolicy = 'manual';
-          probe.setAttribute('aria-hidden', 'true');
-          Object.assign(probe.style, { position: 'fixed', left: '-10000px', top: '0', opacity: '0', pointerEvents: 'none' });
-          document.body.appendChild(probe);
-        }
-        probe.value = shouldWrapAligned(region.value) ? wrapAligned(region.value) : region.value;
-        await new Promise(resolve => requestAnimationFrame(resolve));
+  const matches = [], textInk = new Map();
+  const chunks = page.querySelectorAll(`.chunkwin[data-src="${CSS.escape(sourceId)}"]`);
+  const wholeTable = !rule && surfaces.length === 1 && chunks.length === 1 && chunks[0].querySelector('img.chunk') &&
+    clickedGlyphs.length <= 4096 &&
+    candidates.length && candidates.every(r => r.tableRow != null);
+  const runsByRegion = new Map();
+  function collect(group, probe) {
+    const region = group[0];
+    const tableRuns = wholeTable ? geometry.tablePaintRuns(region.value, probe, clickedGlyphs) : null;
+    if (tableRuns) {
+      const byStart = new Map();
+      for (const run of tableRuns) {
+        byStart.set(run.start, byStart.has(run.start) ? null : run);
       }
-      const occurrences = pages.flatMap(p => {
-        if (!p.glyphs.length) return [];
-        const bounds = { left: Math.min(...p.glyphs.map(g => g.left)), right: Math.max(...p.glyphs.map(g => g.right)),
-          top: Math.min(...p.glyphs.map(g => g.top)), bottom: Math.max(...p.glyphs.map(g => g.bottom)) };
-        const maps = region.kind === 'text'
-          ? geometry.textMaps(region.value, p.glyphs) : geometry.mathMaps(probe, p.glyphs, bounds);
-        return maps.map(({ map }) => ({ map, pageNumber: p.pageNumber,
-          top: Math.min(...map.map(g => g.top)), left: Math.min(...map.map(g => g.left)) }));
-      }).sort((a, b) => a.pageNumber - b.pageNumber || a.top - b.top || a.left - b.left);
-      // Identical source formulas must form a complete source-to-ink
-      // bijection, including copies on other pages of this same block.
-      // Choosing each candidate's nearest ink would edit the first source
-      // occurrence even when the second printed copy was clicked.
-      if (occurrences.length !== group.length) continue;
-      const ordered = [...group].sort((a, b) => a.source.start.line - b.source.start.line || a.source.start.column - b.source.start.column);
-      for (let index = 0; index < occurrences.length; index++) {
-        const occurrence = occurrences[index];
-        if (occurrence.pageNumber !== Number(page.dataset.page)) continue;
-        const hit = geometry.nearest(occurrence.map, point);
-        if (hit && point.x >= hit.left - 2 && point.x <= hit.right + 2 &&
-            point.y >= hit.top - 1 && point.y <= hit.bottom + 1) {
-          matches.push({ region: ordered[index], distance: Math.abs((hit.top + hit.bottom) / 2 - point.y) });
-        }
-      }
+      for (const item of group) runsByRegion.set(item, byStart);
     }
-  } finally { probe?.remove(); }
+    const occurrences = pages.flatMap(p => {
+      if (!p.glyphs.length) return [];
+      const maps = tableRuns ?? (region.kind === 'text'
+        ? geometry.textMaps(region.value, p.glyphs) : geometry.mathMaps(probe, p.glyphs));
+      return maps.map(({ map }) => ({ map, pageNumber: p.pageNumber,
+        top: Math.min(...map.map(g => g.top)), left: Math.min(...map.map(g => g.left)) }));
+    }).sort((a, b) => a.pageNumber - b.pageNumber || a.top - b.top || a.left - b.left);
+    // Count copies across every page of the block. When different source
+    // spellings produce the same ink, require the neighboring prose to
+    // identify the clicked copy before accepting it.
+    const counted = occurrences.length === group.length && (!wholeTable || group.length === 1);
+    if (!counted && region.kind !== 'math') return;
+    for (let index = 0; index < occurrences.length; index++) {
+      const occurrence = occurrences[index];
+      if (occurrence.pageNumber !== Number(page.dataset.page)) continue;
+      if (region.kind === 'text') {
+        const ink = singleLineInk(occurrence.map, occurrence.pageNumber, group.length === 1);
+        if (ink) textInk.set(group[index], ink);
+      }
+      const hit = geometry.nearest(occurrence.map, point);
+      const atGlyph = hit && point.x >= hit.left - 2 && point.x <= hit.right + 2 &&
+        point.y >= hit.top - 1 && point.y <= hit.bottom + 1;
+      if (rule ? !geometry.fractionAtRule(probe, occurrence.map, rule) : !atGlyph) continue;
+      const target = counted ? group[index] :
+        witnessedInlineFormula(group, occurrence, textInk, candidates, page.provisionalSnapshot, clickedGlyphs);
+      if (target) matches.push({ region: target, distance: rule ? 0 : Math.abs((hit.top + hit.bottom) / 2 - point.y) });
+    }
+  }
+  const formulas = [];
+  for (const group of groups.values()) {
+    if (group[0].kind === 'math') formulas.push(group);
+    else collect(group, null);
+  }
+  // Each field needs a rendered atom layout. Measure independent formulas
+  // on the same frame and reuse a bounded set of fields on dense pages.
+  const Mathfield = customElements.get('math-field');
+  const probes = [];
+  const batchSize = 6;
+  try {
+    for (let first = 0; Mathfield && first < formulas.length; first += batchSize) {
+      const batch = formulas.slice(first, first + batchSize);
+      for (const [index, group] of batch.entries()) {
+        if (!probes[index]) {
+          const field = new Mathfield();
+          field.mathVirtualKeyboardPolicy = 'manual';
+          field.readOnly = true;
+          field.inert = true;
+          Object.assign(field.style, { position: 'fixed', left: '-10000px', top: '0', opacity: '0', pointerEvents: 'none' });
+          probes.push(field);
+          document.body.append(field);
+        }
+        const value = group[0].value;
+        probes[index].value = shouldWrapAligned(value) ? wrapAligned(value) : value;
+      }
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      if (!current()) return null;
+      for (const [index, group] of batch.entries()) collect(group, probes[index]);
+    }
+  } finally { for (const probe of probes) probe.remove(); }
   if (!current()) return null;
+  if (wholeTable) {
+    const ink = geometry.tablePaintHit(candidates, clickedGlyphs, runsByRegion, point);
+    if (ink !== undefined) return ink ? { ...ink.region, chunkMap: ink.map } : null;
+  }
   matches.sort((a, b) => a.distance - b.distance);
   if (matches.length > 1 && Math.abs(matches[0].distance - matches[1].distance) < 0.01) return null;
   return matches[0]?.region ?? null;
@@ -5332,6 +6183,10 @@ async function resolveEditRegion(target, event) {
     if (!target) return null;
   }
 
+  if (target.dataset.part) {
+    const rule = target.dataset.part === 'rule' ? target.getBBox() : null;
+    return await provisionalRegionAtPoint(page, src, candidates.filter(region => region.kind === 'math'), event, rule) ?? null;
+  }
   if (block?.gfx || target.classList.contains('tdom-source-hit')) {
     const matched = await provisionalRegionAtPoint(page, src, candidates, event);
     if (matched !== undefined) return matched;
@@ -5626,6 +6481,8 @@ function setDirectSelection(session, start, end = start) {
 
 function directGeometryHit(session, point) {
   const geometry = window.TdomDirectEditGeometry;
+  const ink = pendingFormulas.get(session.formulaSlot?.key);
+  if (ink?.map?.length && ink.paintedValue === session.readValue()) return geometry.mathHit(session.control, ink.map, point, ink.slot.rect);
   return session.kind === 'math'
     ? geometry.mathHit(session.control, session.glyphMap ?? [], point, session.printBounds, session.sourceBoxes)
     : geometry.hit(session.glyphMap ?? [], point);
@@ -5653,6 +6510,599 @@ function cancelDirectEditorVisuals() {
   directEditorVisualNeedsReposition = false;
 }
 
+// A replacement may finish before a new TeX page is available. The active
+// input can keep its committed text inside the old selection's printed box
+// when every selected glyph belongs to one contiguous line on that page.
+function imeReplacementBox(session, start, end, page) {
+  if (start === end || session.kind !== 'text' || !page?.classList.contains('is-final') ||
+      !session.glyphMap?.length || !page.dataset.canonPresentedSrc || page.querySelector('.tdom-canonical-delta')) return null;
+  const glyphs = session.glyphMap.filter(g => g.end > start && g.start < end);
+  const first = glyphs[0], last = glyphs.at(-1);
+  if (first?.start !== start || last?.end !== end) return null;
+  for (let i = 1; i < glyphs.length; i++) {
+    const prev = glyphs[i - 1], next = glyphs[i];
+    if (prev.end !== next.start || Math.abs(next.top - first.top) > 0.5 ||
+        Math.abs(next.bottom - first.bottom) > 0.5 || Math.abs(next.left - prev.right) > 1) return null;
+  }
+  return { left: first.left, right: last.right, top: first.top, bottom: first.bottom };
+}
+
+// Pending edits use the old formula's proven paper position until TeX
+// presents its next page. Keep the input field focused in its own session.
+const pendingFormulas = new Map();
+function forgetPendingFormula(key) {
+  const ink = pendingFormulas.get(key);
+  if (!ink) return;
+  ink.observer.disconnect();
+  cancelAnimationFrame(ink.frame);
+  ink.node.remove();
+  pendingFormulas.delete(key);
+}
+function retirePendingFormulas(page) {
+  if (!page) sourceFormulaEdits.clear();
+  for (const [key, ink] of pendingFormulas) if (!page || ink.page === page) forgetPendingFormula(key);
+}
+
+function printedMathEm(control, map) {
+  const em = parseFloat(getComputedStyle(control).fontSize), sizes = [];
+  for (const glyph of map) {
+    if ([...glyph.symbol].length !== 1) continue;
+    const width = control.getElementInfo(glyph.end)?.glyphBounds?.width;
+    if (width > 0 && glyph.right > glyph.left && em > 0) sizes.push((glyph.right - glyph.left) * em / width);
+    if (sizes.length === 5) break;
+  }
+  sizes.sort((a, b) => a - b);
+  return sizes[Math.floor(sizes.length / 2)];
+}
+
+async function prepareFormulaSlot(session, page, basis) {
+  const { map, src, rev } = basis;
+  const image = page.querySelector('img.canon');
+  if (!image || image.dataset.src !== src || !map.length) return;
+  const geometry = window.TdomDirectEditGeometry;
+  const shapes = await geometry.formulaPageShapes(image);
+  const retained = directEditRevisits.some(record => record.sessionId === session.sessionId);
+  if (!shapes || documentReset.pending || basis.epoch !== documentReset.adoptedEpoch || !page.isConnected ||
+      (directEditor !== session && !retained) || session.revisitCancelled || session.formulaBasis !== basis || page.dataset.canonPresentedSrc !== src ||
+      page.dataset.canonPresentedRev !== rev || !page.classList.contains('is-final')) return;
+  const paper = activePaperGeometry(page), slot = geometry.isolatedFormulaSlot(shapes, map, paper, basis.structures, basis.displayRows, basis.completeMap);
+  if (!slot) return;
+  session.formulaSlot = { ...slot, color: getComputedStyle(page).backgroundColor, paper, src, rev,
+    key: JSON.stringify([documentReset.adoptedEpoch, session.pageNumber, src, directSourceRangeKey(session.region)]) };
+  if (directEditor === session) scheduleDirectEditorVisuals();
+  else if (session.finishedFormula) paintPendingFormula(session, page);
+}
+
+// Source typing has no paper caret. Account for each changed byte using the
+// formula ranges of the printed snapshot and the current source snapshot.
+function sourceFormulaChangeState(old, region) {
+  const auxPattern = /\\(?:label\{[\w.:-]+\}|tag\*?\{[\w .:-]+\}|notag\b|nonumber\b)/g;
+  const structures = ['\\frac', '\\tfrac', '\\dfrac', '\\sqrt'];
+  const symbols = window.TdomOpaqueEditorCoordinator;
+  const syntax = value => {
+    if (typeof value !== 'string' || value.length > 512) return null;
+    let incomplete = /\\(?:[dt]?frac|sqrt)(?![A-Za-z])\s*(?=}|$)/.test(value);
+    const plain = value.replace(auxPattern, '').replace(/\\[A-Za-z]+/g, command => {
+      if (structures.includes(command) || symbols.isPrintedSymbolCommand(command)) return 'x';
+      if (!structures.some(full => full.startsWith(command)) && !symbols.startsPrintedSymbolCommand(command)) return command;
+      incomplete = true;
+      return 'x';
+    }).replace(/\\(?=}|$)/g, () => {
+      incomplete = true;
+      return '';
+    });
+    if (!/^[A-Za-z0-9_^{}\[\]\s+*=().,-]+$/.test(plain)) return null;
+    let depth = 0;
+    for (const char of plain) {
+      if (char === '{') depth++;
+      if (char === '}' && --depth < 0) return null;
+    }
+    return incomplete || depth || /[_^]\s*$/.test(plain) ? 'incomplete' : 'ready';
+  };
+  if (syntax(old.value) !== 'ready' || typeof region.value !== 'string' ||
+      JSON.stringify(old.value.match(auxPattern)) !== JSON.stringify(region.value.match(auxPattern))) return null;
+  return syntax(region.value);
+}
+
+// The candidate ranges are in source order. Scan to each line once per
+// file, even when a multi-cursor edit is near the end of a long chapter.
+function orderedSourceOffsets(text) {
+  let line = 1, start = 0, newline = text.indexOf('\n');
+  return position => {
+    if (!Number.isSafeInteger(position?.line) || position.line < line ||
+        !Number.isSafeInteger(position.column) || position.column < 1) return -1;
+    while (line < position.line) {
+      if (newline < 0) return -1;
+      start = newline + 1;
+      newline = text.indexOf('\n', start);
+      line++;
+    }
+    const offset = start + position.column - 1;
+    return offset <= (newline < 0 ? text.length : newline) ? offset : -1;
+  };
+}
+
+function changedSourceFormulas(before, after, oldBlocks, paperRegions = null) {
+  const changes = [], byFile = new Map();
+  const wanted = new Map(oldBlocks.map(block => [block.id, block]));
+  for (const block of after.blocks) {
+    const oldBlock = wanted.get(block.id);
+    if (!oldBlock) continue;
+    const originals = new Map(oldBlock.editRegions?.map(region => [region.id, region]));
+    for (const region of block.editRegions ?? []) {
+      if (region.kind !== 'math') continue;
+      const old = originals.get(region.id);
+      if (old?.kind !== 'math' || (old.value === region.value && !paperRegions?.has(region.id))) continue;
+      if (Boolean(old.display) !== Boolean(region.display) || old.source.file !== region.source.file || changes.length >= 32) return null;
+      const state = old.value === region.value ? 'ready' : sourceFormulaChangeState(old, region);
+      if (!state) return null;
+      const change = { old, region, oldBlock, state };
+      changes.push(change);
+      if (!byFile.has(old.source.file)) byFile.set(old.source.file, []);
+      byFile.get(old.source.file).push(change);
+    }
+  }
+  if (!changes.length || before.sources.length !== after.sources.length) return null;
+  for (const [i, file] of before.sources.entries()) {
+    const next = after.sources[i];
+    if (next.file !== file.file) return null;
+    const spans = byFile.get(file.file);
+    if (!spans) {
+      if (file.text !== next.text) return null;
+      continue;
+    }
+    if (typeof file.text !== 'string' || typeof next.text !== 'string') return null;
+    const byStart = (a, b) => a.old.source.start.line - b.old.source.start.line ||
+      a.old.source.start.column - b.old.source.start.column;
+    const oldOffset = orderedSourceOffsets(file.text), newOffset = orderedSourceOffsets(next.text);
+    let oldEnd = 0, newEnd = 0;
+    for (const { old, region } of spans.sort(byStart)) {
+      const start = oldOffset(old.source.start), at = newOffset(region.source.start);
+      if (start < oldEnd || at - newEnd !== start - oldEnd ||
+          !next.text.startsWith(file.text.slice(oldEnd, start), newEnd)) return null;
+      const oldValue = old.sourceValue ?? old.value, newValue = region.sourceValue ?? region.value;
+      oldEnd = oldOffset(old.source.end);
+      newEnd = newOffset(region.source.end);
+      if (oldEnd - start !== oldValue.length || newEnd - at !== newValue.length ||
+          !file.text.startsWith(oldValue, start) || !next.text.startsWith(newValue, at)) return null;
+    }
+    if (file.text.length - oldEnd !== next.text.length - newEnd ||
+        !next.text.startsWith(file.text.slice(oldEnd), newEnd)) return null;
+    byFile.delete(file.file);
+  }
+  return byFile.size ? null : changes;
+}
+
+// Keep only recent block IDs. A missing ID can never produce an incorrect
+// match: changedSourceFormulas also checks the complete source files.
+const sourceFormulaEdits = new Map();
+const sourceFormulaProofs = new WeakMap();
+const sourceFormulaBlockIndexes = new WeakMap();
+function sourceFormulaBlocks(snapshot) {
+  let blocks = sourceFormulaBlockIndexes.get(snapshot);
+  if (!blocks) {
+    blocks = new Map(snapshot.blocks.map(block => [block.id, block]));
+    sourceFormulaBlockIndexes.set(snapshot, blocks);
+  }
+  return blocks;
+}
+function sourceFormulaProof(key, page, presented, block, region) {
+  let proofs = sourceFormulaProofs.get(presented.snapshot);
+  if (!proofs) sourceFormulaProofs.set(presented.snapshot, proofs = { slots: new Map(), rows: new Map() });
+  if (!proofs.slots.has(key)) {
+    proofs.slots.set(key, locateSourceFormula(page, presented, block, region, proofs.rows).catch(() => null));
+    if (proofs.slots.size > 32) proofs.slots.delete(proofs.slots.keys().next().value);
+  }
+  return proofs.slots.get(key);
+}
+
+function warmSourceFormula(message) {
+  if (!embeddedHost || directEditor || openingDirectInput || documentReset.pending ||
+      message.documentEpoch !== documentReset.adoptedEpoch || !Number.isSafeInteger(message.offset) || message.offset < 0) return;
+  const targets = new Map();
+  for (const page of pagesEl.querySelectorAll('.page.is-final')) {
+    const bounds = page.getBoundingClientRect();
+    if (bounds.bottom <= 0 || bounds.top >= innerHeight || page.querySelector('.tdom-canonical-delta')) continue;
+    const presented = presentedPageState(page);
+    if (presented?.rev !== message.srcRev) continue;
+    const snapshot = presented.snapshot, n = Number(page.dataset.page);
+    if (!targets.has(snapshot)) {
+      const file = snapshot.sources?.find(source => sameSourceFile(source.file, message.file));
+      if (!file || message.offset > file.text.length) continue;
+      let line = 1, lineStart = 0;
+      for (let at = file.text.indexOf('\n'); at >= 0 && at < message.offset; at = file.text.indexOf('\n', lineStart)) {
+        line++;
+        lineStart = at + 1;
+      }
+      const column = message.offset - lineStart + 1;
+      const found = [];
+      for (const block of snapshot.blocks) for (const region of block.editRegions ?? []) {
+        if (region.kind !== 'math' || region.source?.file !== file.file) continue;
+        const { start, end } = region.source;
+        if (line < start.line || line > end.line || line === start.line && column < start.column ||
+            line === end.line && column > end.column) continue;
+        found.push({ block, region });
+      }
+      targets.set(snapshot, found);
+    }
+    const found = targets.get(snapshot);
+    if (found.length !== 1) continue;
+    const { block, region } = found[0];
+    if (block.pages?.length && !block.pages.includes(n)) continue;
+    const key = JSON.stringify([message.documentEpoch, n, presented.src, directSourceRangeKey(region)]);
+    sourceFormulaProof(key, page, presented, block, region);
+  }
+}
+
+async function locateDisplaySourceFormula(pageNumber, presented, old, stillCurrent) {
+  const [bounds, boxes, glyphs] = await Promise.all([
+    canonicalSourceBounds(old, pageNumber, presented.id),
+    canonicalSourceEditBoxes(pageNumber, presented.id, old),
+    canonicalGlyphs(pageNumber, presented.id),
+  ]);
+  return matchDisplaySourceFormula(old, bounds, boxes, glyphs, stillCurrent);
+}
+
+async function matchDisplaySourceFormula(region, bounds, boxes, glyphs, stillCurrent) {
+  const Mathfield = customElements.get('math-field');
+  if (!Mathfield || !bounds || !boxes.length || !glyphs.length || !stillCurrent()) return null;
+  const rows = boxes.filter(box => !box.empty).map(box => box.box);
+  const displayRows = [...(bounds.sourceRows ?? []), ...rows];
+  if (!rows.length) return null;
+  const scope = { left: Math.min(bounds.left, ...rows.map(b => b.left)), right: Math.max(bounds.right, ...rows.map(b => b.right)),
+    top: Math.min(bounds.top, ...rows.map(b => b.top)), bottom: Math.max(bounds.bottom, ...rows.map(b => b.bottom)) };
+  const field = new Mathfield(), geometry = window.TdomDirectEditGeometry;
+  field.defaultMode = 'math';
+  field.readOnly = true;
+  field.mathVirtualKeyboardPolicy = 'manual';
+  field.inert = true;
+  Object.assign(field.style, { position: 'fixed', left: '-10000px', top: '0', opacity: '0', pointerEvents: 'none' });
+  try {
+    document.body.append(field);
+    field.value = region.value;
+    hidePaperAuxiliaries(field);
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    if (!stillCurrent()) return null;
+    const matches = geometry.mathMaps(field, glyphs, scope);
+    if (matches.length !== 1) return null;
+    const { map } = matches[0];
+    if (!geometry.completeDisplayMap(field, map)) return null;
+    return { map, structures: geometry.printedMathStructures(field, map, glyphs), displayRows,
+      completeMap: true, emSize: printedMathEm(field, map) };
+  } finally { field.remove(); }
+}
+
+async function locateSourceFormula(page, presented, oldBlock, old, rows) {
+  const pageNumber = Number(page.dataset.page), base = presented.snapshot, source = old.source;
+  if (oldBlock.source?.file !== source.file || oldBlock.sourceRanges?.some(range => range.file !== source.file)) return null;
+  const current = () => page.isConnected && page.dataset.canonPresentedSrc === presented.src && !documentReset.pending;
+  const copy = old.display ? await locateDisplaySourceFormula(pageNumber, presented, old, current)
+    : await locateInlineSourceFormula(pageNumber, presented, oldBlock, old, rows, current);
+  if (!copy || !current()) return null;
+  const geometry = window.TdomDirectEditGeometry, paper = activePaperGeometry(page);
+  const shapes = await geometry.formulaPageShapes(presented.image);
+  if (!shapes || !current()) return null;
+  const slot = geometry.isolatedFormulaSlot(shapes, copy.map, paper, copy.structures, copy.displayRows, copy.completeMap);
+  if (!slot) return null;
+  if (!old.display && old.tableRow != null) {
+    if (copy.map.some(g => g.left < copy.extent.left || g.right > copy.extent.right)) return null;
+    slot.rect.right = Math.min(slot.rect.right, copy.extent.right);
+  }
+  const rev = String(presented.rev), src = presented.src, epoch = base.documentEpoch;
+  return { basis: { map: copy.map, value: old.value, epoch, rev, src, started: true, emSize: copy.emSize },
+    slot: { ...slot, rev, src, paper, color: getComputedStyle(page).backgroundColor,
+      key: JSON.stringify([epoch, pageNumber, src, directSourceRangeKey(old)]) },
+    bounds: inkBounds(copy.map, pageNumber) };
+}
+
+async function locateInlineSourceFormula(pageNumber, presented, oldBlock, old, rows, current) {
+  const source = old.source;
+  if (old.tableRow != null) {
+    const sourceRows = tableRowsByFile(oldBlock.editRegions).get(source.file);
+    if (!sourceRows) return null;
+    const boxes = await canonicalSourceEditBoxes(pageNumber, presented.id, old, true);
+    if (!current()) return null;
+    const cell = window.TdomDirectEditGeometry.locateTableCell(sourceRows, boxes, { region: old });
+    if (!cell) return null;
+    const copies = await tableCellInk(cell, pageNumber, presented.id, current, old);
+    return copies?.find(copy => copy.region === old) ?? null;
+  }
+  // The correspondence proof enumerates every printed copy of this value on
+  // its paragraph's lines. Multi-cursor edits share that one immutable result.
+  const rowKey = JSON.stringify([oldBlock.id, pageNumber, source.file, source.start.line, old.value]);
+  if (!rows.has(rowKey)) {
+    const lookup = async () => {
+      const anchors = await inlineSourceLineBoxes(pageNumber, presented.id, oldBlock, source.start.line);
+      if (!anchors.length || !current()) return [];
+      return inlineMathCopies(presented.snapshot, { file: source.file, line: source.start.line, anchors },
+        pageNumber, presented.id, current, old.value);
+    };
+    rows.set(rowKey, lookup());
+    if (rows.size > 32) rows.delete(rows.keys().next().value);
+  }
+  const copies = await rows.get(rowKey);
+  const occurrences = copies.filter(item => directSourceRangeKey(item.region) === directSourceRangeKey(old));
+  if (occurrences.length !== 1 || occurrences[0].region.id !== old.id || !current()) return null;
+  return occurrences[0];
+}
+
+// A finished paper edit may be ahead of an arriving engine snapshot. Before
+// handing its ink back to code editing, ask the host's existing read-only
+// source-anchor service whether Monaco still contains this exact snapshot.
+// For clicks on retained ink, a range rebased over unrelated edits suffices.
+let sourceFormulaRequest = 0;
+function confirmSourceFormulaAnchor(snapshot, region, exactFile) {
+  const sourceText = sourceTextForRegion(snapshot, region);
+  if (typeof sourceText !== 'string') return Promise.resolve(false);
+  const requestId = 'source-formula-' + (++sourceFormulaRequest);
+  const sessionId = requestId, activationId = embedActivationId;
+  const documentEpoch = snapshot.documentEpoch, sourceRev = snapshot.srcRev;
+  return new Promise(resolve => {
+    const finish = matched => {
+      clearTimeout(timer);
+      window.removeEventListener('message', receive);
+      resolve(matched);
+    };
+    const receive = event => {
+      const data = event.data;
+      if (event.source !== window.parent || data?.source !== 'tdom-host' ||
+          data.action !== 'edit-anchor-result' || data.requestId !== requestId || data.sessionId !== sessionId) return;
+      finish(data.ok === true && data.activationId === activationId && data.documentEpoch === documentEpoch &&
+        data.sourceRev === sourceRev && data.file === region.source.file &&
+        data.baseValue === (region.sourceValue ?? region.value) && (!exactFile || data.sourceText === sourceText));
+    };
+    const timer = setTimeout(() => finish(false), 1500);
+    window.addEventListener('message', receive);
+    window.parent.postMessage({ source: 'tdom-embed', action: 'edit-anchor', requestId, sessionId,
+      activationId, documentEpoch, sourceRev, file: region.source.file, start: region.source.start,
+      end: region.source.end, baseValue: region.sourceValue ?? region.value, sourceText }, '*');
+  });
+}
+
+function pruneSourceFormulas(keep) {
+  for (const [key, ink] of pendingFormulas) if (ink.sourceSnapshot && !keep?.has(key)) forgetPendingFormula(key);
+}
+
+async function previewSourceFormula(report) {
+  const rev = report.srcRev, epoch = documentReset.adoptedEpoch;
+  if (!embeddedHost || documentReset.pending || rev !== appliedSrcRev) return;
+  if (!report.dirtySourceNodes?.length && !report.removedSourceNodes?.length) return;
+  for (const node of report.dirtySourceNodes ?? []) {
+    const id = String(node).replace(/^src-/, '');
+    sourceFormulaEdits.delete(id);
+    sourceFormulaEdits.set(id, rev);
+  }
+  while (sourceFormulaEdits.size > 64) sourceFormulaEdits.delete(sourceFormulaEdits.keys().next().value);
+  // A half-written TeX group has no current source map. Preserve the
+  // last visible draft until TeX can describe the next edit.
+  if (openingDirectInput || report.stats?.closureDeferred) return;
+  if (directEditor && ![...pendingFormulas.values()].some(ink => ink.sourceSnapshot)) return;
+  if (report.canonicalAnchor?.status === 'pending') { pruneSourceFormulas(); return; }
+  const base = canonical && presentedDomSnapshots.get(presentedSnapshotKey(canonical.id, canonical.rev));
+  if (!base) { pruneSourceFormulas(); return; }
+
+  // Only load current source when a candidate has math on visible printed
+  // paper. Group by the PDF snapshot actually displayed on each such page.
+  const groups = new Map();
+  const hints = sourceFormulaBlocks(base);
+  const demand = new Map();
+  let unpaginatedRev = -1;
+  for (const [id, lastEdit] of sourceFormulaEdits) {
+    const hint = hints.get(id);
+    if (!hint?.editRegions?.some(r => r.kind === 'math')) continue;
+    if (!hint.pages?.length) unpaginatedRev = Math.max(unpaginatedRev, lastEdit);
+    for (const n of hint.pages ?? []) demand.set(n, Math.max(demand.get(n) ?? -1, lastEdit));
+  }
+  // A native PDF may be ready before the block paginator can place a
+  // long paragraph. Only displayed sheets qualify, and source boxes and
+  // glyphs still have to prove the complete occurrence on each one.
+  if (unpaginatedRev >= 0) for (const page of pagesEl.querySelectorAll('.page.is-final')) {
+    const n = Number(page.dataset.page);
+    demand.set(n, Math.max(demand.get(n) ?? -1, unpaginatedRev));
+  }
+  for (const [n, lastEdit] of demand) {
+    const page = pageDivs.get(n);
+    if (!page?.classList.contains('is-final') || page.querySelector('.tdom-canonical-delta')) continue;
+    const viewport = page.getBoundingClientRect();
+    if (viewport.bottom <= 0 || viewport.top >= innerHeight) continue;
+    const presented = presentedPageState(page);
+    if (!presented || presented.rev >= lastEdit) continue;
+    if (!groups.has(presented.snapshot)) groups.set(presented.snapshot, new Map());
+    groups.get(presented.snapshot).set(n, { page, presented });
+  }
+  if (!groups.size) { pruneSourceFormulas(); return; }
+  const snapshot = await loadProvisionalSnapshot(rev).catch(() => null);
+  const current = () => rev === appliedSrcRev && epoch === documentReset.adoptedEpoch &&
+    !documentReset.pending && !openingDirectInput;
+  if (!current()) return;
+  if (!snapshot) return;
+  const keep = new Set(), paints = [], confirmations = new Map();
+  const paperRegions = new Set([...pendingFormulas.values()].filter(ink => !ink.sourceSnapshot).map(ink => ink.region.id));
+  async function releasePaperInk(key, ink, region) {
+    const file = region.source.file, owner = ink.sessionId, value = ink.renderValue;
+    if (!confirmations.has(file)) confirmations.set(file, confirmSourceFormulaAnchor(snapshot, region, true));
+    if (!await confirmations.get(file) || !current() || directEditor?.formulaSlot?.key === key ||
+        pendingFormulas.get(key) !== ink || owner !== ink.sessionId || value !== ink.renderValue ||
+        !ink.page.classList.contains('is-final') || ink.page.dataset.canonPresentedSrc !== ink.slot.src ||
+        ink.page.querySelector('.tdom-canonical-delta')) return false;
+    const prior = directEditRevisits.findIndex(record => record.sessionId === owner);
+    if (prior >= 0) directEditRevisits.splice(prior, 1);
+    return true;
+  }
+  for (const [printed, pages] of groups) {
+    const originals = sourceFormulaBlocks(printed), oldBlocks = [];
+    for (const [id, lastEdit] of sourceFormulaEdits) if (lastEdit > printed.srcRev && originals.has(id)) oldBlocks.push(originals.get(id));
+    const changes = changedSourceFormulas(printed, snapshot, oldBlocks, paperRegions);
+    if (!changes) continue;
+    for (const [pageNumber, { page, presented }] of pages) {
+      for (const { old, region, oldBlock, state } of changes) {
+        if (oldBlock.pages?.length && !oldBlock.pages.includes(pageNumber)) continue;
+        const key = JSON.stringify([epoch, pageNumber, presented.src, directSourceRangeKey(old)]);
+        keep.add(key);
+        // A partly typed control word cannot be typeset yet. Keep its last
+        // good ink and revalidate that source range on click. Its peers can update.
+        if (state === 'incomplete' || directEditor?.formulaSlot?.key === key) continue;
+        // Code can undo a finished paper edit all the way to the printed
+        // value. Reveal this one original formula and keep its edited peers.
+        if (old.value === region.value) {
+          const ink = pendingFormulas.get(key);
+          if (ink && !ink.sourceSnapshot) paints.push(releasePaperInk(key, ink, region).then(released => {
+            if (released && current() && pendingFormulas.get(key) === ink) forgetPendingFormula(key);
+          }));
+          continue;
+        }
+        paints.push(sourceFormulaProof(key, page, presented, oldBlock, old).then(async proof => {
+          if (!current() || directEditor?.formulaSlot?.key === key) return;
+          if (!proof || page.dataset.canonPresentedSrc !== presented.src || !page.classList.contains('is-final') ||
+              page.querySelector('.tdom-canonical-delta')) return;
+          const existing = pendingFormulas.get(key);
+          if (existing && !existing.sourceSnapshot) {
+            if (directEditValuesEqual('math', existing.renderValue, region.value)) return;
+            if (!await releasePaperInk(key, existing, region)) return;
+          }
+          renderPendingFormula(page, proof.slot, proof.basis, region, proof.bounds, region.value, region.value, null, snapshot);
+        }));
+      }
+    }
+  }
+  pruneSourceFormulas(keep);
+  await Promise.all(paints);
+}
+
+function paintPendingFormula(session, page, restored = null) {
+  if (!session.sentEdit && !restored) {
+    const existing = pendingFormulas.get(session.formulaSlot?.key);
+    return existing?.paintedValue === session.readValue() ? existing : null;
+  }
+  const basis = session.formulaBasis;
+  if (basis && !basis.started && !directEditValuesEqual('math', session.readValue(), basis.value)) {
+    basis.started = true;
+    void prepareFormulaSlot(session, page, basis);
+  }
+  const slot = session.formulaSlot;
+  if (!slot || slot.anchorRev && slot.anchorRev !== canonicalAnchorPreview?.srcRev || slot.src !== page.dataset.canonPresentedSrc || slot.rev !== page.dataset.canonPresentedRev) return null;
+  const value = restored?.value ?? session.finishedFormula?.value ?? session.readValue();
+  if (directEditValuesEqual('math', value, basis.value)) {
+    forgetPendingFormula(slot.key);
+    return null;
+  }
+  return renderPendingFormula(page, slot, basis, session.revisitDisplayRegion, session.printBounds, value,
+    restored?.fieldValue ?? session.finishedFormula?.latex ?? session.control.value, restored?.sessionId ?? session.sessionId);
+}
+
+function hidePaperAuxiliaries(field) {
+  const hiddenCommands = ['label', 'tag', 'tagstar', 'notag', 'nonumber']
+    .map(name => '.ML__tex64-aux-command--' + name).join(',');
+  const auxStyle = document.createElement('style');
+  auxStyle.textContent = hiddenCommands + ' {display:none !important}';
+  field.shadowRoot?.append(auxStyle);
+  return hiddenCommands;
+}
+
+function renderPendingFormula(page, slot, basis, region, bounds, value, latex, sessionId, sourceSnapshot = null) {
+  let ink = pendingFormulas.get(slot.key);
+  if (!ink) {
+    const node = document.createElement('div'), field = new (customElements.get('math-field'))();
+    node.className = 'tdom-pending-formula';
+    node.inert = true;
+    node.setAttribute('aria-hidden', 'true');
+    field.style.color = slot.foreground;
+    field.defaultMode = region.display ? 'math' : 'inline-math';
+    field.readOnly = true;
+    field.mathVirtualKeyboardPolicy = 'manual';
+    field.tabIndex = -1;
+    const { rect, paper } = slot;
+    Object.assign(node.style, { left: rect.left / paper.width * 100 + '%', top: rect.top / paper.height * 100 + '%',
+      width: (rect.right - rect.left) / paper.width * 100 + '%', height: (rect.bottom - rect.top) / paper.height * 100 + '%',
+      background: slot.color, visibility: 'hidden' });
+    const hiddenCommands = hidePaperAuxiliaries(field);
+    node.append(field);
+    page.append(node);
+    ink = { node, field, page, slot, region, bounds, basis,
+      renderValue: null, frame: 0 };
+    const fit = () => {
+      ink.frame = 0;
+      const latex = field.shadowRoot?.querySelector('.ML__latex');
+      if (!latex || !node.isConnected) return;
+      if (latex.querySelector('.ML__tex64-aux-command:not(:is(' + hiddenCommands + '))')) {
+        node.style.visibility = 'hidden';
+        ink.map = [];
+        ink.paintedValue = null;
+        return;
+      }
+      field.style.transform = 'none';
+      const content = latex.getBoundingClientRect(), origin = field.getBoundingClientRect(), area = node.getBoundingClientRect();
+      if (!area.width || !area.height || !content.height) return;
+      const nativeScale = basis.emSize ? basis.emSize * area.width / (rect.right - rect.left) /
+        parseFloat(getComputedStyle(field).fontSize) : Infinity;
+      const height = !basis.emSize && slot.baseHeight ? area.height * slot.baseHeight / (rect.bottom - rect.top) : area.height;
+      const scale = Math.min(area.width / Math.max(1, content.width), height / content.height, nativeScale);
+      // Keep the TeX center unless adjacent paper ink limits that side.
+      // Use the free side before shrinking the letters to fit.
+      const centerX = slot.centered ? (slot.center - rect.left) * area.width / (rect.right - rect.left) : 0;
+      const inset = slot.centered ? Math.max(0, Math.min(area.width - content.width * scale,
+        centerX - content.width * scale / 2)) : 0;
+      const centerY = slot.centerY == null ? area.height / 2 : (slot.centerY - rect.top) * area.height / (rect.bottom - rect.top);
+      const topInset = Math.max(0, Math.min(area.height - content.height * scale, centerY - content.height * scale / 2));
+      const x = inset - (content.left - origin.left) * scale, y = topInset - (content.top - origin.top) * scale;
+      field.style.transform = 'matrix(' + [scale, 0, 0, scale, x, y].join(',') + ')';
+      const toX = x => rect.left + (x - area.left) * (rect.right - rect.left) / area.width;
+      const toY = y => rect.top + (y - area.top) * (rect.bottom - rect.top) / area.height;
+      ink.map = [];
+      const end = field.lastOffset;
+      for (let i = 1; i <= end; i++) {
+        const info = field.getElementInfo(i), box = info?.glyphBounds ?? info?.bounds;
+        if (!box || !info.symbol || !Number.isInteger(info.beforeOffset) || box.width <= 0) continue;
+        ink.map.push({ text: info.symbol, symbol: info.symbol, start: info.beforeOffset, end: i,
+          left: toX(box.left), right: toX(box.right), top: toY(box.top), bottom: toY(box.bottom) });
+      }
+      ink.paintedValue = ink.renderValue;
+      node.style.visibility = '';
+      if (directEditor?.formulaSlot?.key === slot.key) scheduleDirectEditorVisuals();
+    };
+    ink.schedule = () => { if (!ink.frame) ink.frame = requestAnimationFrame(fit); };
+    ink.observer = new ResizeObserver(ink.schedule);
+    ink.observer.observe(node);
+    ink.observer.observe(field);
+    pendingFormulas.set(slot.key, ink);
+    while (pendingFormulas.size > 32) forgetPendingFormula(pendingFormulas.keys().next().value);
+  }
+  if (ink.renderValue !== value) {
+    const previous = ink.sourceSnapshot && ink.paintedValue === ink.renderValue ? ink.paintedValue : null;
+    ink.renderValue = value;
+    ink.field.setValue(latex, { silenceNotifications: true });
+    if (sourceSnapshot && latex.includes('\\') && (ink.field.errors?.length ||
+        ink.field.getModelMetadata().some(atom => atom.type === 'placeholder' || atom.type === 'error'))) {
+      if (previous == null) forgetPendingFormula(slot.key);
+      else {
+        ink.renderValue = previous;
+        ink.field.setValue(previous, { silenceNotifications: true });
+        ink.schedule();
+      }
+      return null;
+    }
+    ink.schedule();
+  }
+  ink.sessionId = sessionId;
+  ink.region = region;
+  ink.sourceSnapshot = sourceSnapshot;
+  return ink.paintedValue === value ? ink : null;
+}
+
+function pendingFormulaHit(page, point) {
+  if (!point) return null;
+  for (const ink of pendingFormulas.values()) {
+    if (ink.page !== page || ink.slot.src !== page.dataset.canonPresentedSrc ||
+        ink.slot.rev !== page.dataset.canonPresentedRev || !ink.map?.length || ink.paintedValue !== ink.renderValue) continue;
+    const glyph = window.TdomDirectEditGeometry.nearest(ink.map, point);
+    if (glyph && point.x >= glyph.left - 0.3 && point.x <= glyph.right + 0.3 &&
+        point.y >= glyph.top - 0.3 && point.y <= glyph.bottom + 0.3) {
+      return { ink, sessionId: ink.sessionId, value: ink.renderValue, offset: window.TdomDirectEditGeometry.hit(ink.map, point) };
+    }
+  }
+  return null;
+}
+
 function paintDirectSelection() {
   // A synchronous click/geometry commit has already painted this state.
   // Preserve a queued reposition, which may still need updated shell bounds.
@@ -5667,13 +7117,21 @@ function paintDirectSelection() {
   const pageRect = page.getBoundingClientRect();
   const paper = activePaperGeometry(page);
   const project = bounds => window.TdomOpaqueEditorCoordinator?.clientBounds?.({ bounds, pageRect, paper }) ?? null;
-  if (session.imeComposing && session.compositionInk?.text) {
-    const { anchor, text } = session.compositionInk;
+  const pending = session.kind === 'math' && paintPendingFormula(session, page);
+  let committed = session.committedIme;
+  if (committed) {
+    const selection = directSelection(session);
+    if (page.dataset.canonPresentedSrc !== committed.surface || !page.classList.contains('is-final') ||
+        page.querySelector('.tdom-canonical-delta') || session.readValue() !== committed.value ||
+        !selection?.every(offset => offset === committed.offset)) {
+      session.committedIme = committed = null;
+    }
+  }
+  const inputInk = session.imeComposing ? session.compositionInk : committed;
+  if (inputInk?.text) {
+    const { anchor, text } = inputInk;
     const client = project(anchor);
     if (!client) return clear();
-    // Only uncommitted IME text uses browser paint. Its immutable paper
-    // anchor is the selected PDF glyph boundary; the surrounding PDF and
-    // every other formula remain mounted through candidate conversion.
     const marker = document.createElement('span');
     marker.className = 'tdom-ink-composition';
     marker.textContent = text;
@@ -5683,23 +7141,45 @@ function paintDirectSelection() {
       fontSize: `${Math.max(1, client.bottom - client.top)}px`,
       fontFamily: getComputedStyle(session.control).fontFamily,
     });
+    if (committed) {
+      marker.classList.add('is-committed');
+      marker.style.width = marker.style.maxWidth = `${client.right - client.left}px`;
+      marker.style.height = `${client.bottom - client.top}px`;
+    }
     session.inkLayer.replaceChildren(marker);
     const end = document.createRange();
     end.selectNodeContents(marker); end.collapse(false);
     const caret = [...end.getClientRects()].at(-1) ?? marker.getBoundingClientRect();
+    if (committed && caret.right > client.right + 1) {
+      session.committedIme = null;
+      return paintDirectSelection();
+    }
+    if (committed) {
+      const cursor = document.createElement('span');
+      cursor.className = 'tdom-ink-caret';
+      Object.assign(cursor.style, {
+        left: `${caret.right - pageRect.left}px`, top: marker.style.top,
+        width: '1.5px', height: marker.style.height,
+      });
+      session.inkLayer.appendChild(cursor);
+    }
     const point = paperPointForClick({ clientX: caret.right, clientY: caret.bottom }, page);
-    if (point) session.canonicalAnchorPoint = point;
+    if (point) {
+      session.canonicalAnchorPoint = point;
+      if (committed) session.lastPaintedCaret = { ...anchor, x: point.x };
+    }
     return;
   }
   const selection = directSelection(session);
-  if (!selection || !session.glyphMap?.length) return clear();
-  const exact = String(session.readValue()) === session.geometryValue;
+  const map = pending?.map ?? session.glyphMap;
+  if (!selection || !map?.length) return clear();
+  const exact = Boolean(pending) || String(session.readValue()) === session.geometryValue;
   const [start, end] = selection;
   // Until the new PDF geometry is ready, the only valid caret is the
   // previous printed one. Do not traverse the changed model to discard it.
   const box = !exact ? session.lastPaintedCaret : session.kind === 'math'
-    ? window.TdomDirectEditGeometry.mathCaret(session.control, session.glyphMap, end, session.printBounds, session.sourceBoxes)
-    : window.TdomDirectEditGeometry.caret(session.glyphMap, end);
+    ? window.TdomDirectEditGeometry.mathCaret(session.control, map, end, pending?.slot.rect ?? session.printBounds, pending ? [] : session.sourceBoxes)
+    : window.TdomDirectEditGeometry.caret(map, end);
   const ink = document.createDocumentFragment();
   const add = (bounds, className) => {
     const client = project(bounds);
@@ -5710,7 +7190,7 @@ function paintDirectSelection() {
       width: `${Math.max(1.5, client.right - client.left)}px`, height: `${Math.max(2, client.bottom - client.top)}px` });
     ink.appendChild(marker);
   };
-  const selectedGlyphs = exact && start !== end ? session.glyphMap.filter(glyph =>
+  const selectedGlyphs = exact && start !== end ? map.filter(glyph =>
     glyph.end > Math.min(start, end) && glyph.start < Math.max(start, end)) : [];
   if (selectedGlyphs.length) {
     for (const glyph of selectedGlyphs) add(glyph, 'tdom-ink-selection');
@@ -5745,6 +7225,10 @@ async function refreshDirectEditGeometry(session = directEditor, clickPoint = nu
   const value = String(session.readValue());
   const epoch = session.geometryEpoch = (session.geometryEpoch ?? 0) + 1;
   const imageSrc = page.classList.contains('is-final') ? page.querySelector('img.canon')?.dataset.src : null;
+  if (session.projectedRev && canonicalAnchorPreview?.srcRev === session.projectedRev && page.querySelector('.tdom-canonical-delta')) return;
+  if (session.shipOpeningSrc && imageSrc === session.shipOpeningSrc && !session.sentEdit && session.geometryValue === value) return;
+  if (!imageSrc && session.chunkOpeningEpoch != null && session.chunkOpeningEpoch === page.provisionalEpoch &&
+      !session.sentEdit && session.geometryValue === value) return;
   const id = canonicalIdFromSrc(imageSrc);
   const canonicalVisible = id != null;
   let printedRegion = null;
@@ -5795,6 +7279,19 @@ async function refreshDirectEditGeometry(session = directEditor, clickPoint = nu
     : geometry.mathMap(session.control, glyphs, mappingBounds,
       mappingAnchor, { allowUnpaintedAnchor: session.sentEdit === true, sourceBoxes });
   if (!map.length) return;
+  if (session.kind === 'math' && canonicalVisible) {
+    const structures = /\\(?:[dt]?frac|sqrt)\b/.test(value) ? geometry.printedMathStructures(session.control, map, glyphs) : [];
+    // Forward SyncTeX may stop at a radical's inner box. The same PDF's
+    // source-box tree also contains the complete expression and column.
+    const displayRows = session.region.display ? [
+      ...(session.printBounds?.sourceRows ?? []), ...sourceBoxes.filter(b => !b.empty).map(b => b.box),
+    ] : null;
+    const completeMap = Boolean(displayRows && geometry.completeDisplayMap(session.control, map));
+    const emSize = displayRows ? printedMathEm(session.control, map) : null;
+    session.formulaBasis = { map, value, structures, displayRows, completeMap, emSize, epoch: documentReset.adoptedEpoch,
+      src: page.dataset.canonPresentedSrc, rev: page.dataset.canonPresentedRev };
+    session.formulaSlot = null;
+  }
   if (session.kind === 'math' && canonicalVisible && session.printBounds) {
     session.printBounds = { ...session.printBounds,
       left: Math.min(session.printBounds.left, ...map.map(g => g.left)),
@@ -5803,6 +7300,7 @@ async function refreshDirectEditGeometry(session = directEditor, clickPoint = nu
       bottom: Math.max(session.printBounds.bottom, ...map.map(g => g.bottom)),
     };
   }
+  if (canonicalVisible && session.kind === 'text') session.printedTextMap = { id, map };
   session.glyphMap = map;
   session.sourceBoxes = sourceBoxes;
   session.geometryValue = value;
@@ -5831,7 +7329,7 @@ pagesEl.addEventListener('load', event => {
 }, true);
 
 async function directProvisionalGeometry(session, page) {
-  const result = directSvgGeometry(session, page);
+  const result = directSvgGeometry(page, directEditorVisualNodes(page));
   if (session.kind !== 'math' && result.glyphs.length) return result;
   const paperRect = (rect) => {
     const a = paperPointForClick({ clientX: rect.left, clientY: rect.top }, page);
@@ -5894,6 +7392,9 @@ async function chunkGlyphsOnPage(page, sourceId) {
   };
   const src = CSS.escape(sourceId);
   const glyphs = [];
+  for (const part of page.querySelectorAll(`.chunkwin.part[data-src="${src}"]`)) {
+    if (part.partGlyphs) glyphs.push(...part.partGlyphs);
+  }
   // (a held chunk shows an earlier generation: its glyphs map no current source)
   for (const chunk of page.querySelectorAll(`.chunkwin[data-src="${src}"]:not(.stale):not(.held)`)) {
     const img = chunk.querySelector('img');
@@ -5914,8 +7415,8 @@ async function chunkGlyphsOnPage(page, sourceId) {
   return glyphs;
 }
 
-function directSvgGeometry(session, page) {
-  const nodes = directEditorVisualNodes(page).filter(node => node.tagName?.toLowerCase() === 'text');
+function directSvgGeometry(page, visualNodes) {
+  const nodes = visualNodes.filter(node => node.tagName?.toLowerCase() === 'text');
   const glyphs = [], words = [];
   const paperPoint = (x, y) => paperPointForClick({ clientX: x, clientY: y }, page);
   for (const node of nodes) {
@@ -6092,6 +7593,11 @@ function closeDirectEditor() {
   cancelDirectEditorVisuals();
   if (!directEditor) return;
   rememberDirectEditorRevisit(directEditor);
+  if (directEditor.kind === 'math' && directEditor.sentEdit && !directEditor.revisitCancelled) {
+    directEditor.finishedFormula = { value: directEditor.readValue(), latex: directEditor.control.value };
+    const page = pageDivs.get(directEditor.pageNumber);
+    if (page) paintPendingFormula(directEditor, page);
+  }
   directEditor.resolveOpeningGeometry?.();
   directEditor.resolvePresentationAnchor?.(null);
   directEditor.wysiwyg?.detach?.();
@@ -6107,7 +7613,19 @@ function closeDirectEditor() {
 
 function sendDirectEdit(region, sessionId, visibleValue, { cancel = false, finish = false } = {}) {
   const sessionState = directEditor?.sessionId === sessionId ? directEditor : null;
-  if (sessionState && cancel) sessionState.revisitCancelled = true;
+  if (sessionState && cancel) {
+    sessionState.revisitCancelled = true;
+    if (sessionState.formulaSlot) {
+      const page = pageDivs.get(sessionState.pageNumber);
+      if (page && sessionState.revisit) paintPendingFormula(sessionState, page, sessionState.revisit);
+      else if (page && sessionState.openedFromSourceFormula &&
+          sessionState.formulaSlot.src === page.dataset.canonPresentedSrc && sessionState.formulaSlot.rev === page.dataset.canonPresentedRev) {
+        const original = sessionState.region;
+        renderPendingFormula(page, sessionState.formulaSlot, sessionState.formulaBasis, original, sessionState.printBounds,
+          original.value, original.value, null, sessionState.sourceSnapshot);
+      } else forgetPendingFormula(sessionState.formulaSlot.key);
+    }
+  }
   // Presentation can advance while a session is open. Its edit anchor stays
   // in the immutable source snapshot from which that session began; the
   // host tracks subsequent changes against this same anchor.
@@ -6118,10 +7636,13 @@ function sendDirectEdit(region, sessionId, visibleValue, { cancel = false, finis
     ? sessionState?.readSourceValue?.() ?? visibleValue : visibleValue;
   const serialized = region.kind === 'math'
     ? preserveMathAuxCommands(region.sourceValue ?? region.value, sourceValue) : null;
-  const replacement = region.kind === 'math'
-    ? preserveMathSourceLayout(sessionState?.formattedSource ?? region.sourceValue ?? region.value,
-      sessionState?.serializedValue ?? region.value, serialized)
-    : latexEscapeText(visibleValue);
+  const raw = sessionState?.formattedSource ?? region.sourceValue ?? region.value;
+  const macroSource = region.mathMacros ? window.TdomMathMacros.withoutComments(raw) : raw;
+  const projection = region.mathMacros && window.TdomMathMacros.project(macroSource, region.mathMacros);
+  const edited = region.kind === 'math' ? preserveMathSourceLayout(projection?.text ?? raw,
+    sessionState?.serializedValue ?? region.value, serialized) : latexEscapeText(visibleValue);
+  const rewritten = projection ? window.TdomMathMacros.rewrite(macroSource, projection, edited) : edited;
+  const replacement = projection && raw !== macroSource ? preserveMathSourceLayout(raw, macroSource, rewritten) : rewritten;
   const payload = {
     source: 'tdom-embed',
     activationId: embedActivationId,
@@ -6162,10 +7683,11 @@ function sendDirectEdit(region, sessionId, visibleValue, { cancel = false, finis
   // existing 80 ms source-sync path update the engine.
   const start = lineColToOffset(editor.value, region.source.start.line, region.source.start.column);
   const session = directEditor?.standalone;
-  const old = session?.lastReplacement ?? region.value;
+  const old = session?.lastReplacement ?? region.sourceValue ?? region.value;
   if (editor.value.slice(start, start + old.length) !== old) return;
-  editor.value = editor.value.slice(0, start) + replacement + editor.value.slice(start + old.length);
-  if (directEditor) directEditor.standalone = { lastReplacement: replacement };
+  const next = cancel ? region.sourceValue ?? region.value : replacement;
+  editor.value = editor.value.slice(0, start) + next + editor.value.slice(start + old.length);
+  if (directEditor) directEditor.standalone = { lastReplacement: next };
   scheduleHighlight();
   scheduleSync();
 }
@@ -6176,19 +7698,23 @@ async function openDirectEditor(
   knownRegion = null,
   clickPoint = null,
   printBounds = null,
-  caretOffset = null
+  caretOffset = null,
+  anchorInk = null,
+  pendingHit = null
 ) {
   const inputOpening = openingDirectInput;
   const page = target.closest('#pages > .page');
   const pageNumber = Number(page?.dataset?.page);
   if (!page || !Number.isFinite(pageNumber)) return;
   const presented = usesDirectEditSurface(page) ? presentedPageState(page) : null;
-  if (usesDirectEditSurface(page) && !presented) return;
-  const sourceSnapshot = presented?.snapshot ?? page.provisionalSnapshot;
+  const nativeShip = anchorInk?.shipSrc && presentedShippingPageState(page)?.src === anchorInk.shipSrc;
+  if (usesDirectEditSurface(page) && !presented && !nativeShip) return;
+  const sourceFormulaOpening = Boolean(pendingHit?.ink.sourceSnapshot);
+  const sourceSnapshot = anchorInk?.snapshot ?? presented?.snapshot ?? page.provisionalSnapshot;
   if (!sourceSnapshot || Number(sourceSnapshot.documentEpoch) !== documentReset.adoptedEpoch) return;
   const presentedRev = Number(presented?.rev ?? sourceSnapshot.srcRev);
   if (!Number.isFinite(presentedRev)) return;
-  const canonicalInput = Boolean(presented);
+  const canonicalInput = Boolean(presented || nativeShip);
   const region = knownRegion ?? await editRegionById(id, page);
   if (!region) return;
   if (directEditor) {
@@ -6364,10 +7890,18 @@ async function openDirectEditor(
           ? window.TdomDirectEditGeometry.mathCaret(session.control, session.glyphMap ?? [], offset, session.printBounds, session.sourceBoxes)
           : window.TdomDirectEditGeometry.caret(session.glyphMap ?? [], offset)
         : session.lastPaintedCaret;
+      session.committedIme = null;
       session.imeComposing = true;
       session.compositionInk = caret
         ? { text: '', anchor: { ...caret, left: caret.x, right: caret.x } }
         : null;
+      if (session.compositionInk && selection && session.geometryValue === readValue()) {
+        const end = Math.max(...selection);
+        const box = imeReplacementBox(session, offset, end, page);
+        if (box) Object.assign(session.compositionInk, {
+          box, start: offset, end, original: session.geometryValue, surface: page.dataset.canonPresentedSrc,
+        });
+      }
     }
     realignOpaqueCaret();
   });
@@ -6378,12 +7912,19 @@ async function openDirectEditor(
     }
     realignOpaqueCaret();
   });
-  control.addEventListener('compositionend', () => {
+  control.addEventListener('compositionend', event => {
     composing = false;
     wysiwyg?.setComposing?.(false);
     resizeText();
     sendDirectEdit(region, sessionId, readValue());
     if (directEditor?.sessionId === sessionId) {
+      const ink = directEditor.compositionInk;
+      const text = event.data ?? '';
+      const value = readValue();
+      if (ink?.box && text && !/[\r\n]/.test(text) && value !== ink.original &&
+          value === ink.original.slice(0, ink.start) + text + ink.original.slice(ink.end)) {
+        directEditor.committedIme = { anchor: ink.box, text, surface: ink.surface, value, offset: ink.start + text.length };
+      }
       directEditor.imeComposing = false;
       directEditor.compositionInk = null;
     }
@@ -6406,7 +7947,17 @@ async function openDirectEditor(
     sendDirectEdit(region, sessionId, readValue());
     scheduleDirectEditorVisuals();
   });
+  // The aligned container belongs to MathLive only. Home, End and arrow
+  // navigation must keep the caret inside its first or last cell.
+  const keepAlignmentCaret = () => {
+    if (!mathWrapped || !control.selectionIsCollapsed || control.lastOffset < 2) return;
+    const pos = control.position;
+    if (pos !== 0 && pos !== control.lastOffset) return;
+    const inside = pos === 0 ? 1 : pos - 1;
+    if (control.getEnvironmentContext?.(inside)?.environments.at(-1) === 'aligned') control.position = inside;
+  };
   control.addEventListener('selection-change', () => {
+    keepAlignmentCaret();
     scheduleDirectEditorVisuals();
   });
   control.addEventListener('keydown', (event) => {
@@ -6518,7 +8069,7 @@ async function openDirectEditor(
     canonicalInput,
     sourceRegion: region,
     sourceSnapshot,
-    sourceRev: presentedRev,
+    sourceRev: anchorInk?.snapshot.srcRev ?? presentedRev,
     sourceText: sourceTextForRegion(sourceSnapshot, region),
     revisit,
     revisitDisplayRegion: region,
@@ -6552,8 +8103,39 @@ async function openDirectEditor(
     lastVisibleValue: readValue(),
     serializedValue: region.kind === 'math' ? preserveMathAuxCommands(region.value, readSourceValue()) : null,
     formattedSource: region.sourceValue ?? region.value,
-    sentFromSrcRev: presentedRev,
+    sentFromSrcRev: anchorInk?.snapshot.srcRev ?? presentedRev,
   };
+  if (pendingHit && revisit && pendingHit.sessionId === revisit.sessionId) {
+    directEditor.glyphMap = pendingHit.ink.basis.map;
+    directEditor.geometryValue = region.value;
+  }
+  if (sourceFormulaOpening) {
+    // Keep the source-backed ink clickable until the session actually
+    // changes it. Escape can return to this exact opening snapshot.
+    directEditor.openedFromSourceFormula = true;
+    directEditor.formulaBasis = pendingHit.ink.basis;
+    directEditor.formulaSlot = pendingHit.ink.slot;
+  }
+  if (anchorInk) {
+    directEditor.shipOpeningSrc = anchorInk.shipSrc;
+    directEditor.chunkOpeningEpoch = anchorInk.chunkEpoch;
+    if (nativeShip && region.kind === 'math') {
+      directEditor.sourceBoxes = anchorInk.sourceBoxes ?? [];
+      directEditor.formulaBasis = { map: anchorInk.map, value: region.value,
+        structures: anchorInk.structures, displayRows: anchorInk.displayRows, completeMap: anchorInk.completeMap,
+        emSize: anchorInk.emSize, epoch: sourceSnapshot.documentEpoch,
+        src: anchorInk.shipSrc, rev: page.dataset.canonPresentedRev };
+      void window.TdomDirectEditGeometry.formulaPageShapes(page.querySelector('img.canon'));
+    }
+    directEditor.projectedRev = anchorInk.projectedRev;
+    if (anchorInk.slot) {
+      directEditor.formulaSlot = anchorInk.slot;
+      directEditor.formulaBasis = { map: anchorInk.map, value: region.value, started: true,
+        epoch: sourceSnapshot.documentEpoch, rev: anchorInk.slot.rev, src: anchorInk.slot.src };
+    }
+    directEditor.glyphMap = anchorInk.map;
+    directEditor.geometryValue = region.value;
+  }
   directEditor.revisitModelIds = [];
   directEditor.revisitTokens = directRevisitTokens(directEditor, directEditor.revisitModelIds);
   directEditor.revisitOffsets = Array.from({ length: directEditor.revisitTokens.length + 1 }, (_, index) => index);
@@ -6603,17 +8185,18 @@ async function openDirectEditor(
     const sourceCaret = region.kind === 'math' && Number.isInteger(caretOffset) &&
       typeof control.getPromptRange === 'function'
       ? mathModelOffsetFromSource(control, region.value, caretOffset, mathWrapped) : null;
-    let openingMathOffset = await waitForDirectOpeningMathGeometry(
+    let openingMathOffset = pendingHit && (sourceFormulaOpening || revisit && pendingHit.sessionId === revisit.sessionId)
+      ? pendingHit.offset : await waitForDirectOpeningMathGeometry(
       directEditor, inputOpening, clickOnPaper, sourceCaret
     );
     if (directEditor?.sessionId !== sessionId) return;
     if (revisit) {
       const originalOffset = region.kind === 'math' ? openingMathOffset : caretOffset;
-      const restoredOffset = await restoreDirectEditorRevisit(directEditor, inputOpening, originalOffset);
+      const restoredOffset = await restoreDirectEditorRevisit(directEditor, inputOpening, originalOffset, pendingHit);
       if (!Number.isInteger(restoredOffset)) {
-        // No accepted host lineage means the queued edit cannot target this
-        // old ink safely. Keep its native input until the opening is cancelled.
-        if (inputOpening) await new Promise(resolve => { inputOpening.resolveCancelled = resolve; });
+        // The displayed edit no longer has a corresponding host range.
+        // Retire only this field. A later click has its own input and source.
+        if (directEditor?.sessionId === sessionId) closeDirectEditor();
         return;
       }
       if (region.kind === 'math') openingMathOffset = restoredOffset;
@@ -6668,10 +8251,11 @@ async function openDirectEditor(
     } else if (control instanceof HTMLTextAreaElement) {
       control.setSelectionRange(control.value.length, control.value.length);
     }
-    if (clickOnPaper && directEditor.glyphMap?.length) {
+    if (clickOnPaper && !pendingHit && directEditor.glyphMap?.length) {
       const offset = directGeometryHit(directEditor, clickOnPaper);
       if (Number.isInteger(offset)) setDirectSelection(directEditor, offset);
     }
+    keepAlignmentCaret();
     alignOpaqueNativeCaretAnchor(sessionId);
     // Adding a DOM/MathLive selection can scroll after focus even when
     // preventScroll is honored. A preview click must never move the paper.
@@ -6719,8 +8303,7 @@ function disposeDirectOpeningInput(opening) {
   resolveDirectOpeningNativeInput(opening);
   opening.resolveGeometry?.();
   opening.resolveGeometry = null;
-  opening.resolveCancelled?.();
-  opening.resolveCancelled = null;
+  opening.cancelShipMap?.();
   opening.sink?.remove();
   if (openingDirectInput === opening) openingDirectInput = null;
   const queuedIndex = queuedDirectOpenings.indexOf(opening);
@@ -6791,12 +8374,9 @@ function focusDirectOpeningInput(opening, event) {
   sink.setAttribute('aria-label', 'Edit document');
   sink.tabIndex = -1;
   sink.spellcheck = false;
-  Object.assign(sink.style, {
-    position: 'fixed', left: `${event.clientX}px`, top: `${event.clientY}px`,
-    width: '1px', height: '1px', minHeight: '0', margin: '0', padding: '0',
-    border: '0', outline: 'none', boxShadow: 'none', resize: 'none',
-    opacity: '0', pointerEvents: 'none', overflow: 'hidden', fontSize: '16px',
-  });
+  sink.rows = sink.cols = 1;
+  sink.style.left = event.clientX + 'px';
+  sink.style.top = event.clientY + 'px';
   opening.sink = sink;
   sink.addEventListener('beforeinput', input => {
     resolveDirectOpeningNativeInput(opening);
@@ -6831,10 +8411,35 @@ function focusDirectOpeningInput(opening, event) {
     clearTimeout(opening.compositionTimer);
     opening.resolveComposition?.();
     opening.composing = true;
+    // Keep the native IME focused while the source lookup runs. Its marked
+    // text and candidate window should already be visible at the click.
+    const page = pageAtClientPoint(event, event.target);
+    const rect = page?.getBoundingClientRect();
+    const position = (x, y, height) => {
+      sink.style.left = x + 'px';
+      sink.style.top = y + 'px';
+      sink.style.fontSize = height + 'px';
+      sink.style.maxWidth = Math.max(height, Math.min(innerWidth, rect?.right ?? innerWidth) - x) + 'px';
+    };
+    const scale = rect && rect.width / activePaperGeometry(page).width;
+    const height = scale > 0 ? 13 * scale : 16;
+    position(event.clientX, event.clientY - height / 2, height);
+    sink.classList.add('is-composing');
+    const shown = page && presentedPageState(page);
+    const point = shown && paperPointForClick(event, page);
+    if (point) void canonicalGlyphs(Number(page.dataset.page), shown.id).then(glyphs => {
+      if (!opening.composing || !sink.isConnected || presentedPageState(page)?.id !== shown.id) return;
+      const glyph = glyphs.find(g => point.x >= g.left && point.x <= g.right && point.y >= g.top && point.y <= g.bottom);
+      if (!glyph) return;
+      const box = clientBoundsForDisplayedPaperBounds(glyph, page);
+      if (box) position(point.x < (glyph.left + glyph.right) / 2 ? box.left : box.right, box.top, box.bottom - box.top);
+    });
+
     opening.compositionDone = new Promise(resolve => { opening.resolveComposition = resolve; });
   });
   sink.addEventListener('compositionend', input => {
     if (!isPendingDirectOpening(opening)) return;
+    sink.classList.remove('is-composing');
     if (input.data) opening.operations.push({ type: 'text', text: input.data, composed: true });
     // Keep the sink through the final native input event as well. Switching
     // focus inside compositionend can drop or duplicate the committed text.
@@ -7016,10 +8621,11 @@ async function activateDirectEditor(event, queuedOpening = null) {
     await activateDirectEditorAtPoint(event);
     if (openingDirectInput !== opening) return;
     if (!directEditor || directEditor === previous) {
-      if (opening.operations.length || opening.composing || opening.nativeInputPending) {
-        // An unproven target must not consume typed text, including text in
-        // later queued clicks. Keep it until the user explicitly cancels.
-        await new Promise(resolve => { opening.resolveCancelled = resolve; });
+      // The lookup has finished without an editable target. Its keys belong
+      // only to this click; later queued clicks must be allowed to resolve.
+      // Keep an in-progress native key/IME on its own sink through commit.
+      while (openingDirectInput === opening && (opening.composing || opening.nativeInputPending)) {
+        await (opening.composing ? opening.compositionDone : opening.nativeInputDone);
       }
       return;
     }
@@ -7046,14 +8652,169 @@ async function activateDirectEditor(event, queuedOpening = null) {
   }
 }
 
+// Shipping can already have painted the new page while its source-mapped
+// PDF is still queued. Keep native input focused during that handoff. Use
+// the physical click only when the same revision prints the same ink there.
+function clickInkPixels(image, paper, point) {
+  if (!image?.naturalWidth || !image.naturalHeight || !(paper.width > 0 && paper.height > 0)) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = 96;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  try {
+    const sx = image.naturalWidth / paper.width, sy = image.naturalHeight / paper.height;
+    ctx.drawImage(image, (point.x - 24) * sx, (point.y - 16) * sy, 48 * sx, 32 * sy, 0, 0, 96, 64);
+    return ctx.getImageData(0, 0, 96, 64).data;
+  } catch { return null; }
+}
+
+// The replay owns a branch-private SyncTeX stream for the exact PDF being
+// shown. Require both its native source row and actual painted glyphs.
+async function nativeShipHit(page, shipping, point, current) {
+  const pageNumber = Number(page.dataset.page), url = new URL(shipping.src, location.href);
+  const query = new URLSearchParams(url.searchParams);
+  query.set('page', pageNumber);
+  const [snapshot, rows, glyphs] = await Promise.all([
+    loadProvisionalSnapshot(shipping.rev),
+    fetch('/ship-source-rows?' + query).then(r => r.ok ? r.json() : null).then(result => result?.rows),
+    displayedShipGlyphs(pageNumber, shipping.src),
+  ]);
+  if (!current() || !rows?.length || snapshot?.srcRev !== shipping.rev || !glyphs.length) return null;
+  const touches = box => point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom;
+  const targets = rows.filter(r => !r.empty && touches(r.box));
+  const copies = [], textHits = [];
+  const geometry = window.TdomDirectEditGeometry;
+  const lines = new Map(), checkedDisplays = new Set();
+  for (const target of targets) {
+    const key = target.file + '\n' + target.line;
+    if (!lines.has(key)) lines.set(key, target);
+  }
+  for (const { file: physicalFile, line } of lines.values()) {
+    const sources = snapshot.sources.filter(s => sameSourceFile(s.file, physicalFile));
+    if (sources.length !== 1) continue;
+    const file = sources[0].file;
+    const fileRows = rows.filter(row => row.file === physicalFile);
+    const relevant = inlineSourceRows(fileRows, line);
+    // TeX tags the outer line with the blank line terminating a paragraph.
+    // An inline atom's own box points to the actual source line.
+    if (snapshot.blocks?.some(block => block.type === 'paragraph' && block.editRegions?.some(region =>
+        region.kind === 'math' && !region.display && sourceNearLine(region.source, { file, line })))) {
+      copies.push(...await inlineMathCopies(snapshot, { file, line }, pageNumber, null, current,
+        null, relevant, false, true, glyphs));
+      if (!current()) return null;
+    }
+    for (const block of snapshot.blocks) {
+      for (const region of block.editRegions ?? []) {
+        if (!region.display || region.kind !== 'math' || !sourceNearLine(region.source, { file, line }) ||
+            checkedDisplays.has(region.id)) continue;
+        checkedDisplays.add(region.id);
+        const boxes = fileRows.filter(row => sourceNearLine(region.source, { file, line: row.line }));
+        const extent = inkBounds(boxes.filter(row => !row.empty).map(row => row.box), pageNumber);
+        const match = await matchDisplaySourceFormula(region, extent, boxes, glyphs, current);
+        if (!current()) return null;
+        if (match) copies.push({ ...match, region, extent, sourceBoxes: boxes });
+      }
+    }
+    const paragraph = (snapshot.blocks ?? []).filter(b => b.type === 'paragraph' && b.source?.file === file &&
+      (b.source.end.line === line || b.source.end.line + 1 === line));
+    if (paragraph.length !== 1) continue;
+    const block = paragraph[0];
+    const sourceLine = block.source.start.line;
+    if (line < sourceLine || line > sourceLine + 1 ||
+        block.sourceRanges?.some(range => !sameSourceFile(range.file, file)) ||
+        block.editRegions?.some(region => region.source?.file !== file ||
+          region.source.start.line !== sourceLine || region.source.end.line !== sourceLine)) continue;
+    // Multiple boxes can enclose the same glyph. The shaped baseline and
+    // the paragraph's reading order must both agree with the text run.
+    const baseRows = fileRows.filter(r => r.line === line && !r.empty);
+    const rowGlyphs = glyphs.filter(g => baseRows.some(r => Math.abs(r.y - g.baseline) <= 0.25 &&
+      (g.left + g.right) / 2 >= r.box.left - 0.25 && (g.left + g.right) / 2 <= r.box.right + 0.25));
+    for (const region of block.editRegions ?? []) {
+      if (region.kind !== 'text' || region.source?.file !== file || region.source.start.line !== block.source.start.line) continue;
+      const hits = geometry.textMaps(region.value, rowGlyphs);
+      if (hits.length !== 1 || !hits[0].map.some(touches)) continue;
+      const map = hits[0].map;
+      textHits.push({ region, map, printBounds: inkBounds(map, pageNumber), caretOffset: geometry.hit(map, point) });
+    }
+  }
+  const mathHit = inlineFormulaHit(copies, pageNumber, point);
+  if (mathHit && !textHits.length) return { ...mathHit, snapshot, shipSrc: shipping.src };
+  if (textHits.length === 1 && !copies.some(copy => copy.map.some(touches))) {
+    return { ...textHits[0], snapshot, shipSrc: shipping.src };
+  }
+  return null;
+}
+
+async function sourceMappedShipClick(page, event, shipping, opening) {
+  const point = paperPointForClick(event, page), paper = activePaperGeometry(page);
+  if (!point || shipping.rev !== appliedSrcRev) return null;
+  event.preventDefault();
+  event.stopPropagation();
+  focusDirectOpeningInput(opening, event);
+  const epoch = documentReset.adoptedEpoch;
+  const current = () => openingDirectInput === opening && !documentReset.pending && documentReset.adoptedEpoch === epoch &&
+    appliedSrcRev === shipping.rev && page.isConnected && presentedShippingPageState(page)?.src === shipping.src;
+  const hit = await nativeShipHit(page, shipping, point, current).catch(() => null);
+  if (!current()) return null;
+  if (hit) {
+    const rect = clientBoundsForDisplayedPaperBounds({ left: point.x, top: point.y, right: point.x, bottom: point.y }, page);
+    if (rect) await openDirectEditor(hit.region.id, page, hit.region, { x: rect.left, y: rect.top },
+      hit.printBounds, hit.caretOffset, hit);
+    return null;
+  }
+  const original = clickInkPixels(shipping.image, paper, point);
+  if (!original) return null;
+  opening.waitingForShipMap = shipping.rev;
+  const mapped = await new Promise(resolve => {
+    const finish = state => {
+      observer.disconnect();
+      delete opening.checkShipMap;
+      delete opening.cancelShipMap;
+      resolve(state);
+    };
+    const check = () => {
+      if (openingDirectInput !== opening || documentReset.pending || documentReset.adoptedEpoch !== epoch ||
+          appliedSrcRev !== shipping.rev || canonical?.rev > shipping.rev || canonical?.errorRev === shipping.rev || !page.isConnected) return finish(null);
+      const state = presentedPageState(page);
+      if (state?.rev === shipping.rev) finish(state);
+    };
+    const observer = new MutationObserver(check);
+    observer.observe(pagesEl, { childList: true, subtree: true, attributes: true,
+      attributeFilter: ['data-canon-presented-id', 'data-canon-presented-rev', 'data-canon-presented-src'] });
+    opening.checkShipMap = check;
+    opening.cancelShipMap = () => finish(null);
+    if (canonical?.rev === shipping.rev) updateCanonState(Number(page.dataset.page));
+    else requestCanonicalDisplay({ residentImpossible: true });
+    check();
+  });
+  delete opening.waitingForShipMap;
+  if (!mapped || openingDirectInput !== opening || appliedSrcRev !== shipping.rev) return null;
+  const nextPaper = activePaperGeometry(page);
+  // pdfinfo rounds to three decimal places. PDF.js exposes the original
+  // page box, so compare in the precision common to both documents.
+  if (paper.rotation !== nextPaper.rotation || Math.abs(paper.width - nextPaper.width) > 0.001 ||
+      Math.abs(paper.height - nextPaper.height) > 0.001) return null;
+  const ink = clickInkPixels(mapped.image, paper, point);
+  if (!ink || !original.every((value, index) => value === ink[index])) return null;
+  const bounds = clientBoundsForDisplayedPaperBounds({ left: point.x, top: point.y, right: point.x, bottom: point.y }, page);
+  return bounds && { target: page, clientX: bounds.left, clientY: bounds.top,
+    preventDefault() {}, stopPropagation() {} };
+}
+
 // A plain click edits; Cmd/Ctrl+click remains source navigation.  Only the
 // printed node under the pointer activates, so scrolling/searching elsewhere
 // on the page never creates editor DOM.
 async function activateDirectEditorAtPoint(event) {
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   if (event.target?.closest?.('.tdom-direct-editor')) return;
-  const clickEpoch = ++directEditClickEpoch;
   const clickedPage = pageAtClientPoint(event, event.target);
+  const shipping = presentedShippingPageState(clickedPage);
+  if (shipping) {
+    event = await sourceMappedShipClick(clickedPage, event, shipping, openingDirectInput);
+    if (!event) return;
+  }
+  const clickEpoch = ++directEditClickEpoch;
   const target = usesDirectEditSurface(clickedPage) || event.directRegionId ? clickedPage :
     event.target?.closest?.('[data-edit], .tdom-source-hit, [data-src]');
   if (!target) return;
@@ -7084,26 +8845,42 @@ async function activateDirectEditorAtPoint(event) {
   }
   if (canonicalClick) {
     const page = targetPage;
-    const resolved = await resolveOpaqueEditRegion(page, event);
-    if (resolved && stillCurrent()) {
+    const pendingHit = pendingFormulaHit(page, paperPointForClick(event, page));
+    const sourceInk = pendingHit?.ink.sourceSnapshot ? pendingHit.ink : null;
+    // An unfinished edit elsewhere may leave this formula on an older
+    // source revision. Only open it if Monaco can still identify the
+    // very same bytes. Never fall through to different ink underneath.
+    const clickedSnapshot = sourceInk?.sourceSnapshot;
+    const staleSource = clickedSnapshot && clickedSnapshot.srcRev !== appliedSrcRev;
+    if (staleSource && (!await confirmSourceFormulaAnchor(clickedSnapshot, sourceInk.region, false) ||
+        sourceInk.sourceSnapshot !== clickedSnapshot || pendingFormulas.get(sourceInk.slot.key) !== sourceInk)) return;
+    const anchorInk = sourceInk ? { snapshot: clickedSnapshot, map: sourceInk.map } :
+      pendingHit ? null : await editAtAnchorInk(page, event);
+    const resolved = pendingHit ? { region: pendingHit.ink.region, printBounds: pendingHit.ink.bounds }
+      : anchorInk === undefined ? await resolveOpaqueEditRegion(page, event) : anchorInk;
+    if (resolved && stillCurrent() && (!anchorInk || staleSource || anchorInk.snapshot.srcRev === appliedSrcRev)) {
       await openDirectEditor(
         resolved.region.id,
         page,
         resolved.region,
         clickPoint,
         resolved.printBounds,
-        resolved.caretOffset
+        resolved.caretOffset,
+        anchorInk, pendingHit
       );
       // (found by its ink: followed by its ink too when the next canonical pages land)
       if (resolved.byInk && directEditor?.region?.id === resolved.region.id) directEditor.openedByInk = true;
     }
     return;
   }
-  const region = await resolveEditRegion(target, event);
-  if (region && stillCurrent()) {
+  const resolved = await resolveEditRegion(target, event);
+  if (resolved && stillCurrent()) {
+    const { chunkMap, ...region } = resolved;
     // The awaited metadata may have replaced the clicked SVG. The page
     // remains stable and the exact glyph map reacquires this source's ink.
-    await openDirectEditor(region.id, target.isConnected ? target : targetPage, region, clickPoint);
+    const ink = chunkMap && { map: chunkMap, snapshot: provisionalSnapshot, chunkEpoch: provisionalEpoch };
+    await openDirectEditor(region.id, target.isConnected ? target : targetPage, region, clickPoint,
+      ink ? inkBounds(chunkMap, Number(targetPage.dataset.page)) : null, null, ink);
   }
 }
 
@@ -7116,12 +8893,14 @@ pagesEl.addEventListener('pointerdown', event => {
   if (!page) return;
   const point = paperPointForClick(event, page);
   const session = directEditor;
-  const glyph = session?.pageNumber === Number(page.dataset.page) &&
-    session.geometryValue === String(session.readValue())
-    ? window.TdomDirectEditGeometry.nearest(session.glyphMap ?? [], point) : null;
+  const pending = pendingFormulaHit(page, point);
+  const map = pending && session?.formulaSlot?.key === pending.ink.slot.key && session.readValue() === pending.value ? pending.ink.map :
+    session && session.geometryValue === String(session.readValue()) ? session.glyphMap : null;
+  const glyph = session?.pageNumber === Number(page.dataset.page) && map
+    ? window.TdomDirectEditGeometry.nearest(map, point) : null;
   const inside = glyph && point.x >= glyph.left - 2 && point.x <= glyph.right + 2 &&
     point.y >= glyph.top - 2 && point.y <= glyph.bottom + 2;
-  directPointer = { page, event, point, session: inside ? session : null, moved: false };
+  directPointer = { page, event, point, session: inside ? session : null, preservePoint: Boolean(pending || presentedShippingPageState(page)), moved: false };
   if (openingDirectInput && session && (inside || event.target.closest?.('.tdom-direct-editor'))) {
     // Returning to the still-visible old editor is another queued click.
     // Its control will be removed by earlier queued edits, so retain the
@@ -7139,6 +8918,16 @@ pagesEl.addEventListener('pointerdown', event => {
     event.preventDefault();
     suppressDirectClick = true;
     directPointer.activation = activateDirectEditor(revisit);
+    directPointer.opening = directOpeningInputTarget();
+    return;
+  }
+  if (pending && !inside && event.pointerType === 'mouse') {
+    // A canonical page can replace these glyphs while the mouse is down.
+    // Open against the source and caret the reader actually pressed.
+    event.preventDefault();
+    suppressDirectClick = true;
+    directPointer.start = pending.offset;
+    directPointer.activation = activateDirectEditor(event);
     directPointer.opening = directOpeningInputTarget();
     return;
   }
@@ -7173,6 +8962,13 @@ pagesEl.addEventListener('pointerup', async event => {
   const drag = directPointer;
   directPointer = null;
   if (pagesEl.hasPointerCapture(event.pointerId)) pagesEl.releasePointerCapture(event.pointerId);
+  // The synthetic click can round off a subpixel inside a small subscript.
+  // Use the original pointer on both live overlays and replayed PDF ink.
+  if (drag?.preservePoint && !drag.moved && !drag.session && !drag.activation) {
+    suppressDirectClick = true;
+    void activateDirectEditor(drag.event);
+    return;
+  }
   if (!drag?.moved || drag.session) return;
   suppressDirectClick = true;
   const activation = drag.activation ?? activateDirectEditor(drag.event);
@@ -7185,8 +8981,7 @@ pagesEl.addEventListener('pointerup', async event => {
   await new Promise(resolve => requestAnimationFrame(resolve));
   await refreshDirectEditGeometry(session);
   if (directEditor !== session || !session.glyphMap?.length) return;
-  const geometry = window.TdomDirectEditGeometry;
-  setDirectSelection(session, directGeometryHit(session, drag.point), directGeometryHit(session, drag.end));
+  setDirectSelection(session, drag.start ?? directGeometryHit(session, drag.point), directGeometryHit(session, drag.end));
 });
 pagesEl.addEventListener('pointercancel', () => {
   const opening = directPointer?.opening;
@@ -7477,7 +9272,7 @@ if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferred
       }
       return lo;
     };
-    const paperPageCount = () => outerBeforeEl.childElementCount + sortedPages().length + outerAfterEl.childElementCount;
+    const paperPageCount = (entries = sortedPages()) => outerBeforeEl.childElementCount + entries.length + outerAfterEl.childElementCount;
     const paperTopPage = () => {
       const top = pagesEl.getBoundingClientRect().top;
       const before = outerBeforeEl.childElementCount;
@@ -7489,13 +9284,34 @@ if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferred
       const after = outerAfterEl.childElementCount;
       return before + entries.length + Math.max(1, Math.min(after, firstBelowTop(outerAfterEl, top) + 1));
     };
-    const paperPageElement = (n) => {
-      const wanted = Math.max(1, Math.min(paperPageCount(), Number.isFinite(n) ? Math.round(n) : 1));
+    const paperPageElement = (n, entries = sortedPages()) => {
+      const wanted = Math.max(1, Math.min(paperPageCount(entries), Number.isFinite(n) ? Math.round(n) : 1));
       const before = outerBeforeEl.childElementCount;
       if (wanted <= before) return outerBeforeEl.children[wanted - 1];
-      const entries = sortedPages();
       if (wanted <= before + entries.length) return entries[wanted - before - 1][1];
       return outerAfterEl.children[wanted - before - entries.length - 1] ?? null;
+    };
+    const toolbarPage = (first, entries) => activePaperPage(first,
+      outerPaper ? paperPageCount(entries) : entries.at(-1)?.[0] ?? first,
+      n => outerPaper ? paperPageElement(n, entries) : pageDivs.get(n),
+      pagesEl.getBoundingClientRect(), directEditor);
+    // Capture the point at the centre before a document reset clears the
+    // page DOM. CSS pixels and fractions also describe the static PDF.
+    embeddedViewport = (top = outerPaper ? paperTopPage() : currentTopPage()) => {
+      const bounds = pagesEl.getBoundingClientRect();
+      const x = bounds.left + pagesEl.clientWidth / 2;
+      const y = bounds.top + pagesEl.clientHeight / 2;
+      const last = outerPaper ? paperPageCount() : pageDivs.size;
+      for (let n = top; n <= last; n++) {
+        const sheet = outerPaper ? paperPageElement(n) : pageDivs.get(n);
+        if (!sheet) break;
+        const rect = sheet.getBoundingClientRect();
+        if (!rect.width || !rect.height || rect.bottom < y) continue;
+        const paper = activePaperGeometry(sheet);
+        return { page: n, width: rect.width, paperHeight: paper.height, x: (x - rect.left) / rect.width,
+          y: (y - rect.top) / rect.height, pdfScale: rect.width / paper.width * 72 / 96 };
+      }
+      return null;
     };
     const visiblePageSnapshot = () => {
       const entries = sortedPages();
@@ -7566,6 +9382,14 @@ if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferred
       try {
         const visible = visiblePageSnapshot();
         const pending = presentationPending(visible.required);
+        const ready = previewReady(visible.required);
+        const firstPaperPainted = !ready && bootComplete && documentReset.acceptsReady(documentReset.adoptedEpoch) &&
+          visible.required.length > 0 && visible.required.every(([, page]) => {
+            if (!page.classList.contains('is-final') || page.dataset.canonFallback === '1') return false;
+            const state = presentedShippingPageState(page) ?? presentedPageState(page);
+            return state && state.image.complete && state.image.naturalWidth > 0;
+          });
+        const topPage = outerPaper ? paperTopPage() : visible.topPage;
         // Canonical-only policies do not enter the provisional staging path.
         // Demand the old source still on paper, not ordinary image decode.
         if (pending && usesCanonicalSurface() && Number(canonical?.rev ?? 0) < appliedSrcRev) {
@@ -7578,12 +9402,15 @@ if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferred
             source: 'tdom-embed',
             activationId: embedActivationId,
             documentEpoch: documentReset.adoptedEpoch,
-            ready: previewReady(visible.required),
+            ready,
+            firstPaperPainted,
             presentationPending: pending,
             pageCount: outerPaper ? paperPageCount() : visible.entries.length,
             pageCountAuthoritative: residentPageCountAuthoritative,
             zoom,
-            page: outerPaper ? paperTopPage() : visible.topPage,
+            page: topPage,
+            activePage: toolbarPage(topPage, visible.entries),
+            viewport: embeddedViewport(topPage),
             srcRev: appliedSrcRev,
             viewportToken: embedViewportToken,
             status: lastEngineStatus,
@@ -7604,6 +9431,8 @@ if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferred
         postEmbedSnapshot();
       });
     };
+    pagesEl.addEventListener('focusin', scheduleEmbedSnapshot);
+    pagesEl.addEventListener('focusout', scheduleEmbedSnapshot);
     const pageEntryFor = (n) => {
       const entries = sortedPages();
       if (!entries.length) return null;
@@ -7830,6 +9659,16 @@ if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferred
       if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
       return { left: x * scale - 10, top: y * scale - 10, width: 20, height: 20 };
     };
+    const alignViewport = (sheet, data) => {
+      const width = sheet.getBoundingClientRect().width;
+      if (data.marker !== false || !(data.viewportWidth > 0) || width <= 0) return;
+      if (Math.abs(data.viewportWidth - width) > 1) setZoom(zoom * data.viewportWidth / width);
+      if (Number.isFinite(data.viewportX)) {
+        const rect = sheet.getBoundingClientRect();
+        const bounds = pagesEl.getBoundingClientRect();
+        pagesEl.scrollLeft += rect.left + rect.width * data.viewportX - bounds.left - pagesEl.clientWidth / 2;
+      }
+    };
     const scrollToSync = (data) => {
       if (outerPaper) {
         // The host's page is a sheet of the Build paper. Outside the chapter
@@ -7843,6 +9682,7 @@ if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferred
           const y = Number.isFinite(blockY)
             ? blockY + (Number.isFinite(blockHeight) ? blockHeight / 2 : 0)
             : Number(data.y);
+          alignViewport(outside, data);
           scrollPageToViewport(outside, Number.isFinite(y) ? y : 0, true);
           embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
           clearSyncMarker();
@@ -7863,6 +9703,7 @@ if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferred
       const y = Number.isFinite(blockY)
         ? blockY + (Number.isFinite(blockHeight) ? blockHeight / 2 : 0)
         : Number(data.y);
+      alignViewport(page, data);
       scrollPageToViewport(page, Number.isFinite(y) ? y : 0, true);
       embedViewportToken = typeof data.viewportToken === 'string' ? data.viewportToken : null;
       // A viewport handoff (the host mirroring where the static PDF was
@@ -7899,8 +9740,10 @@ if (typeof ResizeObserver === 'function') new ResizeObserver(() => stageDeferred
       else if (d.action === 'zoom-fit') setZoom(1);
       else if (d.action === 'goto-page') scrollToPage(Number(d.page));
       else if (d.action === 'goto-sync') scrollToSync(d);
-      else if (d.action === 'page-prev') scrollToPage((outerPaper ? paperTopPage() : currentTopPage()) - 1);
-      else if (d.action === 'page-next') scrollToPage((outerPaper ? paperTopPage() : currentTopPage()) + 1);
+      else if (d.action === 'page-prev' || d.action === 'page-next') {
+        const page = toolbarPage(outerPaper ? paperTopPage() : currentTopPage(), sortedPages());
+        scrollToPage(page + (d.action === 'page-prev' ? -1 : 1));
+      }
       else if (d.action === 'search') runLiveSearch(d.query, d.findPrevious === true);
     });
     setInterval(postEmbedSnapshot, 400);
@@ -8179,7 +10022,13 @@ function receivePreviewEvent(msg) {
         Number(msg.documentEpoch) !== documentReset.adoptedEpoch) {
       return;
     }
-    if (openingDirectInput?.sink) {
+    if (msg.kind === 'ship-repaginated') {
+      if (msg.srcRev === appliedSrcRev && usesCanonicalSurface() && !document.hidden) {
+        requestCanonicalDisplay({ residentImpossible: true });
+      }
+      return;
+    }
+    if (holdingDirectOpeningPaper()) {
       deferredDirectPresentationEvents.push(() => receivePreviewEvent(msg));
       return;
     }
@@ -8196,6 +10045,7 @@ function receivePreviewEvent(msg) {
         if (canonicalAnchorPreview) canonicalAnchorPreview.retiring = true;
       }
       canonical = msg.canonical;
+      openingDirectInput?.checkShipMap?.();
       if (msg.mode) setMode(msg.mode, msg.canonical?.modeReasons ?? modeReasons);
       syncCanonical();
       return;
@@ -8285,6 +10135,10 @@ function receivePreviewEvent(msg) {
           if (patch.type === 'replace-page') updateCanonState(patch.displayList.page);
         }
       }
+      return;
+    }
+    if (msg.kind === 'source-edit-location') {
+      warmSourceFormula(msg);
       return;
     }
     if (msg.kind === 'update' && msg.report.rev > appliedRev) {

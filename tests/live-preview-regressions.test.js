@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fnv1a } from '../engine/hash.js';
 import { needsRescue, projectPackageText } from '../engine/checkpoint/rescue-classifier.js';
+import { PreambleInputs } from '../engine/checkpoint/preamble-inputs.js';
 import { queueMovedOffsets } from '../engine/checkpoint/rescue-offsets.js';
 
 const geometry = {
@@ -204,6 +205,39 @@ test('breakable boxes declared in a project package are found but not rescued up
     assert.equal(result.packageBreakableRe.test('\\begin{offbox}'), false);
     assert.match(projectPackageText(preamble, { docDir }), /DeclareTColorBox\{KKfbox1\}/);
   } finally {
+    rmSync(docDir, { recursive: true, force: true });
+  }
+});
+
+test('preamble inputs keep failed recorder dependencies until a successful compile replaces them', () => {
+  const docDir = mkdtempSync(path.join(tmpdir(), 'tdom-preamble-inputs-'));
+  const style = path.join(docDir, 'local.sty');
+  const options = path.join(docDir, 'layout.clo');
+  const dynamic = path.join(docDir, 'dynamic.sty');
+  const source = String.raw`\usepackage{local}
+\begin{document}Body\end{document}`;
+  const inputs = new PreambleInputs({ docDir, overlays: new Map() }, () => {});
+  try {
+    writeFileSync(style, String.raw`\input{layout.clo}`);
+    writeFileSync(options, '% options');
+    writeFileSync(dynamic, '% invalid');
+    inputs.scan(source);
+    assert.ok(inputs.holdsOverlay(options, '% options'));
+    inputs.acceptFailedInputs([[dynamic, dynamic]]);
+    assert.equal(inputs.diskChanged(dynamic), false);
+    rmSync(dynamic);
+    assert.equal(inputs.diskChanged(dynamic), true);
+    inputs.scan(source, true);
+    assert.equal(inputs.diskChanged(dynamic), false);
+    writeFileSync(dynamic, '% repaired');
+    assert.equal(inputs.diskChanged(dynamic), true);
+    inputs.scan(source, true);
+    assert.ok(inputs.holdsOverlay(dynamic, '% repaired'));
+    inputs.acceptManifest(new Map(), undefined, 7);
+    assert.equal(inputs.watchers.has(dynamic), false);
+    assert.equal(inputs.watchers.has(options), true);
+  } finally {
+    inputs.close();
     rmSync(docDir, { recursive: true, force: true });
   }
 });

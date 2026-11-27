@@ -45,6 +45,13 @@ function chainReady(engine) {
     !engine.shipStale && !ship.err && !!ship.info?.().baselineReady;
 }
 
+// These surfaces paint a complete physical PDF. Its neighboring paragraphs
+// need no individual pictures before the edited paragraph can be shown.
+export function physicalReplayReady(engine) {
+  return (engine.previewPolicy === 'canonical-anchor' || engine.previewPolicy === 'shipping-exact') &&
+    chainReady(engine);
+}
+
 /** Keystrokes of this document are painted from resident pages. */
 export function residentSufficient(engine, pageCount = engine.pages?.length) {
   return engine.mode === 'structured' && engine.previewPolicy === 'structured' &&

@@ -32,11 +32,14 @@ Good output.
     assert.equal(deferred.galley?.tdomDeferred, true, 'last good galley is explicitly held');
     assert.equal(deferred.closure?.reason, 'native-error', 'LuaLaTeX is the semantic closure authority');
 
+    assert.deepEqual(engine.getDOM().rejectedBlocks, [block.id]);
+
     const fixAt = engine.getSource().indexOf(badText);
     await engine.edit(fixAt, fixAt + badText.length, 'Good output again');
     const healed = engine.blocks.find((candidate) => candidate.id === block.id);
     assert.equal(healed.closure?.native, true, 'successful native certificate replaces the hold');
     assert.equal(healed.galley?.tdomDeferred, undefined);
+    assert.equal(engine.getDOM().rejectedBlocks, undefined);
     assert.notEqual(healed.galleyHash, goodHash, 'fresh successful layout is adopted');
   } finally {
     await engine.close();

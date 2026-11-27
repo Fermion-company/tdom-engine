@@ -134,7 +134,11 @@ local function prepare_branch(dir)
   lfs.mkdir(dir)
   make_include_dirs(dir)
   local mappings = {}
-  for _, ext in ipairs(job_extensions()) do
+  local exts = job_extensions()
+  -- SyncTeX renames this open gzip stream when the PDF is finalized.
+  -- Each replay must finish its own stream from the same checkpoint.
+  if PRIVATE_PDF then exts[#exts + 1] = 'synctex(busy)' end
+  for _, ext in ipairs(exts) do
     local source = BRANCHDIR .. '/driver-ship.' .. ext
     local target = dir .. '/driver-ship.' .. ext
     local cloned = fk.copy_open_fd(source, target)

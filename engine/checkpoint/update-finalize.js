@@ -4,7 +4,7 @@ import { nextEditHold, editPageRenderIds, focusRescueIds } from './update-helper
 import { buildPagePatches, EAGER_PAGES } from './page-patches.js';
 import { pageHfSig } from './header-footer.js';
 import { buildUpdateResponse } from './update-response.js';
-import { residentPaintable } from './ship-pacing.js';
+import { physicalReplayReady, residentPaintable } from './ship-pacing.js';
 
 export function finalizeUpdate(engine, {
   text,
@@ -90,7 +90,7 @@ export function finalizeUpdate(engine, {
   // has its shipping generation and canonical compile scheduled.
   scheduleBackground(fgStop, dirtyBlocks, {
     interactive: !rebooted,
-    pageRenderIds: rebooted ? [] : editPageRenderIds(engine.blocks, engine.pages, dirtySource),
+    pageRenderIds: rebooted || physicalReplayReady(engine) ? [] : editPageRenderIds(engine.blocks, engine.pages, dirtySource),
   });
   timer.lap('schedule');
   return buildUpdateResponse({

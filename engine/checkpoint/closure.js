@@ -60,6 +60,81 @@ function skipSpace(text, at) {
   return at;
 }
 
+// TeX's \string reads one unexpanded token. Comments and intervening
+// whitespace produce no printed characters; the returned offsets refer to
+// the original source so the same token can be excluded from edit targets.
+export function stringToken(text, at, limit = text.length) {
+  let lineStart = false;
+  while (at < limit) {
+    if (text[at] === '\n') {
+      if (lineStart) return { start: at, end: at + 1, after: at + 1, value: '\\par' };
+      lineStart = true;
+    } else if (text[at] === '%') {
+      const newline = text.indexOf('\n', at);
+      if (newline < 0 || newline >= limit) return { after: limit };
+      at = newline;
+      lineStart = true;
+    } else if (!/\s/.test(text[at])) break;
+    at++;
+  }
+  if (at === limit) return { after: limit };
+  const start = at;
+  if (text[at] === '\\' && ++at < limit && /[A-Za-z@]/.test(text[at])) {
+    while (at < limit && /[A-Za-z@]/.test(text[at])) at++;
+  } else if (at < limit) {
+    at = Math.min(limit, at + (text.codePointAt(at) > 0xffff ? 2 : 1));
+  }
+  return { start, end: at, after: at };
+}
+
+// A braced \detokenize reads ordinary TeX tokens without expanding them.
+// Only group braces govern its extent. When the editor needs the printed
+// text, control words get their terminator and a parameter token prints ##.
+export function detokenizedArgument(text, at, limit, readValue = false) {
+  // The opening group must be the next token; expansion-driven forms
+  // such as \detokenize\expandafter are left to TeX.
+  const opening = stringToken(text, at, limit);
+  if (opening.start == null || text[opening.start] !== '{') return null;
+  at = opening.start;
+  const start = ++at;
+  let depth = 1, value = '', lineState = 'middle';
+  while (at < limit) {
+    const token = text[at++];
+    if (token === '%') {
+      const newline = text.indexOf('\n', at);
+      at = newline < 0 ? limit : Math.min(limit, newline + 1);
+      lineState = 'new';
+      continue;
+    }
+    if (token === '\\') {
+      const from = at - 1;
+      const word = /[A-Za-z@]/.test(text[at] ?? '');
+      if (word) while (at < limit && /[A-Za-z@]/.test(text[at])) at++;
+      else if (at < limit) at += text.codePointAt(at) > 0xffff ? 2 : 1;
+      if (readValue) value += text.slice(from, at) + (word ? ' ' : '');
+      lineState = word ? 'skip' : 'middle';
+      continue;
+    }
+    if (token === '{') depth++;
+    if (token === '}' && --depth === 0) {
+      return { start, end: at - 1, after: at, ...(readValue && { value }) };
+    }
+    if (token === '\n') {
+      if (readValue) value += lineState === 'new' ? '\\par ' : lineState === 'middle' ? ' ' : '';
+      lineState = 'new';
+    } else if (/[ \t\r]/.test(token)) {
+      if (lineState === 'middle') {
+        if (readValue) value += ' ';
+        lineState = 'skip';
+      }
+    } else {
+      if (readValue) value += token === '#' ? '##' : token;
+      lineState = 'middle';
+    }
+  }
+  return { after: limit }; // no closing brace yet
+}
+
 function bracedArgument(text, at) {
   let i = at;
   while (i < text.length && /\s/.test(text[i])) i++;
@@ -173,18 +248,20 @@ export function sourceClosure(text, { literalEnvs = null, documentConditionals =
     // \string quotes the next token: `\string\verb` prints a name, it does
     // not open a verbatim payload.
     if (name === 'string') {
-      let p = skipSpace(text, end);
-      if (text[p] === '\\') {
-        p++;
-        if (/[A-Za-z@]/.test(text[p] ?? '')) while (p < text.length && /[A-Za-z@]/.test(text[p])) p++;
-        else p++;
-      } else {
-        p++;
-      }
-      i = p;
+      const token = stringToken(text, end);
+      if (token.start == null) return fail('string-token', i);
+      i = token.after;
       continue;
     }
 
+    if (name === 'detokenize') {
+      const literal = detokenizedArgument(text, end, text.length);
+      if (literal) {
+        if (literal.end == null) return fail('detokenize', i);
+        i = literal.after;
+        continue;
+      }
+    }
     if (name === 'lstinline' || name === 'mintinline') {
       let p = end;
       if (text[p] === '[') {

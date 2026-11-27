@@ -21,13 +21,15 @@ import {
   mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync, renameSync,
 } from 'node:fs';
 import path from 'node:path';
-import { withProjectInputs } from '../project-inputs.js';
+import { withProjectInputs, originalSearchInput } from '../project-inputs.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { segmentBody, documentBounds } from '../segmenter.js';
 import { IMAKEIDX_READ_ONLY, labelCaptureShim } from './tex-templates.js';
 import { classifyStructuralAliases } from './structural-aliases.js';
+import { paginationAuxChange } from './shipping-seeds.js';
 import { ensureShim } from './forkshim.js';
 import { distinctCheckpointPeerCount } from './checkpoint-retirement.js';
+import { readSyncTeXSourcePage, sourceBoxesOnPage } from './pdf-source-boxes.js';
 import { pdfPageSvgArgs } from './util/svg.js';
 
 const execFileP = promisify(execFile);
@@ -232,9 +234,10 @@ function endsInsideBracketArgument(text) {
 
 export class ShippingChain {
   constructor({
-    workDir, docDir, overlayDir = null, checkpointBudget = null, waveCutoffMs = null, pageGeometry = null,
+    workDir, docDir, sourceDir = docDir, overlayDir = null, checkpointBudget = null, waveCutoffMs = null, pageGeometry = null,
   }) {
     this.workDir = path.resolve(workDir);
+    this.sourceDir = sourceDir;
     this.docDir = docDir ? path.resolve(docDir) : this.workDir;
     this.overlayDir = overlayDir ? path.resolve(overlayDir) : null;
     this.inputMirrorDir = path.join(this.workDir, 'input-mirror');
@@ -317,12 +320,13 @@ export class ShippingChain {
     return Math.max(1000, this.waveCutoffMs() + 300);
   }
 
-  #reportWaveOutcome(outcome, reason = null) {
+  #reportWaveOutcome(outcome, reason = null, pagination = null) {
     try {
       this.onWaveOutcome?.({
         gen: this.gen,
         outcome,
         reason,
+        ...(pagination && { pagination }),
         elapsedMs: Math.max(0, Date.now() - this.waveStartedAt),
       });
     } catch {
@@ -591,7 +595,7 @@ export class ShippingChain {
     if (!dir || !existsSync(dir)) return out;
     for (const name of readdirSync(dir).sort()) {
       if (name === 'driver-ship.pdf' || name === 'driver-ship.log' ||
-          name === 'driver-ship.tex' || name === 'tdomfork.so' ||
+          name === 'driver-ship.tex' || name === 'driver-ship.synctex.gz' || name === 'driver-ship.synctex(busy)' || name === 'tdomfork.so' ||
           name === 'tdomfork.so.sha256' ||
           /^driver-ship(?:-g\d+-p\d+)?\.svg$/.test(name) ||
           /^feed-u\d+\.tex$/.test(name)) continue;
@@ -652,7 +656,24 @@ export class ShippingChain {
       this.waveDeadlineTimer = null;
       this.lastRejectReason = 'page-count-changed';
       this.wavePublishedGen = this.gen; // fail closed for this generation
-      this.#reportWaveOutcome('rejected', this.lastRejectReason);
+      const before = this.baselineManifest ?? {};
+      const aux = 'driver-ship.aux';
+      let pagination = null;
+      if (before[aux] && manifest[aux] && manifest[aux] !== before[aux] &&
+          Object.keys(before).length === Object.keys(manifest).length &&
+          Object.keys(before).every(name => name === aux || manifest[name] === before[name])) {
+        try {
+          const file = path.join(this.rootOutputDir, aux);
+          if (statSync(file).size <= 1024 * 1024) {
+            const next = readFileSync(file, 'utf8');
+            if (paginationAuxChange(this.baselineAux, next, this.baselinePages, pageCount) &&
+                createHash('sha256').update(next).digest('hex') === manifest[aux]) {
+              pagination = { from: this.baselinePages, to: pageCount, before: this.baselineAux, after: next };
+            }
+          }
+        } catch { /* use the ordinary canonical pass loop */ }
+      }
+      this.#reportWaveOutcome('rejected', this.lastRejectReason, pagination);
       return;
     }
     if (this.gen !== 0 &&
@@ -941,7 +962,7 @@ export class ShippingChain {
     for (const name of readdirSync(this.workDir)) {
       if (/^ship-g\d+-(?:p\d+|ck\d+|root-from-\d+)$/.test(name)) {
         rmSync(path.join(this.workDir, name), { recursive: true, force: true });
-      } else if (/^driver-ship(?:-g\d+-p\d+)?\.svg$/.test(name)) {
+      } else if (name === 'driver-ship.synctex.gz' || name === 'driver-ship.synctex(busy)' || /^driver-ship(?:-g\d+-p\d+)?\.svg$/.test(name)) {
         rmSync(path.join(this.workDir, name), { force: true });
       }
     }
@@ -1004,13 +1025,14 @@ export class ShippingChain {
     // restricted mode, same reason the resident root runs unrestricted
     const includeDirs = includeDirectories(this.source);
     for (const dir of includeDirs) mkdirSync(path.join(this.workDir, dir), { recursive: true });
-    this.root = spawn('lualatex', ['--shell-escape', '-interaction=nonstopmode', 'driver-ship.tex'], {
+    this.root = spawn('lualatex', ['--shell-escape', ...(this.privatePdf ? ['-synctex=1'] : []), '-interaction=nonstopmode', 'driver-ship.tex'], {
       cwd: this.workDir,
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...withProjectInputs(process.env, {
           docDir: this.docDir,
+          sourceDir: this.sourceDir,
           overlayDir: inputState ? this.inputMirrorDir : this.overlayDir,
         }),
         TDOM_SHIP_INCLUDE_DIRS: includeDirs.join('\n'),
@@ -1273,6 +1295,55 @@ export class ShippingChain {
       this.svgCache.delete(this.svgCache.keys().next().value);
     }
     return svg;
+  }
+
+  // Tags in the replay PDF name its private input mirror and byte-exact
+  // body slices. Map only those inputs back to their accepted source.
+  async editSourceRows(page) {
+    const pdf = this.publishedPdf, state = this.inputState, gen = this.gen;
+    if (!pdf || !state || state.source !== this.source || this.wavePublishedGen !== gen) return null;
+    const sidecar = pdf.slice(0, -4) + '.synctex.gz';
+    if (!existsSync(sidecar)) return null;
+    const [sheet, info] = await Promise.all([
+      readSyncTeXSourcePage(sidecar, page),
+      execFileP('pdfinfo', ['-box', '-f', String(page), '-l', String(page), pdf], { timeout: 5000 }),
+    ]);
+    if (!sheet || this.publishedPdf !== pdf || this.gen !== gen || this.inputState !== state) return null;
+    // Raw SyncTeX coordinates describe the uncropped, unrotated sheet.
+    const box = name => info.stdout.match(new RegExp('^Page\\s+' + page + ' ' + name + ':\\s*(.+)$', 'm'))?.[1].trim();
+    const media = box('MediaBox'), crop = box('CropBox');
+    if (!media || media !== crop || !/^0\.00\s+0\.00\s/.test(media) || box('rot') !== '0') return null;
+    const deps = new Map(state.dependencies.filter(d => d.readPathSafe && d.projectPath)
+      .map(d => [path.join(this.inputMirrorDir, d.projectPath), { file: d.actualPath, offset: 0 }]));
+    const start = documentBounds(this.source).body.start;
+    let offset = this.source.slice(0, start).split('\n').length - 1;
+    const offsets = this.lines.map(unit => {
+      const before = offset;
+      offset += unit.split('\n').length - 1;
+      return before;
+    });
+    const pageTags = new Set();
+    for (const line of sheet.lines) {
+      const match = /^[h(](\d+),/.exec(line);
+      if (match) pageTags.add(Number(match[1]));
+    }
+    const sourceInputs = new Map();
+    for (const tag of pageTags) {
+      const input = sheet.inputs.get(tag);
+      if (!input) continue;
+      const dep = deps.get(originalSearchInput(input));
+      if (dep) { sourceInputs.set(tag, dep); continue; }
+      const name = path.relative(this.workDir, input).split(path.sep).join('/');
+      const feed = /^(?:ship-g\d+-(?:root-from-|ck)\d+\/)?feed-u([1-9]\d*)\.tex$/.exec(name);
+      const index = feed ? Number(feed[1]) - 1 : -1;
+      // The final unit is the generated end-document command. A prefix
+      // checkpoint can refer back to an earlier branch's feed file.
+      if (index >= 0 && index < this.lines.length - 1 && existsSync(input) &&
+          readFileSync(input, 'utf8') === this.lines[index]) {
+        sourceInputs.set(tag, { file: state.sourceFile, offset: offsets[index] });
+      }
+    }
+    return sourceBoxesOnPage(sheet, { sourceInputs, page, startLine: 1, endLine: Infinity });
   }
 
   checkpointLimit() {

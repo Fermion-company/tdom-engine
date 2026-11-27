@@ -5,6 +5,9 @@
 // resident and canonical compilers both receive unchanged TeX; the client
 // combines these spans with TeX-harvested line geometry and SyncTeX.
 
+import mathMacros from '../web/math-macro-projection.cjs';
+import { detokenizedArgument, stringToken } from './checkpoint/closure.js';
+
 const MATH_ENVS = new Set([
   'math', 'displaymath', 'equation', 'equation*', 'align', 'align*',
   'alignat', 'alignat*', 'gather', 'gather*', 'multline', 'multline*',
@@ -122,41 +125,91 @@ function balanced(text, open, close, index, end) {
 }
 
 function mathDelimited(text, index, end) {
-  if (text[index] === '$' && !escaped(text, index)) {
-    const double = text[index + 1] === '$';
-    const token = double ? '$$' : '$';
-    for (let i = index + token.length; i < end; i++) {
-      if (!escaped(text, i) && text.startsWith(token, i)) {
-        return {
-          start: index,
-          end: i + token.length,
-          contentStart: index + token.length,
-          contentEnd: i,
-          display: double,
-        };
-      }
-    }
-    return null;
-  }
-  if (text.startsWith('\\(', index) || text.startsWith('\\[', index)) {
-    const close = text[index + 1] === '(' ? '\\)' : '\\]';
-    for (let i = index + 2; i < end - 1; i++) {
-      if (text.startsWith(close, i) && !escaped(text, i)) {
-        return {
-          start: index,
-          end: i + 2,
-          contentStart: index + 2,
-          contentEnd: i,
-          display: text[index + 1] === '[',
-        };
-      }
+  const opener = text[index] === '$' ? (text[index + 1] === '$' ? '$$' : '$') :
+    text[index] === '\\' && (text[index + 1] === '(' || text[index + 1] === '[') ? text.slice(index, index + 2) : null;
+  if (!opener || escaped(text, index)) return null;
+  const closer = opener === '\\(' ? '\\)' : opener === '\\[' ? '\\]' : opener;
+  const tokens = /\\(?:[A-Za-z@]+|[\s\S])|%|\$/g;
+  tokens.lastIndex = index + opener.length;
+  for (let token; (token = tokens.exec(text)) && token.index < end;) {
+    if (token[0] === '%') {
+      const newline = text.indexOf('\n', tokens.lastIndex);
+      if (newline < 0 || newline >= end) return null;
+      tokens.lastIndex = newline + 1;
+    } else if (text.startsWith(closer, token.index) && token.index + closer.length <= end) {
+      return { start: index, end: token.index + closer.length, contentStart: index + opener.length,
+        contentEnd: token.index, display: opener === '$$' || opener === '\\[' };
+    } else if (token[0][0] === '\\') {
+      const literal = inlineLiteral(text, { name: token[0].slice(1), end: tokens.lastIndex }, end);
+      if (literal) tokens.lastIndex = literal.after;
     }
   }
   return null;
 }
 
-function environmentAt(text, index, end) {
-  if (!text.startsWith('\\begin', index)) return null;
+// Inline code is literal up to its closing delimiter or the end of its line.
+// A pasted unfinished example must not hide the rest of the manuscript.
+export function inlineLiteral(text, control, end, readValue = false) {
+  if (control.name === 'detokenize') return detokenizedArgument(text, control.end, end, readValue);
+  if (control.name === 'string') return stringToken(text, control.end, end);
+  if (!['verb', 'lstinline', 'mintinline'].includes(control.name)) return null;
+  let at = control.end;
+  const newline = text.indexOf('\n', at);
+  const stop = newline < 0 ? end : Math.min(end, newline);
+  if (control.name === 'verb') {
+    if (text[at] === '*') at++;
+  } else {
+    at = skipSpace(text, at, stop);
+    if (text[at] === '[') at = balanced(text, '[', ']', at, stop)?.after ?? stop;
+    if (control.name === 'mintinline') at = balanced(text, '{', '}', skipSpace(text, at, stop), stop)?.after ?? stop;
+    at = skipSpace(text, at, stop);
+    if (text[at] === '{') {
+      const group = balanced(text, '{', '}', at, stop);
+      return group ?? { after: stop };
+    }
+  }
+  if (at >= stop) return { after: stop };
+  const close = text.slice(at + 1, stop).indexOf(text[at]);
+  return close < 0 ? { after: stop } : { start: at + 1, end: at + 1 + close, after: at + 2 + close };
+}
+
+// Match closing commands once per block. In particular the inner tabular's
+// closing command must not terminate the surrounding cell or table.
+function environmentClosings(text) {
+  const pairs = new Map(), stack = [];
+  const tokens = /%|\\(?:[A-Za-z@]+|[\s\S])/g;
+  const argument = /\s*\{\s*([^{}\\%\s]+)\s*\}/y;
+  for (let token; (token = tokens.exec(text));) {
+    if (token[0] === '%') {
+      const newline = text.indexOf('\n', tokens.lastIndex);
+      if (newline < 0) break;
+      tokens.lastIndex = newline + 1;
+      continue;
+    }
+    const name = token[0].slice(1);
+    if (name !== 'begin' && name !== 'end') {
+      const literal = inlineLiteral(text, { name, end: tokens.lastIndex }, text.length);
+      if (literal) tokens.lastIndex = literal.after;
+      continue;
+    }
+    argument.lastIndex = tokens.lastIndex;
+    const arg = argument.exec(text);
+    if (!arg) continue;
+    tokens.lastIndex = argument.lastIndex;
+    if (name === 'end') {
+      if (stack.at(-1)?.name === arg[1]) pairs.set(stack.pop().start, { at: token.index, end: tokens.lastIndex });
+    } else if (VERBATIM_ENVS.has(arg[1])) {
+      const close = '\\end{' + arg[1] + '}', at = text.indexOf(close, tokens.lastIndex);
+      if (at < 0) break;
+      tokens.lastIndex = at + close.length;
+      pairs.set(token.index, { at, end: tokens.lastIndex });
+    } else stack.push({ start: token.index, name: arg[1] });
+  }
+  return pairs;
+}
+
+function environmentAt(text, index, end, close) {
+  if (!close || close.end > end) return null;
   let p = skipSpace(text, index + 6, end);
   const nameArg = balanced(text, '{', '}', p, end);
   if (!nameArg) return null;
@@ -180,15 +233,12 @@ function environmentAt(text, index, end) {
     if (!parsed) break;
     contentStart = parsed.after;
   }
-  const close = `\\end{${name}}`;
-  const closeAt = text.indexOf(close, contentStart);
-  if (closeAt < 0 || closeAt >= end) return null;
   return {
     name,
     start: index,
     contentStart,
-    contentEnd: closeAt,
-    end: closeAt + close.length,
+    contentEnd: close.at,
+    end: close.end,
     optional,
   };
 }
@@ -197,6 +247,7 @@ function environmentAt(text, index, end) {
 export function discoverEditRegions(source) {
   const text = String(source ?? '');
   const regions = [];
+  let tableCell = null, closings, leadingLiteral = '';
 
   const add = (
     kind,
@@ -209,7 +260,7 @@ export function discoverEditRegions(source) {
   ) => {
     if (end <= start || contentEnd < contentStart) return;
     const sourceValue = text.slice(contentStart, contentEnd);
-    const value = visibleValue ?? sourceValue;
+    const value = visibleValue ?? (kind === 'math' ? mathMacros.withoutComments(sourceValue) : sourceValue);
     if (kind === 'text' && !/\S/u.test(value)) return;
     regions.push({
       id: regions.length + 1,
@@ -220,16 +271,38 @@ export function discoverEditRegions(source) {
       contentEnd,
       value,
       sourceValue,
+      ...(tableCell && { tableRow: tableCell.row, tableColumn: tableCell.column,
+        ...(leadingLiteral && { tableLiteralBefore: leadingLiteral }),
+        ...(tableCell.span > 1 && { tableSpan: tableCell.span }) }),
       ...(metadata ?? {}),
     });
+    leadingLiteral = '';
   };
 
-  const scan = (from, to, visible) => {
+  const finishRow = (table) => {
+    for (let i = table.firstRegion; i < regions.length; i++) {
+      const region = regions[i];
+      if (region.tableRow !== table.row) continue;
+      if (table.unknownSpan) {
+        delete region.tableRow;
+        delete region.tableColumn;
+        delete region.tableSpan;
+      } else region.tableColumns = table.column + table.span;
+    }
+  };
+  const scan = (from, to, visible, table = null) => {
     let i = from;
     while (i < to) {
       if (text[i] === '%' && !escaped(text, i)) {
         const nl = text.indexOf('\n', i + 1);
         i = nl < 0 || nl >= to ? to : nl + 1;
+        continue;
+      }
+
+      if (table && text[i] === '&') {
+        table.column += table.span;
+        table.span = 1;
+        i++;
         continue;
       }
 
@@ -243,7 +316,8 @@ export function discoverEditRegions(source) {
       }
 
       if (text[i] === '\\') {
-        const env = environmentAt(text, i, to);
+        const env = text.startsWith('\\begin', i) &&
+          environmentAt(text, i, to, (closings ??= environmentClosings(text)).get(i));
         if (env) {
           if (MATH_ENVS.has(env.name)) {
             add('math', env.start, env.end, env.contentStart, env.contentEnd, null, {
@@ -253,7 +327,13 @@ export function discoverEditRegions(source) {
             if (env.optional && VISIBLE_ENVIRONMENT_OPTIONS.has(env.name)) {
               scan(env.optional.start, env.optional.end, true);
             }
-            scan(env.contentStart, env.contentEnd, visible);
+            if (['tabular', 'tabular*', 'tabularx', 'longtable'].includes(env.name)) {
+              const previous = tableCell;
+              tableCell = { row: env.contentStart, column: 0, span: 1, firstRegion: regions.length };
+              scan(env.contentStart, env.contentEnd, visible, tableCell);
+              finishRow(tableCell);
+              tableCell = previous;
+            } else scan(env.contentStart, env.contentEnd, visible);
           }
           i = env.end;
           continue;
@@ -261,6 +341,32 @@ export function discoverEditRegions(source) {
 
         const control = controlAt(text, i);
         if (!control) { i++; continue; }
+        const literal = inlineLiteral(text, control, to, Boolean(tableCell));
+        if (literal) {
+          // Literal ink participates in identifying the surrounding cells,
+          // but must never receive a prose or math edit of its own.
+          if (tableCell && literal.start != null) {
+            const value = literal.value ?? text.slice(literal.start, literal.end);
+            const previous = regions.at(-1);
+            if (previous?.tableRow != null) previous.tableLiteralAfter = (previous.tableLiteralAfter ?? '') + value;
+            else leadingLiteral += value;
+          }
+          i = literal.after;
+          continue;
+        }
+        if (table && (control.name === '\\' || control.name === 'tabularnewline' || control.name === 'cr')) {
+          finishRow(table);
+          i = control.end;
+          if (text[i] === '*') i++;
+          const option = balanced(text, '[', ']', skipSpace(text, i, to), to);
+          if (option) i = option.after;
+          table.row = i;
+          table.column = 0;
+          table.span = 1;
+          table.unknownSpan = false;
+          table.firstRegion = regions.length;
+          continue;
+        }
         if (VISIBLE_ESCAPES.has(control.name)) {
           add('text', i, control.end, i, control.end, VISIBLE_ESCAPES.get(control.name));
           i = control.end;
@@ -295,6 +401,11 @@ export function discoverEditRegions(source) {
             if (!structural) {
               complete = false;
               break;
+            }
+            if (table && control.name === 'multicolumn' && argument === 0) {
+              const count = text.slice(structural.start, structural.end).trim();
+              if (/^[1-9]\d*$/.test(count) && Number.isSafeInteger(Number(count))) table.span = Number(count);
+              else table.unknownSpan = true;
             }
             i = skipSpace(text, structural.after, to);
             // `raisebox` and a few related commands place optional dimensions

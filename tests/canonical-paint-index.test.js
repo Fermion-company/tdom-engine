@@ -1,10 +1,14 @@
 import { test } from 'node:test';
+import { captureCanonicalAnchorBase, planTerminalCanonicalAnchor } from '../engine/checkpoint/canonical-anchor.js';
 import assert from 'node:assert/strict';
 import {
   buildPdfPaintPage,
   certifyCanonicalBlock,
   changedGalleyLines,
+  changedTextSpan,
+  mixedGalleyFrame,
   galleyLineWitnesses,
+  galleyMixedLineWitnesses,
 } from '../engine/checkpoint/canonical-paint-index.js';
 import {
   classifyResidentRun,
@@ -71,6 +75,169 @@ const paintFor = (text, { page = 1, left = 48, baseline = 80, size = 9.2 } = {})
     glyphColors: Array.from(text, () => '#000000'),
     safe: true,
   }],
+});
+
+test('mixed line repaint admits native text confined to a slot beside an unchanged formula', () => {
+  const line = lineBox('温度');
+  const formula = { ...line.runs[0], t: 'n', m: 1, s: 7, x: 22, dy: 2, w: 4 };
+  line.runs.push(formula);
+  const base = { items: [line], backend: certifiedBackend };
+  const project = (modify, native = true) => {
+    const current = structuredClone(base);
+    current.items[0].runs[0].t = '湿度';
+    modify?.(current);
+    return changedTextSpan(mixedGalleyFrame(base, [null]), mixedGalleyFrame(current, [null]),
+      current, [null], [null], () => native);
+  };
+  const span = project();
+  assert.equal(span.oldWitness.paintText, '温度');
+  assert.equal(span.newWitness.paintText, '湿度');
+  assert.deepEqual(span.runs.map(run => run.t), ['湿度']);
+  assert.equal(project(undefined, false), null);
+  assert.equal(project(g => { g.items[0].runs[0].w++; }).expands, true);
+  assert.equal(project(g => { g.items[0].runs[0].w += 4; }), null);
+  assert.equal(project(g => { g.items[0].runs[1].dy++; }), null);
+  assert.equal(project(g => { g.items[0].h++; }), null);
+  assert.equal(project(g => { g.trail = 'changed'; }), null);
+  formula.x = 18.7;
+  assert.equal(project(), null, 'unchanged adjacent math must still clear the text mask');
+});
+
+test('reflow into a mixed line repaints all changed plain rows and preserves their slots', () => {
+  const last = lineBox('日');
+  last.runs.push({ ...last.runs[0], t: 'n', m: 1, s: 7, x: 32, dy: 2, w: 4 });
+  const base = { items: [lineBox('測定'), lineBox('午後'), last], backend: certifiedBackend };
+  const current = structuredClone(base);
+  current.items[0].runs[0].t = '外気';
+  current.items[1].runs[0].t = '測定';
+  current.items[2].runs[0].t = '温';
+  const change = () => {
+    const before = galleyMixedLineWitnesses(base), after = galleyMixedLineWitnesses(current);
+    return changedTextSpan(mixedGalleyFrame(base, before), mixedGalleyFrame(current, after),
+      current, before, after, () => true);
+  };
+  assert.deepEqual(change()?.changedPlainLines, [0, 1]);
+  assert.equal(change().index, 2);
+  const source = '測定午後日$n$';
+  const block = (galley, text) => ({
+    id: 'paragraph', text, start: 0, end: text.length,
+    galley: { ...galley, epochs: [1, 1, 1], closure: 'native', trail: 'unchanged' },
+    stateVec: '[1,2,3,4,5,6,7,8]', fidelity: { level: 'exact-preview-required', itemFlags: [0, 0, 1] },
+    editRegions: [{ kind: 'text', contentStart: 0, contentEnd: text.indexOf('$') }],
+  });
+  const edit = { start: 0, end: 5, text: '外気測定温' };
+  const dom = { id: 'paragraph', span: { start: 0, end: source.length },
+    source: { file: 'main.tex', start: { line: 1, column: 1 }, end: { line: 1, column: source.length + 1 } } };
+  const certificate = { id: 1, rev: 1, inputEpoch: 1, pdfHash: 'pdf', synctexHash: 'synctex' };
+  const baseSnapshot = captureCanonicalAnchorBase({ blocks: [block(base, source)], domBlocks: [dom], edit, certificate });
+  const report = { mode: 'structured', previewPolicy: 'canonical-anchor', srcRev: 2, canonical: { id: 1, rev: 1, pageCount: 1 },
+    patches: [], dirtySourceNodes: ['src-paragraph'] };
+  const plan = planTerminalCanonicalAnchor({ blocks: [block(current, edit.text + '$n$')], domBlocks: [dom], edit, report, baseSnapshot,
+    geometry: { textheight: 680, paintCallbacks: 'none' }, paintContext: { fonts: new Map([['body', { tier: 'native' }]]) } });
+  assert.deepEqual(plan?.provisionalPages, [], 'an unchanged chunk claims no provisional page');
+  assert.deepEqual(plan.linePlans.map(line => line.commands.map(cmd => cmd.text).join('')), ['外気', '測定', '温']);
+  current.items[1].d++;
+  assert.equal(change(), null, 'line depths must still match the printed paragraph');
+});
+
+test('a moved math tail needs a rigid translation and its original PDF paint', () => {
+  const line = lineBox('温度');
+  line.runs.push({ ...line.runs[0], t: 'x', x: 24, w: 5, m: 1 },
+    { ...line.runs[0], t: 'n', x: 29, w: 4, s: 7, dy: 1, m: 1 });
+  const base = { items: [line], backend: certifiedBackend };
+  const current = structuredClone(base);
+  const [prefix, x, n] = current.items[0].runs;
+  prefix.t += '差';
+  prefix.w += 9.2;
+  x.x += 9.2;
+  n.x += 9.2;
+  const change = () => changedTextSpan(mixedGalleyFrame(base, [null]), mixedGalleyFrame(current, [null]),
+    current, [null], [null], () => true);
+  const span = change();
+  assert.ok(span.expands);
+  const paint = paintFor('温度');
+  paint.items.push({ ...paintFor('x', { left: 72 }).items[0], right: 77 },
+    { ...paintFor('n', { left: 77, size: 7, baseline: 81 }).items[0], right: 81 });
+  const match = () => certifyCanonicalBlock({ witnesses: [span.oldWitness], candidates: [candidateFor()], paintPages: [paint] });
+  assert.equal(match(), null, 'a page containing unaccounted graphics cannot be copied');
+  paint.cropSafe = true;
+  assert.ok(match());
+  paint.items.at(-1).baseline = 80;
+  assert.equal(match(), null, 'the printed subscript must be on the witnessed baseline');
+  paint.items.at(-1).baseline = 81;
+  paint.items.push({ ...paint.items.at(-1), paintText: 'z' });
+  assert.equal(match(), null, 'overlaid text does not belong to the tail');
+  n.x += 1;
+  assert.equal(change(), null, 'two different horizontal offsets are not a translation');
+  n.x -= 1;
+  n.t = 'k';
+  assert.equal(change(), null, 'an edited formula cannot reuse its old pixels');
+});
+
+test('a fraction between text runs can move only with its exact printed bar', () => {
+  const line = lineBox('温度');
+  const glyph = (t, x, dy) => ({ ...line.runs[0], t, x, w: 4, s: 7, dy, m: 1 });
+  const bar = { ...ruleRun({ subtype: 0 }), x: 23, dy: -2, w: 4, h: 0.4, rw: -1073741824 };
+  line.runs.push(glyph('x', 23, -3), bar, glyph('n', 23, 1));
+  const base = { items: [line], backend: certifiedBackend }, current = structuredClone(base);
+  current.items[0].runs[0].t += '差';
+  current.items[0].runs[0].w += 9.2;
+  for (const run of current.items[0].runs.slice(1)) run.x += 9.2;
+  const change = changedTextSpan(mixedGalleyFrame(base, [null]), mixedGalleyFrame(current, [null]),
+    current, [null], [null], () => true);
+  assert.ok(change);
+  const paint = paintFor('温度');
+  for (const [letter, baseline] of [['x', 77], ['n', 81]]) {
+    paint.items.push({ ...paintFor(letter, { left: 71, baseline, size: 7 }).items[0], right: 75 });
+  }
+  paint.cropRules = [{ left: 71, right: 75, top: 78, bottom: 78.4 }];
+  const match = () => certifyCanonicalBlock({ witnesses: [change.oldWitness], candidates: [candidateFor()], paintPages: [paint] });
+  assert.ok(match());
+  paint.cropRules[0].right += 0.2;
+  assert.equal(match(), null, 'the width of the printed bar must agree');
+  paint.cropRules[0].right -= 0.2;
+  paint.cropRules.push({ left: 55, right: 61, top: 75, bottom: 76 });
+  assert.equal(match(), null, 'an unrelated stroke behind the new text must stay visible');
+});
+
+test('a native punctuation glyph can have advance overlapping the neighbouring formula', () => {
+  const line = lineBox('温度');
+  const punctuation = { ...line.runs[0], t: '。', x: 18, w: 9.2, ink: [0.38, 2.98] };
+  const formula = { ...line.runs[0], t: 'x', m: 1, x: 26, w: 5 };
+  line.runs.push(punctuation, formula);
+  const base = { items: [line], backend: certifiedBackend };
+  const check = () => {
+    const current = structuredClone(base);
+    current.items[0].runs[0].t = '湿度';
+    return changedTextSpan(mixedGalleyFrame(base, [null]), mixedGalleyFrame(current, [null]),
+      current, [null], [null], () => true);
+  };
+  assert.equal(check().oldWitness.inkRight, 20.98);
+  punctuation.t = '文';
+  assert.equal(check(), null);
+  punctuation.t = '。';
+  delete punctuation.ink;
+  assert.equal(check(), null);
+});
+
+test('partial paint normalizes the SyncTeX box of a line with an overhanging last glyph', () => {
+  const witness = { ...witnessFor('温度'), partial: true, frameLeft: 0, frameRight: 244.6 };
+  const match = width => certifyCanonicalBlock({ witnesses: [witness],
+    candidates: [candidateFor({ width })], paintPages: [paintFor('温度')] });
+  assert.ok(match(244.6));
+  assert.equal(match(246), null);
+});
+
+test('a partial text witness rejects ambiguous, overlapping or unsafe canonical paint', () => {
+  const witness = { ...witnessFor('温度'), partial: true };
+  const candidate = candidateFor(), texts = paintFor('温度'), math = paintFor('n', { left: 74 });
+  const certify = (item, candidates = [candidate]) => certifyCanonicalBlock({ witnesses: [witness],
+    candidates, paintPages: [{ page: 1, items: [...texts.items, item] }] });
+  assert.ok(certify(math.items[0]));
+  assert.equal(certify({ ...math.items[0], left: 58, baseline: 81 }), null);
+  assert.equal(certify({ ...math.items[0], left: 58, safe: false }), null);
+  assert.equal(certify({ ...math.items[0], left: 61, right: 70 }), null);
+  assert.equal(certify({ ...math.items[0], left: 48, right: texts.items[0].right }), null);
 });
 
 const Util = {
@@ -395,6 +562,24 @@ test('operator-list glyph identity and TextContent geometry must agree exactly',
   });
   assert.equal(form.items.length, 1);
   assert.equal(form.items[0].safe, false, 'form reuse is not certified');
+});
+
+test('a copied bar must be an isolated, solid horizontal stroke', () => {
+  const OPS = { save: 1, transform: 2, setDash: 3, setLineCap: 4, setLineWidth: 5, constructPath: 6, restore: 7, stroke: 8 };
+  const args = [[], [1, 0, 0, 1, 10, 50], [[], 0], [0], [0.5], [OPS.stroke, [[0, 0, 0, 1, 5, 0]]], []];
+  const page = () => buildPdfPaintPage({ pageNumber: 1, OPS, Util, textContent: { items: [] },
+    viewport: { transform: [1, 0, 0, -1, 0, 100] },
+    operatorList: { fnArray: [1, 2, 3, 4, 5, 6, 7], argsArray: args } });
+  assert.equal(page().cropSafe, false, 'a line is paint even when no text is present');
+  assert.deepEqual(page().cropRules, [{ left: 10, right: 15, top: 49.75, bottom: 50.25 }]);
+  args[5][1][0][5] = 1;
+  assert.equal(page().cropRules, null, 'a diagonal path is not a printed fraction bar');
+  args[5][1][0][5] = 0;
+  args[2][0] = [1, 2];
+  assert.equal(page().cropRules, null, 'a dashed line cannot be copied as a solid bar');
+  args[2][0] = [];
+  args[4][0] = 0;
+  assert.equal(page().cropRules, null, 'a device hairline has no fixed width in paper units');
 });
 
 test('every canonical glyph must be filled in the color its witness paints', () => {

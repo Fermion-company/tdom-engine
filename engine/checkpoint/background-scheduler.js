@@ -1,3 +1,4 @@
+import { physicalReplayReady } from './ship-pacing.js';
 import { performance } from 'node:perf_hooks';
 import { shippingPriorityQuietMs } from './interactive-priority.js';
 
@@ -125,13 +126,14 @@ export function scheduleBackground(engine, dirtyBlocks, callbacks, { interactive
   // cold case: cap it. Small documents render their whole set at boot
   // (a few seconds, and the referee tools rely on it).
   const hot = dirtyBlocks.length <= Number(process.env.TDOM_RENDER_HOT_MAX || 64) ? dirtyBlocks : [];
+  const foreground = interactive && physicalReplayReady(engine) ? engine.foregroundRenderIds : null;
   for (const id of new Set([...hot, ...pageRenderIds])) {
     const block = engine.blocks.find((b) => b.id === id);
     if (!block?.needsRender) continue;
     const stale = chunkTargets(block).some(
       (t) => engine.chunks.get(t.key)?.forGalley !== block.galleyHash
     );
-    if (stale) queueRender(id, { interactiveRev: interactive ? engine.srcRev : null });
+    if (stale) queueRender(id, { interactiveRev: interactive && (!foreground || foreground.has(id)) ? engine.srcRev : null });
   }
   // stale render holds: the held block moved/changed under its index, or
   // its chunks are already fresh — resume normal grid retirement

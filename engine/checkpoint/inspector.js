@@ -1,3 +1,4 @@
+import mathMacros from '../../web/math-macro-projection.cjs';
 import { SAFE_GLYPH } from './fidelity.js';
 import { instrumentEditRegions } from '../edit-regions.js';
 
@@ -104,6 +105,7 @@ const linesMovedFrom = new WeakMap(); // a core's `source` -> { from: the `sourc
  */
 export function domEntryLinesMovedBy(was, now) {
   if (!was || !now || !sameButSourceAndRegions(was, now)) return null;
+  if (was.editRegions?.some(region => region.mathMacros) || now.editRegions?.some(region => region.mathMacros)) return null;
   let by = 0;
   let source = now.source;
   // (a viewer is at most a few snapshots behind)
@@ -278,14 +280,36 @@ export function buildDomSnapshot({
     // Canonical snapshots can arrive before an isolated rescue's
     // resident metadata. Source spans are lexical and already known;
     // never freeze a temporarily empty editing map into that PDF.
-    const regions = (b.editRegions ?? instrumentEditRegions(b.text).regions).map((region) => ({
-      id: `${b.id}:${region.id}`,
-      kind: region.kind,
-      value: region.value,
-      sourceValue: region.sourceValue,
-      display: region.display,
-      source: editSource(b, region),
-    })).filter(region => region.source);
+    const regions = [];
+    for (const region of b.editRegions ?? instrumentEditRegions(b.text).regions) {
+      const source = editSource(b, region);
+      const id = `${b.id}:${region.id}`;
+      if (source) {
+        regions.push({ id, kind: region.kind, value: region.value, sourceValue: region.sourceValue,
+          display: region.display, source, ...(region.tableRow != null && {
+            tableRow: region.tableRow, tableColumn: region.tableColumn, tableColumns: region.tableColumns,
+            ...(region.tableSpan && { tableSpan: region.tableSpan }),
+            ...(region.tableLiteralBefore && { tableLiteralBefore: region.tableLiteralBefore }),
+            ...(region.tableLiteralAfter && { tableLiteralAfter: region.tableLiteralAfter }),
+          }) });
+        continue;
+      }
+      // One printed paragraph may join literal text from several inputs.
+      // Expose each file's editable words without making the inclusion itself editable.
+      if (!b.sourceParts || region.kind !== 'text' || region.value !== region.sourceValue ||
+          region.sourceValue !== b.text.slice(region.contentStart, region.contentEnd)) continue;
+      for (const [index, part] of b.sourceParts.entries()) {
+        const from = Math.max(region.contentStart, part.at);
+        const to = Math.min(region.contentEnd, part.to, part.at + part.end - part.start);
+        if (from >= to) continue;
+        const raw = b.text.slice(from, to);
+        const value = raw.trim();
+        if (!value) continue;
+        const start = from + raw.length - raw.trimStart().length;
+        const source = editSource(b, { contentStart: start, contentEnd: start + value.length });
+        if (source) regions.push({ id: `${id}.${index}`, kind: 'text', value, sourceValue: value, source });
+      }
+    }
     if (anchor !== null) blockRegionMemo.set(b, { text: b.text, editRegions: b.editRegions, anchor, regions });
     else blockRegionMemo.delete(b);
     return regions;
@@ -432,8 +456,15 @@ export function buildDomSnapshot({
         if (blockRegions === own) blockEntryMemo.set(b, kept);
       }
     }
-    if (kept.entry && kept.index === i && kept.start === b.start && kept.end === b.end && samePages(kept.pages, pages)) return kept.entry;
+    if (kept.entry && kept.macroDefinitions === b.galley?.tdomMathMacros && kept.index === i && kept.start === b.start && kept.end === b.end && samePages(kept.pages, pages)) return kept.entry;
     const core = kept.core;
+    const macroDefinitions = b.galley?.tdomMathMacros;
+    const editRegions = macroDefinitions ? core.editRegions.map(region => {
+      const projected = region.kind === 'math' && mathMacros.project(region.value, macroDefinitions);
+      return projected ? { ...region, value: projected.text, sourceValue: region.sourceValue ?? region.value,
+        mathMacros: projected.definitions } : region;
+    }) : core.editRegions;
+    kept.macroDefinitions = macroDefinitions;
     const entry = {
       id: core.id,
       index: i,
@@ -449,7 +480,7 @@ export function buildDomSnapshot({
       pages: kept.pages && samePages(kept.pages, pages) ? kept.pages : pages,
       file: core.file,
       span: b.file ? null : { start: b.start, end: b.end },
-      editRegions: core.editRegions,
+      editRegions,
     };
     kept.entry = entry;
     kept.index = i;
@@ -458,6 +489,11 @@ export function buildDomSnapshot({
     kept.pages = entry.pages;
     return entry;
   };
+  const rejectedBlocks = [];
+  const entries = blocks.map((block, i) => {
+    if (block.galley?.tdomDeferred && block.closure?.reason === 'native-error') rejectedBlocks.push(block.id);
+    return entryOf(block, i);
+  });
   return {
     rev,
     srcRev,
@@ -469,7 +505,8 @@ export function buildDomSnapshot({
     canonical: canonicalInfo,
     pageCount: pages.length,
     checkpoints: [...checkpoints.keys()].sort((a, b) => a - b),
-    blocks: blocks.map((b, i) => entryOf(b, i)),
+    blocks: entries,
+    ...(rejectedBlocks.length ? { rejectedBlocks } : {}),
     labels: Object.fromEntries(labelTable),
   };
 }

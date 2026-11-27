@@ -9,6 +9,8 @@
     ['≠', '\\ne'], ['×', '\\times'], ['±', '\\pm'], ['∂', '\\partial'],
   ]);
 
+  const printedCommands = new Set(MATH_PRINT_ALIASES.values());
+
   const normalizedPrintedToken = (value) =>
     String(value ?? '').normalize('NFKC').replace(/\s+/gu, '');
 
@@ -108,6 +110,15 @@
   }
 
   class OpaqueEditorCoordinator {
+    static isPrintedSymbolCommand(command) {
+      return printedCommands.has(command);
+    }
+
+    static startsPrintedSymbolCommand(prefix) {
+      for (const command of printedCommands) if (command.startsWith(prefix)) return true;
+      return false;
+    }
+
     static planGenerationBarrier({
       pageNumber,
       pageConnected,

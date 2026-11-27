@@ -79,7 +79,7 @@ export async function runColdIsoCompile(engine, jobdir) {
     timeout: 120_000,
     // doc-relative assets (\includegraphics, \includepdf …) resolve the
     // same way the canonical compile resolves them
-    env: withProjectInputs(process.env, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
+    env: withProjectInputs(process.env, engine),
   });
   engine.isoChildren.add(run.child);
   await run.catch(() => {});

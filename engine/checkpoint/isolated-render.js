@@ -127,7 +127,7 @@ export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, as
         const run = execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
           cwd: jobdir,
           timeout: 90_000,
-          env: withProjectInputs(process.env, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
+          env: withProjectInputs(process.env, engine),
         });
         if (run.child) engine.isoChildren.add(run.child);
         await run.catch(() => {}).finally(() => {

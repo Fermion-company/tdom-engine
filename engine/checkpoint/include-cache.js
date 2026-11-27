@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fnv1a } from '../hash.js';
 
@@ -66,7 +66,9 @@ export function announceIncludeReads(includes, files) {
     if (!targets.has(path.resolve(file)) && !targets.has(path.resolve(cached.readPath))) continue;
     let announcedText = null;
     try { announcedText = readFileSync(cached.readPath, 'utf8'); } catch { /* gone: nothing announced */ }
-    includes.set(file, { ...cached, announcedText });
+    // Atomic copies can preserve mtime and size. When the notification
+    // proved different bytes, the next expansion must reread the chapter.
+    includes.set(file, { ...cached, announcedText, mtime: announcedText === cached.text ? cached.mtime : null });
   }
 }
 
@@ -120,7 +122,7 @@ export function resourceContentSig(resources, file, st) {
   const key = path.resolve(file);
   const cached = resources?.get(key);
   if (cached && cached.mtime === st.mtimeMs && cached.size === st.size) return cached.hash;
-  const hash = hashFile(key);
+  const hash = hashFile(key, st.size);
   resources?.set(key, { mtime: st.mtimeMs, size: st.size, hash, announcedHash: cached ? cached.announcedHash : hash });
   return hash;
 }
@@ -131,7 +133,7 @@ export function announceResourceReads(resources, files) {
     if (!resources?.has(key)) continue;
     try {
       const st = statSync(key);
-      const hash = hashFile(key);
+      const hash = hashFile(key, st.size);
       resources.set(key, { mtime: st.mtimeMs, size: st.size, hash, announcedHash: hash });
     } catch {
       resources.delete(key);
@@ -161,14 +163,28 @@ function resourceReadCurrent(resources, target) {
   let st;
   try { st = statSync(target); } catch { return false; }
   if (st.size !== cached.size) return false;
-  if (st.mtimeMs === cached.mtime) return true;
+  // This runs on a real file notification, outside the keystroke path.
+  // The same size and mtime do not prove an atomically replaced image is
+  // identical. Reuse the regular per-block cache between notifications.
   let hash;
-  try { hash = hashFile(target); } catch { return false; }
+  try { hash = hashFile(target, st.size); } catch { return false; }
   if (hash !== cached.hash) return false;
   resources.set(target, { ...cached, mtime: st.mtimeMs });
   return true;
 }
 
-function hashFile(file) {
-  return createHash('sha1').update(readFileSync(file)).digest('hex');
+function hashFile(file, size) {
+  const hash = createHash('sha1');
+  if (size <= 128 * 1024) return hash.update(readFileSync(file)).digest('hex');
+  // A file notification should not load a second entire high-resolution
+  // figure into memory just to compare it with the previous figure.
+  const buffer = Buffer.allocUnsafe(128 * 1024);
+  const fd = openSync(file, 'r');
+  try {
+    let n;
+    while ((n = readSync(fd, buffer, 0, buffer.length, null)) > 0) hash.update(buffer.subarray(0, n));
+    return hash.digest('hex');
+  } finally {
+    closeSync(fd);
+  }
 }

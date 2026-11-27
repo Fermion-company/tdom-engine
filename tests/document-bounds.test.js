@@ -103,3 +103,53 @@ test('segmentBody keeps a declared listing literal', () => {
   const segs = segmentBody(text, 0, { literalEnvs: new Set(['TeXBlock']) }).map((s) => s.text);
   assert.deepEqual(segs, ['\\begin{TeXBlock}\n\\begin{multicols}{3}\n\n{\n\\end{TeXBlock}\n', 'Next paragraph']);
 });
+
+test('a printed document marker cannot hide either end of the real manuscript', () => {
+  const src = String.raw`% Preamble example
+\def\example{\string\begin{document}}
+\begin{document}
+\string % the following token is printed
+\end{document}
+
+\verb|\string| Text on the second page.
+\end{document}`;
+  assert.equal(documentBounds(src).preamble.end, src.indexOf('\n\\begin{document}') + 1);
+  assert.equal(documentBounds(src).body.end, src.lastIndexOf('\\end{document}'));
+  assert.equal(documentBounds('\\string\\begin{document}\n\\end{document}').hasBegin, false);
+});
+
+test('a printed environment opener keeps following paragraphs independent on cold and incremental scans', () => {
+  const memo = {};
+  const example = String.raw`A \string % continued
+\begin{verbatim}.
+
+Printed \texttt{\string\begin{table}}.
+
+Last paragraph.`;
+  for (const suffix of ['', ' Typed.']) {
+    const text = example + suffix;
+    const expected = ['A \\string % continued\n\\begin{verbatim}.\n', 'Printed \\texttt{\\string\\begin{table}}.\n', 'Last paragraph.' + suffix];
+    assert.deepEqual(segmentBody(text, 0, { memo }).map(b => b.text), expected);
+    assert.deepEqual(segmentBody(text, 0).map(b => b.text), expected);
+  }
+});
+
+test('a blank line supplies a printed paragraph token and leaves the following document end active', () => {
+  const s = '\\begin{document}\nText \\string\n   \n\\end{document}\nTrailing notes';
+  assert.equal(documentBounds(s).body.end, s.indexOf('\\end{document}'));
+  assert.equal(documentBounds('\\\\begin{document}\ntext\n\\end{document}').hasBegin, false);
+});
+
+test('a multiline detokenized example preserves the actual document end and following block boundaries', () => {
+  const example = String.raw`\detokenize % quoted material follows
+{First \begin{verbatim} % } is a comment
+\end{document}
+
+Last \verb $}
+
+Following paragraph.`;
+  const src = '\\begin{document}\n' + example + '\n\\end{document}';
+  assert.equal(body(src), '\n' + example + '\n');
+  assert.deepEqual(segmentBody(example, 0).map(b => b.text),
+    [example.slice(0, example.indexOf('\n\nFollowing') + 1), 'Following paragraph.']);
+});

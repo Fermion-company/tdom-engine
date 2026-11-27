@@ -16,7 +16,7 @@
 
 import http from 'node:http';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -44,6 +44,7 @@ import { singleLiteralChildReadProof } from './engine/checkpoint/dependency-read
 import { validateCanonicalBuildImport } from './engine/checkpoint/canonical-build-import.js';
 import { acquirePreviewBuildLease } from './engine/checkpoint/build-lease-preview.js';
 import { watchInclude } from './engine/checkpoint/include-expander.js';
+import { PreambleInputs, styleInput } from './engine/checkpoint/preamble-inputs.js';
 import { includeHoldsText, inputReadCurrent, rebindIncludeRead } from './engine/checkpoint/include-cache.js';
 import { OpenRequestCache, openRequestIdentity } from './engine/open-request-cache.js';
 
@@ -511,9 +512,21 @@ const openRequests = new OpenRequestCache(8);
 // while an edit is running or queued (the alternative is the superseded
 // snapshot), and rebuilt through the queue otherwise.
 let domCache = null; // { srcRev, epoch, dirty, parts }
+let firstPaperDom = null;
+let documentStartSrcRev = null;
 let domInterestUntil = 0;
 let lastQueueResult = null;
 function cacheDomBeforeNext() {
+  // A newly opened viewer may still be connecting as the next edit starts.
+  // Share the existing serialization and produce its full body only on demand.
+  if (!firstPaperDom && documentStartSrcRev === engine.srcRev && !lastReport?.stats?.closureDeferred) {
+    try {
+      firstPaperDom = domCache?.epoch === documentEpoch && domCache.srcRev === engine.srcRev && !domCache.dirty
+        ? domCache.parts : rememberDom(domPayload());
+    } catch (error) {
+      console.warn('[tdom] opening source map unavailable:', error?.message ?? error);
+    }
+  }
   const result = lastQueueResult;
   if (Date.now() > domInterestUntil || !result?.stats || !Number.isSafeInteger(result.srcRev)) return;
   if (result.srcRev !== engine?.srcRev) return;
@@ -579,7 +592,7 @@ function serializeDom(payload) {
     },
   });
   const parts = {
-    srcRev: payload.srcRev, stamp, order, files, tail,
+    srcRev: payload.srcRev, epoch: payload.documentEpoch, stamp, order, files, tail,
     // the blocks themselves, in order
     entries: blocks,
     // (the texts themselves, to send a change of one as a splice: domDeltaBody)
@@ -841,17 +854,12 @@ function closeBibliographyWatchers() {
 }
 
 function watchProjectBibliography(descriptor) {
-  closeBibliographyWatchers();
-  for (const file of descriptor?.files ?? []) {
-    if (!existsSync(file) || bibliographyWatchers.has(file)) continue;
-    try {
-      const watcher = watch(file, () => {
-        scheduleProjectBibliographyRefresh(file, 120);
-      });
-      bibliographyWatchers.set(file, watcher);
-    } catch {
-      /* watching is best-effort */
-    }
+  const files = new Set(descriptor?.watchFiles ?? []);
+  for (const [file, handle] of bibliographyWatchers) {
+    if (!files.has(file)) { handle.close(); bibliographyWatchers.delete(file); }
+  }
+  for (const file of files) {
+    try { watchInclude(file, bibliographyWatchers, scheduleProjectBibliographyRefresh); } catch { /* best effort */ }
   }
 }
 
@@ -861,19 +869,25 @@ function scheduleProjectBibliographyRefresh(changedFile, delay = 450) {
 }
 
 async function materializeProjectBibliography(source, context) {
-  const descriptor = describeExternalBibliography(source, context.docDir, context.overlayDir);
-  const result = await prepareExternalBibliography({
-    source,
-    descriptor,
-    docDir: context.docDir,
-    documentFile: context.file,
-    workDir: engine.workDir,
-    canonicalWorkDir: engine.canonical.workDir,
-    overlayDir: context.overlayDir,
-  });
-  if (result.warning) console.warn('[tdom] bibliography kept last-good output:', result.warning);
+  const descriptor = describeExternalBibliography(source, context.docDir, context.overlayDir, context.sourceDir);
   context.bibliography = descriptor;
   watchProjectBibliography(descriptor);
+  try {
+    const result = await prepareExternalBibliography({
+      source,
+      descriptor,
+      docDir: context.docDir,
+      documentFile: context.file,
+      workDir: engine.workDir,
+      canonicalWorkDir: engine.canonical.workDir,
+      overlayDir: context.overlayDir,
+    });
+    context.bibliographyError = result.warning || null;
+  } catch (error) {
+    // A broken bibliography does not prevent LaTeX from typesetting the
+    // manuscript. Keep watching its inputs before publishing the first page.
+    context.bibliographyError = String(error?.message || error);
+  }
   return descriptor;
 }
 
@@ -1133,12 +1147,14 @@ function refreshProjectBibliography(changedFile) {
     const descriptor = describeExternalBibliography(
       source,
       activeProject.docDir,
-      activeProject.overlayDir
+      activeProject.overlayDir,
+      activeProject.sourceDir
     );
     if (descriptor?.kind === 'biblatex') {
       const resetEpoch = beginDocumentReset('bibliography-refresh');
       await engine.setDocumentContext({
         docDir: activeProject.docDir,
+        sourceDir: activeProject.sourceDir,
         overlayDir: activeProject.overlayDir,
         force: true,
       });
@@ -1306,6 +1322,8 @@ let pendingDocumentReset = null;
 
 function beginDocumentReset(reason) {
   documentEpoch += 1;
+  firstPaperDom = null;
+  documentStartSrcRev = null;
   terminalAnchorLineage = null;
   pendingDocumentReset = { epoch: documentEpoch, reason };
   broadcast({ kind: 'reset-pending', reason });
@@ -1358,7 +1376,13 @@ engine.onResidentInputChange = () => {
     console.warn('[tdom] resident input refresh failed:', error?.message || error);
   });
 };
-engine.onExternalChange = (changedInput) => {
+function preambleInputsFor(context) {
+  return context.preambleInputs ??= new PreambleInputs(context, (file, raced = false) => {
+    if (activeProject === context) engine.onExternalChange(file, { preamble: true, raced });
+  });
+}
+engine.onExternalChange = (changedInput, origin) => {
+  const projectAtEvent = activeProject;
   const changedFile = typeof changedInput === 'string' ? path.resolve(changedInput) : null;
   if (diskChangeShadowedByOverlay(activeProject, changedFile)) return;
   terminalAnchorLineage = null;
@@ -1366,28 +1390,34 @@ engine.onExternalChange = (changedInput) => {
   withEngine(async () => {
     // An overlay can land while this refresh waits behind the edit that
     // carries it; the write then no longer changes any TeX input.
-    if (diskChangeShadowedByOverlay(activeProject, changedFile)) return lastReport;
+    if (projectAtEvent !== activeProject || diskChangeShadowedByOverlay(activeProject, changedFile)) return lastReport;
+    const preamble = activeProject.preambleInputs;
+    const preambleChanged = preamble?.inputs.has(changedFile);
+    if (origin?.preamble && !preambleChanged) return lastReport;
+    if (preambleChanged && !origin?.raced && !preamble.diskChanged(changedFile)) return lastReport;
     // A refresh queued ahead of this one may already have read these bytes
     // and invalidated them on canonical.
-    if (changedFile && inputReadCurrent(engine.includes, engine.resourceReads, changedFile)) return lastReport;
+    if (!preambleChanged && changedFile && inputReadCurrent(engine.includes, engine.resourceReads, changedFile)) return lastReport;
     const retired = retireSavedOverlay(activeProject, changedFile);
     const source = engine.getSource();
-    const nextBibliography = describeExternalBibliography(source, activeProject.docDir, activeProject.overlayDir);
+    const nextBibliography = describeExternalBibliography(source, activeProject.docDir, activeProject.overlayDir, activeProject.sourceDir);
     const previousBibliography = activeProject.bibliography;
     const bibliographyChanged = nextBibliography?.signature !== previousBibliography?.signature ||
       nextBibliography?.kind !== previousBibliography?.kind;
-    if (bibliographyChanged &&
-        (nextBibliography?.kind === 'biblatex' || previousBibliography?.kind === 'biblatex')) {
-      const resetEpoch = beginDocumentReset('project-bibliography-change');
+    if (preambleChanged || (bibliographyChanged &&
+        (nextBibliography?.kind === 'biblatex' || previousBibliography?.kind === 'biblatex'))) {
+      await engine.canonical.waitForBuildLease();
+      const resetEpoch = beginDocumentReset(preambleChanged ? 'project-preamble-change' : 'project-bibliography-change');
+      preambleInputsFor(activeProject).scan(source, true);
       await engine.setDocumentContext({
         docDir: activeProject.docDir,
+        sourceDir: activeProject.sourceDir,
         overlayDir: activeProject.overlayDir,
         force: true,
       });
       ensureProjectOutputDirectories(source);
       await materializeProjectBibliography(source, activeProject);
-      await engine.canonical.waitForBuildLease();
-      lastReport = await engine.open(source, activeProject.file, { projectSeeds: false });
+      lastReport = await engine.open(source, activeProject.file, { projectSeeds: false, firstPaper: true });
       completeDocumentReset(resetEpoch);
       broadcast({ kind: 'update', report: lastReport });
       return lastReport;
@@ -1472,7 +1502,22 @@ engine.onDeferredUpdate = (report) => {
 // fell back (tex64-internal #66: PDF_PAINT_INDEX_UNAVAILABLE).
 let anchorFocus = null;
 
+engine.canonical.onFailedInputs = (inputs, rev, startedAt) => {
+  if (rev === engine.srcRev || (pendingDocumentReset && rev === engine.srcRev + 1)) {
+    activeProject.preambleInputs?.acceptFailedInputs(inputs, startedAt);
+  }
+};
 engine.onCanonical = (info) => {
+  const paper = engine.canonical.last;
+  if (firstPaperDom && !info.error && paper?.id === info.id && paper.rev > firstPaperDom.srcRev) {
+    firstPaperDom = null;
+  }
+  if (info.error && (info.errorRev === engine.srcRev || (pendingDocumentReset && info.errorRev === engine.srcRev + 1))) {
+    activeProject.preambleInputs?.noteMissing(info.error);
+  }
+  if (!info.error && paper && paper.id === info.id && paper.rev === engine.srcRev) {
+    activeProject.preambleInputs?.acceptManifest(paper.inputManifest, paper.startedAt, paper.id);
+  }
   if (terminalAnchorLineage && info.id !== terminalAnchorLineage.baseGeneration) {
     terminalAnchorLineage = null;
   }
@@ -1484,9 +1529,18 @@ engine.onCanonical = (info) => {
 // Incremental authority (TDOM_SHIP=1): one complete replay PDF reached
 // normal document end. The client atomically swaps its visible pages and
 // lazily renders every offscreen page from that same immutable generation.
+engine.onShipRepaginated = (srcRev) => broadcast({ kind: 'ship-repaginated', srcRev });
 engine.onShipWave = (info) => {
   broadcast({ kind: 'ship-wave', ...info });
 };
+
+// The geometry reader needs image viewports and transforms but never pixels.
+// Keep generation selection and glyph paths identical to the displayed SVG.
+function paperSvgResponse(svg, url) {
+  return url.searchParams.get('geometry') === '1'
+    ? String(svg).replace(/((?:xlink:)?href=")data:image\/[a-z0-9.+-]+;base64,[^"]*"/gi, '$1"')
+    : svg;
+}
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -1495,6 +1549,7 @@ const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
+  '.cjs': 'application/javascript',
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.pdf': 'application/pdf',
@@ -1632,6 +1687,7 @@ function editPageFocus() {
 function docPayload() {
   return {
     documentEpoch,
+    documentStartSrcRev,
     boot: BOOT_ID,
     backend,
     mode: engine.mode,
@@ -1723,12 +1779,12 @@ function domPayload(report = lastReport, raw = engine.getDOM()) {
   for (const block of dom.blocks ?? []) {
     if (block.editRegions?.length) for (const file of filesOfRegions(block.editRegions)) sourceFiles.add(file);
   }
+  const rootFile = path.resolve(engine.docDir, engine.file);
   dom.sources = dom.sourceCurrent ? [...sourceFiles].flatMap(file => {
     // Root text is never expanded. Included files retain the exact original
     // text read during segmentation, including unsaved overlay contents.
-    const text = file === engine.file
-      ? engine.store.get(file)
-      : engine.includes?.get(file)?.text;
+    const absolute = path.resolve(engine.docDir, file);
+    const text = absolute === rootFile ? engine.getSource() : engine.includes?.get(absolute)?.text;
     return typeof text === 'string' ? [{ file, text }] : [];
   }) : [];
   const bbl = path.join(engine.workDir, 'driver.bbl');
@@ -2213,6 +2269,7 @@ const server = http.createServer(async (req, res) => {
       (url.pathname === '/app.js' ||
         url.pathname === '/reset-coordinator.js' ||
         url.pathname === '/opaque-editor-coordinator.js' ||
+        url.pathname === '/math-macro-projection.cjs' ||
         url.pathname === '/direct-edit-geometry.js' ||
         url.pathname === '/viewport-math.js' ||
         url.pathname === '/canonical-anchor-raster.js' ||
@@ -2242,6 +2299,7 @@ const server = http.createServer(async (req, res) => {
         busyMs: engineBusy > 0 ? Date.now() - engineBusySince : 0,
         mode: engine.mode,
         structuredBootError: engine.structuredBootError ?? null,
+        bibliographyError: activeProject.bibliographyError ?? null,
         previewPolicy: engine.previewPolicy,
         rev: engine.rev,
         srcRev: engine.srcRev,
@@ -2650,6 +2708,14 @@ const server = http.createServer(async (req, res) => {
       // edit. Snapshot them together after the queued mutation completes.
       domInterestUntil = Date.now() + 5_000;
       const wantRev = Number(url.searchParams.get('srcRev'));
+      if (url.searchParams.has('printedEpoch') && Number(url.searchParams.get('printedEpoch')) === documentEpoch) {
+        const printed = wantRev === firstPaperDom?.srcRev ? firstPaperDom :
+          domEarlier.findLast(parts => parts.epoch === documentEpoch && parts.srcRev === wantRev);
+        if (printed && wantRev !== engine.srcRev) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+          return res.end(printed.body);
+        }
+      }
       const baseRev = url.searchParams.has('base') ? Number(url.searchParams.get('base')) : NaN;
       const send = (parts) => {
         const body = domDeltaBody(parts, baseRev) ?? parts.body;
@@ -2789,14 +2855,15 @@ const server = http.createServer(async (req, res) => {
       const file = canonicalInputForProjectFile(body.file);
       const id = Number(body.id), page = Number(body.page);
       const boxes = file ? await engine.canonical.sourceEditBoxes({
-        file, id, page, startLine: Number(body.startLine), endLine: Number(body.endLine),
+        file, id, page, startLine: Number(body.startLine), endLine: Number(body.endLine), wholePage: body.wholePage === true,
       }) : null;
       if (documentEpoch !== epoch) return json(res, { boxes: [] }, 404);
       return json(res, { id, page, documentEpoch: epoch, boxes: boxes ?? [] }, boxes ? 200 : 404);
     }
     if (req.method === 'GET' && url.pathname === '/canonical/boxes') {
       const id = url.searchParams.get('c');
-      const pages = await engine.canonical.pageTextBoxes(id ? Number(id) : null);
+      const page = url.searchParams.get('page');
+      const pages = await engine.canonical.pageTextBoxes(id ? Number(id) : null, page === null ? null : Number(page));
       if (!pages) return json(res, { pages: [] }, 404);
       return json(res, { pages });
     }
@@ -2819,7 +2886,7 @@ const server = http.createServer(async (req, res) => {
         // another document after a restart.
         'Cache-Control': 'no-store',
       });
-      return res.end(svg);
+      return res.end(paperSvgResponse(svg, url));
     }
     if (req.method === 'POST' && url.pathname === '/outer') {
       const body = JSON.parse((await readBody(req)) || '{}');
@@ -2840,6 +2907,23 @@ const server = http.createServer(async (req, res) => {
       // the key names the Build paper by its bytes' time and size
       res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'private, max-age=86400' });
       return res.end(readFileSync(file));
+    }
+    if (req.method === 'GET' && url.pathname === '/ship-source-rows') {
+      const chain = engine.shipping, gen = Number(url.searchParams.get('g')), rev = Number(url.searchParams.get('r'));
+      const page = Number(url.searchParams.get('page'));
+      const current = () => chain && engine.shipping === chain && chain.gen === gen && engine.shipGenRev.get(gen) === rev;
+      if (!current() || !Number.isSafeInteger(page) || page < 1) return json(res, { rows: [] }, 404);
+      if (chain.editRowGen !== gen) {
+        chain.editRowGen = gen;
+        chain.editRowPages = new Map();
+      }
+      const pages = chain.editRowPages;
+      if (!pages.has(page)) {
+        pages.set(page, chain.editSourceRows(page).catch(() => null));
+        if (pages.size > 4) pages.delete(pages.keys().next().value);
+      }
+      const rows = await pages.get(page);
+      return current() && rows ? json(res, { rows }) : json(res, { rows: [] }, 404);
     }
     if (req.method === 'GET' && url.pathname === '/ship-glyphs') {
       const chain = engine.shipping;
@@ -2878,7 +2962,7 @@ const server = http.createServer(async (req, res) => {
         'Content-Type': 'image/svg+xml',
         'Cache-Control': 'no-store',
       });
-      return res.end(svg);
+      return res.end(paperSvgResponse(svg, url));
     }
     if (req.method === 'GET' && url.pathname === '/chunk-glyphs') {
       const key = url.searchParams.get('key');
@@ -2956,7 +3040,9 @@ const server = http.createServer(async (req, res) => {
     // preview converged to — never triggers a compile (the compare view's
     // left column auto-refreshes from here on every canonical SSE event)
     if (req.method === 'GET' && url.pathname === '/canonical.pdf') {
-      const body = engine.canonical.pdfBytes();
+      const epoch = url.searchParams.get('documentEpoch');
+      if (epoch !== null && Number(epoch) !== documentEpoch) return json(res, { error: 'stale document epoch' }, 409);
+      const body = engine.canonical.pdfBytes(url.searchParams.get('c'));
       if (!body) {
         res.writeHead(404, { 'Cache-Control': 'no-store' });
         return res.end('no canonical compile yet');
@@ -3107,12 +3193,19 @@ const server = http.createServer(async (req, res) => {
           // overlay of the bytes the engine already read is no input change
           // (measured: a second 4 s update behind a jump in the 316-page book).
           overlayDelta.changed = overlayDelta.changed.filter((file) => {
-            if (!includeHoldsText(engine.includes, file, activeProject.overlays.get(file))) return true;
+            const bytes = activeProject.overlays.get(file);
+            if (activeProject.preambleInputs?.holdsOverlay(file, bytes)) return false;
+            if (!includeHoldsText(engine.includes, file, bytes)) return true;
             rebindIncludeRead(engine.includes, file,
               path.join(activeProject.overlayDir, path.relative(activeProject.docDir, file)));
             return false;
           });
           const changedInputs = [...overlayDelta.changed, ...overlayDelta.removed];
+          const preambleInputs = preambleInputsFor(activeProject);
+          const preambleInputChanged = changedInputs.some(file => styleInput(file) || preambleInputs.inputs.has(file));
+          if (preambleInputChanged || (rootChanged && start < preambleInputs.bodyStart)) {
+            preambleInputs.scan(next, preambleInputChanged);
+          }
           if (!rootChanged && !changedInputs.length) {
             // Saving an overlay's bytes leaves every TeX input as it was: no
             // new source revision, anchor epoch or canonical input epoch.
@@ -3149,6 +3242,13 @@ const server = http.createServer(async (req, res) => {
               ? changedInputs.length === 0 && !anchorEdit.file
               : childInputMatches
           );
+          // Start locating the printed expression while TeX updates the
+          // block. This names an offset in the last accepted source; it
+          // contains no new pixels or speculative revision.
+          if (anchorInputSafe && sseClients.size && engine.canonical.generationCertificate()?.rev === engine.srcRev) {
+            broadcast({ kind: 'source-edit-location', srcRev: engine.srcRev,
+              file: anchorEdit.file ?? activeProject.filePath, offset: anchorEdit.start });
+          }
           if (!anchorInputSafe) anchorBaseSnapshot = null;
           if (anchorBaseSnapshot) {
             anchorProofPrefetch = prefetchCanonicalAnchorProof(
@@ -3160,7 +3260,8 @@ const server = http.createServer(async (req, res) => {
           const nextBibliography = describeExternalBibliography(
             next,
             activeProject.docDir,
-            activeProject.overlayDir
+            activeProject.overlayDir,
+            activeProject.sourceDir
           );
           const previousBibliography = activeProject.bibliography;
           const bibliographyInputChanged = changedInputs.some((file) => /\.(?:bib|bst|bbx|cbx)$/i.test(file));
@@ -3196,6 +3297,7 @@ const server = http.createServer(async (req, res) => {
             await engine.canonical.waitForBuildLease();
             await engine.setDocumentContext({
               docDir: activeProject.docDir,
+              sourceDir: activeProject.sourceDir,
               overlayDir: activeProject.overlayDir,
               force: true,
             });
@@ -3203,19 +3305,17 @@ const server = http.createServer(async (req, res) => {
             const report = await engine.open(next, activeProject.file, { projectSeeds: false });
             return report;
           }
-          const preambleInputChanged = changedInputs.some((file) =>
-            /\.(?:sty|cls|clo|cfg|def|ldf|lbx|bbx|cbx)$/i.test(file)
-          );
           if (preambleInputChanged) {
             resetEpoch = beginDocumentReset('edit-preamble-reboot');
             await engine.canonical.waitForBuildLease();
             await engine.setDocumentContext({
               docDir: activeProject.docDir,
+              sourceDir: activeProject.sourceDir,
               overlayDir: activeProject.overlayDir,
               force: true,
             });
             await materializeProjectBibliography(next, activeProject);
-            const report = await engine.open(next, activeProject.file, { projectSeeds: false });
+            const report = await engine.open(next, activeProject.file, { projectSeeds: false, firstPaper: true });
             return report;
           }
           let primaryReport;
@@ -3453,6 +3553,7 @@ const server = http.createServer(async (req, res) => {
       const docDir = projectRoot || path.dirname(filePath);
       const context = {
         docDir,
+        sourceDir: path.dirname(filePath),
         file: path.relative(docDir, filePath) || path.basename(filePath) || 'main.tex',
         filePath,
         overlayDir: PROJECT_OVERLAY_DIR,
@@ -3481,12 +3582,20 @@ const server = http.createServer(async (req, res) => {
           applyProjectOverlays(context, body, true);
           await engine.setDocumentContext({
             docDir: context.docDir,
+            sourceDir: context.sourceDir,
             overlayDir: context.overlayDir,
             force: true,
           });
           // another document's Build paper is not this one's; the host names it again
-          if (context.filePath !== activeProject.filePath) setOuterPaper(null);
+          if (context.filePath !== activeProject.filePath || context.docDir !== activeProject.docDir) {
+            setOuterPaper(null);
+            closeBibliographyWatchers();
+            rmSync(path.join(engine.workDir, 'driver.bbl'), { force: true });
+            rmSync(path.join(engine.canonical.workDir, 'canon.bbl'), { force: true });
+          }
+          activeProject.preambleInputs?.close();
           activeProject = context;
+          preambleInputsFor(context).scan(text);
           ensureProjectOutputDirectories(text);
           await materializeProjectBibliography(text, activeProject);
           let preparedImport = null;
@@ -3532,7 +3641,7 @@ const server = http.createServer(async (req, res) => {
           }
           let openCompleted = false;
           try {
-            lastReport = await engine.open(text, context.file, { canonicalBaseline: !preparedImport });
+            lastReport = await engine.open(text, context.file, { canonicalBaseline: !preparedImport, firstPaper: true });
             openCompleted = true;
             if (preparedImport) {
               if (engine.srcRev !== expectedSrcRev || engine.getSource() !== text ||
@@ -3564,6 +3673,7 @@ const server = http.createServer(async (req, res) => {
           // then capture one complete, already-adoptable response before the
           // next queued open can reset it again.
           completeDocumentReset(resetEpoch);
+          documentStartSrcRev = engine.srcRev;
           return JSON.stringify({ ...docPayload(), canonicalBuild: importStatus });
         }));
       } catch (error) {
@@ -3605,6 +3715,7 @@ async function shutdown(signal) {
   watchdog.unref?.();
   try {
     closeBibliographyWatchers();
+    activeProject.preambleInputs?.close();
     if (engine.close) await engine.close();
   } catch (err) {
     console.error('[tdom] shutdown error:', err);
