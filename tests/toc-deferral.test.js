@@ -11,6 +11,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
+import { asyncRepaginate } from '../engine/checkpoint/async-repaginate.js';
+import { scheduleBackground } from '../engine/checkpoint/background-scheduler.js';
+import { computeToc } from '../engine/checkpoint/page-metadata.js';
 import { drain, signature } from '../tools/harness.mjs';
 
 const texReady = spawnSync('lualatex', ['--version']).status === 0;
@@ -20,6 +23,56 @@ const paragraph = (n) => `Paragraph ${n} of the section, long enough to fill a f
 const section = (s) => [`\\section{Section ${s}}`, ...Array.from({ length: 6 }, (_, i) => paragraph(`${s}.${i + 1}`))].join('\n\n');
 const SOURCE = ['\\documentclass{article}', '\\begin{document}', '\\tableofcontents', '\\clearpage',
   ...Array.from({ length: 6 }, (_, i) => section(i + 1)), '\\end{document}', ''].join('\n\n');
+
+test('empty contents files need no page metadata', () => {
+  const pages = [{ get number() { assert.fail('contents without entries cannot read page metadata'); } }];
+  assert.deepEqual(computeToc(pages, [{ id: 'text', galley: { toclines: [] } }], 'plain').contents,
+    { toc: '\n', lof: '\n', lot: '\n' });
+});
+
+for (const completed of [false, true]) {
+  test(`a reflow during grid materialization leaves the new contents page number owed (grid ${completed ? 'completed' : 'yielded'})`, async () => {
+    const blocks = [{ id: 'toc', consumesToc: true }, {
+      id: 'heading', galley: { toclines: [{ e: 'toc', l: 'section', t: 'Heading' }] },
+    }];
+    const pageWithHeading = { number: 1, folio: 1, tls: [{ bid: 'heading', i: 0 }] };
+    const oldPages = [pageWithHeading];
+    const newPages = [{ number: 1, folio: 1 }, { ...pageWithHeading, number: 2, folio: 2 }];
+    const contents = pages => computeToc(pages, blocks, 'plain');
+    const engine = {
+      blocks, mode: 'structured', pages: oldPages, pendingChain: { kind: 'grid' },
+      tocHash: contents(oldPages).hash, tocOwed: false, renderHold: new Map(), furnitureSig: () => '',
+    };
+    const visited = [];
+    scheduleBackground(engine, [], {
+      locked: run => run(),
+      runChainPass() {
+        const kind = engine.pendingChain.kind;
+        visited.push(kind);
+        if (kind === 'grid') {
+          asyncRepaginate(engine, {
+            paginateNow: () => newPages, computeToc: contents,
+            displayList: page => ({ page: page.number, commands: [] }),
+            scheduleBackground: () => assert.fail('the grid already owns the scheduler'),
+          });
+          assert.equal(engine.pendingChain.kind, 'grid');
+        } else {
+          engine.tocHash = contents(engine.pages).hash;
+          engine.tocOwed = false;
+        }
+        if (kind !== 'grid' || completed) engine.pendingChain = null;
+      },
+      enforceCheckpointCap() {},
+      queueOwedToc() { engine.pendingChain = { kind: 'settle' }; },
+      queueGrid: () => false,
+    });
+    const gridTask = engine.bgTask;
+    await gridTask;
+    if (engine.bgTask !== gridTask) await engine.bgTask;
+    assert.deepEqual(visited, ['grid', 'settle']);
+    assert.equal(engine.tocHash, contents(newPages).hash);
+  });
+}
 
 test('an edit that moves headings to other pages leaves the table of contents to the settle pass, and ends as a fresh engine does',
   { skip: !texReady && 'lualatex not installed' }, async () => {

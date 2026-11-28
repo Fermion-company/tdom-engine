@@ -96,7 +96,28 @@ const FANCY_EVENT_SHIMS = ['head', 'foot', 'hf'].map((kind) => {
     `\\renewcommand\\${name}[2][]{\\TDOM@${name}[#1]{#2}` +
     `\\directlua{tdom_event('fancy','${kind}','\\luaescapestring{\\detokenize{[#1]{#2}}}')}}\\fi`;
 });
-const PAGE_STYLE_EVENT_SHIMS = [...PAGE_STYLE_EVENT_SHIMS_BASE, ...FANCY_EVENT_SHIMS];
+// A body \floatpagestyle (floatpag: the style of the float pages after it)
+// is replayed by the runs job like \fancyhead: the job starts from the
+// preamble's (audit/scratch r9 float-fixture/body.tex, docs/10 §10.7a F5).
+const FLOAT_PAGE_STYLE_SHIM = '\\ifdefined\\floatpagestyle\\let\\TDOM@floatpagestyle\\floatpagestyle' +
+  "\\def\\floatpagestyle#1{\\TDOM@floatpagestyle{#1}\\directlua{tdom_event('fpstyle','\\luaescapestring{#1}','')}}\\fi";
+// The register alias lets the real number scanner report reads without
+// replacing the numeric value it consumes. The original counter commands
+// still execute the assignments and evaluate their operands once.
+const PAGE_COUNTER_SHIM = '\\newif\\ifTDOM@outpage' +
+  '\\let\\TDOM@outputpage\\@outputpage\\def\\@outputpage{\\global\\TDOM@outpagetrue\\TDOM@outputpage\\global\\TDOM@outpagefalse}' +
+  '\\let\\TDOM@realpage\\c@page\\def\\c@page{\\directlua{tdom_page_read()}\\TDOM@realpage}' +
+  '\\AddToHook{cmd/pageref/before}{\\directlua{tdom_page_read()}}' +
+  '\\def\\TDOM@pagename{page}\\def\\TDOM@pagectr#1{\\ifTDOM@outpage\\else\\edef\\TDOM@ctr{#1}\\ifx\\TDOM@ctr\\TDOM@pagename' +
+  '\\directlua{tdom_pagectr_begin(\\number\\TDOM@realpage,2)}\\fi\\fi}' +
+  "\\def\\TDOM@ctrresult#1#2#3{\\ifTDOM@outpage\\else\\edef\\TDOM@ctr{#1}\\ifx\\TDOM@ctr\\TDOM@pagename" +
+  "\\directlua{tdom_pagectr('#2',\\number\\TDOM@realpage,'\\luaescapestring{\\detokenize{#3}}')}\\fi\\fi}" +
+  '\\let\\TDOM@setcounter\\setcounter\\def\\setcounter#1#2{\\TDOM@pagectr{#1}\\TDOM@setcounter{#1}{#2}\\TDOM@ctrresult{#1}{set}{#2}}' +
+  '\\let\\TDOM@addtocounter\\addtocounter\\def\\addtocounter#1#2{\\TDOM@pagectr{#1}\\TDOM@addtocounter{#1}{#2}\\TDOM@ctrresult{#1}{add}{#2}}' +
+  "\\def\\pagenumbering#1{\\directlua{tdom_pagectr_begin(\\number\\TDOM@realpage)}" +
+  "\\TDOMpagenumbering{#1}\\directlua{tdom_pagenum('\\luaescapestring{#1}')}}";
+const PAGE_STYLE_EVENT_SHIMS = [...PAGE_STYLE_EVENT_SHIMS_BASE, ...FANCY_EVENT_SHIMS, FLOAT_PAGE_STYLE_SHIM];
+
 // \markboth/\markright report their marks as page-style events too
 const MARK_EVENT_SHIMS = [
   '\\let\\TDOMmarkboth\\markboth',
@@ -222,13 +243,16 @@ export function buildDriverSource({
   // exact header/footer state from these (the boxes themselves are later
   // typeset by TeX in a header job — nothing is invented)
   L.push(...PAGE_STYLE_EVENT_SHIMS, ...MARK_EVENT_SHIMS);
+  // Opening jobs use the original TeX counters. A witnessed continuation
+  // installs the probes in its own state only after opening has settled.
+  L.push(`\\def\\TDOMinstallPageCounterProbes{${PAGE_COUNTER_SHIM.replaceAll('#', '##')}}`);
   // \cleardoublepage decides on a blank verso via \ifodd\c@page — but the
   // dormant run never ships pages, so \c@page is meaningless here. Emit a
   // marker instead: the page builder OWNS folios and inserts the blank
   // (with \thispagestyle{empty}, as the classes do) exactly when the
   // assigned folio demands it.
   L.push(
-    "\\renewcommand\\cleardoublepage{\\clearpage\\directlua{tdom_event('cleardouble','odd','')}}"
+    "\\renewcommand\\cleardoublepage{\\clearpage\\directlua{tdom_clear_to('odd',\\if@twoside true\\else false\\fi)}}"
   );
   // jsclasses (ltjsbook & co) have a whole clear-to-parity family that
   // \frontmatter/\mainmatter/\chapter use directly — shim each with its
@@ -241,7 +265,7 @@ export function buildDriverSource({
     ['pltx@cleartoleftpage', 'even'],
   ]) {
     L.push(
-      `\\ifdefined\\${name}\\def\\${name}{\\clearpage\\directlua{tdom_event('cleardouble','${parity}','')}}\\fi`
+      `\\ifdefined\\${name}\\def\\${name}{\\clearpage\\directlua{tdom_clear_to('${parity}',\\if@twoside true\\else false\\fi)}}\\fi`
     );
   }
   // \cite: record dependencies on bibliography keys

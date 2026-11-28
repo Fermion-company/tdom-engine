@@ -51,6 +51,10 @@ const UNSAFE_PACKAGES = [
 // (tex64-internal #64).
 const LANDSCAPE_PACKAGES = ['pdflscape', 'lscape'];
 const LANDSCAPE_BODY_RE = /\\begin\s*\{\s*landscape\s*\}/;
+const TATE_CLASS_RE = /\\(?:documentclass|LoadClass)\s*(?:\[[^\]]*\]\s*)?\{\s*ltjt(?:article|book|report)\s*\}/;
+const JLREQ_TATE_RE = /\\(?:documentclass|LoadClass)\s*\[\s*(?:[^\]]*,\s*)?tate\s*(?:,[^\]]*)?\]\s*\{\s*jlreq\s*\}/;
+const TATE_BODY_RE = /\\(?:tate|dtou|utod)(?![a-zA-Z@])|(?:\\(?:parbox|minipage)(?![a-zA-Z@])|\\begin\s*\{\s*minipage\s*\})\s*(?:\[[^\]]*\]\s*)?<\s*[tdu]\s*>/;
+export const TATE_PREVIEW_REASON = 'vertical writing';
 // Frames reset \vsize and run the real output routine, including overlays
 // and frame-local furniture. Only complete TeX page output retains these
 // slide boundaries and their cross-frame state.
@@ -163,6 +167,10 @@ function safetySource(text) {
   return out.join('\n');
 }
 
+export function usesVerticalWriting(text) {
+  return TATE_BODY_RE.test(text) && TATE_BODY_RE.test(safetySource(text));
+}
+
 /**
  * Preamble half of the gate: unsafe packages + page-production takeovers.
  * Memoizable by preamble hash — the preamble does not change while the
@@ -199,7 +207,9 @@ export function classifyPreamble(preamble) {
   // canonical-addressed, fail-closed text overlays on top of it.
   const canonicalAnchor = /\\(?:documentclass|LoadClass)\s*\[[^\]]*\btwocolumn\b[^\]]*\]/.test(pre);
   const beamer = BEAMER_CLASS_RE.test(actions);
-  const exactReasons = [...(landscapePages ? ['landscape pages'] : []), ...(beamer ? ['beamer frame output routine'] : [])];
+  const tate = TATE_CLASS_RE.test(actions) || JLREQ_TATE_RE.test(actions) || TATE_BODY_RE.test(actions);
+  const exactReasons = [...(landscapePages ? ['landscape pages'] : []), ...(beamer ? ['beamer frame output routine'] : []),
+    ...(tate ? [TATE_PREVIEW_REASON] : [])];
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
@@ -257,7 +267,8 @@ export function classifyDocument(preamble, body) {
   const bodyColumnSwitch = BODY_COLUMN_SWITCH_RE.test(bod);
   const shippingExact = aliases.requiresShippingExact;
   const landscapePages = pre.previewReasons.includes('landscape pages') || LANDSCAPE_BODY_RE.test(bod);
-  const exactPages = pre.previewPolicy === 'shipping-exact' || landscapePages;
+  const tate = TATE_BODY_RE.test(bod);
+  const exactPages = pre.previewPolicy === 'shipping-exact' || landscapePages || tate;
   return {
     safe: reasons.length === 0,
     reasons: [...new Set(reasons)],
@@ -270,6 +281,7 @@ export function classifyDocument(preamble, body) {
       ? [...new Set([
           ...pre.previewReasons,
           ...(landscapePages ? ['landscape pages'] : []),
+          ...(tate ? [TATE_PREVIEW_REASON] : []),
           ...aliases.shippingExactUses.flatMap((use) =>
             use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)),
         ])]
@@ -280,7 +292,8 @@ export function classifyDocument(preamble, body) {
 }
 
 const LIGATURES = { '\uFB00': 'ff', '\uFB01': 'fi', '\uFB02': 'fl', '\uFB03': 'ffi', '\uFB04': 'ffl', '\uFB05': 'ft', '\uFB06': 'st' };
-const ALNUM_PAIR = /^[\p{L}\p{N}]{2}$/u;
+const ALNUM = /^[\p{L}\p{N}]$/u;
+const CJK = /[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Hangul}\p{Script_Extensions=Bopomofo}]/u;
 
 /**
  * Tokens for the exactness verification: character bigrams within each
@@ -292,16 +305,33 @@ const ALNUM_PAIR = /^[\p{L}\p{N}]{2}$/u;
  * representations, for latin and CJK alike.
  */
 export function verifyTokens(text) {
-  let s = String(text ?? '').replace(/[\uFB00-\uFB06]/g, (c) => LIGATURES[c] ?? c);
-  s = s.toLowerCase();
   const out = [];
-  for (const seg of s.split(/\s+/)) {
-    for (let i = 0; i + 1 < seg.length; i++) {
-      const bg = seg.slice(i, i + 2);
-      if (ALNUM_PAIR.test(bg)) out.push(bg);
-    }
-  }
+  appendVerifyTokens(text, out);
   return out;
+}
+
+function appendVerifyTokens(text, out, prev = '', joinCjk = false) {
+  const normalized = String(text ?? '').replace(/[\uFB00-\uFB06]/g, c => LIGATURES[c] ?? c).toLowerCase();
+  for (const char of normalized) {
+    if (!ALNUM.test(char)) {
+      prev = '';
+      joinCjk = false;
+      continue;
+    }
+    if (prev && (!joinCjk || (CJK.test(prev) && CJK.test(char)))) out.push(prev + char);
+    prev = char;
+    joinCjk = false;
+  }
+  return prev;
+}
+
+export function appendVerificationLine(runs, out) {
+  let prev = '';
+  for (const run of runs) {
+    // LuaTeX-ja emits Japanese as one run per glyph. Keep continuity on
+    // this line, while leaving the existing Latin run boundaries intact.
+    prev = run.t ? appendVerifyTokens(run.t, out, prev, true) : '';
+  }
 }
 
 /**

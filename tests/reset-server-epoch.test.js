@@ -213,5 +213,7 @@ Missing citation \cite{does-not-exist}.
   );
   const failedStatus = await fetch(`${base}/status`).then((response) => response.json());
   assert.equal(failedStatus.documentEpoch, 4);
-  assert.equal(failedStatus.busy, false);
+  assert.equal(failedStatus.queued, 0, 'the failed reset leaves the mutation queue');
+  assert.equal(failedStatus.busy, failedStatus.furniture.pending,
+    'only furniture for the retained preview can keep the status busy');
 });

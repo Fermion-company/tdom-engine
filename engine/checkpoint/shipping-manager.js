@@ -392,7 +392,7 @@ export function makeShippingChain(engine, queueShipBoot) {
       currentJob: engine.currentJob,
       activeResidentRenders: engine.activeResidentRenderCheckpoints,
     }).shippingLimit,
-    waveCutoffMs: () => usefulShippingCutoffMs(engine.canonical?.info?.().ms),
+    waveCutoffMs: () => usefulShippingCutoffMs(engine.canonical?.typesetEstimateMs?.() ?? engine.canonical?.info?.().ms),
     pageGeometry: () => !uniformCanonicalGeometry(engine.canonical?.info?.()),
   });
   chain.onWave = (wave) => {

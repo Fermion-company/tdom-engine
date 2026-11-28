@@ -4,6 +4,7 @@ import vm from 'node:vm';
 const app = readFileSync(new URL('../../web/app.js', import.meta.url), 'utf8');
 const span = (start, end) => app.slice(app.indexOf(start), app.indexOf(end, app.indexOf(start) + start.length));
 const transactions = [
+  span('function pageSetEnd', 'let composing'),
   span('function currentCanonicalPageCount', 'function srcOf'),
   span('function stageProvisionalPatches', 'function directPresentationBlocked'),
   span('function tryCommitProvisionalStages', 'let lastCanonicalDisplayDemand'),
@@ -11,7 +12,7 @@ const transactions = [
   span('function reconcilePageCount', 'function moveDirectEditorToPage'),
   span('function tryCommitOpaqueCanonicalBatch', 'function cancelShipWaveBatch'),
   span('function usesCanonicalSurface', 'function createCanonicalImage'),
-  span('const presentationPending = (required)', 'let embedSnapshotRaf'),
+  span('const presentationPending = (required', 'let embedSnapshotRaf'),
   'this.presentationPending = presentationPending;',
 ].join('\n');
 
@@ -26,12 +27,15 @@ export function provisionalViewer(pages, canonicalCount = pages.length) {
     provisionalDisplayLists: new Map(pages.map(dl => [dl.page, dl])),
     provisionalPendingLayout: new Set(pages.filter(dl => dl.commands.some(c => c.op === 'pending-exact' && c.wholePage)).map(dl => dl.page)),
     committedPageSrcs: new Map(), pageDivs: new Map(), pageDirtyRev: new Map(), pageEditGroup: new Map(),
-    editGroupSeq: 0, lastRemoveRev: 0, directEditClickEpoch: 0, opaqueBatchCommitDepth: 0,
+    editGroupSeq: 0, lastRemoveRev: 0, directEditClickEpoch: 0, opaqueBatchCommitDepth: 0, pageListRev: new Map(), pageTopologyRev: 0, pageTopologyCount: 0,
     opaqueCanonicalBatches: new Map(), shipPages: new Map(), canonicalStageObserver: null,
     documentReset: { pending: false, adoptedEpoch: 1 }, committedCanonicalGeneration: null,
     directEditor: null, residentPageCountAuthoritative: false, liveSearch: { query: '' },
+    openingPreview: false,
+    openingEdited: false,
     deferredDirectPresentationEvents: [], canonicalAnchorPreview: null, canonicalAnchorPendingPatch: null,
     directPresentationBlocked: () => false, ensureOpaqueBatchEditorTargetPage: () => true,
+    outerSheetDecoded: () => true, // (no outer paper here)
     captureDirectEditorPageScroll() {}, applyStagedDirectEditor() {}, scheduleViewportWarm() {},
     scheduleChunkPrefetch() {}, // (pictures are not fetched here)
     patchProvisionalSvg: () => false, spliceSvgChildren() {}, // (these shells hold no SVG: a page is put in whole)
@@ -45,7 +49,17 @@ export function provisionalViewer(pages, canonicalCount = pages.length) {
     ensureShell(n) {
       if (!state.pageDivs.has(n)) state.pageDivs.set(n, {
         dataset: { page: String(n) }, isConnected: true, paper: null,
-        classList: { contains: name => name === 'is-final' && state.pageDivs.get(n).dataset.prov !== '1', remove() {} },
+        // ('is-final' as before: a page shows canonical paper until it has provisional ink; any
+        // other class the viewer sets, awaiting-canonical among them, is kept as set)
+        classList: (() => {
+          const set = new Set();
+          return {
+            contains: name => name === 'is-final' ? state.pageDivs.get(n).dataset.prov !== '1' : set.has(name),
+            add: (...names) => names.forEach(name => set.add(name)),
+            remove: (...names) => names.forEach(name => set.delete(name)),
+            toggle: (name, on = !set.has(name)) => { if (on) set.add(name); else set.delete(name); return on; },
+          };
+        })(),
         querySelector(selector) {
           if (selector === 'img.canon') return { complete: true, naturalWidth: 600,
             dataset: { src: this.dataset.canonPresentedSrc } };
@@ -90,14 +104,41 @@ export function provisionalViewer(pages, canonicalCount = pages.length) {
   return state;
 }
 
+// The viewer's own event handler and report transaction on top of the same
+// transactions: what an update and the patches around it leave staged.
+const events = [
+  span('function applyReport', 'function clearCanonicalAnchorPreview'),
+  span('function receivePreviewEvent', '// collapsible inspector'),
+].join('\n');
+function withEvents(state) {
+  Object.assign(state, {
+    appliedRev: 2, appliedReportRev: 2, openingDirectInput: null, embeddedHost: true, canonical: null,
+    // The viewer unrefs these recovery handles. Tests can still replace them
+    // with a fake clock or with the native timers as the audit fixtures do.
+    setTimeout, clearTimeout,
+    previewReasons: [], modeReasons: [], document: { body: { classList: { toggle() {} } } },
+    injectFonts() {}, setMode() {}, closeDirectEditor() {}, prepareOpaqueShell() {}, ensurePresentedDomSnapshot() {},
+    adoptPushedSnapshot() {}, renderInspector() {}, clearCanonicalAnchorPreview() {},
+  });
+  vm.runInContext(events, state);
+  state.teardown = state.teardownDocRecovery;
+  return state;
+}
+export function eventViewer(pages) {
+  return withEvents(provisionalViewer(pages));
+}
+
 // The embed Jump code runs against the same presentation shells as the
 // transaction harness. Only browser layout, network and time are supplied.
-export function jumpViewer({ fetch, pages = 2 } = {}) {
+// (`events`: with the viewer's event handler too, as eventViewer)
+export function jumpViewer({ fetch, pages = 2, events = false } = {}) {
   const state = provisionalViewer(Array.from({ length: pages }, (_, n) => pageList(n + 1)));
+  if (events) withEvents(state);
   const listeners = new Map(), timers = new Map();
   let timerId = 0;
   Object.assign(state, {
-    fetch, CSS: { escape: String }, embedViewportToken: null, dismissSyncMarker() {},
+    fetch, CSS: { escape: String }, embedViewportToken: null, embedViewportSheet: null, embedViewportPointY: null,
+    dismissSyncMarker() {},
     // (no outer paper: the whole document is live, as in a document under the page limit)
     outerPaper: null,
     sameSourceFile: (a, b) => a === b, scheduleEmbedSnapshot() {},
@@ -109,6 +150,7 @@ export function jumpViewer({ fetch, pages = 2 } = {}) {
     setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
     clearTimeout(id) { timers.delete(id); },
     document: {
+      body: { classList: { toggle() {} } },
       addEventListener() {},
       querySelectorAll: () => [...state.pageDivs.values()].flatMap(page => page.markers),
       createElement: () => ({ dataset: {}, style: {}, remove() { this.parent.markers = this.parent.markers.filter(m => m !== this); } }),

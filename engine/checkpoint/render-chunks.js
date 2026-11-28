@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { cropSvg, pdfPageSvgArgs } from './util/svg.js';
 import { learnOutlines } from './exact-synth.js';
+import { farInkOf, readQueries } from './page-art.js';
 
 const execFileP = promisify(execFile);
 
@@ -99,7 +100,15 @@ export async function cropRenderTargets({ jobdir, pdf, targets, chunks, forGalle
     const svgPath = path.join(jobdir, `${prefix}-${tgt.page}.svg`);
     await execFileP('pdftocairo', pdfPageSvgArgs(tgt.page, pdf, svgPath), { timeout: 30_000 });
     const width = tgt.w + 2 * padding;
-    const cropped = cropSvg(readFileSync(svgPath, 'utf8'), width, tgt.h);
+    const raw = readFileSync(svgPath, 'utf8');
+    // The block's galley (page 1): ink far outside its tight page, or a
+    // position on the page read by its pictures (in this RENDER, or in the
+    // JOB whose nodes a CAPTURE shipped: the galley's `posq`), is art drawn
+    // against `current page`, which here is that tight page (page-art.js)
+    const queried = tgt.page === 1 ? readQueries(jobdir) : [];
+    if (tgt.page === 1 && !queried.length && anchor?.galley?.posq) queried.push('(job)');
+    const farInk = tgt.page === 1 ? farInkOf(raw, width, tgt.h, queried) : null;
+    const cropped = cropSvg(raw, width, tgt.h);
     const { svg, anchored } = anchor && anchor.key === tgt.key
       ? anchorGlyphs(cropped, anchor.galley, padding) : { svg: cropped, anchored: false };
     if (anchored && outlines) learnOutlines(svg, anchor.galley, outlines);
@@ -116,6 +125,7 @@ export async function cropRenderTargets({ jobdir, pdf, targets, chunks, forGalle
       forGalley,
       editPdf: editPdf ??= readFileSync(pdf),
       editPage: tgt.page,
+      ...(farInk ? { farInk } : {}),
     });
   }
 }

@@ -1,9 +1,12 @@
 import { rejectWaiter } from './waiters.js';
 import { clearShipPacing } from './ship-pacing.js';
 import { wakeRescues } from './rescue-scheduling.js';
+import { releaseFurniture } from './canonical-arrival.js';
+import { wakeFurnitureUpdates } from './header-scheduler.js';
 
 export async function closeEngine(engine) {
   engine.closed = true;
+  wakeFurnitureUpdates(engine);
   wakeRescues(engine);
   engine.bgAbort = true;
   // cancel every outstanding protocol wait (galley/ckpt/render/__hf …):
@@ -16,6 +19,8 @@ export async function closeEngine(engine) {
     rejectWaiter(engine.waiters, key, err);
   }
   engine.canonical.dispose();
+  // (the document's exact-band bindings, cut queue and retry wake)
+  releaseFurniture(engine);
   clearTimeout(engine.shipBootTimer);
   clearShipPacing(engine);
   if (engine.shipping) await engine.shipping.close().catch(() => {});
@@ -34,6 +39,11 @@ export async function closeEngine(engine) {
     if (peer.pid) {
       try { process.kill(peer.pid, 'SIGKILL'); } catch { /* already gone */ }
     }
+    // The connection is ours to end as well: one whose far side vanished
+    // without a FIN (seen once after infra-escalation's wedged lineage, an
+    // ESTABLISHED loopback socket with no remote end) otherwise keeps the
+    // host process alive after close.
+    try { peer.sock?.end(); peer.sock?.destroy(); } catch { /* already closed */ }
   }
   for (const pid of engine.dyingPids ?? []) {
     try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
@@ -52,4 +62,9 @@ export async function closeEngine(engine) {
   engine.checkpoints.clear();
   engine.peers.clear();
   engine.isoPageCache = null;
+  // (the header job unwinds now: its waits end on `closed`; close returns
+  // once its preview claim is released, at most 1 s)
+  if (engine.hfTask) {
+    await Promise.race([Promise.resolve(engine.hfTask).catch(() => {}), new Promise((resolve) => setTimeout(resolve, 1000).unref?.())]);
+  }
 }

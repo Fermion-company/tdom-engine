@@ -3,7 +3,7 @@ import { stripComments } from './safety.js';
 
 // This only chooses a replay frontier; every source token still executes.
 // Trailing spacing/flush commands are poor anchors for editing visible ink.
-function tailCheckpoint(blocks, limit) {
+function tailCheckpoints(blocks, limit) {
   const textAt = index => typeof blocks[index]?.text === 'string'
     ? stripComments(blocks[index].text).trim() : null;
   const spacing = /^(?:\s*\\(?:par|smallskip|medskip|bigskip|newpage|clearpage)\s*)*$/;
@@ -13,9 +13,16 @@ function tailCheckpoint(blocks, limit) {
   // nearby explicit page boundary is available within the coverage interval.
   const lookback = Math.max(4, Math.ceil(blocks.length / Math.max(1, limit - 1)));
   for (let index = tail - 1; index >= Math.max(0, tail - lookback); index--) {
-    if (/\\(?:newpage|clearpage)\s*$/.test(textAt(index) ?? '')) return index + 1;
+    const text = textAt(index) ?? '';
+    if (/\\(?:newpage|clearpage)\s*$/.test(text)) return [index + 1];
+    // A leading column switch flushes the previous page and sets the
+    // layout used by the following blocks. Keep its output boundary
+    // independently of JOB timings so edits on that page can start there.
+    if (/^\\(?:one|two)column\b/.test(text)) {
+      return limit > 2 && index + 1 < tail ? [index + 1, tail] : [tail];
+    }
   }
-  return tail;
+  return [tail];
 }
 
 /**
@@ -64,11 +71,9 @@ export function checkpointGrid(blockCount, maxCheckpoints) {
 }
 
 /**
- * Pick the resident boundaries by measured replay cost, not source-block
- * count. Equal spacing makes an edit after one giant TikZ/user-macro block
- * replay that block on every keystroke even when all surrounding prose is
- * cheap. Keeping both sides of the most expensive blocks bounds that replay
- * without teaching the engine names such as tikzpicture or tcolorbox.
+ * Space ordinary boundaries by source-block count. Give genuinely expensive
+ * blocks a measured weight and keep both sides when the budget allows, so
+ * editing after a large picture or user macro can skip replaying it.
  */
 export function checkpointKeepSet(blocks, maxCheckpoints) {
   const count = blocks.length;
@@ -79,20 +84,19 @@ export function checkpointKeepSet(blocks, maxCheckpoints) {
   const measured = blocks.map(block => Number(block.typesetCostMs))
     .filter(value => Number.isFinite(value) && value > 0).sort((a, b) => a - b);
   const median = measured[Math.floor(measured.length / 2)] ?? 1;
-  const cost = blocks.map((block) => Math.max(0.1, Number(block.typesetCostMs) || median));
-  const total = cost.reduce((sum, value) => sum + value, 0);
-  // The replay a caret (or a cold keystroke) pays is the cost of the blocks
-  // between its nearest kept boundary and itself. Cut the document into
-  // segments of equal replay cost, and bracket a block that is expensive on
-  // its own (a TikZ picture, a heavy user macro) with its input and output
-  // boundary so neither editing it nor editing the prose after it replays
-  // it. This is measured cost, not names such as tikzpicture or tcolorbox.
-  const target = total / (limit - 1);
-  const hotThreshold = Math.max(median * 8, target / 2);
+  const samples = blocks.map((block) => Math.max(0.1, Number(block.typesetCostMs) || median));
+  const total = samples.reduce((sum, value) => sum + value, 0);
+  const hotThreshold = Math.max(median * 8, total / (2 * (limit - 1)));
+  // A few ms of JOB overhead should not move coverage across ordinary
+  // paragraphs. Give those blocks equal weight, even while boot is still
+  // collecting samples. Use measured weights for genuinely expensive jobs
+  // and keep their input and output so later edits can skip the replay.
+  const cost = samples.map(value => value >= hotThreshold ? value / median : 1);
+  const target = cost.reduce((sum, value) => sum + value, 0) / (limit - 1);
   const keep = new Set([0]);
   let acc = 0;
   for (let i = 0; i < count; i++) {
-    if (cost[i] >= hotThreshold) {
+    if (cost[i] > 1) {
       if (i > 0) keep.add(i);
       keep.add(Math.min(count, i + 1));
       acc = 0;
@@ -106,8 +110,8 @@ export function checkpointKeepSet(blocks, maxCheckpoints) {
   }
   // The tail slot goes before the final visible material and its nearby
   // page context, not after it at a terminal page flush.
-  const tail = count > 1 ? tailCheckpoint(blocks, limit) : count;
-  keep.add(tail);
+  const tail = count > 1 ? tailCheckpoints(blocks, limit) : [count];
+  for (const boundary of tail) keep.add(boundary);
 
   const segmentCost = (from, to) => {
     let sum = 0;
@@ -115,15 +119,15 @@ export function checkpointKeepSet(blocks, maxCheckpoints) {
     return sum;
   };
   // Over budget: merge the two cheapest adjacent segments by dropping the
-  // boundary between them (root and tail stay). Ties drop the later one, so
-  // an expensive block keeps its input boundary longest.
+  // boundary between them (root and tail coverage stay). Ties drop the later
+  // one, so an expensive block keeps its input boundary longest.
   while (keep.size > limit) {
     const sorted = [...keep].sort((a, b) => a - b);
     let victim = null;
     let victimCost = Infinity;
     for (let k = 1; k < sorted.length; k++) {
       const boundary = sorted[k];
-      if (boundary === tail) continue;
+      if (tail.includes(boundary)) continue;
       const before = sorted[k - 1];
       const after = k + 1 < sorted.length ? sorted[k + 1] : count;
       const merged = segmentCost(before, after);

@@ -100,6 +100,8 @@ export function enforceCheckpointCap({
   activeHold = [],
   maxPeers = Infinity,
   dyingPids,
+  // boundary -> who retired it (engine-v3 #restoreInput reports it)
+  retired = null,
 }) {
   const protectedIndices = new Set([...editHold, ...renderHold.keys(), ...activeHold]);
   const available = availableKeepSet(
@@ -119,11 +121,13 @@ export function enforceCheckpointCap({
     retiredPeers.add(peer);
   }
   for (const [idx, peer] of [...checkpoints]) {
-    if (retiredPeers.has(peer)) checkpoints.delete(idx);
+    if (!retiredPeers.has(peer)) continue;
+    retired?.set(idx, { why: 'cap', pid: peer.pid, at: Date.now() });
+    checkpoints.delete(idx);
   }
 }
 
-export function retireOffGrid({ idx, keep, checkpoints, editHold, renderHold, block, dyingPids }) {
+export function retireOffGrid({ idx, keep, checkpoints, editHold, renderHold, block, dyingPids, retired = null }) {
   const protectedIndices = new Set([...editHold, ...renderHold.keys()]);
   const available = availableKeepSet(checkpoints, keep, protectedIndices, protectedIndices);
   const peer = checkpoints.get(idx);
@@ -142,6 +146,9 @@ export function retireOffGrid({ idx, keep, checkpoints, editHold, renderHold, bl
   if (peer) {
     peer.send('DIE\n');
     if (peer.pid) dyingPids?.add(peer.pid);
-    for (const index of aliases) checkpoints.delete(index);
+    for (const index of aliases) {
+      retired?.set(index, { why: 'off-grid', pid: peer.pid, at: Date.now() });
+      checkpoints.delete(index);
+    }
   }
 }

@@ -58,16 +58,18 @@ import { awaitWaiter, fulfillWaiter, rejectWaiter } from './waiters.js';
 import { abortBackgroundJob } from './abort-background-job.js';
 import { editElsewhereThanWalk, endWalkRetain, walkKillPaysOff } from './walk-preemption.js';
 import { Timer } from './timer.js';
-import { buildDisplayList } from './display-list.js';
+import { blockReadsPageState, buildDisplayList, displayListBodyChanged, furnitureChoice } from './display-list.js';
+import { queueFurnitureRender } from './furniture-render.js';
 import { buildDomSnapshot, buildFidelitySummary } from './inspector.js';
-import { computeToc, pageSpecs, hfJobBody } from './page-metadata.js';
+import { computeToc, furnitureGalleyKey, furnitureStateKey, pageSpecs, hfJobBody } from './page-metadata.js';
 import { chunkTargets } from './chunk-targets.js';
-import { editPageRenderIds, focusRescueIds } from './update-helpers.js';
+import { editPageRenderIds, focusRescueIds, hasDefinitionEdit } from './update-helpers.js';
 import { paginateNow, rebuildUnits } from './units.js';
 import { expandIncludes, includeOnlyFromSource, watchInclude } from './include-expander.js';
 import { announceIncludeReads, announceResourceReads, inputReadCurrent } from './include-cache.js';
 import { needsRescue, projectPackageText } from './rescue-classifier.js';
-import { scheduleHeaders as scheduleHeadersHelper } from './header-scheduler.js';
+import { betweenUpdates, discoverFurnitureReads, mapCurrent, rootKey, scheduleHeaders as scheduleHeadersHelper, usesCustomFurniture,
+  wakeFurnitureUpdates } from './header-scheduler.js';
 import {
   normalizeGalleyFonts,
   registerFont,
@@ -89,13 +91,13 @@ import { shippingPriorityQuietMs } from './interactive-priority.js';
 import { queueMovedOffsets as queueMovedOffsetsHelper } from './rescue-offsets.js';
 import { isPathInside } from '../project-inputs.js';
 import { instrumentEditRegions } from '../edit-regions.js';
-import { scheduleBackground as scheduleBackgroundHelper } from './background-scheduler.js';
+import { chainWorkDue, scheduleBackground as scheduleBackgroundHelper } from './background-scheduler.js';
 import { typesetBlock as typesetBlockHelper } from './typeset-dispatch.js';
 import { rescueBlock as rescueBlockHelper, isoGalley } from './rescue-block.js';
 import { trailingGlueSpec } from './util/galley.js';
-import { runChainPass as runChainPassHelper, chainAfterPass as chainAfterPassHelper } from './chain-pass.js';
+import { runChainPass as runChainPassHelper, chainAfterPass as chainAfterPassHelper, runWitnessPass } from './chain-pass.js';
 import { runUpdateTypesetPhase } from './update-typeset-phase.js';
-import { prepareUpdate } from './update-prepare.js';
+import { prepareUpdate, recordFurniturePreamble } from './update-prepare.js';
 import { finalizeShippingExactUpdate, finalizeUpdate } from './update-finalize.js';
 import { classifyResidentEdit } from './resident-edit-admission.js';
 import { source, displayLists, geometry, fontFile, fontManifest, chunkSvg } from './public-accessors.js';
@@ -103,13 +105,17 @@ import { buildClosureDeferredResponse } from './update-response.js';
 import {
   onCanonicalResult as onCanonicalResultHelper,
   cropCanonicalChunks as cropCanonicalChunksHelper,
-  cropCanonicalHeaderBands as cropCanonicalHeaderBandsHelper,
+  queueCanonicalFurniture, furnitureLanded, recutCanonicalFurniture, pruneFurniture, bandShown, entryShown,
+  bindSettledFurniture, provisionalFolio, bandsApart, furnitureSourceKey,
+  pumpCanonicalFurniture, placementVerified,
   verifyAgainstCanonical as verifyAgainstCanonicalHelper,
 } from './canonical-arrival.js';
 import { asyncRepaginate as asyncRepaginateHelper } from './async-repaginate.js';
+import { noteOvertakenPage } from './page-warm-queue.js';
+import { notePageArtLanding } from './page-art.js';
 import { pageHfSig } from './header-footer.js';
 import { buildPagePatches } from './page-patches.js';
-import { adoptGalleyBlock, exactFallbackEligible, exitStateVec } from './galley-adoption.js';
+import { adoptGalleyBlock, exactFallbackEligible, exitStateVec, galleyIdentityHash } from './galley-adoption.js';
 import { cropRenderTargets } from './render-chunks.js';
 import { checkpointBudgetFor, checkpointKeepSet, memoryCheckpointCeiling, nearestCheckpoint,
   nextTypesetCost,
@@ -146,7 +152,7 @@ import {
   buildVolatilePrelude,
 } from './tex-templates.js';
 import { isoCompile as isoCompileHelper } from './iso-compile.js';
-import { rescueWaitMs, waitForRescueChange, wakeRescues } from './rescue-scheduling.js';
+import { coldResumeAhead, rescueWaitMs, waitForRescueChange, wakeRescues } from './rescue-scheduling.js';
 import { fnv1a } from '../hash.js';
 import { buildJobBlockBody } from './job-body.js';
 import { classifyPlainPreviewEdit } from './plain-preview.js';
@@ -168,6 +174,15 @@ const BOOT_TIMEOUT = 60_000;
 // keystroke's own page stood in line behind them (shown after 121 ms where
 // 23 is usual). The pages they bring are far from the edit.
 const WARM_SNAPSHOT_QUIET_MS = 150;
+const NO_FURNITURE = { h: null, f: null, folio: false };
+const OPENING_FURNITURE = { choice: NO_FURNITURE, sig: 0 };
+// (a sheet whose placement is not verified: nothing of its furniture, whatever is cached)
+const UNPLACED_FURNITURE = { choice: NO_FURNITURE, sig: '-|-|' };
+// A furniture witness replay whose typeset failed without an edit (a fork
+// failure) is tried again this many times, this long apart, then settled.
+const WITNESS_RETRIES = 2;
+const WITNESS_RETRY_MS = 250;
+
 const OWED_SLICE_PAGES = 4;
 const OWED_BUSY_WAIT_MS = 20;
 const OWED_QUIET_MS = Number(process.env.TDOM_OWED_QUIET_MS) >= 0 && process.env.TDOM_OWED_QUIET_MS !== ''
@@ -204,8 +219,22 @@ export class CheckpointEngine {
 
   // ------------------------------------------------------------ lifecycle
 
+  get hfPending() {
+    // The body may still be establishing the page styles while furniture waits.
+    return !this.closed && this.mode === 'structured' && !!(this.opening || this.hfScheduleQueued ||
+      this.hfJob || this.hfRendering || this.hfCanonRunning || this.hfCanonRetry ||
+      (this.hfWitness && !this.hfWitness.settled) ||
+      this.hfBindings?.get(this.canonical.last?.id)?.checking);
+  }
+
   async open(text, file = 'main.tex', { canonicalBaseline = true, projectSeeds = true } = {}) {
     resetOpenState(this, text, file);
+    // The opening phase belongs to the opened revision (`rev`, reserved
+    // below): it ends once that revision's baseline canonical has landed,
+    // failed or been superseded by an edit, and the body work is idle
+    // (#finishOpening). A later revision's canonical never extends it.
+    const opening = this.opening = { rev: this.srcRev + 1 };
+    this.openingAuthority = null;
     // The canonical baseline compiles the opened source by itself and needs
     // nothing from the resident tree: start it beside the boot walk instead
     // of after it. On the 316-page book the walk (76 s) and the 3-pass
@@ -228,7 +257,98 @@ export class CheckpointEngine {
       // source under that revision.
       if (canonicalBaseline && this.srcRev < reserved) this.srcRev = reserved;
       throw error;
+    } finally {
+      void this.#finishOpening(opening);
     }
+  }
+
+  #bodyBusy() {
+    return this.updating || this.editPending > 0 || this.warming || this.bgActive || this.pendingChain ||
+      this.tocOwed || this.coldDirty.size || this.rescuePumping || this.rescueQueue.size || this.renderPumping ||
+      this.renderWant.size || this.isoRenderPending?.size || this.owedPaging || this.canonicalBodyWork > 0 ||
+      this.shipBooting || this.shipBootTimer || this.shipRetry?.activeAttemptId != null ||
+      this.navigationPending > 0 || this.canonical.svgInFlight?.size;
+  }
+
+  /** Whether the opened revision's baseline canonical is still to come: it
+   * has neither landed nor failed, and no edit has superseded it. Work the
+   * canonical renderer has for a later revision (an edit's idle timer, a
+   * compile queued behind the baseline) is not the opening's (A1). With
+   * canonical scheduling disabled nothing is queued, and nothing is owed. */
+  #openingBaselineOwed(opening) {
+    if (this.srcRev !== opening.rev) return false;
+    const canonical = this.canonical;
+    if (canonical.last?.rev === opening.rev) return false;
+    return canonical.runningJob?.rev === opening.rev || canonical.pendingJob?.rev === opening.rev;
+  }
+
+  /** The work an opening an edit has superseded still waits for: the edit
+   * in progress, and what establishes the resident layout (the opening's
+   * rescues, a cold keystroke's block, a canonical result being verified).
+   * Not the work every keystroke re-arms while the typing goes on (its
+   * deferred settle, the shipping chain's boot timer, caret warms, renders,
+   * owed lists): in the production server one of them was always pending,
+   * and an opening superseded at +1 s lasted until the typing stopped
+   * (round 21). */
+  #openingWorkBusy() {
+    return this.updating || this.editPending > 0 || this.rescuePumping || this.rescueQueue.size > 0 ||
+      this.coldDirty.size > 0 || this.canonicalBodyWork > 0 || this.pendingChain?.kind === 'cold';
+  }
+
+  async #finishOpening(opening) {
+    // Observe the queues without draining or scheduling them. In particular,
+    // CanonicalRenderer owns its baseline wakeup and retry policy.
+    while (!this.closed && this.opening === opening) {
+      const superseded = this.srcRev !== opening.rev;
+      // The body scheduler can be in its idle gate before it queues a grid
+      // pass. Wait for that task and any successor it scheduled (an unedited
+      // opening: c53846b's settle point).
+      if (!superseded) {
+        const background = this.bgTask;
+        await background;
+        if (this.closed || this.opening !== opening) return;
+        if (this.bgTask !== background) continue;
+      }
+      if ((superseded ? this.#openingWorkBusy() : this.#bodyBusy()) || this.#openingBaselineOwed(opening)) {
+        await new Promise((resolve) => setTimeout(resolve, 25).unref());
+        continue;
+      }
+      const generation = this.canonical.last;
+      this.openingAuthority = generation?.rev === this.srcRev ? { id: generation.id, rev: generation.rev } : null;
+      this.opening = null;
+      if (this.mode === 'structured') this.#deferHeaders({ afterOpening: true });
+      this.onOpeningSettled?.();
+      return;
+    }
+  }
+
+  // Resident-only callers can disable canonical scheduling. Their opening
+  // ends when the same resident queues drain.
+  // `between`: the header job's own steps (its discovery, the witness replay
+  // and the runs job), which run in the gaps of a typing that goes on: a
+  // keystroke, a pass, a caret warm, a rescue or a canonical result being
+  // verified go first, and body work whose gate has passed; body work still
+  // waiting for its gate, renders, the shipping chain and a compile do not
+  // hold them (round 21: the first map waited for the typing to stop).
+  async #waitForFurnitureIdle(wanted, { between = false } = {}) {
+    while (!this.closed && wanted()) {
+      if (!this.opening && (between ? this.#furnitureMayRun() : !this.#bodyBusy() && !this.canonical.running)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25).unref());
+    }
+    return false;
+  }
+
+  // (of the renders only the current edit's own cohort goes first, its
+  // pixels the next thing the page shows: render-pump.js. The others are not
+  // waited for: queued ones wait themselves for a pause in the typing,
+  // render-pump.js and isolated-render.js renderIdleGate, and a held one
+  // spans keystrokes; each held the first map back for seconds)
+  #furnitureMayRun() {
+    const cohort = this.interactiveRenderCohort;
+    return !this.updating && !(this.editPending > 0) && !this.warming && !this.bgActive && !this.rescuePumping &&
+      !this.rescueQueue.size && !this.coldDirty.size && !(this.canonicalBodyWork > 0) &&
+      !(this.navigationPending > 0) && !chainWorkDue(this) &&
+      !(cohort?.rev === this.srcRev && (cohort.queued.size || cohort.active.size));
   }
 
   /**
@@ -312,12 +432,25 @@ export class CheckpointEngine {
    * its promise to tests, while the app deliberately schedules it fire-and-
    * forget during cursor idle time.
    */
-  async warmPage(pageNumber) {
+  async warmPage(pageNumber, { again = false } = {}) {
+    // (the page the reader is on: its head and foot bands are cut first,
+    // canonical-arrival.js bandsWanted; not a page warmed again behind it)
+    if (!again) {
+      this.viewPage = Number(pageNumber);
+      // (the reader's page: its drawn head and foot, rendered if they show no band)
+      this.#queueFurnitureRender();
+    }
     const page = this.pages.find(item => item.number === Number(pageNumber));
     const ids = new Set(page?.draw?.map(draw => draw.u?.blockId));
     const block = this.blocks.find(item => ids.has(item.id));
     if (!block) return { status: 'rejected', reason: 'unknown-page' };
-    return this.warmEditOffset(block.start, block.file ?? this.file, { caret: false });
+    const result = await this.warmEditOffset(block.start, block.file ?? this.file, { caret: false });
+    // A later warm overtook it before its pictures were made: warmed again
+    // once nothing else runs (page-warm-queue.js)
+    if (!this.opening && result?.status === 'superseded') {
+      noteOvertakenPage(this, Number(pageNumber), (n) => this.warmPage(n, { again: true }));
+    }
+    return result;
   }
 
   /** Exact-pixel chunks a block publishes (status reporting). */
@@ -330,6 +463,7 @@ export class CheckpointEngine {
   async warmEditOffset(offset, file = this.file, { caret = true } = {}) {
     // A caret move is the earliest sign of editing: it boots a retired chain.
     if (!this.closed) this.#noteShipActivity();
+    if (this.tateExact) return { status: 'rejected', reason: 'exact-page-policy' };
     const sourceFile = path.resolve(this.docDir, file);
     const rootFile = path.resolve(this.docDir, this.file);
     const source = sourceFile === rootFile ? this.getSource() : this.includes.get(sourceFile)?.text;
@@ -599,7 +733,7 @@ export class CheckpointEngine {
    * would never publish: hand whatever is pending back to the scheduler.
    */
   #kickPendingChain() {
-    if (this.closed || !this.pendingChain) return;
+    if (this.closed || !(this.pendingChain || this.#witnessOwed())) return;
     this.#scheduleBackground(0, [], { interactive: false, pageRenderIds: [] });
   }
 
@@ -652,8 +786,12 @@ export class CheckpointEngine {
 
   getDisplayLists() {
     // (a page whose list is still owed to the viewers gets it here; it stays owed)
+    const bodyContext = `${this.closureDeferred?.residentSrcRev ?? this.srcRev}/${this.pages.length}`;
     for (const page of this.pages) {
-      if (!page.dl || page.dl.hfSig !== pageHfSig(this.hf, page.number)) page.dl = this.#displayList(page);
+      if (!page.dl || (page.dl.hfKey ?? page.dl.hfSig) !== this.furnitureSig(page.number, page) ||
+          displayListBodyChanged(page, this.currentSpecs?.specs[page.number - 1], bodyContext)) {
+        page.dl = this.#displayList(page, bodyContext);
+      }
     }
     return displayLists(this.pages);
   }
@@ -675,6 +813,7 @@ export class CheckpointEngine {
   }
 
   getDOM() {
+    const canonicalInfo = this.canonical.info();
     return buildDomSnapshot({
       rev: this.rev,
       srcRev: this.srcRev,
@@ -683,8 +822,9 @@ export class CheckpointEngine {
       modeReasons: this.modeReasons,
       previewPolicy: this.previewPolicy,
       previewReasons: this.previewReasons,
-      canonicalInfo: this.canonical.info(),
+      canonicalInfo,
       pages: this.pages,
+      reportedPageCount: this.tateExact ? canonicalInfo.pageCount : undefined,
       checkpoints: this.checkpoints,
       blocks: this.closureDeferred ? [] : this.blocks,
       chunkTargets: (b) => this.#chunkTargets(b),
@@ -742,7 +882,7 @@ export class CheckpointEngine {
   }
 
   async #bootRoot() {
-    return bootRootHelper(this, {
+    await bootRootHelper(this, {
       ensureShim: () => this.#ensureShim(),
       ensureServer: () => this.#ensureServer(),
       driverSource: (preamble) => this.#driverSource(preamble),
@@ -873,7 +1013,15 @@ export class CheckpointEngine {
       // spare continuation ready for the next keystroke (daemon.lua SPARE).
       const keystroke = !advance && !override && this.updating && !this.bgActive && !this.warming &&
         !!this.keystrokeSource?.has(block.id);
-      ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}${keystroke ? ' K' : ''}\n`);
+      // Once the header job has traced this root, every continuation uses
+      // that coverage, including cold replays and convergence probes.
+      // A rescued block's continuation only seeds its counters and labels.
+      // That synthetic source cannot attest to the real block's furniture.
+      const watchFurniture = !this.opening && !override && !this.hfLiteralRoot && this.hfWatchVersion;
+      const watchNames = this.hfWatchNames;
+      const trackFolio = !this.opening;
+      const flags = (keystroke ? 'K' : '') + (trackFolio ? 'F' : '') + (watchFurniture ? `W${watchFurniture}` : '');
+      ck.send(`${advance ? 'STEP' : 'JOB'} ${jobId} ${idx + 1} ${body.length} ${capture} ${calibrate ? 'C' : interactive ? 'F' : 'B'} ${liveFloor}${flags ? ' ' + flags : ''}\n`);
       ck.sendRaw(body);
       // The block this edit changed ships its exact RENDER beside its JOB,
       // forked from the same entry state with the JOB's own prelude (label
@@ -937,7 +1085,19 @@ export class CheckpointEngine {
         }
       }
       const [galley, nextCheckpoint] = await Promise.all([galleyP, ckptP]);
+      if (watchFurniture && Number(galley.furniture?.watch) === watchFurniture) {
+        galley.furniture.covered = watchNames;
+      }
+      if (watchFurniture) {
+        for (const event of galley.events ?? []) {
+          if (event.k === 'hfstate' && Number(event.watch) === watchFurniture) event.covered = watchNames;
+        }
+      }
       nextCheckpoint.replayToken = replayToken;
+      if (replayToken && this.bgActive && this.walkRetains) {
+        // Exclude recorder time from the replay retention interval.
+        this.walkRetainedAt += galley.furnitureMs ?? 0;
+      }
       this.confirmedLiveHeapKb = Math.max(this.confirmedLiveHeapKb || 0, nextCheckpoint.gcFloorKb || 0);
       // the live heap is first known here, during the boot walk, and it
       // grows with the document: keep the checkpoint budget inside memory
@@ -960,7 +1120,8 @@ export class CheckpointEngine {
       // a keystroke waiting on this background step waited for its collect
       // too (report timing: lock.gcWaitedMs)
       if (!interactive) this.bgGcMsTotal = (this.bgGcMsTotal ?? 0) + (nextCheckpoint.gcMs ?? 0);
-      block.typesetCleanupMs = (block.typesetCleanupMs ?? 0) + (nextCheckpoint.gcMs ?? 0);
+      const jobOverhead = (nextCheckpoint.gcMs ?? 0) + (galley.furnitureMs ?? 0);
+      block.typesetCleanupMs = (block.typesetCleanupMs ?? 0) + jobOverhead;
       if (!override && block.nativeClosureRequired !== false && galley.closure === 'error') {
         const bad = this.checkpoints.get(idx + 1);
         if (bad) {
@@ -986,7 +1147,7 @@ export class CheckpointEngine {
         // earlier consumer in the same incremental pass.
         galley.refs = [...new Set([...(galley.refs ?? []), ...Object.keys(refSnapshot)])];
       }
-      this.#recordTypesetCost(block, performance.now() - jobStarted - (nextCheckpoint.gcMs ?? 0));
+      this.#recordTypesetCost(block, performance.now() - jobStarted - jobOverhead);
       if (calibrate) this.calibrateInitialHeap = false;
       if (!advance) this.#retireOffGrid(idx);
       this.#enforceCheckpointCap(idx + 1);
@@ -1054,13 +1215,20 @@ export class CheckpointEngine {
       !block.galley.tdomDeferred && !block.galley.tdomFrozen &&
       !block.galley.tdomPendingPaint && !block.galley.tdomStale;
     let killed = false;
+    // (pinned through the in-chain JOB and every fallback after it:
+    // #enforceCheckpointCap)
+    const outerTypesetAt = this.typesetAt;
+    this.typesetAt = idx;
     try {
       return await typesetBlockHelper(this, idx, {
         needsRescue: (text, structuralSinks) => this.#needsRescue(text, structuralSinks),
         rescueBlock: (blockIdx, why) => this.#rescueBlock(blockIdx, why),
         brokenBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx),
         deferredBlockGalley: (blockIdx) => this.#brokenBlockGalley(blockIdx, false, true),
-        jobBlock: (blockIdx) => this.#jobBlock(blockIdx, null, replayMayConsume ? replayToken : null),
+        jobBlock: async (blockIdx) => {
+          await this.#restoreInput(blockIdx);
+          return this.#jobBlock(blockIdx, null, replayMayConsume ? replayToken : null);
+        },
         restoreReplayInput: (blockIdx, failure) => this.#restoreReplayInput(blockIdx, failure),
         rescueCacheKey: (targetBlock, blockIdx) => this.#rescueCacheKey(targetBlock, blockIdx),
         pumpRescues: () => this.#pumpRescues(),
@@ -1073,6 +1241,7 @@ export class CheckpointEngine {
       killed = this.bgAbort && this.bgActive;
       throw err;
     } finally {
+      this.typesetAt = outerTypesetAt;
       // Session-high-water cost is intentional: a later rescue-cache hit
       // must not make the scheduler forget the expensive cold replay that a
       // distant edit would pay again after checkpoint retirement.
@@ -1090,49 +1259,124 @@ export class CheckpointEngine {
       throw new Error(`replay input recovery repeated at ${idx}`);
     }
     failure.tdomReplayRecoveryAttempted = true;
-    const from = this.#nearestCheckpoint(idx);
-    if (!this.checkpoints.has(from)) {
-      throw new Error(`no recovery checkpoint at or before ${idx}`);
+    await this.#replayInput(idx, 'consumed by a failed STEP');
+  }
+
+  /** The input boundary of a block whose own JOB, or the @state continuation
+   * of its fallback (#brokenBlockGalley, a stale-first rescue), is about to
+   * run, retired after the walk passed it. The walk's own boundaries are
+   * pinned (#enforceCheckpointCap typesetAt/walkAt), but a peer can still
+   * die under it; without the boundary the fallback of a block typed into
+   * mid-command threw, and the update rebooted the whole document
+   * (tdom-engine #18). Rebuild it the way a walk reaches any boundary: from
+   * a live checkpoint before it, replaying the invariant prefix with
+   * ordinary JOB forks. */
+  async #restoreInput(idx) {
+    if (this.checkpoints.has(idx)) return;
+    // (who took it, for a field report: checkpoint-retirement.js, peer-accept.js)
+    const by = this.retiredInputs?.get(idx);
+    await this.#replayInput(idx, by
+      ? `retired (${by.why}, pid ${by.pid}, ${Date.now() - by.at} ms ago)`
+      : 'retired');
+  }
+
+  /** The nearest checkpoint at or before idx whose lineage is the current
+   * source's. A suffix peer re-keyed across an edit (vstale) predates it,
+   * and while the edit's verdict on the suffix is open a definition that
+   * peer carries can be stale where the replayed prefix never shows it. */
+  #nearestTrustedCheckpoint(idx) {
+    let best = null;
+    for (const [k, peer] of this.checkpoints) {
+      if (k <= idx && !peer.vstale && (best === null || k > best)) best = k;
     }
+    return best;
+  }
+
+  async #replayInput(idx, why) {
+    // A recovery that fails (a boundary lost again while replaying toward
+    // another one, no trusted checkpoint left, a prefix that does not
+    // reproduce) is a fault in the resident tree, never the content of the
+    // block that asked: tdomInfra takes it past that block's freeze ladder
+    // to the full rebuild (#oweRecoveryRebuild outside an update).
+    const fault = (message) => Object.assign(new Error(message), { tdomInfra: true, tdomInputRecovery: true });
+    if (this.inputReplayAt != null) {
+      throw fault(`input ${idx} lost while replaying toward input ${this.inputReplayAt}`);
+    }
+    const from = this.#nearestTrustedCheckpoint(idx);
+    if (from === null) {
+      const err = fault(`no recovery checkpoint at or before ${idx}`);
+      if (this.bgActive || !this.updating) this.#oweRecoveryRebuild(err);
+      throw err;
+    }
+    this.inputReplays = (this.inputReplays ?? 0) + 1;
+    this.diagnostics.push(`${this.blocks[idx]?.id}: input checkpoint ${idx} ${why} — replaying it from checkpoint ${from}`);
+    this.inputReplayAt = idx;
+    try {
+      await this.#replayPrefix(from, idx);
+    } catch (err) {
+      // (a keystroke pre-empting a background replay stays an abort)
+      if (this.bgAbort && this.bgActive) throw err;
+      err.tdomInfra = true;
+      err.tdomInputRecovery = true;
+      if (this.bgActive || !this.updating) this.#oweRecoveryRebuild(err);
+      throw err;
+    } finally {
+      this.inputReplayAt = null;
+    }
+  }
+
+  async #replayPrefix(from, idx) {
     for (let j = from; j < idx; j++) {
       const block = this.blocks[j];
       if (!block.galley || block.galleyHash == null || block.stateVec == null) {
         throw new Error(`replay input recovery lacks a prior witness at ${j}`);
       }
-      const before = {
-        hash: block.galleyHash,
-        state: block.stateVec,
-        metadata: JSON.stringify({
-          labels: block.galley.labels ?? [],
-          refs: block.galley.refs ?? [],
-          toclines: block.galley.toclines ?? [],
-        }),
-      };
-      // No replay token here: recovery must retain every current input until
-      // its successor exists, including inputs needed by native-error,
-      // isolated-rescue, and broken-galley state continuations.
-      const galley = await this.#typesetBlock(j, null);
-      this.#adoptGalley(block, galley);
-      const metadata = JSON.stringify({
+      const witness = (galley) => JSON.stringify({
         labels: galley.labels ?? [],
         refs: galley.refs ?? [],
         toclines: galley.toclines ?? [],
       });
-      if (block.galleyHash !== before.hash || block.stateVec !== before.state || metadata !== before.metadata) {
-        // Recovery is only valid for an invariant prefix. A changed galley,
-        // exit vector, or dependency witness belongs to the ordinary update
-        // accounting; restart through the existing full-rebuild safety net
-        // rather than silently adopting it inside this local repair.
+      const before = { hash: block.galleyHash, state: block.stateVec, metadata: witness(block.galley) };
+      // No replay token here: recovery must retain every current input until
+      // its successor exists, including inputs needed by native-error,
+      // isolated-rescue, and broken-galley state continuations.
+      const galley = await this.#typesetBlock(j, null);
+      // Recovery is only valid for an invariant prefix, checked before the
+      // galley is adopted: a changed galley, exit vector, or dependency
+      // witness belongs to the ordinary update accounting, so the recovery
+      // fails (the full-rebuild safety net) rather than silently adopting
+      // it. An identical galley needs no adoption: the block's stands.
+      // (its fonts as adoption keys them: the hash is over stable keys)
+      this.#normalizeGalleyFonts(galley);
+      if (galleyIdentityHash(block, galley) !== before.hash ||
+          exitStateVec(galley, this.counters) !== before.state || witness(galley) !== before.metadata) {
         throw new Error(`replay input recovery diverged at ${j} for ${block.id}`);
       }
-      for (const label of galley.labels ?? []) {
-        this.labelTable.set(label.k, label.v);
-        if (label.h != null) this.hrefTable.set(label.k, label.h);
-      }
+      // (a node list the replay kept for a block that wants no exact pixels,
+      // released as adoption does)
+      if (galley.capture && !block.needsRender) this.checkpoints.get(j + 1)?.send(`DROP_CAPTURE ${block.id} ${galley.capture}\n`);
     }
     if (!this.checkpoints.has(idx)) {
       throw new Error(`failed to restore checkpoint ${idx}`);
     }
+  }
+
+  /** A recovery that failed outside an update (a chain pass, a rescue
+   * landing) has no update-level safety net around it, and those passes end
+   * on any typeset error as if a keystroke had pre-empted them: the full
+   * rebuild it promises is owed to the next update
+   * (update-typeset-phase.js), and one is started now so that it does not
+   * wait for a key. */
+  #oweRecoveryRebuild(err) {
+    if (this.recoveryRebuildOwed || this.closed) return;
+    this.recoveryRebuildOwed = err;
+    this.diagnostics.push(`input recovery failed outside an update (${err.message}) — full rebuild owed`);
+    const timer = setTimeout(() => {
+      if (this.closed || this.recoveryRebuildOwed !== err) return;
+      this.#update({ editLabel: 'recovery-rebuild', projectInputChanges: { changed: [], removed: [], unknown: false } })
+        .catch((e) => this.diagnostics.push(`recovery rebuild failed: ${e?.message ?? e}`));
+    }, 0);
+    timer.unref?.();
   }
 
   /** Freeze a doubly-failed block: last good galley when one exists, an
@@ -1147,6 +1391,7 @@ export class CheckpointEngine {
    * the incremental==scratch equation only applies to compilable sources.
    * tdomFrozen marks both shapes so referees (fuzz) can scope the equation. */
   async #brokenBlockGalley(idx, frozen = true, deferred = false) {
+    await this.#restoreInput(idx);
     return brokenBlockGalleyHelper(this, idx, frozen, deferred, {
       jobBlock: (i, override) => this.#jobBlock(i, override),
       stateJobBody: (iso) => this.#stateJobBody(iso),
@@ -1613,7 +1858,10 @@ export class CheckpointEngine {
         isoCacheGet: (cacheKey) => this.#isoCacheGet(cacheKey),
         isoBaseGet: (targetBlock, blockIdx) => this.#isoBaseGet(targetBlock, blockIdx),
         bootIsoCompile: (blockIdx, cacheKey) => this.#bootIsoCompile(blockIdx, cacheKey),
-        jobBlock: (blockIdx, override) => this.#jobBlock(blockIdx, override),
+        jobBlock: async (blockIdx, override) => {
+          await this.#restoreInput(blockIdx);
+          return this.#jobBlock(blockIdx, override);
+        },
         stateJobBody: (iso) => this.#stateJobBody(iso),
         pumpRescues: () => this.#pumpRescues(),
         brokenBlockGalley: (blockIdx, frozen) => this.#brokenBlockGalley(blockIdx, frozen),
@@ -1865,9 +2113,15 @@ export class CheckpointEngine {
       coveragePins: this.editHold,
       renderHold: this.renderHold,
       activeHold: [...activeRender, ...this.#coldPreviewHeld(), ...propagationCheckpointHold(this.pendingChain),
-        ...(Number.isInteger(this.rescueCursor) ? [this.rescueCursor] : [])],
+        ...(Number.isInteger(this.rescueCursor) ? [this.rescueCursor] : []),
+        // the input of the block being typeset (its fallbacks fork from it
+        // after its JOB ends) and the boundary the foreground walk stands on
+        // while it waits for a cold preview: a render landing or a smaller
+        // budget runs this cap between those jobs (tdom-engine #18)
+        ...[this.typesetAt, this.walkAt].filter(Number.isInteger)],
       maxPeers: budget.residentLimit,
       dyingPids: this.dyingPids,
+      retired: this.retiredInputs,
     });
     // CKPT acceptance can temporarily put the resident map one peer over
     // its settled coverage. Reclaim that coverage before Shipping observes
@@ -1886,6 +2140,7 @@ export class CheckpointEngine {
       block: this.foregroundRenderIds && !this.foregroundRenderIds.has(this.blocks[idx]?.id)
         ? null : this.blocks[idx],
       dyingPids: this.dyingPids,
+      retired: this.retiredInputs,
     });
   }
 
@@ -1956,7 +2211,11 @@ export class CheckpointEngine {
       const block = this.blocks[j];
       // a cold preview is no witness of the block's own typeset (docs/10 §10.4b)
       const before = { hash: block.galley?.tdomColdPreview ? null : block.galleyHash, state: block.stateVec };
-      const g = await this.#typesetBlock(j, j < target ? replayToken : null).catch(() => null);
+      // (a failed input recovery is not an early stop: it owes the rebuild)
+      const g = await this.#typesetBlock(j, j < target ? replayToken : null).catch((err) => {
+        if (err?.tdomInputRecovery) throw err;
+        return null;
+      });
       if (!g) break;
       this.#adoptGalley(block, g);
       n++;
@@ -2054,6 +2313,9 @@ export class CheckpointEngine {
   }
 
   #adoptGalley(block, galley) {
+    if (!this.opening && furnitureGalleyKey(block.galley) !== furnitureGalleyKey(galley)) {
+      this.furnitureStateEpoch = (this.furnitureStateEpoch ?? 0) + 1;
+    }
     this.coldDirty?.delete(block.id);
     // a replaced preview's early RENDER (if the pump never took it) is moot
     const replacedEarly = block.galley?.tdomColdPreview?.early;
@@ -2262,6 +2524,7 @@ export class CheckpointEngine {
           this.foregroundRenderIds = null;
           this.progress = null; // /status liveness marker
           wakeRescues(this);
+          wakeFurnitureUpdates(this);
         }
       });
       if (documentResetPending) this.onDocumentResetComplete?.({ report });
@@ -2304,6 +2567,14 @@ export class CheckpointEngine {
     announceDocumentReset,
   }) {
     const t = new Timer();
+    const residentSrcRev = this.closureDeferred?.residentSrcRev ?? this.srcRev;
+    // (the first change of the source: what each page's head and foot are
+    // made from before it, the baseline of #noteFurnitureInputs)
+    if (editLabel !== 'open' && !coldResume && this.mode === 'structured' && this.pages.length && !this.hfInputs) {
+      const { specs, keys, lps } = this.#furnitureInputKeys(this.pages);
+      this.hfInputs = new Map(keys.map((key, i) => [i + 1, { key, lp: lps[i], since: 0 }]));
+      this.hfInputsSpecs = specs;
+    }
     const prepared = await prepareUpdate(this, {
       editLabel,
       editContext,
@@ -2313,7 +2584,9 @@ export class CheckpointEngine {
         deferClosureUpdate: (label, timer, closure) => {
           this.rev++;
           this.srcRev++;
-          this.closureDeferred = closure;
+          // An unfinished construct advances the input, while the page-state
+          // readers still belong to the last successful resident layout.
+          this.closureDeferred = { ...closure, residentSrcRev };
           this.canonical.schedule(this.store.get(this.file), this.srcRev, {
             fallbackReason: `closure-deferred:${closure.scope}:${closure.reason}`,
           });
@@ -2374,6 +2647,12 @@ export class CheckpointEngine {
     });
     if (prepared.response) return prepared.response;
     const { text, diagnostics, oldBlocks, diff, dirtySource, firstDirty, rebooted } = prepared;
+    // (an owed witness replay's frontier is an index: the blocks from the
+    // first one this edit changed may have moved, and are replayed again)
+    const witness = this.hfWitness;
+    if (witness && !witness.settled && Number.isInteger(firstDirty) && firstDirty >= 0) {
+      witness.from = Math.min(witness.from, firstDirty);
+    }
     // Every cold block was re-typeset by a walk that passed over it (or a
     // keystroke landed there first): nothing is left for this resume except
     // the settle/rebuild it carried, which the document still owes.
@@ -2401,10 +2680,10 @@ export class CheckpointEngine {
     // but only a complete native replay may promote physical pages.  On an
     // established document, do not synchronously walk/rescue an atomic
     // region merely to produce JS pages the renderer is forbidden to show.
-    // Initial open still builds the resident witnesses, and deployments
-    // without ShippingChain retain the ordinary structured fallback.
-    if (this.previewPolicy === 'shipping-exact' && this.shipping && editLabel !== 'open' && !rebooted &&
-        residentAdmission.kind !== 'probe') {
+    // Other shipping-exact policies still build resident witnesses at open
+    // and when ShippingChain is disabled. Tate cannot supply those witnesses.
+    if (this.tateExact || (this.previewPolicy === 'shipping-exact' && this.shipping && editLabel !== 'open' &&
+        !rebooted && residentAdmission.kind !== 'probe')) {
       return finalizeShippingExactUpdate(this, {
         text,
         editLabel,
@@ -2493,6 +2772,9 @@ export class CheckpointEngine {
         [`structured typeset failed: ${err.message}`],
         projectInputChanges
       );
+    } finally {
+      // (a walk that ended by throwing stands on no boundary any more)
+      this.walkAt = null;
     }
     this.bootRescueBudgetMs = 0;
     // The settle/rebuild a cold walk carried through its resume is queued
@@ -2515,9 +2797,15 @@ export class CheckpointEngine {
       advanceSrcRev: !coldResume,
       timer: t,
       callbacks: {
+        noteSpecs: (pages, sameLayout) => this.#noteSpecs(pages, sameLayout),
+        noteFurnitureInputs: (pages) => this.#noteFurnitureInputs(pages, {
+          definitions: rebooted || (!!diff?.bounds && hasDefinitionEdit(oldBlocks, this.blocks, diff.bounds, DEF_RE)),
+          dirty: rebooted ? null : dirtySource,
+        }),
         paginateNow: () => this.#paginateNow(),
-        displayList: (page) => this.#displayList(page),
+        displayList: (page, bodyContext) => this.#displayList(page, bodyContext),
         scheduleHeaders: () => this.#scheduleHeaders(),
+        deferHeaders: () => this.#deferHeaders(),
         enforceCheckpointCap: () => this.#enforceCheckpointCap(),
         scheduleBackground: (fgStop, dirtyBlocks, options) => this.#scheduleBackground(fgStop, dirtyBlocks, options),
         shipUpdate: (sourceText, changes) => this.#shipNow(sourceText, changes),
@@ -2668,11 +2956,23 @@ export class CheckpointEngine {
   // ------------------------------------- canonical arrival + verification
 
   #onCanonicalResult(info) {
-    onCanonicalResultHelper(this, info, {
+    const opening = this.opening;
+    const body = onCanonicalResultHelper(this, info, {
       verifyAgainstCanonical: (canonicalInfo) => this.#verifyAgainstCanonical(canonicalInfo),
       cropCanonicalChunks: (canonicalInfo) => this.#cropCanonicalChunks(canonicalInfo),
       teardownTree: () => this.#teardownTree(),
     });
+    if (body) {
+      this.canonicalBodyWork = (this.canonicalBodyWork ?? 0) + 1;
+      void body.finally(() => {
+        this.canonicalBodyWork--;
+        if (!opening && !this.opening && !this.closed && this.srcRev === info.rev) {
+          void this.#waitForFurnitureIdle(() => !this.opening && this.srcRev === info.rev).then((idle) => {
+            if (idle) this.#scheduleHeaders();
+          });
+        }
+      });
+    }
     if (!info?.error && info.rev === this.srcRev && this.mode === 'structured') {
       const prior = this.maxCheckpoints;
       this.canonicalPageCount = Math.max(1, Math.floor(Number(info.pageCount) || 1));
@@ -2747,6 +3047,169 @@ export class CheckpointEngine {
     });
   }
 
+  /** The page specs of `pages` (the header job's input) and their
+   * signature, the layout the header map must be of (header-scheduler.js,
+   * canonical-arrival.js runsCurrent). */
+  #noteSpecs(pages, sameLayout = false) {
+    if (this.opening) return null;
+    const noted = this.currentSpecs;
+    const epoch = this.furnitureStateEpoch ?? 0;
+    const style = this.initialStyle;
+    const pre = this.preDigest;
+    const recordsFurniture = !!this.hfWatchVersion && !this.hfLiteralRoot;
+    if (noted?.epoch === epoch && noted.style === style && noted.pre === pre && noted.recordsFurniture === recordsFurniture &&
+        ((noted.pages === pages && noted.blocks === this.blocks) ||
+          (sameLayout && noted.pages === this.pages && noted.blocks.length === this.blocks.length &&
+            noted.blocks.at(-1)?.id === this.blocks.at(-1)?.id))) {
+      noted.pages = pages;
+      noted.blocks = this.blocks;
+      return noted;
+    }
+    const specs = pageSpecs(pages, this.blocks, style, { furniture: recordsFurniture });
+    const sig = fnv1a(JSON.stringify(specs.map(({ state, ...spec }) => state ? { ...spec, state: furnitureStateKey(state) } : spec)));
+    this.currentSpecs = { pages, blocks: this.blocks, specs, sig, epoch, style, pre, recordsFurniture };
+    return this.currentSpecs;
+  }
+
+  /** When page `n`'s display list is built again: what it draws of its
+   * head and of its foot (display-list.js furnitureChoice): the version of
+   * the band, or the slot's entry while it is shown (header-footer.js
+   * pageHfSig), and whether it draws the provisional folio (docs/10
+   * §10.7a). */
+  furnitureSig(n, page = this.pages[n - 1]) {
+    // (unstamped: the choice's own signature, as the list keeps it)
+    const { sig } = this.#validatedFurniture(n, page);
+    const stamp = this.#furnitureStamp(n);
+    return stamp ? `${sig}${stamp}` : sig;
+  }
+
+  /** The source revision since which what page `n`'s head and foot print
+   * is unchanged, as a display-list stamp ('' while nothing has changed
+   * since the source the engine began comparing with: #noteFurnitureInputs). */
+  #furnitureStamp(n) {
+    const since = this.hfInputs?.get(n)?.since;
+    return since ? `@${since}` : '';
+  }
+
+  /** What each page's head and foot are made from, as far as the layout
+   * tells it: its style, folio and format, marks, float state, the chain of
+   * body furniture definitions and LastPage (page-metadata.js pageSpecs).
+   * What the body's definitions do to the controls a head reads is not in
+   * it: an edit that defines something counts for every page from its own
+   * (#noteFurnitureInputs). */
+  #furnitureInputKeys(pages) {
+    const noted = this.currentSpecs;
+    const specs = noted?.pages === pages ? noted.specs : pageSpecs(pages, this.blocks, this.initialStyle, { furniture: false });
+    return { specs, keys: specs.map((s) => (s ? [s.style, s.fmt, s.folio, s.lmark, s.rmark, s.fl, s.flCarry ?? '',
+      s.tplBody ?? '', s.ctr ?? ''].join('\u0001') : '')), lps: specs.map((s) => s?.lp ?? '') };
+  }
+
+  /** Whether page `n`'s head or foot prints LastPage (daemon.lua
+   * tdom_hf_read 2), as the runs job traced it: while that is not known,
+   * it may. */
+  #readsLastPage(n) {
+    const entry = this.opening ? null : this.hf?.get(n);
+    return !entry || !Number.isInteger(entry.hr) || !Number.isInteger(entry.fr) || !!((entry.hr | entry.fr) & 2);
+  }
+
+  /** B1: an exact page of an earlier source that the viewer keeps for its
+   * unchanged body still prints the head and foot of that source. From the
+   * first source change on, each page carries the revision since which its
+   * furniture inputs are what they are now (`hfInputs`, display-list.js
+   * hfSince): a page whose inputs changed after the source of the exact page
+   * on screen has that page's slots withdrawn, or the page itself when the
+   * list it was mounted with did not describe them (web/app.js
+   * furnitureHolds). Nothing is noted while an unedited document opens.
+   * `definitions`: the edit defined something (DEF_RE), from the first page
+   * of the blocks it changed (`dirty`) on. */
+  #noteFurnitureInputs(pages, { definitions = false, dirty = null } = {}) {
+    const inputs = this.hfInputs;
+    if (!inputs) return;
+    const noted = this.currentSpecs;
+    if (!definitions && noted?.pages === pages && this.hfInputsSpecs === noted.specs) return;
+    const { specs, keys, lps } = this.#furnitureInputKeys(pages);
+    this.hfInputsSpecs = specs;
+    const rev = this.srcRev;
+    let from = Infinity;
+    if (definitions) {
+      from = pages.find((page) => page.draw?.some((entry) => dirty?.has(entry.u?.blockId)))?.number ?? 1;
+    }
+    for (const [i, key] of keys.entries()) {
+      const n = i + 1, lp = lps[i];
+      const was = inputs.get(n);
+      // (a page count that changes changes LastPage on every page: a change
+      // only where the head or foot prints it)
+      const changed = !was || was.key !== key || n >= from || (was.lp !== lp && this.#readsLastPage(n));
+      inputs.set(n, { key, lp, since: changed ? rev : was.since });
+    }
+    for (const n of inputs.keys()) if (n > keys.length) inputs.delete(n);
+  }
+
+  #validatedFurniture(n, page) {
+    if (this.opening) return OPENING_FURNITURE;
+    const noted = this.currentSpecs;
+    const previous = this.furnitureChoices;
+    const chunks = this.chunks;
+    const spec = noted?.pages[n - 1] === page ? noted.specs[n - 1] : null;
+    const sameInputs = previous && previous.noted === noted && previous.chunks === chunks &&
+      previous.chunkRev === chunks.furnitureRev && previous.hf === this.hf &&
+      previous.failed === this.hfFailedSig && previous.geometry === this.geometry &&
+      previous.root === this.rootBoots && previous.pre === this.preDigest;
+    let current = previous;
+    if (!sameInputs || previous.rev !== this.srcRev) {
+      const source = furnitureSourceKey(this);
+      const pages = sameInputs && previous.source === source ? previous.pages : new WeakMap();
+      current = this.furnitureChoices = { noted, chunks, chunkRev: chunks.furnitureRev, hf: this.hf,
+        failed: this.hfFailedSig, geometry: this.geometry, root: this.rootBoots, pre: this.preDigest,
+        rev: this.srcRev, source, pages };
+    }
+    // The placement veto comes before any cached choice and is never cached
+    // itself: a sheet whose body placement is unverified (a picture it still
+    // owes, a binding that has not checked it) draws no head, foot or folio,
+    // whatever the spec it shares with an earlier, verified state (M1).
+    if (!placementVerified(this, page)) return UNPLACED_FURNITURE;
+    const key = spec ?? page;
+    if (key && current.pages.has(key)) return current.pages.get(key);
+    const choice = furnitureChoice(n, this.geometry, this.#furnitureView(page));
+    const slot = (which) => {
+      const c = choice[which];
+      return c?.band ? `b${c.band.v}` : c?.entry ? `e${pageHfSig(this.hf, n, which)}` : '-';
+    };
+    const result = { choice, sig: `${slot('h')}|${slot('f')}|${choice.folio ? `#${choice.folio}` : ''}` };
+    if (key) current.pages.set(key, result);
+    return result;
+  }
+
+  /** The furniture predicates a page's display list is built with
+   * (canonical-arrival.js, docs/10 §10.7a F4). */
+  #furnitureView(page) {
+    return {
+      chunks: this.chunks,
+      hf: this.hf,
+      // (the specs the pages being built were noted with: finalize-update,
+      // async-repaginate)
+      hfEntryShown: (which) => entryShown(this, page, which),
+      hfBandShown: (meta, which) => bandShown(this, page, meta, which),
+      hfBandsApart: (head, foot) => bandsApart(this, head, foot),
+      hfProvisional: () => provisionalFolio(this, page),
+    };
+  }
+
+  #canonicalFurnitureHelpers() {
+    return {
+      asyncRepaginate: () => this.#asyncRepaginate(),
+      waitForIdle: (wanted) => this.#waitForFurnitureIdle(wanted),
+    };
+  }
+
+  /** The current source's furniture for the pages near the reader that show
+   * none (furniture-render.js). */
+  #queueFurnitureRender() {
+    if (!this.opening) {
+      queueFurnitureRender(this, { ...this.#canonicalFurnitureHelpers(), awaitRender: (key, timeout) => this.#await(key, timeout) });
+    }
+  }
+
   async #verifyAgainstCanonical(info) {
     return verifyAgainstCanonicalHelper(this, info, {
       applyFidelity: (block, galley) => this.#applyFidelity(block, galley),
@@ -2781,14 +3244,8 @@ export class CheckpointEngine {
             if (this.closed || !this.rescueQueue.size) return;
             bid = [...this.rescueFocus].find((id) => this.rescueQueue.has(id)) ??
               this.#nextRescueInOrder();
-            // A cold keystroke's resume (docs/10 §10.4a) outranks isolated
-            // rescue adoption: the adopt walk holds the chain lock for seconds
-            // and the keystroke's page is not on screen until the resume runs.
-            // Not when the resume is owed only for this very block (an edit
-            // inside a multicols that the walk left cold): its adoption walk
-            // re-typesets the same path, and the resume would only re-show
-            // the held galley (tex64-internal #94: 2.4-3.0 s edits waited
-            // for it).
+            // a pending keystroke and a cold resume that outranks this
+            // adoption (coldResumeAhead) go first, then the typing quiet window
             const waitMs = rescueWaitMs(this, bid);
             if (!waitMs) break;
             await waitForRescueChange(this, waitMs);
@@ -2811,6 +3268,12 @@ export class CheckpointEngine {
               this.diagnostics.push(`async rescue ${bid}: ${err?.message ?? err}`);
             }
           });
+          // One turn of the event loop per entry. A re-keyed or pre-empted
+          // entry goes back on the queue and its retry may need no wait, but
+          // the work it waits for runs on timers and sockets: retried inside
+          // the same microtask drain, the pump held the engine at 100% CPU
+          // and that work never ran (tex64-internal #121).
+          await new Promise((resolve) => setImmediate(resolve));
         }
       } finally {
         this.rescuePumping = false;
@@ -2963,8 +3426,9 @@ export class CheckpointEngine {
             if (changed && successor.needsRender) this.#queueRender(successor.id);
           },
           // yield to a keystroke waiting for the lock and to a cold resume
-          // it owes (the queue entry retries after them)
-          () => this.bgAbort || this.editPending > 0 || this.pendingChain?.kind === 'cold'
+          // that outranks this adoption, by the rule the pump waits on
+          // (coldResumeAhead; the queue entry retries after them)
+          () => this.bgAbort || this.editPending > 0 || coldResumeAhead(this, bid)
         );
       } catch (err) {
         if (this.bgAbort) return 'aborted';
@@ -3153,6 +3617,94 @@ export class CheckpointEngine {
     for (const k of labels ?? []) cur.labels.add(k);
   }
 
+  /** The furniture witness replay owed for root `ck` and watch `version`
+   * (chain-pass.js runWitnessPass): its own owner and frontier, never body
+   * work in pendingChain. A replay owed for another root or watch is
+   * superseded by it. */
+  #queueFurnitureWitness(ck, version, { eager = false } = {}) {
+    const owed = this.hfWitness;
+    if (owed && !owed.settled && owed.ck === ck && owed.version === version) {
+      owed.eager ||= eager;
+      return owed;
+    }
+    if (owed) this.#settleWitness(owed, 'superseded');
+    // (`eager`: owed for the first header map of the root, background-scheduler.js witnessNow)
+    const witness = { ck, version, from: 0, failures: 0, queuedAt: Date.now(), retryAt: null, settled: null, eager };
+    witness.done = new Promise((resolve) => { witness.resolve = resolve; });
+    this.hfWitness = witness;
+    return witness;
+  }
+
+  /** No header map of the current root has landed: no head or foot of its
+   * runs is shown yet. */
+  #firstFurnitureMap() {
+    return !this.hfIdentity || this.hfIdentity.root !== rootKey(this);
+  }
+
+  #witnessCurrent(witness) {
+    return !!witness && this.hfWitness === witness && !witness.settled && !this.closed && !this.opening &&
+      this.mode === 'structured' && this.checkpoints.get(0) === witness.ck && this.hfWatchVersion === witness.version;
+  }
+
+  /** The replay that is owed and may run now (background-scheduler.js). */
+  #witnessOwed() {
+    const witness = this.hfWitness;
+    if (!witness || witness.settled) return null;
+    if (!this.#witnessCurrent(witness)) {
+      this.#settleWitness(witness, 'superseded');
+      return null;
+    }
+    return witness.retryAt === null ? witness : null;
+  }
+
+  /** The end of a replay: 'done', 'failed' (its retries spent), 'superseded'
+   * (another root or watch, a new document, close). The header job waiting
+   * for it goes on; slots on pages the replay did not reach stay unattested
+   * (their galleys carry no state of this watch: page-metadata.js pageSpecs). */
+  #settleWitness(witness, outcome) {
+    if (witness.settled) return;
+    witness.settled = outcome;
+    clearTimeout(witness.retryTimer);
+    if (this.hfWitness === witness) this.hfWitness = null;
+    witness.resolve?.(outcome);
+  }
+
+  async #runWitness(bodyDue = () => false) {
+    const witness = this.#witnessOwed();
+    if (!witness) return null;
+    const outcome = await runWitnessPass(this, witness, {
+      bodyDue,
+      nearestCheckpoint: (idx) => this.#nearestCheckpoint(idx),
+      typesetBlock: (idx, replayToken) => this.#typesetBlock(idx, replayToken),
+      adoptGalley: (block, galley) => this.#adoptGalley(block, galley),
+      queueRender: (blockId, options) => this.#queueRender(blockId, options),
+      asyncRepaginate: () => this.#asyncRepaginate(),
+      enforceCheckpointCap: () => this.#enforceCheckpointCap(),
+      queueChainWork: (kind, from, labels) => this.#queueChainWork(kind, from, labels),
+      current: () => this.#witnessCurrent(witness),
+    });
+    if (outcome === 'done') this.#settleWitness(witness, 'done');
+    else if (outcome === 'stale') this.#settleWitness(witness, 'superseded');
+    else if (outcome === 'failed') {
+      // A failed typeset is not a pre-empted one: nothing else would run the
+      // replay again before the next edit (B2). Try it again a bounded number
+      // of times, then settle it.
+      witness.failures++;
+      this.diagnostics.push(`furniture witness replay failed at block ${witness.from} (${witness.lastError})` +
+        (witness.failures > WITNESS_RETRIES ? ' — settled without it' : ' — retrying'));
+      if (witness.failures > WITNESS_RETRIES) this.#settleWitness(witness, 'failed');
+      else {
+        witness.retryAt = Date.now() + WITNESS_RETRY_MS;
+        witness.retryTimer = setTimeout(() => {
+          witness.retryAt = null;
+          if (this.#witnessCurrent(witness)) this.#scheduleBackground(0, []);
+        }, WITNESS_RETRY_MS);
+        witness.retryTimer.unref?.();
+      }
+    }
+    return outcome;
+  }
+
   /**
    * The cold walk reached the input boundary of the first block a budgeted
    * keystroke left un-typeset: run the update for the current source again,
@@ -3179,7 +3731,7 @@ export class CheckpointEngine {
    * (docs/03). Root and the end of the document never count.
    */
   gridMissing() {
-    if (this.closed || !this.blocks.length) return [];
+    if (this.closed || this.tateExact || !this.blocks.length) return [];
     return gridMissingBoundaries(this.blocks, this.#checkpointKeepSet(), this.checkpoints, this.maxCheckpoints);
   }
 
@@ -3206,6 +3758,8 @@ export class CheckpointEngine {
       gridWanted: () =>
         process.env.TDOM_GRID_FILL !== '0' && !this.closed && !this.gridFill.stalled &&
         this.gridMissing().length > 0,
+      witnessOwed: () => this.#witnessOwed(),
+      runWitness: (bodyDue) => this.#runWitness(bodyDue),
       queueOwedToc: () => {
         const consumer = this.blocks.findIndex((block) => block.consumesToc);
         if (consumer < 0) this.tocOwed = false;
@@ -3335,26 +3889,34 @@ export class CheckpointEngine {
       this.owedPagesTimer = null;
       if (this.closed || this.mode !== 'structured') {
         this.owedPaging = false;
+        wakeFurnitureUpdates(this);
         return;
       }
       if (this.updating || quietIn() > 0) return this.#pumpOwedPages();
-      const { patches, later } = buildPagePatches(this.pages, this.pages, (page) => pageHfSig(this.hf, page.number),
-        (page) => this.#displayList(page), { limit: OWED_SLICE_PAGES, focus: this.owedFocus ?? null, owedToo: true });
+      const { patches, later } = buildPagePatches(this.pages, this.pages, (page) => this.furnitureSig(page.number, page),
+        (page, bodyContext) => this.#displayList(page, bodyContext), { limit: OWED_SLICE_PAGES, focus: this.owedFocus ?? null,
+          bodyChanged: (page, stamp) => displayListBodyChanged(page, this.currentSpecs?.specs[page.number - 1], stamp),
+          owedToo: true, bodyContext: `${this.closureDeferred?.residentSrcRev ?? this.srcRev}/${this.pages.length}` });
       if (patches.length && this.onAsyncPatches) {
         this.rev++;
-        this.onAsyncPatches({ rev: this.rev, fonts: this.getFontManifest(), patches });
+        this.onAsyncPatches({ rev: this.rev, pageCount: this.pages.length, srcRev: this.srcRev, fonts: this.getFontManifest(), patches });
       }
       this.owedPaging = later > 0;
       if (later > 0) this.#pumpOwedPages();
+      else wakeFurnitureUpdates(this);
     }, Math.max(this.updating ? OWED_BUSY_WAIT_MS : 0, quietIn()));
     this.owedPagesTimer.unref?.();
   }
 
   #asyncRepaginate() {
+    if (this.tateExact) return;
     return asyncRepaginateHelper(this, {
+      noteSpecs: (pages, sameLayout) => this.#noteSpecs(pages, sameLayout),
+      noteFurnitureInputs: (pages) => this.#noteFurnitureInputs(pages),
+      scheduleHeaders: () => this.#scheduleHeaders(),
       pumpOwedPages: () => this.#pumpOwedPages(),
       paginateNow: () => this.#paginateNow(),
-      displayList: (page) => this.#displayList(page),
+      displayList: (page, bodyContext) => this.#displayList(page, bodyContext),
       computeToc: (pages) => this.#computeToc(pages),
       queueChainWork: (kind, from, labels) => this.#queueChainWork(kind, from, labels),
       scheduleBackground: (fromIdx, dirtyBlocks) => this.#scheduleBackground(fromIdx, dirtyBlocks),
@@ -3399,29 +3961,125 @@ export class CheckpointEngine {
   // each page's exact state (folio value + format, style, marks) and a
   // header job typesets the real \@oddhead/\@oddfoot boxes for every page.
 
-  #pageSpecs(pages) {
-    return pageSpecs(pages, this.blocks, this.initialStyle);
+  #hfJobBody(specs, options) {
+    return hfJobBody(specs, options);
   }
 
-  #hfJobBody(specs) {
-    return hfJobBody(specs);
+  #deferHeaders({ afterOpening = false } = {}) {
+    if (this.opening || this.hfScheduleQueued) return;
+    const task = this.hfScheduleQueued = {};
+    setImmediate(async () => {
+      const wanted = () => this.hfScheduleQueued === task && !this.opening && this.mode === 'structured';
+      const current = afterOpening
+        ? await this.#waitForFurnitureIdle(wanted, { between: true })
+        : await betweenUpdates(this, wanted);
+      if (this.hfScheduleQueued !== task) return;
+      this.hfScheduleQueued = null;
+      if (!current) return;
+      if (afterOpening) {
+        recordFurniturePreamble(this, this.lastPreamble ?? '');
+        for (const block of this.blocks) {
+          if (this.chunks.get(block.id)?.farInk) notePageArtLanding(this, block.id);
+        }
+      }
+      this.#scheduleHeaders();
+    });
   }
 
   #scheduleHeaders() {
+    if (this.opening || this.closed || this.mode !== 'structured') return;
+    const helpers = this.#canonicalFurnitureHelpers();
+    const failed = (err) => this.diagnostics.push('canonical furniture crop failed: ' + (err?.message ?? err));
+    // (the page set changed: the bands of pages gone are let go; an undo back
+    // to a bound generation's source has them cut again, and a page count
+    // that grew back lets its generation go on: canonical-arrival.js)
+    // (a generation that landed before the layout of its source settled is
+    // bound once that layout agrees with it, and cut: rule 2)
+    const noteSpecs = (pages) => this.#noteSpecs(pages);
+    const binding = { noteSpecs, ...helpers, asyncRepaginate: () => {
+      this.furnitureChoices = null;
+      this.#asyncRepaginate();
+    } };
+    if (!this.updating && !this.#bodyBusy() && !this.canonical.running) {
+      const noted = noteSpecs(this.pages);
+      pruneFurniture(this);
+      recutCanonicalFurniture(this, helpers).catch(failed);
+      // Correspondence needs the header map to recognize drawing pages.
+      // The first map lands after witness replay, so bind that layout once.
+      if (mapCurrent(this, noted) && bindSettledFurniture(this, binding)) {
+        queueCanonicalFurniture(this, this.canonical.info(), helpers).catch(failed);
+      }
+      if (this.hfCanon && !this.hfCanonRunning && this.hfWakeCount !== this.pages.length) {
+        this.hfWakeCount = this.pages.length;
+        setImmediate(() => pumpCanonicalFurniture(this, helpers).catch(failed));
+      }
+      this.#queueFurnitureRender();
+    }
     scheduleHeadersHelper(this, {
-      pageSpecs: (pages) => this.#pageSpecs(pages),
-      hfJobBody: (specs) => this.#hfJobBody(specs),
+      noteSpecs,
+      waitForIdle: (wanted) => this.#waitForFurnitureIdle(wanted, { between: true }),
+      // (no map of this root yet: nothing shows its heads and feet, and the
+      // job does not wait for the typing's quiet, header-scheduler.js)
+      firstMap: () => this.#firstFurnitureMap(),
+      prepare: async () => {
+        const ck = this.checkpoints.get(0);
+        let refresh = false;
+        if (ck && this.hfDiscoveredRoot !== ck && usesCustomFurniture(this)) {
+          const wanted = () => !this.opening && this.checkpoints.get(0) === ck;
+          const discovered = await withReplaceablePreviewJob(this, 'header-discovery', async () => {
+            if (!(await this.#waitForFurnitureIdle(wanted, { between: true }))) return;
+            return discoverFurnitureReads(this, {
+              hfJobBody,
+              awaitGalley: (key, timeout) => this.#await(key, timeout),
+            });
+          });
+          if (this.closed || !wanted()) return;
+          this.hfDiscoveredRoot = ck;
+          refresh = discovered && !this.hfLiteralRoot;
+        }
+        if (refresh || (ck && this.hfFolioRoot !== ck && (this.geometry?.twoside ||
+            this.blocks.some((block) => /\\(?:setcounter|addtocounter)\s*\{page\}/.test(block.text))))) {
+          const replayed = await this.#replayFurnitureWitness(ck);
+          if (replayed !== 'superseded' && this.checkpoints.get(0) === ck) this.hfFolioRoot = ck;
+        }
+      },
+      hfJobBody: (specs, options) => this.#hfJobBody(specs, options),
       awaitGalley: (key, timeout) => this.#await(key, timeout),
       registerFont: (key, meta) => this.#registerFont(key, meta),
       asyncRepaginate: () => this.#asyncRepaginate(),
-      // heads drawn with graphics take their band from the latest canonical
-      cropHeaderBands: () => {
-        const info = this.canonical.info();
-        if (!info?.id) return;
-        cropCanonicalHeaderBandsHelper(this, info, { asyncRepaginate: () => this.#asyncRepaginate() })
-          .catch((err) => this.diagnostics.push(`header band crop failed: ${err?.message ?? err}`));
+      refreshWatch: () => {
+        const version = this.hfWatchVersion;
+        void this.#replayFurnitureWitness(this.checkpoints.get(0), version)
+          .catch((err) => this.diagnostics.push(err.message));
+      },
+      // (a header map that lands: the bands' fingerprints and the decisions of
+      // rule 3; and the latest generation's bands are cut for the pages that
+      // draw, as v0.1.32 did)
+      landed: (noted, made) => {
+        furnitureLanded(this, noted, made);
+        bindSettledFurniture(this, binding);
+        queueCanonicalFurniture(this, this.canonical.info(), helpers).catch(failed);
+        // (a page whose drawn head or foot shows no band: the current
+        // source's furniture, rendered: furniture-render.js)
+        this.#queueFurnitureRender();
       },
     });
+  }
+
+  /** Replay the established body for root `ck` and watch `version` and wait
+   * until the replay is settled: 'done', 'failed' or 'superseded'. */
+  async #replayFurnitureWitness(ck, version = this.hfWatchVersion) {
+    const wanted = () => !this.closed && !this.opening && this.checkpoints.get(0) === ck &&
+      this.hfWatchVersion === version && this.mode === 'structured';
+    if (!ck || !(await this.#waitForFurnitureIdle(wanted, { between: true })) || !wanted()) return 'superseded';
+    const witness = this.#queueFurnitureWitness(ck, version, { eager: this.#firstFurnitureMap() });
+    if (!this.bgActive) this.#scheduleBackground(0, []);
+    while (!witness.settled) {
+      // (a replay whose root or watch went is settled by whoever sees it first)
+      await Promise.race([witness.done, new Promise((resolve) => setTimeout(resolve, 250).unref?.())]);
+      if (!witness.settled && !this.#witnessCurrent(witness)) this.#settleWitness(witness, 'superseded');
+    }
+    return witness.settled;
   }
 
   #expandIncludes(segs, depth, options = {}) {
@@ -3462,7 +4120,7 @@ export class CheckpointEngine {
     });
   }
 
-  async refresh(inputChanges = {}) {
+  async refresh(inputChanges = {}, childEdit = null) {
     const changed = Array.isArray(inputChanges)
       ? inputChanges
       : Array.isArray(inputChanges.changed) ? inputChanges.changed : [];
@@ -3475,7 +4133,8 @@ export class CheckpointEngine {
     announceIncludeReads(this.includes, [...changed, ...removed]);
     announceResourceReads(this.resourceReads, [...changed, ...removed]);
     this.canonical.invalidateInputs(projectInputChanges);
-    return this.#update({ editLabel: 'external-include', projectInputChanges });
+    const editContext = childEdit && Object.freeze({ ...childEdit, baseSrcRev: this.srcRev });
+    return this.#update({ editLabel: 'external-include', editContext, projectInputChanges });
   }
 
   /** Re-read what only the resident job reads (driver.ind): the source and
@@ -3500,16 +4159,27 @@ export class CheckpointEngine {
     this.canonical.invalidateInputs({ changed: [...changed] });
   }
 
-  #displayList(page) {
+  #displayList(page, bodyContext) {
+    const blocks = this.blocksById;
+    const noted = this.currentSpecs;
+    const { choice, sig } = this.#validatedFurniture(page.number, page);
+    // (the slots this list does not describe: web/app.js furnitureHolds)
+    const unknown = (which) => this.opening || !choice[which] || choice[which].entry?.[`${which}g`] ? which : '';
     return buildDisplayList(page, {
       geometry: this.geometry,
       chunks: this.chunks,
-      hf: this.hf,
-      hfSig: pageHfSig(this.hf, page.number),
+      opening: !!this.opening,
+      furniture: choice,
+      hfSig: sig,
+      hfSince: this.hfInputs?.get(page.number)?.since ?? 0,
+      hfUnknown: unknown('h') + unknown('f'),
       fonts: this.fonts,
       twinMetrics: this.twinMetrics,
+      // (the body's identity, display-list.js bodySignature)
+      galleyOf: (id) => blocks.get(id)?.galleyHash,
+      readsPageState: (id) => blockReadsPageState(blocks.get(id), this.lastPreamble ?? ''),
+      pageSpec: noted?.pages[page.number - 1] === page ? noted.specs[page.number - 1] : null,
+      bodyContext,
     });
   }
 }
-
-// ------------------------------------------------------------- helpers

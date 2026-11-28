@@ -72,7 +72,7 @@ export async function typesetBlock(engine, idx, callbacks) {
   // A timeout whose child DID announce stays on the freeze ladder — that
   // pattern is also what a genuine TeX infinite loop in the user's text
   // produces, and rebooting cannot fix content.
-  const rescueSafely = async (why, inChainSilent = false) => {
+  const rescueSafely = async (why, inChainSilent = false, inChainTimedOut = false) => {
     try {
       return await rescueBlock(idx, why);
     } catch (err) {
@@ -85,14 +85,19 @@ export async function typesetBlock(engine, idx, callbacks) {
         throw err;
       }
       engine.diagnostics.push(`${block.id}: rescue failed (${err.message}) — freezing the block`);
-      if (isTimeoutErr(err)) {
+      // (a block that went straight to its rescue, an output-routine
+      // environment, has had one unanswered job, not two: it freezes)
+      if (isTimeoutErr(err) && inChainTimedOut) {
         // A timeout-shaped double failure (in-chain AND rescue unanswered)
         // marks the PARENT lineage as suspect — a wedged checkpoint would
         // otherwise eat every future edit of this region the same silent
         // way (observed live: the block froze and every keystroke re-paid
-        // the double timeout for the rest of the session). Retire it: the
-        // next edit forks the region from an earlier snapshot, or — with
-        // no snapshot left — fails fast into the full-rebuild retry.
+        // the double timeout for the rest of the session). Retire it and
+        // escalate: the freeze would continue from that lineage, and a state
+        // continuation nothing answers is the resident tree's fault, not the
+        // block's. The update-level full rebuild replaces the tree; a freeze
+        // that rebuilt the input from an older snapshot (#brokenBlockGalley)
+        // would only feed the same wedge again.
         const ck = engine.checkpoints.get(idx);
         if (ck) {
           try { ck.send('DIE\n'); } catch { /* peer gone */ }
@@ -101,7 +106,8 @@ export async function typesetBlock(engine, idx, callbacks) {
             engine.dyingPids.add(ck.pid);
           }
           engine.checkpoints.delete(idx);
-          engine.diagnostics.push(`${block.id}: retired checkpoint ${idx} after unanswered jobs`);
+          engine.diagnostics.push(`${block.id}: retired checkpoint ${idx} after unanswered jobs — escalating to a full rebuild`);
+          throw err;
         }
       }
       return brokenBlockGalley(idx);
@@ -199,6 +205,6 @@ export async function typesetBlock(engine, idx, callbacks) {
       pumpRescues();
       return brokenBlockGalley(idx);
     }
-    return rescueSafely(err.message, err.tdomNoChild === true);
+    return rescueSafely(err.message, err.tdomNoChild === true, isTimeout);
   }
 }

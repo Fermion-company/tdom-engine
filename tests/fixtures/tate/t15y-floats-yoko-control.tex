@@ -1,0 +1,41 @@
+\documentclass[a5paper]{ltjsarticle}
+\begin{document}
+\section{図と表}
+朝から細かい雨が降っていた。傘を持たずに家を出たのは失敗だったと、駅までの坂道を歩きながら何度も思った。商店街の軒先を伝って歩けば少しは濡れずに済むが、それでも肩のあたりはすぐに冷たくなった。
+
+\begin{figure}[t]
+\centering
+\rule{6\zw}{3\zw}
+\caption{上に置いた図}
+\end{figure}
+
+電車は思ったより空いていた。窓際の席に座ると、外の景色が雨粒で滲んで見えた。友人は鞄から文庫本を取り出し、しおりを挟んだ頁を開いた。
+
+\begin{table}[b]
+\centering
+\caption{下に置いた表}
+\begin{tabular}{|c|c|c|}\hline
+項目 & 数 & 備考\\\hline
+りんご & 三 & 赤い\\\hline
+みかん & 五 & 甘い\\\hline
+\end{tabular}
+\end{table}
+
+例の場所というのが何を指すのか、私にはすぐにわかった。学生の頃によく通った川沿いの喫茶店である。店主は無口な人で、注文を聞く以外にはほとんど口をきかなかった。
+
+縦組みの表を本文中に置く：
+\begin{center}
+\begin{tabular}{|l|l|}\hline
+一行目 & 縦組みの表\\\hline
+二行目 & 文字が縦に並ぶ\\\hline
+\end{tabular}
+\end{center}
+横組みのまま置いた表：
+\begin{center}
+\hbox{\yoko\begin{tabular}{|l|l|}\hline
+A & 横組みの表\\\hline
+B & 文字は横\\\hline
+\end{tabular}}
+\end{center}
+表のあとの本文。
+\end{document}

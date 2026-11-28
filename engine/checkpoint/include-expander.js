@@ -61,7 +61,7 @@ export function expandIncludes(segs, depth, context) {
         command,
         raw: rel,
         depth,
-        parentFile: seg.file ?? context.file,
+        parentFile: path.resolve(context.docDir ?? context.workDir, seg.file ?? context.file),
         rootUnit: depth === 0 ? segmentIndex + 1 : context.rootUnit ?? null,
       });
     }

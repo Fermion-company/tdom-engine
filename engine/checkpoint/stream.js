@@ -155,7 +155,7 @@ export function buildStream(block, chunks) {
         h: it.h ?? it.hc ?? 0,
         d: it.d ?? 0,
         hc: it.hc ?? it.h ?? 0,
-        units: miniUnits(it.items, block.id, chunkRef, suppress, galley?.backend),
+        units: miniUnits(it.items, block.id, chunkRef, suppress, galley?.backend, suppress, k),
       });
     } else if (it.k === 'fm') {
       const f = makeFloat(it.n);
@@ -276,7 +276,7 @@ export function buildStream(block, chunks) {
  * units. `suppress` blanks the glyph runs when the fidelity gate forbids a
  * glyph bridge and no exact chunk has landed yet. `pendingExact` also
  * covers graphics whose harvested text runs represent only part of the ink. */
-export function miniUnits(items, blockId, chunkRef, suppress = false, backend = null, pendingExact = suppress) {
+export function miniUnits(items, blockId, chunkRef, suppress = false, backend = null, pendingExact = suppress, bodyInsert) {
   const units = [];
   let y = 0;
   for (const it of items ?? []) {
@@ -287,6 +287,8 @@ export function miniUnits(items, blockId, chunkRef, suppress = false, backend = 
     if (it.k !== 'box') continue;
     units.push({
       blockId,
+      bodyLine: units.length,
+      bodyInsert,
       h: it.h ?? 0,
       d: it.d ?? 0,
       yRel: y + (it.h ?? 0), // baseline relative to the mini-galley top

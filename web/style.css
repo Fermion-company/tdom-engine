@@ -417,9 +417,18 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 
 #pages {
   --zoom: 1;
+  /* The paper's width at zoom 1. Embedded, the host sets the width its own
+     PDF viewer fits a page to (app.js setZoom `fitPx`): Live and the static
+     PDF then draw the same paper at the same width. */
+  --fit-width: min(92%, 640px);
   flex: 1;
   min-height: 0;
   overflow: auto;
+  /* The viewer keeps the reader's place itself (app.js viewAnchor, setZoom,
+     the resize anchor): a page keeps its box when its paper changes, so the
+     browser's own anchoring did nothing then, and on a resize it held a
+     page's top, not the line read. */
+  overflow-anchor: none;
   padding: 24px 16px 48px;
   display: flex;
   flex-direction: column;
@@ -429,7 +438,7 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 .page {
   position: relative;
   container-type: inline-size;
-  width: min(calc(92% * var(--zoom)), calc(640px * var(--zoom)));
+  width: calc(var(--fit-width) * var(--zoom));
   flex: none;
   background: #fff;
   box-shadow: var(--page-shadow);
@@ -440,7 +449,7 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
 .outer-run { display: contents; }
 .outer-page {
   position: relative;
-  width: min(calc(92% * var(--zoom)), calc(640px * var(--zoom)));
+  width: calc(var(--fit-width) * var(--zoom));
   aspect-ratio: 1 / 1.414;
   flex: none;
   background: #fff;
@@ -471,8 +480,43 @@ section, aside { min-width: 0; min-height: 0; display: flex; flex-direction: col
   pointer-events: none;
   user-select: none;
 }
-.page.is-final svg,
-.page.is-final .chunkwin { opacity: 0; }
+.page.is-final > svg,
+.page.is-final > .chunkwin { opacity: 0; }
+/* a canonical page kept for its body with a head or foot that is no longer
+   the page's: those slots are taken off the image, and the page's own layer
+   shows there, above it (app.js showListSlots) */
+.page.is-final.canon-slots > svg:not(.tdom-canonical-delta) {
+  position: relative;
+  z-index: 6;
+  opacity: 1;
+  pointer-events: none;
+}
+.page.is-final.canon-slots > svg:not(.tdom-canonical-delta) > * { visibility: hidden; }
+.page.is-final.canon-slot-h > svg > [data-hf-slot="h"] { visibility: visible; clip-path: var(--canon-slot-h) view-box; }
+.page.is-final.canon-slot-f > svg > [data-hf-slot="f"] { visibility: visible; clip-path: var(--canon-slot-f) view-box; }
+.page.is-final.canon-slot-h > .chunkwin[data-hf-slot="h"],
+.page.is-final.canon-slot-f > .chunkwin[data-hf-slot="f"] {
+  opacity: 1;
+  z-index: 6;
+  clip-path: var(--canon-slot-clip);
+  pointer-events: none;
+}
+.page.withdrawn-slot-h > .chunkwin[data-hf-slot="h"],
+.page.withdrawn-slot-f > .chunkwin[data-hf-slot="f"],
+.page.withdrawn-slot-h > svg > [data-hf-slot="h"],
+.page.withdrawn-slot-f > svg > [data-hf-slot="f"] { visibility: hidden; }
+.page > .tdom-staged-furniture {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.page.awaiting-canonical > .tdom-staged-furniture { visibility: visible; }
+.page.is-final > .tdom-staged-furniture { display: none; }
+.page.is-final > .tdom-staged-furniture.over-canonical:not([hidden]) {
+  display: block;
+  clip-path: var(--tdom-furniture-clip);
+  z-index: 6;
+}
 .page.is-final svg.tdom-canonical-delta {
   display: block;
   position: absolute;

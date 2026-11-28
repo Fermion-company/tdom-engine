@@ -22,6 +22,9 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { CheckpointEngine } from './engine/checkpoint/engine-v3.js';
+import { scoreReverseText } from './engine/checkpoint/jump-sync.js';
+import { documentBounds, segmentBody } from './engine/segmenter.js';
+import { SourceStore } from './engine/source-store.js';
 import { editPageRenderIds } from './engine/checkpoint/update-helpers.js';
 import {
   buildTerminalCanonicalPatch,
@@ -1086,6 +1089,8 @@ function childAnchorEditBeforeOverlay(
     return {
       ...checked.delta,
       file,
+      before: prior.text,
+      after: nextDiskText,
       canonicalInputPath: readPath,
       inputTransition: 'remove-overlay',
       inputText: nextDiskText,
@@ -1105,7 +1110,8 @@ function childAnchorEditBeforeOverlay(
   }
   const delta = singlePlainTextDelta(prior.text, mutation.text);
   return delta
-    ? { ...delta, file, canonicalInputPath: readPath, inputTransition: 'overlay' }
+    ? { ...delta, file, before: prior.text, after: mutation.text,
+        canonicalInputPath: readPath, inputTransition: 'overlay' }
     : reject('child-not-plain-text');
 }
 
@@ -1341,10 +1347,17 @@ engine.onDocumentResetComplete = ({ report } = {}) => {
   completeDocumentReset();
 };
 
+engine.onOpeningSettled = () => broadcast({ kind: 'opening-settled' });
+
 // async patches (TikZ renders, late chain discoveries) from the checkpoint engine
 engine.onAsyncPatches = (partial) => {
   if (domCache) domCache.dirty = true;
-  broadcast({ kind: 'patches', rev: partial.rev, fonts: partial.fonts, patches: partial.patches });
+  // (`rev` is the layout revision; its page count and source revision come
+  // with it: web/app.js orders patches and reports by it)
+  broadcast({
+    kind: 'patches', rev: partial.rev, fonts: partial.fonts, patches: partial.patches,
+    pageCount: partial.pageCount, srcRev: partial.srcRev,
+  });
 };
 // The index canonical made reached the resident job (engine-v3.js
 // #syncResidentIndex): typeset the index block now and publish it.
@@ -1639,8 +1652,16 @@ function docPayload() {
     previewPolicy: engine.previewPolicy,
     previewReasons: engine.previewReasons,
     canonical: engine.canonical.info(),
+    opening: !!engine.opening,
     source: engine.getSource(),
     pages: engine.getDisplayLists(),
+    // (the engine revision these lists are of: a viewer that took newer
+    // patches meanwhile keeps them, web/app.js resyncPendingLayout)
+    layoutRev: engine.rev,
+    // (and their source revision: between an update and its report it is
+    // not `report`'s, and a viewer does not put these lists under that
+    // report's source map, web/app.js adoptResyncDoc)
+    layoutSrcRev: engine.srcRev,
     geometry: geometry(),
     fonts: engine.getFontManifest(),
     report: lastReport,
@@ -1777,16 +1798,16 @@ function canonicalInputForProjectFile(rawFile) {
   return projectFile;
 }
 
+function activeSourceText(file) {
+  const projectFile = path.resolve(file);
+  if (projectFile === path.resolve(activeProject.filePath)) return engine.getSource();
+  try { return projectInputOverride(projectFile) ?? readFileSync(projectFile, 'utf8'); }
+  catch { return null; }
+}
+
 function activeSourceLine(file, line) {
   if (!Number.isInteger(line) || line < 1) return '';
-  const projectFile = path.resolve(file);
-  let text = null;
-  if (projectFile === path.resolve(activeProject.filePath)) text = engine.getSource();
-  else text = projectInputOverride(projectFile);
-  if (text == null) {
-    try { text = readFileSync(projectFile, 'utf8'); } catch { return ''; }
-  }
-  return String(text).split(/\r?\n/)[line - 1] ?? '';
+  return activeSourceText(file)?.split(/\r\n?|\n/)[line - 1] ?? '';
 }
 
 // SyncTeX records glue and boxes, not characters: a click on the first word
@@ -1796,8 +1817,7 @@ function activeSourceLine(file, line) {
 // boxes name the clicked word and its neighbours; the source line that holds
 // them is the answer. Returns null to keep SyncTeX's own location.
 const syncWord = (value) => {
-  const text = String(value ?? '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
-  return text.slice(0, 64);
+  return String(value ?? '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 };
 const syncSourceWords = (line) => String(line ?? '')
   .replace(/(^|[^\\])%.*$/, '$1')
@@ -1805,8 +1825,8 @@ const syncSourceWords = (line) => String(line ?? '')
   .split(/[\s{}[\]()~]+/)
   .map(syncWord)
   .filter(Boolean);
-async function wordsAtPaperPoint({ page, x, y, id }) {
-  const pages = await engine.canonical.pageTextBoxes(id).catch(() => null);
+async function wordsAtPaperPoint({ renderer, page, x, y, id }) {
+  const pages = await renderer.pageTextBoxes(id).catch(() => null);
   const boxes = pages?.[page - 1];
   if (!Array.isArray(boxes) || !boxes.length) return null;
   const hit = boxes.find((box) => x >= box.left - 1 && x <= box.right + 1 && y >= box.top - 1 && y <= box.bottom + 1);
@@ -1821,8 +1841,7 @@ async function wordsAtPaperPoint({ page, x, y, id }) {
     prevPoint: center(line[at - 1]), nextPoint: center(line[at + 1]),
   };
 }
-async function refineSyncHitByWords({ page, x, y, id, hit, resolveFile }) {
-  const context = await wordsAtPaperPoint({ page, x, y, id });
+async function refineSyncHitByWords({ renderer, page, id, hit, context, resolveFile, sourceLine = activeSourceLine }) {
   const word = syncWord(context?.word);
   if (!word) return null;
   const prev = syncWord(context.prev);
@@ -1839,30 +1858,34 @@ async function refineSyncHitByWords({ page, x, y, id, hit, resolveFile }) {
   // file when the point itself fell onto a page or column box.
   for (const point of [context.nextPoint, context.prevPoint]) {
     if (!point) continue;
-    const other = await engine.canonical.reverseSync({ page, x: point.x, y: point.y, id }).catch(() => null);
+    const other = await renderer.reverseSync({ page, x: point.x, y: point.y, id }).catch(() => null);
     const file = other ? resolveFile(other.file) : null;
     if (file) for (let delta = -2; delta <= 2; delta += 1) add(file, other.line + delta, 20 + Math.abs(delta));
   }
-  const score = (text) => {
-    const words = syncSourceWords(text);
-    let best = 0;
-    words.forEach((item, i) => {
-      if (item !== word) return;
-      best = Math.max(best, 1);
-      if (prev && words[i - 1] === prev) best = Math.max(best, 2);
-      if (next && words[i + 1] === next) best = Math.max(best, 2);
-      if (prev && next && words[i - 1] === prev && words[i + 1] === next) best = 3;
-    });
-    return best;
-  };
+  const score = (text) => scoreReverseText(syncSourceWords(text), { word, prev, next });
   let best = null;
   for (const candidate of candidates.values()) {
-    const value = score(activeSourceLine(candidate.file, candidate.line));
+    const value = score(sourceLine(candidate.file, candidate.line));
     if (value && (!best || value > best.value || (value === best.value && candidate.near < best.near))) best = { ...candidate, value };
   }
   if (!best || (best.value === 1 && word.length < 4)) return null;
-  if (score(activeSourceLine(hit.file, hit.line)) >= best.value) return null;
+  if (score(sourceLine(hit.file, hit.line)) >= best.value) return null;
   return { file: best.file, line: best.line };
+}
+
+// Canonical-only pages may never have had a resident block snapshot. Use
+// the existing source segmenter on the compiled text for the fallback span.
+function compiledSourceBlock(source, line) {
+  const text = source.replace(/\r\n?/g, '\n');
+  const store = new SourceStore();
+  store.open('source', text);
+  const at = store.lineStarts('source')[line - 1];
+  if (at == null) return null;
+  const { body, literalEnvs } = documentBounds(text);
+  const block = segmentBody(text.slice(body.start, body.end), body.start, { literalEnvs }).find(segment =>
+    store.position('source', segment.start).line <= line && at < segment.end);
+  return block && { start: store.position('source', block.start).line,
+    end: store.position('source', block.end - 1).line };
 }
 
 async function validatedForwardSyncAll(location, id) {
@@ -2215,6 +2238,8 @@ const server = http.createServer(async (req, res) => {
         url.pathname === '/opaque-editor-coordinator.js' ||
         url.pathname === '/direct-edit-geometry.js' ||
         url.pathname === '/viewport-math.js' ||
+        url.pathname === '/view-anchor.js' ||
+        url.pathname === '/source-line-map.js' ||
         url.pathname === '/canonical-anchor-raster.js' ||
         url.pathname === '/style.css' ||
         url.pathname === '/compare.js')
@@ -2232,12 +2257,13 @@ const server = http.createServer(async (req, res) => {
     // poll every second. A hung/killed server simply stops answering this.
     if (req.method === 'GET' && url.pathname === '/status') {
       res.setHeader('Cache-Control', 'no-store');
+      const furniturePending = engine.hfPending;
       return json(res, {
         up: true,
         pid: process.pid,
         boot: BOOT_ID,
         port: PORT,
-        busy: engineBusy > 0,
+        busy: engineBusy > 0 || furniturePending,
         queued: engineBusy,
         busyMs: engineBusy > 0 ? Date.now() - engineBusySince : 0,
         mode: engine.mode,
@@ -2298,6 +2324,10 @@ const server = http.createServer(async (req, res) => {
         // pages the resident layout has right now (async rescues and
         // repaginations move it between edit reports)
         residentPages: engine.pages?.length ?? null,
+        opening: !!engine.opening,
+        furniture: {
+          pending: furniturePending,
+        },
         render: {
           queued: [...engine.renderWant.keys()],
           pumping: engine.renderPumping,
@@ -2680,66 +2710,137 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/synctex') {
       const body = JSON.parse(await readBody(req));
-      const hit = await engine.canonical.reverseSync({
-        page: Number(body.page),
-        x: Number(body.x),
-        y: Number(body.y),
-        id: body.id == null ? null : Number(body.id),
-      });
+      const page = Number(body.page), x = Number(body.x), y = Number(body.y);
+      const renderer = engine.canonical;
+      const mapsDisplayedPaper = Number.isSafeInteger(body.displayedSourceRev);
+      const id = body.id != null ? Number(body.id) : mapsDisplayedPaper ? null : renderer.info().id;
+      const canonicalSource = path.join(renderer.workDir, 'canon.tex');
+      const bibliography = path.join(renderer.workDir, 'canon.bbl');
+      const epoch = documentEpoch;
+      const root = path.resolve(activeProject.filePath);
+      const behind = () => mapsDisplayedPaper &&
+        (body.displayedSourceRev !== engine.srcRev || !renderer.sourceMatches(engine.getSource(), id));
+      const invalidPaper = () => epoch !== documentEpoch || renderer !== engine.canonical || pendingDocumentReset;
+      const unavailable = () => json(res, { reason: 'paper-unavailable' }, 404);
+      if (invalidPaper() || body.documentEpoch != null && body.documentEpoch !== epoch ||
+          body.boot != null && body.boot !== BOOT_ID) return unavailable();
+      if (body.fallback === true && body.documentEpoch === epoch) {
+        return json(res, { file: root, line: 1, column: 1 });
+      }
+      if (!Number.isSafeInteger(id) || id < 1 || !renderer.generationCertificate(id)) return unavailable();
+
+      const resolveFile = (candidate) => {
+        let file = path.resolve(candidate);
+        if (file === canonicalSource) return root;
+        if (activeProject.overlayDir && isPathInside(activeProject.overlayDir, file)) {
+          file = path.join(activeProject.docDir, path.relative(activeProject.overlayDir, file));
+        }
+        return isPathInside(activeProject.docDir, file) ? file : null;
+      };
+      const inputFile = file => file === root ? canonicalSource : file;
+      const point = { renderer, page, x, y, id };
+      const translate = (file, line, options, extra) => {
+        const current = activeSourceText(file);
+        const previous = renderer.syncSource(id, inputFile(file));
+        if (current == null || previous == null) return unavailable();
+        const location = renderer.mapSyncLocation(id, inputFile(file), current, line, {
+          ...options,
+          get block() { return compiledSourceBlock(previous, line); },
+        });
+        if (!location) return unavailable();
+        return json(res, { file, ...location, lineText: current.split(/\r\n?|\n/)[location.line - 1],
+          ...extra, mappedSourceRev: engine.srcRev });
+      };
+      const verticalReply = async vertical => {
+        const hit = vertical.hit;
+        if (invalidPaper()) return unavailable();
+        if (!hit) return json(res, { error: 'source location not found', reason: 'unreadable' }, 404);
+        const file = resolveFile(hit.file);
+        if (!file) return unavailable();
+        const anchor = { page, x, y, box: hit.box, direction: 'tate' };
+        const extra = { anchor, anchors: [anchor], direction: 'tate', refinedByText: true };
+        if (behind()) {
+          await renderer.syncSourcesFor(id);
+          if (invalidPaper()) return unavailable();
+          return translate(file, hit.line, { column: 1, ...hit.context }, extra);
+        }
+        return json(res, { file, line: hit.line, column: 1, lineText: activeSourceLine(file, hit.line), ...extra });
+      };
+      const tryRetainedVertical = async () => {
+        const vertical = await renderer.verticalSourceAtPoint(point);
+        if (invalidPaper()) return unavailable();
+        if (vertical?.onInk) return verticalReply(vertical);
+        return null;
+      };
+
+      let retained = behind();
+      if (!retained && (engine.tateExact || engine.blocks.some(block => block.galley?.tdomTate))) {
+        const rootSource = engine.getSource();
+        const vertical = await renderer.verticalSourceAtPoint({
+          ...point, rootSource, tateBody: engine.getGeometry()?.writingDirection === 'tate',
+          inputs: [{ file: canonicalSource, source: rootSource },
+            ...[...engine.includes].filter(([file]) => isPathInside(activeProject.docDir, file))
+              .map(([file, entry]) => ({ file, source: entry.text }))],
+        });
+        if (invalidPaper()) return unavailable();
+        retained = behind();
+        if (vertical && !retained) return verticalReply(vertical);
+      }
+      if (retained) {
+        const reply = await tryRetainedVertical();
+        if (reply !== null) return reply;
+      }
+
+      const hit = await renderer.reverseSync(point);
+      if (invalidPaper()) return unavailable();
       if (!hit) return json(res, { error: 'source location not found' }, 404);
-      const anchors = await engine.canonical.forwardSyncAll({
-        file: hit.file,
-        line: hit.line,
-        column: hit.column,
-        id: body.id == null ? null : Number(body.id),
-      });
-      const page = Number(body.page);
-      const px = Number(body.x);
-      const py = Number(body.y);
-      const distance = (item) => {
-        const box = item.box;
-        const dx = px < box.left ? box.left - px : px > box.right ? px - box.right : 0;
-        const dy = py < box.top ? box.top - py : py > box.bottom ? py - box.bottom : 0;
+      const anchors = await renderer.forwardSyncAll({ file: hit.file, line: hit.line, column: hit.column, id });
+      if (invalidPaper()) return unavailable();
+      const distance = ({ box }) => {
+        const dx = x < box.left ? box.left - x : x > box.right ? x - box.right : 0;
+        const dy = y < box.top ? box.top - y : y > box.bottom ? y - box.bottom : 0;
         return dx * dx + dy * dy;
       };
-      const anchor = anchors.filter((item) => item.page === page).sort((a, b) => distance(a) - distance(b))[0] ??
+      const anchor = anchors.filter(item => item.page === page).sort((a, b) => distance(a) - distance(b))[0] ??
         anchors[0] ?? null;
-      let file = path.resolve(hit.file);
-      const canonicalSource = path.join(engine.canonical.workDir, 'canon.tex');
-      if (file === canonicalSource) file = activeProject.filePath;
-      else if (file === path.join(engine.canonical.workDir, 'canon.bbl')) {
-        const location = bibliographySourceLocation(readFileSync(file, 'utf8'), hit.line);
-        if (location) return json(res, { ...location, anchor, anchors });
+      const file = resolveFile(hit.file);
+      if (path.resolve(hit.file) === bibliography) {
+        const sources = await renderer.syncSourcesFor(id);
+        if (invalidPaper()) return unavailable();
+        const text = sources?.get(bibliography);
+        const location = text && bibliographySourceLocation(text, hit.line);
+        if (location) return json(res, { ...location, anchor, anchors, ...(behind() && { mappedSourceRev: engine.srcRev }) });
       }
-      else if (activeProject.overlayDir && isPathInside(activeProject.overlayDir, file)) {
-        file = path.join(activeProject.docDir, path.relative(activeProject.overlayDir, file));
-      }
-      if (!isPathInside(activeProject.docDir, file)) {
-        return json(res, { error: 'source location is outside the project' }, 404);
-      }
-      const resolveFile = (candidate) => {
-        let resolved = path.resolve(String(candidate ?? ''));
-        if (resolved === canonicalSource) resolved = activeProject.filePath;
-        else if (activeProject.overlayDir && isPathInside(activeProject.overlayDir, resolved)) {
-          resolved = path.join(activeProject.docDir, path.relative(activeProject.overlayDir, resolved));
+      if (!file) return json(res, { error: 'source location is outside the project' }, 404);
+
+      const context = await wordsAtPaperPoint(point);
+      if (invalidPaper()) return unavailable();
+      if (mapsDisplayedPaper) await renderer.syncSourcesFor(id);
+      if (invalidPaper()) return unavailable();
+      const compiledLines = new Map();
+      const sourceLine = (candidate, line) => {
+        if (!compiledLines.has(candidate)) {
+          compiledLines.set(candidate, renderer.syncSource(id, inputFile(candidate))?.split(/\r\n?|\n/));
         }
-        return isPathInside(activeProject.docDir, resolved) ? resolved : null;
+        return compiledLines.get(candidate)?.[line - 1] ?? '';
       };
-      const refined = await refineSyncHitByWords({
-        page, x: px, y: py, id: body.id == null ? null : Number(body.id),
-        hit: { file, line: hit.line }, resolveFile,
-      }).catch(() => null);
-      const line = refined?.line ?? hit.line;
-      if (refined) file = refined.file;
-      return json(res, {
-        file,
-        line,
-        column: refined ? 1 : hit.column,
-        lineText: activeSourceLine(file, line),
-        anchor,
-        anchors,
-        ...(refined ? { refinedByText: true } : {}),
-      });
+      const args = { ...point, hit: { file, line: hit.line }, resolveFile, context,
+        ...(mapsDisplayedPaper && { sourceLine }) };
+      const refined = await refineSyncHitByWords(args).catch(() => null);
+      if (invalidPaper()) return unavailable();
+      if (!behind()) {
+        const line = refined?.line ?? hit.line, target = refined?.file ?? file;
+        return json(res, { file: target, line, column: refined ? 1 : hit.column,
+          lineText: (mapsDisplayedPaper ? sourceLine : activeSourceLine)(target, line),
+          anchor, anchors, ...(refined && { refinedByText: true }) });
+      }
+      if (!retained) {
+        const reply = await tryRetainedVertical();
+        if (reply !== null) return reply;
+      }
+      return translate(refined?.file ?? file, refined?.line ?? hit.line, {
+        column: refined ? 1 : hit.column, ...context,
+      }, { anchor, anchors, ...(refined && { refinedByText: true }) });
     }
     if (req.method === 'POST' && url.pathname === '/synctex/jump') {
       const body = JSON.parse(await readBody(req));
@@ -2747,18 +2848,41 @@ const server = http.createServer(async (req, res) => {
       const file = canonicalInputForProjectFile(body.file);
       const line = Number(body.line);
       if (!file || !Number.isSafeInteger(line) || line < 1) return json(res, { error: 'invalid source location' }, 400);
-      const pending = () => ({ pending: true, documentEpoch, srcRev: engine.srcRev });
+      // No answer says why (`reason`), so a host can tell "this line typesets
+      // nothing" from "cannot tell":
+      //   'pending'      no pass of this source revision yet (ask again)
+      //   'failed'       the pass of this source revision failed
+      //   'no-ink'       the current pass typeset nothing for this line
+      //   'not-an-input' the current pass did not read this file (as it is)
+      //   'unreadable'   the file, or the pass's SyncTeX or PDF text, could not be read
+      const pending = () => ({ pending: true, reason: 'pending', documentEpoch, srcRev: engine.srcRev });
       if (pendingDocumentReset || engineBusy || Number(body.documentEpoch) !== epoch || Number(body.srcRev) !== rev) {
         return json(res, pending());
       }
       const rootSource = engine.getSource();
       const projectFile = path.resolve(activeProject.docDir, body.file);
       let source = projectFile === path.resolve(activeProject.filePath) ? rootSource : projectInputOverride(projectFile);
-      if (source == null) { try { source = readFileSync(projectFile, 'utf8'); } catch { return json(res, { found: false }); } }
-      const hit = await engine.canonical.jumpToSource({ file, line, source, rootSource, rev });
+      if (source == null) {
+        try { source = readFileSync(projectFile, 'utf8'); } catch { return json(res, { found: false, reason: 'unreadable' }); }
+      }
+      const why = {};
+      engine.navigationPending = (engine.navigationPending ?? 0) + 1;
+      let hit;
+      try {
+        hit = await engine.canonical.jumpToSource({ file, line, source, rootSource, rev, why, verticalWriting: engine.tateExact });
+      } finally {
+        engine.navigationPending--;
+      }
       if (documentEpoch !== epoch || engine.srcRev !== rev || engineBusy || pendingDocumentReset) return json(res, pending());
       if (hit) return json(res, { ...hit, documentEpoch: epoch });
-      return json(res, { ...pending(), pending: engine.canonical.info().errorRev !== rev && !engine.canonical.sourceMatches(rootSource) });
+      const failed = engine.canonical.info().errorRev === rev;
+      // (`pending` keeps its meaning for the viewer: a pass of the root's
+      // current text is still to come. A pass behind only on another input
+      // is 'pending' by reason, as it is still to come too.)
+      const waiting = !failed && !engine.canonical.sourceMatches(rootSource);
+      const reason = waiting ? 'pending' : failed ? 'failed'
+        : why.reason === 'not-current' ? 'pending' : why.reason ?? 'unreadable';
+      return json(res, { pending: waiting, reason, documentEpoch, srcRev: engine.srcRev });
     }
     if (req.method === 'POST' && url.pathname === '/synctex/forward') {
       const body = JSON.parse(await readBody(req));
@@ -2999,7 +3123,6 @@ const server = http.createServer(async (req, res) => {
       if (typeof start !== 'number' || typeof end !== 'number' || typeof text !== 'string') {
         return json(res, { error: 'edit requires {start, end, text}' }, 400);
       }
-      anchorFocus = { offset: start + text.length, filePath: typeof body.filePath === 'string' ? body.filePath : null };
       let anchorEpoch = null;
       let resetEpoch = null;
       let anchorInputSafe = false;
@@ -3150,6 +3273,23 @@ const server = http.createServer(async (req, res) => {
               : childInputMatches
           );
           if (!anchorInputSafe) anchorBaseSnapshot = null;
+          if (rootChanged) {
+            anchorFocus = { offset: start + text.length, filePath: activeProject.filePath };
+          } else if (childInputMatches) {
+            anchorFocus = { offset: anchorEdit.start + anchorEdit.text.length, filePath: anchorEdit.file };
+          }
+          const projectInputChanges = { changed: overlayDelta.changed, removed: overlayDelta.removed };
+          // Preserve the verified child-local range through refresh. An
+          // overlay-only update otherwise has no edit context for resident
+          // admission, even when it changes a single plain paragraph.
+          const childEdit = childInputMatches ? {
+            file: anchorEdit.file,
+            start: anchorEdit.start,
+            end: anchorEdit.end,
+            replacement: anchorEdit.text,
+            before: anchorEdit.before,
+            after: anchorEdit.after,
+          } : null;
           if (anchorBaseSnapshot) {
             anchorProofPrefetch = prefetchCanonicalAnchorProof(
               anchorBaseSnapshot,
@@ -3178,16 +3318,8 @@ const server = http.createServer(async (req, res) => {
             // Keep the last-good bibliography while the user is typing and
             // run only the latest snapshot after a short idle window.
             const report = rootChanged
-              ? await engine.edit(start, end, text, engine.file, {
-                  changed: overlayDelta.changed,
-                  removed: overlayDelta.removed,
-                })
-              : changedInputs.length
-                ? await engine.refresh({
-                    changed: overlayDelta.changed,
-                    removed: overlayDelta.removed,
-                  })
-                : await engine.edit(start, end, text);
+              ? await engine.edit(start, end, text, engine.file, projectInputChanges)
+              : await engine.refresh(projectInputChanges, childEdit);
             scheduleProjectBibliographyRefresh('unsaved biblatex input', 450);
             return report;
           }
@@ -3219,15 +3351,8 @@ const server = http.createServer(async (req, res) => {
             return report;
           }
           let primaryReport;
-          if (rootChanged) primaryReport = await engine.edit(start, end, text, engine.file, {
-            changed: overlayDelta.changed,
-            removed: overlayDelta.removed,
-          });
-          else if (changedInputs.length) primaryReport = await engine.refresh({
-            changed: overlayDelta.changed,
-            removed: overlayDelta.removed,
-          });
-          else primaryReport = await engine.edit(start, end, text);
+          if (rootChanged) primaryReport = await engine.edit(start, end, text, engine.file, projectInputChanges);
+          else primaryReport = await engine.refresh(projectInputChanges, childEdit);
           if (!bibliographyChanged) return primaryReport;
 
           // Keep disjoint project changes cheap: first update the edited

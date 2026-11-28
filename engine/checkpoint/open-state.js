@@ -1,6 +1,7 @@
 import { clearShipPacing } from './ship-pacing.js';
 import { makeChunkMap } from './constructor-state.js';
 import { LabelTable } from './label-table.js';
+import { releaseFurniture } from './canonical-arrival.js';
 
 export function resetOpenState(engine, text, file) {
   engine.shipDocumentEpoch = (engine.shipDocumentEpoch ?? 0) + 1;
@@ -29,6 +30,7 @@ export function resetOpenState(engine, text, file) {
   engine.file = file;
   engine.store.open(file, text);
   engine.blocks = [];
+  engine.blocksById = new Map();
   engine.canonicalPageCount = null;
   engine.checkpointKeepCache = null;
   engine.checkpointHotFloorMs = 1;
@@ -47,6 +49,7 @@ export function resetOpenState(engine, text, file) {
   engine.structuredBootError = null;
   engine.previewPolicy = 'structured';
   engine.previewReasons = [];
+  engine.tateExact = false;
   // An opaque predecessor left the canonical at display pressure; the new
   // document's gate sets it again if it is opaque too.
   engine.canonical.pressure = 'authority';
@@ -58,6 +61,7 @@ export function resetOpenState(engine, text, file) {
   // every /open stacked the previous document's SVG chunks, poison marks
   // and file watchers into the process for its whole lifetime
   engine.chunks = makeChunkMap();
+  engine.hfBandTop = 0; // (no band in the new map: canonical-arrival.js pruneFurniture)
   engine.unsafeBodyBlocks = new Map();
   engine.preGate = null;
   engine.poisoned = new Map();
@@ -85,9 +89,15 @@ export function resetOpenState(engine, text, file) {
   engine.tocOwed = false;
   engine.hf = new Map();
   engine.hfSig = null;
-  engine.hfPending = null;
-  engine.hfQueued = null;
-  engine.hfQueuedSig = null;
+  // (what each page's head and foot were made from, from the first source change on: engine-v3.js #noteFurnitureInputs)
+  engine.hfInputs = null;
+  engine.hfInputsSpecs = null;
+  // A header job in flight (waiting for a Build lease, typically) is not
+  // abandoned: it plans for this document when it runs, and only its owner
+  // clears its state (header-scheduler.js). Two jobs used to run at once.
+  engine.hfQueued = !!engine.hfJob;
+  engine.hfScheduleQueued = null;
+  releaseFurniture(engine);
   engine.diagnostics.length = 0;
   engine.includes.clear();
   engine.resourceReads.clear();

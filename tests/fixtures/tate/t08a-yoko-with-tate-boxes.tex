@@ -1,0 +1,16 @@
+\documentclass[a5paper]{ltjsarticle}
+\usepackage{lltjext}
+\begin{document}
+\section{横組みの中の縦組み}
+横組みの本文の中に縦組みの箱を置く。次の箱は\verb|\parbox<t>|で作った。
+\parbox<t>{6\zw}{縦書きの箱の中身。二行目に続く。}
+箱のあとも横組みの本文が続く。ここまでが一つ目の段落である。
+
+次は\verb|minipage<t>|である。
+\begin{minipage}<t>{8\zw}
+ミニページの中は縦組みで、少し長めの文を入れておく。三行ほどになるはずだ。
+\end{minipage}
+ミニページのあとの文。
+
+最後に\verb|\hbox{\tate ...}|で一行だけの縦組み：\hbox{\tate 縦の一行}。そして横組みに戻る。
+\end{document}

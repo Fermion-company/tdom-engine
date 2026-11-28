@@ -1,6 +1,7 @@
 import { classifyResidentEdit } from './resident-edit-admission.js';
 import { SAFE_GLYPH } from './fidelity.js';
 import { discoverEditRegions } from '../edit-regions.js';
+import { furnitureGalleyKey } from './page-metadata.js';
 
 // What a keystroke of prose never contains: anything TeX reads as syntax.
 const PROSE_BARRIER = /[\\$%{}&#^_~\r\n]/;
@@ -189,8 +190,14 @@ export function classifyPlainPreviewEdit(engine, options) {
   // paragraph 35 ms of verification before anything was shown). Before any
   // other neighbour the same edit is judged as a prose keystroke.
   const probe = admitted.kind === 'probe' && (next.gfx || Number(next.typesetCostMs) >= HEAVY_NEIGHBOUR_MS);
-  const prose = probe || options.rebooted ? null : proseKeystroke(old, engine.blocks[idx]);
-  if (!probe && !prose) return tracePlain('not-prose', admitted.kind);
+  const plain = probe ? plainPreviewWitness(old) : null;
+  // A replay prelude can disqualify the JOB's catcode certificate even for
+  // ordinary prose. The prose path still checks the edited span and requires
+  // the same TeX boundary after the edit.
+  const replayedProse = old?.galley?.tdomRenderPrelude && !old.galley.tdomActive;
+  const prose = !plain && !options.rebooted && (!probe || replayedProse)
+    ? proseKeystroke(old, engine.blocks[idx]) : null;
+  if (!plain && !prose) return probe ? tracePlain('no-witness', 'plain') : tracePlain('not-prose', admitted.kind);
   if (prose && (touchesActive(old?.galley?.tdomActive, prose.removed) || touchesActive(old?.galley?.tdomActive, prose.inserted))) {
     return tracePlain('active-character');
   }
@@ -200,7 +207,7 @@ export function classifyPlainPreviewEdit(engine, options) {
       touchesActive(old?.galley?.tdomMathActive, prose.inserted))) {
     return tracePlain('math-active-character');
   }
-  const witness = prose ? proseBoundaryWitness(old) : plainPreviewWitness(old);
+  const witness = prose ? proseBoundaryWitness(old) : plain;
   if (!witness) return tracePlain('no-witness', prose ? 'prose' : 'plain');
   tracePlain('admitted', prose ? 'prose' : 'probe');
   return { blockId: id, witness, galley: old.galley, stateVec: old.stateVec, prose };
@@ -223,4 +230,33 @@ export function canDeferPlainVerification(admission, before, block) {
   const same = (admission.prose ? proseBoundaryWitness(block) : plainPreviewWitness(block)) === admission.witness;
   if (!same) tracePlain('witness-after', 'the paragraph left TeX differently');
   return same;
+}
+
+/** A native clearpage can change its empty-page closing glue when the
+ * preceding last glyph changes depth. The successor has already verified
+ * the exit and furniture state. Leave further verification to the usual
+ * settle pass when this is the only difference in the clearpage galley.
+ */
+export function sameClearpageContinuation(was, now, beforeProse, afterProse) {
+  if (was?.closure !== 'native' || now?.closure !== 'native' ||
+      was.gfx || now.gfx || was.items.length !== now.items.length ||
+      was.floats?.length || now.floats?.length ||
+      furnitureGalleyKey(was) !== furnitureGalleyKey(now) ||
+      !['labels', 'refs', 'toclines'].every((key) => JSON.stringify(was[key]) === JSON.stringify(now[key]))) return false;
+  const depth = afterProse?.state?.['tdom@pd'] - beforeProse?.state?.['tdom@pd'];
+  if (!Number.isFinite(depth) || depth === 0) return false;
+  const correction = depth * 72 / (72.27 * 65536);
+  const eject = was.items.findIndex((item) => item.k === 'eject' && item.v === -10000);
+  const drain = was.items.findIndex((item, index) => index > eject && item.k === 'eject' && item.v === -10001);
+  if (eject < 0 || drain < 0) return false;
+  let changed = false;
+  for (const [index, old] of was.items.entries()) {
+    const current = now.items[index];
+    if (JSON.stringify(old) === JSON.stringify(current)) continue;
+    if (changed || index <= eject || index >= drain || old.k !== 'glue' || current.k !== 'glue' ||
+        Math.abs(old.a - current.a - correction) > 0.00001 ||
+        JSON.stringify({ ...old, a: current.a }) !== JSON.stringify(current)) return false;
+    changed = true;
+  }
+  return changed;
 }

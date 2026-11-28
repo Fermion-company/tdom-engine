@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { execFile, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
@@ -165,6 +165,51 @@ test('propagation renders bypass the quiet gate and an active edit cohort withou
   assert.equal(engine.renderPumping, 0);
   assert.equal(engine.renderWant.size, 0);
 });
+
+const texluaReady = spawnSync('texlua', ['-v']).status === 0;
+
+test('a background collection confirms heap growth before lowering coverage',
+  { skip: !texluaReady && 'texlua not installed' }, () => {
+    const daemon = readFileSync(new URL('../engine/checkpoint/daemon.lua', import.meta.url), 'utf8');
+    const from = daemon.indexOf('local GC_SLICE_KB');
+    const to = daemon.indexOf('local function checkpoint_gc', from);
+    assert.ok(from > 0 && to > from, 'the background collection policy');
+    const root = mkdtempSync(path.join(tmpdir(), 'tdom-gc-floor-'));
+    const script = path.join(root, 'floor.lua');
+    try {
+      writeFileSync(script, `
+local gc_base_kb = 205100
+local slices, counts, waiting
+local function collectgarbage(operation)
+  local queue = operation == 'step' and slices or counts
+  assert(#queue > 0, operation .. ' was not expected')
+  return table.remove(queue, 1)
+end
+local function keystroke_waiting() return waiting end
+${daemon.slice(from, to)}
+-- An old cycle completes with garbage left over from the current JOB.
+TDOM_GC_FLOOR = 205100
+slices, counts, waiting = { true, true }, { 350000, 205110 }, false
+assert(gc_collect_background())
+assert(TDOM_GC_FLOOR == 205110, 'temporary garbage must not set the budget')
+-- A keystroke arrives while verifying the candidate floor.
+slices, counts, waiting = { true, false }, { 350000 }, false
+local checks = 0
+keystroke_waiting = function() checks = checks + 1; return checks > 1 end
+assert(not gc_collect_background())
+assert(TDOM_GC_FLOOR == 205110, 'an interrupted verification leaves the previous floor')
+-- A complete fresh cycle can confirm real growth.
+keystroke_waiting = function() return false end
+slices, counts = { true, true }, { 360000, 355000 }
+assert(gc_collect_background())
+assert(TDOM_GC_FLOOR == 355000, 'live growth still limits coverage')
+`);
+      const result = spawnSync('texlua', [script], { encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
 // (the one test of this file that typesets: skipped where TeX is absent, as on CI)
 const texReady = spawnSync('lualatex', ['--version']).status === 0;

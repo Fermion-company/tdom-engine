@@ -1,0 +1,54 @@
+\documentclass[paper=a4paper,fontsize=11pt]{jlreq}
+\usepackage{amsmath,amssymb}
+
+\title{リアルタイム\TeX プレビュー}
+\author{TeXConf 2026 デモ}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{打った瞬間にページが変わる}
+
+この文書は、常駐している Lua\LaTeX{} がその場で組んでいる。
+左のソースを一文字直すと、その段落を含むブロックだけが組み直され、
+変わったページだけが右側で差し替わる。行分割は本物の \TeX{} の
+Knuth--Plass 法で決まり、和文の禁則処理や和欧文間の空白も
+jlreq の設定どおりに入る。
+
+段落の途中に数式 $e^{i\pi} + 1 = 0$ を書いても、見た目は本物の出力と
+変わらない。数式の部分だけは、\TeX{} が組んだ本物の画像を上から重ねている。\footnote{脚注も本物と同じように、ページの下にまとめて置かれる。}
+
+\section{ページを組むのは JavaScript}
+
+ページ分割は、\TeX{} の規則をそのまま JavaScript で組み直している。
+段落が一行増えれば、その行はきちんと次のページへ送られる。
+\begin{equation}
+  c = \begin{cases}
+    p & (b < \infty,\ p \le -10000) \\
+    b + p + q & (b < 10000,\ |p| < 10000) \\
+    \infty & (b = \infty)
+  \end{cases}
+\end{equation}
+上の式は、ページを区切る候補ごとのコストである。
+
+\section{正しさは正本が保証する}
+
+速い表示はあくまで仮のものである。裏では普通の lualatex が
+文書全体を組んでいて、でき上がった正本の PDF と見比べ、
+外れた所があれば描き方を一段慎重にする。
+
+\begin{table}[htbp]
+  \centering
+  \begin{tabular}{lrr}
+    \hline
+    & 仮組み & フルコンパイル \\
+    \hline
+    1 文字打ってから & 約 35 ms & 約 1.3 s \\
+    \hline
+  \end{tabular}
+  \caption{画面が変わるまでの時間}
+\end{table}
+
+\end{document}

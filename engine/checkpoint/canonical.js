@@ -23,8 +23,10 @@ import { projectIndexCommand } from './index-tool.js';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
-import { copyFile, readFile } from 'node:fs/promises';
-import { gunzip } from 'node:zlib';
+import { copyFile, readFile, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { createInterface } from 'node:readline';
+import { createGunzip } from 'node:zlib';
 import {
   mkdirSync,
   writeFileSync,
@@ -38,20 +40,88 @@ import {
   statSync,
 } from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { fnv1a } from '../hash.js';
 import { withProjectInputs, isPathInside } from '../project-inputs.js';
+import { mapSourceLines } from '../../web/source-line-map.js';
 import { parseFlsFiles, MAX_FLS_INPUTS } from './fls.js';
 import { buildPdfPaintPage, PDF_PAINT_INDEX_VERSION } from './canonical-paint-index.js';
 import { pdfEditGlyphs } from './pdf-edit-geometry.js';
 import { parseSyncTeXSourceBoxes } from './pdf-source-boxes.js';
 import { prepareSyncTeXBatchHelper, querySyncTeXRange } from './synctex-batch.js';
-import { parseJumpText, parseJumpTsv, parseJumpRecords, jumpRecords, jumpAnchor, locateJump, indexStartRecords } from './jump-sync.js';
+import {
+  parseJumpText, parseJumpTsv, parseJumpRecords, jumpRecords, jumpAnchor, locateJump, indexStartRecords,
+  verticalRowAtPoint, locateVerticalSource,
+} from './jump-sync.js';
 import { pdfPageSvgArgs } from './util/svg.js';
 
 const execFileP = promisify(execFile);
-const gunzipP = promisify(gunzip);
+// A pass's SyncTeX is read a line at a time, keeping only what a lookup
+// needs: inflated whole, a long document's ran to hundreds of megabytes (the
+// reason Jump and the source boxes used to give up past 8 MB compressed,
+// e.g. a 389-page book, while the status mark was green).
+const SYNCTEX_MAX_INFLATED_BYTES = 2 * 1024 * 1024 * 1024;
+
+/** Calls onLine for each line of a (gzipped) SyncTeX file; false when it could not be read through. */
+async function eachSyncTeXLine(file, onLine) {
+  const raw = createReadStream(file);
+  const input = /\.gz$/i.test(file) ? raw.pipe(createGunzip()) : raw;
+  // (an unreadable or truncated file ends the iteration below with its error)
+  if (input !== raw) raw.on('error', error => input.destroy(error));
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  let bytes = 0;
+  try {
+    for await (const line of lines) {
+      bytes += line.length + 1;
+      if (bytes > SYNCTEX_MAX_INFLATED_BYTES) return false;
+      if (onLine(line) === false) return false;
+    }
+    return true;
+  } finally {
+    lines.close();
+    raw.destroy();
+  }
+}
+
+/**
+ * What Jump reads of a pass's SyncTeX for the inputs `wanted` accepts (paths
+ * resolved against `baseDir`): every box, since a record's place is the box
+ * around it, and those inputs' records, as parseJumpRecords reads them. Null
+ * when the file cannot be read through or is not a form Jump reads.
+ */
+export async function readJumpRecordsOf(synctexFile, baseDir, wanted) {
+  const tags = new Set();
+  const kept = [];
+  const read = await eachSyncTeXLine(synctexFile, row => {
+    const declared = /^Input:(\d+):(.+)$/.exec(row);
+    if (declared) {
+      if (wanted(path.resolve(baseDir, declared[2]))) tags.add(declared[1]);
+    } else if (/^[xgk$r]/.test(row) && !tags.has(/^.(\d+),/.exec(row)?.[1])) {
+      return; // another input's record
+    }
+    kept.push(row);
+  });
+  return read ? parseJumpRecords(kept.join('\n'), baseDir) : null;
+}
+
+/**
+ * A pass's SyncTeX as parseSyncTeXSourceBoxes reads it for one page: that
+ * page, every page's bounds, every input and the header. Null when the file
+ * cannot be read through.
+ */
+export async function readSyncTeXForPage(synctexFile, page) {
+  const kept = [];
+  let otherPage = false;
+  const read = await eachSyncTeXLine(synctexFile, row => {
+    const opening = /^\{(\d+)$/.exec(row);
+    if (opening) otherPage = Number(opening[1]) !== page;
+    else if (row.startsWith('}')) otherPage = false;
+    else if (otherPage && !row.startsWith('Input:')) return;
+    kept.push(row);
+  });
+  return read ? kept.join('\n') : null;
+}
 const MAX_PASSES = 3;
 const SVG_CACHE_MAX = 400; // pages kept as SVG strings (LRU)
 // Keep the latest result plus three predecessors. A browser may still be
@@ -178,6 +248,11 @@ export class CanonicalRenderer {
     // display mode recompiled long documents nearly back-to-back.
     this.pressure = 'authority'; // 'authority' | 'display'
     this.lastEndAt = 0;
+    // A compile that failed on a source the edits have since moved past:
+    // the next one waives the cost cooldown behind it, once per run of
+    // failures (#drain, delayFor).
+    this.failedBehindRev = null;
+    this.failureWaiverUsed = false;
     this.cooldownFactor = Number(process.env.TDOM_CANON_COOLDOWN ?? 2);
     this.cooldownCapMs = Number(process.env.TDOM_CANON_COOLDOWN_CAP ?? 600_000);
     this.displayCooldownFactor = Number(process.env.TDOM_CANON_DISPLAY_COOLDOWN ?? 1);
@@ -343,6 +418,90 @@ export class CanonicalRenderer {
     return manifest;
   }
 
+  #captureSyncSources(generation, rootSource, compileStartedAt = Infinity) {
+    const root = path.join(this.workDir, 'canon.tex');
+    generation.syncSources = new Map([[root, rootSource]]);
+    generation.syncSourcesReady = this.#readSyncSources(generation, compileStartedAt).catch(() => {});
+  }
+
+  async #readSyncSources(generation, compileStartedAt) {
+    const { syncSources, inputManifest: manifest, synctex } = generation;
+    if (!manifest?.size) return;
+    const bibliography = path.join(this.workDir, 'canon.bbl');
+    const candidates = new Set([...manifest.keys()].filter(file => /\.(?:tex|sty|cls|bib|bbl)$/i.test(file)));
+    // SyncTeX names inputs that TeX tokenized, including files with arbitrary
+    // extensions. Recorder alone also lists images, fonts and other assets.
+    if (synctex && candidates.size !== manifest.size) {
+      generation.readers++;
+      try {
+        await eachSyncTeXLine(synctex, row => {
+          if (generation.retired || this.resetting || this.disposed) return false;
+          if (!row.startsWith('Input:')) return;
+          const separator = row.indexOf(':', 6);
+          if (separator < 0) return;
+          const recorded = path.resolve(this.docDir, row.slice(separator + 1));
+          const file = this.#inputIdentity(this.#logicalInputPath(generation, recorded));
+          if (manifest.has(file)) candidates.add(file);
+        });
+      } finally {
+        this.#releaseGeneration(generation);
+      }
+    }
+    let remaining = 16 * 1024 * 1024;
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+    for (const file of candidates) {
+      if (generation.retired || this.resetting || this.disposed || remaining === 0) break;
+      if (file !== bibliography && (!isPathInside(this.docDir, file) || isPathInside(this.workDir, file))) continue;
+      const sha256 = manifest.get(file);
+      const previous = [...this.generations.values()].find(other => other !== generation &&
+        other.inputManifest?.get(file) === sha256 && other.syncSources?.has(file));
+      try {
+        const readable = this.#effectiveInputPath(file);
+        const stats = await stat(readable);
+        // A recorder lists paths, so a disk write during an uninterrupted
+        // pass still prevents those bytes from attesting what TeX read.
+        if (!stats.isFile() || stats.size > Math.min(remaining, 4 * 1024 * 1024) ||
+            Math.max(stats.mtimeMs, stats.ctimeMs) > compileStartedAt) continue;
+        let text = previous?.syncSources.get(file);
+        if (text == null) {
+          const bytes = await readFile(readable);
+          if (bytes.length > remaining || bytes.includes(0) ||
+              createHash('sha256').update(bytes).digest('hex') !== sha256) continue;
+          text = decoder.decode(bytes);
+        }
+        const size = Buffer.byteLength(text);
+        if (generation.retired || size > remaining) continue;
+        syncSources.set(file, text);
+        remaining -= size;
+      } catch { /* missing, changed or non-text input */ }
+    }
+  }
+
+  async syncSourcesFor(id) {
+    const generation = this.#resolveGeneration(id);
+    await generation?.syncSourcesReady;
+    return generation?.syncSources;
+  }
+
+  syncSource(id, file) {
+    return this.#resolveGeneration(id)?.syncSources?.get(this.#inputIdentity(file));
+  }
+
+  mapSyncLocation(id, file, current, line, options) {
+    const generation = this.#resolveGeneration(id);
+    const key = this.#inputIdentity(file);
+    const previous = generation?.syncSources?.get(key);
+    if (previous == null) return null;
+    if (previous === current) return { line, column: options.column ?? 1 };
+    const cache = generation.syncLineMaps ??= new Map();
+    let entry = cache.get(key);
+    if (entry?.current !== current) {
+      if (cache.size >= 8) cache.delete(cache.keys().next().value);
+      cache.set(key, entry = { current, lines: mapSourceLines(previous, current) });
+    }
+    return entry.lines.location(line, options);
+  }
+
   /** Validate a manifest handed in by the Build import. */
   #inputManifestFromRecords(records) {
     if (!Array.isArray(records)) return null;
@@ -406,6 +565,10 @@ export class CanonicalRenderer {
     const job = this.pendingJob;
     this.pendingJob = null;
     this.lastError = null;
+    // (a good generation is current again: a later failure starts a new run
+    // of failures, with its own waiver of the cost cooldown)
+    this.failedBehindRev = null;
+    this.failureWaiverUsed = false;
     this.displayStaleSince = null;
     this.viewerWaitSince = null;
     this.authorityStaleSince = null;
@@ -1120,8 +1283,11 @@ export class CanonicalRenderer {
     // no stale file from an older compile survives beside the new ones.
     this.#seedBuildAuxFiles(prepared.seedFiles);
     this.#registerGeneration(generation);
+    this.#captureSyncSources(generation, currentJob.source);
     this.lastEndAt = Date.now();
     this.lastError = null;
+    this.failedBehindRev = null;
+    this.failureWaiverUsed = false;
     void this.prewarmPaintIndex(id);
     try { this.onResult?.(this.info()); } catch { /* observer errors do not revoke a committed generation */ }
     return generation;
@@ -1371,18 +1537,25 @@ export class CanonicalRenderer {
     // baseline's result broadcast so a viewer's soft demand can escalate.
     if (this.#hasColdBaselineCatchup(job) && this.#hasDisplayDemand(job) &&
         this.residentImpossibleDemandIds.size) return this.displayDebounceMs;
+    // The compile before failed on a source this edit has moved past (a
+    // command half typed when it started, typically) and made no paper: the
+    // pages only canonical paints stay without it until the next one lands,
+    // and the cost cooldown behind a long document's failure was 94 s on
+    // top of the compile (tex64-internal #121). The writing-idle gate stays.
+    const failedBehind = this.failedBehindRev !== null && Number(job?.rev) > this.failedBehindRev;
     if (this.pressure !== 'authority' || job?.fallbackReason || this.#hasDisplayDemand(job)) {
       // canonical is needed for display — stay responsive on small
       // documents, but never let a long document compile back-to-back
-      if (!this.last?.ms) return this.displayDebounceMs;
-      const cool = Math.min(this.last.ms * this.displayCooldownFactor, this.displayCooldownCapMs);
+      if (!this.last?.ms || failedBehind) return this.displayDebounceMs;
+      const cool = Math.min(this.typesetEstimateMs() * this.displayCooldownFactor, this.displayCooldownCapMs);
       return Math.max(this.displayDebounceMs, cool - since);
     }
     const elapsed = preserveIdleStart && Number.isFinite(job?.scheduledAt)
       ? Math.max(0, Date.now() - job.scheduledAt) : 0;
     const stale = this.#authorityStaleIn();
     if (!this.last?.ms) return Math.max(0, Math.min(this.debounceMs - elapsed, stale)); // fast first baseline
-    const cooldown = Math.min(this.last.ms * this.cooldownFactor, this.cooldownCapMs);
+    if (failedBehind) return Math.max(0, Math.min(this.idleMs - elapsed, stale));
+    const cooldown = Math.min(this.typesetEstimateMs() * this.cooldownFactor, this.cooldownCapMs);
     return Math.max(0, Math.min(this.idleMs - elapsed, stale), cooldown - since);
   }
 
@@ -1407,7 +1580,16 @@ export class CanonicalRenderer {
     // ensure both claim `running` synchronously, so two compiles can never
     // share the workdir.
     const compileEpoch = this.compileEpoch;
-    this.runningJob = { rev, inputEpoch };
+    const queued = this.pendingJob;
+    if (queued?.rev === rev && queued.inputEpoch === inputEpoch && queued.source === source) {
+      // Export is taking over this opening baseline. Its timer can fire
+      // during this compile and leave a phantom job with no wakeup.
+      clearTimeout(this.timer);
+      this.timer = null;
+      this.timerDueAt = 0;
+      this.pendingJob = null;
+    }
+    this.runningJob = { rev, inputEpoch, srcHash };
     this.running = this.#compile({ source, rev, inputEpoch, compileEpoch })
       .catch((err) => {
         if (compileEpoch !== this.compileEpoch || err?.tdomSuperseded) return;
@@ -1511,6 +1693,10 @@ export class CanonicalRenderer {
       return;
     }
     const startedWithoutCanonical = !this.last;
+    if (this.failedBehindRev !== null && job.rev > this.failedBehindRev) {
+      this.failureWaiverUsed = true;
+      this.failedBehindRev = null;
+    }
     const compileEpoch = this.compileEpoch;
     this.runningJob = {
       rev: job.rev,
@@ -1568,6 +1754,11 @@ export class CanonicalRenderer {
     await this.running;
     if (compileEpoch !== this.compileEpoch) return;
     this.lastEndAt = Date.now();
+    // (failed, and no generation of it or later: the next source's compile
+    // need not wait out the cost cooldown, once per run of failures)
+    if (this.lastError?.rev === job.rev && !(Number(this.last?.rev) >= job.rev) && !this.failureWaiverUsed) {
+      this.failedBehindRev = job.rev;
+    }
     try {
       this.onResult?.(this.info());
     } catch {
@@ -1626,6 +1817,7 @@ export class CanonicalRenderer {
       return err;
     };
     const t0 = performance.now();
+    const compileStartedAt = performance.timeOrigin + t0;
     const srcHash = this.#sourceHash(source, inputEpoch);
     const tex = path.join(this.workDir, 'canon.tex');
     writeFileSync(tex, source.replace(/\r\n?/g, '\n'), 'utf8');
@@ -1642,13 +1834,18 @@ export class CanonicalRenderer {
         .join(',');
     let passes = 0;
     let log = '';
+    let furnitureMs = 0;
+    const furnitureWatch = this.furnitureWatch ?? '';
+    const furnitureWatchFile = furnitureWatch ? path.join(this.workDir, 'canon.furniture-watch') : null;
+    if (furnitureWatchFile) writeFileSync(furnitureWatchFile, furnitureWatch);
     let before = auxState();
     try {
     // aux fixpoint, the honest way latexmk does it: rerun while the aux
     // family keeps changing (toc page numbers, forward refs), capped
     while (passes < MAX_PASSES) {
       passes++;
-      log = await this.#runLatex(tex, background);
+      log = await this.#runLatex(tex, background, furnitureWatchFile);
+      if (furnitureWatch) furnitureMs += Number(/^TDOMHF T (\d+)$/m.exec(log)?.[1] ?? 0) / 1000;
       if (this.disposed) throw new Error('renderer disposed');
       if (compileEpoch !== this.compileEpoch) throw new Error('canonical compile superseded');
       const indexChanged = await this.#runIndexTools(background);
@@ -1713,6 +1910,7 @@ export class CanonicalRenderer {
       papers,
       passes,
       ms: Math.round(performance.now() - t0),
+      furnitureMs,
       readers: 0,
       retired: false,
       filesDeleted: false,
@@ -1721,18 +1919,26 @@ export class CanonicalRenderer {
       // full five-field \newlabel records (including destination anchors)
       // cannot be reconstructed from the renderer's scalar label table.
       seedFiles,
+      furniture: furnitureWatch ? this.#readFurnitureState(pageCount, furnitureWatch) : null,
     };
     if (this.disposed || compileEpoch !== this.compileEpoch) {
       this.#deleteGenerationFiles(generation);
       throw new Error(this.disposed ? 'renderer disposed' : 'canonical compile superseded');
     }
     this.#registerGeneration(generation, { promote: !obsolete });
+    this.#captureSyncSources(generation, source, compileStartedAt);
     if (!obsolete) this.#persistProjectSeeds(seedFiles, source);
     // Keep PDF import/open off the typing path. This intentionally does not
     // await: canonical pixels are already committed and the index is merely
     // an optional fast-proof accelerator.
     void this.prewarmPaintIndex(id);
       this.lastError = null;
+      this.failureWaiverUsed = false;
+      // A good generation at or past the failed source is current (an export
+      // that ran after the failure, typically): nothing waits behind the
+      // failure any more, and the next edit keeps the ordinary cost cooldown.
+      // A scheduled compile spends the waiver before it starts (#drain).
+      if (!obsolete && this.failedBehindRev !== null && rev >= this.failedBehindRev) this.failedBehindRev = null;
       return generation;
     } catch (error) {
       try { this.#removeMutableCompileArtifacts(); } catch { /* preserve the compile error */ }
@@ -1789,7 +1995,7 @@ export class CanonicalRenderer {
     return changed;
   }
 
-  async #runLatex(tex, background = false) {
+  async #runLatex(tex, background, furnitureWatchFile) {
     let out = '';
     try {
       const latexArgs = [
@@ -1797,9 +2003,12 @@ export class CanonicalRenderer {
         '-recorder',
         '-interaction=nonstopmode',
         '-halt-on-error',
+        '-jobname=canon',
         '-output-directory',
         this.workDir,
-        tex,
+        furnitureWatchFile
+          ? String.raw`\directlua{local ok,m=pcall(dofile,os.getenv('TDOM_FURNITURE_MODULE')); if ok then m.canonical() end; tex.sprint(string.char(92)..'input{'); tex.sprint(-2,os.getenv('TDOM_FURNITURE_INPUT')); tex.sprint('}')}`
+          : tex,
       ];
       const command = background ? 'nice' : 'lualatex';
       const requestedNice = Number(process.env.TDOM_CANON_NICE ?? 10);
@@ -1818,7 +2027,12 @@ export class CanonicalRenderer {
           // canonical page (Live stayed off for the whole session).
           timeout: Number(process.env.TDOM_CANON_TIMEOUT || 900_000),
           maxBuffer: 64 * 1024 * 1024,
-          env: withProjectInputs(process.env, {
+          env: withProjectInputs({
+            ...process.env,
+            TDOM_FURNITURE_MODULE: fileURLToPath(new URL('./furniture-state.lua', import.meta.url)),
+            TDOM_FURNITURE_INPUT: tex,
+            TDOM_FURNITURE_WATCH: furnitureWatchFile ?? '',
+          }, {
             docDir: this.docDir,
             overlayDir: this.overlayDir,
             recursive: true,
@@ -1834,6 +2048,48 @@ export class CanonicalRenderer {
       throw new Error(texErrorFrom(out) || String(err.message || err));
     }
     return out;
+  }
+
+  typesetEstimateMs() {
+    // Replay deadlines add this estimate to an integer epoch timestamp.
+    return Math.max(0, Math.round((this.last?.ms ?? 0) - (this.last?.furnitureMs ?? 0)));
+  }
+
+  #readFurnitureState(pageCount, watch) {
+    let content;
+    try { content = readFileSync(path.join(this.workDir, 'canon.log'), 'utf8'); } catch { return null; }
+    const pages = new Map();
+    const covered = watch.trim().split('\n').filter((name) => name !== 'c@page');
+    let values = new Map(), snapshot = [];
+    let n, page, name = '';
+    for (const [, type, value] of content.matchAll(/^TDOMHF ([PNVE])(?: (.*))?$/gm)) {
+      if (type === 'P') {
+        const [index, folio] = (value ?? '').split(' ');
+        if (!/^\d+$/.test(index) || Number(index) < 1 || Number(index) > pageCount ||
+            !/^(?:-?\d+|-)$/.test(folio) || page || pages.has(Number(index))) return null;
+        n = Number(index);
+        page = { folio: folio === '-' ? null : Number(folio), covered };
+        name = '';
+      } else if (type === 'N' && page && /^(?:[\da-f]{2})+$/.test(value)) {
+        name += value;
+      } else if (type === 'V' && page && name && /^(?:[\da-f]{32}|-)(?: switch)?$|^\+$/.test(value)) {
+        const [digest, kind] = value.split(' ');
+        const cs = Buffer.from(name, 'hex').toString('utf8');
+        if (digest === '+') values.delete(cs);
+        else values.set(cs, [cs, digest === '-' ? '' : digest, kind]);
+        snapshot = null;
+        name = '';
+      } else if (type === 'E' && page && !name) {
+        snapshot ??= [...values.values()];
+        pages.set(n, { ...page, values: snapshot });
+        page = null;
+      } else return null;
+    }
+    return pages;
+  }
+
+  furnitureState(id, page) {
+    return this.#resolveGeneration(id)?.furniture?.get(page) ?? null;
   }
 
   /** Resolve the PDF content transform shared by all text on one page.
@@ -2120,35 +2376,76 @@ export class CanonicalRenderer {
     }
   }
 
-  /** Jump never compiles or relabels an old PDF as the editor's revision.
-   * Its lazy index is owned (and retired) by the immutable generation. */
-  async jumpToSource({ file, line, source, rootSource = source, rev } = {}) {
-    if (!file || !Number.isInteger(line) || line < 1 || typeof source !== 'string') return null;
-    const cur = this.#acquireGeneration(null);
+  #jumpRowsFor(cur) {
+    cur.jumpRows ??= (async () => {
+      const textOptions = { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 };
+      return this.#exec('pdftotext', ['-bbox-layout', cur.pdf, '-'], textOptions).then(result => parseJumpText(result.stdout))
+        .catch(async () => parseJumpTsv((await this.#exec('pdftotext', ['-tsv', cur.pdf, '-'], textOptions)).stdout));
+    })().catch(() => null);
+    return cur.jumpRows;
+  }
+
+  async verticalSourceAtPoint({ page, x, y, id, rootSource, inputs, tateBody = false }) {
+    if (![page, x, y].every(Number.isFinite) || page < 1) return null;
+    const cur = this.#acquireGeneration(id);
     if (!cur) return null;
     try {
+      const rows = await this.#jumpRowsFor(cur);
+      if (!rows) return { direction: 'tate', hit: null };
+      const point = verticalRowAtPoint(rows, page, x, y);
+      if (!point) return tateBody ? { direction: 'tate', hit: null } : null;
+      if (!inputs) {
+        await cur.syncSourcesReady;
+        const captured = [...(cur.syncSources ?? [])].map(([file, source]) => ({ file, source }));
+        return { direction: 'tate', hit: locateVerticalSource(point, captured, true), onInk: true };
+      }
+      if (!this.sourceMatches(rootSource, cur.id)) return { direction: 'tate', hit: null };
+      const checked = inputs.filter(({ file, source }) => {
+        if (path.resolve(file) === path.join(this.workDir, 'canon.tex')) {
+          return source === rootSource;
+        }
+        return cur.inputManifest?.get(this.#inputIdentity(file)) === createHash('sha256').update(source).digest('hex');
+      });
+      return { direction: 'tate', hit: locateVerticalSource(point, checked) };
+    } finally {
+      this.#releaseGeneration(cur);
+    }
+  }
+
+  /** Jump never compiles or relabels an old PDF as the editor's revision.
+   * Its lazy index is owned (and retired) by the immutable generation. */
+  // `why`, when given, is told why there is no answer (`why.reason`):
+  //   'not-current'  no pass of this source revision (none yet, or it failed)
+  //   'not-an-input' the pass did not read this file, or read other text
+  //   'unreadable'   the pass's SyncTeX or PDF text could not be read
+  //   'no-ink'       the pass read it all and typeset nothing for this line
+  async jumpToSource({ file, line, source, rootSource = source, rev, why = null, verticalWriting = false } = {}) {
+    const explain = reason => { if (why && !why.reason) why.reason = reason; };
+    if (!file || !Number.isInteger(line) || line < 1 || typeof source !== 'string') return null;
+    const cur = this.#acquireGeneration(null);
+    if (!cur) { explain('not-current'); return null; }
+    try {
       const current = () => cur.rev === rev && this.sourceMatches(rootSource, cur.id);
-      if (!current() || !cur.synctex) return null;
+      if (!current()) { explain('not-current'); return null; }
+      if (!cur.synctex) { explain('unreadable'); return null; }
       const syncFile = existingRealpath(file);
       if (syncFile === path.join(this.workDir, 'canon.tex')) {
-        if (source !== rootSource) return null;
+        if (source !== rootSource) { explain('not-an-input'); return null; }
       } else if (cur.inputManifest?.get(this.#inputIdentity(syncFile)) !==
-          createHash('sha256').update(source).digest('hex')) return null;
-      cur.jumpIndex ??= (async () => {
-        const textOptions = { timeout: 60_000, maxBuffer: 64 * 1024 * 1024 };
-        const [compressed, rows] = await Promise.all([
-          readFile(cur.synctex),
-          this.#exec('pdftotext', ['-bbox-layout', cur.pdf, '-'], textOptions).then(result => parseJumpText(result.stdout))
-            .catch(async () => parseJumpTsv((await this.#exec('pdftotext', ['-tsv', cur.pdf, '-'], textOptions)).stdout)),
-        ]);
-        if (compressed.length > 8 * 1024 * 1024) return null;
-        const sync = await gunzipP(compressed, { maxOutputLength: 256 * 1024 * 1024 });
-        return { rows, records: parseJumpRecords(sync.toString('utf8'), this.workDir) };
-      })().catch(() => null);
-      const index = await cur.jumpIndex;
-      if (!index || !current()) return null;
+          createHash('sha256').update(source).digest('hex')) { explain('not-an-input'); return null; }
       const lines = source.split(/\r?\n/);
-      if (/\\printindex\b/.test(String(lines[line - 1] ?? '').replace(/(^|[^\\])%.*$/, '$1'))) {
+      const input = this.#syncInputPath(cur, syncFile);
+      const printsIndex = /\\printindex\b/.test(String(lines[line - 1] ?? '').replace(/(^|[^\\])%.*$/, '$1'));
+      const [rows, records] = await Promise.all([
+        this.#jumpRowsFor(cur),
+        this.#jumpRecordsFor(cur, input, printsIndex),
+      ]);
+      const index = rows && records ? { rows, records } : null;
+      if (!index) explain('unreadable');
+      else if (!current()) explain('not-current');
+      if (!index || !current()) return null;
+      const verticalRows = rows.some(row => row.direction === 'tate');
+      if (printsIndex && !verticalWriting && !verticalRows) {
         // the line that prints the index: where the index starts
         const start = indexStartRecords(index.records);
         if (start.length) {
@@ -2160,7 +2457,6 @@ export class CanonicalRenderer {
         }
       }
       let anchor = jumpAnchor(lines, line);
-      const input = this.#syncInputPath(cur, syncFile);
       const ownRaw = anchor.line !== line ? jumpRecords(index.records, input, line) : [];
       const raw = jumpRecords(index.records, input, anchor.line);
       const transforms = new Map();
@@ -2175,17 +2471,35 @@ export class CanonicalRenderer {
       });
       // Opening/rule lines can carry their own title, caption or table row.
       // Only an inkless line borrows the neighbouring source anchor.
-      let hit = anchor.line !== line && locateJump(index.rows, lines[line - 1] ?? '', displayed(ownRaw), false, true);
+      let hit = anchor.line !== line && locateJump(index.rows, lines[line - 1] ?? '', displayed(ownRaw), false, true, ownRaw);
       if (hit) anchor = { line, toEnd: false };
-      else hit = locateJump(index.rows, lines[anchor.line - 1] ?? '', displayed(raw), anchor.toEnd);
-      if (!hit) {
+      else hit = locateJump(index.rows, lines[anchor.line - 1] ?? '', displayed(raw), anchor.toEnd, verticalWriting && !verticalRows, raw);
+      if (!hit && !verticalWriting && !verticalRows) {
         const candidates = await this.forwardSyncAll({ file: syncFile, line: anchor.line, column: 1, id: cur.id });
         hit = locateJump(index.rows, lines[anchor.line - 1] ?? '', candidates.map(c => ({ ...c, ink: true })), anchor.toEnd);
       }
+      if (!current()) explain('not-current');
+      else if (!hit) explain(verticalWriting || verticalRows || raw.some(r => r.ink) || ownRaw.some(r => r.ink)
+        ? 'unreadable' : 'no-ink');
       return current() && hit ? { ...hit, id: cur.id, srcRev: rev, line: anchor.line } : null;
     } finally {
       this.#releaseGeneration(cur);
     }
+  }
+
+  // The records Jump reads of one pass: every box (a record's place is the
+  // box around it) and the records of `input` (and of the generated index,
+  // for a line that prints it), as parseJumpRecords reads them. Kept per
+  // pass and input; the file is read once per input asked for.
+  #jumpRecordsFor(cur, input, withIndex = false) {
+    const key = `${path.resolve(input)}\0${withIndex ? 'ind' : ''}`;
+    cur.jumpRecords ??= new Map();
+    if (!cur.jumpRecords.has(key)) {
+      const wanted = file => file === path.resolve(input) || (withIndex && /\.ind$/i.test(file));
+      cur.jumpRecords.set(key, readJumpRecordsOf(cur.synctex, this.workDir, wanted).catch(() => null));
+      while (cur.jumpRecords.size > 8) cur.jumpRecords.delete(cur.jumpRecords.keys().next().value);
+    }
+    return cur.jumpRecords.get(key);
   }
 
   async sourceEditBoxes({ file, page, startLine, endLine, id } = {}) {
@@ -2200,10 +2514,9 @@ export class CanonicalRenderer {
       if (!cur.sourceBoxCache.has(key)) {
         let job;
         job = (async () => {
-          const compressed = await readFile(cur.synctex);
-          if (compressed.length > 8 * 1024 * 1024) return null;
-          const text = await gunzipP(compressed, { maxOutputLength: 256 * 1024 * 1024 });
-          const boxes = parseSyncTeXSourceBoxes(text.toString('utf8'), {
+          const text = await readSyncTeXForPage(cur.synctex, page);
+          if (text === null) return null;
+          const boxes = parseSyncTeXSourceBoxes(text, {
             file: this.#syncInputPath(cur, file), page, startLine, endLine,
           });
           if (!boxes || this.disposed || this.resetting) return null;
@@ -2578,6 +2891,8 @@ export class CanonicalRenderer {
       this.projectSeedsPlaced = false;
       this.#clearGenerations();
       this.lastError = null;
+      this.failedBehindRev = null;
+      this.failureWaiverUsed = false;
       this.lastEndAt = 0;
       this.inputEpoch++;
       this.inputInvalidations.clear();

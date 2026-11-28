@@ -463,6 +463,97 @@ const DOC1 = [
   '',
 ].join('\n');
 
+// tex64-internal #121: a compile started on a half-typed command failed;
+// the edits had moved on, yet the next compile waited the cost cooldown of
+// the long document (94 s) behind it, and the pages only canonical paints
+// stayed without it. Once per run of failures the next source's compile
+// waits only for the writing pause.
+test('a failure the edits have moved past does not hold the next compile behind the cost cooldown', opts, async () => {
+  const work = WORK + '-failure-waiver';
+  rmSync(work, { recursive: true, force: true });
+  const c = new CanonicalRenderer({ workDir: work, idleMs: 300, maxStaleMs: 600_000 });
+  try {
+    await c.ensure(DOC1, 1);
+    // a long document's compile: its cost cooldown is far longer than any pause
+    c.last.ms = 60_000;
+    c.cooldownFactor = 2;
+    const broken = DOC1.replace('Page two.', '\\clearpa Page two.');
+    c.schedule(broken, 2);
+    await c.settle();
+    assert.equal(c.info().errorRev, 2, 'the half-typed source failed');
+    assert.ok(c.delayFor({ rev: 2, scheduledAt: Date.now() }) >= 100_000, 'the failed source itself is paced as before');
+    c.schedule(DOC1.replace('Page two.', '\\clearpage Page two.'), 3);
+    const due = c.info().scheduledInMs;
+    assert.ok(due !== null && due <= 300, `the next source waits only for the pause (${due} ms)`);
+    // it fails again: a source that keeps failing keeps the duty bound
+    c.schedule(DOC1.replace('Page two.', '\\Kou{ Page two.'), 4);
+    await c.settle();
+    assert.equal(c.info().errorRev, 4);
+    c.schedule(DOC1.replace('Page two.', 'Page two, typed.'), 5);
+    assert.ok(c.info().scheduledInMs >= 100_000, `back on the cost cooldown (${c.info().scheduledInMs} ms)`);
+    // a landed compile gives the waiver back
+    await c.settle();
+    assert.equal(c.info().rev, 5);
+    c.last.ms = 60_000;
+    c.schedule(broken, 6);
+    await c.settle();
+    c.schedule(DOC1, 7);
+    assert.ok(c.info().scheduledInMs <= 300);
+    // so does a good generation made current without a compile: an undo back
+    // to a compiled source (audit/scratch waiver.mjs: the next independent
+    // failure's correction waited 120 s), and a document switch
+    c.schedule(broken, 8);
+    await c.settle();
+    c.schedule(DOC1.replace('Page two.', '\\TdomNoSuchCommand Page two.'), 9);
+    await c.settle();
+    assert.equal(c.info().errorRev, 9);
+    assert.equal(c.failureWaiverUsed, true, 'two failures in a row used the waiver');
+    c.schedule(DOC1.replace('Page two.', 'Page two, typed.'), 10);
+    assert.equal(c.info().rev, 10, 'the undo rebinds the compiled generation');
+    assert.equal(c.failureWaiverUsed, false);
+    c.schedule(broken, 11);
+    await c.settle();
+    c.schedule(DOC1.replace('Page two.', 'Page two, again.'), 12);
+    assert.ok(c.info().scheduledInMs <= 300, `a new run of failures has its waiver (${c.info().scheduledInMs} ms)`);
+    // and so does an export that compiles past the failure (audit/scratch
+    // ensure-waiver.mjs: the next healthy edit was due in 300 ms instead of
+    // its 120 s cooldown)
+    await c.settle();
+    c.schedule(broken, 13);
+    await c.settle();
+    assert.equal(c.info().errorRev, 13);
+    assert.equal(c.failedBehindRev, 13);
+    await c.ensure(DOC1.replace('Page two.', 'Page two, exported.'), 14);
+    assert.equal(c.info().rev, 14);
+    assert.equal(c.failedBehindRev, null, 'the exported generation is past the failure');
+    c.last.ms = 60_000;
+    c.schedule(DOC1.replace('Page two.', 'Page two, after the export.'), 15);
+    assert.ok(c.info().scheduledInMs >= 100_000, `the next edit keeps its cost cooldown (${c.info().scheduledInMs} ms)`);
+    c.failureWaiverUsed = true;
+    c.failedBehindRev = 12;
+    await c.resetDocument(work);
+    assert.equal(c.failureWaiverUsed, false);
+    assert.equal(c.failedBehindRev, null);
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test('ensuring the opening baseline consumes its scheduled copy', opts, async () => {
+  const workDir = path.join(WORK, 'ensure-opening-baseline');
+  const canonical = new CanonicalRenderer({ workDir, debounceMs: 60_000 });
+  try {
+    canonical.schedule(DOC1, 1);
+    assert.equal(canonical.info().scheduledRev, 1);
+    const accepted = await canonical.ensure(DOC1, 1);
+    assert.equal(canonical.info().id, accepted.id);
+    assert.equal(canonical.info().inFlight, false);
+  } finally {
+    await canonical.dispose();
+  }
+});
+
 test('first baseline credit survives a soft demand until the viewer escalates it', opts, async () => {
   const work = WORK + '-cold-baseline-escalation';
   rmSync(work, { recursive: true, force: true });

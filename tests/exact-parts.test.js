@@ -184,7 +184,8 @@ test('the viewer shows such a picture through its openings and gives the text dr
     readyFonts: new Set(['f-text']), FONT_FAMILY: { regular: 'serif' } };
   vm.createContext(viewer);
   // (svgFor joins the pieces svgParts makes)
-  vm.runInContext(cut('const OVER_TEXT_ATTRS', '/** Unified SVG page') +
+  vm.runInContext(cut('function furnitureBandOf', 'const furnitureLists') +
+    cut('const OVER_TEXT_ATTRS', '/** Unified SVG page') +
     app.slice(svgStart, app.indexOf('\n}\n', app.indexOf('function svgParts(')) + 3) +
     '\nthis.clip = chunkShowClip; this.svg = svgFor;', viewer);
 

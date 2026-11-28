@@ -88,6 +88,29 @@ test('terminal page flushes retain the last visible page and its exact neighbors
   assert.ok(!keep.has(215), 'a flush after all visible ink does not consume the tail slot');
 });
 
+test('tail coverage keeps the continuation after a column switch when replay costs vary', () => {
+  const sources = ['\\onecolumn\nFull-width prose.', '\\twocolumn\nColumn prose.', 'Middle prose.', 'Last prose.'];
+  for (const costs of [[63, 32, 32, 31], [76, 13, 18, 8]]) {
+    const blocks = sources.map((source, index) => ({ text: source, typesetCostMs: costs[index] }));
+    const keep = checkpointKeepSet(blocks, 3);
+    assert.deepEqual([...keep].sort((a, b) => a - b), [0, 2, 3]);
+  }
+});
+
+test('ordinary JOB timing variation keeps the same coverage boundaries', () => {
+  const sources = Array.from({ length: 162 }, (_, index) =>
+    `Paragraph ${index}.${index % 4 === 3 ? '\\newpage' : ''}`);
+  const keep = (extra, measured) => [...checkpointKeepSet(sources.map((text, index) => ({
+    text,
+    ...(index < measured ? { typesetCostMs: index < 4 ? 24 : 8 + (index > 48 && index < 92 ? extra : 0) } : {}),
+  })), 4)];
+  const planned = keep(0, 0);
+  for (const measured of [43, 81, 108, sources.length]) {
+    assert.deepEqual(keep(0, measured), planned);
+    assert.deepEqual(keep(4, measured), planned);
+  }
+});
+
 test('ordinary blocks retain coverage instead of spending every slot on similar early costs', () => {
   for (const measuredCount of [8, 224]) {
     const blocks = Array.from({ length: 224 }, (_, index) =>

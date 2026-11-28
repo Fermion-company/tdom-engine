@@ -1106,6 +1106,8 @@ class PageBuilder {
   /** \@vtryfc float page: \@fptop [\@fpsep box]… \@fpbot in a vbox to colht. */
   #emitFloatPage(group) {
     this.pageTop = group.slice();
+    // (\@fcolmade: the page's head and foot may differ, header-footer.js)
+    this.pageFloatPage = true;
     const g = [];
     g.push({ kind: 'glue', spec: this.fptop });
     g.push({ kind: 'glue', spec: negGlue(this.fpsep) });
@@ -1207,10 +1209,12 @@ class PageBuilder {
       feet: this.pageFeet ?? [],
       topFloats: this.pageTop ?? [],
       botFloats: this.pageBot ?? [],
+      ...(this.pageFloatPage ? { floatPage: true } : {}),
       evs: this.pageEvs ?? [],
       tls: this.pageTls ?? [],
     };
     this.pageFeet = null;
+    this.pageFloatPage = false;
     this.pageTop = null;
     this.pageBot = null;
     this.pageEvs = null;
@@ -1339,20 +1343,24 @@ function computeFootrule(geo) {
 }
 
 /** Adopt unchanged page objects (display lists survive by identity). */
-export function reconcile(newPages, oldPages) {
+export function reconcile(newPages, oldPages, sameFurniturePage = null) {
   let reused = 0;
+  let furnitureUnchanged = !!sameFurniturePage && newPages.length === oldPages.length;
   const pages = newPages.map((np) => {
     const op = oldPages[np.number - 1];
-    if (op && op.number === np.number && sameIdentity(op, np)) {
+    const sameFurniture = op === np || !sameFurniturePage || (op && sameFurniturePage(op, np));
+    if (op && op.number === np.number && sameFurniture && sameIdentity(op, np)) {
       reused++;
       return op;
     }
+    if (furnitureUnchanged && !sameFurniture) furnitureUnchanged = false;
     return np;
   });
-  return { pages, reused, rebuilt: pages.length - reused };
+  return { pages, reused, rebuilt: pages.length - reused, furnitureUnchanged };
 }
 
 function sameIdentity(a, b) {
+  if (a.folio !== b.folio) return false;
   const pa = a.pendingExact ?? [];
   const pb = b.pendingExact ?? [];
   if (pa.length !== pb.length || pa.some((bid, i) => bid !== pb[i])) return false;
