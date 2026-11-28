@@ -64,7 +64,7 @@ function blockIdsOn(page) {
   return ids;
 }
 
-export function editPageRenderIds(blocks, pages, dirtySource) {
+export function editPageRenderIds(blocks, pages, dirtySource, { includeAdjacent = false } = {}) {
   // Only the document's own blocks tie pages together. A draw can also name
   // something every page carries (the running head's source): counted as a
   // block it tied the whole chapter to the edited page, and each keystroke
@@ -92,9 +92,15 @@ export function editPageRenderIds(blocks, pages, dirtySource) {
   };
   const idsOf = page => [...blockIdsOn(page)].filter(id => isReal(id));
   const nearby = new Set();
-  for (const page of pages) {
+  const adjacent = new Set();
+  for (let index = 0; index < pages.length; index++) {
+    const page = pages[index];
     if (!holdsOneOf(page, dirtySource)) continue;
     for (const id of idsOf(page)) nearby.add(id);
+    if (includeAdjacent) {
+      if (index > 0) adjacent.add(pages[index - 1]);
+      if (index + 1 < pages.length) adjacent.add(pages[index + 1]);
+    }
   }
   // A block that runs over the page boundary ties the next page to this one:
   // the viewer shows both or neither. In a long document the boot leaves far
@@ -105,6 +111,9 @@ export function editPageRenderIds(blocks, pages, dirtySource) {
     if (!holdsOneOf(page, nearby)) continue;
     for (const id of idsOf(page)) tied.add(id);
   }
+  // A line added or removed can cross a boundary that no block straddled
+  // before the edit. Those pages may use cached ink without replaying TeX.
+  for (const page of adjacent) for (const id of idsOf(page)) tied.add(id);
   return blocks.filter(block => tied.has(block.id) && block.needsRender).map(block => block.id);
 }
 

@@ -60,8 +60,7 @@ last-known-good と pending 表示に限り、同じ page/tree を途中で spli
 source/checkpoint の incremental 処理は維持するが、JS paginator の page patch は表示せず、直前の
 exact page を保持して complete ShippingChain wave だけを原子的に昇格する。通常本文の編集応答では
 表示不可能な resident state/rescue walk も行わず、source generation を先に ShippingChain へ渡す。
-ただし埋め込み直接編集では、Shipping の原文・SyncTeX の世代対応と editor 転送の証明がないため
-wave を表示せず直前の編集可能な面を保持し、既存の版・需要IDを使って canonical 表示を要求する。
+埋め込み画面でも直接編集中の欄がなければ、完成した Shipping の紙面を先に表示する。リプレイごとに SyncTeX の出力も分けて保存する。紙面をクリックすると、その PDF の印字と SyncTeX が指すソースの行を照合して本文や行内数式を開く。照合できない場合は入力を保持して同じ版の canonical PDF を待ち、クリック位置の印字とページ寸法が一致してから編集欄に入力を渡す。直接編集中に届いた Shipping の紙面はその欄に重ねない。
 Shipping replay の plain edit admission は brace depth 0 を要求しない。代わりに旧新の source partition が
 同じで差分が一つの balanced unit に閉じること、選択した checkpoint の consumed-unit cursor がその unit
 より前であることを要求する。したがって `\footnote{...}` や TikZ node の braced visible text も、その
@@ -536,7 +535,7 @@ display list は本文 glyph と行単位の exact chunk を別素材として�
 
 各 edit report と async patch は、その時点の font manifest を page patch と同時に送る。client は新しい `@font-face` を登録し、face の decode が完了するまでページ群の提示を待つ。画面外の準備中に該当 run が透明でも、表示中の完成ページは保持する。
 
-`canonical.schedule()` は source/rev を保存して timer を張るだけで、full `lualatex` compile は edit response を待たせない。完成した provisional 面を提示できる structured モードでは、初回だけ `debounceMs`（既定2500ms）で baseline を取得し、以降は最終編集後の `idleMs`（既定30s）か、正本に未反映の最古の編集から `maxStaleMs`（`TDOM_CANON_MAX_STALE`、既定20s）の早い方で予約する。いずれもコスト比例 cooldown（factor 2、cap 600s）を満たしてから開始する。20s は通常の打鍵ごとの再コンパイルを避けつつ、連続編集でも番号・参照・目次の更新機会を確保する間隔である。長い compile では cooldown が優先され、完了までには組版時間も加わる。初回 baseline の debounce にも同じ待機期限を掛ける。期限後の通常 authority compile は、新しい編集が来ても aux fixed point までの pass を打ち切らず、shipping の優先窓による停止も期限で解除する。実行中に届いた編集は、その最初の到着時刻を次の待機期限に引き継ぎ、次回 timer は完了時点の実測コストから cooldown を計算し直す。opaque モードでは `displayDebounceMs`（既定350ms）と display cooldown（factor 1、cap 60s）を使い、長文書の連続再組版を抑える。
+`canonical.schedule()` は source/rev を保存して timer を張るだけで、full `lualatex` compile は edit response を待たせない。完成した provisional 面を提示できる structured モードでは、初回だけ `debounceMs`（既定2500ms）で baseline を取得し、以降は最終編集後の `idleMs`（既定は直近の全文組版時間の2倍。下限1.5秒、上限30秒。`TDOM_CANON_IDLE` で固定可能）か、正本に未反映の最古の編集から `maxStaleMs`（`TDOM_CANON_MAX_STALE`、既定20s）の早い方で予約する。いずれもコスト比例 cooldown（factor 2、cap 600s）を満たしてから開始する。20s は通常の打鍵ごとの再コンパイルを避けつつ、連続編集でも番号・参照・目次の更新機会を確保する間隔である。長い compile では cooldown が優先され、完了までには組版時間も加わる。初回 baseline の debounce にも同じ待機期限を掛ける。期限後の通常 authority compile は、新しい編集が来ても aux fixed point までの pass を打ち切らず、shipping の優先窓による停止も期限で解除する。実行中に届いた編集は、その最初の到着時刻を次の待機期限に引き継ぎ、次回 timer は完了時点の実測コストから cooldown を計算し直す。opaque モードでは `displayDebounceMs`（既定350ms）と display cooldown（factor 1、cap 60s）を使い、長文書の連続再組版を抑える。
 
 欠けた数式・不一致のページ構成・編集位置の未証明などで新しい紙面を提示できない場合、client は `POST /canonical/display-demand` に現在の `documentEpoch`・`srcRev`・表示側の `demandId` を送る。その版の既存予約だけを display cadence へ早め、追加の組版は作らない。完成したresidentページ群を実際に提示できたら同IDの `fulfilled: true` を送り、全表示側の需要が解消した未開始予約だけを通常のauthority cadenceへ戻す。待機の起点は最終編集時刻を保つ。同版を再び保留した場合やiframeを再作成した場合は新IDで再取得でき、遅延したfulfilledは別表示側の需要を消さない。IDは128文字、現在の版の既出IDは最大64件とし、同IDの重複はtimerを延長・再有効化しない。開始済み・成功済み・失敗済みの組版を需要通知から追加・取消・再試行しない。需要は対象の完了・失敗・別版への更新・文書resetで終わり、後続の無関係な編集は通常のauthority cadenceに戻る。`canonical.info()` の `scheduledInMs` は予約までの残り時間、`compiling` は実組版中、`displayDemandRev` は需要対象の版を示す。`ensure()`（export 経路）は渡された snapshot だけを compile し、途中の打鍵を連続して追いかけない。
 
@@ -551,7 +550,7 @@ structured page の差し替えには、その page の未変更部分も含む 
 
 ただし骨格選択だけでは生存 checkpoint 数の上限にならない。`#retireOffGrid(idx)` は「その JOB が処理した 1 index」しか退役させないので、mid-document から resume する pass（rescue pump・settle・chain・backward-ref）は各停止点に orphan checkpoint を残し、誰も retire しないまま生存集合が creep する（実測: budget 8 指定でも 25 個生存、boot 時 55 個超で 16GB 機が窒息）。`#enforceCheckpointCap()` が「ckpt0 ＋実測コスト骨格 ＋ editHold ＋ renderHold だけ残し、他は DIE」で畳み直す。`#updateInner()` 末（boot/edit walk 後）・`#asyncRescueOne` 後・`#runChainPass` の finally で呼ぶ。各 checkpoint は累積 dormant page を保持する常駐 lualatex なので、これは実メモリの上限である。
 
-`#shipUpdate()` は `TDOM_SHIP=1` のときだけ意味を持つ。現在の root source と、実際に展開した project input bytes の immutable snapshot を shipping chain に渡し、unit diff から resume できるかを判定する。child-only refresh は root が同一でも `unchanged` ではない。単一の既知 literal `\input` だけを最初の reader より前から replay し、未知・複数・`\include` の変更は新しい canonical seed を待って baseline を作り直す。snapshot を受理していない generation は新 `srcRev` に対応付けず、後着 wave も current revision/snapshot の一致を満たさなければ公開しない。実際の page ship と SVG 化は非同期で、`onShipPage` と SSE `ship` として着地する。
+`#shipUpdate()` は `TDOM_SHIP=1` のときだけ意味を持つ。現在の root source と、実際に展開した project input bytes の immutable snapshot を shipping chain に渡し、unit diff から resume できるかを判定する。child-only refresh は root が同一でも `unchanged` ではない。単一の既知 literal `\input` だけを最初の reader より前から replay し、未知・複数・`\include` の変更は新しい canonical seed を待って baseline を作り直す。snapshot を受理していない generation は新 `srcRev` に対応付けず、後着 wave も current revision/snapshot の一致を満たさなければ公開しない。実際の page ship と SVG 化は非同期で、`onShipPage` と SSE `ship` として着地する。 最初の組版結果と補助ファイルがそろった時点で、紙面の表示に使う最初のチェックポイントを準備する。準備中に単一の子ファイルを編集した場合も、組版済みの旧版を引き継いで読込元と差分を照合してから再実行する。
 
 canonical anchor は root 内の plain text に加え、既に読まれた単一 child file の単一 plain-text 差分を扱う。child の公開 DOM span は引き続き `null` とし、編集前の include bytes から差分を算出して、物理 `readPath`、child-local block span、galley witness を非公開 snapshot に固定する。対象は root からの単一 literal `\input` とし、現在の read trace に到達した root/child ごとに字句上の reader 数と trace 数が一致しない場合は採用しない。同じ child が複数 block instance に所有される場合、`sourceParts` を持つ場合、別 input の変更が同居する場合も anchor を作らない。連続入力は最初の canonical snapshot を継承し、input epoch・source revision・canonical generation・PDF/SyncTeX hash のいずれかが変わった後着 proof は公開しない。
 
@@ -564,6 +563,10 @@ frame が「変わっていない」ことの根拠は次のとおり。(1) resi
 VisualCut patch は旧 canonical generation/revision を保持し、通常の行消去範囲 `baseMask` と深い glyph まで含む `mask` を併記する。現在行は旧行の水平 slot 内に収め、複数 mask は重ねない。client は既存 canonical raster の `mask - baseMask` に触れる全 pixel を上限付きで検査し、背景色以外が 1 pixel でもあれば公開しない。イベントは `canonical-visual-cut` として通常の `canonical-anchor` から分離し、この raster 検査を持たない旧 client は未知イベントとして無視する。source revision、input epoch、base generation/revision、表示中 image、700/850ms の proof/publish deadline は従来どおりである。
 
 canonical の行の証明（plain・mixed 共通、同じ証明を使う canonical crop も同じ）は、witness の glyph ごとに文字・大きさ・位置に加えて塗り色を照合する。resident の収穫は color stack を hbox の中（`walk_h`）でしか追わないので、縦モードの push（段落の前や前の block の `\color`）は canonical の行を塗っても run の色に出ない。luacolor を使わない xcolor 文書では、赤い canonical の行を黒の run で描き直し得た。paint index は pdf.js の operator list から glyph ごとの fill color を記録する（pdf.js はどの色空間の fill も `setFillRGBColor` の hex 文字列で渡す。ページの初期値は黒、save/restore と form の終わりで戻す。pattern・透明などそれ以外の fill は不明として、どの witness とも一致させない）。witness は run の色（色のない run は表示リストと同じく黒）を glyph ごとに持つ。黒の表現は揃える: resident はどの色モデルの黒も `#000000` にし、pdf.js は DeviceCMYK の `0 0 0 1 k` を多項式で `#2c2e35` にするので、後者を `#000000` として扱う。すべての glyph で一致しない行は証明しない。
+
+数式と本文が同じ行にある場合は、編集した本文の外側にあるすべての run と行の寸法が一致するかを `changedTextSpan` で照合する。句読点が数式に接していても、フォントに対応するグリフの輪郭があれば印字範囲を字幅と区別できる。追加した文字が余白にはみ出す場合は、塗り直す領域のうち新たに覆う部分が旧 PDF 上で背景色だけであることも確認する。文字の挿入や削除で同じ行の後ろの数式が動く場合は、最初に動いた数式から行末までの全要素で横方向の移動量が等しいかを調べる。文字だけのページに加えて、LuaTeX が水平な実線で分数線を印字したページも対象とする。各文字と添字の位置・色・大きさを照合し、塗り直す範囲内の実線が元の行の分数線と一本ずつ一致することを確かめる。切り取る四辺にインクがなければ、その部分を元の PDF から新しい位置に表示する。移動後の数式をクリックしたときは元の PDF 上の位置に戻して文字を特定し、現在のソースで同じ式を MathLive に開く。インライン数式の途中で改行するときは数式の開始状態を次の行に引き継ぎ、数式の直後から本文として記録する。 折り返しで前後の本文行も変わる場合は、段落の行数と各行の寸法を照合する。変更があった本文行と数式を含む行を一度に描き直す。 行数が変わり PDF の再組版が必要になったときは、その版をキューに入れてから経過した時間を入力待ち時間に含める。直前の組版コストに応じた実行間隔は維持する。
+
+本文をクリックしたときは印字された語とソースを照合する。SyncTeX が段落末の空行を返した場合も、文書全体でソースと印字に一つずつしかない本文に限り、各語の位置と段落の順引き・逆引きが共有する組版上の箱から編集箇所を決める。編集中に表示した差分は新しい PDF の対象ページが表示されるまで維持する。
 
 **累積 lineage（複数ブロック）。** anchor は base generation G に対する「G 以降の全編集の delta」を 1 つの patch で公開する。server の `terminalAnchorLineage` は G に対して編集されたブロックごとに entry（base witness、変わった行、証明済み page patch）を持ち、`ledger`（G が resident の exact compile だった時点の全ブロックの source hash・galleyHash・構造的 exit state）を保持する。別ブロック Y の編集は、(1) lineage が途切れていない（G 以降の全打鍵が anchor された）、(2) Y のブロックが ledger と一致する（G が組んだままである）、の両方が成り立つときだけ、その時点で捕捉した Y の resident witness を G の base witness として `planTerminalCanonicalAnchor` に渡せる（`joinedBase`）。証明は Y の行だけを行い、`resolveTerminalCanonicalAnchor` は他ブロックの証明済み page patch と結合して 1 つの patch（`blockIds`）にする。ブロック間で mask が重なる場合は fallback にする。raster 証明の種類が混在する場合は patch 全体を VisualCut として送り、exact-frame のページは `baseMask = mask`（追加リングなし）で client の raster 検査を通す。client は patch 適用時に全 delta を原子的に置き換えるので、複数ページの overlay を同時に持つ。lease と provisional 抑止は `blockIds` で判定する。covering canonical が着地すれば全 delta が退役する。
 
@@ -605,3 +608,16 @@ canonical のページの click は、reverse SyncTeX が返した source の行
 
 `tests/inline-math-click.test.js` は、math field と glyph の照合を代役にして、採る・採らないの規則（回数が合う、同じ数式が 2 つ、数式の中の数式、範囲の外、display 数式）と、次の世代への追従を確かめる。packaged app では、72 ページの本の該当の `$2$` を実際に click して editor が開き、4 打鍵、9 秒の休止、さらに 2 打鍵がすべて source の 36 行の数式に入ることを確かめた。小さな文書の通常の数式 click（12 打鍵）は変わらない。
 
+### 再組版を待つ間の数式の直接編集
+
+PDF 上で編集したインライン数式は、元の文字が占める範囲を特定できれば同じ位置に MathLive の入力結果を表示する。文字の原点をそのページの SVG の字形と照合し、隣の句読点や罫線の輪郭にかからない範囲を使う。字形が重なって元の式を特定できない場合は PDF の更新を待つ。
+
+画像を含む PDF ページの位置を調べるときは、表示中の版の SVG に `geometry=1` を付けて取得する。サーバーは埋め込み画像のデータだけを省く。ビューアは画像の寸法と変換行列から紙面上の範囲を求め、切り抜きパスの範囲が分かるときはその外側を除く。透過画像の色や不透明度を読み取る処理はない。式のすぐ隣に図がある場合は、反対側の余白を使って文字の大きさを保つ。式自体に図が重なる場合は PDF の更新を待つ。
+
+分数では入力前の MathLive モデルから分子と分母に属する字形を記録する。`\frac`・`\tfrac`・`\dfrac` の分数線は、両者の間にある同色の水平線のうち位置と幅が一致する一本に限る。入れ子の分数では内側と外側の線を別々に照合する。前後の行と文字のメトリクスが重なる場合はその余白を詰め、実際の字形を覆わずに表示できる範囲を使う。
+
+平方根と累乗根では、PDF に印字された `√` の輪郭と、その右端でつながる上線を確認する。上線は根号の中身の幅に合い、根号は中身の高さまで届く必要がある。入れ子の式は内側から照合し、内側の根号や分数線の幅を外側の式にも含める。これにより、同じ式が上下の行に繰り返されていても別の行の根号を塗り替えずに済む。
+
+独立した数式では SyncTeX が返した式と段のボックスを照合する。中央揃えなら元の式の中心を保ち、左揃えなら元の書き出し位置を保つ。式全体のボックスが得られないときは、段内の印字された文字が MathLive の各文字に対応するかも確認する。左側に式番号を出す設定で段のボックスに余分な空きが含まれるときは、式番号の位置も使って段の左端を求める。左右にある式番号などの印字にかかる前に一時表示の幅を制限する。文字サイズは PDF の字幅と入力欄の同じ文字の幅から求める。根号などの入力欄が元の印字より高いときは、前後の印字との空きの半分まで使える。`\label` や `\tag` の編集用バッジは紙面に表示しない。
+
+同じ行にある別の式へ移っても、先に入力した値は新しい紙面が届くまで表示する。追加した文字をクリックすると、その文字の位置から編集を再開する。再編集を Escape で取り消すと直前に確定した値に戻る。ページの差し替え時にはそのページの一時表示とサイズ監視を解除する。

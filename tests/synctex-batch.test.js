@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import os from 'node:os';
 import path from 'node:path';
 import {
+  forgetSyncTeXBatchHelper,
   parseSyncTeXBatchOutput,
   prepareSyncTeXBatchHelper,
   querySyncTeXRange,
@@ -50,7 +51,7 @@ test('SyncTeX batch process accepts complete output and fails closed on invalid 
       chmodSync(executable, 0o755);
       return { stdout: '', stderr: '' };
     }
-    return { stdout: output, stderr: '' };
+    return { stdout: args[0] === '--version' ? 'tdom-synctex-batch 1' : output, stderr: '' };
   };
   try {
     const executable = await prepareSyncTeXBatchHelper({ workDir, timeoutMs: 1_000, run });
@@ -68,6 +69,7 @@ test('SyncTeX batch process accepts complete output and fails closed on invalid 
     assert.equal(groups?.[0]?.[0]?.page, 2);
     assert.equal(calls.filter((call) => call.command === 'cc').length, 1,
       'range query reuses the proactively prepared helper');
+    assert.equal(calls.filter(call => call.args[0] === '--version').length, 1, 'first launch precedes queries and is shared');
     assert.deepEqual(calls.at(-1).args, ['/paper/main.pdf', '/paper/main.tex', '8', '8', '1']);
     output = '{"schemaVersion":1,"complete":true';
     assert.equal(await querySyncTeXRange({
@@ -83,6 +85,35 @@ test('SyncTeX batch process accepts complete output and fails closed on invalid 
   } finally {
     rmSync(workDir, { recursive: true, force: true });
   }
+});
+
+test('disposing a shared preparation never starts the pending probe and a new owner can retry', async t => {
+  const workDir = mkdtempSync(path.join(os.tmpdir(), 'tdom-synctex-dispose-'));
+  t.after(() => { forgetSyncTeXBatchHelper(workDir); rmSync(workDir, { recursive: true, force: true }); });
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const calls = [];
+  const run = async (cmd, args) => {
+    calls.push(cmd);
+    if (cmd === 'cc') {
+      started.resolve();
+      await release.promise;
+      writeFileSync(args[args.indexOf('-o') + 1], 'test binary');
+      return {};
+    }
+    assert.deepEqual(args, ['--version']);
+    return { stdout: 'tdom-synctex-batch 1' };
+  };
+  const options = { workDir, run, timeoutMs: 1000 };
+  const first = prepareSyncTeXBatchHelper(options);
+  const second = prepareSyncTeXBatchHelper(options);
+  await started.promise;
+  forgetSyncTeXBatchHelper(workDir);
+  release.resolve();
+  assert.deepEqual(await Promise.all([first, second]), [null, null]);
+  assert.deepEqual(calls, ['cc']);
+  assert.ok(await prepareSyncTeXBatchHelper(options));
+  assert.equal(calls.length, 2);
 });
 
 test('range CLI fallback kills a late query and does not cache its failure as an empty result', async () => {

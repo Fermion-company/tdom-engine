@@ -31,6 +31,10 @@ test('final vfil accounts for the last box depth before forcing a page', () => {
   assert.equal(pages.length, 2);
   assert.deepEqual(pages[0].identity.map((u) => u.blockId), ['first', 'middle']);
   assert.deepEqual(pages[1].identity.map((u) => u.blockId), ['deep-last']);
+
+  const corrected = buildPages(stream, { ...geo, newpageDepthCorrection: 1 });
+  assert.equal(corrected.length, 1);
+  assert.deepEqual(corrected[0].identity.map((u) => u.blockId), ['first', 'middle', 'deep-last']);
 });
 
 test('glue reapplies a negative maxdepth before the final eject', () => {
@@ -88,4 +92,17 @@ test('a consumed newpage eject does not split a deferred top float from followin
   assert.deepEqual(pages[0].identity.map((u) => u.blockId), ['first']);
   assert.deepEqual(pages[1].topFloats.map((f) => f.id), ['figure-1']);
   assert.deepEqual(pages[1].identity.map((u) => u.blockId), ['figure', 'following']);
+});
+
+test('an exact page fit survives the six decimal bp wire format, but one scaled point of excess still breaks', () => {
+  const wireBp = scaledPoints => Number((scaledPoints / 65781.76).toFixed(6));
+  const boxHeightSp = 500002;
+  const stream = Array.from({ length: 46 }, (_, index) => [
+    { t: 'box', u: unit(String(index), wireBp(boxHeightSp)) },
+    { t: 'glue', a: 0 },
+  ]).flat();
+  const geo = { topskip: 0, maxdepth: 4, raggedbottom: 1 };
+  const firstPageSize = heightSp => buildPages(stream, { ...geo, textheight: wireBp(heightSp) })[0].identity.length;
+  assert.equal(firstPageSize(46 * boxHeightSp), 46);
+  assert.equal(firstPageSize(46 * boxHeightSp - 1), 45);
 });

@@ -92,7 +92,7 @@ export async function bootRoot(
       // and keep the root's stdout pipe open, pinning the host process alive
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: withProjectInputs(process.env, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
+      env: withProjectInputs(process.env, engine),
     }
   );
   let rootLog = '';

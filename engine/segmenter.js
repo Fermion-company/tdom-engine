@@ -24,6 +24,8 @@
 // is cached per block, so this scan is what keeps block identity honest.
 
 import { fnv1a } from './hash.js';
+import { sourceClosure } from './checkpoint/closure.js';
+import { inlineLiteral } from './edit-regions.js';
 
 const FORCED_START = /^\s*\\(par|chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
 
@@ -71,6 +73,39 @@ function literalBegin(stripped, literalEnvs) {
   return builtin;
 }
 
+// Hide literal tokens from structural tests without shifting offsets. A
+// \string at the end of a line can read its token on the next source line.
+function maskQuotedLine(text, line, quoted, literalEnvs) {
+  const end = line.end;
+  let at = Math.min(end, Math.max(line.start, quoted.through));
+  let masked = ' '.repeat(at - line.start);
+  const tokens = /%|\\(?:[A-Za-z@]+|[\s\S])/g;
+  tokens.lastIndex = at - line.start;
+  for (let m; (m = tokens.exec(line.text));) {
+    if (m[0] === '%') break;
+    const name = m[0].slice(1);
+    const next = line.start + tokens.lastIndex;
+    if (name === 'begin') {
+      const env = /^\{([^{}]+)\}/.exec(text.slice(next, end))?.[1];
+      if (LITERAL_BOUNDARY_ENVS.has(env) || literalEnvs?.has(env)) {
+        const close = '\\end{' + env + '}';
+        const last = line.text.indexOf(close, tokens.lastIndex);
+        if (last < 0) break;
+        tokens.lastIndex = last + close.length;
+        continue;
+      }
+    }
+    const literal = inlineLiteral(text, { name, end: next }, name === 'string' || name === 'detokenize' ? text.length : end);
+    if (!literal) continue;
+    const start = line.start + m.index;
+    masked += text.slice(at, start) + ' '.repeat(Math.min(end, literal.after) - start);
+    at = Math.min(end, literal.after);
+    quoted.through = literal.after;
+    tokens.lastIndex = at - line.start;
+  }
+  return masked + text.slice(at, end);
+}
+
 // The scan itself, from the line that starts at `from` to the end of the
 // text. `sync[i]` says that segs[i] began on a line the scan reached with
 // nothing open (no environment, group, display, literal run or pending
@@ -88,6 +123,7 @@ function scanSegments(text, baseOffset, from, aliasEvents, literalEnvs, resync) 
   let inDisplay = false;
   let inVerbatim = null; // env name while inside a literal environment
   let inAlltt = false; // commands/braces execute; unlike normal TeX, % is data
+  const quoted = { through: from };
   let inKKcode = false; // inside \KKcodeS...\KKcodeE (KKluaverb)
   let cur = null; // { start, sync }
   let curStructuralSinks = new Set();
@@ -116,7 +152,7 @@ function scanSegments(text, baseOffset, from, aliasEvents, literalEnvs, resync) 
     ln.start = lineStart;
     ln.end = newline < 0 ? text.length : newline;
     ln.text = text.slice(ln.start, ln.end);
-    const settled = cur === null && envDepth === 0 && braceDepth === 0 && !inDisplay && inVerbatim === null &&
+    const settled = quoted.through <= ln.start && cur === null && envDepth === 0 && braceDepth === 0 && !inDisplay && inVerbatim === null &&
       !inAlltt && !inKKcode && curStructuralSinks.size === 0;
     if (settled && resync) {
       const spliceFrom = resync(ln.start);
@@ -137,13 +173,15 @@ function scanSegments(text, baseOffset, from, aliasEvents, literalEnvs, resync) 
     }
     // Neutralize inline \verb before comments: its delimiter may contain a
     // literal `%`, which must not hide executable text later on the line.
-    let stripped = ln.text.replace(
+    const activeLine = quoted.through > ln.start || /\\(?:string|detokenize)\b/.test(ln.text)
+      ? maskQuotedLine(text, ln, quoted, literalEnvs) : ln.text;
+    let stripped = activeLine.replace(
       /\\verb\*?([^A-Za-z\s])(.*?)\1|\\KKverb\|[^|]*\|/g,
       (match) => ' '.repeat(match.length)
     );
     if (!inAlltt) stripped = stripComment(stripped);
     if (!inAlltt && /\\begin\{alltt\}/.test(stripped)) inAlltt = true;
-    const blank = stripped.trim().length === 0 && ln.text.trim().length === 0;
+    const blank = quoted.through <= ln.start && stripped.trim().length === 0 && ln.text.trim().length === 0;
     const atTop = envDepth === 0 && braceDepth <= 0 && !inDisplay;
 
     if (blank && atTop) {
@@ -208,6 +246,21 @@ function scanSegments(text, baseOffset, from, aliasEvents, literalEnvs, resync) 
     if (hasControlSymbol(stripped, ']')) inDisplay = false;
     braceDepth += braceDelta(stripped);
     if (braceDepth < 0) braceDepth = 0;
+    // Some long manuscripts use explicit paragraph terminators throughout:
+    // no blank line separates even two physical pages. Keep the eject in
+    // the preceding block so its vertical material reaches the pagebuilder.
+    if (atTop && !inAlltt && /^\s*\\newpage\s*$/.test(stripped) && cur && !cur.keepPageBreaks) {
+      const previousLine = text.slice(Math.max(cur.start, text.lastIndexOf('\n', ln.start - 2) + 1), ln.start);
+      if (/(?:^|[^\\])\\par\s*$/.test(stripComment(previousLine))) {
+        const body = text.slice(cur.start, ln.end);
+        // Groups, conditionals and changed command meanings can span pages.
+        // For such a block keep the existing boundary. Avoid rescanning a
+        // growing incomplete block at every subsequent eject.
+        if (/\\(?:if[A-Za-z@]*|begingroup|bgroup|catcode|let|def|edef|gdef|xdef|renewcommand)\b/.test(body) ||
+            !sourceClosure(body, { literalEnvs }).closed) cur.keepPageBreaks = true;
+        else flush(ln.end);
+      }
+    }
     // NOTE: an environment/display CLOSING no longer ends the block — text
     // attached right after \end{...} (no blank line) continues in @endpe
     // state in the continuous run, so it belongs to the same \par unit.
@@ -315,14 +368,8 @@ const LITERAL_BOUNDARY_ENVS = new Set([
   'LVerbatim', 'LVerbatim*', 'SaveVerbatim', 'VerbatimOut', 'lstlisting', 'minted',
   'filecontents', 'filecontents*', 'comment', 'tcblisting', 'luacode', 'luacode*',
 ]);
-const MARKER_RE = /\\(begin|end)\{([^{}]*)\}/g;
-const INLINE_VERB_RE =
-  /(\\(?:verb\*?|lstinline(?:\[[^\]]*\])?|mintinline(?:\[[^\]]*\])?\{[^{}]*\})([^A-Za-z\s{*]))(.*?)\2/g;
-const INLINE_BRACED_RE =
-  /(\\(?:lstinline(?:\[[^\]]*\])?|mintinline(?:\[[^\]]*\])?\{[^{}]*\})\{)((?:[^{}]|\{[^{}]*\})*)\}/g;
-
 const LITERAL_OR_INLINE_RE = new RegExp(
-  `\\\\(?:verb|lstinline|mintinline)|\\\\begin\\{(?:${[...LITERAL_BOUNDARY_ENVS].map((name) => name.replace('*', '\\*')).join('|')})\\}`
+  `\\\\(?:detokenize|string|verb|lstinline|mintinline)|\\\\begin\\{(?:${[...LITERAL_BOUNDARY_ENVS].map((name) => name.replace('*', '\\*')).join('|')})\\}`
 );
 
 let boundsMemo = { text: null, value: null };
@@ -391,7 +438,7 @@ function plainDocumentMarkers(text, literalEnvs) {
   if (begin < 0 || end < begin) return null;
   if (text.indexOf('\\begin{document}', begin + 1) >= 0 || text.indexOf('\\end{document}', end + 1) >= 0) return null;
   if (literalEnvs.size || LITERAL_OR_INLINE_RE.test(text)) return null;
-  if (commentedAt(text, begin) || commentedAt(text, end)) return null;
+  if (text[begin - 1] === '\\' || text[end - 1] === '\\' || commentedAt(text, begin) || commentedAt(text, end)) return null;
   return { begin, end };
 }
 
@@ -403,46 +450,36 @@ function commentedAt(text, offset) {
 
 function findDocumentMarkers(text, literalEnvs) {
   let begin = -1;
-  let inLiteral = null;
-  for (let pos = 0; pos <= text.length;) {
-    let eol = text.indexOf('\n', pos);
-    if (eol < 0) eol = text.length;
-    const line = text.slice(pos, eol);
-    let col = 0;
-    scan: while (col <= line.length) {
-      if (inLiteral) {
-        const close = line.indexOf(`\\end{${inLiteral}}`, col);
-        if (close < 0) break;
-        col = close + `\\end{${inLiteral}}`.length;
-        inLiteral = null;
-      }
-      const active = maskInlineVerbatim(line.slice(col));
-      const code = active.slice(0, commentStart(active));
-      MARKER_RE.lastIndex = 0;
-      for (let m; (m = MARKER_RE.exec(code));) {
-        const [, kind, name] = m;
-        if (kind === 'begin' && (LITERAL_BOUNDARY_ENVS.has(name) || literalEnvs.has(name))) {
-          inLiteral = name;
-          col += m.index + m[0].length;
-          continue scan;
-        }
-        if (name !== 'document') continue;
-        if (kind === 'begin' && begin < 0) begin = pos + col + m.index;
-        else if (kind === 'end' && begin >= 0) return { begin, end: pos + col + m.index };
-      }
-      break;
+  const tokens = /%|\\(?:[A-Za-z@]+|[\s\S])/g;
+  const argument = /\{([^{}\n]*)\}/y;
+  for (let token; (token = tokens.exec(text));) {
+    if (token[0] === '%') {
+      const newline = text.indexOf('\n', tokens.lastIndex);
+      if (newline < 0) break;
+      tokens.lastIndex = newline + 1;
+      continue;
     }
-    pos = eol + 1;
+    const name = token[0].slice(1);
+    if (name !== 'begin' && name !== 'end') {
+      const literal = inlineLiteral(text, { name, end: tokens.lastIndex }, text.length);
+      if (literal) tokens.lastIndex = literal.after;
+      continue;
+    }
+    argument.lastIndex = tokens.lastIndex;
+    const env = argument.exec(text);
+    if (!env) continue;
+    tokens.lastIndex = argument.lastIndex;
+    if (name === 'begin' && (LITERAL_BOUNDARY_ENVS.has(env[1]) || literalEnvs.has(env[1]))) {
+      const close = '\\end{' + env[1] + '}';
+      const at = text.indexOf(close, tokens.lastIndex);
+      if (at < 0) break;
+      tokens.lastIndex = at + close.length;
+    } else if (env[1] === 'document') {
+      if (name === 'begin' && begin < 0) begin = token.index;
+      else if (name === 'end' && begin >= 0) return { begin, end: token.index };
+    }
   }
   return { begin, end: -1 };
-}
-
-// Blank out inline verbatim payloads, keeping every offset in place.
-function maskInlineVerbatim(s) {
-  if (!/\\(?:verb|lstinline|mintinline)/.test(s)) return s;
-  return s
-    .replace(INLINE_VERB_RE, (_, head, delim, payload) => `${head}${' '.repeat(payload.length)}${delim}`)
-    .replace(INLINE_BRACED_RE, (_, head, payload) => `${head}${' '.repeat(payload.length)}}`);
 }
 
 // Offset of the first `%` that starts a comment: one preceded by an even

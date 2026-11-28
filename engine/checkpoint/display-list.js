@@ -349,7 +349,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       line: u.li,
       backend: u.ln.backend,
     });
-    if (u.ln.parts) partCommands(commands, u, L, baseline, chunks.get(u.ln.partsChunk ?? u.blockId));
+    if (u.ln.parts) partCommands(commands, u, L, baseline, chunks.get(u.ln.partsChunk ?? u.blockId), fonts);
     else if (!NO_LINE_REUSE) {
       LINE_COMMANDS.set(u, {
         L, baseline, fonts, twinMetrics, runs: u.ln.runs, src: u.blockId, line: u.li, backend: u.ln.backend,
@@ -513,7 +513,7 @@ function addBodyOverhang(out, unit, x, baseline, bodyTop, bodyBottom) {
  * whole picture is; `held` keeps every reader of exact pixels (editing
  * geometry, the publication referee) from taking them for the current
  * source's. Text between the windows is ordinary glyph commands. */
-function partCommands(commands, unit, X, baseline, meta) {
+function partCommands(commands, unit, X, baseline, meta, fonts) {
   if (!meta) return;
   const pad = -(meta.xBp ?? 0);
   const width = meta.wBp ?? 0;
@@ -530,6 +530,7 @@ function partCommands(commands, unit, X, baseline, meta) {
     if (sy < 0) { y -= sy; h += sy; sy = 0; }
     h = Math.min(h, height - sy);
     if (!(w > 0) || !(h > 0)) continue;
+    const run = unit.ln.editRuns?.[part.runIndex];
     commands.push({
       op: 'chunk',
       chunk: unit.ln.partsChunk ?? unit.blockId,
@@ -544,10 +545,35 @@ function partCommands(commands, unit, X, baseline, meta) {
       cv: meta.v ?? 0,
       held: 1,
       part: 1,
+      partGlyphs: partMathGlyphs(run, X, baseline, fonts),
+      partRule: run?.rule && run.w > 0 && run.h > 0
+        ? [r2(X + run.x), r2(baseline + run.dy), r2(run.w), r2(run.h)] : undefined,
       line: unit.li,
       src: unit.blockId,
     });
   }
+}
+
+// The picture can come from an earlier render, but these positions belong
+// to the current TeX run. They're also the hit geometry for its MathLive input.
+function partMathGlyphs(run, origin, lineBaseline, fonts) {
+  if (!run?.m || !run.t) return undefined;
+  const font = fonts.get(run.f);
+  if (!font) return undefined;
+  const chars = [...(font.remap ? remapText(run.t, font.remap) : run.t)];
+  const offsets = chars.length === 1 ? [0] : run.gp;
+  if (!offsets || offsets.length !== chars.length) return undefined;
+  const baseline = r2(lineBaseline + (run.dy ?? 0));
+  const top = r2(baseline - run.gh), bottom = r2(baseline + run.gd);
+  if (!(bottom > top)) return undefined;
+  const glyphs = [];
+  for (let index = 0; index < chars.length; index++) {
+    const left = r2(origin + run.x + offsets[index]);
+    const right = r2(origin + run.x + (offsets[index + 1] ?? run.w));
+    if (!(right > left)) return undefined;
+    glyphs.push({ text: chars[index], left, right, top, bottom, baseline });
+  }
+  return glyphs;
 }
 
 /** Paint one run list (glyphs + rules) at a baseline — shared by body

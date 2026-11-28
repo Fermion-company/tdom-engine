@@ -33,12 +33,19 @@ export function provisionalViewer(pages, canonicalCount = pages.length) {
     directEditor: null, residentPageCountAuthoritative: false, liveSearch: { query: '' },
     openingPreview: false,
     openingEdited: false,
+    // (the paper size a canonical commit records for each resident page it
+    // keeps: tryCommitOpaqueCanonicalBatch, paintedResidentPage)
+    geometry: { paperwidth: 600, paperheight: 800 },
+    // (no editor is opening on the paper: updateCanonState, holdingDirectOpeningPaper)
+    openingDirectInput: null,
     deferredDirectPresentationEvents: [], canonicalAnchorPreview: null, canonicalAnchorPendingPatch: null,
     directPresentationBlocked: () => false, ensureOpaqueBatchEditorTargetPage: () => true,
     outerSheetDecoded: () => true, // (no outer paper here)
     captureDirectEditorPageScroll() {}, applyStagedDirectEditor() {}, scheduleViewportWarm() {},
     scheduleChunkPrefetch() {}, // (pictures are not fetched here)
     patchProvisionalSvg: () => false, spliceSvgChildren() {}, // (these shells hold no SVG: a page is put in whole)
+    // (no MathLive draft of a formula is on any page: tryCommitProvisionalStages)
+    retirePendingFormulas() {},
     buildDeferredStages: () => 0, // (the stand-in renderPage below builds every page at once: nothing is put off)
     // every page is in sight: a page out of sight does not hold a commit
     // (app.js pagesInSight), and these transactions are about the ones that do
@@ -119,6 +126,9 @@ function withEvents(state) {
     previewReasons: [], modeReasons: [], document: { body: { classList: { toggle() {} } } },
     injectFonts() {}, setMode() {}, closeDirectEditor() {}, prepareOpaqueShell() {}, ensurePresentedDomSnapshot() {},
     adoptPushedSnapshot() {}, renderInspector() {}, clearCanonicalAnchorPreview() {},
+    // (the MathLive drafts of an edited formula are not drawn here: applyReport,
+    // receivePreviewEvent `source-edit-location`)
+    previewSourceFormula: async () => {}, warmSourceFormula() {},
   });
   vm.runInContext(events, state);
   state.teardown = state.teardownDocRecovery;

@@ -1,15 +1,22 @@
-import { readFileSync, statSync, watch } from 'node:fs';
+import { readFileSync, statSync, watch, watchFile, unwatchFile } from 'node:fs';
 import path from 'node:path';
 import { fnv1a } from '../hash.js';
 import { segmentBody } from '../segmenter.js';
-import { resolveProjectInput } from '../project-inputs.js';
+import { isPathInside, resolveProjectInput } from '../project-inputs.js';
 import { expandInputParagraphs } from './mapped-inputs.js';
 import { cacheIncludeRead, includeTextCurrent, overlayContentSig, resourceContentSig } from './include-cache.js';
 import { documentBodyRange } from './subfile.js';
 
 export function expandIncludes(segs, depth, context) {
   if (depth > 3) return segs;
-  if (depth === 0) segs = expandInputParagraphs(segs, context);
+  if (depth === 0) {
+    // Share the root's graphics search path across chapters. Most documents
+    // use no such directive; parse it only when an image asks for it.
+    const root = context.docDir ?? context.workDir;
+    let paths;
+    context = { ...context, graphicDirs: () => paths ??= projectGraphicDirs(context.source, root, context.sourceDir ?? root) };
+    segs = expandInputParagraphs(segs, context);
+  }
   const out = [];
   for (let segmentIndex = 0; segmentIndex < segs.length; segmentIndex++) {
     const seg = segs[segmentIndex];
@@ -40,8 +47,10 @@ export function expandIncludes(segs, depth, context) {
     const resolved = resolveProjectInput(rel, {
       docDir: context.docDir ?? context.workDir,
       overlayDir: context.overlayDir,
-      baseDir: seg.resourceBaseDir ?? context.docDir ?? context.workDir,
+      sourceDir: context.sourceDir,
+      baseDir: seg.resourceBaseDir ?? context.sourceDir ?? context.docDir ?? context.workDir,
       extensions: ['.tex'],
+      onMissing: context.watchInclude,
     });
     const expanded = resolved
       ? expandTextFile(
@@ -130,21 +139,24 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
     const memos = leaf ? leafExpansions.get(context.includes) ?? leafExpansions.set(context.includes, new Map()).get(context.includes) : null;
     const memo = memos?.get(full);
     if (memo && memo.key === memoKey && memo.text === text && memo.rootUnit === rootUnit) {
-      return memo.segs.map((seg) => ({ ...seg }));
+      return memo.segs.map((seg, i) => {
+        const resource = memo.resources?.get(i);
+        if (!resource) return { ...seg };
+        // The chapter text and source ranges are unchanged, but the bytes
+        // read by a figure or plot may have changed since its segmentation.
+        const current = decorateExternalResources(resource, context);
+        return { ...seg, hash: fnv1a(`${full}|${current.hash}`) };
+      });
     }
     const diagnosticsBefore = context.diagnostics?.length ?? 0;
-    const subs = expandIncludes(
-      expandInputParagraphs(segmentBody(bodyText, bodyStart, { literalEnvs: context.literalEnvs }), {
-        ...context,
-        source: text,
-        file: full,
-        rootUnit,
-        structuralEvents: [],
-      })
-        .map((seg) => ({ ...seg, resourceBaseDir: seg.resourceBaseDir ?? path.dirname(full) })),
-      depth + 1,
-      { ...context, file: full, rootUnit }
-    );
+    const local = expandInputParagraphs(segmentBody(bodyText, bodyStart, { literalEnvs: context.literalEnvs }), {
+      ...context,
+      source: text,
+      file: full,
+      rootUnit,
+      structuralEvents: [],
+    }).map(seg => ({ ...seg, resourceBaseDir: seg.resourceBaseDir ?? path.dirname(full) }));
+    const subs = expandIncludes(local, depth + 1, { ...context, file: full, rootUnit });
     const starts = lineStarts(text);
     const expanded = subs.map((s) => {
       const direct = !s.file;
@@ -158,8 +170,12 @@ function expandTextFile(full, depth, context, readPath = full, overlay = false, 
     });
     if (memos) {
       // only what came from this file's own text, and said nothing while it did
-      if (subs.every((seg) => !seg.file) && (context.diagnostics?.length ?? 0) === diagnosticsBefore) {
-        memos.set(full, { key: memoKey, text, rootUnit, segs: expanded.map((seg) => ({ ...seg })) });
+      if (local.length === subs.length && subs.every((seg) => !seg.file) && (context.diagnostics?.length ?? 0) === diagnosticsBefore) {
+        let resources;
+        local.forEach((seg, i) => {
+          if (READS_A_RESOURCE.test(seg.text)) (resources ??= new Map()).set(i, seg);
+        });
+        memos.set(full, { key: memoKey, text, rootUnit, resources, segs: expanded.map((seg) => ({ ...seg })) });
       } else {
         memos.delete(full);
       }
@@ -222,17 +238,32 @@ function offsetPosition(text, starts, offset) {
 // the seven sweeps that ran for each one on every keystroke.
 const READS_A_RESOURCE = /\\(?:includegraphics|includepdf|lstinputlisting|verbatiminput|inputminted|addplot|input|include|printindex)/;
 
+function projectGraphicDirs(source, root, sourceDir) {
+  if (!source?.includes('\\graphicspath')) return [];
+  const dirs = new Set();
+  const literal = /\\graphicspath\s*\{\s*((?:\{[^{}\\%#]*\}\s*)+)\}/g;
+  for (const declaration of stripTexComments(source).matchAll(literal)) {
+    for (const entry of declaration[1].matchAll(/\{([^{}]+)\}/g)) {
+      const dir = path.resolve(sourceDir, entry[1].trim());
+      if (isPathInside(root, dir)) dirs.add(dir);
+    }
+  }
+  return [...dirs];
+}
+
 function decorateExternalResources(seg, context) {
   if (!READS_A_RESOURCE.test(seg.text)) return seg;
   const specs = [];
   const seenTex = new Set();
   let externalGraphics = false;
-  const add = (raw, extensions = [], baseDir = context.docDir ?? context.workDir) => {
+  const add = (raw, extensions = [], baseDir = context.docDir ?? context.workDir, searchDirs = []) => {
     const resolved = resolveProjectInput(raw, {
       docDir: context.docDir ?? context.workDir,
       overlayDir: context.overlayDir,
+      sourceDir: context.sourceDir,
       baseDir,
-      extensions,
+      extensions, searchDirs,
+      onMissing: context.watchInclude,
     });
     if (!resolved) return null;
     try {
@@ -252,7 +283,7 @@ function decorateExternalResources(seg, context) {
     const visible = stripTexComments(text);
     for (const m of visible.matchAll(/\\includegraphics\*?\s*(?:\[[^\]]*\]\s*)?\{([^}]+)\}/g)) {
       externalGraphics = true;
-      add(m[1], ['.pdf', '.png', '.jpg', '.jpeg', '.mps', '.eps'], baseDir);
+      add(m[1], ['.pdf', '.png', '.jpg', '.jpeg', '.mps', '.eps'], baseDir, context.graphicDirs?.());
     }
     for (const m of visible.matchAll(/\\includepdf\s*(?:\[[^\]]*\]\s*)?\{([^}]+)\}/g)) {
       externalGraphics = true;
@@ -279,7 +310,7 @@ function decorateExternalResources(seg, context) {
       }
     }
   };
-  scan(seg.text, seg.resourceBaseDir ?? context.docDir ?? context.workDir);
+  scan(seg.text, seg.resourceBaseDir ?? context.sourceDir ?? context.docDir ?? context.workDir);
   // \printindex reads \jobname.ind, which the engine copies from canonical's
   // makeindex run. Its signature makes the index block dirty when the index
   // arrives or changes, so the resident retypesets it on the next update.
@@ -314,51 +345,77 @@ function stripTexComments(text) {
     .join('\n');
 }
 
-// fs.watch follows the inode, not the path: after an editor or sync client
-// saves by renaming a new file over this one (vim, most atomic writers), the
-// old watch sits on an unlinked inode and never fires again. A `rename` event
-// or a new inode at the path re-arms it on whatever the path holds now. The
-// path can be missing mid-save, so the debounced delivery retries once; a
-// path still missing then leaves `watchers`, and the next expansion that
-// reads it watches it again. The map keeps one handle per path across
-// re-arms, and closing it closes the live watch.
+// A missing chapter or figure has no inode to watch. Share one inexpensive
+// directory stat poll among missing siblings, including when the directory
+// itself has not been created yet. Existing files keep native notifications.
+const missingDirectories = new WeakMap();
+function waitForInput(full, watchers, found) {
+  let dirs = missingDirectories.get(watchers);
+  if (!dirs) missingDirectories.set(watchers, dirs = new Map());
+  const dir = path.dirname(full);
+  let group = dirs.get(dir);
+  if (!group) {
+    const probes = new Set();
+    const check = () => { for (const probe of [...probes]) probe(); };
+    group = { probes, check };
+    dirs.set(dir, group);
+    watchFile(dir, { persistent: false, interval: 600 }, check);
+  }
+  const probe = () => { if (fileIdentity(full)) found(); };
+  group.probes.add(probe);
+  return () => {
+    group.probes.delete(probe);
+    if (group.probes.size) return;
+    unwatchFile(dir, group.check);
+    dirs.delete(dir);
+  };
+}
+
 export function watchInclude(full, watchers, onExternalChange) {
   if (watchers.has(full)) return;
-  let timer = null;
-  let live = null;
-  let closed = false;
+  let timer = null, live = null, stopWaiting = null, closed = false;
   const handle = {
     close() {
       closed = true;
+      clearTimeout(timer);
       live?.close();
+      stopWaiting?.();
     },
   };
+  const signal = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { if (!closed) onExternalChange?.(full); }, 120);
+  };
   const arm = () => {
+    if (closed) return;
+    const identity = fileIdentity(full);
     try {
-      const identity = fileIdentity(full);
-      const w = watch(full, (event) => {
-        if (w === live && (event === 'rename' || fileIdentity(full) !== identity)) {
+      const w = watch(full, event => {
+        if (closed || w !== live) return;
+        if (event === 'rename' || fileIdentity(full) !== identity) {
           w.close();
           live = null;
           arm();
         }
-        clearTimeout(timer);
-        timer = setTimeout(deliver, 120);
+        signal();
       });
       live = w;
-    } catch {
-      /* watching is best-effort */
+    } catch (error) {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') return;
+      const found = () => {
+        if (closed || !stopWaiting) return;
+        stopWaiting();
+        stopWaiting = null;
+        arm();
+        signal();
+      };
+      stopWaiting = waitForInput(full, watchers, found);
+      // The file may have appeared between the failed watch and subscription.
+      if (fileIdentity(full)) found();
     }
-  };
-  const deliver = () => {
-    if (!live && !closed) {
-      arm();
-      if (!live && watchers.get(full) === handle) watchers.delete(full);
-    }
-    onExternalChange?.(full);
   };
   arm();
-  if (live) watchers.set(full, handle);
+  if (live || stopWaiting) watchers.set(full, handle);
 }
 
 function fileIdentity(file) {

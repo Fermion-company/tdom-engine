@@ -3,7 +3,7 @@ import { reconcile } from './pagebuilder.js';
 import { nextEditHold, editPageRenderIds, focusRescueIds } from './update-helpers.js';
 import { buildPagePatches, EAGER_PAGES } from './page-patches.js';
 import { buildUpdateResponse } from './update-response.js';
-import { residentPaintable } from './ship-pacing.js';
+import { physicalReplayReady, residentPaintable } from './ship-pacing.js';
 import { instrumentEditRegions } from '../edit-regions.js';
 import { furniturePageKey } from './page-metadata.js';
 import { displayListBodyChanged } from './display-list.js';
@@ -102,7 +102,7 @@ export function finalizeUpdate(engine, {
   // has its shipping generation and canonical compile scheduled.
   scheduleBackground(fgStop, dirtyBlocks, {
     interactive: !rebooted,
-    pageRenderIds: rebooted ? [] : editPageRenderIds(engine.blocks, engine.pages, dirtySource),
+    pageRenderIds: rebooted || physicalReplayReady(engine) ? [] : editPageRenderIds(engine.blocks, engine.pages, dirtySource),
   });
   timer.lap('schedule');
   return buildUpdateResponse({

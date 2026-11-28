@@ -9,7 +9,7 @@ import { expandIncludes, includeOnlyFromSource } from '../engine/checkpoint/incl
 import { applyFidelity } from '../engine/checkpoint/fidelity-gate.js';
 import { segmentBody } from '../engine/segmenter.js';
 import { describeExternalBibliography, prepareExternalBibliography } from '../engine/project-bibliography.js';
-import { resolveProjectInput, withProjectInputs } from '../engine/project-inputs.js';
+import { originalSearchInput, resolveProjectInput, withProjectInputs } from '../engine/project-inputs.js';
 import { buildJobBlockBody } from '../engine/checkpoint/job-body.js';
 import { chunkTargets } from '../engine/checkpoint/chunk-targets.js';
 
@@ -56,6 +56,27 @@ test('standalone include inherits nested image fidelity and watches both files',
     assert.equal(block.needsRender, true);
   } finally {
     rmSync(docDir, { recursive: true, force: true });
+  }
+});
+
+test('a cached chapter follows a replaced image on the root graphics search path', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tdom-chapter-graphic-'));
+  const child = path.join(dir, 'one.tex'), figures = path.join(dir, 'figures'), image = path.join(figures, 'plot.png');
+  mkdirSync(figures);
+  writeFileSync(child, String.raw`A figure \includegraphics{plot.png}.`);
+  const context = { source: String.raw`\graphicspath{{figures/}}`, file: 'main.tex', docDir: dir,
+    workDir: dir, includes: new Map(), resources: new Map(), diagnostics: [], watchInclude() {} };
+  const expand = () => expandIncludes(segmentBody('\\include{one}\n', 0), 0, context)[0];
+  try {
+    writeFileSync(image, 'first');
+    const initial = expand();
+    writeFileSync(image, 'a different plot');
+    const updated = expand();
+    assert.notEqual(initial.hash, updated.hash);
+    assert.deepEqual(initial.sourceStart, updated.sourceStart);
+    assert.equal(expand().hash, updated.hash);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -128,6 +149,33 @@ test('unsaved project overlays shadow child TeX and bibliography without copying
   } finally {
     rmSync(docDir, { recursive: true, force: true });
     rmSync(overlayDir, { recursive: true, force: true });
+  }
+});
+
+test('a nested manuscript selects its own inputs ahead of a workspace overlay', () => {
+  const docDir = mkdtempSync(path.join(tmpdir(), 'tdom-nested-manuscript-'));
+  const sourceDir = path.join(docDir, 'chapters');
+  const overlayDir = path.join(docDir, 'overlay');
+  const context = { docDir, sourceDir, overlayDir };
+  try {
+    mkdirSync(sourceDir);
+    mkdirSync(path.join(overlayDir, 'chapters'), { recursive: true });
+    const local = path.join(sourceDir, 'format.sty');
+    const draft = path.join(overlayDir, 'format.sty');
+    writeFileSync(draft, 'outer draft');
+    const missing = [];
+    assert.equal(resolveProjectInput('format.sty', { ...context, onMissing: f => missing.push(f) }).readPath, draft);
+    assert.deepEqual(missing, [local]);
+    writeFileSync(local, 'local saved');
+    assert.equal(resolveProjectInput('format.sty', context).readPath, local);
+    const localDraft = path.join(overlayDir, 'chapters', 'format.sty');
+    writeFileSync(localDraft, 'local draft');
+    assert.equal(resolveProjectInput('format.sty', context).readPath, localDraft);
+    const search = withProjectInputs({}, { ...context, recursive: true });
+    assert.deepEqual(search.TEXINPUTS.split(path.delimiter).slice(0, 4),
+      [path.dirname(localDraft), sourceDir, overlayDir, docDir]);
+  } finally {
+    rmSync(docDir, { recursive: true, force: true });
   }
 });
 
@@ -248,4 +296,34 @@ test('includeonly excludes unselected chapters from the provisional source DOM',
   } finally {
     rmSync(docDir, { recursive: true, force: true });
   }
+});
+
+test('Kpathsea reads a nested project with literal search separators and preserves its source identity', async t => {
+  const base = mkdtempSync(path.join(tmpdir(), 'tdom-literal-paths-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const docDir = path.join(base, '修士;論文');
+  const sourceDir = path.join(docDir, '本文 {最終,予備}');
+  const overlayDir = path.join(base, '未保存;原稿');
+  mkdirSync(sourceDir, { recursive: true });
+  const draftDir = path.join(overlayDir, path.basename(sourceDir));
+  mkdirSync(draftDir, { recursive: true });
+  const name = 'tdom-local.tex';
+  writeFileSync(path.join(docDir, name), 'outer');
+  writeFileSync(path.join(sourceDir, name), 'local');
+  const env = withProjectInputs(process.env, { docDir, sourceDir, overlayDir, recursive: true });
+  const lookup = async () => {
+    const { stdout } = await promisify(execFile)('kpsewhich', [name], { env, cwd: base });
+    return path.resolve(base, stdout.trim());
+  };
+  let found;
+  try { found = await lookup(); } catch (e) {
+    if (e.code === 'ENOENT') return t.skip('kpsewhich not installed');
+    throw e;
+  }
+  assert.equal(originalSearchInput(found), path.join(sourceDir, name));
+  assert.equal(readFileSync(found, 'utf8'), 'local');
+  writeFileSync(path.join(draftDir, name), 'draft');
+  found = await lookup();
+  assert.equal(originalSearchInput(found), path.join(draftDir, name));
+  assert.equal(readFileSync(found, 'utf8'), 'draft');
 });

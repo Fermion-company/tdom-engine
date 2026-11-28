@@ -1,10 +1,11 @@
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { hasDefinitionEdit } from './update-helpers.js';
+import { hasDefinitionEdit, editPageRenderIds } from './update-helpers.js';
 import { flushVanishedLabels, labelReferenceCandidates, pushLabelDependencies } from './reference-deps.js';
 import { push2, resolvedInGalley, vecLocalsEqual } from './util/galley.js';
 import { canDeferPlainVerification, sameClearpageContinuation } from './plain-preview.js';
+import { prepareUnpaintedFormula } from './stream.js';
 import { chunkTargets } from './chunk-targets.js';
 
 export async function runUpdateTypesetPhase(engine, {
@@ -86,9 +87,14 @@ export async function runUpdateTypesetPhase(engine, {
   let lastDisplay = lastDirty;
   const displayReplay = new Set();
   if (engine.previewPolicy === 'structured' && engine.foregroundRenderIds) {
+    const canCompose = !defEdit && engine.chunks.outlines?.size > 0;
+    const mathNeighbours = canCompose
+      ? new Set(editPageRenderIds(engine.blocks, engine.pages, dirtySource, { includeAdjacent: true })) : null;
     for (let k = 0; k < engine.blocks.length; k++) {
       const block = engine.blocks[k];
-      if (!engine.foregroundRenderIds.has(block.id) || !block.needsRender) continue;
+      if (!block.needsRender) continue;
+      if (mathNeighbours?.has(block.id) && !dirtySource.has(block.id) && prepareUnpaintedFormula(block, engine.chunks)) continue;
+      if (!engine.foregroundRenderIds.has(block.id)) continue;
       if (!chunkTargets(block).some(target => engine.chunks.get(target.key)?.forGalley !== block.galleyHash)) continue;
       // RENDER can use a retained input directly; it needs no foreground
       // replay merely because its exact pixels have not been requested yet.

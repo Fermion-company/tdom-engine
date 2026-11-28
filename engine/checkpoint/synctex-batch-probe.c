@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define MAX_LINES 512
 #define MAX_RECORDS 100000
@@ -17,6 +18,10 @@ static int parse_positive_int(const char *text, int *value) {
 }
 
 int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+    puts("tdom-synctex-batch 1");
+    return 0;
+  }
   int first = 0, last = 0, first_column = 0;
   if (argc != 6 || !parse_positive_int(argv[3], &first) ||
       !parse_positive_int(argv[4], &last) || !parse_positive_int(argv[5], &first_column) ||

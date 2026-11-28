@@ -609,10 +609,36 @@ body.is-embed .chunkwin { pointer-events: none; }
    again; keyboard focus survives pointer-events:none. The visible suggestion
    panel remains directly interactive. */
 .tdom-direct-editor.is-opaque { pointer-events: none; }
+/* MathLive shadow children can opt back into pointer events. Clip the
+   invisible control's hit area while keeping its keyboard and IME focus. */
+.tdom-direct-editor.is-opaque math-field { clip-path: inset(50%); }
+.tdom-pending-formula {
+  position: absolute;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 11;
+}
+.page:not(.is-final) .tdom-pending-formula { display: none; }
+.tdom-pending-formula math-field {
+  display: block; width: max-content; min-width: 0; padding: 0; margin: 0;
+  border: 0; background: transparent; color: #111; font-size: 32px;
+  transform-origin: top left;
+}
+.tdom-pending-formula math-field::part(menu-toggle),
+.tdom-pending-formula math-field::part(virtual-keyboard-toggle) { display: none; }
 .tdom-ink-layer { position: absolute; inset: 0; z-index: 13; pointer-events: none; }
 .tdom-ink-layer > span { position: absolute; pointer-events: none; }
 .tdom-ink-caret { background: #2563eb; }
 .tdom-ink-selection { background: rgba(37, 99, 235, 0.22); }
+.tdom-direct-opening-input {
+  position: fixed; width: 1px; height: 1px; min-height: 0;
+  margin: 0; padding: 0; border: 0; outline: none; box-shadow: none; resize: none;
+  opacity: 0; pointer-events: none; overflow: hidden; font-size: 16px;
+}
+.tdom-direct-opening-input.is-composing:focus {
+  z-index: 14; field-sizing: content; width: auto; height: auto; min-width: 1ch;
+  color: #111; background: #fff; opacity: 1; font-family: serif; line-height: 1;
+}
 .tdom-ink-composition {
   color: #111;
   background: #fff;
@@ -621,6 +647,11 @@ body.is-embed .chunkwin { pointer-events: none; }
   overflow-wrap: anywhere;
   text-decoration: underline;
   text-underline-offset: 2px;
+}
+.tdom-ink-composition.is-committed {
+  white-space: pre;
+  overflow: hidden;
+  text-decoration: none;
 }
 .tdom-direct-editor.is-opaque .math-wysiwyg-panel {
   pointer-events: auto;

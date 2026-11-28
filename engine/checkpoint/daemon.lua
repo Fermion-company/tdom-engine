@@ -942,6 +942,15 @@ function tdom_num(name, value)
   geo_extra[name] = tonumber(value) or 0
 end
 
+-- The final clearpage is synthesized by the JS page builder. Read the live
+-- newpage definition so older formats and classes using plain vfil keep
+-- their original behavior.
+function tdom_newpage_geometry()
+  local body = (token.get_macro('newpage') or ''):gsub('%s+', '')
+  local correction = [[\ifdim\prevdepth>\z@\vskip-\ifdim\prevdepth>\maxdepth\maxdepth\else\prevdepth\fi\fi\vfil]]
+  tdom_num('newpageDepthCorrection', body:find(correction, 1, true) and 1 or 0)
+end
+
 -- full glue parameters: natural, stretch, shrink + orders (driver sends the
 -- components via \gluestretch etc. so nothing is approximated)
 function tdom_glue(name, w, st, sh, sto, sho)
@@ -1240,10 +1249,29 @@ local function emit_leader_rule(n, parent, x, dy0, out)
   return true
 end
 
-walk_h = function(head, parent, x0, dy0, out, math_mode)
+-- (punctuation_ink is walk_h's alone, in a block: the main chunk is near
+-- Lua's limit of 200 locals)
+do
+-- Japanese punctuation can have a full-em PDF advance but a much smaller
+-- outline. Capture the real native glyph's horizontal bounds, in bp from
+-- its origin. Unmeasured or transformed fonts keep their full advance.
+local function punctuation_ink(f, ch, cp, n)
+  if not f or not ch or ch.commands or f.type == 'virtual' or
+      (f.slant or 0) ~= 0 or (f.extend or 1000) ~= 1000 or
+      (f.squeeze or 1000) ~= 1000 or (f.mode or 0) ~= 0 or
+      (n.expansion_factor or 0) ~= 0 then return nil end
+  local desc = f.descriptions and f.descriptions[cp]
+  local box = desc and desc.boundingbox
+  local factor = f.parameters and f.parameters.hfactor
+  if not box or not ch.index or desc.index ~= ch.index or not factor or factor <= 0 or
+      type(box[1]) ~= 'number' or type(box[3]) ~= 'number' or box[1] >= box[3] then return nil end
+  return {bp(box[1] * factor), bp(box[3] * factor)}
+end
+
+walk_h = function(head, parent, x0, dy0, out, math_mode, continued_math)
   local x = x0
   local run = nil
-  local in_math = math_mode and true or false
+  local in_math = math_mode or continued_math or false
   local function flush()
     if run and #run.g > 0 then
       run.w = math.max(0, x - run.x)
@@ -1285,7 +1313,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       -- TeX's math machinery (variants, extensibles, italic correction).
       -- Either way the LINE needs an exact preview chunk; the twin/glyph
       -- approximation is at best a brief bridge until it lands.
-      if legacy or (fi and fi.mth) then
+      if in_math or legacy or (fi and fi.mth) then
         line_x = true
       end
       -- (a run that is shown as exact pixels says where each of its glyphs
@@ -1310,6 +1338,12 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       local fdata = font.getfont(n.font)
       local cinfo = fdata and fdata.characters and fdata.characters[n.char]
       if cinfo then
+        if #run.g == 1 and not in_math and ((c >= 0x3001 and c <= 0x301b) or
+            c == 0xff08 or c == 0xff09 or c == 0xff0c or c == 0xff0e) then
+          run.ink = punctuation_ink(fdata, cinfo, c, n)
+        elseif run.ink then
+          run.ink = nil
+        end
         if bp(cinfo.height or 0) > run.gh then run.gh = bp(cinfo.height or 0) end
         if bp(cinfo.depth or 0) > run.gd then run.gd = bp(cinfo.depth or 0) end
       end
@@ -1353,7 +1387,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       -- browser glyph path by default
       flush()
       line_x = true
-      in_math = not in_math
+      in_math = math_mode or n.subtype == 0
       -- \mathsurround travels on the math node (kern-like, or glue in
       -- LuaTeX's mathsurroundskip form); zero in almost every document
       local mw = 0
@@ -1392,17 +1426,26 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
     n = n.next
   end
   flush()
+  return in_math
 end
+end
+
+-- A paragraph may break inside inline math. Only its line hboxes share
+-- the open math state; nested boxes have their own lists. (HLIST subtype 1
+-- is a paragraph line; a literal, not a local: see punctuation_ink.)
 
 walk_v = function(box, x0, baseline_dy, out, math_mode)
   -- box is a vlist whose baseline sits at baseline_dy; contents start at its top
   local y = baseline_dy - bp(box.height or 0)
   local n = box.list
+  local continued_math = false
   while n do
     local id = n.id
     if id == HLIST then
       local base = y + bp(n.height or 0)
-      walk_h(n.list, n, x0 + bp(n.shift or 0), base, out, math_mode)
+      local is_line = n.subtype == 1
+      local open = walk_h(n.list, n, x0 + bp(n.shift or 0), base, out, math_mode, is_line and continued_math)
+      if is_line then continued_math = open end
       y = y + bp(n.height or 0) + bp(n.depth or 0)
     elseif id == VLIST then
       walk_v(n, x0 + bp(n.shift or 0), y + bp(n.height or 0), out, math_mode)
@@ -1453,6 +1496,7 @@ end
 local top_epochs = {} -- per top-level item: the EPOCH_ATTR stamp of its node
 local function extract_items(head, parentBox)
   local items = {}
+  local continued_math = false
   local n = head
   while n do
     local id = n.id
@@ -1484,7 +1528,9 @@ local function extract_items(head, parentBox)
         -- LaTeX lists live on it. The nested walks (519/587) honored it;
         -- the top-level line boxes must too, or every \item renders at the
         -- body margin (found by the Phase-0 farm's dx metric).
-        walk_h(n.list, n, bp(n.shift or 0), 0, runs)
+        local is_line = n.subtype == 1
+        local open = walk_h(n.list, n, bp(n.shift or 0), 0, runs, false, is_line and continued_math)
+        if is_line then continued_math = open end
       elseif id == VLIST then
         walk_v(n, bp(n.shift or 0), bp(h), runs)
       else
@@ -2657,6 +2703,7 @@ function tdom_report()
     closure_error = JOB.error,
     tdomSourceCatcodesSafe = JOB.sourceCatcodesSafe == true,
     tdomActive = JOB.activeChars ~= '' and JOB.activeChars or nil,
+    tdomMathMacros = not JOB.had_error and JOB.mathMacros or nil,
     tdomMathActive = JOB.mathActiveChars ~= '' and JOB.mathActiveChars or nil,
     trail = md5.sumhexa(table.concat(blk_trail or {}, '\n')),
     trailMarks = trail_marks,
@@ -3826,6 +3873,77 @@ local function source_math_active_chars(body)
   return ok and found or '?'
 end
 
+-- The resident checkpoint knows which definition is in scope here, even
+-- when it came from an included file. Publish only supported, pure math
+-- templates; never execute a user command to discover its expansion.
+-- (The helpers are locals of a function of their own: the main chunk is at
+-- Lua's limit of 200 active locals, and only math_macro_templates is used
+-- outside them.)
+local math_macro_templates = (function()
+local math_template_commands = { frac=true, dfrac=true, tfrac=true, sqrt=true, alpha=true, beta=true, gamma=true,
+  delta=true, theta=true, lambda=true, mu=true, pi=true, sigma=true, phi=true, omega=true, infty=true,
+  times=true, pm=true, partial=true, le=true, ge=true, ne=true, int=true, sum=true, prod=true }
+local math_template_scope = { def=true, gdef=true, edef=true, xdef=true, let=true, futurelet=true, catcode=true,
+  newcommand=true, renewcommand=true, providecommand=true, DeclareRobustCommand=true,
+  NewDocumentCommand=true, RenewDocumentCommand=true, csname=true }
+local function pure_math_template(value, n)
+  if #value > 512 or value:find('[^%w%s#{}_%^%+%*%=().,%-%[%]\\]') then return false end
+  local plain = value:gsub('\\([A-Za-z]+)', function(c) return math_template_commands[c] and 'x' or '!' end)
+  plain = plain:gsub('#([1-9])', function(i) return tonumber(i) <= n and 'x' or '!' end)
+  return not plain:find('[!#\\]')
+end
+
+local function math_macro_meaning(name)
+  if not token.is_defined(name) then return nil end
+  local kind = token.create(name).cmdname
+  if kind == 'long_call' or kind == 'call' then return token.get_meaning(name) end
+end
+
+local function math_macro_template(name)
+  local meaning = math_macro_meaning(name)
+  if not meaning then return nil end
+  local default
+  -- LaTeX stores the optional default in the public dispatcher and the actual
+  -- parameter text/body under a second control sequence with a leading slash.
+  local prefix = '->\\@protected@testopt \\' .. name .. ' \\\\' .. name .. ' '
+  if meaning:sub(1, #prefix) == prefix then
+    default = meaning:sub(#prefix + 1):match('^(%b{})$')
+    if not default then return nil end
+    default = default:sub(2, -2)
+    if not pure_math_template(default, 0) then return nil end
+    meaning = math_macro_meaning('\\' .. name)
+    if not meaning or meaning:sub(1, 4) ~= '[#1]' then return nil end
+    meaning = '#1' .. meaning:sub(5)
+  end
+  local params, value = meaning:match('^([#%d]*)%->(.+)$')
+  if not params then return nil end
+  local n = #params // 2
+  if n > 9 or not pure_math_template(value, n) then return nil end
+  local expected = ''
+  for i=1,n do expected = expected .. '#' .. i end
+  if params == expected then return { args=n, body=value, default=default } end
+end
+
+local function math_macro_templates(body)
+  if not body:find('\\', 1, true) then return nil end
+  local seen, result, count = {}, {}, 0
+  for name in body:gmatch('\\([A-Za-z]+)') do
+    if math_template_scope[name] then return nil end
+    if not seen[name] and not math_template_commands[name] then
+      seen[name] = true
+      local template = math_macro_template(name)
+      if template then
+        result[name] = template
+        count = count + 1
+        if count > 32 then return nil end
+      end
+    end
+  end
+  return count > 0 and result or nil
+end
+return math_macro_templates
+end)()
+
 function inject_job(body, ship)
   -- Typeset ON the main vertical list — full state continuity with the
   -- previous blocks (prevdepth, \everypar, spacefactor, open counters...).
@@ -3837,6 +3955,7 @@ function inject_job(body, ship)
     JOB.furnitureCarry = true
     JOB.furnitureSeconds = nil
   end
+  JOB.mathMacros = math_macro_templates(body)
   local lines = input_lines(body)
   lines[#lines + 1] = '\\par'
   if ship then

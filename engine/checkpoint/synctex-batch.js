@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   existsSync,
+  mkdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -34,7 +35,7 @@ const builds = new Map();
 const unavailableBuilds = new Set();
 let cachedSourceHash = null;
 
-function sourceHash() {
+export function syncTeXBatchSourceHash() {
   if (cachedSourceHash) return cachedSourceHash;
   const hash = createHash('sha256');
   for (const file of [PROBE, ...VENDOR_FILES.map((name) => path.join(VENDOR_DIR, name))]) {
@@ -47,17 +48,19 @@ function sourceHash() {
   return cachedSourceHash;
 }
 
-async function buildHelper(workDir, run, timeoutMs) {
-  const executable = path.join(workDir, process.platform === 'win32' ? 'tdom-synctex-batch.exe' : 'tdom-synctex-batch');
-  const stamp = `${executable}.sha256`;
-  const hash = sourceHash();
-  if (existsSync(executable) && existsSync(stamp) && readFileSync(stamp, 'utf8').trim() === hash) {
-    return executable;
-  }
+function matchesSources(executable) {
+  try {
+    return existsSync(executable) && readFileSync(executable + '.sha256', 'utf8').trim() === syncTeXBatchSourceHash();
+  } catch { return false; }
+}
+
+async function compileHelper(executable, run, timeoutMs, targetArch) {
+  const stamp = executable + '.sha256';
   const suffix = `${process.pid}-${randomUUID()}`;
   const pendingExecutable = `${executable}.tmp-${suffix}`;
   const pendingStamp = `${stamp}.tmp-${suffix}`;
   const args = [
+    ...(targetArch ? ['-arch', targetArch === 'arm64' ? 'arm64' : 'x86_64'] : []),
     '-O2',
     '-I', VENDOR_DIR,
     '-o', pendingExecutable,
@@ -70,8 +73,9 @@ async function buildHelper(workDir, run, timeoutMs) {
     await run('cc', args, {
       timeout: Math.min(BUILD_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs))),
       maxBuffer: 2 * 1024 * 1024,
+      ...(targetArch ? { env: { ...process.env, MACOSX_DEPLOYMENT_TARGET: process.env.MACOSX_DEPLOYMENT_TARGET || '11.0' } } : {}),
     });
-    writeFileSync(pendingStamp, `${hash}\n`);
+    writeFileSync(pendingStamp, `${syncTeXBatchSourceHash()}\n`);
     renameSync(pendingExecutable, executable);
     renameSync(pendingStamp, stamp);
     return executable;
@@ -81,31 +85,79 @@ async function buildHelper(workDir, run, timeoutMs) {
   }
 }
 
+const prebuiltPath = arch => path.join(DIR, 'prebuilt', `tdom-synctex-batch-darwin-${arch}`);
+
+export async function buildPrebuiltSyncTeXHelper({ arch = process.arch } = {}) {
+  if (process.platform !== 'darwin' || !['arm64', 'x64'].includes(arch)) {
+    throw new Error(`Unsupported SyncTeX helper target: ${process.platform}-${arch}`);
+  }
+  const executable = prebuiltPath(arch);
+  mkdirSync(path.dirname(executable), { recursive: true });
+  return compileHelper(executable, execFileP, BUILD_TIMEOUT_MS, arch);
+}
+
+const interrupted = error => Boolean(error?.killed || error?.signal || error?.code === 'ETIMEDOUT' || error?.code === 'ECANCELED');
+
+async function readyHelper(workDir, run, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const remaining = () => {
+    const time = deadline - Date.now();
+    if (time <= 0) throw Object.assign(new Error('SyncTeX helper initialization timed out'), { code: 'ETIMEDOUT' });
+    return time;
+  };
+  const probe = async executable => {
+    const result = await run(executable, ['--version'], { timeout: remaining(), maxBuffer: 1024 });
+    if (String(result.stdout).trim() !== 'tdom-synctex-batch 1') throw new Error('Invalid SyncTeX helper');
+    return executable;
+  };
+  if (process.platform === 'darwin') {
+    const packed = prebuiltPath(process.arch);
+    if (matchesSources(packed)) {
+      try { return await probe(packed); }
+      catch (error) { if (interrupted(error)) throw error; }
+    }
+  }
+  const executable = path.join(workDir, process.platform === 'win32' ? 'tdom-synctex-batch.exe' : 'tdom-synctex-batch');
+  if (!matchesSources(executable)) {
+    await compileHelper(executable, run, remaining());
+  }
+  // On macOS the first launch of a new executable can cost hundreds of
+  // milliseconds. Do that during preparation, before any manuscript query.
+  return probe(executable);
+}
+
 async function ensureHelper(workDir, run, timeoutMs) {
-  const resolvedWorkDir = path.resolve(workDir);
-  const key = `${resolvedWorkDir}:${sourceHash()}`;
-  if (unavailableBuilds.has(key)) throw new Error('SyncTeX helper compiler is unavailable');
-  let job = builds.get(key);
-  if (job) {
-    const existing = await job.catch(() => null);
-    if (existing && existsSync(existing)) return existing;
-    if (builds.get(key) === job) builds.delete(key);
-    job = null;
+  const key = path.resolve(workDir);
+  if (unavailableBuilds.has(key)) throw new Error('SyncTeX helper is unavailable');
+  const previous = builds.get(key);
+  if (previous) {
+    const executable = await previous;
+    if (existsSync(executable)) return executable;
+    if (builds.get(key) === previous) builds.delete(key);
+    return ensureHelper(workDir, run, timeoutMs);
   }
-  if (!job) {
-    job = buildHelper(resolvedWorkDir, run, timeoutMs);
-    builds.set(key, job);
-    job.catch(() => {
-      if (builds.get(key) === job) builds.delete(key);
-    });
-    job.catch((error) => {
-      // A missing compiler/zlib or a normal compiler failure will not heal
-      // during this engine process. A deadline kill may succeed on a later,
-      // warmer request, so leave that case retryable.
-      if (!error?.killed && !error?.signal) unavailableBuilds.add(key);
-    });
+  const trackedRun = (command, args, options) => {
+    if (builds.get(key) !== job) throw Object.assign(new Error('SyncTeX helper preparation cancelled'), { code: 'ECANCELED' });
+    return run(command, args, options);
+  };
+  const job = Promise.resolve().then(() => readyHelper(key, trackedRun, timeoutMs));
+  builds.set(key, job);
+  try {
+    return await job;
+  } catch (error) {
+    if (builds.get(key) === job) {
+      builds.delete(key);
+      // A later request with more time can retry an interrupted launch.
+      if (!interrupted(error)) unavailableBuilds.add(key);
+    }
+    throw error;
   }
-  return await job;
+}
+
+export function forgetSyncTeXBatchHelper(workDir) {
+  const key = path.resolve(workDir);
+  builds.delete(key);
+  unavailableBuilds.delete(key);
 }
 
 async function beforeTimeout(promise, timeoutMs) {

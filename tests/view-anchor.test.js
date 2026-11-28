@@ -209,14 +209,16 @@ test('a Jump with the engine\'s own place for this revision moves once, asks not
   assert.ok(asked.includes('/dom'));
 });
 
-// Direct editing is off: a click on the paper opens no editor, captures no
-// key and sends no edit; the test hook turns it on.
+// Direct editing has one switch (web/app.js directEditingOn): off, a click on
+// the paper opens no editor, captures no key and sends no edit. Its default
+// is on, as origin/dev (504adab) has it; the owner decides whether it stays
+// on. The test hook sets it either way.
 function editingListeners(on) {
   const listeners = [];
   const target = (name) => ({ addEventListener: (type) => listeners.push(`${name}:${type}`) });
   const context = { globalThis: null, pagesEl: target('paper'), document: { ...target('document'), createElement: () => ({}), head: { append: () => listeners.push('mathlive') } } };
   context.globalThis = context;
-  if (on) context.__tdomDirectEditing = true;
+  if (on !== undefined) context.__tdomDirectEditing = on;
   vm.createContext(context);
   vm.runInContext(span('const directEditingOn = ', '\nlet splitRatio') +
     span("if (directEditingOn()) pagesEl.addEventListener('load'", '\nasync function directProvisionalGeometry') +
@@ -225,11 +227,13 @@ function editingListeners(on) {
     span('let directPointer = null;', '\nlet liveSearchRaf'), context);
   return listeners;
 }
-test('direct editing is off: no editing listener on the paper or the document, no MathLive', () => {
+test('direct editing switched off: no editing listener on the paper or the document, no MathLive; on by default', () => {
   assert.deepEqual(editingListeners(false), []);
-  const on = editingListeners(true);
-  for (const listener of ['mathlive', 'paper:pointerdown', 'paper:click', 'paper:pointerup', 'document:keydown', 'document:paste', 'document:selectionchange'])
-    assert.ok(on.includes(listener), listener);
+  for (const state of [true, undefined]) {
+    const on = editingListeners(state);
+    for (const listener of ['mathlive', 'paper:pointerdown', 'paper:click', 'paper:pointerup', 'document:keydown', 'document:paste', 'document:selectionchange'])
+      assert.ok(on.includes(listener), `${listener} (${state ?? 'default'})`);
+  }
   const index = readFileSync(new URL('../web/index.html', import.meta.url), 'utf8');
   assert.doesNotMatch(index, /mathlive/i, 'the page does not load MathLive itself');
   // the paper's other click (Cmd/Ctrl: the source line) and the host's place stay

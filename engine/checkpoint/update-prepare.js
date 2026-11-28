@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { physicalReplayReady } from './ship-pacing.js';
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
 import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch, usesVerticalWriting, TATE_PREVIEW_REASON } from './safety.js';
@@ -122,11 +123,20 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
       carried = closure.closed ? closure.carry ?? 0 : carried;
       if (!closure.closed && hold) {
         timer.lap('closure');
+        // Segment starts and part starts are character offsets. sourceStart
+        // is a line/column pair for the editor, including in input files.
+        const parts = seg.sourceParts;
+        // An unfinished construct at EOF may end in an engine-inserted
+        // input-boundary comment. Its source endpoint is the last real part.
+        const part = closure.at === seg.text.length ? parts?.at(-1)
+          : parts?.find(p => p.at <= closure.at && closure.at < p.to);
+        const sourceAt = part ? Math.min(part.end, part.start + closure.at - part.at)
+          : parts ? null : seg.start + closure.at;
         return {
           response: deferClosureUpdate(editLabel, timer, {
             ...closure,
-            scope: seg.file ?? engine.file,
-            sourceAt: (seg.sourceStart ?? seg.start) + closure.at,
+            scope: part?.file ?? seg.file ?? engine.file,
+            sourceAt,
           }),
         };
       }
@@ -263,7 +273,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
       prevPreamble: engine.lastPreamble,
       preamble,
       blockTexts: engine.blocks.map((b) => b.text),
-      packageText: projectPackageText(preamble, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
+      packageText: projectPackageText(preamble, engine),
     });
     if (!patch.ok) {
       engine.diagnostics.push(`preamble patch refused: ${patch.reason}`);
@@ -386,7 +396,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
 
   // Pin before the walk can retire a newly materialized input or capture
   // owner. Finalization cannot recover a checkpoint that has already died.
-  const pageRenderIds = editPageRenderIds(engine.blocks, engine.pages, dirtySource);
+  const pageRenderIds = physicalReplayReady(engine) ? [] : editPageRenderIds(engine.blocks, engine.pages, dirtySource);
   engine.foregroundRenderIds = rebooted || !dirtySource.size ? null : new Set([...dirtySource, ...pageRenderIds]);
   if (engine.foregroundRenderIds) {
     for (const [index, id] of engine.renderHold) {

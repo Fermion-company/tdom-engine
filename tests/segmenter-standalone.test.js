@@ -110,3 +110,25 @@ test('a group that ends in a line break and a brace closes', () => {
   assert.deepEqual(texts(src).map((t) => t.trim().split('\n')[0]),
     ['\\funcentry{a\\\\', 'Next paragraph.', 'Third \\{ printed \\} braces.', 'Last.']);
 });
+
+test('a page eject after an explicit paragraph stays with the page it finishes', () => {
+  const paragraph = String.raw`Ratio $\frac{a}{b}$.\par`;
+  const eject = '\n\\newpage % End of sheet\n';
+  const source = paragraph + eject + paragraph + eject + 'Last';
+  assert.deepEqual(texts(source), [
+    paragraph + eject.trimEnd(), paragraph + eject.trimEnd(), 'Last',
+  ]);
+  const memo = {};
+  segmentBody(source, 0, { memo });
+  const joined = source.replace('\\par', '');
+  assert.deepEqual(segmentBody(joined, 0, { memo }), segmentBody(joined, 0));
+});
+
+test('an eject in a literal, a group or a conditional keeps the enclosing block', () => {
+  for (const [open, close] of [
+    ['{', '}'], ['\\begin{verbatim}', '\\end{verbatim}'], ['\\iffalse', '\\fi'],
+    ['\\begingroup', '\\endgroup'], ['$', '$'],
+  ]) {
+    assert.equal(texts([open, 'text.\\par', '\\newpage', 'Next', close].join('\n')).length, 1);
+  }
+});

@@ -1975,7 +1975,7 @@ test('an \\input file saved by renaming a new file over it keeps reaching onExte
   }
 });
 
-test('a deleted include watch still delivers, then leaves the map until an expansion reads the file again', async () => {
+test('a deleted include resumes on restoration without another expansion', async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'tdom-deleted-input-'));
   const one = path.join(root, 'one.tex');
   writeFileSync(one, 'before\n');
@@ -1994,13 +1994,12 @@ test('a deleted include watch still delivers, then leaves the map until an expan
     rmSync(one);
     await until(() => events.length === 1, 'the deletion is delivered');
     assert.equal(events[0], one);
-    assert.equal(watchers.has(one), false, 'a missing path is left to the next expansion');
+    assert.ok(watchers.has(one), 'keep watching while the chapter is missing');
 
     writeFileSync(one, 'after\n');
-    watchInclude(one, watchers, (file) => events.push(file));
-    await armed();
+    await until(() => events.length === 2, 'restoration is delivered without expanding the root');
     writeFileSync(one, 'after, edited\n');
-    await until(() => events.length === 2, 'the path is watched again');
+    await until(() => events.length === 3, 'in-place edits continue after restoration');
   } finally {
     for (const watcher of watchers.values()) watcher.close();
     rmSync(root, { recursive: true, force: true });

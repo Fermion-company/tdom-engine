@@ -2,6 +2,7 @@ import { SAFE_GLYPH, fontTier } from './fidelity.js';
 import { sourceBoxLineCommands } from './display-list.js';
 import {
   changedGalleyLines,
+  changedTextSpan,
   changedMixedGalleyLines,
   galleyLineWitnesses,
   galleyMixedLineWitnesses,
@@ -256,7 +257,15 @@ function mixedAnchorFrame(block, diagnostics = null) {
   if (galley.tdomActive) return reject('mixed-active-chars');
   if (typeof galley.trail !== 'string' || !Array.isArray(galley.epochs) ||
       galley.epochs.length !== (galley.items ?? []).length) return reject('mixed-no-trail');
-  const lineWitnesses = galleyMixedLineWitnesses(galley);
+  let lineWitnesses = galleyMixedLineWitnesses(galley);
+  if (!lineWitnesses) {
+    // A short paragraph can consist entirely of a single mixed line.
+    // Its complete opaque box still captures the base for a measured text span.
+    const boxes = galley.items.filter(item => item.k === 'box');
+    if (boxes.some(box => box.runs?.some(r => r.m) && box.runs.some(r => r.t && !r.m))) {
+      lineWitnesses = boxes.map(() => null);
+    }
+  }
   const frame = lineWitnesses ? mixedGalleyFrame(galley, lineWitnesses) : null;
   const visualFrame = lineWitnesses ? mixedGalleyVisualFrame(galley, lineWitnesses) : null;
   return frame && visualFrame ? { lineWitnesses, frame, visualFrame } : reject('mixed-no-witness');
@@ -369,11 +378,26 @@ const INCOMPARABLE_TEXT = /[\uE000-\uF8FF\uFFFD\u{F0000}-\u{10FFFF}]/u;
  * same representation: native font files, no remapped or math glyphs. */
 function opaqueTextComparable(galley, witnesses, fonts) {
   if (!(fonts instanceof Map)) return false;
+  const required = witnesses.filter(Boolean);
+  const partial = required.length === 1 && required[0].partial ? required[0] : null;
   let box = -1;
   for (const item of galley?.items ?? []) {
     if (item?.k !== 'box') continue;
     box++;
     if (witnesses[box]) continue;
+    // A simple sibling with the same line origin cannot impersonate a
+    // partial witness if a known native glyph inside the witnessed slot
+    // is absent from its text. Its other glyphs may be mathematical.
+    if (partial && item.w === partial.lineWidth && !item.fx && !item.ca && !item.xb && !item.fm &&
+        item.runs?.every(r => Number.isFinite(r.x) && Number.isFinite(r.w) &&
+          r.x >= 0 && r.w >= 0 && r.x + r.w <= item.w) &&
+        item.runs.some(r => {
+          if (r.m || r.rule || r.dy || !/^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]$/u.test(r.t ?? '') ||
+              r.w <= 0 || r.x < partial.inkLeft + 2 || r.x + r.w > partial.inkRight - 2 ||
+              partial.paintText.includes(r.t)) return false;
+          const meta = fonts.get(r.f);
+          return fontTier(meta) === 'native' && !meta.remap && !meta.mth && !meta.omx;
+        })) continue;
     for (const run of item.runs ?? []) {
       if (run.rule || !run.t) continue;
       const meta = fonts.get(run.f);
@@ -622,6 +646,8 @@ export function planTerminalCanonicalAnchor({
   if (block.sourceParts || editFile !== blockFile || baseFile !== blockFile) return reject('file-mismatch');
   const mixed = typeof base.frame === 'string';
   let visualCut = false;
+  let textSpan = null;
+  let witnesses = base.lineWitnesses;
   let currentLines = null;
   let changedLines = null;
   if (mixed) {
@@ -648,10 +674,26 @@ export function planTerminalCanonicalAnchor({
       const visual = mixedVisualCutAdmission(base, block, frame, currentLines);
       if (!visual.changedLines) {
         if (diagnostics) diagnostics.visualCutRefusal = visual.reason;
-        return reject('mixed-frame-changed');
+        textSpan = changedTextSpan(base.frame, frame.frame, block.galley, base.lineWitnesses, currentLines, font => {
+          const meta = paintContext?.fonts?.get(font);
+          return fontTier(meta) === 'native' && !meta.remap && !meta.mth && !meta.omx;
+        });
+        if (!textSpan) return reject('mixed-frame-changed');
+        // An expanded text span also needs the displayed PDF raster to
+        // certify the extra area before erasing it.
+        visualCut = textSpan.expands;
+        // Rewrapping can change ordinary lines alongside the inline formula.
+        // Their boxes are identical in the two frames. Paint every changed
+        // signature in the same patch, keeping each line's own PDF witness.
+        changedLines = [...textSpan.changedPlainLines, textSpan.index];
+        witnesses = base.lineWitnesses.slice();
+        witnesses[textSpan.index] = textSpan.oldWitness;
+        currentLines = currentLines.slice();
+        currentLines[textSpan.index] = textSpan.newWitness;
+      } else {
+        visualCut = true;
+        changedLines = visual.changedLines;
       }
-      visualCut = true;
-      changedLines = visual.changedLines;
     }
   } else {
     if (block.fidelity?.level !== SAFE_GLYPH || block.needsRender) return reject('not-safe-glyph');
@@ -687,18 +729,23 @@ export function planTerminalCanonicalAnchor({
   if (!currentLines || !changedLines) return reject('line-change');
   if (linesCarryShipoutColor(block.galley, changedLines)) return reject('shipout-color');
   if (mixed) {
-    if (!mixedLinesPaintSafely(block, changedLines)) return reject('mixed-line-flags');
+    const plainChanges = textSpan ? textSpan.changedPlainLines : changedLines;
+    if (plainChanges.length && !mixedLinesPaintSafely(block, plainChanges)) return reject('mixed-line-flags');
     if (!editedContributionsReadable(block.galley, changedLines)) return reject('edited-contribution-paint');
     if (!paintCallbacksKnown(documentPaintCallbacks(geometry, blocks))) return reject('paint-callbacks');
-    if (!opaqueTextComparable(block.galley, base.lineWitnesses, paintContext?.fonts)) return reject('opaque-text-incomparable');
-    if (opaqueTextHoldsWitness(block.galley, base.lineWitnesses)) return reject('opaque-text-holds-witness');
+    if (!opaqueTextComparable(block.galley, witnesses, paintContext?.fonts)) return reject('opaque-text-incomparable');
+    if (opaqueTextHoldsWitness(block.galley, witnesses)) return reject('opaque-text-holds-witness');
   }
 
   const containing = (report.patches ?? []).filter((patch) =>
     patch.type === 'replace-page' &&
     patch.displayList?.commands?.some((command) => command.src === blockId)
   );
-  if (!containing.length) return reject('no-page-patch');
+  // A harvested line can change inside an opaque chunk whose placeholder
+  // display list stays identical. In canonical-anchor mode its reflow still
+  // has a complete galley and the original physical PDF supplies the slot.
+  const canUseGalley = canonicalAnchorPolicy && textSpan && paintContext;
+  if (!containing.length && !canUseGalley) return reject('no-page-patch');
   const linePlans = [];
   for (const lineIndex of changedLines) {
     const owners = containing.flatMap((patch) => {
@@ -707,11 +754,17 @@ export function planTerminalCanonicalAnchor({
       );
       return commands.length ? [{ page: patch.page, commands }] : [];
     });
-    if (owners.length !== 1) return reject('line-owner');
+    if (owners.length > 1 || !owners.length && !canUseGalley) return reject('line-owner');
     const owner = owners[0];
     const painted = (commands) => (commands ?? []).filter((command) => command.op === 'glyphs' || command.op === 'rule');
-    let paint = painted(owner.commands);
-    if (!paint.length && mixed) {
+    let paint = painted(owner?.commands);
+    const partial = textSpan?.index === lineIndex;
+    if (partial || !owner) {
+      const item = block.galley.items.filter(entry => entry.k === 'box')[lineIndex];
+      paint = sourceBoxLineCommands({ x: currentLines[lineIndex].contentLeft, y: -item.h },
+        partial ? { ...item, runs: textSpan.runs } : item, { src: blockId, line: lineIndex,
+          fonts: paintContext.fonts, twinMetrics: paintContext.twinMetrics, backend: block.galley.backend });
+    } else if (!paint.length && mixed) {
       // A block with graphics routes every line to its exact chunk, so the
       // page carries only the line's source hit box. Paint the safe line's
       // own runs from that position, as the display list would have.
@@ -727,7 +780,7 @@ export function planTerminalCanonicalAnchor({
           }))
         : [];
     }
-    if (!paint.length || paint.some((command) => command.math)) return reject('line-paint');
+    if (!paint?.length || paint.some((command) => command.math)) return reject('line-paint');
     const bounds = commandBounds(paint);
     const current = currentLines[lineIndex];
     const baselines = uniqueBaselines(paint.filter((command) => command.op === 'glyphs'));
@@ -737,13 +790,15 @@ export function planTerminalCanonicalAnchor({
     if (!bounds || ![lineBoxLeft, baseline].every(Number.isFinite)) return reject('line-bounds');
     linePlans.push({
       lineIndex,
-      provisionalPage: owner.page,
+      provisionalPage: owner?.page,
       commands: paint,
       bounds,
       lineBoxLeft,
+      ...(textSpan?.index === lineIndex ? { textSpan: [textSpan.inkLeft, textSpan.inkRight] } : {}),
       baseline,
     });
   }
+  const provisionalPages = [...new Set(linePlans.map(line => line.provisionalPage).filter(Number.isInteger))];
   const activeGeometry = geometryForGalley(geometry, block.galley);
   const proofDeadline = Number(proofStartedAt) + ANCHOR_PROOF_BUDGET_MS;
   const publishDeadline = Number(proofStartedAt) + ANCHOR_PUBLISH_BUDGET_MS;
@@ -756,12 +811,12 @@ export function planTerminalCanonicalAnchor({
     inputEpoch: Number.isInteger(Number(inputEpoch)) ? Number(inputEpoch) : null,
     physicalPageCount: canonical.pageCount,
     policy: canonicalAnchorPolicy ? 'canonical-anchor' : 'terminal',
-    provisionalPages: [...new Set(linePlans.map((line) => line.provisionalPage))],
+    provisionalPages,
     source: base.source,
     sourceSpan: base.span,
     baseSnapshot: base,
     // The proof matches every plain line; opaque boxes carry no witness.
-    baseLineWitnesses: mixed ? base.lineWitnesses.filter(Boolean) : base.lineWitnesses,
+    baseLineWitnesses: mixed ? witnesses.filter(Boolean) : witnesses,
     currentLineWitnesses: currentLines,
     changedLines,
     visualCut,
@@ -780,7 +835,7 @@ export function planTerminalCanonicalAnchor({
       srcRev: report.srcRev,
       baseGeneration: canonical.id,
       baseRev: canonical.rev,
-      provisionalPages: [...new Set(linePlans.map((line) => line.provisionalPage))],
+      provisionalPages,
       policy: canonicalAnchorPolicy ? 'canonical-anchor' : 'terminal',
       presentation: visualCut ? 'visual-cut' : 'exact-frame',
       authoritative: false,
@@ -839,13 +894,33 @@ export function buildTerminalCanonicalPatch(plan, matching) {
     const dy = Number(anchor.y) - line.baseline;
     const commands = line.commands.map((command) => translateCommand(command, dx, dy));
     const translated = translateBox(line.bounds, dx, dy);
+    if (line.textSpan) {
+      translated.left = anchor.box.left + line.textSpan[0];
+      translated.right = anchor.box.left + line.textSpan[1];
+    }
     if (!boxInside(translated, region, ANCHOR_BLEED_BP)) return null;
     if (plan.visualCut &&
         (translated.left < anchor.box.left - VISUAL_SLOT_TOLERANCE_BP ||
          translated.right > anchor.box.right + VISUAL_SLOT_TOLERANCE_BP)) return null;
     const mask = unionBoxes(anchor.box, translated, ANCHOR_BLEED_BP);
+    if (line.textSpan && mask) {
+      mask.left = anchor.box.left + line.textSpan[0] - 0.5;
+      mask.right = anchor.box.left + line.textSpan[1] + 0.5;
+      if (!boxInside(translated, mask) || !boxInside(mask, region, ANCHOR_BLEED_BP)) return null;
+    }
     if (!validBox(mask)) return null;
     const baseMask = plan.visualCut ? unionBoxes(anchor.box, anchor.box, ANCHOR_BLEED_BP) : null;
+    if (baseMask && line.textSpan) {
+      const witness = plan.baseLineWitnesses.find(w => w.index === line.lineIndex);
+      if (!witness?.partial) return null;
+      baseMask.left = anchor.box.left + witness.inkLeft - 0.5;
+      baseMask.right = anchor.box.left + (witness.translatedTail?.right ?? witness.inkRight) + 0.5;
+      if (witness.translatedTail) {
+        const { left, right, dx } = witness.translatedTail;
+        commands.push({ op: 'canonical-tail', src: plan.blockId, page: anchor.page, generation: plan.baseGeneration,
+          x: anchor.box.left + left, y: baseMask.top, w: right - left, h: baseMask.bottom - baseMask.top, dx });
+      }
+    }
     if (baseMask && (!validBox(baseMask) || !boxInside(baseMask, mask))) return null;
     if (!pages.has(anchor.page)) {
       const pagePatch = { page: anchor.page, masks: [], commands: [] };

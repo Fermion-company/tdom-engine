@@ -550,7 +550,9 @@ test('a document reset drops the held transaction, its timer and any /doc on its
   const resetStart = span('function beginClientDocumentReset', 'function completeClientDocumentReset');
   const withReset = (viewer) => {
     Object.assign(viewer, { deferredDirectPresentationCommits: new Set(), directEditRevisits: [], cancelDirectOpenings() {},
-      bootComplete: true, window: { parent: { postMessage() {} } }, embedActivationId: 'a' });
+      bootComplete: true, window: { parent: { postMessage() {} } }, embedActivationId: 'a',
+      // (what the reset's start also clears and reports: shipping glyphs, the viewport for the host)
+      shipGlyphCache: new Map(), embeddedViewport: () => null });
     viewer.documentReset.begin = (epoch) => { viewer.documentReset.pending = { epoch }; return true; };
     vm.runInContext(resetStart, viewer);
     return viewer;

@@ -476,3 +476,89 @@ test('canonical-surface caret placement never falls through to browser hit geome
   assert.match(placement, /\} else if \(Number\.isInteger\(openingMathOffset\)\) \{\s+setDirectSelection\(directEditor, openingMathOffset\);\s+\} else if \(usesDirectEditSurface\(\)\) \{\s+if \(Number\.isInteger\(sourceCaret\) && sourceCaret >= 0\) control\.position = sourceCaret;\s+\} else if \(clickPoint && typeof control\.getOffsetFromPoint/);
   assert.doesNotMatch(placement, /control\.position = Number\(control\.lastOffset\)/, 'an unresolved PDF caret must not jump to the end of the formula');
 });
+
+test('a resolved paper miss finishes its native input before replaying a later formula click', async () => {
+  const activate = APP.slice(APP.indexOf('async function activateDirectEditor(event'), APP.indexOf('// Shipping can already'));
+  const dispose = APP.slice(APP.indexOf('function disposeDirectOpeningInput'), APP.indexOf('async function waitForDirectOpeningMathGeometry'));
+  const run = Function('scenario', `
+    let openingDirectInput = null, directEditor = null;
+    const queuedDirectOpenings = [];
+    const document = { activeElement: {} };
+    const flushDirectPresentationUpdates = () => {};
+    const focusDirectOpeningInput = (opening, event) => {
+      if (!opening.sink) { opening.sink = { focus() {}, remove() {} }; opening.operations.push(event.key); }
+    };
+    const replayDirectOpeningOperation = (_, operation) => scenario.replayed.push(operation);
+    async function activateDirectEditorAtPoint(event) {
+      focusDirectOpeningInput(openingDirectInput, event);
+      if (event.key === 'miss') {
+        if (scenario.ime) {
+          openingDirectInput.composing = true;
+          const opening = openingDirectInput;
+          opening.compositionDone = new Promise(done => {
+            scenario.finish = () => { opening.composing = false; done(); };
+          });
+        } else {
+          waitForDirectOpeningNativeInput(openingDirectInput, 'm');
+          const opening = openingDirectInput;
+          scenario.finish = () => resolveDirectOpeningNativeInput(opening);
+        }
+        await scenario.lookup;
+      } else {
+        directEditor = { element: { contains: () => true }, control: { dispatchEvent() {} } };
+      }
+    }
+    ${dispose}
+    ${activate}
+    return activateDirectEditor;
+  `);
+  for (const ime of [false, true]) {
+    let foundNoTarget;
+    const scenario = { ime, replayed: [], lookup: new Promise(resolve => { foundNoTarget = resolve; }) };
+    const click = run(scenario);
+    const event = key => ({ key, preventDefault() {}, stopPropagation() {} });
+    const missed = click(event('miss'));
+    const next = click(event('9'));
+    foundNoTarget();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(scenario.replayed, []);
+    scenario.finish();
+    await Promise.all([missed, next]);
+    assert.deepEqual(scenario.replayed, ['9']);
+  }
+});
+
+test('a rejected block can keep the painted page only while its neighbours and the chunk geometry are identical', () => {
+  const keeps = Function(`${APP.slice(APP.indexOf('function onlyRejectedInkChanged'), APP.indexOf('/** Staged pages'))}; return onlyRejectedInkChanged;`)();
+  const chunk = { op: 'chunk', src: 'b1', cv: 2, y: 3, show: [[0, 0, 10, 10]] };
+  const text = { op: 'glyphs', src: 'b2', text: 'abc' };
+  const list = (...commands) => ({ commands });
+  const before = list(chunk, text);
+  const { show, ...failed } = chunk;
+  const rejected = new Set(['b1']);
+  assert.equal(keeps(before, list(failed, { ...text }), rejected), true);
+  assert.equal(keeps(before, list(failed, { ...text, text: 'abcd' }), rejected), false);
+  assert.equal(keeps(before, list({ ...failed, cv: 3 }, text), rejected), false);
+  assert.equal(keeps(before, list({ ...failed, y: 4 }, text), rejected), false);
+  assert.equal(keeps(before, list(failed), rejected), false);
+  assert.equal(keeps(before, list(failed, text), new Set()), false);
+});
+
+test('the toolbar follows the visible edit or the most exposed page while viewport handoff keeps its top page', () => {
+  const activePage = Function(`${APP.slice(APP.indexOf('function activePaperPage('), APP.indexOf('function activePaperGeometry('))}; return activePaperPage`)();
+  const box = (top, bottom) => ({ top, bottom, height: bottom - top });
+  const makePage = (top, bottom) => ({ getBoundingClientRect: () => box(top, bottom) });
+  const pages = [makePage(-650, 100), makePage(115, 865)];
+  const viewport = box(0, 800);
+  const view = editor => activePage(1, 2, n => pages[n - 1], viewport, editor);
+  assert.equal(view(null), 2);
+  const edit = { element: { parentElement: pages[0], matches: () => true, getBoundingClientRect: () => box(40, 55) } };
+  assert.equal(view(edit), 1);
+  edit.element.matches = () => false;
+  assert.equal(view(edit), 2);
+  edit.element.matches = () => true;
+  edit.element.getBoundingClientRect = () => box(-80, -60);
+  assert.equal(view(edit), 2);
+  pages.splice(0, 2, makePage(0, 280), makePage(300, 580));
+  assert.equal(view(null), 1, 'two fully visible sheets retain the first sheet');
+});

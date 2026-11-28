@@ -8,12 +8,14 @@ import assert from 'node:assert/strict';
 import {
   rmSync,
   mkdirSync,
+  mkdtempSync,
   writeFileSync,
   readFileSync,
   existsSync,
   readdirSync,
   realpathSync,
   symlinkSync,
+  utimesSync,
 } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -214,7 +216,9 @@ test('canonical work paths use the filesystem-native spelling for SyncTeX', () =
   }
 });
 
-test('authority pressure: fast baseline, then deep idle + cost cooldown', () => {
+test('authority pressure: fast baseline, then deep idle + cost cooldown', (t) => {
+  t.mock.method(CanonicalRenderer.prototype, 'prepareSyncTeXHelper', async () => false);
+  t.mock.timers.enable({ apis: ['Date'], now: 100_000 });
   const c = new CanonicalRenderer({ workDir: WORK + '-pace' });
   try {
     // no compile yet: base debounce only (fast first exactness)
@@ -280,6 +284,62 @@ test('authority pressure: fast baseline, then deep idle + cost cooldown', () => 
   }
 });
 
+test('authority idle follows measured compile cost but continuous typing keeps its deadline', (t) => {
+  t.mock.method(CanonicalRenderer.prototype, 'prepareSyncTeXHelper', async () => false);
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  const dir = mkdtempSync(WORK + '-quiet-edit-');
+  const c = new CanonicalRenderer({ workDir: dir });
+  try {
+    c.last = { id: 1, rev: 1, inputEpoch: c.inputEpoch, ms: 200 };
+    c.lastEndAt = 99_000;
+    c.schedule('first keystroke', 2);
+    assert.equal(c.timerDueAt, 101_500);
+    t.mock.timers.setTime(101_300);
+    c.schedule('second keystroke', 3);
+    assert.equal(c.timerDueAt, 102_800, 'a short pause between words does not start a full compile');
+    t.mock.timers.setTime(119_600);
+    c.schedule('latest keystroke', 4);
+    assert.equal(c.timerDueAt, 120_000, 'a sustained burst keeps the oldest edit deadline');
+    c.last.ms = 1900;
+    assert.equal(c.idleMs, 3800);
+    c.last.ms = 90_000;
+    c.lastEndAt = Date.now();
+    assert.equal(c.idleMs, 30_000);
+    assert.equal(c.delayFor(), 180_000, 'an expensive compile retains its cost cooldown');
+  } finally {
+    c.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a late resident refusal spends the current edit debounce once', (t) => {
+  t.mock.method(CanonicalRenderer.prototype, 'prepareSyncTeXHelper', async () => false);
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  const workDir = mkdtempSync(WORK + '-reflow-clock-');
+  const c = new CanonicalRenderer({ workDir, displayDebounceMs: 350 });
+  try {
+    c.last = { id: 2, rev: 1, ms: 100, inputEpoch: c.inputEpoch };
+    c.lastEndAt = 95_000;
+    c.schedule('first edit', 2);
+    c.requestDisplay(2, 0, { demandId: 'paper', residentImpossible: false });
+    t.mock.timers.setTime(100_230);
+    c.requestDisplay(2, 0, { demandId: 'paper', residentImpossible: true });
+    assert.equal(c.delayFor(), 120);
+    assert.equal(c.timerDueAt, 100_350);
+    t.mock.timers.setTime(100_450);
+    assert.equal(c.delayFor(), 0);
+    c.lastEndAt = Date.now();
+    assert.equal(c.delayFor(), 100 * c.displayCooldownFactor);
+    c.schedule('next edit', 3);
+    assert.equal(c.requestDisplay(2, 0, { demandId: 'old', residentImpossible: true }).accepted, false);
+    c.requestDisplay(3, 0, { demandId: 'next', residentImpossible: true });
+    assert.equal(c.delayFor(), 350, 'a fresh source revision has its own quiet period');
+  } finally {
+    c.dispose();
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
 test('authority staleness: idle, deadline and cooldown use independent clocks', (t) => {
   t.mock.method(CanonicalRenderer.prototype, 'prepareSyncTeXHelper', async () => false);
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
@@ -315,6 +375,24 @@ test('authority staleness: idle, deadline and cooldown use independent clocks', 
   } finally {
     c.dispose();
     rmSync(WORK + '-staleness', { recursive: true, force: true });
+  }
+});
+
+test('an opened manuscript starts its first paper immediately and later edits retain their debounce', (t) => {
+  t.mock.method(CanonicalRenderer.prototype, 'prepareSyncTeXHelper', async () => false);
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 100_000 });
+  const work = WORK + '-first-paper';
+  const c = new CanonicalRenderer({ workDir: work, debounceMs: 2500 });
+  try {
+    c.schedule('manuscript', 1, { firstPaper: true });
+    assert.equal(c.info().scheduledInMs, 0);
+    c.schedule('manuscript', 1);
+    assert.equal(c.info().scheduledInMs, 0);
+    c.schedule('revised manuscript', 2);
+    assert.equal(c.info().scheduledInMs, 2500);
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
   }
 });
 
@@ -1258,6 +1336,34 @@ async function untilRunning(c, timeoutMs = 10_000) {
   }
 }
 
+test('forward SyncTeX follows the retained generation across overlay creation and removal', opts, async () => {
+  const { work, docDir, overlayDir, canonDir } = identityFixture('-retained-overlay');
+  const project = path.join(work, 'project-link');
+  const buffers = path.join(work, 'overlay-link');
+  symlinkSync(docDir, project);
+  symlinkSync(overlayDir, buffers);
+  const c = new CanonicalRenderer({ workDir: canonDir, debounceMs: 0 });
+  try {
+    await c.resetDocument(project, buffers);
+    const child = path.join(project, 'chapter.tex');
+    const overlay = path.join(buffers, 'chapter.tex');
+    const first = await c.ensure(IDENTITY_ROOT, 1);
+    writeFileSync(overlay, 'Edited child text.\n');
+    c.invalidateInputs({ changed: [child] });
+    assert.ok((await c.forwardSyncAll({ file: overlay, line: 1, id: first.id })).length);
+
+    const second = await c.ensure(IDENTITY_ROOT, 2);
+    assert.notEqual(second.id, first.id);
+    assert.match((await c.pageTexts(second.id)).join(' '), /Edited child text/);
+    rmSync(overlay);
+    c.invalidateInputs({ removed: [child] });
+    assert.ok((await c.forwardSyncAll({ file: child, line: 1, id: second.id })).length);
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
 test('content identity: a child restored to its compiled bytes rebinds the last generation', opts, async () => {
   const { docDir, overlayDir, canonDir } = identityFixture('-identity');
   const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir, debounceMs: 0 });
@@ -1327,6 +1433,73 @@ test('content identity: a child restored to its compiled bytes rebinds the last 
     assert.equal(c.sourceMatches(IDENTITY_ROOT), false);
   } finally {
     c.dispose();
+  }
+});
+
+test('undo and redo after a completed child compile restore the exact retained PDF and source map', opts, async () => {
+  const { work, docDir, overlayDir, canonDir } = identityFixture('-undo-completed-child');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir });
+  const child = path.join(docDir, 'chapter.tex');
+  const overlay = path.join(overlayDir, 'chapter.tex');
+  try {
+    const first = await c.ensure(IDENTITY_ROOT, 1);
+    const expanded = 'Chapter text A.\\newpage Page two.\n';
+    writeFileSync(overlay, expanded);
+    c.invalidateInputs({ changed: [child] });
+    const second = await c.ensure(IDENTITY_ROOT, 2);
+    assert.equal(second.pageCount, 2);
+    const expectedPDF = readFileSync(first.pdf);
+    const expectedMap = readFileSync(first.synctex);
+    rmSync(overlay);
+    c.invalidateInputs({ removed: [overlay] });
+    c.schedule(IDENTITY_ROOT, 3);
+    const undo = c.last;
+    assert.ok(undo.id > second.id);
+    assert.equal(undo.rev, 3);
+    assert.equal(undo.pageCount, 1);
+    assert.equal(c.pendingJob, null);
+    assert.deepEqual(readFileSync(undo.pdf), expectedPDF);
+    assert.deepEqual(readFileSync(undo.synctex), expectedMap);
+    assert.equal(first.rev, 1, 'old reader still references its own revision');
+
+    writeFileSync(overlay, expanded);
+    c.invalidateInputs({ changed: [overlay] });
+    c.schedule(IDENTITY_ROOT, 4);
+    assert.ok(c.last.id > undo.id);
+    assert.equal(c.last.pdfHash, second.pdfHash);
+    assert.equal(c.last.synctexHash, second.synctexHash);
+    assert.equal(c.pendingJob, null);
+
+    // Even exact root/child bytes cannot identify a revision after an
+    // unknown resource change (for example a regenerated bibliography).
+    rmSync(overlay);
+    c.invalidateInputs({ unknown: true });
+    c.schedule(IDENTITY_ROOT, 5);
+    assert.equal(c.pendingJob?.rev, 5);
+    assert.equal(c.last.rev, 4);
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
+  }
+});
+
+test('a same-size input saved with the original timestamp invalidates retained paper', opts, async () => {
+  const { work, docDir, overlayDir, canonDir } = identityFixture('-retained-timestamp');
+  const c = new CanonicalRenderer({ workDir: canonDir, docDir, overlayDir });
+  const file = path.join(docDir, 'chapter.tex');
+  const timestamp = new Date('2025-03-12T12:00:00Z');
+  try {
+    utimesSync(file, timestamp, timestamp);
+    await c.ensure(IDENTITY_ROOT, 1);
+    writeFileSync(file, 'Chapter text B.\n');
+    utimesSync(file, timestamp, timestamp);
+    c.invalidateInputs({ changed: [file] });
+    assert.equal(c.sourceMatches(IDENTITY_ROOT), false);
+    c.schedule(IDENTITY_ROOT, 2);
+    assert.equal(c.pendingJob?.rev, 2);
+  } finally {
+    c.dispose();
+    rmSync(work, { recursive: true, force: true });
   }
 });
 
@@ -1512,7 +1685,7 @@ test('demanded paper: a viewer that keeps demanding while typing goes on gets ca
 test('demanded paper: a revision the viewer lets pass undemanded returns canonical to the idle gate', async () => {
   const work = WORK + '-demand-released';
   rmSync(work, { recursive: true, force: true });
-  const c = new CanonicalRenderer({ workDir: work, debounceMs: 0, displayDebounceMs: 50,
+  const c = new CanonicalRenderer({ workDir: work, debounceMs: 0, idleMs: 30_000, displayDebounceMs: 50,
     residentDisplayState: () => ({ pending: true }) });
   try {
     c.last = { id: 1, rev: 1, ms: 50, inputEpoch: c.inputEpoch };

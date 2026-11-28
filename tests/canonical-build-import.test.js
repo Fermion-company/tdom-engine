@@ -197,7 +197,9 @@ test('imported generation maps logical root paths to normal-Build SyncTeX paths'
   chmodSync(synctexCommand, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${bin}${path.delimiter}${oldPath}`;
-  const renderer = new CanonicalRenderer({ workDir, docDir: data.root });
+  const overlayDir = path.join(workDir, 'overlay');
+  mkdirSync(overlayDir);
+  const renderer = new CanonicalRenderer({ workDir, docDir: data.root, overlayDir });
   try {
     const lease = renderer.acquireBuildLease('build:1', 60_000);
     assert.equal(renderer.renewBuildLease('build:1', lease.token, 90_000).renewed, true);
@@ -209,7 +211,10 @@ test('imported generation maps logical root paths to normal-Build SyncTeX paths'
       requestId: 'build:1', token: lease.token, source: 'source', rev: 1,
       pdf: data.pdf, pdfHash: hash(readFileSync(data.pdf)),
       synctex: data.synctex, synctexHash: hash(readFileSync(data.synctex)),
-      syncInputMap: [{ logicalPath: path.join(workDir, 'canon.tex'), recordedPath: data.main }],
+      syncInputMap: [
+        { logicalPath: path.join(workDir, 'canon.tex'), recordedPath: data.main },
+        { logicalPath: data.child, recordedPath: data.child },
+      ],
       seedFiles: { aux: '\\relax\n\\gdef\\@abspage@last{1}\n', toc: '\\contentsline {section}{One}{1}{}\n', bogus: 'ignored' },
     });
     const generation = await renderer.commitBuildGeneration(prepared, 'source', 1);
@@ -222,6 +227,10 @@ test('imported generation maps logical root paths to normal-Build SyncTeX paths'
     const forward = await renderer.forwardSyncAll({ file: path.join(workDir, 'canon.tex'), line: 7, id: generation.id });
     assert.equal(forward.length, 1);
     assert.match(readFileSync(syncLog, 'utf8'), new RegExp(`7:1:${data.main.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    const overlay = path.join(overlayDir, path.relative(data.root, data.child));
+    writeFileSync(overlay, 'unsaved child');
+    await renderer.forwardSyncAll({ file: overlay, line: 1, id: generation.id });
+    assert.ok(readFileSync(syncLog, 'utf8').split('\n').includes(`1:1:${data.child}`));
     const reverse = await renderer.reverseSync({ page: 1, x: 10, y: 20, id: generation.id });
     assert.equal(reverse.file, path.join(workDir, 'canon.tex'));
     const boxes = await renderer.sourceEditBoxes({

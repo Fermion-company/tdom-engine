@@ -134,11 +134,14 @@ import {
   makeShippingChain,
   queueShipBoot as queueShipBootHelper,
   shippingBaselineInFlight,
+  shippingPageCountChanged,
+  requestCanonicalBaseline,
   shipUpdate as shipUpdateHelper,
 } from './shipping-manager.js';
 import { opaqueUpdate as opaqueUpdateHelper } from './opaque-mode.js';
 import {
   clearShipPacing,
+  physicalReplayReady,
   deferShipUpdate,
   immediateShipUpdate,
   noteDisplayDemand as noteDisplayDemandHelper,
@@ -227,7 +230,7 @@ export class CheckpointEngine {
       this.hfBindings?.get(this.canonical.last?.id)?.checking);
   }
 
-  async open(text, file = 'main.tex', { canonicalBaseline = true, projectSeeds = true } = {}) {
+  async open(text, file = 'main.tex', { canonicalBaseline = true, projectSeeds = true, firstPaper = false } = {}) {
     resetOpenState(this, text, file);
     // The opening phase belongs to the opened revision (`rev`, reserved
     // below): it ends once that revision's baseline canonical has landed,
@@ -249,7 +252,9 @@ export class CheckpointEngine {
     const source = this.store.get(file);
     const reserved = this.srcRev + 1;
     this.canonical.restoreProjectSeeds(file, source, { place: canonicalBaseline && projectSeeds });
-    if (canonicalBaseline && process.env.TDOM_CANON_EARLY_BASELINE !== '0') this.canonical.schedule(source, reserved);
+    if (canonicalBaseline && process.env.TDOM_CANON_EARLY_BASELINE !== '0') {
+      this.canonical.schedule(source, reserved, { firstPaper });
+    }
     try {
       return await this.#update({ editLabel: 'open' });
     } catch (error) {
@@ -357,10 +362,11 @@ export class CheckpointEngine {
    * happen to have byte-identical preambles: their local classes, images,
    * aux state and child files are different compilation inputs.
    */
-  async setDocumentContext({ docDir, overlayDir = null, force = false } = {}) {
+  async setDocumentContext({ docDir, sourceDir = docDir, overlayDir = null, force = false } = {}) {
     const nextDir = path.resolve(docDir || this.workDir);
+    const nextSource = path.resolve(sourceDir || nextDir);
     const nextOverlay = overlayDir ? path.resolve(overlayDir) : null;
-    if (!force && nextDir === this.docDir && nextOverlay === this.overlayDir) return false;
+    if (!force && nextDir === this.docDir && nextSource === this.sourceDir && nextOverlay === this.overlayDir) return false;
     this.bgAbort = true;
     if (this.bgActive && !this.coldWalking) {
       abortBackgroundJob(this, 'background pass pre-empted by a document switch');
@@ -369,10 +375,11 @@ export class CheckpointEngine {
     this.bgGateWake?.();
     await this.bgTask.catch(() => {});
     return this.#locked(async () => {
-      await this.canonical.resetDocument(nextDir, nextOverlay);
+      await this.canonical.resetDocument(nextDir, nextOverlay, nextSource);
       // The replacement shipping chain captures these input roots at
       // construction, just like the canonical renderer above.
       this.docDir = nextDir;
+      this.sourceDir = nextSource;
       this.overlayDir = nextOverlay;
       clearTimeout(this.shipBootTimer);
       this.shipBootTimer = null;
@@ -502,7 +509,9 @@ export class CheckpointEngine {
     // a fast edited chunk alone cannot replace an otherwise unpaintable page.
     const targetId = this.blocks[target].id;
     // and bring the caret page's queued rescues to the front of the pump
-    const focus = focusRescueIds(this.pages, new Set([targetId]), this.rescueQueue);
+    const physical = physicalReplayReady(this);
+    const focus = physical ? new Set(this.rescueQueue.has(targetId) ? [targetId] : [])
+      : focusRescueIds(this.pages, new Set([targetId]), this.rescueQueue);
     if (focus.size) {
       this.rescueFocus = focus;
       wakeRescues(this);
@@ -512,11 +521,12 @@ export class CheckpointEngine {
     // checkpoint before the first block there whose exact pixels are stale,
     // so a tied page left out of the warm sent the first keystrokes of a
     // book back to a distant checkpoint: 2.3 s each, measured)
-    const pageIds = new Set([
+    const pageIds = physical ? new Set([targetId]) : new Set([
       ...this.pages.filter(page => page.draw?.some(draw => draw.u?.blockId === targetId))
         .flatMap(page => page.draw.map(draw => draw.u?.blockId)),
       ...editPageRenderIds(this.blocks, this.pages, new Set([targetId])),
     ]);
+    if (physical && caretTarget !== null) pageIds.add(this.blocks[caretTarget].id);
     const missing = this.blocks.map((block, index) => ({ block, index })).filter(({ block }) =>
       pageIds.has(block.id) && block.needsRender && this.#chunkTargets(block).some(chunk =>
         this.chunks.get(chunk.key)?.forGalley !== block.galleyHash));
@@ -1405,7 +1415,7 @@ export class CheckpointEngine {
       breakableRe: this._breakableRe,
       packageBreakableRe: this._packageBreakableRe,
       source: () => this.store.get(this.file) ?? '',
-      packageText: (preamble) => projectPackageText(preamble, { docDir: this.docDir, overlayDir: this.overlayDir }),
+      packageText: (preamble) => projectPackageText(preamble, this),
       structuralSinks,
       tocRealPage: this._tocRealPage === true,
     });
@@ -2998,19 +3008,14 @@ export class CheckpointEngine {
       const source = this.store.get(this.file);
       const generation = this.canonical.sourceMatches(source) ? this.canonical.last : null;
       // A baseline still being built settles and replays forward; a ready
-      // chain that is only behind (a held or rejected replay) replays
-      // forward on its next update. Neither needs a new baseline.
+      // chain can replay forward unless its fixed page sequence changed.
       const needsBaseline = !shippingBaselineInFlight(this) && (
-        this.shipBootedFor === null ||
+        this.shipBootedFor === null || shippingPageCountChanged(this.shipping, generation) ||
         !this.shipping?.info?.().baselineReady ||
         this.shipStale || !!this.shipping?.err ||
         (this.shipping?.source !== source && !this.shipping?.replayableFrom?.(source)));
-      if (needsBaseline && !this.shipIdleRetired && generation?.id === info.id && generation.seedFiles &&
-          this.shipDesiredCanonicalId !== generation.id) {
-        this.shipDesiredCanonicalId = generation.id;
-        this.shipDesiredCanonicalHash = generation.pdfHash ?? null;
-        this.shipBootedFor = null;
-        this.#queueShipBoot();
+      if (needsBaseline && generation?.id === info.id) {
+        requestCanonicalBaseline(this, generation, () => this.#queueShipBoot());
       }
     }
   }
@@ -4088,6 +4093,7 @@ export class CheckpointEngine {
     return expandIncludes(segs, depth, {
       source,
       file: this.file,
+      sourceDir: this.sourceDir,
       structuralEvents: options.structuralEvents,
       literalEnvs: options.literalEnvs,
       docDir: this.docDir,
