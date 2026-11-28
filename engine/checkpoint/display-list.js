@@ -2,6 +2,119 @@ import { fnv1a } from '../hash.js';
 import { remapText } from './mathmap.js';
 import { classifyResidentRun } from './run-semantics.js';
 import { r2 } from './util/svg.js';
+import { pageArtCommands, PAGE_ART_OFF } from './page-art.js';
+import { extractBraced } from './util/tex.js';
+
+const PAGE_FOLIO = 1;
+const LAST_PAGE = 2;
+const LEFT_MARK = 4;
+const RIGHT_MARK = 8;
+const UNRESOLVED_PAGE_STATE = 16;
+const counterFormatters = new Set('value arabic roman Roman alph Alph fnsymbol'.split(' '));
+const pageRefs = new Set('pageref autopageref vpageref cpageref Cpageref zpageref lastpageref'.split(' '));
+const pageWords = new Set(['thepage', 'pagename']);
+const primitiveMarks = new Set('topmark firstmark botmark topmarks firstmarks botmarks FirstMark LastMark TopMark'.split(' '));
+const BODY_CONTEXTS = new WeakMap();
+
+function bodyPageState(page, spec, reads, sourceStamp) {
+  const unresolved = !spec || spec.ctr === 'unknown' || !!(reads & UNRESOLVED_PAGE_STATE);
+  const state = JSON.stringify([page.number, spec?.folio ?? page.folio,
+    reads & PAGE_FOLIO ? spec?.fmt : null,
+    reads & LAST_PAGE ? spec?.lp : null,
+    reads & LEFT_MARK ? spec?.lmark : null,
+    reads & RIGHT_MARK ? spec?.rmark : null,
+    unresolved ? sourceStamp : null]);
+  return { state, unresolved, reads, spec };
+}
+
+export function displayListBodyChanged(page, spec, sourceStamp) {
+  const list = page.dl;
+  if (list?.bodyContext === undefined) return false;
+  const kept = BODY_CONTEXTS.get(list);
+  if (!kept) return list.bodyContext !== sourceStamp;
+  if (kept.spec === spec && (!kept.unresolved || list.bodyContext === sourceStamp)) return false;
+  return kept.state !== bodyPageState(page, spec, kept.reads, sourceStamp).state;
+}
+
+function pageStateSource(text) {
+  const literals = /\\begin\s*\{(verbatim\*?|Verbatim|lstlisting|minted)\}[\s\S]*?\\end\s*\{\1\}|\\verb\*?([^\sA-Za-z@])[^\r\n]*?\2|\\[^A-Za-z@]|%[^\r\n]*/g;
+  return text.replace(literals, (token, env, delimiter) => env || delimiter || token[0] === '%' ? '' : token);
+}
+
+function pageStateTokens(text, macros = null) {
+  let reads = 0;
+  for (const match of text.matchAll(/\\([A-Za-z@]+|[^\r\n])/g)) {
+    const name = match[1];
+    if (pageWords.has(name)) reads |= PAGE_FOLIO;
+    if (name === 'leftmark') reads |= LEFT_MARK;
+    if (name === 'rightmark') reads |= RIGHT_MARK;
+    if (name === 'c@page') reads |= PAGE_FOLIO;
+    if (primitiveMarks.has(name)) reads |= UNRESOLVED_PAGE_STATE;
+    if (counterFormatters.has(name) || pageRefs.has(name) || name === 'ref') {
+      const after = text.slice(match.index + match[0].length);
+      if (counterFormatters.has(name) && /^\s*\{\s*page\s*\}/.test(after)) reads |= PAGE_FOLIO;
+      if (pageRefs.has(name) || name === 'ref') {
+        if (/^\*?\s*\{\s*LastPage\s*\}/.test(after)) reads |= LAST_PAGE;
+        else if (pageRefs.has(name)) reads |= UNRESOLVED_PAGE_STATE;
+      }
+    }
+    reads |= macros?.get(name) ?? 0;
+  }
+  return reads;
+}
+
+function preamblePageReaders(preamble) {
+  const text = pageStateSource(preamble);
+  const declarations = /\\([gex]?def|let|(?:new|renew|provide)command|DeclareRobustCommand|(?:New|Renew|Provide|Declare)DocumentCommand)(?![A-Za-z@])|\\[^A-Za-z@]/g;
+  const primitive = /^\s*\\([A-Za-z@]+)[^{\\]*/;
+  const alias = /^\s*\\([A-Za-z@]+)\s*=?\s*(\\[A-Za-z@]+)/;
+  const command = /^\*?\s*(?:\{\s*\\([A-Za-z@]+)\s*\}|\\([A-Za-z@]+))\s*(?:\[[^\]\r\n]*\]\s*){0,2}/;
+  const readers = new Map();
+  for (let declaration; (declaration = declarations.exec(text));) {
+    const kind = declaration[1];
+    if (!kind) continue;
+    const tail = text.slice(declarations.lastIndex);
+    if (kind === 'let') {
+      const match = alias.exec(tail);
+      if (match) readers.set(match[1], pageStateTokens(match[2]));
+      continue;
+    }
+    const match = (kind.endsWith('def') ? primitive : command).exec(tail);
+    if (!match) continue;
+    const name = match[1] ?? match[2];
+    let open = declarations.lastIndex + match[0].length;
+    if (text[open] !== '{') continue;
+    if (kind.endsWith('DocumentCommand')) {
+      open += extractBraced(text, open).length + 2;
+      while (/\s/.test(text[open] ?? '')) open++;
+    }
+    if (text[open] !== '{') continue;
+    const body = extractBraced(text, open);
+    readers.set(name, pageStateTokens(body));
+    declarations.lastIndex = open + body.length + 2;
+  }
+  return readers;
+}
+
+// A single expansion of ordinary declarations is enough to recognize a
+// body macro that prints page state. Resolve once per preamble, and keep the
+// result per block while its text and the preamble stay the same.
+let pageReaderPreamble;
+let pageReaderMacros = new Map();
+const PAGE_STATE_READERS = new WeakMap();
+export function blockReadsPageState(block, preamble = '') {
+  if (!block) return 0;
+  if (preamble !== pageReaderPreamble) {
+    pageReaderPreamble = preamble;
+    pageReaderMacros = preamblePageReaders(preamble);
+  }
+  let cached = PAGE_STATE_READERS.get(block);
+  if (cached?.text !== block.text || cached?.macros !== pageReaderMacros) {
+    cached = { text: block.text, macros: pageReaderMacros, reads: pageStateTokens(pageStateSource(block.text), pageReaderMacros) };
+    PAGE_STATE_READERS.set(block, cached);
+  }
+  return cached.reads | (block.consumesToc ? UNRESOLVED_PAGE_STATE : 0);
+}
 
 // Half a bp is smaller than one device pixel at common preview zoom levels,
 // so fractional CSS clipping could still shave antialiased math ink. Two bp
@@ -46,20 +159,53 @@ export function hfBandChunkKey(page, which) {
   return `__hf-${page}-${which}`;
 }
 
-export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twinMetrics }) {
+/** A band of the current source's furniture render (furniture-render.js):
+ * beside the exact PDF's, which it stands in for while that is not shown. */
+export function hfRenderChunkKey(page, which) {
+  return `__hfr-${page}-${which}`;
+}
+
+export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twinMetrics, hfEntryShown = () => true,
+  hfBandShown = () => true, hfBandsApart = () => false, hfProvisional = () => true, galleyOf = null,
+  readsPageState = null, bodyContext = '', pageSpec = null, furniture = null, opening = false,
+  hfSince = 0, hfUnknown = '' }) {
   const geo = geometry;
   const L = 72 + (geo.oddsidemargin ?? 0);
   const T = 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0) + (geo.headsep ?? 0);
   const commands = [];
+  const bodyOverhang = [];
   for (const src of page.pendingExact ?? []) {
     // The absent block has no geometry yet; the signal is deliberately
     // page-wide and contributes no fabricated coordinates or dimensions.
     commands.push({ op: 'pending-exact', src, wholePage: 1 });
   }
   let gfxOpen = null;
+  // (whether this page shows page-art pictures whole, and which it shows: page-art.js)
+  const shownWhole = new Map();
   const flushGfx = () => {
     if (!gfxOpen) return;
     const meta = chunks.get(gfxOpen.blockId);
+    if (!opening && meta?.farInk && !PAGE_ART_OFF) {
+      // A picture drawn against `current page` (page-art.js): the block's
+      // picture on the paper for this page, or, until one is made for the
+      // places its lines have now, nothing for its lines without text and
+      // the tight picture for the others (each run of those its own window).
+      const group = gfxOpen;
+      gfxOpen = null;
+      pageArtCommands(commands, {
+        page, group, meta, chunks, geo, L, T, shownWhole,
+        emitTight: (run) => emitWindow({
+          ...group, clip0: run[0].yOff, clip1: Math.max(...run.map((u) => u.yOff + u.h + u.d)),
+          units: run.length, line: run.length === 1 ? run[0].li : null,
+          covered: run.reduce((sum, u) => sum + Math.max(0, u.h + u.d), 0), ink: run.some((u) => u.ink),
+        }, meta),
+      });
+      return;
+    }
+    emitWindow(gfxOpen, meta);
+    gfxOpen = null;
+  };
+  const emitWindow = (gfxOpen, meta) => {
     // PDF/SVG ink may overhang TeX's logical box (notably subscripts,
     // superscripts and large operators). Keep the chunk clipped, but give its
     // outer band a bounded bleed that also survives browser pixel rounding.
@@ -102,7 +248,6 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       line: gfxOpen.units === 1 ? gfxOpen.line : undefined,
       src: gfxOpen.blockId,
     });
-    gfxOpen = null;
   };
 
   let ownsPage = false; // a real shipped page (iso `full` chunk) carries
@@ -110,6 +255,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
   for (const entry of page.draw ?? []) {
     const u = entry.u;
     const baseline = T + entry.y;
+    addBodyOverhang(bodyOverhang, u, L, baseline, T, T + geo.textheight);
     if (u.ln.gfxChunk) {
       const c = u.ln.gfxChunk;
       if (c.full) ownsPage = true;
@@ -121,6 +267,8 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       const unitInk = unitRuns.some((run) => runPaintsInk(run, u.ln.backend));
       const unitExtent = Math.max(0, (u.h ?? 0) + (u.d ?? 0));
       const reveal = u.ln.reveal ?? null;
+      // (each line of the window, for a picture drawn against the page: page-art.js)
+      const line = { li: u.li, top: unitTop, h: u.h ?? 0, d: u.d ?? 0, ink: unitInk, yOff: c.yOff };
       if (gfxOpen && gfxOpen.blockId === c.blockId && Math.abs(gfxOpen.top - chunkTop) < 0.05) {
         gfxOpen.clip1 = Math.max(gfxOpen.clip1, clip1);
         gfxOpen.stale ||= !!c.stale;
@@ -129,6 +277,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
         if (gfxOpen.line !== u.li) gfxOpen.line = null;
         gfxOpen.covered += unitExtent;
         gfxOpen.ink ||= unitInk;
+        gfxOpen.list.push(line);
       } else {
         flushGfx();
         gfxOpen = {
@@ -143,6 +292,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
           units: 1,
           covered: unitExtent,
           ink: unitInk,
+          list: [line],
         };
       }
       if (reveal) {
@@ -199,7 +349,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
       line: u.li,
       backend: u.ln.backend,
     });
-    if (u.ln.parts) partCommands(commands, u, L, baseline, chunks.get(u.ln.partsChunk ?? u.blockId));
+    if (u.ln.parts) partCommands(commands, u, L, baseline, chunks.get(u.ln.partsChunk ?? u.blockId), fonts);
     else if (!NO_LINE_REUSE) {
       LINE_COMMANDS.set(u, {
         L, baseline, fonts, twinMetrics, runs: u.ln.runs, src: u.blockId, line: u.li, backend: u.ln.backend,
@@ -211,60 +361,150 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
   // Header / footer: TeX-typeset boxes from the page-style job (the exact
   // \@oddhead/\@oddfoot with the page's real folio format, style and
   // marks). \@outputpage geometry: head box bottom at topmargin+headheight,
-  // foot baseline \footskip below the text area.
+  // foot baseline \footskip below the text area. v0.1.32's presentation,
+  // slot by slot (docs/10 §10.7a, furnitureChoice).
   // A page shipped whole (iso `full` chunk) is cropped to the text area, so
   // its own head and foot are not in the picture. The header job reads the
   // page's style events (a \thispagestyle{empty} in it included), so its
   // entry is still the page's furniture; only the provisional folio, which
   // knows no style, is withheld (tdom-engine #17: running heads and folios
   // vanished from every page a two-column block filled).
-  const hfEntry = hf?.get(page.number);
-  if (hfEntry) {
-    const headBand = { top: 0, bottom: T };
-    const footBand = { top: T + geo.textheight, bottom: geo.paperheight };
-    for (const [which, anchorY, band] of [
-      ['h', 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0), headBand],
-      ['f', T + geo.textheight + (geo.footskip ?? 30), footBand],
-    ]) {
-      // (one overlay picture in the head may paint the foot too: either
-      // band with graphics takes both from the canonical page)
-      if (!hfEntry.hg && !hfEntry.fg) {
-        paintHfItems(commands, hfEntry[which], L, anchorY, { fonts, twinMetrics });
-        continue;
-      }
-      // Graphics in the head or foot (TikZ against `current page`): the
-      // canonical page's own band, when one has been cut for this page
-      // (canonical-arrival.js cropCanonicalHeaderBands).
-      const key = hfBandChunkKey(page.number, which);
-      const meta = chunks.get(key);
-      if (!meta || !(band.bottom > band.top)) continue;
+  const choice = furniture ?? furnitureChoice(page.number, geo, { chunks, hf, hfEntryShown, hfBandShown, hfBandsApart, hfProvisional });
+  const anchors = hfAnchors(geo);
+  const bandTop = { h: 0, f: T + geo.textheight };
+  for (const which of ['h', 'f']) {
+    const slot = choice[which];
+    if (slot?.band) {
+      const meta = slot.band;
       commands.push({
         op: 'chunk',
-        chunk: key,
+        chunk: meta.rec?.render ? hfRenderChunkKey(page.number, which) : hfBandChunkKey(page.number, which),
         x: 0,
-        y: r2(band.top),
+        y: r2(bandTop[which]),
         w: r2(meta.wBp),
         h: r2(meta.hBp),
         sy: 0,
         ch: r2(meta.hBp),
         cv: meta.v ?? 0,
+        hfSlot: which,
+        hfGeneration: meta.canonicalId,
         src: '_hf',
       });
+    } else if (slot?.entry && !slot.entry[`${which}g`]) {
+      const from = commands.length;
+      paintHfItems(commands, slot.entry[which], L, anchors[which], { fonts, twinMetrics });
+      for (let i = from; i < commands.length; i++) commands[i].hfSlot = which;
     }
-  } else if (!ownsPage) {
+  }
+  if (choice.folio && !ownsPage) {
     // header job hasn't landed yet: provisional plain folio (replaced by
     // the TeX-typeset footer as soon as the async job reports)
     commands.push({
       op: 'folio',
       x: r2(L + geo.textwidth / 2),
       y: r2(T + geo.textheight + (geo.footskip ?? 30)),
-      text: String(page.number),
+      text: typeof choice.folio === 'string' ? choice.folio : String(page.number),
     });
   }
   const dl = { page: page.number, commands };
-  dl.hash = hashCommands(commands);
+  if (bodyOverhang.length) dl.bodyOverhang = bodyOverhang;
   dl.hfSig = hfSig; // this page's own head and foot: rebuilt when they change (header-footer.js pageHfSig)
+  // (what the list is checked against: the head and foot with the revision
+  // since which their inputs held, engine-v3.js furnitureSig; not sent)
+  if (hfSince) Object.defineProperty(dl, 'hfKey', { value: `${hfSig}@${hfSince}`, enumerable: false });
+  if (galleyOf) {
+    let reads = 0;
+    if (readsPageState) {
+      for (const id of page.pendingExact ?? []) reads |= readsPageState(id);
+      for (const { u } of page.draw ?? []) reads |= readsPageState(u.blockId);
+      for (const float of page.topFloats ?? []) reads |= readsPageState(float.blockId);
+      for (const float of page.botFloats ?? []) reads |= readsPageState(float.blockId);
+    }
+    let state = '';
+    if (reads) {
+      // bodyContext is the cache stamp. The signature records the state that
+      // can affect the ink. Unresolved readers keep the conservative stamp.
+      dl.bodyContext = bodyContext;
+      const context = bodyPageState(page, pageSpec, reads, bodyContext);
+      state = context.state;
+      BODY_CONTEXTS.set(dl, context);
+    }
+    dl.body = bodySignature(page, galleyOf, state, [L, T, geo.textwidth, geo.textheight, geo.paperwidth, geo.paperheight]);
+  }
+  // What the viewer needs to decide on an exact page of an earlier source it
+  // keeps for this body (web/app.js furnitureHolds): the source revision
+  // since which what this page's head and foot print is unchanged (B1), and
+  // the slots this list does not describe (opening, owed runs, a picture
+  // still to come: an exact page mounted with it has unknown bands there).
+  if (hfSince) dl.hfSince = hfSince;
+  if (hfUnknown) dl.hfUnknown = hfUnknown;
+  // A change in the canonical body's identity must be published even when
+  // the resident renderer still produces the same commands.
+  const inkHash = hashCommands(commands);
+  dl.hash = (dl.body ? `${inkHash}/${dl.body}` : inkHash) + (hfSince ? `@${hfSince}` : '') + (hfUnknown ? `?${hfUnknown}` : '');
   return dl;
+}
+
+const SYNTHETIC_BODY_PAINT = new WeakMap();
+
+/** What a page's body is, apart from how it is drawn now: its blocks, the
+ * galley each is set from, and where each of their lines stands. Left out:
+ * which of its pictures are in hand (a block that owes its picture and the
+ * same block drawn are one body), their versions, and the head and foot. The
+ * viewer keeps an exact page of an earlier source on the paper while the body
+ * is what it was then (web/app.js canonicalShowsList): the booklet's writing
+ * rules, drawn only in the exact page, went when a warm completed the page's
+ * resident list (tex64-internal #121, round 11, sheet 25). */
+export function bodySignature(page, galleyOf, context = '', geometry = '') {
+  let text = `${context}|${geometry};`;
+  const update = (prefix, entries) => {
+    for (const f of entries ?? []) text += `${prefix}|${f.id}|${galleyOf(f.blockId) ?? ''}|${f.w}|${f.h}|${f.d};`;
+  };
+  update('top', page.topFloats);
+  update('bottom', page.botFloats);
+  if (page.floatPage) text += 'float-page;';
+  for (const src of page.pendingExact ?? []) text += `p|${src}|${galleyOf(src) ?? ''};`;
+  for (const entry of page.draw ?? []) {
+    const u = entry.u;
+    const position = u.li ?? `${u.bodyLine ?? ''}:${u.yRel ?? ''}`;
+    let paint = galleyOf(u.blockId);
+    if (u.blockId == null && u.ln?.runs) {
+      paint = SYNTHETIC_BODY_PAINT.get(u);
+      if (paint === undefined) SYNTHETIC_BODY_PAINT.set(u, paint = fnv1a(JSON.stringify(u.ln.runs)));
+    }
+    text += `${u.blockId}|${paint ?? ''}|${entry.float?.id ?? u.bodyInsert ?? ''}|${position}|` +
+      `${r2(entry.y)}|${r2(u.h ?? 0)}|${r2(u.d ?? 0)};`;
+  }
+  return `${fnv1a(text)}:${text.length}`;
+}
+
+// Resident paint windows start at a line's logical box. Its harvested runs
+// can reach above or below that box (e.g. a zero-height raised label). Give
+// the viewer the body-owned ink there before the exact page is composited.
+const BODY_RUN_BOUNDS = new WeakMap();
+function addBodyOverhang(out, unit, x, baseline, bodyTop, bodyBottom) {
+  const runs = unit.ln.editRuns ?? unit.ln.runs ?? [];
+  let extent = BODY_RUN_BOUNDS.get(unit);
+  if (!extent) {
+    let top = Infinity, bottom = -Infinity;
+    for (const run of runs) {
+      if (!runPaintsInk(run, unit.ln.backend)) continue;
+      const y = run.dy ?? 0;
+      top = Math.min(top, run.rule ? y : y - (run.gh ?? (run.s ?? 0) * 0.8));
+      bottom = Math.max(bottom, run.rule ? y + run.h : y + (run.gd ?? (run.s ?? 0) * 0.2));
+    }
+    extent = [top - 1, bottom + 1];
+    BODY_RUN_BOUNDS.set(unit, extent);
+  }
+  if (baseline + extent[0] >= bodyTop && baseline + extent[1] <= bodyBottom) return;
+  for (const run of runs) {
+    if (!runPaintsInk(run, unit.ln.backend) || !(run.w > 0)) continue;
+    const y = baseline + (run.dy ?? 0);
+    const top = run.rule ? y : y - (run.gh ?? (run.s ?? 0) * 0.8);
+    const bottom = run.rule ? y + run.h : y + (run.gd ?? (run.s ?? 0) * 0.2);
+    if (top - 1 >= bodyTop && bottom + 1 <= bodyBottom) continue;
+    out.push([r2(x + (run.x ?? 0) - 1), r2(top - 1), r2(run.w + 2), r2(bottom - top + 2)]);
+  }
 }
 
 /** The exact runs of a composed line (stream.js `parts`): each a window on
@@ -273,7 +513,7 @@ export function buildDisplayList(page, { geometry, chunks, hf, hfSig, fonts, twi
  * whole picture is; `held` keeps every reader of exact pixels (editing
  * geometry, the publication referee) from taking them for the current
  * source's. Text between the windows is ordinary glyph commands. */
-function partCommands(commands, unit, X, baseline, meta) {
+function partCommands(commands, unit, X, baseline, meta, fonts) {
   if (!meta) return;
   const pad = -(meta.xBp ?? 0);
   const width = meta.wBp ?? 0;
@@ -290,6 +530,7 @@ function partCommands(commands, unit, X, baseline, meta) {
     if (sy < 0) { y -= sy; h += sy; sy = 0; }
     h = Math.min(h, height - sy);
     if (!(w > 0) || !(h > 0)) continue;
+    const run = unit.ln.editRuns?.[part.runIndex];
     commands.push({
       op: 'chunk',
       chunk: unit.ln.partsChunk ?? unit.blockId,
@@ -304,10 +545,35 @@ function partCommands(commands, unit, X, baseline, meta) {
       cv: meta.v ?? 0,
       held: 1,
       part: 1,
+      partGlyphs: partMathGlyphs(run, X, baseline, fonts),
+      partRule: run?.rule && run.w > 0 && run.h > 0
+        ? [r2(X + run.x), r2(baseline + run.dy), r2(run.w), r2(run.h)] : undefined,
       line: unit.li,
       src: unit.blockId,
     });
   }
+}
+
+// The picture can come from an earlier render, but these positions belong
+// to the current TeX run. They're also the hit geometry for its MathLive input.
+function partMathGlyphs(run, origin, lineBaseline, fonts) {
+  if (!run?.m || !run.t) return undefined;
+  const font = fonts.get(run.f);
+  if (!font) return undefined;
+  const chars = [...(font.remap ? remapText(run.t, font.remap) : run.t)];
+  const offsets = chars.length === 1 ? [0] : run.gp;
+  if (!offsets || offsets.length !== chars.length) return undefined;
+  const baseline = r2(lineBaseline + (run.dy ?? 0));
+  const top = r2(baseline - run.gh), bottom = r2(baseline + run.gd);
+  if (!(bottom > top)) return undefined;
+  const glyphs = [];
+  for (let index = 0; index < chars.length; index++) {
+    const left = r2(origin + run.x + offsets[index]);
+    const right = r2(origin + run.x + (offsets[index + 1] ?? run.w));
+    if (!(right > left)) return undefined;
+    glyphs.push({ text: chars[index], left, right, top, bottom, baseline });
+  }
+  return glyphs;
 }
 
 /** Paint one run list (glyphs + rules) at a baseline — shared by body
@@ -447,6 +713,82 @@ function sourceHitCommand(commands, X, baseline, unit, src, fallbackWidth = 1, f
 
 /** Paint a harvested header/footer box (vbox-wrapped hbox items) with its
  * first line's baseline at anchorY. */
+/** Where a head's and a foot's first baseline stand on the page (bp from
+ * its top): \@outputpage puts the head box's bottom at
+ * topmargin+headheight and the foot's baseline \footskip below the text. */
+export function hfAnchors(geo) {
+  const top = 72 + (geo.topmargin ?? 0) + (geo.headheight ?? 0);
+  return { h: top, f: top + (geo.headsep ?? 0) + (geo.textheight ?? 0) + (geo.footskip ?? 30) };
+}
+
+/** The vertical extent [top, bottom] on the page of a head's (`h`) or
+ * foot's (`f`) items, where paintHfItems puts them: their boxes, and their
+ * runs, which can stand outside them (fancyhdr's \headrule and \footrule
+ * after a \headruleskip): a rule where it is, a glyph as svgInkRows reads
+ * one (its baseline and 6 bp above it); an empty slot stands at its anchor. */
+export function hfSlotExtent(items, which, geo) {
+  let y = hfAnchors(geo)[which];
+  let top = y;
+  let bottom = y;
+  let first = true;
+  for (const it of items ?? []) {
+    if (it.k === 'glue' || it.k === 'kern') {
+      y += it.a ?? 0;
+    } else if (it.k === 'box') {
+      if (!first) y += it.h ?? 0;
+      top = Math.min(top, y - (it.h ?? 0));
+      bottom = Math.max(bottom, y + (it.d ?? 0));
+      for (const r of it.runs ?? []) {
+        const at = y + (Number(r?.dy) || 0);
+        const [a, b] = r?.rule ? [at, at + (Number(r.h) || 0)] : [at - 6, at + 1];
+        top = Math.min(top, a);
+        bottom = Math.max(bottom, b);
+      }
+      y += it.d ?? 0;
+      first = false;
+    }
+  }
+  return [top, bottom];
+}
+
+/**
+ * What page `n` draws of its head and of its foot (docs/10 §10.7a), slot by
+ * slot: the slot's own canonical band while F4 holds for it
+ * (`hfBandShown(meta, which)`), alone only where neither band holds art of
+ * the other or from elsewhere (`hfBandsApart`: art that crosses the bands
+ * takes both together); else the slot's runs while the page's entry is
+ * shown for it (`hfEntryShown(which)`; a slot that draws takes nothing
+ * without its band); else, for the foot, the provisional folio where the
+ * page's style draws one (`hfProvisional`: true, or the folio as TeX numbers
+ * the page). engine-v3.js furnitureSig reads
+ * the same choice.
+ */
+export function furnitureChoice(n, geo, { chunks, hf, hfEntryShown = () => true, hfBandShown = () => true,
+  hfBandsApart = () => false, hfProvisional = () => true }) {
+  const T = 72 + (geo?.topmargin ?? 0) + (geo?.headheight ?? 0) + (geo?.headsep ?? 0);
+  const room = geo ? { h: T > 0, f: geo.paperheight > T + geo.textheight } : { h: true, f: true };
+  // (the exact PDF's two bands, then the furniture render's: each pair as one)
+  const pair = (key) => {
+    const meta = { h: chunks?.get(key(n, 'h')) ?? null, f: chunks?.get(key(n, 'f')) ?? null };
+    const shown = {};
+    for (const which of ['h', 'f']) shown[which] = !!meta[which] && room[which] && hfBandShown(meta[which], which);
+    const visible = shown.h ? meta.h : meta.f;
+    const alone = shown.h !== shown.f && (visible?.rec?.apart || (!!meta.h && !!meta.f && hfBandsApart(meta.h, meta.f)));
+    return (which) => ((shown.h && shown.f) || (shown[which] && alone) ? meta[which] : null);
+  };
+  const exact = pair(hfBandChunkKey);
+  const rendered = pair(hfRenderChunkKey);
+  const entry = hf?.get(n) ?? null;
+  const slot = (which) => {
+    const band = exact(which) ?? rendered(which);
+    if (band) return { band };
+    return entry && hfEntryShown(which) ? { entry } : null;
+  };
+  const h = slot('h');
+  const f = slot('f');
+  return { h, f, folio: !f && hfProvisional() };
+}
+
 function paintHfItems(commands, items, X, anchorY, context) {
   let y = anchorY;
   let first = true;

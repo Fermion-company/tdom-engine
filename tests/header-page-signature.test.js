@@ -61,7 +61,9 @@ test('a header job that lands builds again the pages whose head changed, and no 
   const sent = [];
   const built = [];
   const engine = { mode: 'structured', pages, hf: after, hfSig: 'specs-after', rev: 7, blocks: [], pendingChain: null, tocOwed: false,
-    getFontManifest: () => [], onAsyncPatches: (message) => sent.push(message) };
+    getFontManifest: () => [], onAsyncPatches: (message) => sent.push(message),
+    // (no keys noted here: the page's entry alone, engine-v3.js furnitureSig)
+    furnitureSig: (n) => pageHfSig(after, n) };
   asyncRepaginate(engine, {
     paginateNow: () => pages.map((page) => ({ number: page.number, identity: page.identity, draw: [] })),
     displayList: (page) => { built.push(page.number); return list(after)(page); },
@@ -90,7 +92,7 @@ const DOC = [
 ].join('\n\n');
 
 const headersIdle = async (engine) => {
-  for (const deadline = Date.now() + 20_000; (engine.hfPending || engine.hfQueuedSig) && Date.now() < deadline;) {
+  for (const deadline = Date.now() + 20_000; (engine.hfPending || engine.hfQueued) && Date.now() < deadline;) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
 };

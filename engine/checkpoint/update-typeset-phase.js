@@ -1,10 +1,11 @@
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { hasDefinitionEdit } from './update-helpers.js';
+import { hasDefinitionEdit, editPageRenderIds } from './update-helpers.js';
 import { flushVanishedLabels, labelReferenceCandidates, pushLabelDependencies } from './reference-deps.js';
 import { push2, resolvedInGalley, vecLocalsEqual } from './util/galley.js';
-import { canDeferPlainVerification } from './plain-preview.js';
+import { canDeferPlainVerification, sameClearpageContinuation } from './plain-preview.js';
+import { prepareUnpaintedFormula } from './stream.js';
 import { chunkTargets } from './chunk-targets.js';
 
 export async function runUpdateTypesetPhase(engine, {
@@ -32,6 +33,14 @@ export async function runUpdateTypesetPhase(engine, {
     queueMovedOffsets,
     coldPreview = null,
   } = callbacks;
+  // An input recovery that failed in a background pass owes this update the
+  // full rebuild (engine-v3 #oweRecoveryRebuild): the update-level safety
+  // net takes it from here.
+  if (engine.recoveryRebuildOwed) {
+    const owed = engine.recoveryRebuildOwed;
+    engine.recoveryRebuildOwed = null;
+    throw owed;
+  }
   // The block typed into (one source-dirty block): its renders are the ones
   // the next keystroke spares (render-pump.js, tex64-internal #103)
   if (!coldResume && dirtySource.size === 1) engine.heldFocus = [...dirtySource][0];
@@ -78,9 +87,14 @@ export async function runUpdateTypesetPhase(engine, {
   let lastDisplay = lastDirty;
   const displayReplay = new Set();
   if (engine.previewPolicy === 'structured' && engine.foregroundRenderIds) {
+    const canCompose = !defEdit && engine.chunks.outlines?.size > 0;
+    const mathNeighbours = canCompose
+      ? new Set(editPageRenderIds(engine.blocks, engine.pages, dirtySource, { includeAdjacent: true })) : null;
     for (let k = 0; k < engine.blocks.length; k++) {
       const block = engine.blocks[k];
-      if (!engine.foregroundRenderIds.has(block.id) || !block.needsRender) continue;
+      if (!block.needsRender) continue;
+      if (mathNeighbours?.has(block.id) && !dirtySource.has(block.id) && prepareUnpaintedFormula(block, engine.chunks)) continue;
+      if (!engine.foregroundRenderIds.has(block.id)) continue;
       if (!chunkTargets(block).some(target => engine.chunks.get(target.key)?.forGalley !== block.galleyHash)) continue;
       // RENDER can use a retained input directly; it needs no foreground
       // replay merely because its exact pixels have not been requested yet.
@@ -150,6 +164,7 @@ export async function runUpdateTypesetPhase(engine, {
     }
   }
   const walkStartedAt = performance.now();
+  let recordingMs = 0;
   let typesetDirty = false; // a source-dirty or galley-less block is behind the walk
   // per-block walk timing for the report: [index, ms, flags]
   const walkTrace = [];
@@ -160,7 +175,12 @@ export async function runUpdateTypesetPhase(engine, {
   // after a clean replay that reproduced its galley and exit state
   let atCleanBoundary = true;
   let previewAwaited = false;
+  // Open uses the full foreground walk. A paintable prefix can place ink
+  // (and its source hits) on a sheet that the rest of the walk moves.
   while (i < engine.blocks.length) {
+    // the boundary the walk stands on: pinned while it waits for a cold
+    // preview below (engine-v3 #enforceCheckpointCap)
+    engine.walkAt = i;
     // While a cold preview is in flight and the walk would still be far from
     // the block when it lands (so it would stop cold at the next boundary
     // anyway), wait for it here instead of stepping the next clean block
@@ -213,7 +233,7 @@ export async function runUpdateTypesetPhase(engine, {
     if (waitedHere) engine.heavyWaitId = null;
     if (preview && !preview.noWait && preview.galley === undefined && !coldResume && coldBudgetMs > 0 && !waitedHere &&
         (engine.coldPreviewWaitMs ?? 1000) > 0 && atCleanBoundary && i < firstDirty && nextReplayMs > heavyMs &&
-        performance.now() - walkStartedAt + nextReplayMs > coldBudgetMs) {
+        performance.now() - walkStartedAt - recordingMs + nextReplayMs > coldBudgetMs) {
       const sinceStart = performance.now() - preview.startedAt;
       const waitMs = Math.min(nextReplayMs, (engine.coldPreviewTimeoutMs ?? 15_000) - sinceStart - 500);
       if (waitMs > 0) {
@@ -242,7 +262,8 @@ export async function runUpdateTypesetPhase(engine, {
     engine.progress = { phase: 'typeset', at: i + 1, total: engine.blocks.length };
     const block = engine.blocks[i];
     // a cold preview is no witness of the block's own typeset (§10.4b)
-    const before = { hash: block.galley?.tdomColdPreview ? null : block.galleyHash, state: block.stateVec, hadGalley: !!block.galley };
+    const before = { hash: block.galley?.tdomColdPreview ? null : block.galleyHash,
+      state: block.stateVec, hadGalley: !!block.galley, galley: block.galley };
     // The edited source block carries the old galley but not its closure;
     // that certificate was checked on oldBlocks before the walk.
     const plainBefore = plainPreviewAdmission?.blockId === block.id &&
@@ -250,6 +271,7 @@ export async function runUpdateTypesetPhase(engine, {
       ? plainPreviewAdmission.witness : null;
     const t0 = performance.now();
     const galley = await typesetBlock(i, i < firstDirty ? replayToken : null);
+    recordingMs += galley.furnitureMs ?? 0;
     forkMs += performance.now() - t0;
     typesetCount++;
     const wasClean = before.hadGalley && !dirtySource.has(block.id);
@@ -291,7 +313,7 @@ export async function runUpdateTypesetPhase(engine, {
     // budget).
     if (coldBudgetMs > 0 && wasClean && !changed && i <= lastDirty &&
         (!coldResume || typesetDirty || engine.editPending > 0) &&
-        (performance.now() - walkStartedAt > coldBudgetMs || engine.keystrokePending > 0 ||
+        (performance.now() - walkStartedAt - recordingMs > coldBudgetMs || engine.keystrokePending > 0 ||
           // a preview in hand ends the walk unless the rest is short
           (preview?.galley && costTo(i) > (engine.coldPreviewFromMs ?? 500) / 2))) {
       verdict = 'cold';
@@ -348,6 +370,13 @@ export async function runUpdateTypesetPhase(engine, {
       }
       continue;
     }
+    const prose = engine.blocks[i - 2];
+    if (!defEdit && !changedLabels.size && plainPreviewAdmission?.prose && prose?.id === plainPreviewAdmission.blockId &&
+        before.state === block.stateVec && i > lastNoGalley && i < engine.blocks.length &&
+        sameClearpageContinuation(before.galley, galley, plainPreviewAdmission.galley, prose.galley)) {
+      verdict = 'verify';
+      break;
+    }
     if (block.galleyHash !== before.hash) {
       // real layout coupling (\addvspace max-merge, @nobreak …) extends
       // the edited region — within a budget. A long cascade means an
@@ -400,6 +429,7 @@ export async function runUpdateTypesetPhase(engine, {
       if (!preview.block.needsRender) preview.release();
     }
   }
+  engine.walkAt = null;
   // the walk reached the block itself, or the preview came too late
   if (preview && !preview.adopted) preview.cancel();
   engine.coldPreviewActive = null;
@@ -487,7 +517,7 @@ export async function runUpdateTypesetPhase(engine, {
   // are still moving until the suffix settles).
   let tocDeferred = false;
   const tocRuns = !engine.pendingChain;
-  for (let pass = 0; pass < 3 && !engine.pendingChain; pass++) {
+  for (let pass = 0; pass < 3 && tocRuns && !engine.pendingChain; pass++) {
     const prov = paginateNow();
     const toc = computeToc(prov);
     if (toc.hash === engine.tocHash) break;

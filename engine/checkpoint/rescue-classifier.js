@@ -162,10 +162,24 @@ export function collectBreakableTcolorboxNames(preamble) {
  * TeX-system packages stay out: reading TEXMF would cost a kpathsea walk
  * per preamble, and their breakable boxes are used through \tcolorbox.
  */
-export function projectPackageText(preamble, { docDir, overlayDir = null } = {}) {
-  if (!docDir) return '';
+export function projectPackageText(preamble, context = {}) {
   const parts = [];
+  visitProjectPackages(preamble, context, (_file, text) => parts.push(text));
+  return parts.join('\n');
+}
+
+export function visitProjectPackages(preamble, { docDir, sourceDir = docDir, overlayDir = null } = {}, onInput, onMissing) {
+  if (!docDir) return;
   const seen = new Set();
+  const read = (resolved, depth) => {
+    if (!resolved || !isPathInside(docDir, resolved.actualPath) || seen.has(resolved.actualPath)) return;
+    seen.add(resolved.actualPath);
+    let bytes;
+    try { bytes = readFileSync(resolved.readPath); } catch { return; }
+    const text = bytes.toString('utf8');
+    onInput(resolved.actualPath, text, bytes);
+    visit(text, depth + 1);
+  };
   const visit = (text, depth) => {
     if (depth > 6) return;
     const clean = stripComments(text);
@@ -176,29 +190,17 @@ export function projectPackageText(preamble, { docDir, overlayDir = null } = {})
       for (const raw of match[1].split(',')) {
         const name = raw.trim();
         if (!name || /[\\#{}]/.test(name)) continue;
-        const resolved = resolveProjectInput(name.endsWith(ext) ? name : name + ext, { docDir, overlayDir });
-        if (!resolved || !isPathInside(docDir, resolved.actualPath) || seen.has(resolved.actualPath)) continue;
-        seen.add(resolved.actualPath);
-        let body;
-        try { body = readFileSync(resolved.readPath, 'utf8'); } catch { continue; }
-        parts.push(body);
-        visit(body, depth + 1);
+        const resolved = resolveProjectInput(name.endsWith(ext) ? name : name + ext, { docDir, sourceDir, overlayDir, onMissing });
+        read(resolved, depth);
       }
     }
     for (const match of clean.matchAll(/\\input\s*\{([^}]+)\}/g)) {
       const name = match[1].trim();
-      const resolved = resolveProjectInput(name, { docDir, overlayDir, extensions: ['.tex', '.sty'] });
-      if (!resolved || !isPathInside(docDir, resolved.actualPath) || seen.has(resolved.actualPath) ||
-          !/\.(?:sty|cls|tex|def|cfg)$/i.test(resolved.actualPath)) continue;
-      seen.add(resolved.actualPath);
-      let body;
-      try { body = readFileSync(resolved.readPath, 'utf8'); } catch { continue; }
-      parts.push(body);
-      visit(body, depth + 1);
+      const resolved = resolveProjectInput(name, { docDir, sourceDir, overlayDir, extensions: ['.tex', '.sty'], onMissing });
+      if (resolved && /\.(?:sty|cls|tex|ltx|def|fd|ldf|clo|cfg|lbx|bbx|cbx)$/i.test(resolved.actualPath)) read(resolved, depth);
     }
   };
   visit(preamble, 0);
-  return parts.join('\n');
 }
 
 const namesRe = (names) => names.length

@@ -1,3 +1,5 @@
+import { releaseFurniture } from './canonical-arrival.js';
+
 export function teardownResidentTree(engine) {
   for (const peer of engine.peers) {
     peer.send('DIE\n');
@@ -26,5 +28,6 @@ export function teardownResidentTree(engine) {
   }
   engine.preHash = null; // a later promotion must reboot from scratch
   engine.pages = [];
+  releaseFurniture(engine);
   engine._pageRun = null;
 }

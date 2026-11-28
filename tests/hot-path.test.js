@@ -2525,14 +2525,16 @@ sharedTest('display-math exact render reuses the foreground JOB node list', opts
   await drain(eng);
 });
 
-sharedTest('mixed prose and display math reaches fresh exact pixels without canonical compile', opts, async () => {
+sharedTest('mixed prose and display math reaches fresh exact pixels without canonical compile', opts, async (context) => {
   await eng.renderTask.catch(() => {});
   const beforeHits = eng.renderStats.captureHits;
   const source = eng.getSource();
   const at = source.indexOf('h(x)=x^3-2x');
   assert.ok(at >= 0, 'mixed equation source found');
   const two = at + 'h(x)=x^3-'.length;
-  const canonicalRev = eng.canonical.last?.rev ?? eng.canonical.current?.rev ?? null;
+  // An older baseline may finish during this edit. Withhold the new
+  // background job so only the captured nodes can supply the edited pixels.
+  const schedule = context.mock.method(eng.canonical, 'schedule', () => {});
   await eng.edit(two, two + 1, '');
   await Promise.race([
     eng.renderTask,
@@ -2548,11 +2550,9 @@ sharedTest('mixed prose and display math reaches fresh exact pixels without cano
     `capture path served the mixed edit (${JSON.stringify(eng.renderStats)})`
   );
   assert.equal(eng.chunks.get(mixed.id)?.forGalley, mixed.galleyHash);
-  assert.equal(
-    eng.canonical.last?.rev ?? eng.canonical.current?.rev ?? null,
-    canonicalRev,
-    'exact pixels landed without waiting for a new canonical result'
-  );
+  assert.ok((eng.canonical.last?.rev ?? -1) < eng.srcRev,
+    'exact pixels landed before the edited revision had a canonical result');
+  schedule.mock.restore();
 
   const undo = eng.getSource().indexOf('h(x)=x^3-x') + 'h(x)=x^3-'.length;
   await eng.edit(undo, undo, '2');

@@ -6,13 +6,31 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 import { CanonicalRenderer } from '../engine/checkpoint/canonical.js';
-import { jumpAnchor, locateJump, parseJumpText, parseJumpTsv, parseJumpRecords, jumpRecords } from '../engine/checkpoint/jump-sync.js';
+import { jumpAnchor, locateJump, parseJumpText, parseJumpTsv, parseJumpRecords, jumpRecords, scoreReverseText } from '../engine/checkpoint/jump-sync.js';
 import { jumpViewer } from './helpers/provisional-viewer.js';
 
 const box = (top, left = 60) => ({ left, top, right: left + 180, bottom: top + 12 });
 const response = data => ({ ok: true, json: async () => data });
 const jump = { page: 1, y: 70, sourceFile: '/paper/main.tex', sourceLine: 5 };
 const exact = (page = 2, top = 270) => ({ id: 2, srcRev: 2, documentEpoch: 1, page, boxes: [box(top)] });
+
+test('Live reverse text recognizes a wrapped yoko paragraph from t00', () => {
+  // Normalized source and pdftotext -bbox-layout words from the real PDF.
+  // These wrapped words are neither TeX tokens nor complete source words.
+  const paragraphs = [
+    ['はじめに', '吾輩は猫である名前はまだ無いどこで生れたかとんと見当がつかぬ何でも薄暗いじめじめした所でニャーニャー泣いていた事だけは記憶している吾輩はここで始めて人間というものを見た',
+      'る吾輩はここで始めて人間というものを見た'],
+    ['', 'しかもあとで聞くとそれは書生という人間中で一番獰悪な種族であったそうだこの書生というのは時々我々を捕えて煮て食うという話であるしかしその当時は何という考もなかったから別段恐しいとも思わなかった',
+      'しかもあとで聞くとそれは書生という人間中で一番獰悪な種族であったそ'],
+  ];
+  for (const [wrong, line, word] of paragraphs) {
+    assert.equal(scoreReverseText([wrong], { word }), 0);
+    assert.equal(scoreReverseText([line], { word }), 1);
+  }
+  assert.equal(scoreReverseText(['これは本文です'], { word: '本文' }), 0);
+  assert.equal(scoreReverseText(['concatenate'], { word: 'cat' }), 0);
+  assert.equal(scoreReverseText(['left', 'word', 'right'], { word: 'word', prev: 'left', next: 'right' }), 3);
+});
 
 test('the old Build position is only an approximate band until current paper answers', async () => {
   let ready = false;
@@ -39,6 +57,56 @@ test('the old Build position is only an approximate band until current paper ans
   assert.equal(marker.style.top, '269px');
   assert.equal(marker.style.height, '14px');
   assert.equal(marker.dataset.exact, 'true');
+});
+
+// Round 20 release audit, "Opening Jump": Jump from line 3 while a ten-page
+// article opens, the host's position an older Build's (paper y=200). The
+// resident lookup finds the line; the exact lookup is pending. The marker went
+// back to the older host band (~75 px off) for a second before the exact box.
+test('an opening Jump keeps the resident place it found until the exact answer for the same Jump', async () => {
+  let ready = false;
+  const viewer = jumpViewer({ fetch: async url => response(url === '/dom'
+    ? { srcRev: 2, documentEpoch: 1, blocks: [{ id: 'p1', source: { file: jump.sourceFile, start: { line: 3 }, end: { line: 3 } } }] }
+    : ready ? { id: 2, srcRev: 2, documentEpoch: 1, page: 1, boxes: [box(131)] } : { pending: true, srcRev: 2, documentEpoch: 1 }) });
+  const fallbacks = [];
+  const setTimer = viewer.setTimeout;
+  viewer.setTimeout = (fn, ms) => {
+    if (ms === 1200) fallbacks.push(fn);
+    return setTimer(fn, ms);
+  };
+  viewer.openingPreview = true;
+  // sheet 1 provisional, its line 3 drawn from 120 to 160 px
+  const page = viewer.pageDivs.get(1);
+  page.dataset.prov = '1'; page.dataset.provRev = '2';
+  const ink = { dataset: { line: '0' }, tagName: 'text', classList: { contains: () => false },
+    getBoundingClientRect: () => ({ top: page.getBoundingClientRect().top + 120, bottom: page.getBoundingClientRect().top + 160,
+      left: 72, right: 520, width: 448, height: 40 }) };
+  page.querySelectorAll = selector => selector.includes('data-src="p1"') ? [ink] : [];
+  const tops = [];
+  const sample = () => tops.push(viewer.markers().map(marker => marker.parent.dataset.page + ':' + Math.round(parseFloat(marker.style.top))).join());
+  viewer.jump({ page: 1, y: 200, sourceFile: jump.sourceFile, sourceLine: 3, blockX: 72, blockY: 190, blockWidth: 448, blockHeight: 20 });
+  sample();
+  await viewer.flush();
+  sample();
+  await viewer.tick();
+  sample();
+  // the first-move deadline passes with the exact answer still pending
+  assert.equal(fallbacks.length, 1);
+  const scrolled = viewer.pagesEl.scrollTop;
+  fallbacks[0]();
+  sample();
+  assert.equal(viewer.pagesEl.scrollTop, scrolled, 'the deadline does not move to the older place');
+  ready = true;
+  viewer.commitCanonical(2, 2);
+  delete page.dataset.prov; // (the exact sheet is on screen now)
+  await viewer.tick();
+  sample();
+  const resident = tops[1];
+  assert.notEqual(tops[0], resident, 'the host band first, then the resident place');
+  assert.deepEqual(tops.slice(1, 4), [resident, resident, resident], 'the resident place stays: ' + tops.join(' | '));
+  const exactMarker = viewer.markers()[0];
+  assert.equal(exactMarker.dataset.exact, 'true');
+  assert.equal(exactMarker.style.top, '130px');
 });
 
 test('an exact chunk supplies a current block estimate, never a box-sized precise marker', async () => {

@@ -79,3 +79,17 @@ test('a document switch may open in one block and close in a later one', async (
   assert.equal(sourceClosure('\\ifx a', { documentConditionals }).reason, 'conditional:ifx');
   assert.equal(sourceClosure('x \\fi \\fi', { documentConditionals, carried: 1 }).reason, 'unexpected:fi');
 });
+
+test('a string primitive skips an intervening TeX comment and awaits its token', () => {
+  const unfinished = '\\string % literal token on the next line\n';
+  assert.equal(sourceClosure(unfinished).closed, false);
+  assert.equal(sourceClosure(unfinished + '\\verb').closed, true);
+  assert.equal(sourceClosure(unfinished + '$').closed, true);
+});
+
+test('detokenized control words and math tokens have no effect on native closure', () => {
+  const example = String.raw`\detokenize{# \end{document} $ \verb \# \%}`;
+  assert.equal(sourceClosure(example).closed, true);
+  assert.equal(sourceClosure(example.slice(0, -1)).closed, false);
+  assert.equal(sourceClosure(String.raw`\detokenize\expandafter{\jobname}`).closed, true);
+});

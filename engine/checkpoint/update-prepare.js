@@ -1,6 +1,8 @@
+import { createHash } from 'node:crypto';
+import { physicalReplayReady } from './ship-pacing.js';
 import { fnv1a } from '../hash.js';
 import { segmentBody, documentBounds, diffBlocks } from '../segmenter.js';
-import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch } from './safety.js';
+import { classifyPreamble, classifyBodyBlock, bodyUsesColumnSwitch, usesVerticalWriting, TATE_PREVIEW_REASON } from './safety.js';
 import { classifyStructuralAliases, classifyStructuralAliasesOfBlocks } from './structural-aliases.js';
 import { firstDirtyIndex, nextEditHold, editPageRenderIds } from './update-helpers.js';
 import { checkpointBudgetFor } from './checkpoint-selection.js';
@@ -9,15 +11,23 @@ import { sourceClosure } from './closure.js';
 import { planPreamblePatch } from './preamble-patch.js';
 import { projectPackageText } from './rescue-classifier.js';
 import { synthChunkKey } from './exact-synth.js';
+import { literalFurnitureBlock } from './header-scheduler.js';
 
-// Asked of every block on every update; the answer belongs to the text.
-const columnSwitchMemo = new WeakMap(); // block -> { text, uses }
-function usesColumnSwitch(block) {
-  const kept = columnSwitchMemo.get(block);
-  if (kept && kept.text === block.text) return kept.uses;
-  const uses = bodyUsesColumnSwitch(block.text);
-  columnSwitchMemo.set(block, { text: block.text, uses });
-  return uses;
+// Asked of every block on every update; the answers belong to the text.
+const layoutMemo = new WeakMap();
+function blockLayout(block) {
+  let kept = layoutMemo.get(block);
+  if (!kept || kept.text !== block.text) {
+    kept = { text: block.text, columnSwitch: bodyUsesColumnSwitch(block.text), tate: usesVerticalWriting(block.text) };
+    layoutMemo.set(block, kept);
+  }
+  return kept;
+}
+
+export function recordFurniturePreamble(engine, preamble) {
+  if (engine.preambleText === preamble) return;
+  engine.preambleText = preamble;
+  engine.preDigest = createHash('sha256').update(preamble).digest('hex');
 }
 
 export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, callbacks }) {
@@ -31,6 +41,9 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   engine.literalEnvs = bounds.literalEnvs;
   engine.documentConditionals = bounds.conditionals ?? null;
   const preHash = fnv1a(preamble);
+  // (the preamble a header job forked from: a reply made from another one
+  // is not published, header-scheduler.js)
+  if (!engine.opening) recordFurniturePreamble(engine, preamble);
 
   // Keep both the old page tree and its block boundaries while the user is
   // in an unambiguously unfinished construct. In particular, an unclosed
@@ -56,8 +69,6 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   if (engine.preGate?.preHash !== preHash) {
     engine.preGate = { preHash, gate: classifyPreamble(preamble) };
   }
-  engine.previewPolicy = engine.preGate.gate.previewPolicy ?? 'structured';
-  engine.previewReasons = engine.preGate.gate.previewReasons ?? [];
   // ---- segmentation + diff ---------------------------------------------
   // Independent of the resident boot, so it runs even for opaque documents.
   // Besides feeding the body safety gate, these blocks carry direct-edit
@@ -112,11 +123,20 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
       carried = closure.closed ? closure.carry ?? 0 : carried;
       if (!closure.closed && hold) {
         timer.lap('closure');
+        // Segment starts and part starts are character offsets. sourceStart
+        // is a line/column pair for the editor, including in input files.
+        const parts = seg.sourceParts;
+        // An unfinished construct at EOF may end in an engine-inserted
+        // input-boundary comment. Its source endpoint is the last real part.
+        const part = closure.at === seg.text.length ? parts?.at(-1)
+          : parts?.find(p => p.at <= closure.at && closure.at < p.to);
+        const sourceAt = part ? Math.min(part.end, part.start + closure.at - part.at)
+          : parts ? null : seg.start + closure.at;
         return {
           response: deferClosureUpdate(editLabel, timer, {
             ...closure,
-            scope: seg.file ?? engine.file,
-            sourceAt: (seg.sourceStart ?? seg.start) + closure.at,
+            scope: part?.file ?? seg.file ?? engine.file,
+            sourceAt,
           }),
         };
       }
@@ -125,6 +145,34 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   }
   const diff = diffBlocks(engine.blocks, segs, () => engine.idSeq++);
   engine.blocks = diff.blocks;
+  for (const id of diff.removed) engine.blocksById.delete(id);
+  for (const index of diff.bounds.changedNew) {
+    const block = engine.blocks[index];
+    engine.blocksById.set(block.id, block);
+    if (!engine.opening && engine.hfLiteralRoot && !literalFurnitureBlock(block.text)) engine.hfLiteralRoot = false;
+  }
+  if (preHash !== engine.preHash) engine.hfLiteralRoot = false;
+  const wasTate = engine.tateExact;
+  const preGate = engine.preGate.gate;
+  const sourceTate = preGate.previewReasons.includes(TATE_PREVIEW_REASON) ||
+    engine.blocks.some(block => blockLayout(block).tate);
+  const setPreviewPolicy = (tate) => {
+    engine.tateExact = tate;
+    engine.previewPolicy = preGate.previewPolicy;
+    const reasons = [...preGate.previewReasons];
+    const exact = tate || shippingExactUses.length > 0;
+    if (exact) {
+      engine.previewPolicy = 'shipping-exact';
+      if (tate) reasons.push(TATE_PREVIEW_REASON);
+      reasons.push(...shippingExactUses.flatMap(use =>
+        use.sinks.map(sink => `certified structural alias: ${use.key} -> ${sink}`)));
+    } else if (engine.blocks.some(block => blockLayout(block).columnSwitch)) {
+      engine.previewPolicy = 'canonical-anchor';
+      reasons.push('body column switch');
+    }
+    engine.previewReasons = [...new Set(reasons)];
+  };
+  setPreviewPolicy(sourceTate || (preHash === engine.preHash && engine.geometry?.writingDirection === 'tate'));
   // Block indices and carried cost profiles may have moved. Rebuild the
   // sparse resident skeleton once for this source generation; subsequent
   // JOBs reuse it unless a genuinely hotter block changes the top set.
@@ -134,15 +182,6 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
     pageCount: engine.canonicalPageCount,
     heapFloorKb: engine.confirmedLiveHeapKb,
   });
-  if (shippingExactUses.length) {
-    engine.previewPolicy = 'shipping-exact';
-    engine.previewReasons = [...new Set(shippingExactUses.flatMap((use) =>
-      use.sinks.map((sink) => `certified structural alias: ${use.key} -> ${sink}`)
-    ))];
-  } else if (engine.blocks.some(usesColumnSwitch)) {
-    engine.previewPolicy = 'canonical-anchor';
-    engine.previewReasons = [...new Set([...engine.previewReasons, 'body column switch'])];
-  }
   for (const id of diff.removed) {
     unindexBlock(id);
     engine.unsafeBodyBlocks.delete(id);
@@ -219,18 +258,22 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
   }
 
   let rebooted = false;
+  // A native-only update skipped resident jobs, so its checkpoint suffix
+  // cannot carry state back into structured layout after a direction edit.
+  if (wasTate && !engine.tateExact) engine.preHash = null;
   // A preamble edit that only changes the body of a macro or environment
   // the document declares re-runs that declaration in front of the jobs
   // that use it, instead of rebooting the root (tex64-internal #93).
   let patch = null;
   if (preHash !== engine.preHash && engine.preHash != null && engine.root &&
+      !engine.geometry?.writingDirection &&
       engine.bootPreamble != null && engine.lastPreamble != null && process.env.TDOM_PREAMBLE_PATCH !== '0') {
     patch = planPreamblePatch({
       bootPreamble: engine.bootPreamble,
       prevPreamble: engine.lastPreamble,
       preamble,
       blockTexts: engine.blocks.map((b) => b.text),
-      packageText: projectPackageText(preamble, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
+      packageText: projectPackageText(preamble, engine),
     });
     if (!patch.ok) {
       engine.diagnostics.push(`preamble patch refused: ${patch.reason}`);
@@ -299,6 +342,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
       return { response: opaqueUpdate(editLabel, timer, [`structured boot failed: ${err.message}`]) };
     }
     engine.preHash = preHash;
+    setPreviewPolicy(sourceTate || engine.geometry?.writingDirection === 'tate');
     rebooted = true;
     for (const b of engine.blocks) {
       // A preamble edit needs an honest replay from block zero, but it must
@@ -352,7 +396,7 @@ export async function prepareUpdate(engine, { editLabel, coldIds = null, timer, 
 
   // Pin before the walk can retire a newly materialized input or capture
   // owner. Finalization cannot recover a checkpoint that has already died.
-  const pageRenderIds = editPageRenderIds(engine.blocks, engine.pages, dirtySource);
+  const pageRenderIds = physicalReplayReady(engine) ? [] : editPageRenderIds(engine.blocks, engine.pages, dirtySource);
   engine.foregroundRenderIds = rebooted || !dirtySource.size ? null : new Set([...dirtySource, ...pageRenderIds]);
   if (engine.foregroundRenderIds) {
     for (const [index, id] of engine.renderHold) {

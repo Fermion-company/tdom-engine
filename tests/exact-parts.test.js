@@ -73,10 +73,10 @@ test('every exact run is found in the painted galley, wherever its line and its 
   assert.deepEqual(runs.map((run) => run.t), ['zab', 'cd'], 'the text stays with the glyph layer');
   // the painted line's baseline: 10 (first line) + 4 (glue) + 8 (its height)
   assert.deepEqual(parts, [
-    { x: 17, w: 5, top: -5, h: 6, sx: 12, sy: 22 - 5 },
-    { x: 22, w: 3, top: -9, h: 6, sx: 17, sy: 22 - 4 - 5 },
-    { x: 27.5, w: 6, top: -5, h: 6, sx: 22, sy: 22 - 5 },
-    { x: 36, w: 5, top: -5, h: 6, sx: 30, sy: 22 - 5 },
+    { runIndex: 1, x: 17, w: 5, top: -5, h: 6, sx: 12, sy: 22 - 5 },
+    { runIndex: 2, x: 22, w: 3, top: -9, h: 6, sx: 17, sy: 22 - 4 - 5 },
+    { runIndex: 3, x: 27.5, w: 6, top: -5, h: 6, sx: 22, sy: 22 - 5 },
+    { runIndex: 4, x: 36, w: 5, top: -5, h: 6, sx: 30, sy: 22 - 5 },
   ]);
 
   // a keystroke inside the formula: one run has no twin, so nothing is composed
@@ -93,6 +93,12 @@ test('every exact run is found in the painted galley, wherever its line and its 
   // no exact line at all: nothing to compose
   const plain = { items: [line([text('plain', 0, 20)])] };
   assert.equal(composeExactLines(plain, fidelityOf(plain), painted, fidelityOf(painted)), null);
+});
+
+test('a math run with the same width still needs the same glyph slots and internal advances', () => {
+  const run = { ...math('xy', 10, 12), gc: [120, 121], gp: [0, 6] };
+  assert.notEqual(exactRunKey(run), exactRunKey({ ...run, gp: [0, 7] }));
+  assert.notEqual(exactRunKey(run), exactRunKey({ ...run, gc: [120, 122] }));
 });
 
 test('the glyphs of a picture are put where the galley says, or the picture is left alone', () => {
@@ -184,7 +190,8 @@ test('the viewer shows such a picture through its openings and gives the text dr
     readyFonts: new Set(['f-text']), FONT_FAMILY: { regular: 'serif' } };
   vm.createContext(viewer);
   // (svgFor joins the pieces svgParts makes)
-  vm.runInContext(cut('const OVER_TEXT_ATTRS', '/** Unified SVG page') +
+  vm.runInContext(cut('function furnitureBandOf', 'const furnitureLists') +
+    cut('const OVER_TEXT_ATTRS', '/** Unified SVG page') +
     app.slice(svgStart, app.indexOf('\n}\n', app.indexOf('function svgParts(')) + 3) +
     '\nthis.clip = chunkShowClip; this.svg = svgFor;', viewer);
 

@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
-import { proseKeystroke } from '../engine/checkpoint/plain-preview.js';
+import { canDeferPlainVerification, classifyPlainPreviewEdit, proseKeystroke } from '../engine/checkpoint/plain-preview.js';
 import { drain, signature } from '../tools/harness.mjs';
 
 const TEXT = 'ソート比較の詳細は \\ref{sec:a} 節で\\textbf{説明}されています。 Plain words follow, $x+y$ too.';
@@ -48,6 +48,32 @@ test('ordinary characters typed into an inline formula are a prose keystroke of 
   assert.equal(prose('Here \\[x+y\\] ok', 'Here \\[x+ay\\] ok'), false, 'display mathematics');
   assert.equal(prose('Here $x+y$ ok', 'Here $ax+y$ ok'), false, 'the first character of a formula');
   assert.equal(prose('Here $x+y$ ok', 'Here $x\\alpha+y$ ok'), false, 'a command');
+});
+
+test('a replay prelude does not put a slower neighbouring block back on the prose response path', () => {
+  const original = {
+    id: 'prose', text: 'Plain words.', start: 0, end: 12, stateVec: '[]',
+    closure: { native: true, closed: true }, nativeClosureRequired: true,
+    fidelity: { level: 'safe-glyph' },
+    galley: {
+      closure: 'native', tdomSourceCatcodesSafe: false, state: {}, w: 10, h: 8, d: 2,
+      tdomRenderPrelude: '\\makeatletter\\setcounter{section}{4}\\makeatother\n',
+      items: [{ k: 'box', w: 10, h: 8, d: 2, runs: [{ t: 'Plain words.' }] }],
+    },
+  };
+  const text = 'Plain wordsx.';
+  const edited = { ...original, text, end: text.length };
+  const editContext = { file: 'main.tex', baseSrcRev: 1, start: 11, end: 11,
+    replacement: 'x', before: original.text, after: text };
+  for (const typesetCostMs of [2, 20]) {
+    const engine = { previewPolicy: 'structured', file: 'main.tex', srcRev: 1,
+      blocks: [edited, { id: 'next', typesetCostMs }] };
+    const admission = classifyPlainPreviewEdit(engine, {
+      text, editContext, oldBlocks: [original], dirtySource: new Set([original.id]),
+    });
+    assert.deepEqual(admission?.prose, { inserted: 'x', removed: '' });
+    assert.equal(canDeferPlainVerification(admission, admission.witness, edited), true);
+  }
 });
 
 const texReady = spawnSync('lualatex', ['--version']).status === 0;

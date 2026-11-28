@@ -9,6 +9,22 @@ const NO_SYNTH = !!process.env.TDOM_NO_EXACT_SYNTH;
 // shown from that picture whole, text included, as it was before 2026-11-19.
 const WHOLE_LINES = !!process.env.TDOM_EXACT_WHOLE_LINES;
 
+// A page can need an unchanged formula whose block has never had a picture.
+// Prepare only the edited page's neighbours, from outlines already checked
+// against TeX. The rest of the book keeps its cached layout.
+export function prepareUnpaintedFormula(block, chunks) {
+  if (NO_SYNTH || !chunks.outlines?.size || chunks.has(block.id) ||
+      block.galleyHash == null || !block.needsRender || block.rescued || block.sourceChanged || block.gfx ||
+      block.galley?.tdomFrozen || block.galley?.tdomDeferred || block.galley?.tdomPendingPaint ||
+      block.fidelity?.blockExact || block.fidelity?.canonicalOnly ||
+      !exactFallbackEligible(block.galley)) return false;
+  const previous = chunks.get(synthChunkKey(block.id));
+  const picture = synthChunkFor(block, chunks);
+  if (!picture) return false;
+  if (picture !== previous) block.units = null;
+  return true;
+}
+
 /**
  * galley items -> the page builder's input stream. The items ARE the real
  * main vertical list (boxes, glue with full specs, penalties, inserts,
@@ -48,7 +64,8 @@ export function buildStream(block, chunks) {
   // engine has drawn before (exact-synth.js), and the lines are composed out
   // of that picture instead, each run at its own place.
   let partsChunk = null;
-  if (!composed && candidate && composable && !NO_SYNTH) {
+  const prepared = !bc && block.galleyHash != null && chunks.get(synthChunkKey(block.id))?.forGalley === block.galleyHash;
+  if (!composed && (candidate || prepared) && composable && !NO_SYNTH) {
     const synth = synthChunkFor(block, chunks);
     if (synth) {
       composed = composeExactLines(block.galley, block.fidelity, block.galley, block.fidelity, why);
@@ -155,7 +172,7 @@ export function buildStream(block, chunks) {
         h: it.h ?? it.hc ?? 0,
         d: it.d ?? 0,
         hc: it.hc ?? it.h ?? 0,
-        units: miniUnits(it.items, block.id, chunkRef, suppress, galley?.backend),
+        units: miniUnits(it.items, block.id, chunkRef, suppress, galley?.backend, suppress, k),
       });
     } else if (it.k === 'fm') {
       const f = makeFloat(it.n);
@@ -276,7 +293,7 @@ export function buildStream(block, chunks) {
  * units. `suppress` blanks the glyph runs when the fidelity gate forbids a
  * glyph bridge and no exact chunk has landed yet. `pendingExact` also
  * covers graphics whose harvested text runs represent only part of the ink. */
-export function miniUnits(items, blockId, chunkRef, suppress = false, backend = null, pendingExact = suppress) {
+export function miniUnits(items, blockId, chunkRef, suppress = false, backend = null, pendingExact = suppress, bodyInsert) {
   const units = [];
   let y = 0;
   for (const it of items ?? []) {
@@ -287,6 +304,8 @@ export function miniUnits(items, blockId, chunkRef, suppress = false, backend = 
     if (it.k !== 'box') continue;
     units.push({
       blockId,
+      bodyLine: units.length,
+      bodyInsert,
       h: it.h ?? 0,
       d: it.d ?? 0,
       yRel: y + (it.h ?? 0), // baseline relative to the mini-galley top

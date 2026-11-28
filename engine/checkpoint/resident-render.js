@@ -3,8 +3,10 @@ import path from 'node:path';
 import { waitForPdf } from './util/fs.js';
 import { cropRenderTargets } from './render-chunks.js';
 import { buildLastskipPrimer } from './job-body.js';
+import { notePageArtLanding } from './page-art.js';
 
-async function runShipCommand(engine, {
+// (also page-art.js: a page-art render is one more RENDER of the block)
+export async function runShipCommand(engine, {
   block,
   idx,
   ck,
@@ -233,9 +235,13 @@ export async function renderResidentBlock(
         if (landing === 'held' && target.key !== block.id) continue;
         const chunk = staged.get(target.key);
         if (!chunk) continue;
-        chunk.v = Math.max(chunk.v ?? 0, (engine.chunks.get(target.key)?.v ?? 0) + 1);
+        const prev = engine.chunks.get(target.key);
+        chunk.v = Math.max(chunk.v ?? 0, (prev?.v ?? 0) + 1);
+        // (the same galley drawn again keeps its pictures on the paper, page-art.js)
+        if (chunk.farInk && prev?.art && prev.forGalley === chunk.forGalley) chunk.art = prev.art;
         engine.chunks.set(target.key, chunk);
       }
+      if (landing === 'current') notePageArtLanding(engine, block.id);
     }
     if (landing === 'current' || landing === 'held') asyncRepaginate();
     timing.publishedMs = Date.now() - t0;

@@ -38,7 +38,7 @@ export function applyFidelity(block, galley, { fonts, fidelityDemoted }) {
   // this band, so the canonical page (margin note included) shows
   // through. This is what keeps \todo-bearing paper drafts structured
   // instead of demoting the whole document.
-  if (sourceRequiresCanonicalOnly(block.text)) {
+  if (galley.tdomTate || sourceRequiresCanonicalOnly(block.text)) {
     // comment-stripped: a `% \todo{...}` must not blank the block's band
     fid = demoteFidelity(fid, 'canonical');
   }

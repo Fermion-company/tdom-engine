@@ -74,7 +74,11 @@ for (const cold of [false, true]) {
         assert.ok(owners[0].has(title.id) && owners[0].has(first.id));
         assert.ok(!owners[1].has(title.id) && !owners[1].has(first.id));
         assert.ok(owners[1].has(second.id) && !owners[0].has(second.id));
-        assert.deepEqual(pages[1], secondPage, 'the untouched page retains its exact display list');
+        assert.equal(pages[1].body, secondPage.body, 'the untouched page retains its body identity');
+        // The isolated title has no continuous TeX-state witness. The old
+        // canonical furniture can be withdrawn even while the body stays.
+        const body = (list) => list.commands.filter((c) => c.src !== '_hf' && c.op !== 'folio');
+        assert.deepEqual(body(pages[1]), body(secondPage), 'the body commands stay on the same sheet');
       }
     } finally {
       await engine.close();

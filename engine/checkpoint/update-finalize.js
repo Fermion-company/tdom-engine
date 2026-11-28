@@ -2,9 +2,11 @@ import { performance } from 'node:perf_hooks';
 import { reconcile } from './pagebuilder.js';
 import { nextEditHold, editPageRenderIds, focusRescueIds } from './update-helpers.js';
 import { buildPagePatches, EAGER_PAGES } from './page-patches.js';
-import { pageHfSig } from './header-footer.js';
 import { buildUpdateResponse } from './update-response.js';
-import { residentPaintable } from './ship-pacing.js';
+import { physicalReplayReady, residentPaintable } from './ship-pacing.js';
+import { instrumentEditRegions } from '../edit-regions.js';
+import { furniturePageKey } from './page-metadata.js';
+import { displayListBodyChanged } from './display-list.js';
 
 export function finalizeUpdate(engine, {
   text,
@@ -21,7 +23,8 @@ export function finalizeUpdate(engine, {
   callbacks,
 }) {
   const {
-    paginateNow, displayList, scheduleHeaders, enforceCheckpointCap, scheduleBackground,
+    paginateNow, displayList, scheduleHeaders, deferHeaders = scheduleHeaders,
+    enforceCheckpointCap, scheduleBackground, noteSpecs = () => {}, noteFurnitureInputs = () => {},
     shipUpdate, deferShipUpdate = shipUpdate, fidelitySummary, pumpOwedPages = () => {},
   } = callbacks;
   const { dirtyBlocks, depDirty, changedLabels, typesetCount, forkMs, fgStop, verdict, cold = null } = typesetResult;
@@ -31,11 +34,20 @@ export function finalizeUpdate(engine, {
   // ---- pages, display lists, patches ---------------------------------
   const pagesRaw = paginateNow();
   const prevPageCount = engine.pages.length;
-  const { pages, reused, rebuilt } = reconcile(pagesRaw, engine.pages);
+  const { pages, reused, rebuilt, furnitureUnchanged } = reconcile(pagesRaw, engine.pages,
+    engine.opening ? undefined : (a, b) => furniturePageKey(a) === furniturePageKey(b));
+  const noted = noteSpecs(pages, furnitureUnchanged && dirtySource.size <= 1 && !removedBlocks.length && !cold?.pending?.length);
+  // Band provenance is checked when its list is built. The source store
+  // already holds the edited text, so the old revision cannot attest it.
+  if (advanceSrcRev) engine.srcRev++;
+  // (since which revision each page's head and foot inputs are what they are
+  // now: its display list carries it, engine-v3.js #noteFurnitureInputs)
+  noteFurnitureInputs(pages);
   // (the pages nearest the edit now, the others a few at a time afterwards:
   // page-patches.js EAGER_PAGES. A boot delivers every page.)
-  const { patches, dirtyPages, later } = buildPagePatches(pages, engine.pages, (page) => pageHfSig(engine.hf, page.number), displayList,
-    { limit: rebooted ? Infinity : EAGER_PAGES });
+  const { patches, dirtyPages, later } = buildPagePatches(pages, engine.pages, (page) => engine.furnitureSig(page.number, page), displayList,
+    { limit: rebooted ? Infinity : EAGER_PAGES, bodyContext: `${engine.srcRev}/${pages.length}`,
+      bodyChanged: (page, stamp) => displayListBodyChanged(page, noted?.specs?.[page.number - 1], stamp) });
   if (dirtyPages.length) engine.owedFocus = dirtyPages[0];
   if (!advanceSrcRev) {
     // A cold resume owes the keystroke its page: when another walk already
@@ -54,11 +66,12 @@ export function finalizeUpdate(engine, {
   if (later) pumpOwedPages();
   // the edited pages' own rescues go first (engine #pumpRescues)
   if (!rebooted && dirtySource.size) engine.rescueFocus = focusRescueIds(pages, dirtySource, engine.rescueQueue);
-  // header/footer respecification walks every page and hashes the result —
-  // only worth it when the page composition actually moved (folio values,
-  // marks and styles all ride on galley changes, which show up as rebuilt
-  // pages or a page-count change)
-  if (rebuilt > 0 || pages.length !== prevPageCount || !engine.hfSig) scheduleHeaders();
+  // A furniture witness can change while the body pages retain their identity.
+  const changedFurniture = noted && noted.sig !== engine.hfSig && noted.sig !== engine.hfFailedSig;
+  if (rebuilt > 0 || pages.length !== prevPageCount || !engine.hfSig || changedFurniture) {
+    if (rebooted || editLabel === 'open') scheduleHeaders();
+    else deferHeaders();
+  }
   timer.lap('paginate');
 
   // ---- async work: rebuild remaining checkpoint chain + gfx renders --
@@ -69,7 +82,6 @@ export function finalizeUpdate(engine, {
 
   engine.rev++;
   if (advanceSrcRev) {
-    engine.srcRev++;
     // Bind shipping and the foreground exact-render cohort to the same source
     // revision. Cold work keeps the shipping priority window; edited blocks
     // and their changed neighbors may supply an earlier complete preview.
@@ -90,7 +102,7 @@ export function finalizeUpdate(engine, {
   // has its shipping generation and canonical compile scheduled.
   scheduleBackground(fgStop, dirtyBlocks, {
     interactive: !rebooted,
-    pageRenderIds: rebooted ? [] : editPageRenderIds(engine.blocks, engine.pages, dirtySource),
+    pageRenderIds: rebooted || physicalReplayReady(engine) ? [] : editPageRenderIds(engine.blocks, engine.pages, dirtySource),
   });
   timer.lap('schedule');
   return buildUpdateResponse({
@@ -153,17 +165,39 @@ export function finalizeShippingExactUpdate(engine, {
   callbacks,
 }) {
   const { queueChainWork, shipUpdate, scheduleBackground, fidelitySummary } = callbacks;
-  queueChainWork('rebuild', Math.max(0, firstDirty), []);
+  if (engine.tateExact) {
+    // The resident walker and paginator have no vertical coordinate model.
+    // Even a height-only witness can mislabel pages, crops and Jump bands.
+    engine.pendingChain = null;
+    engine.pages = [];
+    engine._pageRun = null;
+    engine.rescueQueue.clear();
+    engine.renderWant.clear();
+    for (const block of engine.blocks) {
+      if (dirtySource.has(block.id)) block.editRegions = instrumentEditRegions(block.text).regions;
+    }
+  } else {
+    queueChainWork('rebuild', Math.max(0, firstDirty), []);
+  }
   timer.lap('typeset');
   timer.lap('paginate');
 
   engine.rev++;
   engine.srcRev++;
-  // Bind the fast exact replay before scheduling the low-priority canonical
-  // audit.  Both consume this immutable source text/srcRev pair.
-  shipUpdate(text, projectInputChanges);
-  engine.canonical.schedule(text, engine.srcRev);
-  scheduleBackground(firstDirty, []);
+  if (engine.tateExact) {
+    // Bind the display demand before asking for replay. A synchronous ship
+    // refusal releases its lease and wakes this canonical job immediately.
+    engine.canonical.schedule(text, engine.srcRev);
+    engine.canonical.requestDisplay(engine.srcRev, engine.canonical.displayDemandEpoch ?? 0, {
+      demandId: 'vertical-writing', residentImpossible: true,
+    });
+    shipUpdate(text, projectInputChanges);
+    if (!engine.shipping || engine.shipDisabledFor === engine.preHash) engine.canonical.releaseAuthorityDeferral();
+  } else {
+    shipUpdate(text, projectInputChanges);
+    engine.canonical.schedule(text, engine.srcRev);
+    scheduleBackground(firstDirty, []);
+  }
   timer.lap('schedule');
 
   const canonical = engine.canonical.info();

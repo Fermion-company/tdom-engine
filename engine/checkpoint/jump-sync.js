@@ -9,6 +9,89 @@ const decode = value => value.replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos);/g
     ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[code]);
 const bounds = boxes => ({ left: Math.min(...boxes.map(b => b.left)), top: Math.min(...boxes.map(b => b.top)),
   right: Math.max(...boxes.map(b => b.right)), bottom: Math.max(...boxes.map(b => b.bottom)) });
+const centerX = box => (box.left + box.right) / 2;
+const centerY = box => (box.top + box.bottom) / 2;
+const width = box => box.right - box.left;
+const cjkGlyph = /^[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}]$/u;
+
+export function scoreReverseText(words, { word, prev, next }) {
+  let best = 0;
+  for (const [i, item] of words.entries()) {
+    if (item === word) {
+      const before = Boolean(prev && words[i - 1] === prev);
+      const after = Boolean(next && words[i + 1] === next);
+      best = Math.max(best, 1 + Number(before) + Number(after));
+    }
+  }
+  // Poppler may split a Japanese sentence at every printed line break.
+  // A distinctive fragment still belongs to the uninterrupted source word.
+  if (!best && word.length >= 4 && [...word].some(char => cjkGlyph.test(char)) &&
+      words.some(item => item.includes(word))) return 1;
+  return best;
+}
+
+function rowFromGlyphs(page, glyphs) {
+  return { page, glyphs, box: bounds(glyphs.map(glyph => glyph.box)),
+    text: glyphs.map(glyph => glyph.text).join(''), tokens: glyphs.flatMap(glyph => glyph.tokens) };
+}
+
+// Poppler emits the vertical CJK glyphs as single-glyph words, on their
+// own lines or mixed into horizontal rows across several actual columns.
+// Rebuild only geometrically supported stacks of those words.
+// Singleton yoko cells normally have horizontal spacing or line leading
+// instead. Keep their original Poppler rows, as well as horizontal boxes
+// and furniture on a tate page.
+function groupVerticalRows(rows) {
+  const pages = new Map();
+  for (const row of rows) {
+    if (!pages.has(row.page)) pages.set(row.page, []);
+    pages.get(row.page).push(row);
+  }
+  return [...pages.values()].flatMap(pageRows => {
+    const glyphs = pageRows.flatMap(row => row.glyphs.filter(({ box, text }) =>
+      [...text].length <= 1 && box.bottom - box.top > 1.15 * width(box)));
+    if (glyphs.length < 3) return pageRows;
+    const columns = [];
+    for (const glyph of glyphs.sort((a, b) => centerX(b.box) - centerX(a.box))) {
+      const x = centerX(glyph.box), w = width(glyph.box);
+      const column = columns.find(c => Math.abs(c.x - x) <= Math.min(c.w, w) * 0.2);
+      if (column) column.glyphs.push(glyph);
+      else columns.push({ x, w, glyphs: [glyph] });
+    }
+    const taken = new Set(), vertical = [], short = [];
+    const add = (stack, allowShort = false) => {
+      const count = stack.filter(glyph => cjkGlyph.test(glyph.text)).length;
+      if (count === 2 && stack.length === 2 && !allowShort) short.push(stack);
+      if (count < (allowShort ? 2 : 3)) return;
+      stack.forEach(glyph => taken.add(glyph));
+      vertical.push({ ...rowFromGlyphs(pageRows[0].page, stack), direction: 'tate' });
+    };
+    for (const column of columns) {
+      let stack = [];
+      for (const glyph of column.glyphs.sort((a, b) => centerY(a.box) - centerY(b.box))) {
+        const previous = stack.at(-1);
+        if (previous) {
+          const step = centerY(glyph.box) - centerY(previous.box);
+          if (step < column.w * 0.4 || step > column.w * 1.8) {
+            add(stack);
+            stack = [];
+          }
+        }
+        stack.push(glyph);
+      }
+      add(stack);
+    }
+    if (!vertical.length) return pageRows;
+    short.forEach(stack => add(stack, true));
+    const horizontal = pageRows.flatMap(row => {
+      const remaining = row.glyphs.filter(glyph => !taken.has(glyph));
+      if (!remaining.length) return [];
+      return remaining.length === row.glyphs.length ? [row] : [rowFromGlyphs(row.page, remaining)];
+    });
+    return [...vertical.sort((a, b) => centerX(b.box) - centerX(a.box) || a.box.top - b.box.top),
+      ...horizontal];
+  });
+}
 
 // Preserve Poppler's typeset-line boundaries: merging words by y alone joins
 // columns, raster cells and side-by-side boxes into a page-wide marker.
@@ -21,13 +104,15 @@ export function parseJumpText(output) {
       for (const word of line[1].matchAll(/<word\b([^>]*)>([\s\S]*?)<\/word>/g)) {
         const attr = Object.fromEntries([...word[1].matchAll(/(xMin|yMin|xMax|yMax)="([\d.-]+)"/g)].map(m => [m[1], Number(m[2])]));
         const box = { left: attr.xMin, top: attr.yMin, right: attr.xMax, bottom: attr.yMax };
-        if (Object.values(box).every(Number.isFinite)) words.push({ ...box, text: normal(decode(word[2])), tokens: tokens(decode(word[2])) });
+        if (!Object.values(box).every(Number.isFinite)) continue;
+        const text = decode(word[2]);
+        words.push({ box, text: normal(text), tokens: tokens(text) });
       }
-      if (words.length) rows.push({ page: pages.length + 1, box: bounds(words), text: words.map(w => w.text).join(''), tokens: words.flatMap(w => w.tokens) });
+      if (words.length) rows.push(rowFromGlyphs(pages.length + 1, words));
     }
     pages.push(rows);
   }
-  return pages.flat();
+  return groupVerticalRows(pages.flat());
 }
 
 // Some Poppler versions throw while writing empty beamer PDF metadata to
@@ -38,15 +123,100 @@ export function parseJumpTsv(output) {
   for (const line of String(output).split(/\r?\n/)) {
     const [level, page, , , , , left, top, width, height, , ...text] = line.split('\t');
     if (level === '4') {
-      const box = { left: +left, top: +top, right: +left + +width, bottom: +top + +height };
-      row = Object.values(box).every(Number.isFinite) ? { page: +page, box, text: '', tokens: [] } : null;
-      if (row) rows.push(row);
+      row = { page: +page, glyphs: [] };
+      rows.push(row);
     } else if (level === '5' && row && row.page === +page) {
-      row.text += normal(text.join('\t'));
-      row.tokens.push(...tokens(text.join('\t')));
+      const box = { left: +left, top: +top, right: +left + +width, bottom: +top + +height };
+      if (!Object.values(box).every(Number.isFinite)) continue;
+      const value = text.join('\t');
+      row.glyphs.push({ box, text: normal(value), tokens: tokens(value) });
     }
   }
-  return rows;
+  return groupVerticalRows(rows.filter(row => row.glyphs.length).map(row => rowFromGlyphs(row.page, row.glyphs)));
+}
+
+function sourceLiteral(sourceLine) {
+  return uncomment(sourceLine).replace(/\\verb\*?([^\w\s])([^\n]*?)\1/g, '$2')
+    .replace(/\\(?:begin|end|label|ref|eqref)\s*\{[^}]*\}/g, ' ')
+    .replace(/\\[a-zA-Z@]+\*?/g, ' ').replace(/[\w/.]+\s*=/g, ' ');
+}
+
+function locateVerticalJump(rows, literal, records, toEnd) {
+  const text = normal(literal);
+  const byRow = new Map();
+  const inkPages = new Set(records.filter(record => record.ink).map(record => record.page));
+  if (text.length >= 2 && text.length < 4 && [...text].every(char => cjkGlyph.test(char))) {
+    const matches = rows.filter(row => row.text === text);
+    if (matches.length === 1) return { page: matches[0].page, direction: 'tate', boxes: [matches[0].box] };
+  }
+  // A source line is often a whole paragraph and wraps over many columns.
+  // Weigh distinctive consecutive text inside each column. SyncTeX leaf
+  // page numbers can break ties, even when its x/y are in another frame.
+  for (const length of [8, 4]) {
+    const fragments = new Map();
+    for (let at = 0; at + length <= text.length; at++) {
+      const fragment = text.slice(at, at + length);
+      if (!fragments.has(fragment)) fragments.set(fragment, at);
+    }
+    for (const [fragment, at] of fragments) {
+      let matching = rows.filter(row => row.text.includes(fragment));
+      if (matching.length > 1) {
+        const onInkPage = matching.filter(row => inkPages.has(row.page));
+        if (onInkPage.length === 1) matching = onInkPage;
+      }
+      if (matching.length !== 1) continue;
+      const row = matching[0];
+      const match = byRow.get(row) ?? { first: at, last: at };
+      match.first = Math.min(match.first, at);
+      match.last = Math.max(match.last, at);
+      byRow.set(row, match);
+    }
+    if (byRow.size) break;
+  }
+  if (!byRow.size) return null;
+  const ranked = [...byRow].sort((a, b) => a[1].first - b[1].first);
+  const best = toEnd ? ranked.reduce((last, match) => last[1].last > match[1].last ? last : match) : ranked[0];
+  const { page } = best[0];
+  return { page, direction: 'tate', boxes: toEnd ? [best[0].box]
+    : rows.filter(row => row.page === page && byRow.has(row)).map(row => row.box) };
+}
+
+export function verticalRowAtPoint(rows, page, x, y) {
+  let best = null;
+  for (const row of rows) {
+    if (row.page !== page || row.direction !== 'tate' || x < row.box.left - 1 || x > row.box.right + 1) continue;
+    for (const glyph of row.glyphs) {
+      if (y < glyph.box.top - 1 || y > glyph.box.bottom + 1) continue;
+      const distance = (centerX(glyph.box) - x) ** 2 + (centerY(glyph.box) - y) ** 2;
+      if (!best || distance < best.distance) best = { row, glyph, distance };
+    }
+  }
+  return best;
+}
+
+export function locateVerticalSource({ row, glyph }, inputs, withContext = false) {
+  const at = Math.min(row.text.length - 1,
+    row.glyphs.slice(0, row.glyphs.indexOf(glyph)).reduce((n, item) => n + item.text.length, 0));
+  const lines = inputs.flatMap(({ file, source }) => source.split(/\r?\n/).map((line, index) => ({
+    file, line: index + 1, text: normal(sourceLiteral(line)),
+  })));
+  const best = new Set();
+  for (let length = Math.min(14, row.text.length); length >= Math.min(4, row.text.length); length--) {
+    for (let start = Math.max(0, at - length + 1); start <= Math.min(at, row.text.length - length); start++) {
+      const fragment = row.text.slice(start, start + length);
+      const matches = lines.filter(line => line.text.includes(fragment));
+      if (matches.length === 1) best.add(matches[0]);
+    }
+    if (best.size) break;
+  }
+  if (best.size !== 1) return null;
+  const [{ file, line }] = best;
+  const context = withContext ? {
+    word: glyph.text,
+    prev: row.text.slice(Math.max(0, at - 8), at),
+    next: row.text.slice(at + glyph.text.length, at + glyph.text.length + 8),
+  } : undefined;
+  return { file, line, direction: 'tate', box: row.box, ...(context && { context }) };
 }
 
 // A closing/blank line belongs to the preceding output; an opening marker
@@ -167,13 +337,21 @@ function tableRowBoxes(rows, literal, seeds) {
   return boxes;
 }
 
-export function locateJump(rows, sourceLine, records, toEnd = false, textOnly = false) {
+export function locateJump(rows, sourceLine, records, toEnd = false, textOnly = false, verticalRecords = records) {
   // Collected macro arguments (twocolumn, align, user wrappers) may all
   // carry their closing source line. Literal text in this very PDF supplies
   // the missing distinction; repeated text still needs SyncTeX ownership.
-  const literal = uncomment(sourceLine).replace(/\\verb\*?([^\w\s])([^\n]*?)\1/g, '$2')
-    .replace(/\\(?:begin|end|label|ref|eqref)\s*\{[^}]*\}/g, ' ')
-    .replace(/\\[a-zA-Z@]+\*?/g, ' ').replace(/[\w/.]+\s*=/g, ' ');
+  const literal = sourceLiteral(sourceLine);
+  const vertical = rows.filter(row => row.direction === 'tate');
+  if (vertical.length) {
+    const hit = locateVerticalJump(vertical, literal, verticalRecords, toEnd);
+    if (hit) return hit;
+    const verticalPages = new Set(vertical.map(row => row.page));
+    // LuaTeX-ja's local coordinates cannot establish ownership in a PDF
+    // column sharing a page with rotated content.
+    rows = rows.filter(row => row.direction !== 'tate');
+    records = records.filter(record => !verticalPages.has(record.page));
+  }
   const table = /(?<!\\)&/.test(literal);
   const fragments = [...new Set(tokens(literal).map(normal).filter(s => s.length >= 4 || table))];
   const owned = new Map(rows.map(row => [row, records.filter(record => record.page === row.page &&

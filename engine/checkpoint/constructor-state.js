@@ -11,16 +11,32 @@ import { LabelTable } from './label-table.js';
 export function makeChunkMap() {
   const m = new Map();
   m.rev = 0;
+  m.furnitureRev = 0;
+  m.furnitureGenerations = new Map();
+  m.furnitureRenderRevs = new Map();
   // the outline of every formula glyph seen in a checked picture, by font
   // and slot (exact-synth.js): not a chunk, and not counted in `rev`
   m.outlines = new Map();
   const set = m.set.bind(m);
   const del = m.delete.bind(m);
+  const indexFurniture = (chunk, delta) => {
+    const gen = chunk?.rec?.gen;
+    if (!gen) return;
+    const index = gen.render ? m.furnitureRenderRevs : m.furnitureGenerations;
+    const key = gen.render ? gen.rev : gen;
+    const count = (index.get(key) ?? 0) + delta;
+    if (count) index.set(key, count);
+    else index.delete(key);
+    m.furnitureRev++;
+  };
   m.set = (k, v) => {
     m.rev++;
+    indexFurniture(m.get(k), -1);
+    indexFurniture(v, 1);
     return set(k, v);
   };
   m.delete = (k) => {
+    indexFurniture(m.get(k), -1);
     const had = del(k);
     if (had) m.rev++;
     return had;
@@ -39,6 +55,7 @@ export function initializeEngineState(
   engine.store = new SourceStore();
   engine.file = 'main.tex';
   engine.blocks = [];
+  engine.blocksById = new Map();
   engine.idSeq = 1;
   engine.rev = 0; // patch-stream ordering (advances on async repaints too)
   engine.srcRev = 0; // SOURCE revisions only — what canonical compiles chase
@@ -74,11 +91,13 @@ export function initializeEngineState(
   engine.dyingPids = new Set(); // DIE'd checkpoint pids not yet exited — #reapDying backpressure
   engine.cancelledJobIds = new Set(); // jobs aborted before their FORKED pid announcement
   engine.poisoned = new Map(); // block.id -> fnv1a(text) that failed in-chain
+  engine.retiredInputs = new Map(); // boundary -> { why, pid, at } of its last retirement (#restoreInput)
   engine.hf = new Map(); // page number -> {h: items, f: items} TeX-typeset header/footer
-  engine.hfSig = null; // page-spec signature the current hf map was built for
-  engine.hfPending = null; // spec signature of an in-flight header job
-  engine.hfQueued = null; // {specs, sig} newest layout waiting behind the in-flight job
-  engine.hfQueuedSig = null;
+  engine.hfSig = null; // page-spec signature of the layout the hf map was built for (engine-v3.js #noteSpecs)
+  engine.hfJob = null; // the header job in flight, its owner (header-scheduler.js)
+  engine.hfWitness = null; // the furniture witness replay owed (chain-pass.js runWitnessPass)
+  engine.hfCanon = null; // the canonical generation whose bands are being cut (canonical-arrival.js)
+  engine.hfQueued = false; // the layout changed meanwhile: plan again when it lands
   engine.initialStyle = 'plain'; // \pagestyle in effect at \begin{document}
   engine.bgAbort = false;
   engine.bgActive = false; // a background pass holds the chain lock right now

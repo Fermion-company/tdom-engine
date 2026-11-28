@@ -11,6 +11,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { learnOutlines, synthesizeExactPicture, synthChunkKey } from '../engine/checkpoint/exact-synth.js';
+import { buildStream, prepareUnpaintedFormula } from '../engine/checkpoint/stream.js';
 import { CheckpointEngine } from '../engine/checkpoint/engine-v3.js';
 import { drain } from '../tools/harness.mjs';
 
@@ -73,6 +74,44 @@ test('a formula is put together where the galley puts its glyphs, and refused wh
   const color = galley();
   color.items[0].runs[1].c = 'red" onload="x';
   assert.equal(synthesizeExactPicture(color, fidelity, store), null, 'a colour that is not #rrggbb');
+});
+
+test('a cold neighbouring formula uses verified outlines until its own picture arrives', () => {
+  const block = { id: 'neighbor', needsRender: true, galleyHash: 'first', galley: galley(), fidelity };
+  const chunks = new Map();
+  chunks.outlines = new Map();
+  assert.equal(prepareUnpaintedFormula(block, chunks), false);
+  learnOutlines(PICTURE, block.galley, chunks.outlines);
+  assert.equal(prepareUnpaintedFormula({ ...block, gfx: true }, chunks), false);
+  assert.equal(prepareUnpaintedFormula({ ...block, sourceChanged: true }, chunks), false);
+  block.units = ['cached'];
+  assert.equal(prepareUnpaintedFormula(block, chunks), true);
+  assert.equal(block.units, null);
+  const key = synthChunkKey(block.id);
+  const first = chunks.get(key);
+  const line = buildStream(block, chunks).find(unit => unit.t === 'box').u.ln;
+  assert.equal(line.partsChunk, key);
+  assert.equal(line.parts.length, 2);
+  assert.deepEqual(line.runs.map(run => run.t), ['Ab']);
+  block.units = [line];
+  assert.equal(prepareUnpaintedFormula(block, chunks), true);
+  assert.deepEqual(block.units, [line], 'reusing ink preserves cached page layout');
+
+  chunks.set(block.id, { forGalley: 'first', v: 1 });
+  buildStream(block, chunks);
+  assert.ok(!chunks.has(key), 'the real picture retires temporary ink');
+  chunks.delete(block.id);
+  block.galleyHash = 'second';
+  block.galley.items[0].runs[1].t = 'yx';
+  assert.equal(prepareUnpaintedFormula(block, chunks), true);
+  const second = chunks.get(key);
+  assert.notEqual(second.svg, first.svg);
+  assert.ok(second.v > first.v, 'a browser must not reuse the retired image URL');
+  block.galleyHash = 'unseen';
+  block.galley.items[0].runs[1].t = 'xz';
+  assert.equal(prepareUnpaintedFormula(block, chunks), false);
+  assert.ok(!chunks.has(key));
+  assert.ok(!buildStream(block, chunks).find(unit => unit.t === 'box').u.ln.parts);
 });
 
 const texReady = spawnSync('lualatex', ['--version']).status === 0;

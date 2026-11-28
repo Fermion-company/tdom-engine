@@ -66,8 +66,10 @@ export function expandInputParagraphs(segs, context) {
       const resolved = resolveProjectInput(match[2], {
         docDir: context.docDir ?? context.workDir,
         overlayDir: context.overlayDir,
+        sourceDir: context.sourceDir,
         baseDir: path.dirname(file),
         extensions: ['.tex'],
+        onMissing: context.watchInclude,
       });
       if (!resolved) continue;
       let text;

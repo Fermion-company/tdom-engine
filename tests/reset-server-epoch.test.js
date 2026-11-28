@@ -174,10 +174,11 @@ Document epoch two.
     'body typing does not create a document reset epoch'
   );
 
-  // Failure is also terminal for the handshake. A bibliography preparation
-  // error happens after /open has announced reset-pending but before
-  // engine.open; the server must emit the matching reset completion instead
-  // of leaving the host permanently stuck in pending mode.
+  // A bibliography whose preparation fails after /open has announced
+  // reset-pending must not leave the host permanently stuck in pending mode
+  // either. It used to fail the open (500); since origin/dev 504adab the
+  // manuscript opens without it and /status reports bibliographyError. Either
+  // way the server emits the matching reset completion.
   const failingSource = String.raw`\documentclass{article}
 \begin{document}
 Missing citation \cite{does-not-exist}.
@@ -194,7 +195,7 @@ Missing citation \cite{does-not-exist}.
       projectRoot: path.join(ROOT, 'samples'),
     }),
   });
-  assert.equal(failedOpen.status, 500);
+  assert.equal(failedOpen.status, 200, 'the manuscript opens without its bibliography');
 
   const failureDeadline = Date.now() + 5_000;
   while (!events.some((event) => event.kind === 'reset' && event.documentEpoch === 4) && Date.now() < failureDeadline) {
@@ -213,5 +214,8 @@ Missing citation \cite{does-not-exist}.
   );
   const failedStatus = await fetch(`${base}/status`).then((response) => response.json());
   assert.equal(failedStatus.documentEpoch, 4);
-  assert.equal(failedStatus.busy, false);
+  assert.ok(failedStatus.bibliographyError, 'the bibliography failure is reported');
+  assert.equal(failedStatus.queued, 0, 'the failed reset leaves the mutation queue');
+  assert.equal(failedStatus.busy, failedStatus.furniture.pending,
+    'only furniture for the retained preview can keep the status busy');
 });

@@ -27,6 +27,9 @@ const COLOR = /^#[0-9a-fA-F]{6}$/;
 // A document's formulas use a few hundred glyphs; this only bounds a
 // document that sets whole pages in mathematics fonts.
 const MAX_OUTLINES = 20000;
+// A real render retires the synthetic SVG. If the block needs a different
+// synthetic SVG later, its immutable image URL must still be new.
+const lastSyntheticVersion = new WeakMap();
 // Room around the galley's width for ink that hangs over its edge.
 const SYNTH_PAD_BP = 12;
 
@@ -150,7 +153,9 @@ export function synthChunkFor(block, chunks) {
     if (held) chunks.delete(key);
     return null;
   }
-  const chunk = { ...picture, v: (held?.v ?? 0) + 1, forGalley: block.galleyHash, synthetic: true };
+  const version = (lastSyntheticVersion.get(chunks) ?? 0) + 1;
+  lastSyntheticVersion.set(chunks, version);
+  const chunk = { ...picture, v: version, forGalley: block.galleyHash, synthetic: true };
   chunks.set(key, chunk);
   return chunk;
 }

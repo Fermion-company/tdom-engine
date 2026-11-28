@@ -5,9 +5,9 @@ const TEX_BLOCK_STRUCTURE = /[\\$%{}&#^_~]/;
 const ATOMIC_LAYOUT = /\\(?:begin|end)\s*\{|\\(?:columnbreak|setcolumnsep|onecolumn|twocolumn)\b/;
 
 export function bindEditContext(engine, text, context) {
-  if (!context || context.file !== engine.file || context.baseSrcRev !== engine.srcRev ||
-      context.after !== text) return null;
-  return context;
+  if (!context || context.baseSrcRev !== engine.srcRev) return null;
+  const source = context.file === engine.file ? text : engine.includes?.get(context.file)?.text;
+  return typeof source === 'string' && source === context.after ? context : null;
 }
 
 /**
@@ -30,14 +30,15 @@ export function classifyResidentEdit(engine, {
   if (engine.pendingChain) return exactOnly('resident-chain-pending');
   if (dirtySource.size !== 1) return exactOnly('multi-block-edit');
 
-  const oldBlock = oldBlocks.find((block) =>
-    context.start >= Number(block.start) && context.end <= Number(block.end));
+  const file = context.file === engine.file ? null : context.file;
+  const ownsEdit = (block, end) => (block.file ?? null) === file && !block.sourceParts &&
+    context.start >= Number(block.start) && end <= Number(block.end);
+  const oldBlock = oldBlocks.find((block) => ownsEdit(block, context.end));
   const newEnd = context.start + context.replacement.length;
   const block = engine.blocks.find((candidate) =>
-    candidate.id === oldBlock?.id && context.start >= Number(candidate.start) &&
-    newEnd <= Number(candidate.end));
+    candidate.id === oldBlock?.id && ownsEdit(candidate, newEnd));
   if (!oldBlock || !block || !dirtySource.has(block.id)) return exactOnly('block-boundary-edit');
-  if (block.file || block.sourceStart || block.includeStart || block.includeEnd) {
+  if (block.includeStart || block.includeEnd || block.subfileStart || block.subfileEnd) {
     return exactOnly('included-source');
   }
   if (block.structuralSinks?.length || oldBlock.structuralSinks?.length ||

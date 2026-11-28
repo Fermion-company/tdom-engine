@@ -27,13 +27,13 @@ const AWFUL = 0x3fffffff; // tex.web awful_bad
 const INF_BAD = 10000;
 const DEPLORABLE = 100000;
 const EJECT = -10000;
-const FIL = 65536 / 65781.76; // 1fil in bp units (the stream's bp scale)
+const SP_PER_BP = 65781.76;
+const sp = bp => Math.round(bp * SP_PER_BP);
+const FIL = 65536 / SP_PER_BP; // 1fil in bp units (the stream's bp scale)
 const ORDERS = 5; // LuaTeX glue orders: normal, fi, fil, fill, filll
 
 // TeX's badness function (tex.web §108), computed in scaled points.
-function badness(tBp, sBp) {
-  const t = Math.round(tBp * 65781.76);
-  const s = Math.round(sBp * 65781.76);
+function badness(t, s) {
   if (t === 0) return 0;
   if (s <= 0) return INF_BAD;
   let r;
@@ -200,11 +200,11 @@ class PageBuilder {
 
   #resetPage() {
     this.contents = []; // placed entries: {e (stream entry), …}
-    this.total = 0; // \pagetotal
+    this.totalSp = 0; // \pagetotal
     this.depth = 0; // \pagedepth
     this.prevdepth = null; // real \prevdepth (uncapped) for interline synthesis
     this.stretch = new Array(ORDERS).fill(0); // by LuaTeX order (fi..filll)
-    this.shrink = 0;
+    this.shrinkSp = 0;
     this.shrinkInf = false;
     this.hasBox = false; // topskip not yet inserted
     this.feet = []; // ins entries accepted on this page (in order)
@@ -212,6 +212,12 @@ class PageBuilder {
     this.best = null; // {index into contents, cost}
     this.lastPen = 0; // most recent penalty passed (for @nobreak emulation)
   }
+
+  // Daemon dimensions are rounded to six decimal bp. Recover each TeX
+  // dimension before adding it: rounding a page sum loses scaled points
+  // and can eject a line that exactly fits.
+  get total() { return this.totalSp / SP_PER_BP; }
+  get shrink() { return this.shrinkSp / SP_PER_BP; }
 
   get goal() {
     // \pagegoal = \vsize (= \@colroom after float commits), reduced by
@@ -396,6 +402,12 @@ class PageBuilder {
         // break is reprocessed on the next page instead of being dropped.
         const closing = [];
         if (this.hasBox) {
+          // LaTeX's final \newpage backs out the last box's positive depth
+          // before \vfil. Otherwise a deep last line can force an extra page.
+          if (this.geo.newpageDepthCorrection === 1 && this.prevdepth > 0) {
+            const maxdepth = this.geo.maxdepth ?? this.maxdepth;
+            closing.push({ t: 'glue', a: -Math.min(this.prevdepth, maxdepth), st: 0, sh: 0 });
+          }
           closing.push({ t: 'glue', a: 0, st: FIL, sto: 2, sh: 0, sho: 0 });
         }
         closing.push({ t: 'eject', v: EJECT });
@@ -514,17 +526,17 @@ class PageBuilder {
         e: { t: 'glue', a: eff, st: this.topskip.st, sto: this.topskip.sto, sh: this.topskip.sh, sho: this.topskip.sho, sub: 10 },
         topskip: true,
       });
-      this.total += eff;
+      this.totalSp += sp(eff);
       this.stretch[this.topskip.sto] += this.topskip.st;
-      if (this.topskip.sho === 0) this.shrink += this.topskip.sh;
+      if (this.topskip.sho === 0) this.shrinkSp += sp(this.topskip.sh);
       else if (this.topskip.sh) this.shrinkInf = true;
       this.hasBox = true;
     }
-    this.total += this.depth + e.u.h;
+    this.totalSp += sp(this.depth) + sp(e.u.h);
     this.depth = e.u.d;
     this.prevdepth = e.u.d; // uncapped, unlike \pagedepth
     if (this.depth > this.maxdepth) {
-      this.total += this.depth - this.maxdepth;
+      this.totalSp += sp(this.depth) - sp(this.maxdepth);
       this.depth = this.maxdepth;
     }
     this.contents.push({ e });
@@ -551,16 +563,16 @@ class PageBuilder {
     this.contents.push({ e });
     // tex.web UPDATE_HEIGHTS: once glue is accepted, the preceding box's
     // pending depth becomes part of \pagetotal and \pagedepth resets.
-    this.total += this.depth + (e.a ?? 0);
+    this.totalSp += sp(this.depth) + sp(e.a ?? 0);
     this.depth = 0;
     // LuaTeX's common CONTRIBUTE tail reapplies maxdepth after every
     // UPDATE_HEIGHTS path; this matters when \maxdepth is negative.
     if (this.depth > this.maxdepth) {
-      this.total += this.depth - this.maxdepth;
+      this.totalSp += sp(this.depth) - sp(this.maxdepth);
       this.depth = this.maxdepth;
     }
     this.stretch[e.sto ?? 0] += e.st ?? 0;
-    if ((e.sho ?? 0) === 0) this.shrink += e.sh ?? 0;
+    if ((e.sho ?? 0) === 0) this.shrinkSp += sp(e.sh ?? 0);
     else if (e.sh) this.shrinkInf = true;
   }
 
@@ -576,10 +588,10 @@ class PageBuilder {
     }
     this.contents.push({ e });
     // Kerns take the same UPDATE_HEIGHTS path as glue in TeX's page builder.
-    this.total += this.depth + (e.a ?? 0);
+    this.totalSp += sp(this.depth) + sp(e.a ?? 0);
     this.depth = 0;
     if (this.depth > this.maxdepth) {
-      this.total += this.depth - this.maxdepth;
+      this.totalSp += sp(this.depth) - sp(this.maxdepth);
       this.depth = this.maxdepth;
     }
   }
@@ -605,7 +617,7 @@ class PageBuilder {
       // break badness. Omitting the latter can reject a page that fits by
       // shrinking the footnote separator (article's skip\footins has 2pt).
       this.stretch[this.footskip.sto] += this.footskip.st;
-      if (this.footskip.sho === 0) this.shrink += this.footskip.sh;
+      if (this.footskip.sho === 0) this.shrinkSp += sp(this.footskip.sh);
       else if (this.footskip.sh) this.shrinkInf = true;
     }
     const entry = { e };
@@ -651,14 +663,15 @@ class PageBuilder {
   #evalBreak(index, pi, pending) {
     if (pi >= INF_BAD) return false;
     let b;
-    if (this.total < this.goal) {
+    const excessSp = this.totalSp - sp(this.goal);
+    if (excessSp < 0) {
       b = this.stretch[1] || this.stretch[2] || this.stretch[3] || this.stretch[4]
         ? 0
-        : badness(this.goal - this.total, this.stretch[0]);
-    } else if (this.total - this.goal > this.shrink && !this.shrinkInf) {
+        : badness(-excessSp, sp(this.stretch[0]));
+    } else if (excessSp > this.shrinkSp && !this.shrinkInf) {
       b = AWFUL;
     } else {
-      b = badness(this.total - this.goal, this.shrinkInf ? 1e9 : this.shrink);
+      b = badness(excessSp, this.shrinkInf ? sp(1e9) : this.shrinkSp);
     }
     let c;
     if (b < AWFUL) {
@@ -1106,6 +1119,8 @@ class PageBuilder {
   /** \@vtryfc float page: \@fptop [\@fpsep box]… \@fpbot in a vbox to colht. */
   #emitFloatPage(group) {
     this.pageTop = group.slice();
+    // (\@fcolmade: the page's head and foot may differ, header-footer.js)
+    this.pageFloatPage = true;
     const g = [];
     g.push({ kind: 'glue', spec: this.fptop });
     g.push({ kind: 'glue', spec: negGlue(this.fpsep) });
@@ -1207,10 +1222,12 @@ class PageBuilder {
       feet: this.pageFeet ?? [],
       topFloats: this.pageTop ?? [],
       botFloats: this.pageBot ?? [],
+      ...(this.pageFloatPage ? { floatPage: true } : {}),
       evs: this.pageEvs ?? [],
       tls: this.pageTls ?? [],
     };
     this.pageFeet = null;
+    this.pageFloatPage = false;
     this.pageTop = null;
     this.pageBot = null;
     this.pageEvs = null;
@@ -1339,20 +1356,24 @@ function computeFootrule(geo) {
 }
 
 /** Adopt unchanged page objects (display lists survive by identity). */
-export function reconcile(newPages, oldPages) {
+export function reconcile(newPages, oldPages, sameFurniturePage = null) {
   let reused = 0;
+  let furnitureUnchanged = !!sameFurniturePage && newPages.length === oldPages.length;
   const pages = newPages.map((np) => {
     const op = oldPages[np.number - 1];
-    if (op && op.number === np.number && sameIdentity(op, np)) {
+    const sameFurniture = op === np || !sameFurniturePage || (op && sameFurniturePage(op, np));
+    if (op && op.number === np.number && sameFurniture && sameIdentity(op, np)) {
       reused++;
       return op;
     }
+    if (furnitureUnchanged && !sameFurniture) furnitureUnchanged = false;
     return np;
   });
-  return { pages, reused, rebuilt: pages.length - reused };
+  return { pages, reused, rebuilt: pages.length - reused, furnitureUnchanged };
 }
 
 function sameIdentity(a, b) {
+  if (a.folio !== b.folio) return false;
   const pa = a.pendingExact ?? [];
   const pb = b.pendingExact ?? [];
   if (pa.length !== pb.length || pa.some((bid, i) => bid !== pb[i])) return false;

@@ -11,7 +11,7 @@
 3. 必要なら in-flight background JOB を `SIGKILL` する。
 4. chain lock を取り、`#updateInner()` を実行する。
 
-編集応答は、この lock 内で作った patch/report を返す。canonical compile、exact chunk render、rescue compile、deferred chain は同期応答に載らない。
+編集応答は、この lock 内で作った patch/report を返す。canonical compile、exact chunk render、rescue compile、deferred chain は同期応答に載らない。update と非同期 patch は engine の一つのカウンタ（`rev`）で番号が付くが、update の report は update が返ってから呼び出し側（`server.js`）が出し、その間に着地した仕事（canonical の検証、chain lock を待っていた render の着地）の patch は先に出る。frame は report を report の順にだけ適用し（`appliedReportRev`）、各ページにはそれまでに届いた中で最も新しい display list を残す（`pageListRev`、`web/app.js`）。後の番号の patch と比べて update を捨てると、その source revision ごと失われ、各ページが一つ前の revision の source mapping を求め続けた（tex64-internal #121: undo の後や、preamble の reboot 中に積まれた打鍵の後、次の canonical まで数分 Live に戻らなかった）。後から届いた古い report は、それより新しい patch のあとで手つかずのページの list だけを持ち込み、ページの集合（ページ数、末尾の削除、末尾への追加）は変えない（`pageTopologyRev`。古い report が新しく増えた 3 ページ目を消し、消えた 2 ページ目を戻していた）。その report より新しい patch で、一つ前の source のうちに塗られたページは、絵はそのままでも source revision とクリックの source mapping が古いので、その report の source で組み直す（engine の番号は一つなので、その patch はその report の source から作られている）。
 
 ## 10.2 safety と boot
 
@@ -60,8 +60,7 @@ last-known-good と pending 表示に限り、同じ page/tree を途中で spli
 source/checkpoint の incremental 処理は維持するが、JS paginator の page patch は表示せず、直前の
 exact page を保持して complete ShippingChain wave だけを原子的に昇格する。通常本文の編集応答では
 表示不可能な resident state/rescue walk も行わず、source generation を先に ShippingChain へ渡す。
-ただし埋め込み直接編集では、Shipping の原文・SyncTeX の世代対応と editor 転送の証明がないため
-wave を表示せず直前の編集可能な面を保持し、既存の版・需要IDを使って canonical 表示を要求する。
+埋め込み画面でも直接編集中の欄がなければ、完成した Shipping の紙面を先に表示する。リプレイごとに SyncTeX の出力も分けて保存する。紙面をクリックすると、その PDF の印字と SyncTeX が指すソースの行を照合して本文や行内数式を開く。照合できない場合は入力を保持して同じ版の canonical PDF を待ち、クリック位置の印字とページ寸法が一致してから編集欄に入力を渡す。直接編集中に届いた Shipping の紙面はその欄に重ねない。
 Shipping replay の plain edit admission は brace depth 0 を要求しない。代わりに旧新の source partition が
 同じで差分が一つの balanced unit に閉じること、選択した checkpoint の consumed-unit cursor がその unit
 より前であることを要求する。したがって `\footnote{...}` や TikZ node の braced visible text も、その
@@ -106,6 +105,8 @@ body は `segmentBody()` と `#expandIncludes()` で block 列になる。`diffB
 foreground は nearest checkpoint から始まる。各 block について `#typesetBlock()` を呼び、`#adoptGalley()` で galley、font、label/ref、state を採用する。
 
 同じ cold prefix walk が作った一時 continuation は、前回の native 成功証明があり、deferred・frozen・rescue 状態でない block に限って `STEP` で直接消費する。`STEP` 中に今回初めて native error や timeout が起きた場合、失敗した continuation は捨て、通常予算で残る最寄りの正しい checkpoint から通常 `JOB` でその input を一度だけ復元する。その後に last-good exit state を入れる既存 fallback を行うため、壊れた TeX 状態を後続 block の入口として採用しない。
+
+block の入力 checkpoint（その block の `JOB`、または fallback の `@state` continuation が fork する境界）は、`#typesetBlock` の間（in-chain の JOB が終わってから fallback が fork するまでを含む）と、foreground walk が cold preview を待つ間の立ち位置を `#enforceCheckpointCap` が退役させない（`typesetAt` / `walkAt`）。それでも peer が死ぬなどして無くなっていた場合は、その index 以前で lineage が今の source の checkpoint（edit をまたいで re-key された suffix の peer、`vstale` は使わない。suffix の扱いが決まる前の定義を持ちうる）から不変な prefix を通常 `JOB` で再生して境界を作り直してから続ける（`#restoreInput`）。診断には、その境界が無くなった理由（予算の cap、off-grid、peer の終了）と pid、経過時間を出す（`retiredInputs`）。再生した block の galley・exit state・label/ref/toc は採用する前に比べ、同じなら採用しない（元の galley のまま）。違う、再生中にまた境界を失った、そういう checkpoint が無い、のどれかなら block の内容の失敗ではないので freeze せず rebuild へ上げる。update の外（chain pass、rescue の採択、caret warm）での失敗は、それらの pass の早期終了として飲み込まず、full rebuild を owed にして直ちに update を起こす（`#oweRecoveryRebuild`、`update-typeset-phase.js` の先頭）。以前はこの境界が無いと、打ちかけの box の fallback が投げて update 全体の rebuild になり、文書がリセットされていた（tdom-engine #18）。in-chain の JOB と rescue の `@state` の両方が答えなかった lineage は、その入力を退役させて rebuild へ上げる。rescue に直行した block（output routine の環境）の 1 回の timeout は freeze に留める。
 
 停止判定は次を見る。
 
@@ -364,6 +365,32 @@ engine だけの計測（上の文書、行が増える打鍵）: 223 ms → 39�
 - **closure の判定を最初の読み込みで残す**（`update-prepare.js`）。block ごとの closure の memo は block があるときだけ作っていたので、開いた直後は空で、最初の打鍵が全 block を判定していた（2.2 ms）。最初の読み込みでも作る（そこでは何も保留しない）。
 - `editPageRenderIds` が呼ばれるたびに作っていた「文書の block の id の集合」を、block の list と一緒に持つ（list は update のたびに新しく作られ、書き換えられない）。
 
+## 10.4q ページに描く絵の render と打鍵
+
+`current page` に描く絵（表紙など。docs/08 §8.5a）は、前にページを足すと canonical に無いページへ移り、exact render の tight picture では正しく描けない。その block は紙面の大きさで組み直す（`page-art.js`）。
+
+- **いつ。** その block の tight picture が着地したとき（`notePageArtLanding`）と、そのページの display list が、行の位置・folio・galley に合う紙面の絵を持たない窓を作ったとき（`pageArtWanted`）。表示側からの要求なので、位置が変わったページの display list が作り直されたときにだけ起き、変わらないページは何もしない。
+- **打鍵に譲る。** 1 本ずつ。update 中と、今の編集の exact render（cohort）が動いている間は待ち、最後の update の終わりから 450 ms（`TDOM_COVER_QUIET_MS`。§10.4f の `BURST_PAUSE_MS` と同じ）静かになってから始める。待つ起点を update の終わりにするのは、`lastEditAt` が update の始まりなので、150 ms 間隔で 50 ms かかる打鍵では隙間が 100 ms になり、120 ms の quiet では打鍵の合間に lualatex を fork しては次の打鍵で kill していたため。子は `rr@` の request なので、それでも走っていれば次の編集の preempt が kill し、block は次の静寂で組み直す。他の block の render の backlog は待たない。Build lease の間は `withReplaceablePreviewJob` で待つ。
+- **費用。** 1 回は RENDER 1〜3 本（位置が前の pass と同じになるまで。remember picture の無い絵は 1 本）と、block のページ数だけの pdftocairo。preamble は読み直さない。
+- **失敗。** 他の block の絵の位置・running mark・`\pageref` を読む絵、行が galley と合わない組版、3 pass で止まらない位置は失敗で、そのページは A（`pending-exact`）のまま canonical を待つ。同じ位置の計画は 2 回まで（2 回目は 1 s 後）、編集に追い越された分は 20 回まで。それ以上は位置か galley が変わるまで組まない。loop の各周は timer を経る。
+
+測定（engine だけ、`TDOM_MAX_CHECKPOINTS=8`、他の作業と同じ機械で 1 分 load を併記。数 ms の差は意味を持たない）は下のとおり。比べた画素は、ページの exact chunk の窓を白紙に重ねたものと、同じ source の full compile のページを、どちらも pdftocairo の SVG と librsvg で 72 dpi にしたもの（fuzz 8 %）。
+
+- 6 ページの再現文書（表紙・本文の隅の印・overlay でない章扉・裏表紙。先頭に 1 ページ足す）: 動いた表紙と裏表紙は full compile と一致（差 0 画素）。c53846b は 50 万画素中 49 万画素が違っていた（白紙に帯だけ）。印のある本文のページは block の紙面の絵を全面で見せ、印は紙の右上に出る。紙面の絵は打鍵が止まってから約 1.5 s で出る。
+- 30 ページの冊子（`r9/booklet`）: 裏表紙の前に 1 ページ足すと、31 ページ目の裏表紙は編集から 2.0 s で紙面の絵になり、full compile と差 0 画素（c53846b は 1.6 万画素。紙の地が白に近いので fuzz の内に入る分を除いた数）。先頭に 1 ページ足すと、2 ページ目の表紙は 10.3 s（編集そのものが 2.8 s、その後の rescue と表紙の組み直しを含む）で差 0 画素。絵の大きさは表紙 214 KB・裏表紙 104 KB の SVG と、その PDF 52 KB・19 KB（block ごとに 1 組）。普通の絵（69 個の chunk）は c53846b と bytes まで同じで、その render は c53846b と同じ 15 本（CAPTURE 13、RENDER 2）。表紙を見つけるための boot の render が 1〜2 本増える。
+- 冊子を開いてから落ち着くまで（約 11 分、rescue が次々に着地してページが動く）に、裏表紙の紙面の絵は 15 回組み直された（pass は計 17。前の位置から始めるので多くは 1 pass）。rescue の placeholder が残っている間（どのページも表示できない）は組まない。この待ちと位置の引き継ぎの前は 53 回・106 pass だった。
+- 打鍵（冊子の第 1 講の Data の枠の中、150 ms 間隔で 30 打鍵、`e.edit()` の所要。裏表紙の前に 1 ページ足した直後＝裏表紙の紙面の絵を待っている間と、待っていない間を交互に 2 回ずつ）: 待っていない間 p50 48.4 / p90 73.2 ms（load 3.8）、34.1 / 76.2 ms（4.4〜4.6）。待っている間 45.1 / 63.7 ms（3.9〜4.1）、36.2 / 54.2 ms（4.2〜4.5）。打っている間に紙面の render は 1 本も始まらず、最後の打鍵から 2.27 s と 2.24 s で裏表紙の絵が出た。
+
+## 10.4r 追い越されたページの warm
+
+長い文書の boot は block の exact な絵を一つも queue しない（`background-scheduler.js`、canonical がページを描く）。そういう絵を含むページを viewer が仮の紙面で見せる（編集の後、boot の時に段取りしたページ）とき、そのページはその block が render されるまで exact の画素を負い、それを作るのはページの warm だけである。viewer は、見えていて画素を負うページに `POST /warm {page}` を送る（`web/app.js` の `scheduleViewportWarm`）。warm は前の warm を追い越す（`warmEditOffset` の `warmSeq`）ので、1〜2 秒のうちに次のページへ進む読者は、前のページを warm されないまま残し、viewer はそこへ戻るまで頼み直さない。30 ページの冊子で、アプリの probe が講を打った 8 s 後と 45 s 後に 29〜31・25〜28 ページを 0.5 秒ずつ見たとき、26 ページの Data の枠は render されず、8 s 後も 45 s 後も古い紙面のままだった（この直しの前の 4 回のうち 3 回。残りの 1 回は 26 ページが実ページの絵で覆われていた）。
+
+`warmPage` が追い越された（`superseded`）ページは `page-warm-queue.js` に残し（新しい方から 8 ページまで）、update も walk も無く、編集も warm も 600 ms 無い時に、新しい方から warm し直す。もう画素を負わないページは捨て、各ページは source の版ごとに 3 回までにする。読者のページ（`viewPage`、柱の帯を先に切るページ）は変えない。loop の各周は timer を経る。
+
+**画素を待つ間に見せるもの（viewer）。** 26 ページが見せていた「古い紙面」は、そのページの古い版ではなく 14 ページの中身だった。boot の最初の配置は rescue する block（multicols）の寸法を持たず、冊子では 56 ページで始まって 30 ページへ縮む。その間、各ページの list は前のページの中身を順に持ち（26 ページは 14〜25 ページの中身）、viewer はインクの揃った list を確定し、Data の枠を負う list を止める。最後の list が負うので、最後に確定した途中の紙面が残っていた（c53846b も同じ）。今の viewer（`web/app.js` の `renderPage`）は、画素を負う list を止める時、紙面の block が新しい list に一つも無ければその紙面を外し、shell と同じく canonical のページを待つ（箱の大きさは保つ。`paperOfAnotherPage`／`dropProvisionalPaper`）。また、画素を負って止まっているページには、canonical のページがまだその list を見せているなら（list の本文がその canonical の版から変わらず、その間にページの block の編集が無く、柱と脚は canonical のページの帯か、これも変わらない。`canonicalShowsList`）、その canonical のページを見せる（`updateCanonState` の `unchangedFresh`）。c53846b が 26 ページに rev 2 の canonical を見せたのは、A の打鍵が canonical anchoring で凍結され、26 ページが読者に見られるまで段取りし直されなかった時だけで、今の木では A の打鍵ごとに段取りし直されて（rev 3〜5）その canonical が「新しく」なくなっていた。
+
+**本文の同一性（round 11 の 4）。** 負っていた絵が warm で揃うと、ページの resident の list が確定して canonical のページと入れ替わる。冊子の書き込み罫（`\notefill`、段の下まで引く罫）は exact なページにしか無い（rescue した二段組の絵は単独で組むので、罫を引く段の下が無い）。25 ページは +8 s に 11 本の罫を見せ、+45 s には 0 本だった（追い越された warm をやり直すこの節の待ち行列で、確定が増えた。c53846b でも warm が間に合えば 27 ページで同じことが起きていた）。engine は各ページの list に本文の署名 `body` を付ける（`display-list.js` の `bodySignature`：ページの block、それぞれの galley の hash、各行の位置。絵が手元にあるか、その版、柱と脚は入れない）。負っている block と、描けた同じ block は同じ本文である。viewer は、canonical のページがその本文を見せている間は、段取り中でも確定後でもそのページを紙面に残し、柱と脚はスロットごとの判定を上に重ねる（`web/app.js` の `canonicalShowsBody`、`updateOwedFurnitureClip`）。もうそのページのものでない柱・脚のスロットは画像から外し、ページの list が確定していれば、そのスロットにだけ resident の柱・脚を画像の上に出す（`showListSlots`、`style.css` の `.canon-slots`）。canonical のページは、その版の hit map（その版の `/dom` の snapshot）と一緒にしか出せず、`/dom` は今のソースしか返さない。冊子では rev 5 の canonical がソース rev 190 の時に届き、まだ画像を出していなかったページは resident に戻って罫を失った。本文で残すページには、hit map が手元にある generation を選ぶ：今の generation、そのページが出している generation、手元にある最新の generation の順で、本文を見せるもの（`keptGeneration`。engine は generation を 4 つ持つ）。クリックはその generation の SyncTeX とその版の snapshot で引くので、版と hit map は食い違わない。
+
 ## 10.5 definition edit
 
 body block の `\def`、`\newcommand`、`\renewcommand`、`\let`、`\newenvironment`、`\newcounter`、`\setlength`、`\catcode`、`\pagestyle` などは、下流 block の意味を state vector だけでは追えない可能性がある。
@@ -393,11 +420,63 @@ label が動いたとき、後方で定義された label を前方 block が参
 
 `toc` は provisional pagination から `.toc` 内容を合成し、hash が動けば toc consumer block を再組版する。最大 3 pass である。chain work が pending のときは、`#chainAfterPass()` 側で同じ処理を行う。編集（boot・reboot・retry 以外）で目次が動いたときは、編集した block の載るページに目次が無ければ、この場で組み直さず `engine.tocOwed` を立てる（`deferToc`）。scheduler は打鍵が止まって quiet gate を過ぎてから目次の block から settle を積み、`#chainAfterPass()` が同じ固定点を回して公開する。すぐ積まないのは、編集 block より前から始まる chain work が pending だと、以後の打鍵が prose keystroke として扱われず、後ろの block の検証を待ってから見せることになるため。非同期の再ページ割りが見つけた目次のずれも同じく owed にする。`#chainAfterPass()` は目次の block を組み直し終えてから `tocHash` を更新する（途中で打鍵に止められたら、次の pass がもう一度組む）。打鍵が止まって積まれた目次だけの settle（`tocOnly`）は、終わる前に打鍵が来れば owed に戻す（積まれたままだと、以後の打鍵はまた後ろの段落の検証を待つ）。打鍵が続いている間（最後の打鍵から 300 ms 以内）に期限切れで始まった pass も、目次は組まずに owed にして残す（目次の組み直しは本で 0.5 s かかり、打鍵の合間ごとに始まっては次の打鍵に止められていた）。prose keystroke の判定は、labels の無い after 段の settle（残りは目次だけで、`plainBlockId` が残っていれば後ろの段落は変わらなかった）を妨げにしない。72 ページの本で行が 1 行増える打鍵は、見出しが次のページへ移って目次の組み直しに 0.5〜3.7 s かかり、後ろの打鍵もそれを待っていた。
 
-## 10.7a 柱とノンブルの job が届いたとき
+## 10.7a 柱とノンブル
 
-見出しが別のページへ移る、ページ数が変わる、といった編集のあとは、柱とノンブルを組む job（`header-scheduler.js`）が走り、届くと `asyncRepaginate` が display list を作り直す。作り直すのは、**そのページ自身の柱・ノンブルが変わったページだけ**である（`header-footer.js` の `pageHfSig`。ページの display list は `dl.hfSig` に自分のページの entry の署名を持ち、`buildPagePatches` はそれが変わったページだけを組み直す）。
+見出しが別のページへ移る、ページ数が変わる、といった編集のあとは、柱とノンブルを組む job（`header-scheduler.js`）が走り、届くと `asyncRepaginate` が display list を作り直す。作り直すのは、**そのページ自身の柱・ノンブルが変わったページだけ**である（`engine-v3.js` の `furnitureSig`：頭と脚のそれぞれについて、描く帯の版か描く entry の枠の署名 `pageHfSig`、それに仮の folio を描くかどうか。`buildPagePatches` はそれが変わったページだけを組み直す）。以前は map 全体の署名で比べていたため、job が届くたびに全ページの display list を、打鍵を受けるスレッドの上で一度に作り直していた（72 ページの本で 20〜45 ms）。
 
-以前は map 全体の署名で比べていたため、job が届くたびに全ページの display list を、打鍵を受けるスレッドの上で一度に作り直していた（72 ページの本で 20〜45 ms。柱が変わったのは数ページ）。段落に 1 行足す打鍵のたびに起きる。最初の job（open 直後。全ページが仮のノンブルから本物の柱へ変わる）は今も全ページを作り直す。
+柱と脚の出どころは二つしかない。header job の runs（文字と罫）と、canonical のページから切った exact な帯である。header job の画素（合成の帯）は作らない。帯や、別の配置のために作られた entry をページに描くかどうかは、記録した事実（ソース、ページ、版面、spec、指紋）だけから決める**状態を持たない一つの述語**で、ページを組むたびに評価する（規則 F1〜F7）。占有（ページの行の照合）と、行の hash、8b の同一性の補助は削除した。
+
+**header job（v0.1.32 のもの）。** 一つの job が全ページの spec（`page-metadata.js` の `pageSpecs`）を root の checkpoint 0 で組み、各ページの柱と脚の runs と、図を含むかの印（`hg`/`fg`）を返す。画素は作らない。spec は folio と番号形式、style、mark、float の着地 `fl`、そのページまでに再生する本文の定義（`\fancyhead`/`\fancyfoot`/`\fancyhf`/`\floatpagestyle`）、テンプレート `tpl`（style と、その定義の連なりと、folio の偶奇の hash）、`\pageref{LastPage}` の値 `lp`。spec が変わると走り、届いた map が map 全体を置き換える。job は一度に一つで所有者がいる（`engine.hfJob`）。返事の鍵は job ごと、子が消えたら待たずに終える、別の root・preamble（`rootKey`：file・root boot・preamble digest）で作った返事、所有者でなくなった job の返事は公開しない。map を公開するとき、その map が何から作られたか（`engine.hfIdentity`：配置の `sig`、ソースの revision、root、版面）と各 entry の spec（`engine.hfSpecs`）を記録する。job が失敗したら、その配置について「pending」ではなくなる（`hfFailedSig`）。
+
+**F1：指紋は組まれた枠の全体。** 頭と脚の枠ごとに、runs、罫、図の印に加え、PDF literal の中身すべてが入る（`header-footer.js` の `slotFingerprint`。entry の指紋 `entryFingerprint` と `pageHfSig` はこれを二つ並べたもので、計算は一か所）。LuaTeX 1.24 では TeX が作った literal の中身を Lua から読むとフィールド名（`'data'`）が返るため、同じ大きさで向きの逆な斜線を描く二つの柱が同じ指紋になっていた（audit/scratch r9 diagonal、`50e4d4dc`）。job の中では `\pdfextension` を `tdom_hf_ext`（`daemon.lua`）に置き換え、literal は daemon が中身を文字列として持つ node で作る。収穫（`note_fx`）がその中身を item に記録し、枠ごとの literal の hash を `hx`/`fx` に持つ。special と colorstack の中身はもともと読める。
+
+**F2：感度は job 自身が、その文脈で測る。** 文脈（`probeContext`）はテンプレート（style、定義の連なり、folio の偶奇）と float の着地の組で、文脈ごとに、それを持つ最初のページの柱と脚を組んだ直後に、spec の成分を一つずつ変えて組み直す（probe）：mark（空と、空でない番兵）、上の float、下の float、float ページ、LastPage。folio は変えない（帯も entry も別の folio のページには描かないので）。probe は group の中で組み、pgf の picture の番号と LastPage を元に戻す。返った entry の頭（脚）の指紋が元と違えば、頭（脚）はその成分に「敏感」。probe が返らない、組めないときも敏感とする（`measureSensitivity`）。結果は root ごとに `engine.hfSens` に持つ（文脈 64 個まで。それを超えた文脈は測られず、敏感扱い）。一つの文脈の測定はほかの文脈について何も言わない：twoside の奇数ページの柱が mark を読まなくても偶数ページの柱は読み、`\iftopfloat{\rightmark}{…}` の柱は上に図のあるページでだけ読む。以前はテンプレートの最初のページだけで測っていたため、奇数ページの測定で偶数ページの柱を残し、Build の lease の 4.2 s の間、2 枚目に BEFORE を出し続けた（PDF は AFTER。audit/scratch r10 even）。
+
+mark と LastPage の probe の値（空、番兵）は代わりの値で、変わった先の値ではない。特定の値でだけ枝が変わる柱（mark が AFTER のときだけ「Solutions」）では、二つの代わりの値がどちらも同じ枝を通り、敏感でないと見えた（audit/scratch r11 conditional）。そこで job は各ページの頭と脚を、もう一度、`\leftmark`・`\rightmark` と LastPage の値が展開されたら報告するようにして組み（daemon.lua の `tdom_hf_trace`）、枠ごとに読んだものを `hr`/`fr` に持つ（1 が mark、2 が LastPage）。
+
+**測る組版はページの組版に何も残さない。** job はまず全ページの頭と脚を、ページ順に、それだけで組む（v0.1.32 と同じ。group の中で、floatpag の大域の `\at@float@page` も戻す）。測る組版（上の trace と probe）はその後で、定義の連なりを始めから再生しながら行い、その中では `\immediate` を無効にし（`\write` は捨てられる box の中に残るだけ）、`\label`・`\index`・`\addtocontents`・`\addcontentsline` を捨て、測るたびに LaTeX のすべての counter（`\cl@@ckpt`）と pgf の picture の番号と LastPage を戻す。probe はその状態で組み直したページ自身（`q<i>.base`）と比べる。以前は測る組版がページの組版の間に入り、counter を進める柱（書式番号）がプレビューで 1, 9, 17, 19 と印字した（PDF と v0.1.32 は 1, 2, 3, 4。audit/scratch r12 value）。そのページの設定で一度も展開しなかった枠は、その値が何であっても同じに組まれる。mark と LastPage の変化は、probe で敏感でなく、かつ記録の spec で組んだときにその枠が読まなかった（`hr`/`fr` が分かっていて、そのビットが立っていない）ときだけ無視できる（`specInsensitive` の `reads`。帯は記録 `rec.reads`、残った entry はその map の entry）。`\ifx\rightmark\@empty` のように展開せずに比べる柱は、空と番兵の probe の違いで敏感と分かる。展開せずに特定の値の macro と `\ifx` で比べる柱は見分けられない（既知の限界）。float の probe は、変わる先の状態そのもの（上下の図の有無、float ページ）で組む。ただし測るのは文脈の代表のページの mark と LastPage のもとでである。
+
+**F3：記録。** canonical の generation が届き、resident の配置がその generation のソースのもの（同じ revision、同じページ数、ソースが一致）なら、各ページを物理ページに結びつける（`canonical-arrival.js` の `bindCanonicalFurniture`）：generation（revision、長さ、hash、root、配置の `sig`、本文のページ番号の代入）、ページ番号、版面、そのページの spec。指紋は、その generation のソース・配置・root の job から**一度だけ**入れる（結びつけたときにその job の map があればそこで、無ければその job が届いたときに。`furnitureLanded`）。preamble を直して root が立ち直っても、上書きしない。帯はこの記録（`rec`、小さな共有の `gen` を指す）を持つ。残った entry の spec は、その map の job の spec（`hfSpecs`）。同じソースのまま配置が変わったら（spec の `sig` か、各ページの最初と最後の行が変わったら）結びつけ直し（F6 の照合もやり直す）、切ってある同じ generation の帯は新しい記録に付け替える（同じ PDF の同じページの画素なので）。更新の途中で告げられた generation は、その更新が終わってから結びつける。着地のときに配置のページ数が違った generation は、配置が一致した最初のときに結びつける（`bindSettledFurniture`）。
+
+**F4：述語。** 頭と脚は枠ごとに決める。ページ p の枠（頭か脚）に帯を描くのは、folio（番号形式と値）と版面が記録と同じで、かつ次のどれかのとき（`bandShown`。表示、切り出し、`furnitureSig` が同じ関数を使う）。
+- (i) 今のソースが、帯の generation のソースそのもの（元に戻す・やり直す）。
+- (ii) 今の配置の job が届いていて、帯の generation のその枠の指紋が分かっていて（KNOWN）、今の p のその枠の指紋と同じ。
+- (iii) 今の配置の job が pending（届いておらず、失敗もしていない）で、記録の spec と今の spec で違う成分が一つだけで、記録の spec の文脈で、その枠がその成分に敏感でないと F2 で測られている。二つ以上の成分が同時に違う（mark と LastPage、mark と float など：組み合わせの効き方は測っていない）、テンプレート（style・定義の連なり・偶奇）が違う、測られていない、root が違う、は敏感とする。
+
+(ii) と (iii) は、別のソースの帯を使うことである。それは F6 で照合したページ、c53846b が帯を持っていたページ、F7 のページ番号の代入より前のページに限る。F5 の帯は (i) だけ。どれでもなければ帯は隠れる。帯は捨てず、次に評価するときに描かれうる（指紋が元に戻れば (ii) がまた描く：audit/scratch r9 restore）。帯はページ番号の間を移らない。
+
+残った entry（map が今の配置のものでないとき）も枠ごとに、map が今の配置のものなら描き、そうでなければ (iii) と同じ判定（map の job の spec と今の spec、root と版面が同じ）を満たすときだけ描く（`entryShown`）。entry にとって「generation のソース」は map の job のソースと配置そのものなので、(i) は (ii) と同じになる。満たさなければ仮の表示にする：ページの style が `empty` でも float ページでもなければ仮の folio、そうでなければ何も描かない（`provisionalFolio`。`\thispagestyle{empty}` の表紙に余計な folio が出ていた）。
+
+**表示（v0.1.32 の見え方を枠ごとに）。** 枠ごとに決める（`display-list.js` の `furnitureChoice`。`furnitureSig` も同じ選択を読む）。頭と脚の帯がどちらも F4 で描けるなら両方を描く（entry が隠れていても描く）。片方だけが描けるときは、その帯を単独で描くのは、二つの帯がそれぞれ自分の枠のインクしか持たないときに限る（`bandsApart`：切り出すときに読んだ canonical のページの帯の中のインク（本文の縁から 4 bp を除く）が、その帯の generation の job の runs が置く枠の items の縦の範囲から 3 bp 以内にすべて収まる。範囲は枠の box と、その外に立ちうる runs（`\headruleskip` の後の fancyhdr の罫はその位置、字は `svgInkRows` と同じく baseline とその 6 bp 上）を合わせたもので、指紋と一緒に一度だけ入れる）。冊子の柱は `remember picture, overlay` の一枚の絵が頭の罫と柱の字に加えて脚の罫とノンブル（―29―）も描くので、脚の帯のインクは頭の絵のもので、二つの帯は一緒にしか描かない。
+
+**今のソースの柱を組んで見せる。** 柱が変わったページでは、その帯（頭の絵が脚に描いたノンブルも）は次の canonical まで描けず、冊子では講を足すと 29 ページのノンブルが消えた（v0.1.32 は古い、誤った柱と一緒に 29 を出していた。audit/scratch r12 item 5）。配置が変わるたび、また読者が別のページへ移ったとき（`warmPage`）、打鍵が 300 ms 止まり、更新が終わり、前の組版から 1 s 経ったら、図を含む枠が帯を描けないページ（読者のページから 16 ページ以内、一度に 8 ページまで。canonical がまだ一つも結びついていない開いた直後と、結びついた generation の帯がこれから切られるページは除く）について、job と同じ状態（spec、定義の連なり、LastPage、図の着地）で頭と脚を紙の上の `\@outputpage` の位置に置いて ship し（本文は空。`page-metadata.js` の `hfRenderBody`、`furniture-render.js`）、pgf の覚えた位置を page art と同じく pass ごとに持ち越して止まるまで組み、各ページを二つの帯に切る。この帯（`rec.render`）は、組んだときの spec・root・版面がページの今のものと同じ間（job を待たない）、または今の配置の job がその枠に同じ指紋を与える間、そのページのもの（job が pending の間は (iii) と同じ判定）。job も Build の lease も待たない：数百 ms の daemon の仕事で、打鍵の直後に Build が取る lease は冊子で 1 分を超え、v0.1.32 は数秒でノンブルを見せていたので。打鍵の途中では組まず（300 ms の静けさ）、組む途中で編集や配置が変われば結果を捨てる。同じソースの canonical の帯が切られたページからは消し、文書が短くなれば、閉じれば捨てる。job が知るのは spec だけなので、知らないもの（一度も進めない counter、primitive の mark）を印字する柱は誤って組まれる。そこで毎回、今 exact な帯が描かれているページを一つ対照として一緒に組み、その二つの帯が exact な PDF と同じに塗られている（字はその outline と位置、罫や絵はその枠で、1 bp 以内）ときだけ使う。違えばその root では二度と組まない（帯は今までどおり隠れる）。頭から脚まで下ろした線、ページの枠、背景のように帯をまたぐ絵があれば、二つの帯は一緒にしか描かない（従来どおりの保守的な規則）。帯を描かない枠は、entry を描けるなら、文字と罫だけの枠は runs を描き、図を含む枠は何も描かない。脚が帯でも entry でもなければ仮の表示。ページ全体が一つの chunk のページには仮の folio を描かない。以前は頭と脚を一緒に決めていたため、柱の mark だけを変える編集で、正しいままの 1 枚目の「Sheet 1」の脚が job を待つ間は裸の 1 に、job が届いたあとは何も無しになった（audit/scratch r10 restore）。
+
+**柱と脚が読む本文の状態。** 常駐 TeX は明示改ページの境界とブロック末尾で、正本組版は実際に出力した用紙ごとに、起動時から変化した定義、条件分岐、レジスター、色・フォントの指紋を記録する（`furniture-state.lua`、`daemon.lua`）。ページ配置側ではその記録と本文のブロックを照合し、ページの spec に載せる（`page-metadata.js`）。job は記録と一致する値を使い、マクロの再定義は TeX 上でトークン列の一致を確認できた場合に限る。まだ組版していない区間や、状態を確認できない分離組版の先では、依存する枠を保留する。文字の runs、別ソースの帯の再利用、帯の再描画のいずれも、各枠が読んだ値を確認する。帯の再描画では、対照ページの描画も正本と照合する。
+
+**F5：帯の有無は PDF から。** 本文の event（`\pagestyle`、`\fancyhead`、`\floatpagestyle` など）の印は、段落の中で出されると行の中に残り、どのページにも届かなかった。今は `\mark` と同じく `\vadjust` で行の後へ出す（`daemon.lua` の `tdom_event`）。結びつけた generation の job が、style が `empty` でないページ、または float ページについて、頭も脚も空の entry を返したら、そのページの canonical の SVG の頭と脚の帯にインクがあるかを見る（`svgInkRows`：`<defs>` を除いた path・glyph・image の縦の範囲）。あればそのページにも帯を切り（`pdfInk`）、(i) で描く。無ければ切らない（`\floatpagestyle{empty}` の float ページは空のまま）。本文の `\floatpagestyle` は `\fancyhead` と同じく shim が event にし（`tex-templates.js`）、job が再生する（audit/scratch r9 float-fixture/body.tex：3 枚目の TOPFIG）。
+
+**F6：対応を確かめてから別のソースに使う。** 結びつけたあと、更新の合間に、各ページについて resident の配置と generation の PDF が同じ紙面を持つかを確かめる。まず SyncTeX で（`probePoints`・`probesCorrespond`）：配置がページの最初の block と最後の block を置いている所（その block の、高さのある行の縦の中央、本文の幅の中央）で、PDF のそのページに、そこで組んだソースの行を尋ね（`synctex edit`）、その行がその block の行（次の block の行の前まで：TeX は段落を、次に読んだ空行やコマンドの行の名で閉じる）であることを確かめる。SyncTeX は点を含む box の行を返すので、別の所で組まれて置かれた box（multicols のページの上の例題の枠）では別の block の行が返ることがある。そのときはその block 自身の行を SyncTeX で引き、このページでの一番上（最後の block は一番下）が配置の上端（下端）から 10 bp 以内なら、その block がそこにあるとする（1 行ずれたページはこれを超える）。段落一つずれたページでは、そこに前の block か次の block がある（audit/scratch r9 cold-follow：配置が 153 を置く所に PDF は 152 を持つ）。返った行のファイルは、その block を読んだ物理的な入力と完全なパスで比べる（シンボリックリンクを解決して。include はその読み取りのパスと名前、root は canonical が読む `canon.tex` と文書自身のファイル）。以前はファイル名だけで比べていたため、`unit2/chapter.tex` の行を `unit1/chapter.tex` の block の行として受け入れた（audit/scratch r10 check-capture）。package や library の行（TikZ が自分のマクロで描くもの）や、別の入力の行が返ったら何も分からない。冊子のページは大半が exact な絵（例題の枠、図）で runs が少なく、文字だけでは確かめられなかった（round 10 の最終の連鎖：講を足すと、その前の 26〜28 ページの柱と脚が消えた。c53846b は番号で残していた）。SyncTeX が答えないページは、文字で確かめる（`pageCorresponds`）：resident のページの最初の行と最後の行（NFKC、小文字、文字と数字だけ、12 文字以上になるまで最大 4 行）が canonical のページの文字列（pdftotext）にこの順で入っていて、その前に柱の文字数＋16 文字、その後に脚の文字数＋16 文字を超える文字が無いこと。これが合わなくても、文字と数字の数（順序を問わない。柱と脚の文字を足して）が 1 %（最低 4 字）以内で同じなら確かめられたとする（pdftotext は表を列ごとに読み、runs は行ごとに持つ：audit/scratch r9 repeat table）。段落一つが前のページから来たページはこの差を超える。どちらでも決まらないページ（尋ねる行も文字も無い：表紙）は、前後で一番近い決まったページ（または文書の端）がどちらも確かめられたときに確かめられたとする。確かめられないページは (i) だけ。配置が同じソースのまま変われば結びつけ直して確かめ直す。尋ねるのは、この generation の帯が別のソースで描かれうるページ（図を含み、c53846b の集合にあるページ）だけで、1 ページに 2 回（`synctex edit` の呼び出し。1 回ごとに SyncTeX のファイル全体を読む）、更新の合間に順に行う。同じ generation の同じ位置への問いは覚えておき、同じ配置で結びつけ直しても尋ね直さない。
+
+**F7：ページ番号の代入。** 本文で実行した代入のイベントに、代入直前の TeX のページ番号を記録する（`tex-templates.js`、`daemon.lua`）。配置がその位置に与えるノンブルと一致し、直前にページ状態を読んだ履歴や未確認の条件分岐がなく、代入位置と値が確かな場合にだけ、決まった番号を spec に反映する。`\pagenumbering` は番号形式を切り替え、カウンターを 1 に戻す。本文で実行されなかった代入はイベントを出さない。位置や値が確かでない代入があれば、そのページ以降は `folioUnknownFrom` が文字の柱・脚と仮のノンブルを保留する。同じソースの PDF が届けば、その帯を使う。先行するページでは、確定しているノンブルを引き続き描く。
+
+**元に戻す操作。** 使っている generation（`engine.hfCanon`）の帯は、文書が今そのページを持つかどうかにかかわらず、その generation のすべてのページの分をメモリに持ち、次の generation の待ち行列がそれを置き換えるまで持つ（`pruneFurniture`）。42 → 1 → 42 ページの元に戻す操作で、26 ページと 40 ページは新しい SVG の読み取りを待たずに描かれる。ほかの generation の帯は、文書に無いページの分を捨てる。今のソースが結びつけた generation のソースと同じになり、それでも帯の無いページがあれば、その generation の PDF から切り直す（`recutCanonicalFurniture`）。
+
+**入れ替えは一度に。** 新しい generation の帯は古い帯と一度に入れ替わる（両方の帯を同じ更新の間に、新しい版で）。F4 が描かない帯は切らず、公開もしない。
+
+**切り出し（canonical の待ち行列）。** 結びつけた generation の、図を含むページ（と F5 で見るページ）の帯を、8 ページずつ、読者のページ、次に編集のページに近い順に、更新と更新の間に公開する（ページ数の上限は無い）。待ち行列を作るのは、着地では最新の generation だけ、map の着地のときも最新の generation、元に戻す操作では同じソースの generation。ページの境目ごとに Build lease を待つ。変換に失敗したページは 1 s 後に、generation ごとに 3 回まで試す。再試行の起こしは一つで、新しい generation の待ち行列が引き継ぐ。
+
+**縦書き。** 縦書きかどうかは engine が一か所で決める（`update-prepare.js` の `tateExact`：本文の `\tate` や縦書きのクラス、または boot のときに LuaTeX-ja が報告する組方向。`daemon.lua` の `writingDirection`）。縦書きの文書は exact なページとして表示し（`previewPolicy` が `shipping-exact`）、帯は結びつけない（横書きの版面で切る帯には本文が入る）。preamble の文字列を別に調べることはしない：使わないマクロの中の `\tate` で横書きの文書の図を含む柱が 4 つとも消えた（audit/scratch r10 unused）。
+
+**既知の限界。** 常駐組版で観測できない自然改ページや分離組版では、同じソースの正本を待つ場合がある。F6 の文字による照合では、同じ文言のページが一つずれた配置を区別できない。
+
+| 段階 | 決めること・すること | 無効になる・やり直すとき | 残るもの |
+|---|---|---|---|
+| ページの状態を決める | `pageSpecs` と、その `sig` と revision（`engine.currentSpecs`、ページ配列・block 配列ごとに一つ） | ページ配列か block 配列が替わったとき | open、opaque への降格、close で捨てる（`releaseFurniture`） |
+| job を出す | map が今の配置・root のものでなければ job を一つ。走っている間に変われば、届いたあとにもう一度。打鍵の静かな間を待ち、Build が lease を持つ間は待つ（譲る） | open は `hfQueued` を立てるだけ | 作業ディレクトリ `hf-render/<番号>` は次の job が始まるときに前のものを消す |
+| job を公開する | root・preamble が同じで、job がまだ所有者のときだけ、更新と更新の間に map を置き換え、`hfIdentity`・`hfSpecs`・`hfSens` を記録し、その job の generation に指紋を一度だけ入れ、再ページ割りする | 別の root・preamble の返事、所有者でない job の返事は捨てる。失敗はその配置を pending でなくする | map は次の着地まで |
+| canonical を結びつけ、切る | F3 の記録を着地のとき（または配置が一致したとき）に。F6 の照合を更新の合間に。帯は記録を持ち、両方の帯を一度に公開する | 新しい generation が待ち行列を置き換える。同じソースで配置が変われば結びつけ直す | 結びつけは最近の四つの generation まで。失敗は 1 s 後、3 回まで |
+| 画素を選ぶ | F4（帯と entry）。表示は v0.1.32 の見え方 | — | — |
+| 作り直し・転送・退役 | display list は `furnitureSig` が変わったページだけ作り直す。帯は chunk `__hf-<page>-<h/f>` で、command の `cv` が版 | ページ数が減っても、使っている generation の帯は持つ。ほかの generation の帯は無いページの分を捨てる | 帯は、次の generation が切り直すか置き換えるまで（隠れても捨てない） |
 
 ## 10.8 page-context rescue
 
@@ -408,6 +487,8 @@ label が動いたとき、後方で定義された label を前方 block が参
 現行実装は foreground で長い re-rescue chain を走らせない。`#queueMovedOffsets()` が offset 差分を見て rescue queue に積み、exact pipeline が async に fixed point へ近づける。表示中は stale galley/chunk と canonical overlay が残る。
 
 rescue pump は一度に一件だけ処理する。編集・caret の対象ページの rescue は quiet gate を通らず、foreground 完了と caret focus の更新で待機を即座に解除する（`rescue-scheduling.js`）。起床後に対象 id と最新の cache key を読み直し、待機中の編集や別 block の cold resume があれば再び譲る。backlog は従来の800ms（有効な shipping baseline があれば shipping 優先窓）を保持する。200ms の poll は通知のない状態変更のための上限であり、編集完了後に必ず払う待ち時間ではない。
+
+cold resume に譲るかどうかは `coldResumeAhead()` の一つの規則で決め、pump の待機と adopt walk の中断の両方がこれを読む。resume がこの block だけのために残っている場合（multicols 内の cold keystroke など）は譲らない（tex64-internal #94）。以前は walk だけが cold chain 全般に譲っていたため、結果が cache 済みの focus rescue が「walk 開始→即中断→再投入」を microtask の中だけで繰り返し、cold resume の idle gate（timer）が永久に来なかった（#121: プリアンブル編集直後に rescued box へ入力すると engine が CPU 100% のまま Live が戻らない）。さらに pump は1件ごとに event loop を1周させ、待ち時間なしの再試行でも timer と socket の処理を止めない。回帰テストは `tests/rescue-cold-yield.test.js`（別プロセスで実行し、heartbeat が止まれば kill する）。
 
 multicols の内側は段落や textbox ごとに分割せず、一つの layout block として実 output routine で組み直す。この rescue は resident RENDER の120ms gate、isolated **render** の3秒 gateとは別経路である。救済PDFが完了した後の SVG 変換は `iso-pages.js` の2レーンで処理し、全ページが揃ってから従来どおり galley/chunk を採択する。変換失敗時も実行中のもう一件を待ってから失敗を返すため、cold retry やディレクトリ削除と競合しない。ページ数によらず converter は最大2本、ISO組版は直列のままである。
 
@@ -454,7 +535,7 @@ display list は本文 glyph と行単位の exact chunk を別素材として�
 
 各 edit report と async patch は、その時点の font manifest を page patch と同時に送る。client は新しい `@font-face` を登録し、face の decode が完了するまでページ群の提示を待つ。画面外の準備中に該当 run が透明でも、表示中の完成ページは保持する。
 
-`canonical.schedule()` は source/rev を保存して timer を張るだけで、full `lualatex` compile は edit response を待たせない。完成した provisional 面を提示できる structured モードでは、初回だけ `debounceMs`（既定2500ms）で baseline を取得し、以降は最終編集後の `idleMs`（既定30s）か、正本に未反映の最古の編集から `maxStaleMs`（`TDOM_CANON_MAX_STALE`、既定20s）の早い方で予約する。いずれもコスト比例 cooldown（factor 2、cap 600s）を満たしてから開始する。20s は通常の打鍵ごとの再コンパイルを避けつつ、連続編集でも番号・参照・目次の更新機会を確保する間隔である。長い compile では cooldown が優先され、完了までには組版時間も加わる。初回 baseline の debounce にも同じ待機期限を掛ける。期限後の通常 authority compile は、新しい編集が来ても aux fixed point までの pass を打ち切らず、shipping の優先窓による停止も期限で解除する。実行中に届いた編集は、その最初の到着時刻を次の待機期限に引き継ぎ、次回 timer は完了時点の実測コストから cooldown を計算し直す。opaque モードでは `displayDebounceMs`（既定350ms）と display cooldown（factor 1、cap 60s）を使い、長文書の連続再組版を抑える。
+`canonical.schedule()` は source/rev を保存して timer を張るだけで、full `lualatex` compile は edit response を待たせない。完成した provisional 面を提示できる structured モードでは、初回だけ `debounceMs`（既定2500ms）で baseline を取得し、以降は最終編集後の `idleMs`（既定は直近の全文組版時間の2倍。下限1.5秒、上限30秒。`TDOM_CANON_IDLE` で固定可能）か、正本に未反映の最古の編集から `maxStaleMs`（`TDOM_CANON_MAX_STALE`、既定20s）の早い方で予約する。いずれもコスト比例 cooldown（factor 2、cap 600s）を満たしてから開始する。20s は通常の打鍵ごとの再コンパイルを避けつつ、連続編集でも番号・参照・目次の更新機会を確保する間隔である。長い compile では cooldown が優先され、完了までには組版時間も加わる。初回 baseline の debounce にも同じ待機期限を掛ける。期限後の通常 authority compile は、新しい編集が来ても aux fixed point までの pass を打ち切らず、shipping の優先窓による停止も期限で解除する。実行中に届いた編集は、その最初の到着時刻を次の待機期限に引き継ぎ、次回 timer は完了時点の実測コストから cooldown を計算し直す。opaque モードでは `displayDebounceMs`（既定350ms）と display cooldown（factor 1、cap 60s）を使い、長文書の連続再組版を抑える。
 
 欠けた数式・不一致のページ構成・編集位置の未証明などで新しい紙面を提示できない場合、client は `POST /canonical/display-demand` に現在の `documentEpoch`・`srcRev`・表示側の `demandId` を送る。その版の既存予約だけを display cadence へ早め、追加の組版は作らない。完成したresidentページ群を実際に提示できたら同IDの `fulfilled: true` を送り、全表示側の需要が解消した未開始予約だけを通常のauthority cadenceへ戻す。待機の起点は最終編集時刻を保つ。同版を再び保留した場合やiframeを再作成した場合は新IDで再取得でき、遅延したfulfilledは別表示側の需要を消さない。IDは128文字、現在の版の既出IDは最大64件とし、同IDの重複はtimerを延長・再有効化しない。開始済み・成功済み・失敗済みの組版を需要通知から追加・取消・再試行しない。需要は対象の完了・失敗・別版への更新・文書resetで終わり、後続の無関係な編集は通常のauthority cadenceに戻る。`canonical.info()` の `scheduledInMs` は予約までの残り時間、`compiling` は実組版中、`displayDemandRev` は需要対象の版を示す。`ensure()`（export 経路）は渡された snapshot だけを compile し、途中の打鍵を連続して追いかけない。
 
@@ -469,7 +550,7 @@ structured page の差し替えには、その page の未変更部分も含む 
 
 ただし骨格選択だけでは生存 checkpoint 数の上限にならない。`#retireOffGrid(idx)` は「その JOB が処理した 1 index」しか退役させないので、mid-document から resume する pass（rescue pump・settle・chain・backward-ref）は各停止点に orphan checkpoint を残し、誰も retire しないまま生存集合が creep する（実測: budget 8 指定でも 25 個生存、boot 時 55 個超で 16GB 機が窒息）。`#enforceCheckpointCap()` が「ckpt0 ＋実測コスト骨格 ＋ editHold ＋ renderHold だけ残し、他は DIE」で畳み直す。`#updateInner()` 末（boot/edit walk 後）・`#asyncRescueOne` 後・`#runChainPass` の finally で呼ぶ。各 checkpoint は累積 dormant page を保持する常駐 lualatex なので、これは実メモリの上限である。
 
-`#shipUpdate()` は `TDOM_SHIP=1` のときだけ意味を持つ。現在の root source と、実際に展開した project input bytes の immutable snapshot を shipping chain に渡し、unit diff から resume できるかを判定する。child-only refresh は root が同一でも `unchanged` ではない。単一の既知 literal `\input` だけを最初の reader より前から replay し、未知・複数・`\include` の変更は新しい canonical seed を待って baseline を作り直す。snapshot を受理していない generation は新 `srcRev` に対応付けず、後着 wave も current revision/snapshot の一致を満たさなければ公開しない。実際の page ship と SVG 化は非同期で、`onShipPage` と SSE `ship` として着地する。
+`#shipUpdate()` は `TDOM_SHIP=1` のときだけ意味を持つ。現在の root source と、実際に展開した project input bytes の immutable snapshot を shipping chain に渡し、unit diff から resume できるかを判定する。child-only refresh は root が同一でも `unchanged` ではない。単一の既知 literal `\input` だけを最初の reader より前から replay し、未知・複数・`\include` の変更は新しい canonical seed を待って baseline を作り直す。snapshot を受理していない generation は新 `srcRev` に対応付けず、後着 wave も current revision/snapshot の一致を満たさなければ公開しない。実際の page ship と SVG 化は非同期で、`onShipPage` と SSE `ship` として着地する。 最初の組版結果と補助ファイルがそろった時点で、紙面の表示に使う最初のチェックポイントを準備する。準備中に単一の子ファイルを編集した場合も、組版済みの旧版を引き継いで読込元と差分を照合してから再実行する。
 
 canonical anchor は root 内の plain text に加え、既に読まれた単一 child file の単一 plain-text 差分を扱う。child の公開 DOM span は引き続き `null` とし、編集前の include bytes から差分を算出して、物理 `readPath`、child-local block span、galley witness を非公開 snapshot に固定する。対象は root からの単一 literal `\input` とし、現在の read trace に到達した root/child ごとに字句上の reader 数と trace 数が一致しない場合は採用しない。同じ child が複数 block instance に所有される場合、`sourceParts` を持つ場合、別 input の変更が同居する場合も anchor を作らない。連続入力は最初の canonical snapshot を継承し、input epoch・source revision・canonical generation・PDF/SyncTeX hash のいずれかが変わった後着 proof は公開しない。
 
@@ -482,6 +563,10 @@ frame が「変わっていない」ことの根拠は次のとおり。(1) resi
 VisualCut patch は旧 canonical generation/revision を保持し、通常の行消去範囲 `baseMask` と深い glyph まで含む `mask` を併記する。現在行は旧行の水平 slot 内に収め、複数 mask は重ねない。client は既存 canonical raster の `mask - baseMask` に触れる全 pixel を上限付きで検査し、背景色以外が 1 pixel でもあれば公開しない。イベントは `canonical-visual-cut` として通常の `canonical-anchor` から分離し、この raster 検査を持たない旧 client は未知イベントとして無視する。source revision、input epoch、base generation/revision、表示中 image、700/850ms の proof/publish deadline は従来どおりである。
 
 canonical の行の証明（plain・mixed 共通、同じ証明を使う canonical crop も同じ）は、witness の glyph ごとに文字・大きさ・位置に加えて塗り色を照合する。resident の収穫は color stack を hbox の中（`walk_h`）でしか追わないので、縦モードの push（段落の前や前の block の `\color`）は canonical の行を塗っても run の色に出ない。luacolor を使わない xcolor 文書では、赤い canonical の行を黒の run で描き直し得た。paint index は pdf.js の operator list から glyph ごとの fill color を記録する（pdf.js はどの色空間の fill も `setFillRGBColor` の hex 文字列で渡す。ページの初期値は黒、save/restore と form の終わりで戻す。pattern・透明などそれ以外の fill は不明として、どの witness とも一致させない）。witness は run の色（色のない run は表示リストと同じく黒）を glyph ごとに持つ。黒の表現は揃える: resident はどの色モデルの黒も `#000000` にし、pdf.js は DeviceCMYK の `0 0 0 1 k` を多項式で `#2c2e35` にするので、後者を `#000000` として扱う。すべての glyph で一致しない行は証明しない。
+
+数式と本文が同じ行にある場合は、編集した本文の外側にあるすべての run と行の寸法が一致するかを `changedTextSpan` で照合する。句読点が数式に接していても、フォントに対応するグリフの輪郭があれば印字範囲を字幅と区別できる。追加した文字が余白にはみ出す場合は、塗り直す領域のうち新たに覆う部分が旧 PDF 上で背景色だけであることも確認する。文字の挿入や削除で同じ行の後ろの数式が動く場合は、最初に動いた数式から行末までの全要素で横方向の移動量が等しいかを調べる。文字だけのページに加えて、LuaTeX が水平な実線で分数線を印字したページも対象とする。各文字と添字の位置・色・大きさを照合し、塗り直す範囲内の実線が元の行の分数線と一本ずつ一致することを確かめる。切り取る四辺にインクがなければ、その部分を元の PDF から新しい位置に表示する。移動後の数式をクリックしたときは元の PDF 上の位置に戻して文字を特定し、現在のソースで同じ式を MathLive に開く。インライン数式の途中で改行するときは数式の開始状態を次の行に引き継ぎ、数式の直後から本文として記録する。 折り返しで前後の本文行も変わる場合は、段落の行数と各行の寸法を照合する。変更があった本文行と数式を含む行を一度に描き直す。 行数が変わり PDF の再組版が必要になったときは、その版をキューに入れてから経過した時間を入力待ち時間に含める。直前の組版コストに応じた実行間隔は維持する。
+
+本文をクリックしたときは印字された語とソースを照合する。SyncTeX が段落末の空行を返した場合も、文書全体でソースと印字に一つずつしかない本文に限り、各語の位置と段落の順引き・逆引きが共有する組版上の箱から編集箇所を決める。編集中に表示した差分は新しい PDF の対象ページが表示されるまで維持する。
 
 **累積 lineage（複数ブロック）。** anchor は base generation G に対する「G 以降の全編集の delta」を 1 つの patch で公開する。server の `terminalAnchorLineage` は G に対して編集されたブロックごとに entry（base witness、変わった行、証明済み page patch）を持ち、`ledger`（G が resident の exact compile だった時点の全ブロックの source hash・galleyHash・構造的 exit state）を保持する。別ブロック Y の編集は、(1) lineage が途切れていない（G 以降の全打鍵が anchor された）、(2) Y のブロックが ledger と一致する（G が組んだままである）、の両方が成り立つときだけ、その時点で捕捉した Y の resident witness を G の base witness として `planTerminalCanonicalAnchor` に渡せる（`joinedBase`）。証明は Y の行だけを行い、`resolveTerminalCanonicalAnchor` は他ブロックの証明済み page patch と結合して 1 つの patch（`blockIds`）にする。ブロック間で mask が重なる場合は fallback にする。raster 証明の種類が混在する場合は patch 全体を VisualCut として送り、exact-frame のページは `baseMask = mask`（追加リングなし）で client の raster 検査を通す。client は patch 適用時に全 delta を原子的に置き換えるので、複数ページの overlay を同時に持つ。lease と provisional 抑止は `blockIds` で判定する。covering canonical が着地すれば全 delta が退役する。
 
@@ -523,3 +608,16 @@ canonical のページの click は、reverse SyncTeX が返した source の行
 
 `tests/inline-math-click.test.js` は、math field と glyph の照合を代役にして、採る・採らないの規則（回数が合う、同じ数式が 2 つ、数式の中の数式、範囲の外、display 数式）と、次の世代への追従を確かめる。packaged app では、72 ページの本の該当の `$2$` を実際に click して editor が開き、4 打鍵、9 秒の休止、さらに 2 打鍵がすべて source の 36 行の数式に入ることを確かめた。小さな文書の通常の数式 click（12 打鍵）は変わらない。
 
+### 再組版を待つ間の数式の直接編集
+
+PDF 上で編集したインライン数式は、元の文字が占める範囲を特定できれば同じ位置に MathLive の入力結果を表示する。文字の原点をそのページの SVG の字形と照合し、隣の句読点や罫線の輪郭にかからない範囲を使う。字形が重なって元の式を特定できない場合は PDF の更新を待つ。
+
+画像を含む PDF ページの位置を調べるときは、表示中の版の SVG に `geometry=1` を付けて取得する。サーバーは埋め込み画像のデータだけを省く。ビューアは画像の寸法と変換行列から紙面上の範囲を求め、切り抜きパスの範囲が分かるときはその外側を除く。透過画像の色や不透明度を読み取る処理はない。式のすぐ隣に図がある場合は、反対側の余白を使って文字の大きさを保つ。式自体に図が重なる場合は PDF の更新を待つ。
+
+分数では入力前の MathLive モデルから分子と分母に属する字形を記録する。`\frac`・`\tfrac`・`\dfrac` の分数線は、両者の間にある同色の水平線のうち位置と幅が一致する一本に限る。入れ子の分数では内側と外側の線を別々に照合する。前後の行と文字のメトリクスが重なる場合はその余白を詰め、実際の字形を覆わずに表示できる範囲を使う。
+
+平方根と累乗根では、PDF に印字された `√` の輪郭と、その右端でつながる上線を確認する。上線は根号の中身の幅に合い、根号は中身の高さまで届く必要がある。入れ子の式は内側から照合し、内側の根号や分数線の幅を外側の式にも含める。これにより、同じ式が上下の行に繰り返されていても別の行の根号を塗り替えずに済む。
+
+独立した数式では SyncTeX が返した式と段のボックスを照合する。中央揃えなら元の式の中心を保ち、左揃えなら元の書き出し位置を保つ。式全体のボックスが得られないときは、段内の印字された文字が MathLive の各文字に対応するかも確認する。左側に式番号を出す設定で段のボックスに余分な空きが含まれるときは、式番号の位置も使って段の左端を求める。左右にある式番号などの印字にかかる前に一時表示の幅を制限する。文字サイズは PDF の字幅と入力欄の同じ文字の幅から求める。根号などの入力欄が元の印字より高いときは、前後の印字との空きの半分まで使える。`\label` や `\tag` の編集用バッジは紙面に表示しない。
+
+同じ行にある別の式へ移っても、先に入力した値は新しい紙面が届くまで表示する。追加した文字をクリックすると、その文字の位置から編集を再開する。再編集を Escape で取り消すと直前に確定した値に戻る。ページの差し替え時にはそのページの一時表示とサイズ監視を解除する。

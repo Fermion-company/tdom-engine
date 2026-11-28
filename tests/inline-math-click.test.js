@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const app = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
-const start = app.indexOf('async function inlineMathCopies(');
+const start = app.indexOf('function sourceNearLine(');
 const SOURCE = app.slice(start, app.indexOf('\n}\n', app.indexOf('async function inlineMathBoundsByInk(')) + 3);
 
 const FILE = '/doc/chapter.tex';
@@ -25,7 +25,7 @@ const text = (id, value, line) => ({ id, kind: 'text', value, source: { file: FI
 const block = (id, from, to, editRegions) => ({ id, source: { file: FILE, start: { line: from, column: 1 }, end: { line: to, column: 40 } }, editRegions });
 
 // `printed`: formula value -> the copies of it printed on the page (each a list of glyphs)
-function viewer({ printed }) {
+function viewer({ printed, boxes = [] }) {
   const state = {
     window: { TdomDirectEditGeometry: {
       mathMaps: (field, glyphs, bounds) => (printed[field.value] ?? [])
@@ -40,6 +40,8 @@ function viewer({ printed }) {
     shouldWrapAligned: () => false, wrapAligned: (value) => value,
     sameSourceFile: (a, b) => a === b,
     canonicalGlyphs: async () => Object.values(printed).flat(2),
+    canonicalSourceEditBoxes: async (page, id, { source }) => source.end.line - source.start.line > 512 ? [] : boxes.filter(row => row.file === source.file &&
+      row.page === page && row.line >= source.start.line && row.line <= source.end.line),
     // (a click brings SyncTeX's answer with it; following an open editor asks for one)
     reverse: null,
     fetch: async (url, options) => {
@@ -132,6 +134,19 @@ test('a formula inside a larger one is not the formula clicked; display formulas
     answer(22, tops), 18, { x: 94, y: 205 }, 7, still), null);
 });
 
+test('equal formulas across an input follow expanded paragraph order', async () => {
+  const parent = math('parent', 'y', 12, 20);
+  const child = math('child', 'y', 1, 4);
+  child.source.file = '/doc/study.tex';
+  const para = { ...block('mixed', 12, 13, [parent, child]), type: 'paragraph', pages: [18],
+    sourceRanges: [parent.source, child.source] };
+  const v = viewer({ printed: { y: [[glyph('y', 80, 101)], [glyph('y', 300, 101)]] } });
+  const location = { ...answer(1, [100]), file: child.source.file };
+  const at = x => v.find({ blocks: [para] }, location, 18, { x, y: 105 }, 7, still);
+  assert.equal((await at(82)).region.id, 'parent');
+  assert.equal((await at(302)).region.id, 'child');
+});
+
 test('an editor opened by a formula\'s ink is followed into the next canonical pages by its ink', async () => {
   // the formula was `2`; the user typed, the source has `23` now and the new pages print it a little further right
   const typed = block('b112', 34, 38, [text('t1', 'グループを閉じるのは', 36), math('m1', '23', 36, 40), math('m2', 'x', 37, 5)]);
@@ -153,4 +168,98 @@ test('an editor opened by a formula\'s ink is followed into the next canonical p
   assert.equal(await v.follow({ ...region, display: true }, { blocks: [typed] }, 9, { page: 18, x: 216, y: 431 }), null);
   assert.equal(await v.follow(region, { blocks: [typed] }, 9, { page: 18 }), null);
   assert.equal(await v.follow(text('t', 'words', 36), { blocks: [typed] }, 9, { page: 18, x: 216, y: 431 }), null);
+});
+
+test('a source-side formula preview requires the other files and bytes on the printed page to match', () => {
+  const fn = name => {
+    const first = app.indexOf('function ' + name + '(');
+    return app.slice(first, app.indexOf('\n}', first) + 2);
+  };
+  const scope = { window: {} };
+  vm.runInNewContext(readFileSync(new URL('../web/opaque-editor-coordinator.js', import.meta.url), 'utf8'), scope);
+  const diff = vm.runInNewContext([fn('orderedSourceOffsets'), fn('sourceFormulaChangeState'), fn('changedSourceFormulas'),
+    'changedSourceFormulas'].join('\n'), scope);
+  function document(value, { prefix = '前', suffix = '後', otherFile = 'original' } = {}) {
+    const start = prefix.length + 2;
+    const region = { id: 'b1:m', kind: 'math', value, source: { file: FILE,
+      start: { line: 1, column: start }, end: { line: 1, column: start + value.length } } };
+    return { blocks: [{ id: 'b1', editRegions: [region] }], sources: [
+      { file: FILE, text: prefix + '$' + value + '$' + suffix }, { file: 'master.tex', text: otherFile },
+    ] };
+  }
+  const changed = (before, next) => diff(before, next, before.blocks)?.[0] ?? null;
+  const before = document('x_{n}');
+  const from = next => changed(before, next);
+  assert.equal(from(document('x_{na}')).region.value, 'x_{na}');
+  assert.equal(from(document('x_{na}', { prefix: '別' })), null);
+  assert.equal(from(document('x_{na}', { suffix: '追記' })), null);
+  assert.equal(from(document('x_{na}', { otherFile: 'changed' })), null);
+  assert.equal(from(document('x_{n')).state, 'incomplete');
+  assert.equal(from(document('x_{n\\sq}')).state, 'incomplete');
+  assert.equal(from(document('x_{\\theta}')).region.value, 'x_{\\theta}');
+  const equation = (letter, label) => document('H=\\frac{\\sqrt[3]{' + letter + '}}{z}\\label{' + label + '}');
+  const printed = equation('q', 'eq:first');
+  const edited = equation('qr', 'eq:first');
+  assert.equal(changed(printed, edited).region.value, edited.blocks[0].editRegions[0].value);
+  const renamed = equation('qr', 'eq:second');
+  assert.equal(changed(printed, renamed), null);
+  const unknown = document('\\fracwithsideeffects{x}{2}');
+  assert.equal(changed(before, unknown), null);
+
+  function pair(a, b, gap = ' と ') {
+    const snapshot = document(a, { suffix: gap + '$' + b + '$' });
+    const column = snapshot.sources[0].text.lastIndexOf('$' + b + '$') + 2;
+    snapshot.blocks.push({ id: 'b2', editRegions: [{ id: 'b2:m', kind: 'math', value: b,
+      source: { file: FILE, start: { line: 1, column }, end: { line: 1, column: column + b.length } } }] });
+    return snapshot;
+  }
+  const base = pair('x', 'x'), both = pair('x_a', 'x_b');
+  const changes = diff(base, both, base.blocks);
+  assert.deepEqual(Array.from(changes, c => c.region.value), ['x_a', 'x_b']);
+  assert.equal(diff(base, both, base.blocks.slice(1)), null, 'an unaccounted earlier edit');
+  assert.equal(diff(base, pair('x_a', 'x_b', ' とも '), base.blocks), null, 'an edit between the formulas');
+  assert.equal(diff(base, pair('x', 'x_b'), base.blocks).length, 1, 'one edit undone');
+  const partial = diff(base, pair('x_a', 'x_{\\sq}'), base.blocks);
+  assert.deepEqual(Array.from(partial, c => c.state), ['ready', 'incomplete']);
+  const invalid = pair('x_a', 'x_b');
+  invalid.blocks[1].editRegions[0].source.start.line = 2;
+  assert.equal(diff(base, invalid, base.blocks), null, 'range points beyond the actual source line');
+
+});
+
+test('a macro degree attributed to the root resolves to its printed occurrence in the included file', async () => {
+  const first = { ...block('b1', 5, 6, [math('first', '3', 5, 12)]), type: 'paragraph', pages: [18] };
+  const second = { ...block('b2', 7, 8, [math('second', '3', 7, 12)]), type: 'paragraph', pages: [18] };
+  const boxes = [5, 7].map((line, i) => ({ id: line, file: FILE, line, page: 18, empty: false,
+    box: { left: 72, right: 300, top: 100 + i * 20, bottom: 111 + i * 20 } }));
+  const v = viewer({ boxes, printed: { 3: [[glyph('3', 210, 101)], [glyph('3', 210, 121)]] } });
+  const root = { file: '/doc/main.tex', line: 6, column: 1, anchors: [] };
+  const at = y => v.find({ blocks: [first, second] }, root, 18, { x: 212, y }, 7, still);
+  assert.equal((await at(104)).region.id, 'first');
+  assert.equal((await at(124)).region.id, 'second');
+  assert.equal(await at(115), null);
+});
+
+test('one formula in a long block of explicit paragraphs uses the printed source row', async () => {
+  const count = 601, line = 540;
+  const regions = Array.from({ length: count }, (_, n) => math('formula-' + (n + 1), 'q/z', n + 1, 6));
+  const paragraph = { ...block('book', 1, count, regions), type: 'paragraph', pages: [] };
+  const boxes = [{ id: 11, file: FILE, line, page: 18, box: { left: 150, right: 230, top: 212, bottom: 229 } }];
+  const formula = [glyph('q', 200, 212), glyph('z', 200, 221)];
+  const v = viewer({ boxes, printed: { 'q/z': [formula, [glyph('q', 200, 250), glyph('z', 200, 259)]] } });
+  const res = await v.find({ blocks: [paragraph] }, answer(line, [212]), 18, { x: 202, y: 215 }, 7, still);
+  assert.equal(res.region.id, 'formula-540');
+  assert.equal(res.printBounds.bottom, 229);
+});
+
+test('a numerator hit wins over the padded hit area of the previous denominator', () => {
+  const state = viewer({ printed: {} });
+  vm.runInContext(readFileSync(new URL('../web/direct-edit-geometry.js', import.meta.url), 'utf8'), state);
+  const extent = { left: 0, right: 100, top: 0, bottom: 40 };
+  const copy = (id, top) => ({ region: { id }, extent,
+    map: [glyph('q', 10, top), glyph('z', 10, top + 9)] });
+  state.copies = [copy('first', 0), copy('second', 16)];
+  const locate = vm.runInContext('y => inlineFormulaHit(copies, 18, { x: 12, y })?.region.id', state);
+  assert.equal(locate(17.5), 'second');
+  assert.equal(locate(16.5), undefined); // the two real glyph boxes overlap
 });

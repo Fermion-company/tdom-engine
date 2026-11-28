@@ -10,6 +10,7 @@ import { cropRenderTargets } from './render-chunks.js';
 import { buildIsolatedRenderSource } from './isolated-render-source.js';
 import { trailingGlueSpec } from './util/galley.js';
 import { withReplaceablePreviewJob } from './build-lease-preview.js';
+import { notePageArtLanding } from './page-art.js';
 
 const execFileP = promisify(execFile);
 
@@ -56,7 +57,7 @@ async function renderIdleGate(engine) {
     }
     const busy =
       engine.rescueQueue.size > 0 ||
-      engine.canonical.info().inFlight ||
+      engine.canonical.info().compiling ||
       Date.now() - (engine.lastEditAt ?? 0) < 3000;
     if (!busy) return true;
     await new Promise((r) => setTimeout(r, 500));
@@ -127,7 +128,7 @@ export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, as
         const run = execFileP('nice', ['-n', '15', 'lualatex', '-interaction=nonstopmode', 'iso.tex'], {
           cwd: jobdir,
           timeout: 90_000,
-          env: withProjectInputs(process.env, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
+          env: withProjectInputs(process.env, engine),
         });
         if (run.child) engine.isoChildren.add(run.child);
         await run.catch(() => {}).finally(() => {
@@ -148,9 +149,12 @@ export async function renderIsolatedBlock(engine, { block, idx, chunkTargets, as
             if (landing === 'held' && t.key !== block.id) continue;
             const chunk = staged.get(t.key);
             if (!chunk) continue;
-            chunk.v = Math.max(chunk.v ?? 0, (engine.chunks.get(t.key)?.v ?? 0) + 1);
+            const prev = engine.chunks.get(t.key);
+            chunk.v = Math.max(chunk.v ?? 0, (prev?.v ?? 0) + 1);
+            if (chunk.farInk && prev?.art && prev.forGalley === chunk.forGalley) chunk.art = prev.art;
             engine.chunks.set(t.key, chunk);
           }
+          if (landing === 'current') notePageArtLanding(engine, block.id);
         }
         if (landing === 'current' || landing === 'held') asyncRepaginate();
       } finally {

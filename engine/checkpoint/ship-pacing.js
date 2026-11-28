@@ -21,6 +21,8 @@
 const paintBlocked = (cmd) => cmd.op === 'canon' || cmd.op === 'pending-exact' ||
   (cmd.op === 'glyphs' && cmd.math) || (cmd.op === 'chunk' && cmd.st);
 
+export const displayListPaintable = (list) => !(list?.commands ?? []).some(paintBlocked);
+
 const DEFAULT_CATCHUP_MS = 900;
 const DEFAULT_IDLE_MS = 120_000;
 // After a viewer asked for canonical pixels, the next keystrokes of the
@@ -45,6 +47,13 @@ function chainReady(engine) {
     !engine.shipStale && !ship.err && !!ship.info?.().baselineReady;
 }
 
+// These surfaces paint a complete physical PDF. Its neighboring paragraphs
+// need no individual pictures before the edited paragraph can be shown.
+export function physicalReplayReady(engine) {
+  return (engine.previewPolicy === 'canonical-anchor' || engine.previewPolicy === 'shipping-exact') &&
+    chainReady(engine);
+}
+
 /** Keystrokes of this document are painted from resident pages. */
 export function residentSufficient(engine, pageCount = engine.pages?.length) {
   return engine.mode === 'structured' && engine.previewPolicy === 'structured' &&
@@ -59,8 +68,7 @@ export function residentSufficient(engine, pageCount = engine.pages?.length) {
 export function residentPaintable(engine, pages, patches, projectInputChanges) {
   if (!shipCatchupMs() || hasInputChanges(projectInputChanges)) return false;
   if (!chainReady(engine) || !residentSufficient(engine, pages.length)) return false;
-  return patches.every((patch) => patch.type !== 'replace-page' ||
-    !(patch.displayList?.commands ?? []).some(paintBlocked));
+  return patches.every((patch) => patch.type !== 'replace-page' || displayListPaintable(patch.displayList));
 }
 
 // While the canonical compile of the held revision runs, the catch-up waits

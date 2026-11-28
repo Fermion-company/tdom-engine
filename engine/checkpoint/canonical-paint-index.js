@@ -21,7 +21,7 @@ const BLACK = '#000000';
 // model's black as #000000.
 const PDFJS_CMYK_BLACK = '#2c2e35';
 
-export const PDF_PAINT_INDEX_VERSION = 2;
+export const PDF_PAINT_INDEX_VERSION = 3;
 
 /** Freeze the visible resident lines before the first edit against a
  * canonical generation. Spaces are TeX glue, not painted glyphs, so the
@@ -447,6 +447,131 @@ export function mixedGalleyFrameDifference(beforeFrame, afterFrame) {
   };
 }
 
+function spanInkBounds(runs) {
+  let left = Infinity, right = -Infinity;
+  for (const run of runs) {
+    if (!run.t) continue;
+    const ink = run.ink;
+    const measured = /^[\u3001-\u301b（）．，]$/u.test(run.t) && Array.isArray(ink) && ink.length === 2 &&
+      ink.every(Number.isFinite) && ink[0] < ink[1];
+    left = Math.min(left, run.x + (measured ? ink[0] : 0));
+    right = Math.max(right, run.x + (measured ? ink[1] : run.w));
+  }
+  return { left, right };
+}
+
+const resolvedHorizontalRule = r => r.rule && r.rv === 2 && r.rs === 0 && r.rdir === 'TLT' &&
+  r.w > 0 && r.h > 0 && [r.x, r.dy, r.w, r.h].every(Number.isFinite);
+
+// When a text edit moves the unchanged mathematics after it, reuse the
+// printed tail only if TeX translated every one of its runs by the same dx.
+function translatedMathTail(before, after, first, plain, backend) {
+  const start = before.findIndex((r, i) => i >= first && r.m);
+  const next = after.findIndex((r, i) => i >= first && r.m);
+  if (start <= first || next <= first || before.length - start !== after.length - next ||
+      !before.slice(first, start).every(plain) || !after.slice(first, next).every(plain)) return null;
+  const dx = after[next].x - before[start].x;
+  if (!Number.isFinite(dx) || Math.abs(dx) < EPSILON) return null;
+  const glyphs = [], rules = [];
+  for (let i = start; i < before.length; i++) {
+    const { x, ...old } = before[i], { x: newX, ...current } = after[next + i - start];
+    if (!sameNumber(newX - x, dx, 0.001) || JSON.stringify(old) !== JSON.stringify(current)) return null;
+    if (classifyResidentRun(before[i], backend).tag === 'LayoutOnly') continue;
+    // A fraction bar has a running TeX width. Its resolved painted width
+    // is harvested separately and must match an actual stroke in the PDF.
+    if (resolvedHorizontalRule(before[i])) {
+      rules.push({ left: x, right: x + old.w, top: old.dy, bottom: old.dy + old.h });
+      continue;
+    }
+    if (!old.t || old.rule || !(old.w > 0) || !(old.s > 0) ||
+        ![x, old.w, old.dy ?? 0, old.s].every(Number.isFinite) || UNSAFE_TEXT.test(old.t)) return null;
+    glyphs.push(before[i]);
+  }
+  if (!glyphs.length) return null;
+  const left = Math.min(...glyphs.map(r => r.x), ...rules.map(r => r.left));
+  const right = Math.max(...glyphs.map(r => r.x + r.w), ...rules.map(r => r.right));
+  const margin = Math.min(left - spanInkBounds(before.slice(first, start)).right,
+    left + dx - spanInkBounds(after.slice(first, next)).right);
+  if (!(margin >= 2) || !Number.isFinite(right)) return null;
+  return { start, next, dx, left: left - margin / 2, right: right + 1, glyphs, rules };
+}
+
+// Repaint native text only within a proven slot. The remaining frame must
+// match the printed base, including any rigid tail that will be copied.
+export function changedTextSpan(baseFrame, currentFrame, galley, baseLines, currentLines, isNative) {
+  if (baseFrame.length > 128 * 1024 || currentFrame.length > 128 * 1024) return null;
+  const before = parsedMixedFrame(baseFrame), after = parsedMixedFrame(currentFrame);
+  if (!before || !after || before.items.length !== after.items.length ||
+      before.gfx || before.floats.length || baseLines.length !== currentLines.length ||
+      baseLines.some((w, i) => Boolean(w) !== Boolean(currentLines[i]) || w &&
+        (!sameNumber(w.lineWidth, currentLines[i].lineWidth, EPSILON) ||
+         !sameNumber(w.height, currentLines[i].height, EPSILON) ||
+         !sameNumber(w.depth, currentLines[i].depth, EPSILON)))) return null;
+  const equal = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  let span = null, box = -1;
+  for (let i = 0; i < after.items.length; i++) {
+    const old = before.items[i], item = after.items[i];
+    if (item.k === 'box') box++;
+    if (equal(item, old)) continue;
+    if (span || item.k !== 'box' || item.fx || item.xb || item.ca || item.fm || baseLines[box] ||
+        !Array.isArray(item.runs) || !Array.isArray(old.runs) || !item.runs.some(r => r.m)) return null;
+    const plain = r => r.t && !r.rule && !r.m && !r.dy && isNative(r.f) ||
+      classifyResidentRun(r, galley.backend).tag === 'LayoutOnly';
+
+    // Peel off the identical outer runs. Text can grow, shrink or be
+    // re-spaced by TeX's glue, but every formula outside it must still
+    // paint exactly the same glyphs in exactly the same place.
+    let first = 0, oldEnd = old.runs.length, end = item.runs.length;
+    while (first < oldEnd && first < end && equal(old.runs[first], item.runs[first])) first++;
+    while (oldEnd > first && end > first && equal(old.runs[oldEnd - 1], item.runs[end - 1])) { oldEnd--; end--; }
+    while (first && plain(item.runs[first - 1])) first--;
+    while (end < item.runs.length && plain(item.runs[end])) { oldEnd++; end++; }
+    let tail = null;
+    if (old.runs.slice(first, oldEnd).some(r => r.m)) {
+      tail = translatedMathTail(old.runs, item.runs, first, plain, galley.backend);
+      if (!tail) return null;
+      oldEnd = tail.start;
+      end = tail.next;
+    }
+    const original = old.runs.slice(first, oldEnd), slice = item.runs.slice(first, end);
+    if (!original.every(plain) || !slice.every(plain)) return null;
+    const style = r => JSON.stringify([r.f, r.s, r.c ?? BLACK]);
+    const baseStyles = new Set(original.filter(r => r.t).map(style));
+    if (slice.some(r => r.t && !baseStyles.has(style(r)))) return null;
+    const witness = runs => boxLineWitness({ ...item, runs }, box, galley.backend, residentBackendProfileKey(galley.backend));
+    const oldWitness = witness(original), newWitness = witness(slice);
+    if (!oldWitness || !newWitness) return null;
+    const oldInk = spanInkBounds(original), newInk = spanInkBounds(slice);
+    const left = Math.min(oldInk.left, newInk.left), right = Math.max(oldInk.right, newInk.right);
+    const expands = left < oldInk.left || right > oldInk.right;
+    // Reserve space at both ends for glyph overhang and antialiasing.
+    const outside = [...item.runs.slice(0, first), ...(tail ? [] : item.runs.slice(end))];
+    for (const other of outside) {
+      if (classifyResidentRun(other, galley.backend).tag === 'LayoutOnly') continue;
+      if (!(other.t || tail && resolvedHorizontalRule(other)) || !Number.isFinite(other.x) || !Number.isFinite(other.w) ||
+          !(other.x + other.w <= left - 2 || other.x >= right + 2)) return null;
+    }
+    // SyncTeX may report the full line's overhanging punctuation even
+    // when the edited text occupies only an interior part of the line.
+    const glyphRuns = old.runs.filter(run => run.t);
+    oldWitness.frameLeft = Math.min(...glyphRuns.map(run => run.x));
+    oldWitness.frameRight = Math.max(...glyphRuns.map(run => run.x + run.w));
+    oldWitness.inkLeft = oldInk.left;
+    oldWitness.inkRight = oldInk.right;
+    oldWitness.partial = true;
+    newWitness.partial = true;
+    if (tail) oldWitness.translatedTail = tail;
+    span = { index: box, oldWitness, newWitness, runs: slice, inkLeft: left,
+      inkRight: tail ? Math.max(tail.right, tail.right + tail.dx, right) : right, expands: expands || Boolean(tail) };
+    after.items[i] = { ...item, runs: old.runs };
+  }
+  if (!span || !equal(after, before)) return null;
+  // The serialized frame omits ordinary glyph runs. Their PDF witnesses
+  // still have to be repainted whenever text wraps into or out of this row.
+  span.changedPlainLines = changedMixedGalleyLines(baseLines, currentLines) ?? [];
+  return span;
+}
+
 /** Mixed counterpart of changedGalleyLines: opaque boxes stay opaque and
  * unchanged (the caller compares frames), and only plain lines may change. */
 export function changedMixedGalleyLines(baseLines, currentLines) {
@@ -623,6 +748,7 @@ export function buildPdfPaintPage({ pageNumber, textContent, operatorList, viewp
   if (p < painted.length && extractedGlyphs.length) extractedGlyphs.at(-1).item.safe = false;
   while (e < extractedGlyphs.length) unpaired(extractedGlyphs[e++]);
   if (items.some((item) => item.glyphSizes.length !== Array.from(item.paintText).length)) return null;
+  const cropRules = items.every(item => item.safe) ? pageCropRules(operatorList, OPS, Util, viewport.transform) : null;
   return {
     page: pageNumber,
     items,
@@ -630,13 +756,14 @@ export function buildPdfPaintPage({ pageNumber, textContent, operatorList, viewp
     // The line index proves text geometry only: a background path, image,
     // transparency group or clip can otherwise hitchhike with a paragraph
     // and move when that galley is reused. This additional whole-page gate
-    // belongs only to the crop shortcut; canonical-anchor's line proof and
-    // existing eligibility remain unchanged.
-    cropSafe: items.every(item => item.safe) && cropPageHasOnlyTextPaint(operatorList, OPS),
+    // belongs to whole-galley crops. A translated tail may also own proved
+    // horizontal rules in its rectangle.
+    cropSafe: cropRules?.length === 0,
+    cropRules,
   };
 }
 
-function cropPageHasOnlyTextPaint(operatorList, OPS) {
+function pageCropRules(operatorList, OPS, Util, viewport) {
   const allowed = new Set([
     'dependency', 'save', 'restore', 'transform',
     'setLineWidth', 'setLineCap', 'setLineJoin', 'setMiterLimit', 'setDash',
@@ -648,20 +775,45 @@ function cropPageHasOnlyTextPaint(operatorList, OPS) {
     'setStrokeGray', 'setFillGray', 'setStrokeRGBColor', 'setFillRGBColor',
     'setStrokeCMYKColor', 'setFillCMYKColor',
   ].map(name => OPS[name]).filter(Number.isInteger));
+  const rules = [], stack = [];
+  let matrix = viewport;
   for (let index = 0; index < operatorList.fnArray.length; index++) {
     const op = operatorList.fnArray[index], args = operatorList.argsArray[index] ?? [];
-    if (op === OPS.setTextRenderingMode) {
-      if (Number(args[0]) !== 0) return false;
+    if (op === OPS.save) stack.push(matrix);
+    if (op === OPS.restore) {
+      if (!stack.length) return null;
+      matrix = stack.pop();
+    }
+    if (op === OPS.transform) matrix = Util.transform(matrix, args);
+    if (op === OPS.constructPath) {
+      // LuaTeX writes bars in a saved graphics state as a solid butt-cap
+      // stroke. Accept only that standalone move/line path and transform.
+      const prior = operatorList.fnArray, a = operatorList.argsArray;
+      const path = args[1]?.[0], width = a[index - 1]?.[0];
+      if (args[0] !== OPS.stroke || args[1]?.length !== 1 || path?.length !== 6 ||
+          path[0] !== 0 || path[3] !== 1 || path[2] !== path[5] || !(path[4] > path[1]) ||
+          prior[index - 5] !== OPS.save || prior[index - 4] !== OPS.transform ||
+          prior[index - 3] !== OPS.setDash || a[index - 3]?.[0]?.length !== 0 ||
+          prior[index - 2] !== OPS.setLineCap || a[index - 2]?.[0] !== 0 ||
+          prior[index - 1] !== OPS.setLineWidth || !Number.isFinite(width) || width <= 0 ||
+          prior[index + 1] !== OPS.restore || matrix[0] !== 1 || matrix[1] !== 0 ||
+          matrix[2] !== 0 || matrix[3] !== -1) return null;
+      const y = matrix[5] - path[2];
+      const rule = { left: matrix[4] + path[1], right: matrix[4] + path[4], top: y - width / 2, bottom: y + width / 2 };
+      if (!Object.values(rule).every(Number.isFinite)) return null;
+      rules.push(rule);
+    } else if (op === OPS.setTextRenderingMode) {
+      if (Number(args[0]) !== 0) return null;
     } else if (op === OPS.setGState) {
       // Only explicit opaque/default compositing is understood. Unknown
       // extended state (including soft masks and transfer functions) is not
       // evidence that a crop contains only its witnessed glyphs.
       if (!Array.isArray(args[0]) || args[0].some(([key, value]) =>
         !((key === 'ca' || key === 'CA') && value === 1 ||
-          key === 'BM' && (value === 'Normal' || value === 'source-over')))) return false;
-    } else if (!allowed.has(op)) return false;
+          key === 'BM' && (value === 'Normal' || value === 'source-over')))) return null;
+    } else if (!allowed.has(op)) return null;
   }
-  return true;
+  return stack.length ? null : rules;
 }
 
 /** Certify a unique full matching from every base resident line to a
@@ -669,14 +821,15 @@ function cropPageHasOnlyTextPaint(operatorList, OPS) {
 export function certifyCanonicalBlock({ witnesses, candidates, paintPages }) {
   if (!Array.isArray(witnesses) || !witnesses.length || !Array.isArray(candidates) ||
       !Array.isArray(paintPages) || paintPages.some((page) => !page)) return null;
-  const pageItems = new Map(paintPages.map((page) => [Number(page.page), page.items ?? []]));
+  const pagePaint = new Map(paintPages.map(page => [Number(page.page), page]));
   const physical = dedupeCandidates(candidates).map((candidate, candidateIndex) => ({
     candidateIndex,
     candidate,
-    pageItems: pageItems.get(Number(candidate.page)) ?? [],
+    paint: pagePaint.get(Number(candidate.page)),
   }));
   const edges = witnesses.map((witness) => physical
-    .filter((entry) => candidateMatchesWitness(entry.candidate, entry.pageItems, witness))
+    .filter(({ candidate, paint }) => paint && (!witness.translatedTail || paint.cropSafe === true || Array.isArray(paint.cropRules)) &&
+      candidateMatchesWitness(candidate, paint.items, witness, paint.cropRules))
     .map((entry) => ({ index: entry.candidateIndex, key: lineSlotKey(entry.candidate, witness) })));
   if (edges.some((options) => !options.length)) return null;
   // SyncTeX reports one line through several boxes: enclosing boxes that
@@ -716,8 +869,8 @@ function lineBoxFor(candidate, witness) {
   const left = Number(candidate.box.left);
   const right = Number(candidate.box.right);
   if (sameNumber(right - left, witness.lineWidth, BOX_TOLERANCE_BP)) return { left, right };
-  const visibleLeft = Math.min(0, witness.contentLeft);
-  const visibleRight = Math.max(witness.lineWidth, witness.contentRight);
+  const visibleLeft = Math.min(0, witness.frameLeft ?? witness.contentLeft);
+  const visibleRight = Math.max(witness.lineWidth, witness.frameRight ?? witness.contentRight);
   if (visibleRight - visibleLeft > witness.lineWidth + BOX_TOLERANCE_BP &&
       sameNumber(right - left, visibleRight - visibleLeft, BOX_TOLERANCE_BP)) {
     return { left: left - visibleLeft, right: left - visibleLeft + witness.lineWidth };
@@ -725,7 +878,35 @@ function lineBoxFor(candidate, witness) {
   return null;
 }
 
-export function candidateMatchesWitness(candidate, pageItems, witness) {
+// A text-only PDF page can still contain other lines or columns. Every
+// text item within the crop must account for consecutive harvested glyphs
+// at their actual offsets and baselines (including raised/lowered indices).
+function printedTailMatches(tail, items, origin, baseline, top, bottom) {
+  const glyphs = tail.glyphs;
+  let index = 0;
+  const cropped = items.filter(item => item.right > origin + tail.left && item.left < origin + tail.right &&
+    item.baseline >= top - ANCHOR_CROP_BLEED && item.baseline <= bottom + ANCHOR_CROP_BLEED);
+  for (const item of cropped) {
+    const first = glyphs[index];
+    if (!item.safe || !first || !sameNumber(item.left - origin, first.x, CONTENT_TOLERANCE_BP)) return false;
+    let count = 0, text = '';
+    while (text.length < item.paintText.length) {
+      const run = glyphs[index++];
+      if (!run || !sameNumber(item.baseline - baseline, run.dy ?? 0, BASELINE_TOLERANCE_BP)) return false;
+      text += run.t;
+      for (const _ of run.t) {
+        if (!sameNumber(item.glyphSizes[count], run.s, FONT_SIZE_TOLERANCE_BP) ||
+            item.glyphColors[count++] !== (run.c || BLACK).toLowerCase()) return false;
+      }
+    }
+    const end = glyphs[index - 1];
+    if (item.paintText !== text || !sameNumber(item.right - origin, end.x + end.w, CONTENT_TOLERANCE_BP)) return false;
+  }
+  return index === glyphs.length;
+}
+const ANCHOR_CROP_BLEED = 2;
+
+export function candidateMatchesWitness(candidate, pageItems, witness, pageRules = []) {
   const box = candidate?.box;
   const baseline = Number(candidate?.y);
   if (!validBox(box) || !Number.isFinite(baseline)) return false;
@@ -738,10 +919,33 @@ export function candidateMatchesWitness(candidate, pageItems, witness) {
   // line envelope after the PDF paint witness proves the baseline contents.
   const line = lineBoxFor(candidate, witness);
   if (!line || box.top > lineTop + BOX_TOLERANCE_BP || box.bottom < lineBottom - BOX_TOLERANCE_BP) return false;
+  const tail = witness.translatedTail;
+  if (tail) {
+    if (!printedTailMatches(tail, pageItems, line.left, baseline, lineTop, lineBottom)) return false;
+    // Outside this mask other bars stay on the immutable page. Inside it
+    // every stroke must belong to the translated tail, exactly once.
+    const actual = pageRules.filter(r => r.right >= line.left + witness.inkLeft - 1 &&
+      r.left <= line.left + tail.right + Math.max(0, tail.dx) + 1 &&
+      r.top <= lineBottom + ANCHOR_CROP_BLEED && r.bottom >= lineTop - ANCHOR_CROP_BLEED);
+    if (tail.rules.length !== actual.length) return false;
+    for (let i = 0; i < actual.length; i++) {
+      const r = tail.rules[i], pdf = actual[i];
+      if (!sameNumber(line.left + r.left, pdf.left, 0.035) || !sameNumber(line.left + r.right, pdf.right, 0.035) ||
+          !sameNumber(baseline + r.top, pdf.top, 0.035) || !sameNumber(baseline + r.bottom, pdf.bottom, 0.035)) return false;
+    }
+  }
+  const left = witness.partial ? line.left + witness.contentLeft : box.left;
+  const right = witness.partial ? line.left + witness.contentRight : box.right;
+  const inkLeft = line.left + (witness.inkLeft ?? witness.contentLeft);
+  const inkRight = line.left + (witness.inkRight ?? witness.contentRight);
+  if (witness.partial && pageItems.some(item => item.right > inkLeft + BOX_TOLERANCE_BP &&
+      item.left < inkRight - BOX_TOLERANCE_BP && item.baseline >= lineTop && item.baseline <= lineBottom &&
+      (!item.safe || Math.abs(item.baseline - baseline) > BASELINE_TOLERANCE_BP ||
+       item.left < left - BOX_TOLERANCE_BP || item.right > right + BOX_TOLERANCE_BP))) return false;
   const inside = pageItems.filter((item) =>
     item?.safe && Math.abs(Number(item.baseline) - baseline) <= BASELINE_TOLERANCE_BP &&
-    Number(item.left) >= box.left - BOX_TOLERANCE_BP &&
-    Number(item.right) <= box.right + BOX_TOLERANCE_BP
+    Number(item.left) >= left - BOX_TOLERANCE_BP &&
+    Number(item.right) <= right + BOX_TOLERANCE_BP
   ).sort((left, right) => left.left - right.left);
   if (!inside.length) return false;
   for (let index = 1; index < inside.length; index++) {

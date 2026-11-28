@@ -200,6 +200,8 @@ export async function runChainPass(engine, callbacks) {
       // A retired boundary needs prefix replay; merged work can also have
       // clean islands before its last frontier. Neither proves convergence.
       const staleFrom = Math.max(work.from, work.through ?? work.from);
+      // (body work only: the furniture witness replay has its own owner and
+      // frontier, runWitnessPass below)
       while (j < engine.blocks.length) {
         if (engine.bgAbort) {
           work.through = Math.max(work.from, work.through ?? work.from);
@@ -213,7 +215,10 @@ export async function runChainPass(engine, callbacks) {
         let galley;
         try {
           galley = await typesetBlock(j);
-        } catch {
+        } catch (err) {
+          // a failed input recovery owes the full rebuild (engine-v3
+          // #oweRecoveryRebuild): no resume over the same boundary
+          if (err?.tdomInputRecovery) throw err;
           work.through = Math.max(work.from, work.through ?? work.from);
           work.from = Math.min(work.from, j);
           return; // killed by an incoming edit — resume afterwards
@@ -259,6 +264,103 @@ export async function runChainPass(engine, callbacks) {
     engine.progress = null;
     // the settle/rebuild/after walks left checkpoints at every block they
     // re-typeset — collapse back to the grid
+    enforceCheckpointCap();
+  }
+}
+
+/**
+ * The furniture witness replay (engine-v3 #replayFurnitureWitness): every
+ * block of an established body typeset again from its own input, so that
+ * its galley records the furniture state of the current root and watch
+ * (`witness.ck`, `witness.version`). It is not body verification, and it is
+ * owned apart from it: it never sits in pendingChain (where a keystroke
+ * would be classified against it and verify its neighbour, A2), it stops at
+ * the next block boundary for input and resumes from its own frontier
+ * (`witness.from`), and it renders only blocks whose pixels the body
+ * already owes: an untouched cold picture stays cold (B3). A block the
+ * replay finds changed is body work after all; its successors are replayed
+ * anyway, and the changed labels go to an ordinary settle.
+ *
+ * Returns 'done', 'yielded' (an edit), 'stale' (another root or watch) or
+ * 'failed' (the typeset failed without an edit: a fork failure, B2).
+ */
+export async function runWitnessPass(engine, witness, callbacks) {
+  const { nearestCheckpoint, typesetBlock, adoptGalley, queueRender, asyncRepaginate, enforceCheckpointCap, current,
+    queueChainWork, bodyDue = () => false } = callbacks;
+  const yieldNow = () => engine.bgAbort || engine.editPending > 0 || bodyDue();
+  engine.bgActive = true;
+  engine.witnessActive = true;
+  // A boundary is kept every walkRetainMs of the replay (engine-v3 #jobBlock,
+  // as for a cold walk): a keystroke that ends a step loses at most that much,
+  // and the next pass starts there.
+  engine.walkRetains = true;
+  engine.walkRetainedAt = performance.now();
+  engine.walkRetainedIdx = null;
+  // (the replay observes an established body: the clean-replay admission may
+  // consume the continuations it does not retain)
+  const replayToken = {};
+  const labels = new Set();
+  let sinceRepaint = 0;
+  let labelFrom = null;
+  try {
+    // (from the nearest boundary at or before the frontier: the replay's own
+    // continuations do not outlive a pass)
+    let j = nearestCheckpoint(Math.min(witness.from, engine.blocks.length));
+    while (j < engine.blocks.length) {
+      if (!current()) return 'stale';
+      if (yieldNow()) return 'yielded';
+      engine.progress = { phase: 'witness', at: j + 1, total: engine.blocks.length };
+      const block = engine.blocks[j];
+      const before = { hash: block.galley?.tdomColdPreview ? null : block.galleyHash, state: block.stateVec };
+      let galley;
+      try {
+        galley = await typesetBlock(j, replayToken);
+      } catch (err) {
+        if (err?.tdomInputRecovery) throw err;
+        if (yieldNow()) return 'yielded';
+        witness.lastError = err?.message ?? String(err);
+        return 'failed';
+      }
+      adoptGalley(block, galley);
+      for (const l of galley.labels ?? []) {
+        if (engine.labelTable.get(l.k) !== l.v) {
+          labels.add(l.k);
+          labelFrom ??= j + 1;
+          engine.labelTable.set(l.k, l.v);
+        }
+        if (l.h != null) engine.hrefTable.set(l.k, l.h);
+      }
+      const changed = block.galleyHash !== before.hash || block.stateVec !== before.state;
+      // (pixels only where the body scheduler already holds or wants them)
+      const owned = engine.chunks.has(block.id) || engine.renderWant.has(block.id) ||
+        engine.renderBusy?.has(block.id) || engine.isoRenderPending?.has(block.id);
+      const stale = owned && block.needsRender && galley.capture &&
+        engine.chunks.get(block.id)?.forGalley !== block.galleyHash;
+      if (changed && owned && block.needsRender && !stale) queueRender(block.id);
+      if (changed && ++sinceRepaint >= 8) {
+        asyncRepaginate();
+        sinceRepaint = 0;
+      }
+      j++;
+      witness.from = Math.max(witness.from, j);
+      if (stale) {
+        // (its capture is resident now: ship it before the walk moves on)
+        queueRender(block.id, { propagation: true });
+        while (!yieldNow() && (engine.renderWant.has(block.id) || engine.renderBusy?.has(block.id))) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        if (yieldNow()) return 'yielded';
+      }
+    }
+    asyncRepaginate();
+    return 'done';
+  } finally {
+    endWalkRetain(engine);
+    // (a label the replay moved is body work: its references, an ordinary settle)
+    if (labels.size) queueChainWork('settle', labelFrom, [...labels]);
+    engine.bgActive = false;
+    engine.witnessActive = false;
+    engine.progress = null;
     enforceCheckpointCap();
   }
 }

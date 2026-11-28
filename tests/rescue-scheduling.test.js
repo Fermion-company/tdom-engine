@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rescueWaitMs, waitForRescueChange, wakeRescues } from '../engine/checkpoint/rescue-scheduling.js';
+import { coldResumeAhead, rescueWaitMs, waitForRescueChange, wakeRescues } from '../engine/checkpoint/rescue-scheduling.js';
 import { renderIsoPages } from '../engine/checkpoint/iso-pages.js';
 
 const engine = () => ({ coldDirty: new Set(), rescueFocus: new Set(), lastEditAt: 1000 });
@@ -41,6 +41,28 @@ test('rescue wake is a notification; current foreground and unrelated cold work 
   e.coldDirty = new Set(['box']);
   e.pendingChain = { kind: 'cold' };
   assert.equal(rescueWaitMs(e, 'box', 1020), 0);
+});
+
+test('the adopt walk gives way to a cold resume by the rule the pump waits on (tex64-internal #121)', () => {
+  const e = engine();
+  e.rescueFocus.add('box');
+  assert.equal(coldResumeAhead(e, 'box'), false);
+  // owed only for this block: the pump goes at once and the walk keeps going
+  // (it re-typesets the same path, #94) instead of giving way at once
+  e.coldDirty = new Set(['box']);
+  e.pendingChain = { kind: 'cold' };
+  assert.equal(coldResumeAhead(e, 'box'), false);
+  assert.equal(rescueWaitMs(e, 'box', 1020), 0);
+  // owed for another block too, or for a block another walk already typeset
+  // (the resume still owes the keystroke its report): both wait and give way
+  for (const dirty of [['box', 'other'], ['other'], []]) {
+    e.coldDirty = new Set(dirty);
+    assert.equal(coldResumeAhead(e, 'box'), true, JSON.stringify(dirty));
+    assert.equal(rescueWaitMs(e, 'box', 1020), 200, JSON.stringify(dirty));
+  }
+  e.pendingChain = null;
+  e.coldDirty = new Set(['box']);
+  assert.equal(coldResumeAhead(e, 'box'), false, 'the resume update of this very block (#94)');
 });
 
 test('backlog retains its quiet gate and uses only the remaining delay', () => {

@@ -57,6 +57,14 @@ export async function bootRoot(
       : 'plain';
   engine.hf = new Map();
   engine.hfSig = null;
+  engine.hfWatchContents = undefined;
+  engine.hfWatchVersion = null;
+  engine.hfWatchFolio = false;
+  engine.hfLiteralRoot = false;
+  if (engine.canonical) engine.canonical.furnitureWatch = '';
+  // (a header job forks this root's checkpoint 0: what it made from another
+  // root is not published, header-scheduler.js)
+  engine.rootBoots = (engine.rootBoots ?? 0) + 1;
   writeFileSync(path.join(engine.workDir, 'driver.tex'), driverSource(preamble));
 
   // The aux family is a BYPRODUCT of the previous process tree, not state:
@@ -84,7 +92,7 @@ export async function bootRoot(
       // and keep the root's stdout pipe open, pinning the host process alive
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: withProjectInputs(process.env, { docDir: engine.docDir, overlayDir: engine.overlayDir }),
+      env: withProjectInputs(process.env, engine),
     }
   );
   let rootLog = '';

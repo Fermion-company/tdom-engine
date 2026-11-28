@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { buildPagePatches } from '../engine/checkpoint/page-patches.js';
@@ -93,6 +93,70 @@ test('complete resident growth remains prompt from a compatible baseline', () =>
   viewer.stageProvisionalPatches([replace(pageList(2)), replace(pageList(3))], true, 3);
   assert.equal(viewer.pageDivs.size, 3);
   assert.equal(viewer.pageDivs.get(3).dataset.provRev, '2');
+});
+
+// tex64-internal #121: an inserted lesson moved the back cover to a new last
+// page while canonical compiled a half-typed source, failed, and waited 94 s
+// to try again; the frame kept the old count and the back cover was out of
+// reach. A page only canonical can paint (its TikZ cover: op 'canon') never
+// becomes ready without one.
+const failedCanonical = (viewer) => {
+  viewer.canonical = { ...viewer.canonical, error: '! Undefined control sequence.', errorRev: viewer.appliedSrcRev };
+};
+const cover = (page) => pageList(page, [{ op: 'canon', src: 'b9' }]);
+
+test('the settled resident count makes a new last page reachable, canonical compiling an older source or failed', () => {
+  for (const state of ['compiling', 'failed']) {
+    const viewer = provisionalViewer([pageList(1), pageList(2)]);
+    if (state === 'failed') failedCanonical(viewer);
+    else viewer.canonical = { ...viewer.canonical, runningRev: 1 };
+    // the page typed on waits for its exact ink, in sight; the cover moved on to page 3
+    viewer.stageProvisionalPatches([replace(pageList(2, [{ op: 'pending-exact', src: 'b2' }])), replace(cover(3))], true, 3);
+    assert.deepEqual([...viewer.pageDivs.keys()], [1, 2, 3], `${state}: the new last page has its place`);
+    assert.equal(viewer.pageDivs.get(2).paper, 'canonical:1:2', `${state}: the page in sight keeps what it shows until its ink lands`);
+  }
+});
+
+test('a stalled canonical leaves a shrink to the settled resident count', () => {
+  const shrink = (viewer) => viewer.stageProvisionalPatches([replace(cover(2)), { type: 'remove-pages', from: 3 }], true, 2);
+  // the lesson is deleted again: the cover comes back to page 2, page 3 goes
+  const failed = provisionalViewer([pageList(1), pageList(2), pageList(3)]);
+  failedCanonical(failed);
+  shrink(failed);
+  assert.deepEqual([...failed.pageDivs.keys()], [1, 2], 'the obsolete tail is removed');
+  // a removal alone, too
+  const alone = provisionalViewer([pageList(1), pageList(2), pageList(3)]);
+  failedCanonical(alone);
+  alone.stageProvisionalPatches([{ type: 'remove-pages', from: 3 }], true, 2);
+  assert.deepEqual([...alone.pageDivs.keys()], [1, 2]);
+  // a canonical compiling this revision is waited for, as before
+  const compiling = provisionalViewer([pageList(1), pageList(2), pageList(3)]);
+  compiling.canonical = { ...compiling.canonical, runningRev: compiling.appliedSrcRev };
+  shrink(compiling);
+  assert.deepEqual([...compiling.pageDivs.keys()], [1, 2, 3]);
+  // and a page the resident paints is waited for while it is in sight
+  const owed = provisionalViewer([pageList(1), pageList(2), pageList(3)]);
+  failedCanonical(owed);
+  owed.stageProvisionalPatches([replace(pageList(2, [{ op: 'pending-exact', src: 'b2' }])), { type: 'remove-pages', from: 3 }], true, 2);
+  assert.deepEqual([...owed.pageDivs.keys()], [1, 2, 3]);
+  owed.provisionalStages.get(2).ready = true;
+  owed.tryCommitProvisionalStages();
+  assert.deepEqual([...owed.pageDivs.keys()], [1, 2]);
+});
+
+test('a shrink held while this revision compiles goes when that compile fails, the last event', () => {
+  const viewer = provisionalViewer([pageList(1), pageList(2), pageList(3)]);
+  viewer.canonical = { ...viewer.canonical, runningRev: viewer.appliedSrcRev };
+  viewer.stageProvisionalPatches([replace(cover(2)), { type: 'remove-pages', from: 3 }], true, 2);
+  assert.deepEqual([...viewer.pageDivs.keys()], [1, 2, 3], 'held for the compile of this revision');
+  // its failure is the last event: no edit or render follows it
+  viewer.canonical = { ...viewer.canonical, runningRev: null, error: '! Undefined control sequence.', errorRev: viewer.appliedSrcRev };
+  viewer.retryCommitAfterCanonicalStall();
+  assert.deepEqual([...viewer.pageDivs.keys()], [1, 2], 'the obsolete tail goes on the failure itself');
+  // (the frame's canonical event is what calls it)
+  const app = readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
+  const handler = app.slice(app.indexOf("if (msg.kind === 'canonical') {"), app.indexOf("if (msg.kind === 'canonical-anchor') {"));
+  assert.match(handler, /syncCanonical\(\);\s*retryCommitAfterCanonicalStall\(\);/);
 });
 
 test('beamer uses real page output, including class options and LoadClass', () => {

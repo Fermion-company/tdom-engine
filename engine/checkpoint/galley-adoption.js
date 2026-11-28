@@ -47,6 +47,25 @@ export function exitStateVec(galley, counters) {
   ]);
 }
 
+/** Whether two chunk PDFs (Buffers, or absent) hold the same bytes. */
+export function samePdf(a, b) {
+  if (a === b) return true;
+  return !!a && !!b && a.length === b.length && Buffer.compare(a, b) === 0;
+}
+
+/** The galleyHash a block would record for `galley`, without adopting it
+ * (the identity adoptGalleyBlock hashes). */
+export function galleyIdentityHash(block, galley) {
+  // A page-state witness has a position in the stream, but its values
+  // describe furniture. Keep counter-only changes out of the body hash.
+  const events = galley.events?.map((event) => event.k === 'hfstate' ? { k: 'hfstate' } : event);
+  const identity = [galley.items, galley.floats, galley.w, galley.h, galley.d, events];
+  if (galley.gfx) identity.push(galley.tdomStale ? galley.tdomPaintSourceHash : block.hash);
+  if (galley.gfx && galley.tdomColdPreview) identity.push('cold-preview');
+  if (galley.tdomTate) identity.push('vertical-list');
+  return fnv1a(JSON.stringify(identity));
+}
+
 export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, applyFidelity }) {
   const reusedStaleGalley = !!galley.tdomStale;
   // (a rescue's own chunks, or a galley carried over stale, are laid out anew)
@@ -56,18 +75,15 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
     : null;
   holdExactGalley(block, galley, chunks);
   block.galley = galley;
-  const identity = [galley.items, galley.floats, galley.w, galley.h, galley.d, galley.events];
+  if (galley.furniture && !reusedStaleGalley) galley.furniture.source ??= block.text;
   // PDF literals/resources are not glyph runs: changing only a gradient or
   // underlay must invalidate its exact chunk even when every box is identical.
-  if (galley.gfx) {
-    if (!reusedStaleGalley) galley.tdomPaintSourceHash = block.hash;
-    identity.push(galley.tdomPaintSourceHash);
-  }
   // A cold preview (docs/10 §10.4b) paints graphics from another lineage's
   // state (a \tcbset between its checkpoint and the block): the galley that
   // replaces it must not keep those pixels. Glyph and math chunks carry on.
-  if (galley.gfx && galley.tdomColdPreview) identity.push('cold-preview');
-  block.galleyHash = fnv1a(JSON.stringify(identity));
+  // (both are part of galleyIdentityHash)
+  if (galley.gfx && !reusedStaleGalley) galley.tdomPaintSourceHash = block.hash;
+  block.galleyHash = galleyIdentityHash(block, galley);
   if (galley.tdomIsoChunks) {
     // Isolated rescue bypasses buildJobBlockBody, which normally records
     // editable source spans. Its real PDF still contains editable prose
@@ -83,8 +99,16 @@ export function adoptGalleyBlock(block, galley, { counters, chunks, headingRe, a
       // version of it: a new version made the viewer fetch and decode the
       // picture again on every keystroke (202 KB for one box), and the
       // server read its glyph positions from the PDF again.
+      // The PDF is compared by its bytes: a result read back from the disk
+      // cache (iso-disk-cache.js) after the memory cache let it go brings
+      // the same bytes in a new buffer. Compared by object, every rescue a
+      // walk passed over became a new version, and every page holding one
+      // was sent to the viewer again: on the 30-page booklet a lesson typed
+      // before the appendix re-sent pages 3-31, and a page whose other
+      // pictures had never been rendered (cold, never looked at) could then
+      // not be shown until the next canonical (tex64-internal #121, p26).
       if (prev && prev.svg === c.svg && prev.wBp === c.wBp && prev.logicalWBp === c.logicalWBp &&
-          prev.xBp === c.xBp && prev.hBp === c.hBp && prev.editPdf === c.editPdf && prev.editPage === c.editPage &&
+          prev.xBp === c.xBp && prev.hBp === c.hBp && samePdf(prev.editPdf, c.editPdf) && prev.editPage === c.editPage &&
           prev.editX === c.editX && prev.editY === c.editY) {
         prev.forGalley = block.galleyHash;
         continue;

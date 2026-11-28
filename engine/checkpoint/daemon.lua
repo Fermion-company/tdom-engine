@@ -30,6 +30,79 @@ local WORKDIR = ''
 local COUNTERS = {}
 local CKPT = 0
 local JOB = nil -- set in a freshly forked job child
+local Furniture = (function()
+  local filename = debug.getinfo(1, 'S').source:match('^@(.*[/])') .. 'furniture-state.lua'
+  local loaded
+  return function()
+    loaded = loaded or dofile(filename)
+    return loaded
+  end
+end)()
+local furniture = {}
+local furniture_clock = os.gettimeofday or os.clock
+local paragraph_hooks = { 'para/before', 'para/begin', 'para/end', 'para/after' }
+local paragraph_callbacks_safe
+
+local function paragraph_hooks_empty()
+  for _, name in ipairs(paragraph_hooks) do
+    local code = token.get_macro('__hook ' .. name) or ''
+    if code ~= '' and (code:gsub('%s+', '') ~= '\\__hook_toplevel' .. name .. '\\__hook_next' .. name) then return false end
+    if (token.get_macro('__hook_toplevel ' .. name) or '') ~= '' or
+        (token.get_macro('__hook_next ' .. name) or '') ~= '' then return false end
+  end
+  return true
+end
+
+local function can_carry_furniture()
+  if not JOB.sourceCatcodesSafe or JOB.activeChars ~= '' or not furniture.last or
+      furniture.lastVersion ~= furniture.version or not TDOM_PARAGRAPH_CONTROLS then return false end
+  local ok, everypar = pcall(tex.gettoks, 'everypar')
+  if not ok or everypar ~= '' or not paragraph_hooks_empty() or not paragraph_callbacks_safe() then return false end
+  for name, baseline in pairs(TDOM_PARAGRAPH_CONTROLS) do
+    if (token.get_meaning(name) or false) ~= baseline then return false end
+  end
+  return true
+end
+
+local function furniture_snapshot()
+  if not JOB or not JOB.furnitureWatch or JOB.had_error then return end
+  return Furniture().capture(furniture.base, false, furniture.pinned, JOB.furnitureWatch)
+end
+
+local function set_furniture_watch(version)
+  if version == furniture.version then return end
+  local read = loadfile(WORKDIR .. '/tdom-hf-base-' .. version, 't', {})
+  if not read then return end
+  furniture.names, furniture.base = read()
+  furniture.prior = furniture.prior or md5.sumhexa('[]')
+  furniture.version = version
+  furniture.pinned = nil
+  furniture.last = nil
+end
+
+local function write_furniture_base(version, contents, plainParagraph)
+  if plainParagraph and not TDOM_PARAGRAPH_CONTROLS then
+    TDOM_PARAGRAPH_CONTROLS = {}
+    for _, name in ipairs({ 'par', '@@par', 'endgraf', 'g__para_standard_everypar_tl', 'hook_use:n',
+      '@kernel@before@para@before', '@kernel@before@para@begin', '@kernel@after@para@end', '@kernel@after@para@after' }) do
+      TDOM_PARAGRAPH_CONTROLS[name] = token.get_meaning(name) or false
+    end
+  end
+  local names = {}
+  for name in contents:gmatch('[^\n]+') do names[#names + 1] = name end
+  local baseline = Furniture().capture(nil, false, nil, names, true)
+  for name, value in pairs(Furniture().capture(nil, false, nil, {})) do baseline[name] = value end
+  local file = assert(io.open(WORKDIR .. '/tdom-hf-base-' .. version, 'w'))
+  file:write('return {')
+  for _, name in ipairs(names) do file:write(string.format('%q,', name)) end
+  file:write('},{')
+  for name, value in pairs(baseline) do file:write(string.format('[%q]=%q,', name, value)) end
+  file:write('}')
+  file:close()
+  set_furniture_watch(version)
+  furniture.pinned = Furniture().pinBaseline(furniture.base)
+end
+
 -- fault injection (tests): 'FAULT FORKFAIL <n>' makes the next n fork()
 -- attempts report failure; 'FAULT WEDGE <n>' makes the next n fork children
 -- hang before ever connecting (a wedged lineage). Counters live per process,
@@ -119,6 +192,8 @@ local function bp(sp) return math.floor(((sp or 0) / SP2BP) * 1000000 + 0.5) / 1
 
 local DUMMY_ATTR = 8123
 local LASTSKIP_ATTR = 8124 -- marks the \lastskip primer glue (see tdom_prime_lastskip)
+local HLIST = node.id('hlist')
+local VLIST = node.id('vlist')
 -- The build_page call that moved a top-level node (see note_trail). The
 -- canonical-anchor proof reads it, so it takes an allocated attribute rather
 -- than a fixed number a document could also set; the daemon loads after the
@@ -191,7 +266,12 @@ local function note_trail(info)
   local epoch = #blk_trail + 1
   local n = EPOCH_ATTR and tex.lists.contrib_head
   while n do
-    if not node.has_attribute(n, EPOCH_ATTR) then node.set_attribute(n, EPOCH_ATTR, epoch) end
+    if not node.has_attribute(n, EPOCH_ATTR) then
+      node.set_attribute(n, EPOCH_ATTR, epoch)
+      if furniture.trackFolio and JOB and not RENDER_MODE and (n.id == HLIST or n.id == VLIST) and not node.has_attribute(n, DUMMY_ATTR) then
+        furniture.bodySinceEject = true
+      end
+    end
     n = n.next
   end
   local nest = tex.nest[0]
@@ -594,12 +674,28 @@ local function scan_paint_callbacks(late)
   end
 end
 
+-- The node filters used by supported glyph shaping and Japanese line
+-- breaking do not execute a paragraph's text as TeX assignments.
+local plain_filters = {
+  ['pre_linebreak_filter\0luaotfload.node_processor'] = true,
+  ['post_linebreak_filter\0luaotfload.harf.finalize_vlist'] = true,
+  ['hpack_filter\0luaotfload.node_processor'] = true,
+  ['hpack_filter\0luaotfload.harf.finalize_hlist'] = true,
+}
+paragraph_callbacks_safe = function()
+  for key in pairs(paint_seen) do
+    if not plain_filters[key] then return false end
+  end
+  return true
+end
+
 function tdom_geo()
   local function dim(name)
     local ok, v = pcall(function() return tex.dimen[name] end)
     return ok and bp(v or 0) or 0
   end
   local geo = {
+    fancyhdr = token.is_defined('fancyhead') or nil,
     -- The PDF canvas is LuaTeX's actual output page, not necessarily the
     -- LaTeX layout registers. With a site-wide A4 pdftexconfig, plain
     -- article leaves \paperwidth at Letter while LuaTeX ships an A4
@@ -608,6 +704,10 @@ function tdom_geo()
     -- publish the same canvas dimensions the PDF backend will ship.
     paperwidth = bp(tex.pagewidth or tex.dimen.paperwidth or 0),
     paperheight = bp(tex.pageheight or tex.dimen.paperheight or 0),
+    -- the document's own (the driver sets both to -1in after this report so
+    -- that render children ship tight pages; page-art.js ships on the paper)
+    hoffset = bp(tex.hoffset or 0),
+    voffset = bp(tex.voffset or 0),
     textwidth = dim('textwidth'),
     columnwidth = dim('columnwidth'),
     columnsep = dim('columnsep'),
@@ -634,6 +734,13 @@ function tdom_geo()
     lineskipsh = bp(tex.lineskip.shrink or 0),
     lineskipsho = tex.lineskip.shrink_order or 0,
   }
+  -- The driver is already inside the document, after class and begin hooks.
+  -- LuaTeX's own box direction is still horizontal in LuaTeX-ja tate mode.
+  local ltj = luatexja
+  if ltj and ltj.direction and ltj.direction.get_dir_count then
+    local dir = ltj.direction.get_dir_count()
+    if dir and dir > 0 then geo.writingDirection = dir == ltj.dir_table.dir_yoko and 'yoko' or 'tate' end
+  end
   local callbacks = {}
   for _, name in ipairs(PAINT_CALLBACKS) do
     local ok, desc = pcall(function() return luatexbase.callback_descriptions(name) end)
@@ -762,12 +869,43 @@ end
 -- occur, so the page builder knows which page each event lands on even when
 -- one block spans several pages. The header/footer boxes themselves are
 -- typeset by TeX (tdom_hf_*) — nothing is invented.
-function tdom_event(kind, a, b)
+-- (the value of tex.nest's mode in a paragraph: tex.getmodevalues)
+local HMODE = nil
+local function paragraph_mode(mode)
+  if HMODE == nil then
+    HMODE = false
+    local ok, values = pcall(tex.getmodevalues)
+    for value, name in pairs(ok and values or {}) do
+      if name == 'horizontal' then HMODE = value end
+    end
+  end
+  return HMODE and mode == HMODE
+end
+
+function tdom_event(kind, a, b, outer)
+  if RENDER_MODE and (kind == 'fancy' or kind == 'fpstyle') then return end
   blk_events[#blk_events + 1] = { k = kind, a = a, b = b }
   local ok, err = pcall(function()
     local m = node.new('whatsit', node.subtype('special'))
     m.data = 'tdom:ev:' .. (#blk_events - 1)
-    node.write(m)
+    -- In a paragraph the marker stayed inside its line, where the item
+    -- stream does not look for it, and the event reached no page (a body
+    -- \floatpagestyle after a sentence, audit/scratch r9 float-fixture):
+    -- like a \mark, it leaves the line after it (\vadjust).
+    if outer and tex.nest.ptr > 0 then
+      -- A global page assignment takes effect while TeX is still building
+      -- the paragraph/box, even if that material later moves or is thrown
+      -- away. Anchor uncertainty before it on the surrounding page list.
+      local list = tex.nest[0]
+      node.insert_after(list.head, list.tail, m)
+      list.tail = m
+    elseif paragraph_mode(tex.nest[tex.nest.ptr].mode) then
+      local adjust = node.new('adjust')
+      adjust.head = m
+      node.write(adjust)
+    else
+      node.write(m)
+    end
   end)
   if os.getenv('TDOM_TRACE_EV') then
     texio.write_nl('term and log', 'TDOMEV ' .. kind .. ' idx=' .. (#blk_events - 1) ..
@@ -804,6 +942,15 @@ function tdom_num(name, value)
   geo_extra[name] = tonumber(value) or 0
 end
 
+-- The final clearpage is synthesized by the JS page builder. Read the live
+-- newpage definition so older formats and classes using plain vfil keep
+-- their original behavior.
+function tdom_newpage_geometry()
+  local body = (token.get_macro('newpage') or ''):gsub('%s+', '')
+  local correction = [[\ifdim\prevdepth>\z@\vskip-\ifdim\prevdepth>\maxdepth\maxdepth\else\prevdepth\fi\fi\vfil]]
+  tdom_num('newpageDepthCorrection', body:find(correction, 1, true) and 1 or 0)
+end
+
 -- full glue parameters: natural, stretch, shrink + orders (driver sends the
 -- components via \gluestretch etc. so nothing is approximated)
 function tdom_glue(name, w, st, sh, sto, sho)
@@ -829,8 +976,6 @@ end
 -- ------------------------------------------------------- galley walking
 
 local GLYPH = node.id('glyph')
-local HLIST = node.id('hlist')
-local VLIST = node.id('vlist')
 local RULE = node.id('rule')
 local GLUE = node.id('glue')
 local KERN = node.id('kern')
@@ -1073,6 +1218,16 @@ end
 -- math boundary nodes, so \mathrm and other text-font math remain identifiable.
 
 local walk_h, walk_v
+local ltj_dirs = luatexja and luatexja.dir_table
+local ltj_dir_attr = ltj_dirs and luatexbase.attributes['ltj@dir']
+local ltj_dir_id = ltj_dirs and luatexja.userid_table.DIR
+local ltj_user_whatsit = node.subtype('user_defined')
+
+local function note_vertical_list(n)
+  if not JOB or JOB.tate or not ltj_dir_attr or n.subtype ~= ltj_user_whatsit or n.user_id ~= ltj_dir_id then return end
+  local dir = node.has_attribute(n, ltj_dir_attr)
+  if dir and dir > 0 and dir ~= ltj_dirs.dir_yoko then JOB.tate = true end
+end
 
 local function leader_rule(n)
   if node.getleader then
@@ -1094,10 +1249,29 @@ local function emit_leader_rule(n, parent, x, dy0, out)
   return true
 end
 
-walk_h = function(head, parent, x0, dy0, out, math_mode)
+-- (punctuation_ink is walk_h's alone, in a block: the main chunk is near
+-- Lua's limit of 200 locals)
+do
+-- Japanese punctuation can have a full-em PDF advance but a much smaller
+-- outline. Capture the real native glyph's horizontal bounds, in bp from
+-- its origin. Unmeasured or transformed fonts keep their full advance.
+local function punctuation_ink(f, ch, cp, n)
+  if not f or not ch or ch.commands or f.type == 'virtual' or
+      (f.slant or 0) ~= 0 or (f.extend or 1000) ~= 1000 or
+      (f.squeeze or 1000) ~= 1000 or (f.mode or 0) ~= 0 or
+      (n.expansion_factor or 0) ~= 0 then return nil end
+  local desc = f.descriptions and f.descriptions[cp]
+  local box = desc and desc.boundingbox
+  local factor = f.parameters and f.parameters.hfactor
+  if not box or not ch.index or desc.index ~= ch.index or not factor or factor <= 0 or
+      type(box[1]) ~= 'number' or type(box[3]) ~= 'number' or box[1] >= box[3] then return nil end
+  return {bp(box[1] * factor), bp(box[3] * factor)}
+end
+
+walk_h = function(head, parent, x0, dy0, out, math_mode, continued_math)
   local x = x0
   local run = nil
-  local in_math = math_mode and true or false
+  local in_math = math_mode or continued_math or false
   local function flush()
     if run and #run.g > 0 then
       run.w = math.max(0, x - run.x)
@@ -1139,7 +1313,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       -- TeX's math machinery (variants, extensibles, italic correction).
       -- Either way the LINE needs an exact preview chunk; the twin/glyph
       -- approximation is at best a brief bridge until it lands.
-      if legacy or (fi and fi.mth) then
+      if in_math or legacy or (fi and fi.mth) then
         line_x = true
       end
       -- (a run that is shown as exact pixels says where each of its glyphs
@@ -1164,6 +1338,12 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       local fdata = font.getfont(n.font)
       local cinfo = fdata and fdata.characters and fdata.characters[n.char]
       if cinfo then
+        if #run.g == 1 and not in_math and ((c >= 0x3001 and c <= 0x301b) or
+            c == 0xff08 or c == 0xff09 or c == 0xff0c or c == 0xff0e) then
+          run.ink = punctuation_ink(fdata, cinfo, c, n)
+        elseif run.ink then
+          run.ink = nil
+        end
         if bp(cinfo.height or 0) > run.gh then run.gh = bp(cinfo.height or 0) end
         if bp(cinfo.depth or 0) > run.gd then run.gd = bp(cinfo.depth or 0) end
       end
@@ -1207,7 +1387,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
       -- browser glyph path by default
       flush()
       line_x = true
-      in_math = not in_math
+      in_math = math_mode or n.subtype == 0
       -- \mathsurround travels on the math node (kern-like, or glue in
       -- LuaTeX's mathsurroundskip form); zero in almost every document
       local mw = 0
@@ -1224,6 +1404,7 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
         node.free(fake)
       end
     elseif id == WHATSIT then
+      note_vertical_list(n)
       note_fx(n)
       if COL_SUB and n.subtype == COL_SUB then
         flush()
@@ -1245,17 +1426,26 @@ walk_h = function(head, parent, x0, dy0, out, math_mode)
     n = n.next
   end
   flush()
+  return in_math
 end
+end
+
+-- A paragraph may break inside inline math. Only its line hboxes share
+-- the open math state; nested boxes have their own lists. (HLIST subtype 1
+-- is a paragraph line; a literal, not a local: see punctuation_ink.)
 
 walk_v = function(box, x0, baseline_dy, out, math_mode)
   -- box is a vlist whose baseline sits at baseline_dy; contents start at its top
   local y = baseline_dy - bp(box.height or 0)
   local n = box.list
+  local continued_math = false
   while n do
     local id = n.id
     if id == HLIST then
       local base = y + bp(n.height or 0)
-      walk_h(n.list, n, x0 + bp(n.shift or 0), base, out, math_mode)
+      local is_line = n.subtype == 1
+      local open = walk_h(n.list, n, x0 + bp(n.shift or 0), base, out, math_mode, is_line and continued_math)
+      if is_line then continued_math = open end
       y = y + bp(n.height or 0) + bp(n.depth or 0)
     elseif id == VLIST then
       walk_v(n, x0 + bp(n.shift or 0), y + bp(n.height or 0), out, math_mode)
@@ -1275,6 +1465,7 @@ walk_v = function(box, x0, baseline_dy, out, math_mode)
     elseif id == KERN then
       y = y + bp(n.kern or 0)
     elseif id == WHATSIT then
+      note_vertical_list(n)
       note_fx(n)
       if LIT_SUB and n.subtype == LIT_SUB then blk_gfx = true end
     end
@@ -1305,9 +1496,11 @@ end
 local top_epochs = {} -- per top-level item: the EPOCH_ATTR stamp of its node
 local function extract_items(head, parentBox)
   local items = {}
+  local continued_math = false
   local n = head
   while n do
     local id = n.id
+    if id == WHATSIT then note_vertical_list(n) end
     local before = #items
     if is_dummy(n) then
       -- the page-keeper box: not document content
@@ -1335,7 +1528,9 @@ local function extract_items(head, parentBox)
         -- LaTeX lists live on it. The nested walks (519/587) honored it;
         -- the top-level line boxes must too, or every \item renders at the
         -- body margin (found by the Phase-0 farm's dx metric).
-        walk_h(n.list, n, bp(n.shift or 0), 0, runs)
+        local is_line = n.subtype == 1
+        local open = walk_h(n.list, n, bp(n.shift or 0), 0, runs, false, is_line and continued_math)
+        if is_line then continued_math = open end
       elseif id == VLIST then
         walk_v(n, bp(n.shift or 0), bp(h), runs)
       else
@@ -1413,8 +1608,9 @@ local function extract_items(head, parentBox)
         end
         pending_fmarks = {}
       elseif SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data and n.data:match('^tdom:eject') then
-        local pen = tonumber(n.data:match('^tdom:eject:(-?%d+)')) or -10000
-        items[#items + 1] = { k = 'eject', v = pen }
+        local pen, witness = n.data:match('^tdom:eject:(%-?%d+):?(%d*)$')
+        if witness and witness ~= '' then items[#items + 1] = { k = 'ev', n = tonumber(witness) } end
+        items[#items + 1] = { k = 'eject', v = tonumber(pen) or -10000 }
       elseif SPECIAL_SUB and n.subtype == SPECIAL_SUB and n.data and n.data:match('^tdom:enlarge') then
         local sp, star = n.data:match('^tdom:enlarge:(-?%d+):(%d)')
         items[#items + 1] = { k = 'enlarge', a = bp(tonumber(sp) or 0), star = tonumber(star) }
@@ -1574,11 +1770,25 @@ end
 -- (0.8-2.5 s). The cycle stays open in this checkpoint, and the next step
 -- that collects finishes it. Returns whether the cycle finished.
 local GC_SLICE_KB = 16384
-local function gc_collect_background()
+local function gc_finish_background_cycle()
   while not collectgarbage('step', GC_SLICE_KB) do
     if keystroke_waiting() then return false end
   end
-  TDOM_GC_FLOOR = collectgarbage('count')
+  return true
+end
+
+local function gc_collect_background()
+  if not gc_finish_background_cycle() then return false end
+  local live = collectgarbage('count')
+  -- A cycle may have started before the current JOB's allocations. Its
+  -- first count can still include dead tables and token userdata from
+  -- furniture recording. Confirm growth with a fresh cycle before it can
+  -- permanently reduce the document's resident checkpoint budget.
+  if live > math.max(TDOM_GC_FLOOR, gc_base_kb) then
+    if keystroke_waiting() or not gc_finish_background_cycle() then return false end
+    live = collectgarbage('count')
+  end
+  TDOM_GC_FLOOR = live
   return true
 end
 
@@ -1603,6 +1813,9 @@ end
 
 function tdom_seed()
   luacolor_black() -- once in the root, before any fork
+  -- (read right after this call, before the first fork: the positions a
+  -- block's pictures read are recorded, tdom_page_art_query)
+  tex.print(tdom_pos_query_wrap())
   scan_paint_callbacks(true) -- anything the boot template added after GEO
   if luatexbase and luatexbase.add_to_callback then
     pcall(luatexbase.add_to_callback, 'buildpage_filter', note_trail, TRAIL_CALLBACK)
@@ -1697,12 +1910,41 @@ function tdom_absorb_output(boxnum)
     b.list = nil
     tex.box[boxnum] = nil -- frees the (now empty) ordinary box register
   end
+  -- (a page-art render: \c@page becomes the folio of the next line's page)
+  if TDOM_PAGE_ART and list then tdom_page_art_absorbed(list) end
+  -- An explicit eject is a real TeX boundary in the continuous body job.
+  -- Carry its witness on the existing eject node. Harvest places it just
+  -- before the break without adding any material to TeX's vertical list.
+  local witness
+  if pen == -10000 and furniture.trackFolio and not RENDER_MODE then
+    -- Harvest leaves only a dummy at a block boundary. The next block's
+    -- eject can still end the placed sheet containing the previous blocks.
+    local has_body = furniture.bodySinceEject
+    furniture.bodySinceEject = false
+    -- The placer can have material on the sheet even when the resident
+    -- list is empty here: an isolated block typeset that material.
+    if JOB and JOB.furnitureWatch then
+      local started = furniture_clock()
+      local values = furniture_snapshot()
+      if values then
+        JOB.furnitureSeconds = (JOB.furnitureSeconds or 0) + furniture_clock() - started
+        blk_events[#blk_events + 1] = { k = 'hfstate', a = values, b = furniture.folios, watch = furniture.version }
+        furniture.folios = nil
+        witness = #blk_events - 1
+      end
+    end
+    if has_body then
+      -- The dormant walk can count explicit sheets only. JS compares this
+      -- count with the actual placed folio before trusting an assignment.
+      tex.setcount('global', 'TDOM@realpage', tex.getcount('TDOM@realpage') + 1)
+    end
+  end
   local marker = nil
   if pen > -10002 then
     -- a genuine eject (\newpage -10000 / \clearpage -10001), not a float
     -- signal: plant the marker at the break position
     marker = node.new('whatsit', SPECIAL_SUB)
-    marker.data = 'tdom:eject:' .. pen
+    marker.data = 'tdom:eject:' .. pen .. (witness and (':' .. witness) or '')
   end
   local newhead = list
   if not newhead or not is_dummy(newhead) then
@@ -1805,7 +2047,50 @@ end
 -- page's exact state (folio, \thepage format, style, marks), typesets the
 -- head/foot boxes, and we extract their glyph runs like any other galley.
 local hf_pages = {}
+-- The PDF literals the job's current box drew. A literal TeX makes keeps its
+-- payload as a token list, and LuaTeX 1.24 hands Lua the field's name for
+-- it (n.data == 'data'), so two heads drawing equal-size opposite diagonals
+-- had one fingerprint (audit/scratch r9 diagonal). In the runs job
+-- \pdfextension is tdom_hf_ext (hfJobBody): each literal is made here with
+-- its payload as a string, which the harvest records with the item
+-- (note_fx), and the slot keeps their hash as `hx`/`fx`.
+local HF_LITS = {}
+local HF_LIT_MODES = { { 'direct', 2 }, { 'page', 1 }, { 'raw', 3 }, { 'text', 4 }, { 'font', 5 } }
+local function hf_toks_text(toks)
+  local out = {}
+  for _, t in ipairs(toks) do
+    if t.csname then
+      out[#out + 1] = '\\' .. t.csname .. ' '
+    elseif t.mode then
+      out[#out + 1] = utf8.char(t.mode)
+    end
+  end
+  return table.concat(out)
+end
+function tdom_hf_ext()
+  if not token.scan_keyword('literal') then
+    -- any other extension: the primitive reads it as it stands
+    token.put_next(token.create('TDOM@pdfext'))
+    return
+  end
+  token.scan_keyword('shipout')
+  local mode = 0
+  for _, km in ipairs(HF_LIT_MODES) do
+    if token.scan_keyword(km[1]) then
+      mode = km[2]
+      break
+    end
+  end
+  local s = hf_toks_text(token.scan_toks(false, true))
+  HF_LITS[#HF_LITS + 1] = mode .. ':' .. s
+  local n = node.new('whatsit', 'pdf_literal')
+  n.mode = mode
+  n.data = s
+  node.write(n)
+end
 function tdom_hf_box(boxnum, page, which)
+  local lits = HF_LITS
+  HF_LITS = {}
   local box = tex.box[boxnum]
   if not box then return end
   colstack = {}
@@ -1827,7 +2112,385 @@ function tdom_hf_box(boxnum, page, which)
   -- shipped page puts them. The preview takes this band from the canonical
   -- page instead (display-list.js, tdom-engine #17).
   if gfx then hf_pages[key][which .. 'g'] = 1 end
+  if #lits > 0 then hf_pages[key][which .. 'x'] = md5.sumhexa(table.concat(lits, '\n')) end
 end
+
+-- What a page's head and foot read of its spec (docs/10 §10.7a F2): the job
+-- sets each page's two boxes once more with \leftmark, \rightmark and
+-- LastPage's value made to report here when they are expanded (hfJobBody,
+-- the trace), and keeps for each slot (`hr`, `fr`) what it expanded: 1 the
+-- marks, 2 LastPage. A slot that expanded neither on its page came out the
+-- same whatever their values; two sampled values cannot show that (a head
+-- that prints "Solutions" for one mark only, audit/scratch r11 conditional).
+local HF_READS = 0
+function tdom_hf_read(bit)
+  HF_READS = HF_READS | bit
+end
+function tdom_hf_trace_begin(initial)
+  HF_READS = initial or 0
+end
+do
+local HF_LOG_START, HF_TRACING_MACROS, HF_TRACING_ASSIGNS, HF_TRACING_RESTORES
+local HF_STYLE_READS, HF_STYLE_NAMES, HF_STYLE_WRITES = 0, {}, {}
+local HF_VALUES, HF_UNCERTAIN, HF_COVERED = {}, {}, nil
+local HF_TRACE_ENABLED = true
+-- The job supplies these inputs before it even selects the page style.
+-- Reads of their values are handled by the page spec and its probes.
+local HF_JOB_STATE = {
+  ['c@page'] = true, thepage = true, leftmark = true, rightmark = true,
+  ['r@LastPage'] = true, ['if@fcolmade'] = true,
+  ['f@nch@topfloat'] = true, ['f@nch@botfloat'] = true,
+}
+
+function tdom_hf_positions(names)
+  for _, name in ipairs(names) do HF_JOB_STATE['pgf@sys@pdf@mark@pos@' .. name] = true end
+end
+
+function tdom_hf_state(values, uncertain, covered)
+  if not HF_TRACE_ENABLED then return end
+  HF_VALUES, HF_UNCERTAIN, HF_COVERED = {}, uncertain, covered
+  for name, fingerprint in pairs(values) do
+    -- The style/mark timeline can establish a definition on its own. The
+    -- same comparison also verifies the TeX state after each replay.
+    if Furniture().fingerprint(name) ~= fingerprint then HF_VALUES[name] = true end
+  end
+end
+
+local function hf_trace_begin(initial)
+  if not HF_TRACE_ENABLED then return end
+  tdom_hf_trace_begin(initial)
+  HF_LOG_START = fk.flush() and lfs.attributes(HF_TRACE_LOG or (WORKDIR .. '/driver.log'), 'size')
+  HF_TRACING_MACROS = tex.tracingmacros
+  HF_TRACING_ASSIGNS = tex.tracingassigns
+  HF_TRACING_RESTORES = tex.tracingrestores
+  tex.tracingmacros = 1
+  tex.tracingassigns = 1
+  tex.tracingrestores = 1
+end
+
+local trace_width = tonumber(kpse.var_value('max_print_line')) or 79
+local register_prefix = { assign_int = 'count', assign_dimen = 'dimen', assign_glue = 'skip', assign_toks = 'toks' }
+local operand_count = { ifx = 2, ifcat = 2, ifdefined = 1, meaning = 1 }
+local definition = { def = true, gdef = true, edef = true, xdef = true }
+local numeric = { ifnum = true, ifdim = true, ifodd = true, ifcase = true,
+  ['the'] = true, number = true, numexpr = true, dimexpr = true, advance = true, divide = true, multiply = true }
+
+-- Adjacent sheets often execute the very same expansions even when their
+-- output contains different folios. Reuse the parse only for identical log
+-- bytes, starting writes and live token classifications.
+local trace_cache, trace_order, trace_bytes = {}, {}, 0
+local operand_cache, operand_count_cached = {}, 0
+local function trace_operands(body)
+  local known = operand_cache[body]
+  if known then return known end
+  local terms, adjacent = {}, 1
+  for at, name, nextAt in body:gmatch('()\\([%w@:_]+)()') do
+    local gap = body:sub(adjacent, at - 1)
+    local depth = 0
+    for c in gap:gmatch('[{}]') do depth = depth + (c == '{' and 1 or -1) end
+    terms[#terms + 1] = { name, depth, gap:find('[}#]'), gap:find('[^%s=]'), body:find('^%s*=', nextAt) }
+    adjacent = nextAt
+  end
+  if operand_count_cached >= 4096 then
+    operand_cache, operand_count_cached = {}, 0
+  end
+  operand_cache[body] = terms
+  operand_count_cached = operand_count_cached + 1
+  return terms
+end
+
+local function trace_property(name)
+  local t = token.create(name)
+  local cmd = t and t.cmdname
+  local idx = t and register_prefix[cmd] and t.index
+  return idx and idx >= 0 and register_prefix[cmd] .. idx or name, cmd
+end
+
+local function trace_matches(kept, initialized)
+  for name in pairs(initialized) do if not kept.initialized[name] then return false end end
+  for name in pairs(kept.initialized) do if not initialized[name] then return false end end
+  for name, value in pairs(kept.properties) do
+    local key, cmd = trace_property(name)
+    if value.key ~= key or value.command ~= cmd then return false end
+  end
+  return true
+end
+
+local function hf_trace_end(names, initialized)
+  if not HF_TRACE_ENABLED then return true end
+  tex.tracingrestores = HF_TRACING_RESTORES
+  tex.tracingassigns = HF_TRACING_ASSIGNS
+  tex.tracingmacros = HF_TRACING_MACROS
+  if not HF_LOG_START or not fk.flush() then return false end
+  local log = io.open(HF_TRACE_LOG or (WORKDIR .. '/driver.log'), 'rb')
+  if not log then return false end
+  local length = log:seek('end') - HF_LOG_START
+  local trace
+  if length > 0 and length <= 8 * 1024 * 1024 and log:seek('set', HF_LOG_START) then trace = log:read(length) end
+  log:close()
+  if not trace then return false end
+  local kept = trace_cache[trace]
+  if kept and trace_matches(kept, initialized) then
+    for name in pairs(kept.read) do names[name] = true end
+    for name in pairs(initialized) do initialized[name] = nil end
+    for name in pairs(kept.written) do initialized[name] = true end
+    if kept.folio then tdom_hf_read(128) end
+    return true
+  end
+  -- Expansion records name the macro TeX actually ran. References in its
+  -- replacement are not expansions: they can be destinations, deferred
+  -- definitions, or in paths that were never taken. Inspect the operands
+  -- which TeX reads without expanding, and follow native writes/restores.
+  local properties, pending, wrapped = {}, {}, {}
+  local initial, observed, written = {}, {}, {}
+  local folio = false
+  for name in pairs(initialized) do initial[name] = true end
+  local computed
+  local function property(name)
+    local cached = properties[name]
+    if cached then return cached end
+    local key, cmd = trace_property(name)
+    cached = { key = key, command = cmd }
+    properties[name] = cached
+    return cached
+  end
+  local function read(name)
+    local key = property(name).key
+    if initialized[name] or initialized[key] then return end
+    if name == 'thepage' or name == 'c@page' or key == property('TDOM@realpage').key then folio = true end
+    names[name] = true
+    observed[name] = true
+  end
+  local function operands(body, ownPictureId)
+    local remaining, previous, destination = 0, nil, nil
+    local depth, conditional = 0, false
+    local writes, planned = {}, nil
+    for _, term in ipairs(trace_operands(body)) do
+      local name = term[1]
+      depth = depth + term[2]
+      if planned and depth == 0 and term[3] then
+        writes[planned] = true
+        planned = nil
+      end
+      if term[4] then remaining, previous, destination = 0, nil, nil end
+      if destination then
+        pending[destination] = name
+        if depth == 0 and not conditional then writes[destination] = true end
+        destination = nil
+      elseif previous == 'let' then
+        destination = name
+        if depth == 0 and not conditional then planned = name end
+      elseif definition[previous] then
+        if depth == 0 and not conditional then planned = name end
+      elseif remaining > 0 then
+        if depth ~= 0 or not writes[name] then read(name) end
+        remaining = remaining - 1
+      elseif previous ~= 'futurelet' then
+        local cmd = property(name).command
+        -- PGF allocates the remembered-position key in this PDF. A read
+        -- of its counter elsewhere (e.g. printed by the header) still
+        -- needs the body record.
+        if not (ownPictureId and name == 'pgf@picture@serial@count') and (depth ~= 0 or not writes[name]) and
+            (cmd == 'if_test' or cmd == 'set_font' or
+              (register_prefix[cmd] and (numeric[previous] or not term[5]))) then
+          read(name)
+        end
+        if cmd == 'if_test' then conditional = true end
+      end
+      remaining = operand_count[name] or remaining
+      previous = name
+    end
+  end
+  local function record(line)
+    local lead = line:byte()
+    if lead == 123 then -- {
+      local assigned = line:match('^{into \\([%w@:_]+)[= ]') or line:match('^{reassigning \\([%w@:_]+)[= ]')
+      if assigned then
+        local from = pending[assigned]
+        if from then read(from) end
+        pending[assigned], initialized[assigned] = nil, true
+      else
+        local restored = line:match('^{restoring \\([%w@:_]+)[= ]')
+        if restored then initialized[restored] = nil end
+      end
+    elseif lead == 92 then -- backslash
+      local name, body = line:match('^\\([%w@:_]+)[^>]*%-%>(.*)$')
+      if name then
+        pending = {}
+        read(name)
+        operands(body, name == 'pgfpicture')
+        computed = nil
+        if body:find('\\csname', 1, true) then
+          for prefix, argument in body:gmatch('\\csname%s*([%w@:_]*)#(%d)%s*\\endcsname') do
+            computed = computed or {}
+            computed[argument] = prefix
+          end
+        end
+      end
+    elseif lead == 35 then -- #
+      local argument, body = line:match('^#(%d+)<%-(.*)$')
+      if body then
+        operands(body)
+        local name = computed and computed[argument] and body:match('^([%w@:_]+)%s*$')
+        if name then read(computed[argument] .. name) end
+      end
+    end
+  end
+  for line in (trace .. '\n'):gmatch('([^\n]*)\n') do
+    if #line >= trace_width then
+      wrapped[#wrapped + 1] = line
+    elseif #wrapped > 0 then
+      wrapped[#wrapped + 1] = line
+      record(table.concat(wrapped))
+      for i = #wrapped, 1, -1 do wrapped[i] = nil end
+    else
+      record(line)
+    end
+  end
+  if folio then tdom_hf_read(128) end
+  if #trace <= 1024 * 1024 then
+    if not kept then
+      while #trace_order >= 24 or trace_bytes + #trace > 4 * 1024 * 1024 do
+        local evicted = table.remove(trace_order, 1)
+        trace_cache[evicted] = nil
+        trace_bytes = trace_bytes - #evicted
+      end
+      trace_order[#trace_order + 1] = trace
+      trace_bytes = trace_bytes + #trace
+    end
+    for name in pairs(initialized) do written[name] = true end
+    trace_cache[trace] = { initialized = initial, properties = properties, read = observed, written = written, folio = folio }
+  end
+  return true
+end
+
+local HF_REPLAY_WRITES, HF_REPLAY_READS = {}, {}
+function tdom_hf_replay_reset() HF_REPLAY_WRITES, HF_REPLAY_READS = {}, {} end
+function tdom_hf_replay_begin() hf_trace_begin(0) end
+
+function tdom_hf_replay_end()
+  hf_trace_end(HF_REPLAY_READS, HF_REPLAY_WRITES)
+end
+
+local function hf_slot_evidence()
+  local names = { ['$font'] = true, ['$color'] = true }
+  for name in pairs(HF_STYLE_NAMES) do names[name] = true end
+  local initialized = {}
+  for name in pairs(HF_STYLE_WRITES) do initialized[name] = true end
+  if not hf_trace_end(names, initialized) then tdom_hf_read(64) end
+  local deps = {}
+  local blocked = {}
+  for name in pairs(names) do
+    if not HF_JOB_STATE[name] and name:sub(1, 4) ~= 'TDOM' then
+      if HF_UNCERTAIN[name] or HF_VALUES[name] or
+          (HF_COVERED and not HF_COVERED[name] and name ~= '$font' and name ~= '$color') then
+        tdom_hf_read(64)
+        blocked[#blocked + 1] = name
+      end
+      deps[#deps + 1] = name
+    end
+  end
+  table.sort(deps)
+  table.sort(blocked)
+  return HF_READS, deps, blocked
+end
+
+function tdom_hf_style_begin()
+  hf_trace_begin(0)
+end
+
+function tdom_hf_style_end()
+  HF_STYLE_NAMES, HF_STYLE_WRITES = {}, {}
+  for name in pairs(HF_REPLAY_READS) do HF_STYLE_NAMES[name] = true end
+  for name in pairs(HF_REPLAY_WRITES) do HF_STYLE_WRITES[name] = true end
+  if not hf_trace_end(HF_STYLE_NAMES, HF_STYLE_WRITES) then tdom_hf_read(64) end
+  HF_STYLE_READS = HF_READS
+end
+
+function tdom_hf_slot_begin()
+  hf_trace_begin(HF_STYLE_READS)
+end
+
+function tdom_hf_render_trace(page, which)
+  if not HF_TRACE_ENABLED then return end
+  local out = assert(io.open('tdom-hf-reads', 'a'))
+  local reads, deps, blocked = hf_slot_evidence()
+  out:write(page, ' ', which, ' ', reads, ' ', table.concat(deps, ','), '\n')
+  out:close()
+  if os.getenv('TDOM_TRACE_HF') then texio.write_nl('log', 'TDOM furniture ' .. page .. which .. ' blocked: ' .. table.concat(blocked, ',')) end
+end
+
+function tdom_hf_position_pass() HF_TRACE_ENABLED = false end
+
+function tdom_page_read()
+  if furniture.trackFolio and JOB and JOB.ckpt >= 0 and not furniture.before then
+    furniture.read = true
+    if tex.currentiflevel > 0 then
+      local value = tex.getcount('TDOM@realpage')
+      furniture.folios = furniture.folios or {}
+      if furniture.folios[#furniture.folios] ~= value then
+        furniture.folios[#furniture.folios + 1] = value
+      end
+    end
+  end
+end
+
+function tdom_pagectr_begin(before, wrapperDepth)
+  if not furniture.trackFolio then return end
+  furniture.before = before
+  -- A copied primitive register may bypass the read hook. An enclosing
+  -- conditional is then unproved, even when the current folio agrees.
+  furniture.guard = furniture.read or (wrapperDepth and tex.currentiflevel > wrapperDepth)
+end
+
+function tdom_clear_to(parity, twoside)
+  tdom_event('cleardouble', parity, '')
+  if twoside and furniture.trackFolio and JOB and JOB.ckpt >= 0 then
+    local value = tex.getcount('TDOM@realpage')
+    if (value % 2 == 1) ~= (parity == 'odd') then tex.setcount('global', 'TDOM@realpage', value + 1) end
+  end
+end
+
+function tdom_pagenum(format)
+  if not furniture.trackFolio then
+    tdom_event('pagenum', format, '')
+    return
+  end
+  local placed = tex.nest.ptr == 0
+  tdom_event('pagenum', format, nil, not placed)
+  local event = blk_events[#blk_events]
+  event.before, event.guard = furniture.before, furniture.guard or not placed or nil
+  furniture.before = nil
+end
+
+function tdom_pagectr(kind, after, operand)
+  local before, guard = furniture.before, furniture.guard
+  furniture.before = nil
+  if before == nil then return end
+  local n = kind == 'add' and after - before or after
+  local literal = operand:match('^%s*[+-]?%s*%d+%s*$') or
+    operand:match('^%s*\\numexpr%s+[%d%s()+*/-]+\\relax%s*$') or
+    (kind == 'add' and operand:match('^%s*\\@ne%s*$') and n == 1)
+  if (kind == 'add' and literal and n == 0) or (kind == 'set' and after == before and
+      (operand:match('^%s*\\value%s*{page}%s*$') or operand:match('^%s*\\c@page%s*$'))) then return end
+  local placed = tex.nest.ptr == 0
+  tdom_event('pagectr', kind, placed and literal and tostring(n) or '?', not placed)
+  local event = blk_events[#blk_events]
+  event.before, event.guard = before, guard or nil
+end
+
+function tdom_hf_trace(page, which)
+  local key = 'p' .. page
+  hf_pages[key] = hf_pages[key] or {}
+  local reads, deps, blocked = hf_slot_evidence()
+  hf_pages[key][which .. 'r'] = reads
+  hf_pages[key][which .. 'deps'] = deps
+  if os.getenv('TDOM_TRACE_HF') then hf_pages[key][which .. 'blocked'] = blocked end
+  HF_READS = 0
+  HF_LITS = {}
+end
+
+end -- furniture expansion trace
 
 function tdom_hf_flush()
   for _, page in pairs(hf_pages) do
@@ -1841,13 +2504,37 @@ function tdom_hf_flush()
       fonts[tostring(fid)] = { file = f.file, name = f.name, size = f.size, fmt = f.fmt, mth = f.mth }
     end
   end
-  local payload = jenc({ block = '__hf', hf = hf_pages, fonts = fonts, backend = resident_backend_profile() })
-  conn:send('GALLEY __hf ' .. #payload .. '\n')
+  -- answered under the job's own request id: a reply that outlived its
+  -- wait can never be taken for a later job's (header-scheduler.js)
+  local id = (JOB and JOB.id) or '__hf'
+  local payload = jenc({ block = id, hf = hf_pages, fonts = fonts, backend = resident_backend_profile() })
+  conn:send('GALLEY ' .. id .. ' ' .. #payload .. '\n')
   conn:send(payload)
   fk._exit(0)
 end
 
+function tdom_furniture_prepare()
+  if JOB.furnitureWatch and JOB.furnitureCarry and #blk_events == 0 and
+      not JOB.had_error and furniture.last then
+    furniture.snapshot = furniture.last
+    return
+  end
+  local started = furniture_clock()
+  local snapshot = furniture_snapshot()
+  if not snapshot then return end
+  JOB.furnitureStarted = started
+  local observations = {snapshot}
+  for _, event in ipairs(blk_events) do
+    if event.k == 'hfstate' then observations[#observations + 1] = event.a end
+  end
+  furniture.snapshot = snapshot
+  Furniture().prepareChecks(observations)
+end
+
 function tdom_report()
+  if JOB.furnitureStarted then
+    JOB.furnitureSeconds = (JOB.furnitureSeconds or 0) + furniture_clock() - JOB.furnitureStarted
+  end
   if os.getenv('TDOM_TRACE_MEM') then
     local ok, st = pcall(status.list)
     st = ok and st or {}
@@ -1977,6 +2664,16 @@ function tdom_report()
   -- ("<size in sp> <name>" lines)
   local font_list = SPARE.fonts and JOB.fontBase and font_specs_since(JOB.fontBase) or nil
   JOB.fontList = font_list
+  local snapshot = furniture.snapshot
+  furniture.snapshot = nil
+  if snapshot then
+    Furniture().finishChecks()
+    local digest = snapshot == furniture.last and furniture.prior or md5.sumhexa(jenc({snapshot, furniture.version}))
+    furniture.block = { before = furniture.prior, after = digest, values = snapshot,
+      watch = furniture.version, folios = furniture.folios }
+    furniture.prior = digest
+    furniture.last, furniture.lastVersion = snapshot, furniture.version
+  end
   local payload = jenc_wire({
     tm = tm,
     -- this job ran in a spare continuation: pages it read ahead, fonts it loaded ahead
@@ -1988,6 +2685,7 @@ function tdom_report()
     block = JOB.id,
     capture = capture,
     gfx = blk_gfx,
+    tdomTate = JOB.tate or nil,
     w = w,
     h = hsum,
     d = 0,
@@ -1999,15 +2697,20 @@ function tdom_report()
     state = blk_counters,
     toclines = blk_toclines,
     events = blk_events,
+    furniture = furniture.block,
+    furnitureMs = JOB.furnitureSeconds and JOB.furnitureSeconds * 1000 or nil,
     closure = JOB.had_error and 'error' or 'native',
     closure_error = JOB.error,
     tdomSourceCatcodesSafe = JOB.sourceCatcodesSafe == true,
     tdomActive = JOB.activeChars ~= '' and JOB.activeChars or nil,
+    tdomMathMacros = not JOB.had_error and JOB.mathMacros or nil,
     tdomMathActive = JOB.mathActiveChars ~= '' and JOB.mathActiveChars or nil,
     trail = md5.sumhexa(table.concat(blk_trail or {}, '\n')),
     trailMarks = trail_marks,
     epochs = epochs,
     paintLate = paint_late,
+    -- the block's pictures read positions on the page (page-art.js)
+    posq = tdom_pos_queried() and 1 or nil,
     backend = resident_backend_profile(),
   })
   local TJ = os.gettimeofday and os.gettimeofday() or os.clock()
@@ -2025,7 +2728,8 @@ function tdom_report()
   end
   payload, items = nil, nil -- not live across the collect
   local gc_started = os.gettimeofday and os.gettimeofday() or os.clock()
-  checkpoint_gc(JOB.calibrate, JOB.interactive, (T_JOB or 0) > 0 and gc_started - T_JOB or 0)
+  local recording = (JOB.furnitureSeconds or 0) - (JOB.furnitureSetupSeconds or 0)
+  checkpoint_gc(JOB.calibrate, JOB.interactive, (T_JOB or 0) > 0 and gc_started - T_JOB - recording or 0)
   local gc_ms = ((os.gettimeofday and os.gettimeofday() or os.clock()) - gc_started) * 1000 + gc_guard_ms
   -- this child now becomes the next checkpoint in the chain
   CKPT = JOB.ckpt
@@ -2065,6 +2769,137 @@ local function render_horizontal_padding()
   file:write(string.format('%.8f', bp(pad)))
   file:close()
   return pad
+end
+
+-- ---- page art (docs/08 §8.5a)
+--
+-- A block whose exact picture has ink far outside its tight page draws
+-- against `current page` (a cover, a page-anchored mark): on the tight page
+-- that is the wrong rectangle. page-art.js renders such a block again on the
+-- document's paper, with the places the page builder gave its lines:
+--   TDOM_PAGE_ART = { segs = { { f = <folio>, lines = { { <li>, <top> }, ... } }, ... } }
+-- one segment a page; `li` counts the block's top-level boxes from 0 as
+-- extract_items counts the galley's lines, `top` is the line's top below the
+-- text area's top (sp). Each segment ships as a page of its own (PDF page k =
+-- segment k): its lines at their places, at \oddsidemargin as the preview
+-- lays every page out. Lines the page builder placed nowhere (the empty box
+-- of a \clearpage) and the glue and penalties between lines are not shipped;
+-- other nodes stay beside the line before them. \c@page is the folio of the
+-- page the block's next line is on (tdom_page_art_absorbed), so art that
+-- prints \thepage or tests its parity reads the page it is on.
+local ART_PAGES = {}
+local function art_is_line(n)
+  return (n.id == HLIST or n.id == VLIST or n.id == RULE) and not is_dummy(n) and
+    node.has_attribute(n, LASTSKIP_ATTR) == nil
+end
+
+-- the folio of the segment that holds line `li`, or the first placed line after it
+local function art_folio(li)
+  local best, folio = nil, nil
+  for _, s in ipairs(TDOM_PAGE_ART.segs or {}) do
+    for _, l in ipairs(s.lines or {}) do
+      if l[1] >= li and (not best or l[1] < best) then best, folio = l[1], s.f end
+    end
+  end
+  return folio
+end
+
+-- the dormant output routine fired (tdom_absorb_output): what comes next is
+-- on the page that holds the next line
+function tdom_page_art_absorbed(list)
+  local count = 0
+  local n = list
+  while n do
+    if art_is_line(n) then count = count + 1 end
+    n = n.next
+  end
+  local f = art_folio(count)
+  if f then
+    local counter = token.is_defined('TDOM@realpage') and 'TDOM@realpage' or 'c@page'
+    pcall(tex.setcount, 'global', counter, f)
+  end
+end
+
+local function ship_page_art(out)
+  local segs = TDOM_PAGE_ART.segs or {}
+  local where = {}
+  for k, s in ipairs(segs) do
+    for _, l in ipairs(s.lines or {}) do where[l[1]] = { k, l[2] } end
+  end
+  local top0 = (tex.dimen.topmargin or 0) + (tex.dimen.headheight or 0) + (tex.dimen.headsep or 0)
+  local pages, early, cur, li = {}, {}, nil, -1
+  local report = { 'offsets ' .. (tex.hoffset or 0) .. ' ' .. (tex.voffset or 0) }
+  local n = out
+  while n do
+    local nxt = n.next
+    n.next = nil
+    n.prev = nil
+    if art_is_line(n) then
+      li = li + 1
+      local w = where[li]
+      if w then
+        local pg = pages[w[1]]
+        if not pg then
+          pg = { y = 0, nodes = {} }
+          pages[w[1]] = pg
+          -- (nodes before the block's first placed line open its first page)
+          for _, m in ipairs(early) do pg.nodes[#pg.nodes + 1] = m end
+          early = {}
+        end
+        local k = node.new('kern')
+        k.kern = top0 + w[2] - pg.y
+        pg.nodes[#pg.nodes + 1] = k
+        pg.nodes[#pg.nodes + 1] = n
+        pg.y = top0 + w[2] + (n.height or 0) + (n.depth or 0)
+        cur = w[1]
+        report[#report + 1] = string.format('line %d %d %d', li, n.height or 0, n.depth or 0)
+      else
+        node.flush_node(n)
+      end
+    elseif n.id == GLUE or n.id == KERN or n.id == PENALTY then
+      node.flush_node(n)
+    elseif cur then
+      local pg = pages[cur]
+      pg.nodes[#pg.nodes + 1] = n
+    else
+      early[#early + 1] = n
+    end
+    n = nxt
+  end
+  for _, m in ipairs(early) do node.flush_node(m) end
+  report[#report + 1] = 'lines ' .. (li + 1)
+  ART_PAGES = {}
+  for k = 1, math.max(#segs, 1) do
+    local head, tail = nil, nil
+    for _, m in ipairs(pages[k] and pages[k].nodes or { node.new('kern') }) do
+      if tail then
+        tail.next = m
+        m.prev = tail
+      else
+        head = m
+      end
+      tail = m
+    end
+    local inner = node.vpack(head)
+    inner.shift = tex.dimen.oddsidemargin or 0
+    ART_PAGES[k] = node.vpack(inner)
+  end
+  tex.box[255] = ART_PAGES[1]
+  ART_PAGES[1] = false
+  -- the paper as the document has it (\pagewidth, \pageheight); no padding
+  local file = assert(io.open('render-padding.txt', 'w'))
+  file:write('0')
+  file:close()
+  file = assert(io.open('tdomart.txt', 'w'))
+  file:write(table.concat(report, '\n') .. '\n')
+  file:close()
+end
+
+function tdom_load_art(k)
+  local b = ART_PAGES[k]
+  if not b then return end
+  ART_PAGES[k] = false
+  tex.box[255] = b
 end
 
 -- Vpack an owned MVL node list and install it as one tight PDF page.
@@ -2107,12 +2942,68 @@ local function ship_node_list(head)
     n = nxt
   end
   if not out then return end
+  if TDOM_PAGE_ART then
+    -- a block drawn against `current page`: its pages, on the paper
+    ship_page_art(out)
+    return
+  end
   local b = node.vpack(out)
   local w = math.max(b.width or 0, 65536)
   local total = math.max((b.height or 0) + (b.depth or 0), 65536)
   tex.box[255] = b
   tex.pagewidth = w + 2 * render_horizontal_padding()
   tex.pageheight = total
+end
+
+-- A page-art render records where each remembered picture landed on its
+-- page (pgf's \pgfsys@markposition, rerouted by the job body to a late_lua
+-- here: pdf.getpos() is \lastxpos/\lastypos). The next pass defines the
+-- positions before typesetting, as a second LaTeX run reads them from its
+-- .aux; page-art.js runs passes until they no longer move.
+function tdom_page_art_mark(name)
+  local x, y = pdf.getpos()
+  local file = io.open('tdompos.aux', 'a')
+  if not file then return end
+  file:write(string.format('\\pgfsyspdfmark{%s}{%d}{%d}\n', name, x or 0, y or 0))
+  file:close()
+end
+
+-- Which positions the block's pictures read (\pgfsys@getposition: `current
+-- page` reads pgfpageorigin, a node of another picture that picture's
+-- mark). On the tight page every such position is wrong, and art placed by
+-- one can lie wholly outside the page, where the converted picture has no
+-- trace of it at all (page-art.js). The root wraps the command once
+-- (tdom_seed); a JOB says in its galley that its block read one (`posq`,
+-- for a picture CAPTUREd from its nodes), a RENDER child writes the names as
+-- tdomart-q.txt when it ends (tdom_render_end). Each job and render starts
+-- with none (tdom_pos_queries_reset).
+local POS_QUERIES = {}
+local POS_QUERY_WRAP = '\\ifdefined\\TDOMgetpos\\else' ..
+  '\\expandafter\\ifx\\csname pgfsys@getposition\\endcsname\\relax\\else' ..
+  '\\expandafter\\let\\expandafter\\TDOMgetpos\\csname pgfsys@getposition\\endcsname' ..
+  "\\expandafter\\def\\csname pgfsys@getposition\\endcsname#1{\\directlua{tdom_page_art_query('\\luaescapestring{#1}')}" ..
+  '\\TDOMgetpos{#1}}\\fi\\fi'
+function tdom_page_art_query(name)
+  POS_QUERIES[name] = true
+end
+function tdom_pos_queries_reset()
+  POS_QUERIES = {}
+end
+function tdom_pos_queried()
+  return next(POS_QUERIES) ~= nil
+end
+function tdom_pos_query_wrap()
+  return POS_QUERY_WRAP
+end
+local function write_pos_queries()
+  local names = {}
+  for name in pairs(POS_QUERIES) do names[#names + 1] = name end
+  if #names == 0 then return end
+  table.sort(names)
+  local file = io.open('tdomart-q.txt', 'w')
+  if not file then return end
+  file:write(table.concat(names, '\n') .. '\n')
+  file:close()
 end
 
 -- Legacy render child: retypeset then harvest. Kept as the universal
@@ -2134,6 +3025,7 @@ end
 -- Render child epilogue: leave the dormant page truly empty so the \end
 -- primitive can finalize the PDF without exercising the output routine.
 function tdom_render_end()
+  write_pos_queries()
   local old = tex.lists.page_head
   tex.lists.page_head = nil
   tex.lists.contrib_head = nil
@@ -2147,6 +3039,16 @@ end
 -- order, 2+F..1+F+N = footnote inserts in order.
 function tdom_ship_floats()
   local lines = {}
+  if TDOM_PAGE_ART then
+    -- a page-art render ships the block's pages only (its floats and
+    -- footnotes keep the pictures of its ordinary render)
+    for k = 2, #ART_PAGES do
+      lines[#lines + 1] = '\\directlua{tdom_load_art(' .. k .. ')}'
+      lines[#lines + 1] = '\\shipout\\box255'
+    end
+    if #lines > 0 then tex.print(lines) end
+    return
+  end
   for i = 1, #FLOAT_COPIES do
     lines[#lines + 1] = '\\directlua{tdom_load_float(' .. i .. ')}'
     lines[#lines + 1] = '\\shipout\\box255'
@@ -2477,12 +3379,19 @@ function tdom_wait()
     if not line then
       fk._exit(0) -- orchestrator went away
     end
-    local cmd, a, b, c, d, mode, live_floor, key =
+    local cmd, a, b, c, d, mode, live_floor, flags =
       line:match('^(%S+)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)%s*(%S*)')
     if cmd == 'DIE' then
       fk._exit(0)
     elseif cmd == 'PING' then
       conn:send('PONG ' .. CKPT .. '\n')
+    elseif cmd == 'HFBASE' and CKPT == 0 then
+      local body = recv_exact(tonumber(c))
+      local ok = pcall(write_furniture_base, a, body, d == 'P')
+      local payload = ok and '{}' or '{"error":"could not write furniture baseline"}'
+      conn:send('GALLEY ' .. b .. ' ' .. #payload .. '\n')
+      conn:send(payload)
+      return -- run the pinning aliases before waiting for the next command
     elseif cmd == 'FAULT' then
       -- test-only fault injection: FAULT FORKFAIL <n> | FAULT WEDGE <n>
       -- (a spare forked before the fault was set would not carry it)
@@ -2508,8 +3417,8 @@ function tdom_wait()
         if not SPARE.pid then SPARE.due = true end
       end
     elseif cmd == 'JOB' or cmd == 'STEP' then
-      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B|C> <liveFloorKb> [K]
-      -- (K: the job of the block a keystroke changed)
+      -- JOB <blockId> <newCkptIdx> <bodyLen> <captureToken|-> <F|B|C> <liveFloorKb> [KW]
+      -- K is the edited block. W<version> selects a traced furniture baseline.
       local id = a
       T_RECV = os.gettimeofday and os.gettimeofday() or nil
       local newckpt = tonumber(b) or (CKPT + 1)
@@ -2523,7 +3432,8 @@ function tdom_wait()
       else
       local wedge = take_wedge_fault()
       -- a keystroke's job goes to the spare continuation when there is one
-      local sparable = SPARE.on and cmd == 'JOB' and key == 'K' and not wedge
+      local keystroke = flags:find('K', 1, true) ~= nil
+      local sparable = SPARE.on and cmd == 'JOB' and keystroke and not wedge
       -- (and the next spare typesets its characters once ahead: warm_text)
       if sparable and not handed_body then SPARE.warmBody = body end
       local pid
@@ -2552,7 +3462,28 @@ function tdom_wait()
         T_FORKED = os.gettimeofday and os.gettimeofday() or nil
         drop_capture()
         JOB = { id = id, ckpt = newckpt, body = body, capture = capture, had_error = false, error = nil, interactive = mode == 'F', calibrate = mode == 'C',
-          keystroke = key == 'K', fontBase = handed_body and SPARE.base or font.max() }
+          keystroke = keystroke,
+          fontBase = handed_body and SPARE.base or font.max() }
+        furniture.trackFolio = flags:find('F', 1, true) ~= nil
+        local watch = flags:match('W(%d+)')
+        if watch then
+          local started = furniture_clock()
+          set_furniture_watch(watch)
+          if furniture.version == watch then
+            JOB.furnitureWatch = furniture.names
+            JOB.furnitureSetupSeconds = furniture_clock() - started
+            JOB.furnitureSeconds = JOB.furnitureSetupSeconds
+          end
+        end
+        if furniture.trackFolio and not furniture.folioHooksInstalled then
+          tex.sprint('\\csname TDOMinstallPageCounterProbes\\endcsname')
+          furniture.folioHooksInstalled = true
+        end
+        if not JOB.furnitureWatch then
+          -- This continuation may have crossed an unobserved assignment.
+          -- Its next witnessed job must acquire live state before carrying it.
+          furniture.last, furniture.prior = nil, nil
+        end
         SPARE.pid, SPARE.due, SPARE.owed = nil, false, false
         fk.set_interactive(JOB.interactive and 1 or 0)
         gc_base_kb = tonumber(live_floor) or 0
@@ -2572,12 +3503,15 @@ function tdom_wait()
         blk_counters = {}
         blk_toclines = {}
         blk_events = {}
+        furniture.block, furniture.read, furniture.before, furniture.guard = nil, nil, nil, nil
+        furniture.folios = nil
         blk_gfx = false
         blk_floats = {}
         blk_fonts = {}
         blk_trail = {}
         pending_fmarks = {}
         tdom_absorb_reset()
+        tdom_pos_queries_reset()
         RENDER_MODE = false
         if cmd == 'STEP' then
           conn:send('FORKED ' .. id .. ' ' .. fk.getpid() .. '\n')
@@ -2626,6 +3560,17 @@ function tdom_wait()
         render_usage_start('render')
         reconnect('render', 0)
         assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish resident PDF')
+        if id == '__hf' or id == '__hfart' then
+          if not furniture.folioHooksInstalled then tex.sprint('\\csname TDOMinstallPageCounterProbes\\endcsname') end
+          -- Only the isolated furniture child gives up CPU priority.
+          os.execute('/usr/bin/renice -n 10 -p ' .. fk.getpid() .. ' >/dev/null 2>&1')
+          local trace = jobdir .. '/tdom-hf-trace.log'
+          local f = io.open(trace, 'w')
+          if f then
+            f:close()
+            if fk.redirect_open_fd(WORKDIR .. '/driver.log', trace) then HF_TRACE_LOG = trace end
+          end
+        end
         lfs.chdir(jobdir)
         -- under LaTeX, raw callback.register is owned by luatexbase
         local notify = function()
@@ -2639,6 +3584,8 @@ function tdom_wait()
         else
           pcall(callback.register, 'finish_pdffile', notify)
         end
+        -- (the positions the block's pictures read: write_pos_queries)
+        tdom_pos_queries_reset()
         inject_job(body, true)
         return
       elseif pid then
@@ -2662,6 +3609,7 @@ function tdom_wait()
           RENDER_MODE = true
           FLOAT_COPIES = {}
           FOOT_COPIES = {}
+          tdom_pos_queries_reset()
           render_usage_start('capture')
           reconnect('render', 0)
           assert(fk.publish_pdf(PDF_FD, jobdir .. '/driver.pdf'), 'cannot publish captured PDF')
@@ -2925,6 +3873,77 @@ local function source_math_active_chars(body)
   return ok and found or '?'
 end
 
+-- The resident checkpoint knows which definition is in scope here, even
+-- when it came from an included file. Publish only supported, pure math
+-- templates; never execute a user command to discover its expansion.
+-- (The helpers are locals of a function of their own: the main chunk is at
+-- Lua's limit of 200 active locals, and only math_macro_templates is used
+-- outside them.)
+local math_macro_templates = (function()
+local math_template_commands = { frac=true, dfrac=true, tfrac=true, sqrt=true, alpha=true, beta=true, gamma=true,
+  delta=true, theta=true, lambda=true, mu=true, pi=true, sigma=true, phi=true, omega=true, infty=true,
+  times=true, pm=true, partial=true, le=true, ge=true, ne=true, int=true, sum=true, prod=true }
+local math_template_scope = { def=true, gdef=true, edef=true, xdef=true, let=true, futurelet=true, catcode=true,
+  newcommand=true, renewcommand=true, providecommand=true, DeclareRobustCommand=true,
+  NewDocumentCommand=true, RenewDocumentCommand=true, csname=true }
+local function pure_math_template(value, n)
+  if #value > 512 or value:find('[^%w%s#{}_%^%+%*%=().,%-%[%]\\]') then return false end
+  local plain = value:gsub('\\([A-Za-z]+)', function(c) return math_template_commands[c] and 'x' or '!' end)
+  plain = plain:gsub('#([1-9])', function(i) return tonumber(i) <= n and 'x' or '!' end)
+  return not plain:find('[!#\\]')
+end
+
+local function math_macro_meaning(name)
+  if not token.is_defined(name) then return nil end
+  local kind = token.create(name).cmdname
+  if kind == 'long_call' or kind == 'call' then return token.get_meaning(name) end
+end
+
+local function math_macro_template(name)
+  local meaning = math_macro_meaning(name)
+  if not meaning then return nil end
+  local default
+  -- LaTeX stores the optional default in the public dispatcher and the actual
+  -- parameter text/body under a second control sequence with a leading slash.
+  local prefix = '->\\@protected@testopt \\' .. name .. ' \\\\' .. name .. ' '
+  if meaning:sub(1, #prefix) == prefix then
+    default = meaning:sub(#prefix + 1):match('^(%b{})$')
+    if not default then return nil end
+    default = default:sub(2, -2)
+    if not pure_math_template(default, 0) then return nil end
+    meaning = math_macro_meaning('\\' .. name)
+    if not meaning or meaning:sub(1, 4) ~= '[#1]' then return nil end
+    meaning = '#1' .. meaning:sub(5)
+  end
+  local params, value = meaning:match('^([#%d]*)%->(.+)$')
+  if not params then return nil end
+  local n = #params // 2
+  if n > 9 or not pure_math_template(value, n) then return nil end
+  local expected = ''
+  for i=1,n do expected = expected .. '#' .. i end
+  if params == expected then return { args=n, body=value, default=default } end
+end
+
+local function math_macro_templates(body)
+  if not body:find('\\', 1, true) then return nil end
+  local seen, result, count = {}, {}, 0
+  for name in body:gmatch('\\([A-Za-z]+)') do
+    if math_template_scope[name] then return nil end
+    if not seen[name] and not math_template_commands[name] then
+      seen[name] = true
+      local template = math_macro_template(name)
+      if template then
+        result[name] = template
+        count = count + 1
+        if count > 32 then return nil end
+      end
+    end
+  end
+  return count > 0 and result or nil
+end
+return math_macro_templates
+end)()
+
 function inject_job(body, ship)
   -- Typeset ON the main vertical list — full state continuity with the
   -- previous blocks (prevdepth, \everypar, spacefactor, open counters...).
@@ -2932,6 +3951,11 @@ function inject_job(body, ship)
   JOB.sourceCatcodesSafe = native_source_catcodes_safe(body)
   JOB.activeChars = source_active_chars(body)
   JOB.mathActiveChars = source_math_active_chars(body)
+  if JOB.furnitureWatch and can_carry_furniture() then
+    JOB.furnitureCarry = true
+    JOB.furnitureSeconds = nil
+  end
+  JOB.mathMacros = math_macro_templates(body)
   local lines = input_lines(body)
   lines[#lines + 1] = '\\par'
   if ship then
@@ -2956,6 +3980,7 @@ function inject_job(body, ship)
       '\\else\\directlua{tdom_counter(\'tdom@twocolumn\',0)}\\fi'
     lines[#lines + 1] =
       '\\directlua{tdom_counter(\'tdom@columnwidth\',\\number\\dimexpr\\columnwidth\\relax)}'
+    if JOB.furnitureWatch then lines[#lines + 1] = '\\directlua{tdom_furniture_prepare()}' end
     lines[#lines + 1] = '\\directlua{tdom_report()}'
   end
   tex.print(lines)

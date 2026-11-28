@@ -1,6 +1,6 @@
-import { verifyTokens, tokenContainment } from './safety.js';
+import { appendVerificationLine, verifyTokens, tokenContainment } from './safety.js';
 
-export function compareCanonicalText(pages, texts, pageCount) {
+export function compareCanonicalText(pages, texts, pageCount, { joinCjkRuns = true } = {}) {
   const mismatches = [];
   // Pagination drift (different page count, or content landing a page
   // early/late) is NOT block-level wrongness: the canonical overlay
@@ -17,9 +17,9 @@ export function compareCanonicalText(pages, texts, pageCount) {
   for (const page of pages) {
     const provTokens = [];
     for (const d of page.draw ?? []) {
-      for (const r of d.u?.ln?.runs ?? []) {
-        if (r.t) provTokens.push(...verifyTokens(r.t));
-      }
+      const runs = d.u?.ln?.runs ?? [];
+      if (joinCjkRuns) appendVerificationLine(runs, provTokens);
+      else for (const run of runs) if (run.t) provTokens.push(...verifyTokens(run.t));
     }
     if (provTokens.length < 20) continue; // chunk/gfx pages carry exact pixels already
     const n = page.number;

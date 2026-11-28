@@ -98,6 +98,8 @@ export function queueRender(engine, blockId, callbacks, { interactiveRev = null,
   // while its fork holds cost ~500MB each on Linux (the Lua GC dirties
   // every COW page, materializing the full heap per resident)
   if (process.env.TDOM_NO_RENDER === '1') return;
+  // (the page-art pump sends its RENDERs through the same callbacks, page-art.js)
+  engine.renderCallbacks = callbacks;
   const previous = engine.renderWant.get(blockId);
   const currentRev = Number.isSafeInteger(engine.srcRev) && engine.srcRev > 0 ? engine.srcRev : null;
   // A later chain/backlog enqueue must not demote this edit's foreground

@@ -60,7 +60,7 @@ Last prose.
     const wall = performance.now() - t0;
     assert.ok(wall < 500, `resident prose update should stay subsecond (got ${wall.toFixed(0)}ms)`);
     assert.equal(report.previewPolicy, 'canonical-anchor');
-    assert.ok(report.stats.blocksTypeset <= 2, 'only the edited paragraph and convergence probe run');
+    assert.ok(report.stats.blocksTypeset <= 2, 'only the edited paragraph and convergence probe run ' + JSON.stringify(report.stats));
 
     const plan = planTerminalCanonicalAnchor({
       blocks: engine.blocks,

@@ -52,7 +52,7 @@
       return { glyph: g, score: dx * dx + dy * dy * 4 + Math.abs(c.y - point.y) * 0.01 };
     }).sort((a, b) => a.score - b.score)[0]?.glyph ?? null;
   }
-  function textMatches(value, glyphs, maxCandidates = Infinity) {
+  function textMatches(value, glyphs, maxCandidates = Infinity, allowLineSlice = false) {
     const source = [], painted = [];
     let offset = 0;
     for (const char of String(value)) {
@@ -67,7 +67,17 @@
       } });
     }
     const needle = source.map(c => c.token).join(''), text = painted.map(c => c.token).join('');
-    if (!needle) return [];
+    if (!needle || !text) return [];
+    if (allowLineSlice && text.length < needle.length) {
+      // A certified line can contain just the middle of a wrapped source
+      // region. Its complete paint must occur exactly once in that region.
+      const at = needle.indexOf(text);
+      if (at < 0 || needle.indexOf(text, at + 1) >= 0) return [];
+      const offset = [...needle.slice(0, at)].length;
+      const map = painted.map((part, i) => ({ ...part.glyph,
+        start: source[offset + i].start, end: source[offset + i].end }));
+      return [{ map, cost: 0, start: 0, end: map.length }];
+    }
     const matches = [];
     for (let at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + 1)) {
       // Tokens can be non-BMP; offsets into the normalized string must be
@@ -88,9 +98,9 @@
       return (x.x-p.x)**2+(x.y-p.y)**2-((y.x-p.x)**2+(y.y-p.y)**2);
     })[0] ?? [];
   }
-  function textMaps(value, glyphs) {
+  function textMaps(value, glyphs, allowLineSlice = false) {
     if (String(value).length > 4096 || glyphs.length > 4096) return [];
-    return distinctOccurrences(textMatches(value, glyphs, 256));
+    return distinctOccurrences(textMatches(value, glyphs, 256, allowLineSlice));
   }
   function hit(map, point) {
     const glyph = nearest(map, point);
@@ -325,6 +335,47 @@
         Math.abs(box.y - smallest[0].y) > 0.01)) return null;
     return measuredBoxCaret(smallest[0], reference, offset);
   }
+  // A horizontal rule selects a fraction only when the complete, mapped
+  // numerator and denominator lie on opposite sides of that very rule.
+  function fractionAtRule(field, map, rule) {
+    if (!field || !map.length || !(rule.width > 0 && rule.height > 0)) return false;
+    const model = mathModelSnapshot(field);
+    for (let offset = 0; offset <= model.lastOffset; offset++) {
+      if (model.getElementInfo(offset)?.type !== 'genfrac') continue;
+      const branches = glyphBranches(model, map, offset);
+      const above = branches.filter(item => item.branch === 'above');
+      const below = branches.filter(item => item.branch === 'below');
+      const fitsWidth = ({ glyph }) => glyph.left >= rule.x - 0.5 && glyph.right <= rule.x + rule.width + 0.5;
+      if (above.length && below.length &&
+          above.every(item => fitsWidth(item) && item.glyph.baseline < rule.y) &&
+          below.every(item => fitsWidth(item) && item.glyph.baseline > rule.y + rule.height)) return true;
+    }
+    return false;
+  }
+
+  // Keep the original branch geometry before typing changes MathLive offsets.
+  function printedMathStructures(field, map, glyphs = []) {
+    if (field.lastOffset > 512) return null;
+    const model = mathModelSnapshot(field), structures = [];
+    const signs = glyphs.filter(g => g.text === '√');
+    for (let offset = 0; offset <= model.lastOffset; offset++) {
+      const atom = model.getElementInfo(offset);
+      if (atom?.type === 'surd') {
+        const body = glyphBranches(model, map, offset).filter(g => g.branch === 'body').map(g => g.glyph);
+        if (!body.length) return null;
+        const b = union(body);
+        structures.push({ body, signs: signs.filter(g => g.left < b.left && g.right <= b.right + 1 &&
+          g.baseline >= b.top - 32 && g.baseline <= b.bottom + 4) });
+      } else if (atom?.type === 'genfrac' && ['\\frac', '\\dfrac', '\\tfrac'].includes(atom.command)) {
+        const branches = glyphBranches(model, map, offset);
+        const above = branches.filter(g => g.branch === 'above').map(g => g.glyph);
+        const below = branches.filter(g => g.branch === 'below').map(g => g.glyph);
+        if (above.length && below.length) structures.push({ above, below });
+      }
+    }
+    return structures;
+  }
+
   function fractionBoundaryCaret(field, map, offset, sourceBoxes) {
     const above = [], below = [], outside = [];
     for (const { glyph, branch } of glyphBranches(field, map, offset)) {
@@ -411,6 +462,7 @@
         left: g.left + (g.right - g.left) * i / tokens.length,
         right: g.left + (g.right - g.left) * (i + 1) / tokens.length }));
     }).filter(g => {
+      if (!bounds) return true; // already restricted to the visible block chunk
       const c = center(g);
       return c.x >= bounds.left - 1 && c.x <= bounds.right + 1 &&
         c.y >= bounds.top - 2 && c.y <= bounds.bottom + 2;
@@ -465,7 +517,8 @@
           cost += pair.cost;
         }
       }
-      matches.push({ map: mergeMathAtoms(result), cost, start, end: start + count });
+      matches.push({ map: mergeMathAtoms(result), cost, start, end: start + count,
+        paintStart: window[0].paintIndex, paintEnd: window.at(-1).paintIndex + 1 });
       if (matches.length > maxCandidates) return null;
     }
     return matches;
@@ -525,12 +578,58 @@
   // separate near-point lookup for each identical source region would map
   // every region onto the clicked copy. This bounded helper refuses partial
   // matches and ambiguous occurrence sets instead of inventing a bijection.
-  function mathMaps(field, glyphs, bounds) {
+  function mathMaps(field, glyphs, bounds, { contiguous = false } = {}) {
     if (Number(field.lastOffset) > 512 || glyphs.length > 4096) return [];
     const matches = mathMatches(field, glyphs, bounds, {
-      complete: true, maxCandidates: 256, maxPairings: 200000,
+      complete: true, contiguous, maxCandidates: 256, maxPairings: 200000,
     });
     return distinctOccurrences(matches);
+  }
+
+  // A nested alignment can ship its first inner row above a preceding outer
+  // cell. Walk the exact PDF text operators in TeX traversal order. Each
+  // editable value must account for its complete consecutive piece of ink.
+  function tablePaintRuns(value, field, glyphs) {
+    if (glyphs.length > 4096 || String(value).length > 4096 || Number(field?.lastOffset) > 512) return [];
+    if (!field) return textMatches(value, glyphs, 256) ?? [];
+    const matches = mathMatches(field, glyphs, null, { complete: true, contiguous: true,
+      maxCandidates: 256, maxPairings: 200000 });
+    return (matches ?? []).filter(m => m.end - m.start === m.paintEnd - m.paintStart)
+      .map(m => ({ map: m.map, start: m.paintStart, end: m.paintEnd }));
+  }
+
+  function tablePaintHit(regions, glyphs, runsByRegion, point) {
+    // undefined leaves other mappings available; null is proven noneditable ink.
+    let offset = 0, overLiteral = false;
+    const printed = glyphs.flatMap(glyph => [...key(glyph.text)].map(token => ({ token, glyph })));
+    function consumeLiteral(value) {
+      for (const token of key(value)) {
+        const part = printed[offset++];
+        if (part?.token !== token) return false;
+        const g = part.glyph;
+        if (point.x >= g.left && point.x <= g.right && point.y >= g.top && point.y <= g.bottom) overLiteral = true;
+      }
+      return true;
+    }
+    const hits = [];
+    for (const region of regions) {
+      if (region.tableLiteralBefore && !consumeLiteral(region.tableLiteralBefore)) return undefined;
+      const run = runsByRegion.get(region)?.get(offset);
+      if (!run) return undefined;
+      offset = run.end;
+      if (region.tableLiteralAfter && !consumeLiteral(region.tableLiteralAfter)) return undefined;
+      const glyph = nearest(run.map, point);
+      if (glyph && point.x >= glyph.left - 2 && point.x <= glyph.right + 2 &&
+          point.y >= glyph.top - 1 && point.y <= glyph.bottom + 1) hits.push({ region, map: run.map });
+    }
+    if (offset !== printed.length) return undefined;
+    if (overLiteral) return null;
+    if (hits.length > 1) {
+      const exact = hits.filter(hit => hit.map.some(g => point.x >= g.left && point.x <= g.right &&
+        point.y >= g.top && point.y <= g.bottom));
+      return exact.length === 1 ? exact[0] : null;
+    }
+    return hits[0] ?? null;
   }
 
   function distinctOccurrences(matches) {
@@ -555,5 +654,366 @@
     return best[0].occurrences.map(({ map, cost }) => ({ map, cost }));
   }
 
-  root.TdomDirectEditGeometry = { textMap, textMapFromGlyphs, textMaps, mathMap, mathMaps, hit, mathHit, caret, mathCaret, nearest };
+  // Only path geometry from the PDF renderer enters the measuring SVG.
+  const formulaShapeCache = new WeakMap();
+  function formulaPageShapes(image) {
+    const src = image.dataset.src;
+    let cached = formulaShapeCache.get(image);
+    if (cached?.src !== src) {
+      cached = { src, promise: readFormulaPageShapes(src).catch(() => null) };
+      formulaShapeCache.set(image, cached);
+    }
+    return cached.promise;
+  }
+
+  function paperTransform(node) {
+    let matrix = new DOMMatrix();
+    for (let element = node; element.localName !== 'svg'; element = element.parentElement) {
+      const transform = element.transform.baseVal.consolidate()?.matrix;
+      if (transform) matrix = DOMMatrix.fromMatrix(transform).multiply(matrix);
+    }
+    return matrix;
+  }
+
+  function transformedBox(x, y, width, height, matrix) {
+    const points = [[x, y], [x + width, y], [x, y + height], [x + width, y + height]].map(([px, py]) =>
+      matrix ? new DOMPoint(px, py).matrixTransform(matrix) : { x: px, y: py });
+    return { left: Math.min(...points.map(p => p.x)), right: Math.max(...points.map(p => p.x)),
+      top: Math.min(...points.map(p => p.y)), bottom: Math.max(...points.map(p => p.y)) };
+  }
+
+  function paperImageBounds(node, image) {
+    if (node !== image && (!image.closest('defs') || node.hasAttribute('width') || node.hasAttribute('height') ||
+        image.closest('[filter]'))) return null;
+    const number = (element, key, fallback) => {
+      const value = element.getAttribute(key);
+      return value === null ? fallback : Number(value);
+    };
+    const x = number(image, 'x', 0), y = number(image, 'y', 0);
+    const w = number(image, 'width', NaN), h = number(image, 'height', NaN);
+    if (!(w > 0 && h > 0)) return null;
+    let matrix = paperTransform(node);
+    if (node !== image) {
+      matrix = matrix.translate(number(node, 'x', 0), number(node, 'y', 0));
+      const transform = image.transform.baseVal.consolidate()?.matrix;
+      if (transform) matrix = matrix.multiply(transform);
+    }
+    const box = transformedBox(x, y, w, h, matrix);
+    return Object.values(box).every(Number.isFinite) ? box : null;
+  }
+
+  function paperClips(node, pathFor) {
+    const clips = [];
+    for (let el = node.closest('[clip-path]'); el; el = el.parentElement?.closest('[clip-path]')) {
+      const id = /^url\(#([^)]*)\)$/.exec(el.getAttribute('clip-path'))?.[1];
+      const clip = id && el.ownerDocument.getElementById(id);
+      if (clip?.localName !== 'clipPath' || clip.children.length !== 1 ||
+          (clip.getAttribute('clipPathUnits') ?? 'userSpaceOnUse') !== 'userSpaceOnUse') continue;
+      const path = clip.firstElementChild;
+      if (path.localName !== 'path') continue;
+      let matrix = paperTransform(el);
+      for (const element of [clip, path]) {
+        const transform = element.transform.baseVal.consolidate()?.matrix;
+        if (transform) matrix = matrix.multiply(transform);
+      }
+      clips.push({ path: pathFor(path), matrix });
+    }
+    return clips;
+  }
+
+  async function readFormulaPageShapes(src) {
+    const url = new URL(src, location.href);
+    url.searchParams.set('geometry', '1');
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const svg = new DOMParser().parseFromString(await response.text(), 'image/svg+xml').documentElement;
+    if (svg.localName !== 'svg' || svg.querySelector('parsererror, style, [style]')) return null;
+    const viewport = svg.viewBox.baseVal;
+    if (viewport.x !== 0 || viewport.y !== 0 || !(viewport.width > 0 && viewport.height > 0)) return null;
+    const probe = document.createElementNS(svg.namespaceURI, 'svg');
+    probe.style.cssText = 'position:fixed;visibility:hidden;width:0;height:0';
+    const paths = new Map(), entries = [];
+    const pathFor = source => {
+      if (!paths.has(source)) {
+        const path = document.createElementNS(svg.namespaceURI, 'path');
+        path.setAttribute('d', source.getAttribute('d') ?? '');
+        paths.set(source, path);
+        probe.append(path);
+      }
+      return paths.get(source);
+    };
+    for (const node of svg.querySelectorAll('*')) {
+      if (node.closest('defs')) continue;
+      if (node.closest('[filter],g[stroke]:not([stroke="none"])')) return null;
+      if (node.localName === 'g') continue;
+      if (entries.length >= 15000) return null;
+      const use = node.localName === 'use';
+      const ref = use && (node.getAttributeNS('http://www.w3.org/1999/xlink', 'href') ?? node.getAttribute('href'));
+      const target = ref && ref.startsWith('#') && svg.ownerDocument.getElementById(ref.slice(1));
+      const image = node.localName === 'image' ? node : target?.localName === 'image' ? target : null;
+      if (image) {
+        const rect = paperImageBounds(node, image);
+        if (!rect) return null;
+        entries.push({ rect, clips: paperClips(node, pathFor) });
+        continue;
+      }
+      if (node.closest('g[transform]')) return null;
+      if (use) {
+        if (node.hasAttribute('transform') || node.hasAttribute('stroke')) return null;
+        const group = target;
+        if (!group?.closest('defs') || group.children.length !== 1 || group.firstElementChild.localName !== 'path' ||
+            group.closest('[transform],[stroke],[filter],[mask]') || group.firstElementChild.matches('[transform],[stroke],[filter],[mask]')) return null;
+        const x = Number(node.getAttribute('x')), y = Number(node.getAttribute('y'));
+        const color = node.closest('[fill]')?.getAttribute('fill') ?? 'black';
+        entries.push({ path: pathFor(group.firstElementChild), x, y, color,
+          editable: !node.closest('[clip-path],[mask],[opacity]:not([opacity="1"]),[fill-opacity]:not([fill-opacity="1"])') && CSS.supports('color', color) });
+      } else if (node.localName === 'path') {
+        // Rules and figures can share a page with editable text. A conservative
+        // transformed stroke envelope prevents the editor covering their ink.
+        const stroke = node.getAttribute('stroke'), width = Number(node.getAttribute('stroke-width') ?? 1);
+        const miter = Number(node.getAttribute('stroke-miterlimit') ?? 4);
+        const bleed = stroke && stroke !== 'none' ? Math.max(1, miter) * width / 2 : 0;
+        const transform = node.transform.baseVal.consolidate()?.matrix;
+        if (!Number.isFinite(bleed)) return null;
+        const straight = /^\s*M\s+([-+.\deE]+)\s+([-+.\deE]+)\s+L\s+([-+.\deE]+)\s+([-+.\deE]+)\s*$/.exec(node.getAttribute('d') ?? '');
+        const horizontal = straight && +straight[2] === +straight[4] && +straight[1] !== +straight[3] &&
+          (!transform || transform.b === 0 && transform.c === 0) && width > 0 &&
+          node.getAttribute('fill') === 'none' && (node.getAttribute('stroke-linecap') ?? 'butt') === 'butt' &&
+          !node.closest('[clip-path],[mask],[opacity]:not([opacity="1"]),[stroke-opacity]:not([stroke-opacity="1"]),[stroke-dasharray]') &&
+          CSS.supports('color', stroke);
+        entries.push({ path: pathFor(node), transform, bleed, ruleWidth: horizontal ? width : 0, color: stroke });
+      } else return null;
+    }
+    try {
+      document.body.append(probe);
+      const boxes = new Map([...paths.values()].map(path => [path, path.getBBox()]));
+      const shapes = entries.map(entry => {
+        if (entry.rect) {
+          // Masks can only remove pixels. Clip the raster viewport to proven
+          // clip envelopes, without loading the raster or its opacity mask.
+          const rect = entry.rect;
+          for (const clip of entry.clips) {
+            const b = boxes.get(clip.path), c = transformedBox(b.x, b.y, b.width, b.height, clip.matrix);
+            rect.left = Math.max(rect.left, c.left);
+            rect.right = Math.min(rect.right, c.right);
+            rect.top = Math.max(rect.top, c.top);
+            rect.bottom = Math.min(rect.bottom, c.bottom);
+          }
+          return rect.right > rect.left && rect.bottom > rect.top ? rect : null;
+        }
+        const box = boxes.get(entry.path);
+        if (Number.isFinite(entry.x) && Number.isFinite(entry.y)) return { x: entry.x, y: entry.y,
+          left: entry.x + box.x, right: entry.x + box.x + box.width, top: entry.y + box.y, bottom: entry.y + box.y + box.height,
+          color: entry.color, editable: entry.editable };
+        if (entry.ruleWidth) {
+          const { a, d, e, f } = entry.transform ?? { a: 1, d: 1, e: 0, f: 0 };
+          const x1 = a * box.x + e, x2 = a * (box.x + box.width) + e, y = d * box.y + f;
+          const half = Math.abs(d) * entry.ruleWidth / 2;
+          return { left: Math.min(x1, x2), right: Math.max(x1, x2), top: y - half, bottom: y + half,
+            rule: true, color: entry.color };
+        }
+        return transformedBox(box.x - entry.bleed, box.y - entry.bleed,
+          box.width + 2 * entry.bleed, box.height + 2 * entry.bleed, entry.transform);
+      }).filter(Boolean);
+      return { width: viewport.width, height: viewport.height, shapes };
+    } finally { probe.remove(); }
+  }
+
+  function completeDisplayMap(field, map) {
+    if (field.lastOffset > 512) return false;
+    const atoms = field.getModelMetadata?.();
+    if (!atoms?.length) return false;
+    const hidden = new Set(), offsets = new Set(map.map(glyph => glyph.end));
+    // MathLive enumerates children before their parent. The payload of a
+    // label or custom tag is not printed inside the expression.
+    for (let i = atoms.length - 1; i >= 0; i--) {
+      const atom = atoms[i];
+      if (hidden.has(atom.parentOffset) || ['\\label', '\\tag', '\\tag*', '\\notag', '\\nonumber'].includes(atom.command)) {
+        hidden.add(i);
+      } else if (atom.symbol) {
+        if (!offsets.delete(i)) return false;
+      } else if (!['first', 'group', 'subsup', 'surd'].includes(atom.type) &&
+          !(atom.type === 'genfrac' && ['\\frac', '\\dfrac', '\\tfrac'].includes(atom.command))) return false;
+    }
+    return offsets.size === 0;
+  }
+
+  // Match each PDF text operator to exactly one Cairo glyph origin. Advances
+  // may overlap while the printed shapes of a period and a subscript do not.
+  function isolatedFormulaSlot(index, map, paper, structures = [], displayRows = null, completeMap = false) {
+    if (!index || !map.length || !structures || Math.abs(index.width - paper.width) > 0.02 ||
+        Math.abs(index.height - paper.height) > 0.02) return null;
+    const shapes = index.shapes;
+    const own = new Set(), outlines = new Map();
+    const outline = glyph => {
+      const exact = shapes.filter(s => Math.abs(s.x - glyph.left) < 0.03 && Math.abs(s.y - glyph.baseline) < 0.03);
+      return exact.length === 1 && exact[0].editable ? exact[0] : null;
+    };
+    for (const glyph of map) {
+      const shape = outline(glyph);
+      if (!shape) return null;
+      own.add(shape);
+      outlines.set(glyph, shape);
+    }
+    const color = own.values().next().value.color;
+    // MathLive visits child atoms first. Enclosing bars must span the
+    // already measured inner signs and rules as well as the body letters.
+    const extensions = new Map();
+    const span = members => union(members.map(g => extensions.get(g) ?? g));
+    for (const structure of structures) {
+      if (structure.body) {
+        const body = span(structure.body);
+        const inkTop = Math.min(...structure.body.map(g => outlines.get(g).top));
+        const inkBottom = Math.max(...structure.body.map(g => outlines.get(g).bottom));
+        const bars = shapes.filter(g => g.rule && g.color === color && g.bottom <= inkTop + 0.25 &&
+          Math.abs(g.left - body.left) <= 2 && Math.abs(g.right - body.right) <= 2);
+        const pairs = [];
+        for (const sign of structure.signs) {
+          const head = outline(sign);
+          if (!head || head.color !== color || own.has(head) || head.bottom < inkBottom - 0.8) continue;
+          for (const bar of bars) {
+            if (!own.has(bar) && Math.abs(sign.right - bar.left) < 0.65 &&
+                Math.abs(head.right - bar.left) < 1 && Math.abs(head.top - bar.top) < 0.65) pairs.push({ sign, head, bar });
+          }
+        }
+        if (pairs.length !== 1) return null;
+        const { sign, head, bar } = pairs[0];
+        own.add(head);
+        own.add(bar);
+        extensions.set(structure.body[0], union([body, sign, head, bar]));
+      } else {
+        const a = span(structure.above), b = span(structure.below);
+        const left = Math.min(a.left, b.left), right = Math.max(a.right, b.right);
+        const upper = Math.max(...structure.above.map(g => g.baseline)), lower = Math.min(...structure.below.map(g => g.baseline));
+        // An indexed radical can reserve a leading kern beyond its printed sign.
+        const tolerance = structure.above.some(g => extensions.has(g)) || structure.below.some(g => extensions.has(g)) ? 1.6 : 0.8;
+        const matches = shapes.filter(g => g.rule && g.color === color && g.top > upper && g.bottom < lower &&
+          Math.abs(g.left - left) < tolerance && Math.abs(g.right - right) < tolerance &&
+          [a, b].every(s => Math.abs((s.left + s.right - g.left - g.right) / 2) < 0.8));
+        if (matches.length !== 1 || own.has(matches[0])) return null;
+        own.add(matches[0]);
+        extensions.set(structure.above[0], union([a, b, matches[0]]));
+      }
+    }
+    const ink = [...own];
+    const left = Math.min(...ink.map(g => g.left)) - 0.35, right = Math.max(...ink.map(g => g.right)) + 0.35;
+    const inkTop = Math.min(...ink.map(g => g.top)), inkBottom = Math.max(...ink.map(g => g.bottom));
+    let top = Math.min(inkTop, ...map.map(g => g.top)) - 0.35;
+    let bottom = Math.max(inkBottom, ...map.map(g => g.bottom)) + 0.35;
+    // Font ascents and descents may reach the previous or next printed row.
+    // Trim only their spare padding; the full original outline must still fit.
+    for (const g of shapes) {
+      if (own.has(g) || g.right <= left - 0.25 || g.left >= right + 0.25 || g.left === g.right) continue;
+      if (g.bottom <= inkTop) top = Math.max(top, g.bottom + 0.25);
+      if (g.top >= inkBottom) bottom = Math.min(bottom, g.top - 0.25);
+    }
+    if (!(right > left && top < inkTop && bottom > inkBottom && (bottom - top < 32 || displayRows && completeMap)) ||
+        ink.some(g => g.color !== color)) return null;
+    if (displayRows) {
+      const rows = displayRows.filter(row => map.every(g => g.left >= row.left - 0.5 && g.right <= row.right + 0.5 &&
+        g.baseline >= row.top - 0.5 && g.baseline <= row.bottom + 0.5)).sort((a, b) => (a.right - a.left) - (b.right - b.left));
+      const natural = rows.find(row => Math.abs(row.left - left) <= 4 && Math.abs(row.right - right) <= 4);
+      // fleqn and custom tags may expose only a whole column and individual
+      // subexpressions. In that case every visible model atom must be mapped.
+      if (!natural && (!rows.length || !completeMap)) return null;
+      const expression = natural ?? { left, right };
+      const column = rows.find(row => row.left <= expression.left && row.right >= expression.right &&
+        row.right - row.left > expression.right - expression.left + 4);
+      const center = (expression.left + expression.right) / 2;
+      let line = column;
+      if (column && Math.abs((column.left + column.right) / 2 - center) >= 1) {
+        // With leqno, SyncTeX can include the hanging tag's glue in the
+        // enclosing box. The tag box starts at the physical column edge.
+        for (const tag of displayRows) {
+          if (tag.top >= bottom || tag.bottom <= top || tag.left < column.left || tag.right > column.right) continue;
+          const candidate = tag.right < left ? { left: tag.left, right: column.right } :
+            tag.left > right ? { left: column.left, right: tag.right } : null;
+          if (candidate && Math.abs((candidate.left + candidate.right) / 2 - center) < 1) {
+            line = candidate;
+            break;
+          }
+        }
+      }
+      const centered = line && Math.abs((line.left + line.right) / 2 - center) < 1;
+      let start = centered ? Math.max(0, line.left) : left;
+      let end = Math.min(paper.width, line?.right ?? right + Math.max(12, right - left));
+      for (const g of shapes) {
+        if (own.has(g) || g.bottom <= top || g.top >= bottom || g.left === g.right) continue;
+        if (g.right <= Math.min(left, expression.left) - 0.25) start = Math.max(start, g.right + 0.25);
+        else if (g.left >= Math.max(right, expression.right) + 0.25) end = Math.min(end, g.left - 0.25);
+        else return null;
+      }
+      if (start > left || end < right) return null;
+      // The MathLive line box can be taller than the original printed ink.
+      // Use at most half the blank gap so neighboring edited displays can
+      // both expand without one masking the other.
+      const baseHeight = bottom - top;
+      let upper = Math.max(0, top - baseHeight), lower = Math.min(paper.height, bottom + baseHeight);
+      for (const g of shapes) {
+        if (own.has(g) || g.right <= start || g.left >= end || g.left === g.right) continue;
+        if (g.bottom <= top) upper = Math.max(upper, (top + g.bottom) / 2);
+        if (g.top >= bottom) lower = Math.min(lower, (bottom + g.top) / 2);
+      }
+      return { rect: { left: start, right: end, top: upper, bottom: lower }, baseHeight, centerY: (top + bottom) / 2,
+        centered: Boolean(centered), center: centered ? center : null, foreground: color };
+    }
+    let limit = Math.min(paper.width - 1, right + Math.max(12, right - left));
+    for (const g of shapes) {
+      if (own.has(g) || g.bottom <= top || g.top >= bottom || g.right <= left - 0.25 || g.left === g.right) continue;
+      if (g.left < right + 0.25) return null;
+      limit = Math.min(limit, g.left - 0.25);
+    }
+    return { rect: { left, right: limit, top, bottom }, foreground: ink[0].color };
+  }
+
+  // A TeX alignment's row and closing cell may be tagged with the *next*
+  // input line. Use the actual sibling cell boxes and the source lines of
+  // their contents, including script/fraction boxes nested inside them.
+  function locateTableCell(sourceRows, boxes, { point, region }) {
+    const inside = b => point.x >= b.left && point.x <= b.right && point.y >= b.top && point.y <= b.bottom;
+    const rowsWithSource = new Set(), children = new Map(), contentLines = new Map();
+    for (const b of boxes) {
+      if (!children.has(b.parentId)) children.set(b.parentId, []);
+      children.get(b.parentId).push(b);
+      if (b.empty) continue;
+      for (const id of [b.id, ...(b.ancestors ?? [])]) {
+        if (!contentLines.has(id)) contentLines.set(id, new Set());
+        contentLines.get(id).add(b.line);
+        if (region && region.source.start.line <= b.line && b.line <= region.source.end.line) rowsWithSource.add(id);
+      }
+    }
+    let found = null;
+    for (const row of boxes) {
+      if (row.empty || row.parentKind !== 'vbox' || (point ? !inside(row.box) : !rowsWithSource.has(row.id))) continue;
+      const cells = (children.get(row.id) ?? []).filter(b => b.parentKind === 'hbox').sort((a, b) => a.box.left - b.box.left);
+      if (cells.length < 2 || cells.length !== cells[0].parentChildCount ||
+          cells.some((cell, i) => i && cell.box.left < cells[i - 1].box.right - 0.5)) continue;
+      if (region && !cells[region.tableColumn]) continue;
+      const matching = [];
+      for (const regions of sourceRows.values()) {
+        if (regions[0]?.tableColumns !== cells.length || !regions.every(r => {
+          if (r.tableSpan > 1 && (r.tableColumn + r.tableSpan > cells.length ||
+              !cells.slice(r.tableColumn + 1, r.tableColumn + r.tableSpan).every(cell => cell.empty))) return false;
+          const lines = contentLines.get(cells[r.tableColumn]?.id);
+          if (r.source.start.line === r.source.end.line) return lines?.has(r.source.start.line);
+          return lines && [...lines].some(line => r.source.start.line <= line && line <= r.source.end.line);
+        })) continue;
+        matching.push(regions);
+      }
+      if (matching.length !== 1) {
+        if (matching.length && (point || matching.some(regions => regions.includes(region)))) return null;
+        continue;
+      }
+      const cellBox = r => ({ ...cells[r.tableColumn].box,
+        right: cells[r.tableColumn + (r.tableSpan ?? 1) - 1].box.right });
+      const regions = matching[0].filter(r => point ? inside(cellBox(r)) : r.tableColumn === region.tableColumn);
+      if (regions.some(r => r.tableColumn !== regions[0].tableColumn)) return null;
+      if (!regions.length || region && !regions.includes(region)) continue;
+      if (found) return null;
+      found = { regions, box: cellBox(regions[0]) };
+    }
+    return found;
+  }
+
+  root.TdomDirectEditGeometry = { tablePaintRuns, tablePaintHit, locateTableCell, formulaPageShapes, printedMathStructures, completeDisplayMap, isolatedFormulaSlot, textMap, textMapFromGlyphs, textMaps, mathMap, mathMaps, fractionAtRule, hit, mathHit, caret, mathCaret, nearest };
 })(typeof window === 'undefined' ? globalThis : window);

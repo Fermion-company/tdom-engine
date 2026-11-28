@@ -202,15 +202,46 @@ function snapshotsMatch(a, b) {
     a.snapshotId === b.snapshotId;
 }
 
-/** Everything but the root source text agrees: a baseline certified for an
- * older revision is still this document's exact lineage, and a replay can
- * carry it forward like any keystroke. */
-function sameLineage(a, b) {
-  return a.sessionId === b.sessionId &&
-    a.documentEpoch === b.documentEpoch &&
-    a.preHash === b.preHash &&
-    a.dependencyHash === b.dependencyHash &&
-    a.executionProfileHash === b.executionProfileHash;
+// A behind baseline is never published for the new revision. If one
+// included file changed during boot, pass the pending edit to resume(),
+// which checks its actual bytes, read path and checkpoint before replay.
+function canCatchUpBaseline(current, attempt, pending) {
+  if (current.sessionId !== attempt.sessionId || current.documentEpoch !== attempt.documentEpoch ||
+      current.preHash !== attempt.preHash || current.executionProfileHash !== attempt.executionProfileHash) return false;
+  if (current.dependencyHash === attempt.dependencyHash) return true;
+  const changes = pending?.projectInputChanges;
+  return current.sourceRevision > attempt.sourceRevision && current.sourceHash === attempt.sourceHash &&
+    changes?.unknown === false && changes.changed?.length === 1 && !changes.removed?.length;
+}
+
+// A replay certifies a fixed physical page sequence until a new baseline opens.
+export function shippingPageCountChanged(chain, generation) {
+  const before = chain?.baselinePages;
+  const after = generation?.pageCount;
+  return Number.isSafeInteger(before) && before > 0 &&
+    Number.isSafeInteger(after) && after > 0 && before !== after;
+}
+
+// Both a newly arrived PDF and a baseline finishing after an undo may
+// discover the exact seeds for the current physical page sequence.
+export function requestCanonicalBaseline(engine, generation, queueShipBoot) {
+  if (!engine.shipping || engine.shipIdleRetired || !generation?.seedFiles ||
+      generation !== engine.canonical.last || generation.rev !== engine.srcRev ||
+      generation.inputEpoch !== engine.canonical.inputEpoch || generation.id === engine.shipDesiredCanonicalId) {
+    return false;
+  }
+  engine.shipDesiredCanonicalId = generation.id;
+  engine.shipDesiredCanonicalHash = generation.pdfHash ?? null;
+  engine.shipBootedFor = null;
+  queueShipBoot();
+  return true;
+}
+
+function restoreCurrentPagination(engine, chain, queueShipBoot) {
+  const authority = engine.canonical?.last;
+  return shippingPageCountChanged(chain, authority) && authority.rev === engine.srcRev &&
+    engine.canonical.sourceMatches(engine.store.get(engine.file)) &&
+    requestCanonicalBaseline(engine, authority, queueShipBoot);
 }
 
 /** A gen-0 baseline of the current chain is still being built or validated. */
@@ -307,7 +338,7 @@ export function settleShippingBaseline(engine, chain, event, queueShipBoot = () 
   }
 
   if (event.outcome === 'CERTIFIED' && event.pdfCertificateId && currentChain && !engine.shipStale &&
-      !currentMatchesAttempt && sameLineage(current, attempt)) {
+      !currentMatchesAttempt && canCatchUpBaseline(current, attempt, engine.shipPendingInputChanges)) {
     // Edits landed while the baseline was being built. Its pages are exact
     // for the source it booted with; replay forward like any keystroke
     // instead of discarding it (under continuous typing every baseline used
@@ -383,6 +414,7 @@ export function shippingBootDelay(engine) {
 export function makeShippingChain(engine, queueShipBoot) {
   const chain = new ShippingChain({
     workDir: path.join(engine.workDir, 'ship'),
+    sourceDir: engine.sourceDir,
     docDir: engine.docDir,
     overlayDir: engine.overlayDir,
     checkpointBudget: () => sharedCheckpointBudget({
@@ -392,7 +424,7 @@ export function makeShippingChain(engine, queueShipBoot) {
       currentJob: engine.currentJob,
       activeResidentRenders: engine.activeResidentRenderCheckpoints,
     }).shippingLimit,
-    waveCutoffMs: () => usefulShippingCutoffMs(engine.canonical?.info?.().ms),
+    waveCutoffMs: () => usefulShippingCutoffMs(engine.canonical?.typesetEstimateMs?.() ?? engine.canonical?.info?.().ms),
     pageGeometry: () => !uniformCanonicalGeometry(engine.canonical?.info?.()),
   });
   chain.onWave = (wave) => {
@@ -440,16 +472,25 @@ export function makeShippingChain(engine, queueShipBoot) {
       engine.shipLabelOverrides.set(key, val);
     }
   };
-  chain.onWaveOutcome = ({ gen, outcome }) => {
+  chain.onWaveOutcome = ({ gen, outcome, reason, pagination }) => {
     if (outcome !== 'rejected' || chain !== engine.shipping ||
         engine.shipGenRev.get(gen) !== engine.srcRev) return;
+    const repaginated = reason === 'page-count-changed' && !engine.shipStale &&
+      chain.acceptedSnapshotId && chain.acceptedSnapshotId === engine.shipDesiredInputSnapshot &&
+      engine.shipGenSnapshot.get(gen) === chain.acceptedSnapshotId;
+    if (repaginated) engine.canonical?.noteRepagination?.(engine.srcRev, pagination);
     engine.canonical?.releaseAuthorityDeferral?.();
+    if (repaginated && restoreCurrentPagination(engine, chain, queueShipBoot)) return;
+    if (repaginated && (engine.previewPolicy === 'canonical-anchor' || engine.previewPolicy === 'shipping-exact')) {
+      engine.onShipRepaginated?.(engine.srcRev);
+    }
   };
   chain.retryState = engine.shipRetry;
   chain.onBaselineOutcome = (event) => {
     settleShippingBaseline(engine, chain, event, queueShipBoot, () => {
       const pending = engine.shipPendingInputChanges;
       engine.shipPendingInputChanges = null;
+      if (restoreCurrentPagination(engine, chain, queueShipBoot)) return;
       shipUpdate(engine, engine.store.get(engine.file), pending?.projectInputChanges ?? null, queueShipBoot);
     });
   };
@@ -554,7 +595,17 @@ export async function bootShipping(engine, { makeShipping, paginateNow, computeT
 }
 
 export function queueShipBoot(engine, bootShipping) {
-  if (!engine.shipping || engine.shipBootTimer) return;
+  if (!engine.shipping) return;
+  // On first open the native paper may be waiting only for the converged
+  // aux files. Once those exact seeds arrive, wake the scheduled boot now.
+  const seed = engine.canonical?.last;
+  const firstSeed = !engine.shipping.rootPeer && !engine.shipRetry.lastCertifiedSnapshot;
+  const repaginated = engine.shipping.done && shippingPageCountChanged(engine.shipping, seed);
+  const wakeNow = engine.previewPolicy !== 'structured' && !engine.shipBooting && (firstSeed || repaginated) &&
+    !engine.shipRetry.lastFailureClass && seed?.seedFiles && seed.id === engine.shipDesiredCanonicalId &&
+    seed.rev === engine.srcRev && seed.inputEpoch === engine.canonical.inputEpoch &&
+    engine.canonical.sourceMatches(engine.store.get(engine.file));
+  if (engine.shipBootTimer && !wakeNow) return;
   const initialDelay = shippingBootDelay(engine);
   if (initialDelay === null) return;
   const arm = (delay = 800) => {
@@ -582,7 +633,8 @@ export function queueShipBoot(engine, bootShipping) {
     }, delay);
     engine.shipBootTimer.unref?.();
   };
-  arm(initialDelay);
+  if (wakeNow) clearTimeout(engine.shipBootTimer);
+  arm(wakeNow ? 0 : initialDelay);
 }
 
 /** Hot-path hook: cheap (a unit diff + one socket line). */

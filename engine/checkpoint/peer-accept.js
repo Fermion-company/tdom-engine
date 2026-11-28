@@ -7,7 +7,9 @@ export function acceptPeer(engine, sock) {
     engine.peers.delete(peer);
     if (peer.pid) engine.dyingPids?.delete(peer.pid);
     for (const [idx, p] of engine.checkpoints) {
-      if (p === peer) engine.checkpoints.delete(idx);
+      if (p !== peer) continue;
+      engine.retiredInputs?.set(idx, { why: 'peer exited', pid: peer.pid, at: Date.now() });
+      engine.checkpoints.delete(idx);
     }
     if (engine.realRoot === peer) engine.realRoot = null; // splitting rescues go cold again
     // fail fast: if the process carrying the in-flight job dies (TeX

@@ -1,0 +1,18 @@
+\documentclass[a5paper]{ltjtarticle}
+\usepackage{lltjext}
+\begin{document}
+\section{縦組みの中の横組み}
+縦組みの本文の中に横組みの箱を置く。次の箱は横組みの\texttt{parbox}で作った。
+\parbox<y>{10\zw}{横書きの箱の中身。二行目に続く。}
+箱のあとも縦組みの本文が続く。ここまでが一つ目の段落である。
+
+次は横組みのミニページである。
+\begin{minipage}<y>{10\zw}
+ミニページの中は横組みで、少し長めの文を入れておく。三行ほどになるはずだ。
+\end{minipage}
+ミニページのあとの文。
+
+最後に一行だけの横組み：\hbox{\yoko 横の一行}。そして縦組みに戻る。表を横組みで置く：
+\hbox{\yoko\begin{tabular}{|c|c|}\hline 一 & 二\\\hline 三 & 四\\\hline\end{tabular}}
+表のあと。
+\end{document}

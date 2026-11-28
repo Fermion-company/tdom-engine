@@ -33,12 +33,15 @@ export function pagesOwed(pages) {
  * a keystroke that follows one which moved every page builds its own page,
  * not three more of the pages still on their way.
  */
-export function buildPagePatches(pages, prevPages, hfSig, displayList, { limit = Infinity, focus = null, owedToo = false } = {}) {
+export function buildPagePatches(pages, prevPages, hfSig, displayList,
+  { limit = Infinity, focus = null, owedToo = false, bodyContext, bodyChanged } = {}) {
   const prevHashes = new Map(prevPages.map((p) => [p.number, shownOf(p)]));
   const patches = [];
   const dirtyPages = [];
   const sigOf = typeof hfSig === 'function' ? hfSig : () => hfSig;
-  const stale = (page) => !page.dl || page.dl.hfSig !== sigOf(page);
+  const stale = (page) => !page.dl || (page.dl.hfKey ?? page.dl.hfSig) !== sigOf(page) ||
+    (bodyContext !== undefined && page.dl.bodyContext !== undefined &&
+      (bodyChanged ? bodyChanged(page, bodyContext) : page.dl.bodyContext !== bodyContext));
   const owed = (page) => !!page.owed && page.owed.number === page.number;
   // (a page copied to another number carries no claim about that number)
   for (const page of pages) if (page.owed && page.owed.number !== page.number) delete page.owed;
@@ -61,7 +64,7 @@ export function buildPagePatches(pages, prevPages, hfSig, displayList, { limit =
       if (!owed(page)) page.owed = { number: page.number, hash: prevHashes.get(page.number) ?? null };
       continue;
     }
-    if (stale(page)) page.dl = displayList(page);
+    if (stale(page)) page.dl = displayList(page, bodyContext);
     const shown = owed(page) ? page.owed.hash : prevHashes.get(page.number);
     delete page.owed;
     if (page.dl.hash !== shown) {
